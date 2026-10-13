@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Clock, Rows3, ListTree, Search, ChevronRight } from 'lucide-react';
-import { buildTrace, rawText, type TraceRecord } from './model';
+import { buildTrace, rawText, requestSystemPrompt, type TraceRecord } from './model';
 import TraceInspector from './TraceInspector';
 
 const colors: Record<string, string> = { input: 'bg-emerald-500', model: 'bg-purple-400', tools: 'bg-amber-500' };
@@ -19,11 +19,16 @@ export default function TrajectoryView({ messages, loading, focusId }: { message
   useEffect(() => {
     if (focusId) { setSelectedId(focusId); setQuery(''); setCollapsed(new Set()); setCalls(true); }
   }, [focusId]);
-  useEffect(() => { if (selectedId) rowRefs.current.get(selectedId)?.scrollIntoView?.({ block: 'nearest' }); }, [selectedId, calls, collapsed, query]);
   const select = (id: string) => { setSelectedId(id); setQuery(''); setCollapsed(new Set()); setCalls(true); };
-  const selected = records.find(r => r.id === selectedId);
+  let selected = records.find(r => r.id === selectedId || r.aliases?.includes(selectedId || ''));
+  if (!selected && selectedId?.startsWith('request:')) {
+    const source = records.find(r => `request:${r.request?.id}` === selectedId);
+    if (source?.request) selected = { ...source, id: selectedId, role: 'system', title: 'System Prompt', step: 0, text: requestSystemPrompt(source.request) };
+  }
+  const resolvedId = selected?.id;
+  useEffect(() => { if (resolvedId) rowRefs.current.get(resolvedId)?.scrollIntoView?.({ block: 'nearest' }); }, [resolvedId, calls, collapsed, query]);
   const q = query.trim().toLowerCase();
-  const filtered = records.filter(r => (!q || `${preview(r)} ${rawText(r.result)}`.toLowerCase().includes(q)) && (calls || r.role !== 'tool'));
+  const filtered = records.filter(r => (!q || `${preview(r)} ${rawText(r.result)} ${rawText(r.blocks)}`.toLowerCase().includes(q)) && (calls || r.role !== 'tool'));
   const groups = Array.from(new Set(filtered.map(r => r.turn))).map(turn => ({ turn, rows: filtered.filter(r => r.turn === turn) }));
   const turns = collapsed.size === 0;
   const toggleTurn = (turn: number) => setCollapsed(prev => { const next = new Set(prev); if (next.has(turn)) next.delete(turn); else next.add(turn); return next; });
@@ -44,7 +49,7 @@ export default function TrajectoryView({ messages, loading, focusId }: { message
           if (lane(r) !== name || duration && r.startedAt == null) return null;
           const left = duration ? (r.startedAt! - start) / span * 100 : i / Math.max(1, records.length) * 100;
           const width = duration ? Math.max(.3, ((r.endedAt ?? (r.status === 'running' ? Date.now() : r.startedAt!)) - r.startedAt!) / span * 100) : 100 / Math.max(1, records.length) - .15;
-          return <button type="button" key={r.id} aria-label={`定位 ${r.title} Turn ${r.turn} Step ${r.step}`} title={`${r.title} · Turn ${r.turn} · Step ${r.step}`} onClick={() => select(r.id)} className={`absolute top-1 h-2 min-w-[3px] rounded-sm ${colors[name]} ${r.id === selectedId ? 'ring-2 ring-blue-500 ring-offset-1' : ''}`} style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }} />;
+          return <button type="button" key={r.id} aria-label={`定位 ${r.title} Turn ${r.turn} Step ${r.step}`} title={`${r.title} · Turn ${r.turn} · Step ${r.step}`} onClick={() => select(r.id)} className={`absolute top-1 h-2 min-w-[3px] rounded-sm ${colors[name]} ${r.id === resolvedId ? 'ring-2 ring-blue-500 ring-offset-1' : ''}`} style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }} />;
         })}
       </div></div>)}
       {duration && timed.length < records.length && <p className="mt-1 text-xs text-claude-textSecondary">部分历史步骤未记录时间；关闭 Duration 可查看全部步骤。</p>}
@@ -52,14 +57,14 @@ export default function TrajectoryView({ messages, loading, focusId }: { message
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
       <div className="min-h-0 min-w-0 flex-1 overflow-auto" aria-label="过程列表">
         {groups.map(({ turn, rows }) => <div key={turn}>
-          {rows.filter(r => q || !collapsed.has(turn) || r.role === 'user').map(r => <div key={r.id}><button type="button" ref={el => { if (el) rowRefs.current.set(r.id, el); else rowRefs.current.delete(r.id); }} aria-pressed={r.id === selectedId} onClick={() => setSelectedId(r.id)} className={`flex w-full min-w-0 items-center gap-3 border-b border-claude-border px-3 py-1.5 text-left text-xs ${r.id === selectedId ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-400' : 'hover:bg-claude-hover'}`}>
+          {rows.filter(r => q || !collapsed.has(turn) || r.role === 'user').map(r => <div key={r.id}><button type="button" ref={el => { if (el) rowRefs.current.set(r.id, el); else rowRefs.current.delete(r.id); }} aria-pressed={r.id === resolvedId} onClick={() => setSelectedId(r.id)} className={`flex w-full min-w-0 items-center gap-3 border-b border-claude-border px-3 py-1.5 text-left text-xs ${r.id === resolvedId ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-400' : 'hover:bg-claude-hover'}`}>
           <span className="w-24 shrink-0 whitespace-nowrap text-[10px] text-claude-textSecondary">Turn {r.turn} · Step {r.step}</span>
           <span className={`w-20 shrink-0 rounded px-1.5 py-0.5 text-center font-semibold ${r.role === 'tool' ? 'bg-amber-500/10 text-amber-600' : r.role === 'assistant' ? 'bg-purple-500/10 text-purple-500' : 'bg-blue-500/10 text-blue-500'}`}>{r.role.toUpperCase()}</span>
           <span className={`min-w-0 flex-1 truncate ${r.status === 'error' ? 'text-red-500' : ''}`}>{(r.role === 'system' ? r.title : preview(r)) || '(无内容)'}</span>{r.status === 'running' && <span className="animate-pulse">运行中</span>}
         </button>{r.role === 'user' && turn > 0 && collapsed.has(turn) && !q && !selected && <button type="button" aria-label={`Turn ${turn}`} aria-expanded={false} onClick={() => toggleTurn(turn)} className="flex w-full items-center gap-2 border-b border-claude-border px-3 py-1.5 text-xs text-claude-textSecondary hover:bg-claude-hover"><ChevronRight size={12} /><b>Turn {turn}</b><span>{rows.filter(row => row.role === 'assistant' || row.role === 'tool').length} steps</span><span>· {rows.filter(row => row.role === 'tool').length} tool calls</span></button>}</div>)}</div>)}
         {!filtered.length && <p className="p-6 text-sm text-claude-textSecondary">{query ? '没有匹配的过程' : '暂无过程记录'}</p>}
       </div>
-      {selected && <TraceInspector key={selected.id} record={selected} onClose={() => setSelectedId(null)} />}
+      {selected && <TraceInspector key={selected.id} record={selected} onClose={() => setSelectedId(null)} onSelectRequest={id => setSelectedId(`request:${id}`)} />}
     </div>
   </div>;
 }

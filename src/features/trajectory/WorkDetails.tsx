@@ -5,7 +5,7 @@ import MarkdownRenderer from '../../components/MarkdownRenderer';
 import ToolDiffView, { shouldUseDiffView } from '../../components/ToolDiffView';
 import CopyButton from './CopyButton';
 import ToolOutput from './ToolOutput';
-import { messageSteps, recordId, toolCategory, toolCommand, toolInput, toolOutput, toolStatus, rawText, type ProcessStep } from './model';
+import { commandStreams, messageSteps, recordId, toolCategory, toolCommand, toolInput, toolOutput, toolStatus, rawText, type ProcessStep } from './model';
 
 export function InspectButton({ id, onInspect }: { id: string; onInspect?: (id: string) => void }) {
   if (!onInspect) return null;
@@ -30,6 +30,13 @@ function ToolBlock({ tool, level, live, id, onInspect }: { tool: any; level: Det
   const running = live && status === 'running';
   const command = toolCommand(tool);
   const output = toolOutput(tool);
+  const result = tool.result ?? tool.output ?? tool.error;
+  const isCommand = toolCategory(tool.name) === 'Ran commands';
+  const streams = isCommand ? commandStreams(result) : null;
+  const hasStdout = !!streams?.stdout;
+  const hasStderr = !!streams?.stderr;
+  const outputLabel = isCommand ? hasStdout && hasStderr ? 'output' : hasStderr ? 'stderr' : 'stdout' : 'Result';
+  const outputColor = hasStdout && hasStderr ? 'text-yellow-600 dark:text-yellow-400' : hasStderr ? 'text-red-500' : 'text-claude-textSecondary';
   const description = input.description || input.file_path || input.path || input.pattern || command || tool.name;
   return <div className="group/process relative min-w-0 py-1">
     <button type="button" aria-expanded={open} onClick={() => setExpanded(!open)} className={`flex w-full min-w-0 items-center gap-2 py-1 text-left text-[13px] ${failed ? 'text-red-500' : 'text-claude-textSecondary'}`}>
@@ -45,8 +52,8 @@ function ToolBlock({ tool, level, live, id, onInspect }: { tool: any; level: Det
         {level !== 'compact' && <CopyButton text={command} label="复制命令" />}
       </div>
       {level === 'verbose' && command !== rawText(tool.input) && <div className="border-b border-claude-border p-3"><CopyButton text={rawText(tool.input)} label="复制参数" /><pre className="max-h-64 overflow-auto whitespace-pre-wrap">{rawText(tool.input)}</pre></div>}
-      <div className="p-3"><div className="mb-2 flex items-center justify-between text-claude-textSecondary"><span>输出</span>{level !== 'compact' && <CopyButton text={output} label="复制输出" />}</div>
-        <ToolOutput name={tool.name} result={tool.result ?? tool.output ?? tool.error} empty={running ? '等待输出…' : '(无输出)'} />
+      <div className="p-3"><div className="mb-2 flex items-center justify-between"><span className={outputColor}>{outputLabel}</span>{level !== 'compact' && <CopyButton text={output} label="复制输出" />}</div>
+        <ToolOutput name={tool.name} result={result} showLabels={hasStdout && hasStderr} empty={running ? '等待输出…' : '(无输出)'} />
       </div>
       {toolCategory(tool.name) !== 'Ran commands' && shouldUseDiffView(tool.name, input) && <ToolDiffView toolName={tool.name} input={input} result={tool.result} />}
       {level === 'verbose' && <div className={`border-t border-claude-border p-3 ${failed ? 'text-red-500' : 'text-claude-textSecondary'}`}>{status} · {tool.startedAt && tool.endedAt ? `${tool.endedAt - tool.startedAt} ms` : '耗时未记录'}</div>}

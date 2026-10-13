@@ -18,6 +18,40 @@ export interface RequestSnapshot {
   systemMessages: { role: string; content: unknown }[];
   tools: { name: string; description: string; input_schema: unknown }[];
   persisted?: boolean;
+  status?: 'running' | 'completed' | 'error' | 'interrupted';
+  providerId?: string;
+  apiFormat?: string;
+  responseModel?: string;
+  responseId?: string | null;
+  endedAt?: number | null;
+  firstTokenAt?: number | null;
+  totalDurationMs?: number | null;
+  ttftMs?: number | null;
+  generationMs?: number | null;
+  throughputTokensPerSecond?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  reasoningTokens?: number | null;
+  contentTokens?: number | null;
+  totalTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  maxOutputTokens?: number | null;
+  effort?: string | null;
+  finishReason?: string | null;
+  timingSource?: string;
+  error?: string | null;
+  responseBlocks?: ResponseBlock[];
+  usage?: Record<string, unknown>;
+}
+export interface ResponseBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  arguments?: string;
+  [key: string]: unknown;
 }
 export interface TraceRecord extends ProcessStep {
   turn: number;
@@ -29,6 +63,8 @@ export interface TraceRecord extends ProcessStep {
   result?: unknown;
   schema?: unknown;
   request?: RequestSnapshot;
+  blocks?: ResponseBlock[];
+  aliases?: string[];
 }
 export const rawText = (value: unknown): string => value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 export function toolInput(tool: any): any {
@@ -113,6 +149,24 @@ export function recordTool(message: any, tool: any, now = Date.now()) {
 }
 export function messageSteps(message: any): ProcessStep[] {
   if (message.processSteps?.length) return message.processSteps;
+  const snapshots: RequestSnapshot[] = message.requestSnapshots || [];
+  if (snapshots.some(request => request.responseBlocks?.length)) {
+    const usedTools = new Set<number>();
+    return snapshots.flatMap(request => (request.responseBlocks || []).flatMap<ProcessStep>((block, index) => {
+      const base = { requestId: request.id, startedAt: request.firstTokenAt ?? request.startedAt, endedAt: request.endedAt ?? undefined };
+      if (block.type === 'tool_call') {
+        const tools = message.toolCalls || [];
+        const exactIndex = tools.findIndex((tool: any, i: number) => !usedTools.has(i) && tool.id === block.id);
+        const toolIndex = exactIndex >= 0 ? exactIndex : tools.findIndex((tool: any, i: number) => !usedTools.has(i)
+          && tool.name === block.name && canonical(toolInput(tool)) === canonical(block.input));
+        if (toolIndex < 0) return [];
+        usedTools.add(toolIndex);
+        const tool = message.toolCalls[toolIndex];
+        return [{ ...base, id: `tool:${tool.id || toolIndex}`, kind: 'tool', toolId: tool.id || String(toolIndex) }];
+      }
+      return [{ ...base, id: `response:${request.id}:block:${index}`, kind: block.type === 'thinking' ? 'thinking' : 'text', text: block.text || '' }];
+    }));
+  }
   const steps: ProcessStep[] = [];
   if (message.thinking) steps.push({ id: 'thinking', kind: 'thinking', text: message.thinking });
   const tools = message.toolCalls || [];
@@ -144,18 +198,36 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
       startedAt: message.created_at && Number.isFinite(Date.parse(message.created_at)) ? Date.parse(message.created_at) : undefined,
     }];
     const snapshots: RequestSnapshot[] = message.requestSnapshots || [];
-    const steps = messageSteps(message).map((s) => {
+    let steps: TraceRecord[] = messageSteps(message).map((s) => {
       const tool = s.kind === 'tool' ? (message.toolCalls || []).find((t: any, k: number) => (t.id || String(k)) === s.toolId) : null;
       const request = snapshots.find(r => r.id === s.requestId) ?? (snapshots.length === 1 ? snapshots[0] : undefined);
       const status = tool ? toolStatus(tool) : undefined;
       return {
-        ...s, id: recordId(i, s.id), turn, step: ++step, role: tool ? 'tool' : 'assistant', request,
+        ...s, id: recordId(i, s.id), turn, step: 0, role: tool ? 'tool' : 'assistant', request,
         title: tool?.name || (s.kind === 'thinking' ? 'Think' : 'Assistant'),
         status: status ? status === 'running' && !running ? 'interrupted' : status : running && !s.endedAt ? 'running' : 'done',
         startedAt: tool?.startedAt ?? s.startedAt, endedAt: tool?.endedAt ?? s.endedAt,
         input: tool?.input, result: tool?.result ?? tool?.output, schema: tool?.schema ?? request?.tools.find(t => t.name === tool?.name)?.input_schema,
       };
     });
+    if (snapshots.length) {
+      const responses = snapshots.flatMap<TraceRecord>(request => {
+        const related = steps.filter(s => s.request?.id === request.id);
+        const blocks: ResponseBlock[] = request.responseBlocks?.length ? request.responseBlocks : related.map(s => s.role === 'tool'
+          ? { type: 'tool_call', id: s.toolId, name: s.title, input: s.input }
+          : { type: s.kind === 'thinking' ? 'thinking' : 'text', text: s.text || '' });
+        const assistant: TraceRecord = {
+          id: recordId(i, `response:${request.id}`), kind: 'text', role: 'assistant', turn, step: 0,
+          title: 'Assistant', text: blocks.filter(block => block.type === 'text').map(block => block.text || '').join(''),
+          requestId: request.id, request, blocks, aliases: related.filter(s => s.role === 'assistant').map(s => s.id),
+          status: request.status === 'completed' ? 'done' : request.status === 'running' && !running ? 'interrupted' : request.status || (running ? 'running' : 'done'),
+          startedAt: request.startedAt, endedAt: request.endedAt ?? undefined,
+        };
+        return [assistant, ...related.filter(s => s.role === 'tool')];
+      });
+      steps = [...responses, ...steps.filter(s => !s.request)];
+    }
+    steps = steps.map(s => ({ ...s, step: ++step }));
     const headers: TraceRecord[] = snapshots.flatMap(request => {
       const context = canonical({ systemPrompt: request.systemPrompt, systemMessages: request.systemMessages || [] });
       if (context === previousSystemContext) return [];

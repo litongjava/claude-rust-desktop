@@ -19,6 +19,24 @@ function harness() {
   return { callbacks: createStreamCallbacks(ctx), message: () => messages[messages.length - 1] };
 }
 describe('stream process recording', () => {
+  it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s updates the same request on response completion without ending or reassigning tool steps', callback => {
+    const { callbacks: c, message } = harness();
+    const request = { id: 'request-1', number: 27, startedAt: 1000, model: 'test', status: 'running', systemPrompt: 'test', tools: [], responseBlocks: [] };
+    c[callback]('request_snapshot', '', { snapshot: request, persisted: true });
+    c.onThinking('Think', 'Think');
+    c.onDelta('Answer', 'Answer');
+    c.onToolUse({ type: 'start', tool_use_id: 'call', tool_name: 'Bash', tool_input: { command: 'pwd' } });
+    c[callback]('request_snapshot', '', { snapshot: { ...request, status: 'completed', outputTokens: 305, reasoningTokens: 44, contentTokens: 261,
+      responseBlocks: [{ type: 'thinking', text: 'Think' }, { type: 'text', text: 'Answer' }, { type: 'tool_call', id: 'call', name: 'Bash', input: { command: 'pwd' } }] }, persisted: true });
+    expect(message().requestSnapshots).toHaveLength(1);
+    expect(message().requestSnapshots[0]).toMatchObject({ number: 27, status: 'completed', outputTokens: 305, reasoningTokens: 44, contentTokens: 261 });
+    expect(message().processSteps.at(-1)).toMatchObject({ kind: 'tool', requestId: 'request-1' });
+    expect(message().processSteps.at(-1).endedAt).toBeUndefined();
+    c[callback]('request_snapshot', '', { snapshot: { ...request, id: 'request-2', number: 28 }, persisted: true });
+    c.onDelta('Final', 'AnswerFinal');
+    expect(message().processSteps.at(-1).requestId).toBe('request-2');
+    expect(message().requestSnapshots.map((r: any) => r.id)).toEqual(['request-1', 'request-2']);
+  });
   it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s associates blocks with their actual request snapshot', callback => {
     const { callbacks: c, message } = harness();
     const first = { id: 'request-1', number: 1, systemPrompt: 'initial', tools: [] };

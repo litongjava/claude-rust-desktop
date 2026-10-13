@@ -259,6 +259,11 @@ async fn chat_handler(
 
         let assistant_id = uuid::Uuid::new_v4().to_string();
         let mut request_snapshots = Vec::<serde_json::Value>::new();
+        let db_number = db_clone.clone();
+        let conv_number = conv_id.clone();
+        let mut request_number = tokio::task::spawn_blocking(move || db_number.with_conn(|conn| {
+            conn.query_row("SELECT COALESCE(MAX(request_number), 0) FROM model_requests WHERE conversation_id = ?1", rusqlite::params![conv_number], |row| row.get::<_, i64>(0))
+        })).await.ok().and_then(Result::ok).and_then(Result::ok).unwrap_or(0);
         let mut terminal_event = None;
         let mut full_text = String::new();
         let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
@@ -269,23 +274,30 @@ async fn chat_handler(
                 None => {
                     tracing::error!(module = "Chat", "Event channel closed unexpectedly for conv_id={}", conv_id);
                     if full_text.is_empty() {
-                        yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
+                        terminal_event = Some(serde_json::json!({
                             "type": "error",
                             "error": "Connection to engine lost. The engine may have crashed."
-                        }).to_string()));
+                        }));
                     } else {
-                        yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
+                        terminal_event = Some(serde_json::json!({
                             "type": "message_stop",
                             "stop_reason": "channel_closed",
                             "full_text": full_text.clone(),
-                        }).to_string()));
+                        }));
                     }
                     break;
                 }
             };
             let event_data = match event {
-                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(snapshot) => {
-                    request_snapshots.push(snapshot.clone());
+                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(mut snapshot) => {
+                    if let Some(existing) = request_snapshots.iter_mut().find(|entry| entry["id"] == snapshot["id"]) {
+                        snapshot["number"] = existing["number"].clone();
+                        *existing = snapshot.clone();
+                    } else {
+                        request_number += 1;
+                        snapshot["number"] = serde_json::json!(request_number);
+                        request_snapshots.push(snapshot.clone());
+                    }
                     let db = db_clone.clone();
                     let message_id = assistant_id.clone();
                     let conversation_id = conv_id.clone();
@@ -447,13 +459,27 @@ async fn chat_handler(
 
         crate::metrics::ACTIVE_SSE_CONNECTIONS.dec();
 
+        // A cancelled/crashed engine may never emit its final RequestSnapshot.
+        // Persist a terminal status without inventing missing usage or timings.
+        let mut pending_snapshot_updates = Vec::new();
+        for snapshot in &mut request_snapshots {
+            if snapshot["status"] == "running" {
+                let error = terminal_event.as_ref().and_then(|event| event.get("error")).cloned();
+                snapshot["status"] = serde_json::json!(if error.is_some() { "error" } else { "interrupted" });
+                snapshot["endedAt"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+                if let Some(error) = error { snapshot["error"] = error; }
+                pending_snapshot_updates.push(snapshot.clone());
+            }
+        }
+
         // Save assistant message to SQLite after stream ends
         if !full_text.is_empty() || !request_snapshots.is_empty() || !collected_tool_calls.is_empty() {
             let db = db_clone;
             let conv_id_save = conv_id.clone();
             let assistant_text = full_text.clone();
             let tool_calls_save = collected_tool_calls.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let snapshots_save = serde_json::json!(request_snapshots);
+            let saved = tokio::task::spawn_blocking(move || {
                 db.with_conn(|conn| {
                     tracing::info!(module = "BridgeDB", "Saving assistant message for conv_id={}", conv_id_save);
                     let msg_id = assistant_id;
@@ -471,6 +497,7 @@ async fn chat_handler(
 
                     // Save tool calls for this message
                     if insert_result.is_ok() {
+                        crate::db::message_repo::save_request_snapshots(conn, &msg_id, &snapshots_save)?;
                         for (i, (_tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
                             let tc_row_id = uuid::Uuid::new_v4().to_string();
                             let _ = crate::db::message_repo::insert_tool_call(
@@ -487,7 +514,7 @@ async fn chat_handler(
                         if !tool_calls_save.is_empty() {
                             tracing::info!(module = "BridgeDB", "Saved {} tool_calls for message {}", tool_calls_save.len(), msg_id);
                         }
-                    }
+                    } else { insert_result?; }
 
                     // Update conversation message_count and updated_at
                     let total_msgs = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
@@ -501,6 +528,11 @@ async fn chat_handler(
                     Ok::<(), anyhow::Error>(())
                 })
             }).await;
+            let persisted = matches!(saved, Ok(Ok(Ok(()))));
+            if !persisted { tracing::error!("Could not persist final assistant trajectory: {:?}", saved); }
+            for snapshot in pending_snapshot_updates {
+                yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"request_snapshot", "snapshot":snapshot, "persisted":persisted}).to_string()));
+            }
         }
         if let Some(event) = terminal_event {
             yield Ok::<Event, Infallible>(Event::default().data(event.to_string()));

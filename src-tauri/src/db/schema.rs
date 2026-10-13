@@ -32,6 +32,43 @@ CREATE TABLE IF NOT EXISTS message_trajectory (
     requests_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS model_requests (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    request_number INTEGER,
+    provider_id TEXT,
+    model TEXT,
+    response_model TEXT,
+    api_format TEXT,
+    status TEXT,
+    started_at_ms INTEGER,
+    first_token_at_ms INTEGER,
+    ended_at_ms INTEGER,
+    total_duration_ms INTEGER,
+    ttft_ms INTEGER,
+    generation_ms INTEGER,
+    throughput_tokens_per_second REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    content_tokens INTEGER,
+    total_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    max_output_tokens INTEGER,
+    effort TEXT,
+    finish_reason TEXT,
+    response_id TEXT,
+    timing_source TEXT,
+    error TEXT,
+    response_blocks_json TEXT NOT NULL DEFAULT '[]',
+    usage_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_requests_conversation ON model_requests(conversation_id, request_number);
+CREATE INDEX IF NOT EXISTS idx_model_requests_provider_model ON model_requests(provider_id, model, started_at_ms);
+CREATE INDEX IF NOT EXISTS idx_model_requests_message ON model_requests(message_id);
+
 CREATE TABLE IF NOT EXISTS tool_calls (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,

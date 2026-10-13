@@ -259,9 +259,15 @@ export function createStreamCallbacks(ctx: StreamContext) {
       if (!last || last.role !== 'assistant') return prev;
       const steps = last.processSteps || [];
       const tail = steps[steps.length - 1];
-      if (tail && tail.endedAt == null) tail.endedAt = Date.now();
-      last.requestSnapshots = [...(last.requestSnapshots || []).filter((r: any) => r.id !== data.snapshot.id), { ...data.snapshot, persisted: data.persisted }];
-      last.currentRequestId = data.snapshot.id;
+      const snapshots = [...(last.requestSnapshots || [])];
+      const existing = snapshots.findIndex((r: any) => r.id === data.snapshot.id);
+      if (existing >= 0) snapshots[existing] = { ...snapshots[existing], ...data.snapshot, persisted: data.persisted };
+      else {
+        if (tail && tail.endedAt == null) tail.endedAt = Date.now();
+        snapshots.push({ ...data.snapshot, persisted: data.persisted });
+        last.currentRequestId = data.snapshot.id;
+      }
+      last.requestSnapshots = snapshots;
       return next;
     });
   };

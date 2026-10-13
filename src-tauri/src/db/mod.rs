@@ -1,6 +1,7 @@
 pub mod schema;
 pub mod conversation_repo;
 pub mod message_repo;
+pub mod request_repo;
 pub mod project_repo;
 pub mod task_repo;
 pub mod diff_repo;

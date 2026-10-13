@@ -4,6 +4,7 @@ use crate::native_engine::openai_client::{OpenAIClient, OpenAIContent, OpenAIMes
 use crate::native_engine::provider_manager::{ApiFormat, ResolvedProvider};
 use crate::native_engine::token_counter::TokenCounter;
 use crate::native_engine::context_compressor::{ContextCompressor, ContextWindow, CompressionLevel};
+use crate::native_engine::request_trace::RequestTrace;
 use crate::permissions::{PermissionManager, PermissionResult};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::sse_parser::{consume_sse_payloads, merge_tool_args, recover_malformed_tool_input};
@@ -914,16 +915,21 @@ impl ToolLoopExecutor {
             }
 
             self.streaming_tool_args.clear();
-            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(json!({
+            let mut request_trace = RequestTrace::new(json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "number": iteration + 1,
                 "startedAt": chrono::Utc::now().timestamp_millis(),
                 "model": self.provider.model.id,
+                "providerId": self.provider.provider.id,
+                "apiFormat": self.provider.provider.api_format,
+                "maxOutputTokens": self.max_tokens,
+                "effort": self.provider.model.effort,
                 "systemPrompt": self.system_prompt,
                 "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
                 "tools": tools,
                 "source": "native_engine"
-            }))).await;
+            }));
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.started())).await;
             let stream = self.anthropic_client
                 .send_message_stream_with_thinking(
                     &self.provider,
@@ -943,6 +949,7 @@ impl ToolLoopExecutor {
                 Err(e) => {
                     let err_msg = format!("API request failed: {}", e);
                     tracing::error!(module = "AnthropicLoop", "Stream creation FAILED: {}", err_msg);
+                    let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.finish("error", Some(&err_msg)))).await;
                     let _ = self.event_tx.send(EngineEvent::Error(err_msg.clone())).await;
                     return Err(anyhow!(err_msg));
                 }
@@ -957,7 +964,13 @@ impl ToolLoopExecutor {
             let mut current_tool_name: Option<String> = None;
             let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                let chunk_result = match stream.next().await {
+                    Some(chunk) => chunk,
+                    // Some providers omit the delimiter on their final SSE event.
+                    None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                    None => break,
+                };
                 if self.event_tx.is_closed() {
                     drop(stream);
                     break;
@@ -967,6 +980,7 @@ impl ToolLoopExecutor {
                     Err(e) => {
                         let err_msg = format!("Stream error: {}", e);
                         tracing::error!(module = "AnthropicLoop", "Stream chunk error: {}", err_msg);
+                        let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.finish("error", Some(&err_msg)))).await;
                         let _ = self.event_tx.send(EngineEvent::Error(err_msg)).await;
                         let _ = self.event_tx.send(EngineEvent::MessageStop {
                             full_text: full_text.clone(),
@@ -987,6 +1001,7 @@ impl ToolLoopExecutor {
                         Err(_) => continue,
                     };
 
+                    request_trace.observe_anthropic(&event);
                     let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                     match event_type {
@@ -1127,27 +1142,15 @@ impl ToolLoopExecutor {
                 }
             }
 
-            if !sse_buffer.is_empty() {
-                let consumed = consume_sse_payloads(&sse_buffer);
-                for payload in &consumed.payloads {
-                    let event: Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if event_type == "message_delta" {
-                        let delta = event.get("delta");
-                        let sr = delta.and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()).map(String::from);
-                        if sr.is_some() {
-                            stop_reason = sr.clone();
-                            let _ = self.event_tx.send(EngineEvent::MessageDelta {
-                                stop_reason: sr,
-                            }).await;
-                        }
-                    }
-                }
+            let interrupted = self.event_tx.is_closed();
+            let snapshot = request_trace.finish(if interrupted { "interrupted" } else { "completed" }, None);
+            let response_status = snapshot["status"].as_str().unwrap_or("interrupted").to_string();
+            let response_error = snapshot["error"].as_str().unwrap_or("Model response ended before completion").to_string();
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(snapshot)).await;
+            if response_status != "completed" {
+                let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
+                return Ok((full_text, Some(response_status)));
             }
-
             if has_tool_use && !pending_tool_calls.is_empty() {
                 let mut tool_results: Vec<AnthropicMessage> = Vec::new();
 
@@ -1378,16 +1381,21 @@ impl ToolLoopExecutor {
             }
 
             self.streaming_tool_args.clear();
-            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(json!({
+            let mut request_trace = RequestTrace::new(json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "number": iteration + 1,
                 "startedAt": chrono::Utc::now().timestamp_millis(),
                 "model": self.provider.model.id,
+                "providerId": self.provider.provider.id,
+                "apiFormat": self.provider.provider.api_format,
+                "maxOutputTokens": self.max_tokens,
+                "effort": self.provider.model.effort,
                 "systemPrompt": self.system_prompt,
                 "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
                 "tools": tools,
                 "source": "native_engine"
-            }))).await;
+            }));
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.started())).await;
             let stream = self.openai_client
                 .send_message_stream(
                     &self.provider,
@@ -1406,6 +1414,7 @@ impl ToolLoopExecutor {
                 Err(e) => {
                     let err_msg = format!("API request failed: {}", e);
                     tracing::error!(module = "OpenAILoop", "Stream creation FAILED: {}", err_msg);
+                    let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.finish("error", Some(&err_msg)))).await;
                     let _ = self.event_tx.send(EngineEvent::Error(err_msg.clone())).await;
                     return Err(anyhow!(err_msg));
                 }
@@ -1419,7 +1428,12 @@ impl ToolLoopExecutor {
             let mut assistant_tool_calls: Vec<crate::native_engine::openai_client::OpenAIToolCall> = Vec::new();
             let mut openai_tool_args: HashMap<usize, (String, String, String)> = HashMap::new();
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                let chunk_result = match stream.next().await {
+                    Some(chunk) => chunk,
+                    None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                    None => break,
+                };
                 if self.event_tx.is_closed() {
                     drop(stream);
                     break;
@@ -1429,6 +1443,7 @@ impl ToolLoopExecutor {
                     Err(e) => {
                         let err_msg = format!("Stream error: {}", e);
                         tracing::error!(module = "OpenAILoop", "Stream chunk error: {}", err_msg);
+                        let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.finish("error", Some(&err_msg)))).await;
                         let _ = self.event_tx.send(EngineEvent::Error(err_msg)).await;
                         let _ = self.event_tx.send(EngineEvent::MessageStop {
                             full_text: full_text.clone(),
@@ -1445,6 +1460,7 @@ impl ToolLoopExecutor {
 
                 for payload in &consumed.payloads {
                     if payload == "[DONE]" {
+                        request_trace.mark_completed();
                         continue;
                     }
 
@@ -1453,7 +1469,14 @@ impl ToolLoopExecutor {
                         Err(_) => continue,
                     };
 
+                    request_trace.observe_openai(&event);
                     if let Some(content) = event.get("provider_content") { assistant_provider_content = Some(content.clone()); }
+                    // Usage-only final chunks have no choices and must still be recorded.
+                    if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
+                        if let Some(tokens) = usage.get("prompt_tokens").and_then(|v| v.as_f64()) { crate::metrics::TOKENS_CONSUMED.inc_by(tokens); }
+                        if let Some(tokens) = usage.get("completion_tokens").and_then(|v| v.as_f64()) { crate::metrics::TOKENS_CONSUMED.inc_by(tokens); }
+                        let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
+                    }
                     let choices = match event.get("choices").and_then(|c| c.as_array()) {
                         Some(c) => c,
                         None => continue,
@@ -1533,18 +1556,18 @@ impl ToolLoopExecutor {
                         }
                     }
 
-                    if let Some(usage) = event.get("usage") {
-                        if let Some(prompt_tokens) = usage.get("prompt_tokens").and_then(|v| v.as_f64()) {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(prompt_tokens);
-                        }
-                        if let Some(completion_tokens) = usage.get("completion_tokens").and_then(|v| v.as_f64()) {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(completion_tokens);
-                        }
-                        let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
-                    }
                 }
             }
 
+            let interrupted = self.event_tx.is_closed();
+            let snapshot = request_trace.finish(if interrupted { "interrupted" } else { "completed" }, None);
+            let response_status = snapshot["status"].as_str().unwrap_or("interrupted").to_string();
+            let response_error = snapshot["error"].as_str().unwrap_or("Model response ended before completion").to_string();
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(snapshot)).await;
+            if response_status != "completed" {
+                let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
+                return Ok((full_text, Some(response_status)));
+            }
             if has_tool_calls {
                 let mut indices: Vec<usize> = openai_tool_args.keys().copied().collect();
                 indices.sort();

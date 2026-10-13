@@ -27,6 +27,13 @@ beforeEach(() => {
 });
 
 describe('ordered process events', () => {
+  it('matches repeated tool arguments by call ID before historical input fallback', () => {
+    const input = { command: 'pwd' };
+    const steps = messageSteps({ requestSnapshots: [{ id: 'request', responseBlocks: [
+      { type: 'tool_call', id: 'first', name: 'Bash', input }, { type: 'tool_call', id: 'second', name: 'Bash', input },
+    ] }], toolCalls: [{ id: 'second', name: 'Bash', input }, { id: 'first', name: 'Bash', input }] });
+    expect(steps.map(step => step.toolId)).toEqual(['first', 'second']);
+  });
   it('keeps captured system prompts authoritative and numbers steps across assistant messages', () => {
     const snapshot = { id: 'request', number: 1, startedAt: 100, model: 'test', systemPrompt: 'Actual project instructions', systemMessages: [], tools: [] };
     const assistant = { role: 'assistant', content: 'one', requestSnapshots: [snapshot] };
@@ -83,6 +90,53 @@ describe('ordered process events', () => {
 });
 
 describe('work details and inspect', () => {
+  it('shows an unfinished historical request as interrupted', () => {
+    const request = { id: 'unfinished', number: 1, startedAt: 1000, model: 'test', status: 'running',
+      systemPrompt: null, systemMessages: [], tools: [], responseBlocks: [{ type: 'text', text: 'Partial' }] };
+    render(<TrajectoryView messages={[{ role: 'user', content: 'Question' }, { role: 'assistant', requestSnapshots: [request] }]}
+      loading={false} focusId="message:1/response:unfinished" />);
+    expect(within(screen.getByRole('tabpanel')).getByText('Interrupted')).toBeInTheDocument();
+    expect(within(screen.getByRole('tabpanel')).queryByText('Running')).not.toBeInTheDocument();
+  });
+  it('shows an entire assistant response and request metrics after reloading server history', () => {
+    const request = { id: 'r27', number: 27, startedAt: 1000, endedAt: 3070, firstTokenAt: 1976, model: 'test', providerId: 'provider',
+      systemPrompt: 'Actual prompt', systemMessages: [], tools: [], status: 'completed', outputTokens: 305, reasoningTokens: 44,
+      contentTokens: 261, inputTokens: 100, totalTokens: 405, totalDurationMs: 2070, ttftMs: 976, generationMs: 1090, throughputTokensPerSecond: 278.5,
+      responseBlocks: [{ type: 'thinking', text: 'Need to verify' }, { type: 'text', text: '修复完成' }, { type: 'tool_call', id: 'provider-call', name: 'Bash', input: { command: 'pwd' } }] };
+    const message = { role: 'assistant', content: '修复完成', requestSnapshots: [request], toolCalls: [{ id: 'sqlite-row', name: 'Bash', input: { command: 'pwd' }, result: 'directory', status: 'done' }] };
+    const trace = buildTrace([{ role: 'user', content: 'Fix' }, message]);
+    expect(trace.filter(r => r.role === 'assistant')).toHaveLength(1);
+    expect(trace.filter(r => r.role === 'tool')).toHaveLength(1);
+    expect(trace.find(r => r.role === 'assistant')?.blocks).toEqual(request.responseBlocks);
+    render(<TrajectoryView messages={[{ role: 'user', content: 'Fix' }, message]} loading={false} focusId="message:1/response:r27" />);
+    const panel = screen.getByRole('tabpanel');
+    for (const value of ['Completed', '305 tok', '44 tok', '261 tok', '976 ms', '2.07 s', '1.09 s', '278.5 tok/s', 'Need to verify']) expect(within(panel).getByText(value)).toBeInTheDocument();
+    expect(within(panel).getByText('Bash')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Preview' }));
+    expect(within(panel).getByText('Need to verify')).toBeInTheDocument();
+    expect(within(panel).getByText('修复完成')).toBeInTheDocument();
+    expect(within(panel).getByText('Bash')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Raw' }));
+    expect(within(panel).getByText('Block #1 thinking')).toBeInTheDocument();
+    expect(within(panel).getByText('Block #2 text')).toBeInTheDocument();
+    expect(within(panel).getByText('Block #3 tool-call')).toBeInTheDocument();
+    expect(within(panel).getByText('Bash · provider-call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Summary' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Request #27 ›' }));
+    expect(within(screen.getByRole('tabpanel')).getByText('Actual prompt')).toBeInTheDocument();
+  });
+  it.each([
+    { stdout: 'result', stderr: '', label: 'stdout', color: 'text-claude-textSecondary' },
+    { stdout: '', stderr: 'error', label: 'stderr', color: 'text-red-500' },
+    { stdout: 'result', stderr: 'warning', label: 'output', color: 'text-yellow-600' },
+  ])('labels command output $label with the matching color', ({ stdout, stderr, label, color }) => {
+    const message = sample();
+    message.toolCalls[0].result = { stdout, stderr, exit_code: 0 };
+    render(<WorkDetails message={message} index={1} live={false} />);
+    fireEvent.click(screen.getByRole('button', { name: /列出文件/ }));
+    expect(screen.getByText(label)).toHaveClass(color);
+    expect(screen.queryByText('输出')).not.toBeInTheDocument();
+  });
   it('shows turn summaries below Step 0 only when folded, and opens details without folding steps', () => {
     const snapshot = { id: 'request', number: 1, startedAt: 100, model: 'test', systemPrompt: null, systemMessages: [{ role: 'system', content: 'Actual prompt' }], tools: [] };
     render(<TrajectoryView messages={[
@@ -108,7 +162,7 @@ describe('work details and inspect', () => {
     expect(screen.queryByRole('button', { name: 'Turn 1' })).not.toBeInTheDocument();
     expect(within(list).getByText('**First answer**')).toBeInTheDocument();
     fireEvent.click(within(list).getByText('Initial System Prompt'));
-    expect(screen.getAllByRole('tab').map(t => t.textContent)).toEqual(['System Prompt', 'Tools']);
+    expect(screen.getAllByRole('tab').map(t => t.textContent)).toEqual(['System Prompt', 'Tools', 'Request']);
     expect(within(screen.getByRole('tabpanel')).getByText('Actual prompt')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Turn 2' })).not.toBeInTheDocument();
   });

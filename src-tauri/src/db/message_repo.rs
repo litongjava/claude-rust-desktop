@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub fn save_request_snapshots(conn: &Connection, message_id: &str, snapshots: &serde_json::Value) -> Result<()> {
     conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
         params![message_id, serde_json::to_string(snapshots)?])?;
+    if let Some(requests) = snapshots.as_array() {
+        for request in requests { super::request_repo::save_request(conn, message_id, request)?; }
+    }
     Ok(())
 }
 
