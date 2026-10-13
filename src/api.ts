@@ -445,6 +445,10 @@ export async function getUserUsage() {
 }
 
 export async function getUnreadAnnouncements() {
+  // Local usage does not require an account or the separate gateway service.
+  if (localStorage.getItem('user_mode') === 'selfhosted' || !localStorage.getItem('auth_token')) {
+    return { announcements: [] };
+  }
   const res = await request('/user/announcements');
   return res.json();
 }
