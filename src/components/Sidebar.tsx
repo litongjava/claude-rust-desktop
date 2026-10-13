@@ -445,15 +445,15 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       >
         {!isCollapsed && (
           <div className="flex-shrink-0 border-b border-claude-border px-2 py-2 mt-1.5">
-            <div className="flex gap-1" role="group" aria-label="Workspace mode">
+            <div className="flex rounded-lg bg-[var(--bg-mode-tabs)] p-0.5" role="group" aria-label="Workspace mode">
               {[
-                { id: 'chat' as const, icon: <MessageSquare size={17} />, label: 'Chat' },
-                { id: 'cowork' as const, icon: <Users size={17} />, label: 'Cowork' },
-                { id: 'code' as const, icon: <IconCode size={17} />, label: 'Code' },
+                { id: 'chat' as const, icon: <MessageSquare size={15} />, label: 'Chat' },
+                { id: 'cowork' as const, icon: <Users size={15} />, label: 'Cowork' },
+                { id: 'code' as const, icon: <IconCode size={15} />, label: 'Code' },
               ].map(tab => (
                 <button key={tab.id} type="button" aria-pressed={activeTab === tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex-1 flex items-center justify-center gap-1.5 min-h-10 py-2 px-1.5 rounded-lg border text-[14px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D97757] ${activeTab === tab.id ? 'bg-[#D97757]/15 border-[#D97757]/50 text-claude-text shadow-sm' : 'border-transparent text-claude-textSecondary hover:bg-claude-hover hover:text-claude-text'}`}>
+                  className={`flex-1 flex items-center justify-center gap-1.5 h-7 px-1.5 rounded-md text-[13px] font-normal text-claude-text transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-textSecondary ${activeTab === tab.id ? 'bg-[var(--bg-mode-tab-active)] shadow-sm' : 'hover:bg-claude-btnHover'}`}>
                   {tab.icon}{tab.label}
                 </button>
               ))}

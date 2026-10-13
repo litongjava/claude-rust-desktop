@@ -11,14 +11,18 @@ export function conversationWorkspaceMode(conversation: { workspace_mode?: strin
 interface WorkspaceModeState {
   mode: WorkspaceMode;
   recentsCollapsed: Record<WorkspaceMode, boolean>;
+  lastCodeProjectId: string | null;
   setMode: (mode: WorkspaceMode) => void;
+  setLastCodeProjectId: (id: string | null) => void;
   toggleRecents: (mode: WorkspaceMode) => void;
 }
 
 export const useWorkspaceModeStore = create<WorkspaceModeState>()(persist((set) => ({
   mode: 'chat',
   recentsCollapsed: { chat: false, cowork: false, code: false },
+  lastCodeProjectId: null,
   setMode: (mode) => set({ mode }),
+  setLastCodeProjectId: (lastCodeProjectId) => set({ lastCodeProjectId }),
   toggleRecents: (mode) => set(state => ({
     recentsCollapsed: { ...state.recentsCollapsed, [mode]: !state.recentsCollapsed[mode] },
   })),

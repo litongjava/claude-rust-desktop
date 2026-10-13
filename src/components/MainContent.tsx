@@ -23,6 +23,7 @@ import CompactDialog from '../features/compact/CompactDialog';
 import CreateProjectDialog from '../features/project/CreateProjectDialog';
 import ProjectWorkspaceBar from '../features/project/ProjectWorkspaceBar';
 import TrustProjectDialog from '../features/project/TrustProjectDialog';
+import { useLastCodeProject } from '../features/project/useLastCodeProject';
 import MessageList, { draftsStore } from '../features/message-list/MessageList';
 import { handleSlashCommand, SLASH_COMMANDS } from '../features/slash-commands/registry';
 import { createStreamCallbacks } from '../features/streaming/createStreamCallbacks';
@@ -539,6 +540,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       }
     }
   }, [resetKey, resolveModelForNewChat]);
+
+  useLastCodeProject(activeId);
 
   useDraftPersistence(
     activeId, inputBarBaseHeight,
@@ -1550,6 +1553,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const handleNewChat = useCallback(() => {
     // Navigate to root chat path (no conversation ID)
     navigate('/', { replace: true });
+    setLocalId(null);
+    setCurrentProjectId(null);
+    setPendingProjectId(null);
     // Reset messages and state for new chat
     setMessages([]);
     setLoading(false);
@@ -1557,7 +1563,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     setInputText('');
     setPendingFiles([]);
     setEditingMessageIdx(null);
-  }, [navigate, setMessages, setLoading, setConversationTitle, setInputText, setPendingFiles, setEditingMessageIdx]);
+  }, [navigate, setMessages, setLoading, setConversationTitle, setInputText, setPendingFiles, setEditingMessageIdx, setCurrentProjectId, setPendingProjectId]);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();

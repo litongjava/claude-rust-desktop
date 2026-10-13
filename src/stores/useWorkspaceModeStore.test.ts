@@ -4,7 +4,7 @@ import { createLocalConversation, getLocalConversations } from '../services/loca
 
 beforeEach(() => {
   localStorage.clear();
-  useWorkspaceModeStore.setState({ mode: 'chat', recentsCollapsed: { chat: false, cowork: false, code: false } });
+  useWorkspaceModeStore.setState({ mode: 'chat', recentsCollapsed: { chat: false, cowork: false, code: false }, lastCodeProjectId: null });
 });
 
 describe('workspace histories', () => {
@@ -26,5 +26,14 @@ describe('workspace histories', () => {
     await useWorkspaceModeStore.persist.rehydrate();
     expect(useWorkspaceModeStore.getState().mode).toBe('code');
     expect(useWorkspaceModeStore.getState().recentsCollapsed).toEqual({ chat: false, cowork: true, code: false });
+  });
+
+  it('persists the last Code project across hydration and mode changes', async () => {
+    useWorkspaceModeStore.getState().setMode('code');
+    useWorkspaceModeStore.getState().setLastCodeProjectId('project-1');
+    useWorkspaceModeStore.getState().setMode('chat');
+    await useWorkspaceModeStore.persist.rehydrate();
+    expect(useWorkspaceModeStore.getState().lastCodeProjectId).toBe('project-1');
+    expect(JSON.parse(localStorage.getItem('workspace-mode')!).state.lastCodeProjectId).toBe('project-1');
   });
 });
