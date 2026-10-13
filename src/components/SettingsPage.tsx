@@ -1,6 +1,6 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock } from 'lucide-react';
+import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu } from 'lucide-react';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
 import McpSettingsPage from './McpSettingsPage';
@@ -329,17 +329,19 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
 
         <button
           onClick={() => setTab('general')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
             }`}
         >
+          <Settings size={16} />
           {t('settings.general')}
         </button>
         {localStorage.getItem('user_mode') === 'selfhosted' && (
           <button
             onClick={() => setTab('models')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
               }`}
           >
+            <Cpu size={16} />
             {t('settings.models')}
           </button>
         )}
