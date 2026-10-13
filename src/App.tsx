@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { HashRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { BellRing, Menu, ArrowLeft, ArrowRight, GitBranch, BarChart3, Terminal, HelpCircle } from 'lucide-react';
 import Sidebar from './components/Sidebar';
+import AppTitleBar, { WindowFrame } from './components/AppTitleBar';
 import MainContent from './components/MainContent';
 import { IconSidebarToggle } from './components/Icons';
 import { updateConversation, deleteConversation, exportConversation, getUnreadAnnouncements, markAnnouncementRead, getSystemStatus, detectBridgePort } from './api';
@@ -341,11 +342,11 @@ const Layout = () => {
   }, []);
 
   if (needsGitBash) {
-    return <GitBashRequiredModal onResolved={() => setNeedsGitBash(false)} />;
+    return <WindowFrame><GitBashRequiredModal onResolved={() => setNeedsGitBash(false)} /></WindowFrame>;
   }
 
   if (showOnboarding) {
-    return <Onboarding onComplete={() => {
+    return <WindowFrame><Onboarding onComplete={() => {
       setShowOnboarding(false);
       if (!isTauri) { setAuthValid(true); return; }
       const mode = localStorage.getItem('user_mode');
@@ -359,18 +360,18 @@ const Layout = () => {
       } else {
         setAuthValid(false);
       }
-    }} />;
+    }} /></WindowFrame>;
   }
 
   if (!authChecked) {
     return (
-      <div className="flex items-center justify-center w-full h-screen bg-claude-bg">
+      <WindowFrame><div className="flex items-center justify-center w-full h-screen bg-claude-bg">
         <div className="text-claude-textSecondary text-[14px]">Loading...</div>
-      </div>
+      </div></WindowFrame>
     );
   }
   if (!authValid) {
-    return <Auth />;
+    return <WindowFrame><Auth /></WindowFrame>;
   }
 
   return (
@@ -383,7 +384,7 @@ const Layout = () => {
             <button onClick={() => { setZoomLevel(1); localStorage.setItem('app_zoom', '1'); }} className="ml-1 px-1.5 py-0.5 text-[11px] rounded bg-white/20 dark:bg-black/10 hover:bg-white/30 dark:hover:bg-black/20 transition-colors">Reset</button>
           </div>
         )}
-        <div className="absolute top-0 left-0 w-full z-50 flex items-center select-none pointer-events-none bg-claude-bg border-b border-claude-border transition-all duration-300" style={{ WebkitAppRegion: 'drag', height: `${titleBarHeight}px` } as React.CSSProperties}>
+        <AppTitleBar height={titleBarHeight}>
           <div className="h-full flex items-center pr-2 gap-0.5" style={{ pointerEvents: 'auto', WebkitAppRegion: 'no-drag', paddingLeft: isMac ? '78px' : '4px' } as React.CSSProperties}>
             <Tooltip content="Menu"><button onClick={() => { }} className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><Menu size={18} className="opacity-80" /></button></Tooltip>
             <Tooltip content={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}><button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><IconSidebarToggle size={26} className="dark:invert transition-[filter] duration-200" /></button></Tooltip>
@@ -398,7 +399,7 @@ const Layout = () => {
             <Tooltip content="终端 (Ctrl+`)"><button onClick={() => setShowTerminal(!showTerminal)} className={`p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors ${showTerminal ? 'text-[#C6613F]' : 'text-claude-textSecondary hover:text-claude-text'}`}><Terminal size={16} strokeWidth={1.5} /></button></Tooltip>
             <Tooltip content="帮助"><button type="button" aria-label="帮助" aria-haspopup="dialog" aria-expanded={showHelpModal} onClick={() => setShowHelpModal(true)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><HelpCircle size={16} strokeWidth={1.5} /></button></Tooltip>
           </div>
-        </div>
+        </AppTitleBar>
         <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { navigate('/settings'); setShowUpgrade(false); }} onOpenUpgrade={() => setShowUpgrade(true)} onOpenDirectory={() => setShowDirectoryModal(true)} onCloseOverlays={() => setShowUpgrade(false)} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} showHelpModal={showHelpModal} onHelpModalChange={setShowHelpModal} />
         <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden relative" style={{ paddingTop: `${titleBarHeight}px` }}>
           {isChatMode && !showUpgrade && (location.pathname === '/' || location.pathname.startsWith('/chat/')) && (
@@ -499,8 +500,8 @@ const App = () => {
     <ErrorBoundary>
       <HashRouter>
         <Routes>
-          <Route path="/login" element={<Auth />} />
-          <Route path="/admin" element={<AdminLayout />}>
+          <Route path="/login" element={<WindowFrame><Auth /></WindowFrame>} />
+          <Route path="/admin" element={<WindowFrame><AdminLayout /></WindowFrame>}>
             <Route index element={<AdminDashboard />} />
             <Route path="keys" element={<AdminKeyPool />} />
             <Route path="models" element={<AdminModels />} />
