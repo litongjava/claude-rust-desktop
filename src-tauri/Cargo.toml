@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.24"
 opentelemetry = "0.23"
+# Keep this SDK aligned with opentelemetry 0.23, tracing-opentelemetry 0.24, and opentelemetry-otlp 0.16.
 opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.16"
 futures = "0.3"
