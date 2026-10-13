@@ -28,6 +28,7 @@ import TrustProjectDialog from '../features/project/TrustProjectDialog';
 import { useLastCodeProject } from '../features/project/useLastCodeProject';
 import MessageList, { draftsStore } from '../features/message-list/MessageList';
 import { handleSlashCommand, SLASH_COMMANDS } from '../features/slash-commands/registry';
+import SlashCommandSuggestions from '../features/slash-commands/SlashCommandSuggestions';
 import { createStreamCallbacks } from '../features/streaming/createStreamCallbacks';
 import { useStreamSession } from '../features/streaming/useStreamSession';
 import PanelsRenderer from '../features/panels/PanelsRenderer';
@@ -387,6 +388,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const [projectToTrust, setProjectToTrust] = useState<Project | null>(null);
   const [projectAddToast, setProjectAddToast] = useState<string | null>(null);
   const [slashCommandFilter, setSlashCommandFilter] = useState<string | null>(null);
+  const slashCommandAnchorRef = useRef<HTMLDivElement>(null);
+  const slashCommandBoundaryRef = useRef<HTMLDivElement>(null);
 
   const filteredCommands = slashCommandFilter !== null
     ? SLASH_COMMANDS.filter(c => c.name.startsWith(slashCommandFilter))
@@ -1767,7 +1770,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 1: Landing Page (No ID)
   if (!activeId && messages.length === 0) {
     return (
-      <div className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-y-auto overflow-x-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
+      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-y-auto overflow-x-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
 
         {/* Centered Content */}
         <div
@@ -1799,25 +1802,19 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div className="w-full relative z-20 group">
+          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group">
             <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading} />
             {filteredCommands.length > 0 && (
-              <div className="absolute bottom-full left-0 right-0 mb-1 bg-claude-bg border border-claude-border rounded-xl shadow-lg overflow-hidden z-50">
-                {filteredCommands.map(cmd => (
-                  <button
-                    key={cmd.name}
-                    className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-claude-hover transition-colors text-left"
-                    onClick={() => {
-                      setInputText(cmd.name + ' ');
-                      setSlashCommandFilter(null);
-                      inputRef.current?.focus();
-                    }}
-                  >
-                    <span className="text-[14px] font-mono font-semibold text-[#C6613F]">{cmd.name}</span>
-                    <span className="text-[13px] text-claude-textSecondary">{cmd.description}</span>
-                  </button>
-                ))}
-              </div>
+              <SlashCommandSuggestions
+                anchorRef={slashCommandAnchorRef}
+                boundaryRef={slashCommandBoundaryRef}
+                commands={filteredCommands}
+                onSelect={command => {
+                  setInputText(command + ' ');
+                  setSlashCommandFilter(null);
+                  inputRef.current?.focus();
+                }}
+              />
             )}
             <input
               type="file"
