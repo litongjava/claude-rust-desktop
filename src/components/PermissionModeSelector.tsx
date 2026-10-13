@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useChatStore } from '../stores/useChatStore';
 import { useI18n } from '../hooks/useI18n';
 import { Shield, ShieldCheck, ShieldOff, Eye } from 'lucide-react';
@@ -62,33 +63,59 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
   const [showBypassWarning, setShowBypassWarning] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const [dropdownPosition, setDropdownPosition] = useState<'bottom' | 'top'>('bottom');
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({});
 
   const currentMode = MODE_OPTIONS.find((m) => m.value === permissionMode) || MODE_OPTIONS[1];
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      if (!dropdownRef.current?.contains(e.target as Node) && !menuRef.current?.contains(e.target as Node)) {
         setIsOpen(false);
+      }
+    };
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+        buttonRef.current?.focus();
       }
     };
     if (isOpen) {
       document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('keydown', handleEscape);
     }
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
   }, [isOpen]);
 
-  useEffect(() => {
-    if (isOpen && buttonRef.current) {
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    const updatePosition = () => {
+      if (!buttonRef.current || !menuRef.current) return;
       const rect = buttonRef.current.getBoundingClientRect();
-      const spaceBelow = window.innerHeight - rect.bottom;
-      const dropdownHeight = 240;
-      if (spaceBelow < dropdownHeight && rect.top > dropdownHeight) {
-        setDropdownPosition('top');
-      } else {
-        setDropdownPosition('bottom');
-      }
-    }
+      const gap = 8;
+      const width = Math.min(288, window.innerWidth - gap * 2);
+      const below = Math.max(0, window.innerHeight - rect.bottom - gap * 2);
+      const above = Math.max(0, rect.top - gap * 2);
+      const height = menuRef.current.scrollHeight;
+      const openAbove = height > below && above > below;
+      const maxHeight = openAbove ? above : below;
+      setMenuStyle({
+        width,
+        maxHeight,
+        left: Math.max(gap, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - gap)),
+        top: openAbove ? rect.top - gap - Math.min(height, maxHeight) : rect.bottom + gap,
+      });
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
   }, [isOpen]);
 
   const handleModeChange = (mode: PermissionMode) => {
@@ -132,6 +159,8 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
       <div className={`relative ${className}`} ref={dropdownRef}>
         <button
           ref={buttonRef}
+          aria-expanded={isOpen}
+          aria-haspopup="dialog"
           onClick={() => setIsOpen(!isOpen)}
           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium bg-claude-input border border-claude-border hover:bg-claude-hover transition-colors"
         >
@@ -142,12 +171,13 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
           </svg>
         </button>
 
-        {isOpen && (
+        {isOpen && createPortal(
           <div
-            className={`absolute z-50 w-72 rounded-xl shadow-xl border border-claude-border bg-claude-input overflow-hidden ${
-              dropdownPosition === 'top' ? 'bottom-full mb-2' : 'top-full mt-2'
-            }`}
-            style={{ left: '50%', transform: 'translateX(-50%)' }}
+            ref={menuRef}
+            role="dialog"
+            aria-label="Permission Mode"
+            className="fixed z-[120] w-72 rounded-xl shadow-xl border border-claude-border bg-claude-input overflow-y-auto"
+            style={menuStyle}
           >
             <div className="px-3 py-2 border-b border-claude-border">
               <span className="text-[11px] font-medium text-claude-textSecondary uppercase tracking-wide">
@@ -186,7 +216,8 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
                 </button>
               ))}
             </div>
-          </div>
+          </div>,
+          document.body
         )}
       </div>
 
