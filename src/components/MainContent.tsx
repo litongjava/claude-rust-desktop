@@ -15,6 +15,7 @@ import { useToolStore } from '../stores/useToolStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import PermissionModeSelector from './PermissionModeSelector';
+import PromptSuggestionsPanel from './PromptSuggestionsPanel';
 import FileUploadPreview, { PendingFile } from './FileUploadPreview';
 import AddFromGithubModal from './AddFromGithubModal';
 import CompactingStatus from '../features/compact/CompactingStatus';
@@ -1681,30 +1682,29 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 1: Landing Page (No ID)
   if (!activeId && messages.length === 0) {
     return (
-      <div className={`flex-1 bg-claude-bg h-screen flex flex-col relative overflow-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
+      <div className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-y-auto overflow-x-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
 
         {/* Centered Content */}
         <div
-          className="flex-1 flex flex-col items-center w-full mx-auto px-4"
+          className="flex flex-col items-center shrink-0 min-w-0 w-full mx-auto my-auto px-4 py-10"
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
-            marginTop: `${tunerConfig?.mainContentMt || 0}px`,
-            paddingTop: '40vh'
+            paddingTop: `${40 + (tunerConfig?.mainContentMt || 0)}px`,
           }}
         >
 
           <div
-            className="flex items-center gap-4"
+            className="flex items-center justify-center gap-4 w-full min-w-0"
             style={{ marginBottom: `${tunerConfig?.welcomeMb || 40}px` }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
               <ClaudeLogo color="#D97757" maxScale={0.17} />
             </div>
             <h1
-              className="text-claude-text dark:!text-[#d6cec3] tracking-tight leading-none pt-1 transition-all duration-100 ease-out whitespace-nowrap"
+              className="min-w-0 text-claude-text dark:!text-[#d6cec3] tracking-tight leading-tight pt-1 transition-all duration-100 ease-out"
               style={{
                 fontFamily: 'Optima, Candara, "Segoe UI", Segoe, "Humanist 521", sans-serif',
-                fontSize: '46px',
+                fontSize: 'clamp(28px, 3.2vw, 46px)',
                 fontWeight: 500,
                 letterSpacing: '-0.05em',
               }}
@@ -1714,7 +1714,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div className="w-full relative group">
+          <div className="w-full relative z-20 group">
             {filteredCommands.length > 0 && (
               <div className="absolute bottom-full left-0 right-0 mb-1 bg-claude-bg border border-claude-border rounded-xl shadow-lg overflow-hidden z-50">
                 {filteredCommands.map(cmd => (
@@ -1792,7 +1792,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   />
                 </div>
               </div>
-              <div className="px-4 pb-3 pt-1 flex items-center justify-between flex-shrink-0">
+              <div className="px-4 pb-3 pt-1 flex flex-wrap gap-2 items-center justify-between flex-shrink-0">
                 <div className="relative flex items-center">
                   <button
                     ref={plusBtnRef}
@@ -1814,7 +1814,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   )}
                   {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap justify-end items-center gap-2 ml-auto">
                   <PermissionModeSelector />
                   <ModelSelector
                     currentModelString={currentModelString}
@@ -1866,6 +1866,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               </div>
             )}
           </div>
+          <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
+            setInputText(prompt);
+            setSlashCommandFilter(null);
+            inputRef.current?.focus();
+          }} />
         </div>
         <AddFromGithubModal
           isOpen={showGithubModal}

@@ -38,7 +38,6 @@ const CATEGORY_ORDER = ['learn', 'life-hacks', 'games', 'creative', 'touch-grass
 
 const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelectPrompt }) => {
   const [activeCategory, setActiveCategory] = useState<string>('life-hacks');
-  const [scrollPositions, setScrollPositions] = useState<Record<string, number>>({});
 
   const items = (inspirationsData as { items: InspirationItem[] }).items;
   const categoryItems = items.filter(item => item.category === activeCategory);
@@ -50,8 +49,7 @@ const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelec
       ? container.scrollLeft - scrollAmount
       : container.scrollLeft + scrollAmount;
     container.scrollTo({ left: newPos, behavior: 'smooth' });
-    setScrollPositions(prev => ({ ...prev, [activeCategory]: newPos }));
-  }, [activeCategory]);
+  }, []);
 
   const containerRefs = React.useRef<Record<string, HTMLDivElement | null>>({});
 
@@ -60,14 +58,15 @@ const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelec
   }, []);
 
   return (
-    <div className="w-full mt-8">
+    <section aria-label="Prompt suggestions" className="relative z-0 w-full min-w-0 max-w-full mt-8">
       {/* Category tabs */}
-      <div className="flex items-center justify-center gap-2 mb-4">
+      <div className="flex flex-wrap items-center justify-center gap-2 mb-4">
         {CATEGORY_ORDER.map(cat => {
           const isActive = cat === activeCategory;
           return (
             <button
               key={cat}
+              aria-pressed={isActive}
               onClick={() => setActiveCategory(cat)}
               className={`flex items-center gap-2 px-4 py-2 rounded-full text-[14px] font-medium transition-all duration-200 ${
                 isActive
@@ -86,6 +85,7 @@ const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelec
       <div className="relative">
         {/* Left scroll arrow */}
         <button
+          aria-label="Previous suggestions"
           onClick={() => handleScroll('left', containerRefs.current[activeCategory])}
           className="absolute left-0 top-1/2 -translate-y-1/2 z-10 w-8 h-8 flex items-center justify-center bg-claude-bg/80 backdrop-blur-sm rounded-full shadow-md text-claude-textSecondary hover:text-claude-text hover:bg-claude-bg transition-colors"
         >
@@ -94,8 +94,9 @@ const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelec
 
         {/* Cards container */}
         <div
+          key={activeCategory}
           ref={(el) => setContainerRef(activeCategory, el)}
-          className="flex gap-4 overflow-x-auto scrollbar-hide px-10 py-2 scroll-smooth"
+          className="flex w-full min-w-0 gap-4 overflow-x-auto scrollbar-hide px-10 py-2 scroll-smooth"
           style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
         >
           {categoryItems.map(item => (
@@ -121,13 +122,14 @@ const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelec
 
         {/* Right scroll arrow */}
         <button
+          aria-label="Next suggestions"
           onClick={() => handleScroll('right', containerRefs.current[activeCategory])}
           className="absolute right-0 top-1/2 -translate-y-1/2 z-10 w-8 h-8 flex items-center justify-center bg-claude-bg/80 backdrop-blur-sm rounded-full shadow-md text-claude-textSecondary hover:text-claude-text hover:bg-claude-bg transition-colors"
         >
           <ChevronRight size={18} />
         </button>
       </div>
-    </div>
+    </section>
   );
 };
 

@@ -35,7 +35,6 @@ import ModelsPage from './components/ModelsPage';
 import DesignPage from './components/DesignPage';
 import MemoryPanel from './components/MemoryPanel';
 import DirectoryModal from './components/DirectoryModal';
-import PromptSuggestionsPanel from './components/PromptSuggestionsPanel';
 import { tauriAPI } from './utils/tauriAPI';
 import ChatHeader from './components/ChatHeader';
 import Tooltip from './components/ui/Tooltip';
@@ -89,7 +88,6 @@ const Layout = () => {
   const setShowOnboarding = useUIStore(s => s.setShowOnboarding);
   const [needsGitBash, setNeedsGitBash] = useState(false);
   const [showDirectoryModal, setShowDirectoryModal] = useState(false);
-  const [showPromptSuggestions, setShowPromptSuggestions] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -497,16 +495,6 @@ const Layout = () => {
         </div>
       )}
       <DirectoryModal isOpen={showDirectoryModal} onClose={() => setShowDirectoryModal(false)} />
-      {showPromptSuggestions && (
-        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-[100]">
-          <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
-            sessionStorage.setItem('prefill_input', prompt);
-            setShowPromptSuggestions(false);
-            handleNewChat();
-            window.location.hash = '#/';
-          }} />
-        </div>
-      )}
     </>
   );
 };
