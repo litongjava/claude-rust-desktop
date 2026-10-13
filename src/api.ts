@@ -663,7 +663,7 @@ export async function createProjectConversation(projectId: string, title?: strin
 // 对话相关
 export async function getConversations() {
   console.log('[API] getConversations called, isTauriApp:', isTauriApp);
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
       const res = await fetch(`${API_BASE}/conversations`, {
@@ -753,7 +753,7 @@ export async function createConversation(title?: string, model?: string, extras?
   const researchMode = extras?.research_mode || false;
   const workspaceMode = useWorkspaceModeStore.getState().mode;
 
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
       const body: any = { model: modelName, workspace_mode: workspaceMode };
@@ -806,7 +806,7 @@ export async function createConversation(title?: string, model?: string, extras?
 
 export async function getConversation(id: string) {
   console.log('[API] getConversation called for id:', id);
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
       const res = await fetch(`${API_BASE}/conversations/${id}`, {
@@ -889,7 +889,7 @@ export async function getConversation(id: string) {
 }
 
 export async function deleteConversation(id: string) {
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('conversationDeleting', { detail: { id } }));
     }
@@ -921,19 +921,18 @@ export async function deleteConversation(id: string) {
 }
 
 export async function updateConversation(id: string, data: any) {
-  if (isTauriApp) {
-    try {
-      await waitForApiReady();
-      const token = getToken();
-      await fetch(`${API_BASE}/conversations/${id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { 'Authorization': `Bearer ${token}` } : {}) },
-        body: JSON.stringify(data),
-      });
-    } catch (e) {
-      console.error('[API] updateConversation failed:', e);
-    }
+  if (isTauriApp || useDevProxy) {
+    const res = await request(`/conversations/${id}`, { method: 'POST', body: JSON.stringify(data) });
+    const result = await res.json();
+    if (result.ok === false || result.error) throw new Error(result.error || 'Could not update conversation');
     return { ...data, id };
+  }
+  if ('project_id' in data) {
+    if (data.project_id) {
+      const project: Project = await getProject(data.project_id);
+      if (project.folders.some(folder => !folder.trusted)) throw new Error('Trust the project folders before moving this chat.');
+      data = { ...data, workspace_path: project.workspace_path };
+    } else data = { ...data, workspace_path: null };
   }
   updateLocalConversation(id, data);
   return { ...data, id };

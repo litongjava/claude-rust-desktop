@@ -1,8 +1,6 @@
-import { useEffect, useState } from 'react';
-import { ChevronDown, Folder, Plus, Search, Wrench, Puzzle, MessageSquare, Terminal, Cpu, Eye, Code, Palette, Sparkles, Brain, Users, Smartphone, Globe, Network, Github, BookOpen, Monitor } from 'lucide-react';
+import { useState } from 'react';
+import { ChevronDown, Folder, Search, Wrench, Puzzle, MessageSquare, Terminal, Cpu, Eye, Code, Palette, Sparkles, Brain, Users, Smartphone, Globe, Network, Github, BookOpen, Monitor } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { getProjects, Project } from '../api';
-import CreateProjectDialog from '../features/project/CreateProjectDialog';
 
 export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPanel, onNavigate, onSwarm }: {
   collapsed: boolean; onNewChat: () => void; onSearch: () => void;
@@ -10,15 +8,6 @@ export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPa
 }) {
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState<string | null>('Projects');
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => getProjects().then(list => { if (!cancelled) { setProjects(list.filter(p => !p.is_archived)); setError(''); } }).catch(() => { if (!cancelled) setError('Could not load projects'); });
-    refresh(); window.addEventListener('projectsChanged', refresh);
-    return () => { cancelled = true; window.removeEventListener('projectsChanged', refresh); };
-  }, []);
   const tools = [
     { label: 'Terminal', icon: Terminal, action: () => onPanel('terminal') },
     { label: 'Agent', icon: Cpu, action: () => onPanel('agent') },
@@ -51,15 +40,6 @@ export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPa
         {group.items.map(item => <button type="button" key={item.label} onClick={() => { item.action(); if (collapsed) setExpanded(null); }} className={itemClass}><item.icon size={15} className="shrink-0" />{item.label}</button>)}
       </div>}
     </div>)}
-    <div className="flex items-center">
-      <button type="button" aria-label="Projects" aria-expanded={expanded === 'Projects'} onClick={() => collapsed ? navigate('/projects') : setExpanded(expanded === 'Projects' ? null : 'Projects')} className={itemClass}><Folder size={17} className="shrink-0" />{!collapsed && <><span className="flex-1">Projects</span><ChevronDown size={13} className={expanded === 'Projects' ? '' : '-rotate-90'} /></>}</button>
-      {!collapsed && <button type="button" aria-label="Create project" title="Create project" onClick={() => setCreating(true)} className="p-1.5 rounded-md text-claude-textSecondary hover:bg-claude-hover"><Plus size={15} /></button>}
-    </div>
-    {!collapsed && expanded === 'Projects' && <div className="ml-4 border-l border-claude-border pl-2">
-      {projects.map(project => <button type="button" key={project.id} onClick={() => navigate(`/projects?project=${encodeURIComponent(project.id)}`)} title={project.name} className={itemClass}><Folder size={14} className="shrink-0" /><span className="truncate">{project.name}</span></button>)}
-      <button type="button" onClick={() => navigate('/projects')} className="px-2 py-2 text-[14px] text-claude-textSecondary hover:text-claude-text">All projects</button>
-      {error && <p role="alert" className="p-2 text-xs text-red-500">{error}</p>}
-    </div>}
-    {creating && <CreateProjectDialog onClose={() => setCreating(false)} onCreated={project => { setCreating(false); navigate(`/projects?project=${encodeURIComponent(project.id)}`); }} />}
+    {collapsed && <button type="button" aria-label="Projects" title="Projects" onClick={() => navigate('/projects')} className={itemClass}><Folder size={17} /></button>}
   </nav>;
 }

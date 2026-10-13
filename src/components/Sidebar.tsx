@@ -1,16 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useStreamingStore } from '../stores/useStreamingStore';
-import { useWorkspaceModeStore, conversationWorkspaceMode } from '../stores/useWorkspaceModeStore';
+import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
 import { useI18n } from '../hooks/useI18n';
-import { IconDotsHorizontal, IconStarOutline, IconPencil, IconTrash, IconCode } from './Icons';
+import { IconCode } from './Icons';
 import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Pin, PinOff, X, MessageSquare, Users } from 'lucide-react';
-import { getConversations, deleteConversation, updateConversation, getUser, getUserUsage, logout, getUserProfile } from '../api';
+import { getConversations, getUser, getUserUsage, logout, getUserProfile } from '../api';
 
 import SearchModal from './SearchModal';
 import SidebarNavigation from './SidebarNavigation';
-import FileExplorer from './FileExplorer';
-import RenameModal from './RenameModal';
+import SidebarProjects from '../features/project/SidebarProjects';
 import EmbeddedBrowser from './EmbeddedBrowser';
 import SwarmCollaboration from './SwarmCollaboration';
 import H5AccessPanel from './H5AccessPanel';
@@ -46,11 +45,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const navigate = useNavigate();
   const location = useLocation();
   const [chats, setChats] = useState<any[]>([]);
-  const [activeMenuIndex, setActiveMenuIndex] = useState<number | null>(null);
-  const [menuPosition, setMenuPosition] = useState<{ top: number, left: number } | null>(null);
-  const [showRenameModal, setShowRenameModal] = useState(false);
-  const [renameChatId, setRenameChatId] = useState<string | null>(null);
-  const [renameInitialTitle, setRenameInitialTitle] = useState('');
   const [userUser, setUserUser] = useState<any>(null);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -61,10 +55,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [showSearch, setShowSearch] = useState(false);
   const activeTab = useWorkspaceModeStore(s => s.mode);
   const setActiveTab = useWorkspaceModeStore(s => s.setMode);
-  const isRecentsCollapsed = useWorkspaceModeStore(s => s.recentsCollapsed[s.mode]);
-  const toggleRecents = useWorkspaceModeStore(s => s.toggleRecents);
   const [showSwarm, setShowSwarm] = useState(false);
-  const [pinnedChats, setPinnedChats] = useState<Set<string>>(new Set());
   const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set(useStreamingStore.getState().streamingIds));
   const [updateStatus, setUpdateStatus] = useState<{ type: string; version?: string; percent?: number } | null>(null);
   // Bridge connection status
@@ -158,7 +149,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [showComputerUse, showBrowser, showH5Panel, showIMPanel, showTerminalPanel, showAgentView, showLivePreview, showMcpPanel, showKnowledgePanel, showGitHubHub, showAppStudio]);
 
-  const menuRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
   const userBtnRef = useRef<HTMLButtonElement>(null);
@@ -238,6 +228,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     window.addEventListener('conversationDeleted', handleConversationDeleted);
     window.addEventListener('conversationUpdated', handleConversationUpdated);
     window.addEventListener('userProfileUpdated', handleProfileUpdate);
+    window.addEventListener('focus', fetchChats);
 
     return () => {
       window.removeEventListener('conversationTitleUpdated', handleTitleUpdate);
@@ -245,6 +236,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       window.removeEventListener('conversationDeleted', handleConversationDeleted);
       window.removeEventListener('conversationUpdated', handleConversationUpdated);
       window.removeEventListener('userProfileUpdated', handleProfileUpdate);
+      window.removeEventListener('focus', fetchChats);
     };
   }, [refreshTrigger]);
 
@@ -259,36 +251,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       console.error("Failed to fetch chats", e);
     }
   };
-
-  const handlePinChat = (chatId: string) => {
-    setPinnedChats(prev => {
-      const next = new Set(prev);
-      if (next.has(chatId)) next.delete(chatId);
-      else next.add(chatId);
-      return next;
-    });
-    setActiveMenuIndex(null);
-  };
-
-  const getSortedAndFilteredChats = () => {
-    const result = chats.filter(chat => conversationWorkspaceMode(chat) === activeTab);
-
-    const pinned = result.filter(c => pinnedChats.has(c.id));
-    const unpinned = result.filter(c => !pinnedChats.has(c.id));
-
-    unpinned.sort((a, b) => {
-      const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
-      const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
-      return bTime - aTime;
-    });
-
-    return [...pinned, ...unpinned].slice(0, 30);
-  };
-
-  const sortedChats = getSortedAndFilteredChats();
-  useEffect(() => {
-    setActiveMenuIndex(null);
-  }, [activeTab]);
 
   const fetchPlan = async () => {
     try {
@@ -313,60 +275,12 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     }
   };
 
-  const handleRenameClick = (e: React.MouseEvent, index: number) => {
-    e.stopPropagation();
-    if (chats[index]) {
-      setRenameChatId(chats[index].id);
-      setRenameInitialTitle(chats[index].title || chats[index].first_message?.slice(0, 30) || 'New Chat');
-      setShowRenameModal(true);
-    }
-    setActiveMenuIndex(null);
-  };
-
-  const handleRenameSubmit = async (newTitle: string) => {
-    if (!renameChatId) return;
-
-    try {
-      // Optimistic update
-      setChats(chats.map(c => c.id === renameChatId ? { ...c, title: newTitle } : c));
-      await updateConversation(renameChatId, { title: newTitle });
-
-      // Notify other components (like Header) about the title change if it's the active chat
-      if (location.pathname === `/chat/${renameChatId}`) {
-        window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
-      }
-    } catch (err) {
-      console.error('Failed to rename chat:', err);
-      // Revert on failure
-      fetchChats();
-    }
-    setShowRenameModal(false);
-    setRenameChatId(null);
-  };
-
-  const handleDeleteChat = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      await deleteConversation(id);
-      setChats(chats.filter(c => c.id !== id));
-      setActiveMenuIndex(null);
-      if (location.pathname === `/chat/${id}`) {
-        navigate('/');
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
   // Close menu when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       // 忽略用户按钮本身的点击（由按钮 onClick 处理）
       if (userBtnRef.current && userBtnRef.current.contains(event.target as Node)) {
         return;
-      }
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
-        setActiveMenuIndex(null);
       }
       if (userMenuRef.current && !userMenuRef.current.contains(event.target as Node)) {
         setShowUserMenu(false);
@@ -375,11 +289,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
     // Close on scroll
     const handleScroll = () => {
-      if (activeMenuIndex !== null) setActiveMenuIndex(null);
       if (showUserMenu) setShowUserMenu(false);
     };
 
-    if (activeMenuIndex !== null || showUserMenu) {
+    if (showUserMenu) {
       document.addEventListener('click', handleClickOutside);
       // Attach scroll listener to the sidebar scroll container
       const scrollEl = scrollRef.current;
@@ -393,44 +306,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       scrollEl?.removeEventListener('scroll', handleScroll);
       window.removeEventListener('resize', handleScroll);
     };
-  }, [activeMenuIndex, showUserMenu]);
-
-  const handleMenuClick = (e: React.MouseEvent, index: number) => {
-    e.stopPropagation();
-    e.preventDefault();
-
-    if (activeMenuIndex === index) {
-      setActiveMenuIndex(null);
-      return;
-    }
-
-    const button = e.currentTarget as HTMLElement;
-    const buttonRect = button.getBoundingClientRect();
-    const parentElement = button.parentElement;
-
-    let leftPos = buttonRect.right - 200; // Fallback to button alignment
-
-    if (parentElement) {
-      const parentRect = parentElement.getBoundingClientRect();
-      // Align right edge of menu (200px wide) with the right edge of the chat item container
-      leftPos = parentRect.right - 200;
-    }
-
-    const menuHeight = 120; // Approximate height of the menu
-    let topPos = buttonRect.bottom + 4;
-
-    // Check if menu would overflow bottom of viewport
-    if (topPos + menuHeight > window.innerHeight) {
-      // Position above the button instead
-      topPos = buttonRect.top - menuHeight - 4;
-    }
-
-    setMenuPosition({
-      top: topPos,
-      left: leftPos,
-    });
-    setActiveMenuIndex(index);
-  };
+  }, [showUserMenu]);
 
   return (
     <>
@@ -462,95 +338,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         )}
         <div ref={scrollRef} className="flex-1 overflow-y-auto sidebar-scroll min-h-0 px-2 pt-3 pb-4">
           <SidebarNavigation collapsed={isCollapsed} onNewChat={handleNewChat} onSearch={() => setShowSearch(true)} onPanel={panel => openPanel(panel as Parameters<typeof openPanel>[0])} onNavigate={handleNavClick} onSwarm={() => setShowSwarm(true)} />
-          {!isCollapsed && <div className="flex items-center justify-between px-2 pt-3 pb-2">
-            <span className="text-[13px] font-medium text-claude-textSecondary">Recents</span>
-            <button type="button" onClick={() => toggleRecents(activeTab)} className="text-xs text-claude-textSecondary hover:text-claude-text">{isRecentsCollapsed ? 'Show' : 'Hide'}</button>
-          </div>}
-          {/* Recents List */}
-          <div data-recents-mode={activeTab} className={`space-y-0.5 pb-2 transition-all duration-200 ${isCollapsed || isRecentsCollapsed ? 'opacity-0 hidden h-0 overflow-hidden' : 'opacity-100'}`}>
-            {sortedChats.map((chat, index) => {
-              const isActive = location.pathname === `/chat/${chat.id}`;
-              const isPinned = pinnedChats.has(chat.id);
-              return (
-                <div
-                  key={chat.id}
-                  onClick={() => { onCloseOverlays?.(); navigate(`/chat/${chat.id}`); }}
-                  className={`
-                    relative group flex items-center w-full rounded-lg transition-colors cursor-pointer min-h-[32px]
-                    ${isActive || chats[activeMenuIndex ?? -1]?.id === chat.id ? 'bg-claude-hover' : 'hover:bg-claude-hover'}
-                  `}
-                  style={{
-                    paddingTop: `${tunerConfig?.recentsItemPy || 6}px`,
-                    paddingBottom: `${tunerConfig?.recentsItemPy || 6}px`,
-                    paddingLeft: `${tunerConfig?.recentsPl || 12}px`,
-                    paddingRight: `${tunerConfig?.recentsPl || 12}px`
-                  }}
-                >
-                  {isPinned && (
-                    <span className="flex-shrink-0 mr-1.5">
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-yellow-400/70">
-                        <path d="M12 17v5"/><path d="M9 10.5 3 17l3 3 6.5-6.5"/><path d="m14.5 6.5 3 3-6 6-3-3 6-6z"/>
-                      </svg>
-                    </span>
-                  )}
-                  {/* Streaming indicator — single breathing dot */}
-                  {streamingIds.has(chat.id) && (
-                    <span
-                      className="flex-shrink-0 mr-2 w-[7px] h-[7px] rounded-full bg-neutral-700 dark:bg-neutral-300 animate-pulse"
-                      style={{ animationDuration: '1.6s' }}
-                    />
-                  )}
-                  {/* Chat Title */}
-                  <div className="flex-1 min-w-0 pr-6">
-                    <div
-                      className="text-claude-text truncate leading-snug"
-                      style={{ fontSize: `${tunerConfig?.recentsFontSize || 13}px` }}
-                    >
-                      {chat.title || chat.first_message?.slice(0, 30) || 'New Chat'}
-                    </div>
-                    {chat.project_name && (
-                      <div className="text-[11px] text-claude-textSecondary truncate leading-snug mt-0.5 opacity-60">
-                        {chat.project_name}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Three Dots Button */}
-                  <button
-                    onClick={(e) => handleMenuClick(e, chats.findIndex(c => c.id === chat.id))}
-                    className={`
-                      absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-claude-textSecondary hover:text-claude-text transition-all
-                      ${chats[activeMenuIndex ?? -1]?.id === chat.id ? 'opacity-100 block' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
-                    `}
-                  >
-                    <IconDotsHorizontal size={16} />
-                  </button>
-                </div>
-              );
-            })}
-            {chats.filter(chat => conversationWorkspaceMode(chat) === activeTab).length > 30 && (
-              <button
-                onClick={() => { onCloseOverlays?.(); navigate('/chats'); }}
-                className="w-full flex items-center gap-2 rounded-lg hover:bg-claude-hover transition-colors text-claude-textSecondary hover:text-claude-text"
-                style={{
-                  paddingTop: `${tunerConfig?.recentsItemPy || 6}px`,
-                  paddingBottom: `${tunerConfig?.recentsItemPy || 6}px`,
-                  paddingLeft: `${tunerConfig?.recentsPl || 12}px`,
-                }}
-              >
-                <IconDotsHorizontal size={18} className="opacity-60" />
-                <span style={{ fontSize: `${tunerConfig?.recentsFontSize || 13}px` }} className="leading-tight">{t('sidebar.allChats')}</span>
-              </button>
-            )}
-          </div>
+          {!isCollapsed && <SidebarProjects chats={chats} streamingIds={streamingIds} onOpenChat={id => { onCloseOverlays?.(); navigate(`/chat/${id}`); }} />}
           {!isCollapsed && activeTab === 'cowork' && (
             <div className="mt-3 border-t border-claude-border pt-3" data-sidebar-panel="cowork">
               <SwarmCollaboration />
-            </div>
-          )}
-          {!isCollapsed && activeTab === 'code' && (
-            <div className="mt-3 border-t border-claude-border pt-3" data-sidebar-panel="code">
-              <FileExplorer />
             </div>
           )}
         </div>
@@ -717,54 +508,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         </div>
       </div >
 
-      {/* Fixed Context Menu Portal */}
-      {
-        activeMenuIndex !== null && menuPosition && chats[activeMenuIndex] && (
-          <div
-            ref={menuRef}
-            className="fixed z-50 bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_12px_rgba(0,0,0,0.08)] py-1.5 flex flex-col w-[200px]"
-            style={{
-              top: `${menuPosition.top}px`,
-              left: `${menuPosition.left}px`
-            }}
-          >
-            <button
-              onClick={(e) => handlePinChat(chats[activeMenuIndex].id)}
-              className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
-            >
-              {pinnedChats.has(chats[activeMenuIndex].id) ? (
-                <PinOff size={16} className="text-yellow-400/80 group-hover:text-yellow-400" />
-              ) : (
-                <Pin size={16} className="text-claude-textSecondary group-hover:text-yellow-400" />
-              )}
-              <span className="text-[13px] text-claude-text">
-                {pinnedChats.has(chats[activeMenuIndex].id) ? (t('sidebar.unpin') || '取消置顶') : (t('sidebar.pin') || '置顶')}
-              </span>
-            </button>
-            <button className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group">
-              <IconStarOutline size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
-              <span className="text-[13px] text-claude-text">{t('sidebar.star')}</span>
-            </button>
-            <button
-              onClick={(e) => handleRenameClick(e, activeMenuIndex as number)}
-              className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
-            >
-              <IconPencil size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
-              <span className="text-[13px] text-claude-text">{t('sidebar.rename')}</span>
-            </button>
-            <div className="h-[1px] bg-claude-border my-1 mx-3" />
-            <button
-              onClick={(e) => handleDeleteChat(chats[activeMenuIndex].id, e)}
-              className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
-            >
-              <IconTrash size={16} className="text-[#B9382C]" />
-              <span className="text-[13px] text-[#B9382C]">{t('sidebar.delete')}</span>
-            </button>
-          </div>
-        )
-      }
-      {/* Fixed Layout Tuner (Removed) */}
-
       <SearchModal
         isOpen={showSearch}
         onClose={() => setShowSearch(false)}
@@ -910,15 +653,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         </div>
       </div>}
       {/* Rename Modal */}
-      <RenameModal
-        isOpen={showRenameModal}
-        onClose={() => {
-          setShowRenameModal(false);
-          setRenameChatId(null);
-        }}
-        onSave={handleRenameSubmit}
-        initialTitle={renameInitialTitle}
-      />
+
 
       {/* Logout Confirmation Modal */}
       {showLogoutConfirm && (
