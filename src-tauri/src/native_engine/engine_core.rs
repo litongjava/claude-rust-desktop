@@ -325,6 +325,9 @@ impl QueryEngine {
 
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
     pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
+        request.system_prompt = Some(crate::prompt::compose_desktop_system_prompt(
+            request.system_prompt.as_deref(), &request.model,
+        ));
         let conv_id = request.conversation_id.clone();
         let db = self.db_manager.clone();
         let project_conv_id = conv_id.clone();
