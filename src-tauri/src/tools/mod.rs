@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 pub mod macros;
+mod utf8;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -86,13 +87,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Bash".to_string(),
-            description: "Execute a shell command and return stdout/stderr.".to_string(),
+            description: "Execute a shell command and return stdout/stderr. On Windows, use shell powershell or pwsh for PowerShell commands; UTF-8 input/output and file cmdlet encoding are configured automatically. Windows PowerShell -File requires UTF-8 with BOM; Write/Edit add it to .ps1 files.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The shell command to execute" },
                     "timeout": { "type": "number", "description": "Timeout in seconds (default: 120)" },
-                    "shell": { "type": "string", "description": "Shell to use: bash, zsh, fish, sh, cmd (default: bash)" }
+                    "shell": { "type": "string", "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh (default: bash)" }
                 },
                 "required": ["command"]
             }),
@@ -550,6 +551,7 @@ fn tool_read(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     }
 
     let content = fs::read_to_string(&path)?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let offset = input["offset"].as_u64().unwrap_or(1) as usize;
     let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
 
@@ -579,12 +581,12 @@ fn tool_write(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> 
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(&path, content)?;
+    let bytes_written = utf8::write_utf8(Path::new(&path), content)?;
 
     Ok(serde_json::json!({
         "success": true,
         "content": format!("Successfully wrote to {}", path),
-        "bytes_written": content.len()
+        "bytes_written": bytes_written
     }))
 }
 
@@ -617,7 +619,7 @@ fn tool_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
         (content.replacen(old_string, new_string, 1), 1)
     };
 
-    fs::write(&path, new_content)?;
+    utf8::write_utf8(Path::new(&path), &new_content)?;
 
     Ok(serde_json::json!({
         "success": true,
@@ -658,7 +660,7 @@ fn tool_multi_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Va
         }));
     }
 
-    fs::write(&path, new_content)?;
+    utf8::write_utf8(Path::new(&path), &new_content)?;
 
     Ok(serde_json::json!({
         "success": true,
@@ -913,7 +915,7 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
             }
         }
         "powershell" | "pwsh" => {
-            if let Some(pwsh_path) = find_shell("powershell").or_else(|| find_shell("pwsh")) {
+            if let Some(pwsh_path) = find_shell(&shell_type.to_lowercase()) {
                 (pwsh_path, "-Command".to_string())
             } else {
                 return Ok(serde_json::json!({
@@ -948,9 +950,25 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         cwd.to_string()
     };
 
-    cmd.arg(&flag)
-        .arg(command)
-        .current_dir(&safe_cwd)
+    let command = if flag == "-Command" {
+        cmd.args(["-NoProfile", "-NonInteractive"]);
+        utf8::powershell_command(command)
+    } else if flag == "/C" && cfg!(windows) {
+        utf8::cmd_command(command)
+    } else {
+        command.to_string()
+    };
+    #[cfg(windows)]
+    if flag == "/C" {
+        // cmd uses its own quoting rules; normal Windows argument escaping adds
+        // literal backslashes before quotes in nested PowerShell file paths.
+        cmd.args(["/D", "/S", "/C"]).raw_arg(format!("\"{command}\""));
+    } else {
+        cmd.arg(&flag).arg(&command);
+    }
+    #[cfg(not(windows))]
+    cmd.arg(&flag).arg(&command);
+    cmd.current_dir(&safe_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
