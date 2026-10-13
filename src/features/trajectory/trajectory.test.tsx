@@ -36,6 +36,14 @@ describe('ordered process events', () => {
     const restored = restoreProcessMetadata(assistant, 0, [{ ...assistant, requestSnapshots: [{ ...snapshot, systemPrompt: 'stale' }] }]);
     expect(restored.requestSnapshots[0].systemPrompt).toBe(snapshot.systemPrompt);
   });
+  it('merges unchanged system prompt rows while preserving each step request and prompt changes', () => {
+    const snapshot = { id: 'r1', number: 1, startedAt: 100, model: 'test', systemPrompt: null, systemMessages: [{ role: 'system', content: [{ type: 'text', text: '实际系统指令' }] }], tools: [] };
+    const snapshots = [snapshot, { ...snapshot, id: 'r2', number: 2 }, { ...snapshot, id: 'r3', number: 3, systemPrompt: 'Changed project instructions' }];
+    const trace = buildTrace([{ role: 'user', content: 'test' }, { role: 'assistant', requestSnapshots: snapshots,
+      processSteps: snapshots.map(request => ({ id: request.id, kind: 'text', text: request.id, requestId: request.id })) }]);
+    expect(trace.filter(r => r.role === 'system').map(r => r.text)).toEqual(['实际系统指令', 'Changed project instructions\n\n实际系统指令']);
+    expect(trace.filter(r => r.role === 'assistant').map(r => r.request?.id)).toEqual(['r1', 'r2', 'r3']);
+  });
   it('keeps thinking, commentary, tool and final answer in stream order without repeated text', () => {
     const message = sample();
     expect(messageSteps(message).map(s => s.kind)).toEqual(['thinking', 'text', 'tool', 'text']);
@@ -75,8 +83,8 @@ describe('ordered process events', () => {
 });
 
 describe('work details and inspect', () => {
-  it('uses assistant Preview/Raw and system prompt/tools inspectors, with individual turn folding', () => {
-    const snapshot = { id: 'request', number: 1, startedAt: 100, model: 'test', systemPrompt: 'Actual prompt', systemMessages: [], tools: [] };
+  it('shows turn summaries below Step 0 only when folded, and opens details without folding steps', () => {
+    const snapshot = { id: 'request', number: 1, startedAt: 100, model: 'test', systemPrompt: null, systemMessages: [{ role: 'system', content: 'Actual prompt' }], tools: [] };
     render(<TrajectoryView messages={[
       { role: 'user', content: 'First question' }, { role: 'assistant', content: '**First answer**', requestSnapshots: [snapshot] },
       { role: 'user', content: 'Second question' }, { role: 'assistant', content: 'Second answer' },
@@ -84,27 +92,62 @@ describe('work details and inspect', () => {
     expect(screen.getAllByRole('tab').map(t => t.textContent)).toEqual(['Summary', 'Preview', 'Raw']);
     fireEvent.click(screen.getByRole('tab', { name: 'Raw' }));
     expect(within(screen.getByRole('tabpanel')).getByText('**First answer**')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Turn 1' }));
-    expect(screen.getByRole('button', { name: 'Turn 1' })).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.getByRole('button', { name: 'Turn 2' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.queryByRole('button', { name: 'Turn 1' })).not.toBeInTheDocument();
     const list = screen.getByLabelText('过程列表');
+    fireEvent.click(within(list).getByText('Second answer'));
+    expect(within(list).getByText('**First answer**')).toBeInTheDocument();
+    expect(within(screen.getByRole('tabpanel')).getByText('Second answer')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Turns' }));
+    expect(screen.getByRole('button', { name: 'Turn 1' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: 'Turn 2' })).toHaveAttribute('aria-expanded', 'false');
+    const userRow = within(list).getByText('First question').closest('button')!;
+    expect(userRow.compareDocumentPosition(screen.getByRole('button', { name: 'Turn 1' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(list).queryByText('**First answer**')).not.toBeInTheDocument();
     expect(within(list).getByText('First question')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Turn 1' }));
+    expect(screen.queryByRole('button', { name: 'Turn 1' })).not.toBeInTheDocument();
+    expect(within(list).getByText('**First answer**')).toBeInTheDocument();
     fireEvent.click(within(list).getByText('Initial System Prompt'));
     expect(screen.getAllByRole('tab').map(t => t.textContent)).toEqual(['System Prompt', 'Tools']);
     expect(within(screen.getByRole('tabpanel')).getByText('Actual prompt')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Turns' }));
-    expect(screen.getByRole('button', { name: 'Turn 1' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.queryByRole('button', { name: 'Turn 2' })).not.toBeInTheDocument();
   });
   it.each(['standard', 'detailed', 'verbose'] as const)('%s copies the full command and output independently', async level => {
     useGeneralSettingsStore.setState({ workDetails: level });
     render(<WorkDetails message={sample()} index={1} live={false} />);
     if (level !== 'verbose') fireEvent.click(screen.getByRole('button', { name: /列出文件/ }));
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '复制命令' })); });
+    const commandCopy = screen.getByRole('button', { name: '复制命令' });
+    const outputCopy = screen.getByRole('button', { name: '复制输出' });
+    expect(commandCopy).toHaveTextContent('');
+    expect(outputCopy).toHaveTextContent('');
+    await act(async () => { fireEvent.click(commandCopy); });
     expect(writeText).toHaveBeenLastCalledWith('Get-ChildItem\nGet-Date');
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: '复制输出' })); });
     expect(writeText).toHaveBeenLastCalledWith(output);
     expect(screen.getAllByText('已复制')).toHaveLength(2);
+    expect(commandCopy).toHaveAttribute('title', '已复制');
+    expect(outputCopy).toHaveAttribute('title', '已复制');
+    expect(screen.getAllByText('已复制').every(element => element.classList.contains('sr-only'))).toBe(true);
+  });
+  it.each([
+    { status: 'done', result: { exit_code: 0 }, failed: false },
+    { status: 'error', result: 'failed', failed: true },
+    { status: 'done', result: { exit_code: 1 }, failed: true },
+    { status: 'done', result: JSON.stringify({ exit_code: 2, stderr: 'failed' }), failed: true },
+  ])('shows command outcome for $status with result $result', ({ status, result, failed }) => {
+    const message = sample();
+    message.toolCalls[0] = { ...message.toolCalls[0], status, result };
+    const view = render(<WorkDetails message={message} index={1} live={false} />);
+    expect(screen.getByRole('img', { name: failed ? '运行失败' : '运行成功' })).toHaveClass(failed ? 'bg-red-500' : 'bg-green-500');
+    expect(screen.getByRole('button', { name: /列出文件/ }).classList.contains('text-red-500')).toBe(failed);
+    expect(buildTrace([message]).find(r => r.role === 'tool')?.status).toBe(failed ? 'error' : 'done');
+    view.unmount();
+    message.toolCalls.push({ id: 't2', name: 'pwsh', status: 'done', result: { exit_code: 0 } });
+    message.processSteps = undefined;
+    render(<WorkDetails message={message} index={1} live={false} />);
+    const group = screen.getByRole('button', { name: /Ran commands · 2/ });
+    expect(within(group).getByRole('img', { name: failed ? '运行失败' : '运行成功' })).toBeInTheDocument();
+    expect(group.classList.contains('text-red-500')).toBe(failed);
   });
   it('compact groups consecutive shell calls and keeps commentary visible', () => {
     useGeneralSettingsStore.setState({ workDetails: 'compact' });
@@ -112,6 +155,38 @@ describe('work details and inspect', () => {
     expect(screen.getByText('检查目录')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Ran commands · 2/ })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('Think')).not.toBeInTheDocument();
+  });
+  it('offers Inspect only under individual successful calls, including expanded groups', () => {
+    const onInspect = vi.fn();
+    const message = { role: 'assistant', content: '完成', toolCalls: [
+      { id: 'a', name: 'pwsh', status: 'done' }, { id: 'b', name: 'Bash', status: 'done' },
+      { id: 'c', name: 'Write', status: 'done', result: { success: false, error: 'Failed to write' } }, { id: 'd', name: 'Read', status: 'running' },
+    ] };
+    render(<WorkDetails index={0} live={true} message={message} onInspect={onInspect} />);
+    expect(screen.queryByRole('button', { name: 'Inspect' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Ran commands · 2/ }));
+    const buttons = screen.getAllByRole('button', { name: 'Inspect' });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]);
+    expect(onInspect).toHaveBeenCalledWith('message:0/tool:b');
+  });
+  it.each(['object', 'json'] as const)('renders and copies stdout/stderr from %s results without execution metadata', async format => {
+    const result = { exit_code: 1, shell: 'cmd', stdout: '名称    内存\r\nQQ      0.67\r\n', stderr: '错误信息\r\n  行 17\r\n', success: false };
+    const message = sample();
+    message.toolCalls[0].result = format === 'json' ? JSON.stringify(result) : result;
+    const view = render(<WorkDetails message={message} index={1} live={false} />);
+    fireEvent.click(screen.getByRole('button', { name: /列出文件/ }));
+    expect(screen.getByLabelText('stdout')).toHaveTextContent('名称');
+    expect(screen.getByLabelText('stdout').querySelector('pre')?.textContent).toBe('名称    内存\nQQ      0.67\n');
+    expect(screen.getByLabelText('stderr').querySelector('pre')?.textContent).toBe('错误信息\n  行 17\n');
+    expect(screen.queryByText(/exit_code|"success"|"shell"/)).not.toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '复制输出' })); });
+    expect(writeText).toHaveBeenLastCalledWith('名称    内存\nQQ      0.67\n\n错误信息\n  行 17\n');
+    view.unmount();
+    render(<TrajectoryView messages={[message]} loading={false} focusId="message:0/tool:t1" />);
+    expect(within(screen.getByRole('tabpanel')).getByLabelText('stderr')).toHaveTextContent('错误信息');
+    fireEvent.click(screen.getByRole('tab', { name: 'Result' }));
+    expect(within(screen.getByRole('tabpanel')).queryByText(/exit_code|"success"|"shell"/)).not.toBeInTheDocument();
   });
   it('Inspect selects the exact tool record and shows payload, result and timing', () => {
     const message = sample();

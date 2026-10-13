@@ -39,7 +39,41 @@ export function toolCommand(tool: any): string {
   const input = toolInput(tool);
   return rawText(input.command ?? input.cmd ?? input.script ?? input.code ?? tool.input);
 }
-export function toolOutput(tool: any): string { return rawText(tool.result ?? tool.output ?? tool.error); }
+export function commandStreams(value: unknown): { stdout: string; stderr: string } | null {
+  let result: any = value;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch { return null; }
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+    || !['stdout', 'stderr', 'exit_code', 'exitCode', 'shell', 'error'].some(key => key in result)) return null;
+  const format = (stream: unknown) => rawText(stream).replace(/\r\n?/g, '\n');
+  return { stdout: format(result.stdout), stderr: format(result.stderr || result.error) };
+}
+export function toolOutput(tool: any): string {
+  const result = tool.result ?? tool.output ?? tool.error;
+  const streams = toolCategory(tool.name || '') === 'Ran commands' ? commandStreams(result) : null;
+  return streams ? [streams.stdout, streams.stderr].filter(Boolean).join('\n') : rawText(result);
+}
+export function requestSystemPrompt(request: RequestSnapshot): string {
+  const contentText = (value: unknown): string => Array.isArray(value)
+    ? value.map(block => block?.type === 'text' ? block.text || '' : '').filter(Boolean).join('\n')
+    : extractTextContent(value);
+  return [request.systemPrompt, ...(request.systemMessages || []).map(message => contentText(message.content))].filter(Boolean).join('\n\n');
+}
+export function toolStatus(tool: any): string {
+  if (tool.status === 'error' || tool.is_error === true || tool.isError === true) return 'error';
+  if (tool.status === 'running') return 'running';
+  let result = tool.result ?? tool.output;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch { result = null; }
+  }
+  if (result?.is_error === true || result?.isError === true || result?.success === false) return 'error';
+  if (toolCategory(tool.name || '') === 'Ran commands') {
+    const exitCode = result?.exit_code ?? result?.exitCode;
+    if (exitCode != null && exitCode !== '' && Number.isFinite(Number(exitCode)) && Number(exitCode) !== 0) return 'error';
+  }
+  return tool.status || 'done';
+}
 export function toolCategory(name: string): string {
   if (/bash|pwsh|powershell|shell|exec_command|terminal/i.test(name)) return 'Ran commands';
   if (/glob|list|find/i.test(name)) return 'Found files';
@@ -100,6 +134,7 @@ export const recordId = (messageIndex: number, stepId: string) => `message:${mes
 export function buildTrace(messages: any[], loading = false): TraceRecord[] {
   let turn = 0;
   let step = 0;
+  let previousSystemContext: string | undefined;
   const records = messages.flatMap<TraceRecord>((message, i) => {
     if (message.role === 'user') { turn++; step = 0; }
     const running = loading && i === messages.length - 1;
@@ -112,20 +147,26 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
     const steps = messageSteps(message).map((s) => {
       const tool = s.kind === 'tool' ? (message.toolCalls || []).find((t: any, k: number) => (t.id || String(k)) === s.toolId) : null;
       const request = snapshots.find(r => r.id === s.requestId) ?? (snapshots.length === 1 ? snapshots[0] : undefined);
+      const status = tool ? toolStatus(tool) : undefined;
       return {
         ...s, id: recordId(i, s.id), turn, step: ++step, role: tool ? 'tool' : 'assistant', request,
         title: tool?.name || (s.kind === 'thinking' ? 'Think' : 'Assistant'),
-        status: tool ? tool.status === 'running' && !running ? 'interrupted' : tool.status || 'done' : running && !s.endedAt ? 'running' : 'done',
+        status: status ? status === 'running' && !running ? 'interrupted' : status : running && !s.endedAt ? 'running' : 'done',
         startedAt: tool?.startedAt ?? s.startedAt, endedAt: tool?.endedAt ?? s.endedAt,
         input: tool?.input, result: tool?.result ?? tool?.output, schema: tool?.schema ?? request?.tools.find(t => t.name === tool?.name)?.input_schema,
       };
     });
-    const headers: TraceRecord[] = snapshots.map(request => ({
-      id: `request:${request.id}`, kind: 'text', turn, step: 0, role: 'system',
-      title: 'System Prompt', status: request.persisted === false ? '未保存' : 'recorded',
-      text: request.systemPrompt ?? '', input: request.systemMessages, result: request.tools, request,
-      startedAt: request.startedAt,
-    }));
+    const headers: TraceRecord[] = snapshots.flatMap(request => {
+      const context = canonical({ systemPrompt: request.systemPrompt, systemMessages: request.systemMessages || [] });
+      if (context === previousSystemContext) return [];
+      previousSystemContext = context;
+      return [{
+        id: `request:${request.id}`, kind: 'text' as const, turn, step: 0, role: 'system',
+        title: 'System Prompt', status: request.persisted === false ? '未保存' : 'recorded',
+        text: requestSystemPrompt(request), input: request.systemMessages, result: request.tools, request,
+        startedAt: request.startedAt,
+      }];
+    });
     if (!steps.some(s => s.requestId)) return [...headers, ...steps];
     const ordered: TraceRecord[] = [];
     const emitted = new Set<string>();
@@ -137,7 +178,7 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
     return [...ordered, ...headers.filter(h => !emitted.has(h.id))];
   });
   if (records.length) {
-    const first = records.findIndex(r => r.role === 'system' && r.request);
+    const first = records.findIndex(r => r.role === 'system' && (r.request || r.text));
     if (first >= 0) {
       const [initial] = records.splice(first, 1);
       records.unshift({ ...initial, turn: 0, title: 'Initial System Prompt' });
