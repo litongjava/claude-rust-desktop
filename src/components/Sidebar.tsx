@@ -74,7 +74,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     import('../api').then(({ detectBridgePort }) => {
       detectBridgePort().then(port => {
         setBridgePort(port);
-        fetch(`http://127.0.0.1:${port}/api/health`).then(r => setBridgeHealthy(r.ok)).catch(() => setBridgeHealthy(false));
+        fetch(`http://127.0.0.1:${port}/health`).then(r => setBridgeHealthy(r.ok)).catch(() => setBridgeHealthy(false));
       });
     });
   }, []);
