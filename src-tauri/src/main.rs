@@ -834,6 +834,9 @@ fn main() {
             commands::remove_always_allow_rule,
             commands::get_always_allow_rules,
             commands::set_permission_mode,
+            commands::general_settings::read_general_settings,
+            commands::general_settings::write_general_settings,
+            commands::general_settings::open_general_settings,
             // Computer Use commands
             commands::computer_use_screenshot,
             commands::computer_use_mouse_click,

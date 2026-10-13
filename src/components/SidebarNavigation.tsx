@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ChevronDown, Folder, Search, Wrench, Puzzle, MessageSquare, Terminal, Cpu, Eye, Code, Palette, Sparkles, Brain, Users, Smartphone, Globe, Network, Github, BookOpen, Monitor } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useI18n } from '../hooks/useI18n';
+import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 
 export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPanel, onNavigate, onSwarm }: {
   collapsed: boolean; onNewChat: () => void; onSearch: () => void;
@@ -9,10 +10,11 @@ export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPa
 }) {
   const navigate = useNavigate();
   const { t } = useI18n();
+  const showCodingView = useGeneralSettingsStore(state => state.showCodingView);
   const [expanded, setExpanded] = useState<string | null>(null);
   const tools = [
     { label: t('sidebar.terminal'), icon: Terminal, action: () => onPanel('terminal') },
-    { label: t('sidebar.agent'), icon: Cpu, action: () => onPanel('agent') },
+    ...(showCodingView ? [{ label: t('sidebar.agent'), icon: Cpu, action: () => onPanel('agent') }] : []),
     { label: t('sidebar.preview'), icon: Eye, action: () => onPanel('preview') },
     { label: t('sidebar.code'), icon: Code, action: () => onNavigate('Code') },
     { label: t('sidebar.design'), icon: Palette, action: () => onNavigate('Design') },

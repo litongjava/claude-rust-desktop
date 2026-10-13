@@ -1,4 +1,6 @@
 import React from 'react';
+import { useGeneralSettingsStore } from '../../stores/useGeneralSettingsStore';
+import { openChatLink } from '../../utils/chatLinks';
 import {
   ChevronDown,
   FileText,
@@ -64,8 +66,15 @@ const MessageList = React.memo<MessageListProps>(({
   onToggleExpand, onResend, onEdit, onCopy, onBranch, onOpenDocument, onSetMessages,
   messageContentRefs, onOpenResearch, t,
 }) => {
+  const showCodingView = useGeneralSettingsStore(state => state.showCodingView);
   return (
-    <>
+    <div className="conversation-content" onClickCapture={event => {
+      const anchor = (event.target as HTMLElement).closest('a');
+      if (!anchor || !/^https?:\/\//i.test(anchor.href)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void openChatLink(anchor.href).catch(error => console.error('Failed to open chat link:', error));
+    }}>
       <style>{`
         @keyframes shimmer {
           0% { background-position: 200% 0; }
@@ -189,7 +198,7 @@ const MessageList = React.memo<MessageListProps>(({
                             );
                           }
                           if (block.type === 'text' && block.text?.trim()) {
-                            return <div key={bi} className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{block.text}</div>;
+                            return <div key={bi} className="conversation-text text-[15px] leading-relaxed whitespace-pre-wrap break-words">{block.text}</div>;
                           }
                           return null;
                         })}
@@ -199,7 +208,7 @@ const MessageList = React.memo<MessageListProps>(({
                   const displayText = extractTextContent(content); return displayText && displayText.trim() !== ''; })() && (
                   <div className="max-w-[85%] w-fit">
                     <div
-                      className="bg-[var(--msg-user-bg)] text-claude-text px-4 py-[10px] text-[15px] leading-relaxed font-sans font-[400] whitespace-pre-wrap break-words relative overflow-hidden"
+                      className="conversation-text bg-[var(--msg-user-bg)] text-claude-text px-4 py-[10px] text-[15px] leading-relaxed font-sans font-[400] whitespace-pre-wrap break-words relative overflow-hidden"
                       style={{ borderRadius: 'var(--msg-user-radius)', maxHeight: expandedMessages.has(idx) ? 'none' : '300px' }}
                       ref={(el) => { if (el) messageContentRefs.current.set(idx, el); }}
                     >
@@ -257,7 +266,7 @@ const MessageList = React.memo<MessageListProps>(({
             )
           ) : (
             <div className="px-1 text-claude-text text-[16.5px] leading-normal mt-2">
-              {msg.thinking && (
+              {showCodingView && msg.thinking && (
                 <div className="mb-4">
                   <div
                     className="flex items-center gap-2 cursor-pointer select-none group/think text-claude-textSecondary hover:text-claude-text transition-colors"
@@ -352,7 +361,7 @@ const MessageList = React.memo<MessageListProps>(({
                 </button>
               )}
               {/* Tool calls display */}
-              {msg.toolCalls && msg.toolCalls.length > 0 && (() => {
+              {showCodingView && msg.toolCalls && msg.toolCalls.length > 0 && (() => {
                 const FRONTEND_HIDDEN = new Set(['WebSearch', 'WebFetch']);
                 const visibleToolCalls = msg.toolCalls.filter((tc: any) => !FRONTEND_HIDDEN.has(tc.name));
                 if (visibleToolCalls.length === 0) return null;
@@ -541,8 +550,8 @@ const MessageList = React.memo<MessageListProps>(({
                 <DocumentCreationProcess drafts={normalizeDocumentDrafts(msg)} />
               )}
 
-              <MarkdownRenderer content={(msg as any)._finalText ?? extractTextContent(msg.content)} citations={msg.citations} isStreaming={isCurrentlyStreaming} />
-              {(msg as any).codeDiffs && (msg as any).codeDiffs.length > 0 && (
+              <MarkdownRenderer content={(showCodingView ? (msg as any)._finalText : undefined) ?? extractTextContent(msg.content)} citations={msg.citations} isStreaming={isCurrentlyStreaming} />
+              {showCodingView && (msg as any).codeDiffs && (msg as any).codeDiffs.length > 0 && (
                 <div className="mt-2 mb-1 space-y-2">
                   {(msg as any).codeDiffs.map((diff: any) => (
                     <DiffViewer
@@ -643,7 +652,7 @@ const MessageList = React.memo<MessageListProps>(({
         </div>
         );
       })}
-    </>
+    </div>
   );
 });
 

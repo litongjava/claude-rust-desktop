@@ -11,6 +11,7 @@ import Auth from './components/Auth';
 import Onboarding from './components/Onboarding';
 import SettingsPage from './components/SettingsPage';
 import AgentPanel from './components/AgentPanel';
+import { useGeneralSettingsStore } from './stores/useGeneralSettingsStore';
 import AnalyticsPanel from './components/AnalyticsPanel';
 import TerminalPanel from './components/TerminalPanel';
 import UpgradePlan from './components/UpgradePlan';
@@ -78,6 +79,18 @@ const Layout = () => {
   const setShowAnalyticsPanel = useUIStore(s => s.setShowAnalyticsPanel);
   const showUpgrade = useUIStore(s => s.showUpgrade);
   const showAgentPanel = useUIStore(s => s.showAgentPanel);
+  const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (showCodingView && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'a') {
+        event.preventDefault();
+        setShowAgentPanel(true);
+        setShowAnalyticsPanel(false);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [showCodingView, setShowAgentPanel, setShowAnalyticsPanel]);
   const showAnalyticsPanel = useUIStore(s => s.showAnalyticsPanel);
   const showTerminal = useUIStore(s => s.showTerminalPanel);
   const setShowTerminal = useUIStore(s => s.setShowTerminalPanel);
@@ -394,7 +407,7 @@ const Layout = () => {
             {canGoForward ? (
               <Tooltip content="Forward"><button onClick={handleNavForward} className="p-1.5 rounded-md transition-colors hover:bg-black/5 dark:hover:bg-white/5 text-claude-navActive"><ArrowRight size={16} strokeWidth={1.5} /></button></Tooltip>
             ) : (<span className="p-1.5 text-claude-navDisabled"><ArrowRight size={16} strokeWidth={1.5} /></span>)}
-            <Tooltip content="Agent Worktree (Ctrl+Shift+A)"><button onClick={() => { setShowAgentPanel(true); setShowAnalyticsPanel(false); }} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><GitBranch size={16} strokeWidth={1.5} /></button></Tooltip>
+            {showCodingView && <Tooltip content="Agent Worktree (Ctrl+Shift+A)"><button onClick={() => { setShowAgentPanel(true); setShowAnalyticsPanel(false); }} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><GitBranch size={16} strokeWidth={1.5} /></button></Tooltip>}
             <Tooltip content="使用统计"><button onClick={() => { setShowAnalyticsPanel(true); setShowAgentPanel(false); }} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><BarChart3 size={16} strokeWidth={1.5} /></button></Tooltip>
             <Tooltip content="终端 (Ctrl+`)"><button onClick={() => setShowTerminal(!showTerminal)} className={`p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors ${showTerminal ? 'text-[#C6613F]' : 'text-claude-textSecondary hover:text-claude-text'}`}><Terminal size={16} strokeWidth={1.5} /></button></Tooltip>
             <Tooltip content="帮助"><button type="button" aria-label="帮助" aria-haspopup="dialog" aria-expanded={showHelpModal} onClick={() => setShowHelpModal(true)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><HelpCircle size={16} strokeWidth={1.5} /></button></Tooltip>
@@ -480,7 +493,7 @@ const Layout = () => {
           </div>
         </div>
       )}
-      {showAgentPanel && <AgentPanel onClose={() => setShowAgentPanel(false)} />}
+      {showCodingView && showAgentPanel && <AgentPanel onClose={() => setShowAgentPanel(false)} />}
       {showAnalyticsPanel && <AnalyticsPanel onClose={() => setShowAnalyticsPanel(false)} />}
       {showTerminal && (
         <div

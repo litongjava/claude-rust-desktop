@@ -6,6 +6,8 @@ import ClaudeLogo from './ClaudeLogo';
 import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getGenerationStatus, stopGeneration, getContextSize, getStreamStatus, reconnectStream, getSkills, warmEngine, getProjects, getProject, createProjectConversation, attachConversationToProject, Project, getProviders } from '../api';
 import PermissionDialog, { ApprovalInfo } from './PermissionDialog';
 import { permissionApprovalAPI } from '../utils/tauriAPI';
+import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
+import { useBusySendStore } from '../stores/useBusySendStore';
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
 import { useUIStore } from '../stores/useUIStore';
@@ -69,6 +71,7 @@ import { formatChatError } from '../utils/chatErrors';
 import SkillTag from '../features/chat/SkillTag';
 import { useScrollToBottom } from '../features/chat/useScrollToBottom';
 import { useDraftPersistence } from '../features/chat/useDraftPersistence';
+import { submitBusyMessage } from '../features/chat/submitBusyMessage';
 
 import { SkillInputOverlay } from '../features/input-bar/SkillInputOverlay';
 
@@ -86,6 +89,12 @@ interface MainContentProps {
 
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
+  const busySendBehavior = useGeneralSettingsStore(state => state.busySendBehavior);
+  const queues = useBusySendStore(state => state.queues);
+  const queueProcessing = useRef(false);
+  const [queueVersion, setQueueVersion] = useState(0);
+  const [readyConversationId, setReadyConversationId] = useState<string | null>(null);
+  const steering = useRef(false);
   const { id } = useParams(); // Get conversation ID from URL
   const location = useLocation();
   const [localId, setLocalId] = useState<string | null>(null);
@@ -574,6 +583,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     setAskUserDialog(null);
     isCreatingRef.current = false;
     viewingIdRef.current = activeId || null;
+    setReadyConversationId(null);
 
     // Pre-warm engine when user opens a conversation (init in background before they send)
     if (activeId) warmEngine(activeId);
@@ -590,6 +600,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           if (data?.model && viewingIdRef.current === buffConvId) {
             setCurrentModelString(isModelSelectable(data.model) ? data.model : resolveModelForNewChat(data.model));
           }
+          if (viewingIdRef.current === buffConvId) setReadyConversationId(buffConvId);
         }).catch(() => {});
       } else {
         setLoading(false);
@@ -766,11 +777,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, [abortStreamSession]);
 
   const loadConversation = async (conversationId: string) => {
+    let loaded = false;
     console.log('[MainContent] loadConversation called for:', conversationId);
     stopPolling();
     try {
       console.log('[MainContent] Calling getConversation...');
       const data = await getConversation(conversationId);
+      if (viewingIdRef.current !== conversationId) return;
       console.log('[MainContent] getConversation returned:', data ? 'success' : 'null', 'messages:', data?.messages?.length);
       // Restore conversation model. If the stored model isn't available in the
       // current user_mode (typical case: user switched modes after the conv was
@@ -820,6 +833,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         return sanitizeInlineArtifactMessage(msg);
       });
       setMessages(normalizedMessages);
+      loaded = true;
       isAtBottomRef.current = true;
       scheduleScrollToBottomAfterRender();
       setConversationTitle(data.title || 'New Chat');
@@ -828,6 +842,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       // 检查是否有活跃的后台生成
       try {
         const genStatus = await getGenerationStatus(conversationId);
+        if (viewingIdRef.current !== conversationId) return;
         if (genStatus.active && genStatus.status === 'generating') {
           // 追加占位 assistant 消息（如果最后一条不是 assistant）
           setMessages(prev => {
@@ -927,6 +942,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     } catch (err) {
       console.error(err);
       setLoading(false);
+    } finally {
+      if (loaded && viewingIdRef.current === conversationId) setReadyConversationId(conversationId);
     }
   };
 
@@ -976,8 +993,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
-  const handleSend = async (overrideText?: string) => {
+  const handleSend = async (overrideText?: string, queuedFiles?: PendingFile[], queuedMessageId?: string) => {
     try {
+    const files = queuedFiles ?? pendingFiles;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
     const selectedProjectId = activeId ? currentProjectId : pendingProjectId;
     if (selectedProjectId) {
@@ -988,21 +1006,42 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (await handleSlashCommand(effectiveText, activeId)) return;
     // Skill slug is already in the text (inserted when selected from menu)
     setSelectedSkill(null);
-    const hasFiles = pendingFiles.some(f => f.status === 'done');
-    const hasErrorFiles = pendingFiles.some(f => f.status === 'error');
-    if ((!effectiveText.trim() && !hasFiles) || loading) {
+    const hasFiles = files.some(f => f.status === 'done');
+    const hasErrorFiles = files.some(f => f.status === 'error');
+    if (!effectiveText.trim() && !hasFiles) {
       if (!loading && !effectiveText.trim() && !hasFiles && hasErrorFiles) {
         alert('有文件上传失败，请先删除失败文件后再发送');
       }
       return;
     }
-    if (activeRequestCountRef.current >= 2) {
+    if (!loading && activeRequestCountRef.current >= 2) {
       alert('最多同时进行 2 个对话，请等待其他对话完成');
       return;
     }
-    const isUploading = pendingFiles.some(f => f.status === 'uploading');
+    const isUploading = files.some(f => f.status === 'uploading');
     if (isUploading) {
       alert('文件仍在上传中，请稍等完成后再发送');
+      return;
+    }
+
+    if (loading && activeId) {
+      if (steering.current) return;
+      steering.current = busySendBehavior === 'steer';
+      try {
+        await submitBusyMessage(activeId, effectiveText, files, busySendBehavior, async () => {
+          await stopGeneration(activeId);
+          abortStreamSession(activeId);
+          stopPolling();
+          removeStreaming(activeId);
+          setLoading(false);
+        });
+      } catch (error) {
+        alert(formatChatError(error instanceof Error ? error.message : String(error)));
+        return;
+      } finally { steering.current = false; }
+      setInputText('');
+      setPendingFiles([]);
+      draftsStore.delete(activeId);
       return;
     }
 
@@ -1014,7 +1053,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const userMode = localStorage.getItem('user_mode');
     const hasGatewayKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
     if (isTauriApp && userMode !== 'selfhosted' && !hasGatewayKey) {
-      pendingLoginSendRef.current = () => handleSend(effectiveText);
+      pendingLoginSendRef.current = () => handleSend(effectiveText, queuedFiles, queuedMessageId);
       setShowLoginRequired(true);
       return;
     }
@@ -1024,16 +1063,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // show the modal. The modal's callbacks will re-invoke handleSend after
     // the user picks "keep cross-mode" or "switch model".
     if (crossModeWarning && crossModeWarning.convId === activeId) {
-      pendingCrossModeSendRef.current = () => handleSend(effectiveText);
+      pendingCrossModeSendRef.current = () => handleSend(effectiveText, queuedFiles, queuedMessageId);
       return;
     }
 
     const userMessageText = effectiveText;
-    setInputText(""); // Clear input
+    if (queuedMessageId && activeId) useBusySendStore.getState().take(activeId);
+    if (!queuedFiles) setInputText(""); // Preserve a draft when draining the queue
 
     // 收集已上传的附件
-    const uploadedFiles = pendingFiles.filter(f => f.status === 'done' && f.fileId);
-    const githubFiles = pendingFiles.filter(f => f.status === 'done' && f.source === 'github');
+    const uploadedFiles = files.filter(f => f.status === 'done' && f.fileId);
+    const githubFiles = files.filter(f => f.status === 'done' && f.source === 'github');
     const uploadedPayload = uploadedFiles.map(f => ({ fileId: f.fileId!, fileName: f.fileName, fileType: f.fileType, mimeType: f.mimeType, size: f.size }));
     const githubPayload = githubFiles.map(f => ({
       fileId: `github:${f.ghRepo || f.fileName}`,
@@ -1072,9 +1112,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
 
     // 清空 pendingFiles 并释放预览 URL
-    pendingFiles.forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
-    setPendingFiles([]);
-    draftsStore.delete(activeId || '__new__');
+    files.forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+    if (!queuedFiles) {
+      setPendingFiles([]);
+      draftsStore.delete(activeId || '__new__');
+    }
 
     // 重置 textarea 高度
     textareaHeightVal.current = inputBarBaseHeight;
@@ -1084,7 +1126,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
 
     // Optimistic UI: Add user message immediately
-    const imageFiles = pendingFiles.filter(f => f.status === 'done' && f.fileType === 'image' && f.previewUrl);
+    const imageFiles = files.filter(f => f.status === 'done' && f.fileType === 'image' && f.previewUrl);
     const hasImages = imageFiles.length > 0;
 
     let tempUserMsg: any;
@@ -1261,6 +1303,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
+  // Keep queued messages bound to their conversation, including across tab switches.
+  useEffect(() => {
+    if (!activeId || readyConversationId !== activeId || loading || queueProcessing.current || steering.current || activeRequestCountRef.current >= 2) return;
+    if (!queues[activeId]?.length) return;
+    queueProcessing.current = true;
+    const message = queues[activeId][0];
+    if (message) void handleSend(message.text, message.files, message.id).finally(() => {
+      queueProcessing.current = false;
+      // Retry only after a send was committed; authorization gates retain the message.
+      if (useBusySendStore.getState().queues[activeId]?.[0]?.id !== message.id) setQueueVersion(version => version + 1);
+    });
+    else queueProcessing.current = false;
+  }, [activeId, readyConversationId, loading, queues, queueVersion]);
+
+  useEffect(() => {
+    if (!activeId && !loading) setPermissionMode(useGeneralSettingsStore.getState().defaultPermissionMode);
+  }, [activeId]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' || e.nativeEvent.isComposing) return;
 
@@ -1268,15 +1328,23 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // Normalize format (settings uses underscore, old might use plus)
     const sk = sendKey.replace('+', '_').toLowerCase();
 
-    let shouldSend = false;
-    if (sk === 'enter') {
-      if (!e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) shouldSend = true;
-    } else if (sk === 'ctrl_enter') {
-      if (e.ctrlKey) shouldSend = true;
-    } else if (sk === 'cmd_enter') {
-      if (e.metaKey) shouldSend = true;
-    } else if (sk === 'alt_enter') {
-      if (e.altKey) shouldSend = true;
+    const matches = (key: string) => {
+      const normalized = key.replace('+', '_').toLowerCase();
+      return (normalized === 'enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+        || (normalized === 'shift_enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+        || (normalized === 'ctrl_enter' && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey)
+        || (normalized === 'cmd_enter' && e.metaKey && !e.shiftKey && !e.ctrlKey && !e.altKey)
+        || (normalized === 'alt_enter' && e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey);
+    };
+    const shouldSend = matches(sk);
+    if (!shouldSend && matches(localStorage.getItem('newlineKey') || 'shift_enter')) {
+      e.preventDefault();
+      const input = inputRef.current;
+      if (input) {
+        const start = input.selectionStart;
+        setInputText(inputText.slice(0, start) + '\n' + inputText.slice(input.selectionEnd));
+        requestAnimationFrame(() => input.setSelectionRange(start + 1, start + 1));
+      }
     }
 
     if (shouldSend) {
@@ -1841,7 +1909,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   <button
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => handleSend()}
-                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || loading || pendingFiles.some(f => f.status === 'uploading')}
+                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
                     className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUp size={22} strokeWidth={2.5} />
@@ -2067,6 +2135,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     )}
                   </div>
                   <div className="flex items-center gap-3">
+                    {activeId && queues[activeId]?.length > 0 && <div className="max-w-[200px] text-xs text-claude-textSecondary">
+                      <span>{t('general.queued')} ({queues[activeId].length})</span>
+                      {queues[activeId].map(message => <div key={message.id} className="flex items-center gap-1">
+                        <span className="truncate">{message.text || message.files.map(file => file.fileName).join(', ')}</span>
+                        <button aria-label={t('general.cancelQueued')} onClick={() => useBusySendStore.getState().cancel(activeId, message.id)}>&times;</button>
+                      </div>)}
+                    </div>}
                     <PermissionModeSelector />
                     <ModelSelector
                       currentModelString={currentModelString}
@@ -2087,7 +2162,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <IconVoice size={20} />
                       </button>
                     )}
-                    {loading ? (
+                    {loading && !inputText.trim() && !pendingFiles.some(f => f.status === 'done') ? (
                       <button
                         onClick={handleStop}
                         className="p-2 text-claude-text hover:bg-claude-hover rounded-lg transition-colors"

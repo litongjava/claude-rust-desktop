@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useStreamingStore } from '../stores/useStreamingStore';
 import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
+import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 import { useI18n } from '../hooks/useI18n';
 import { IconCode } from './Icons';
 import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Pin, PinOff, X, MessageSquare, Users } from 'lucide-react';
@@ -42,6 +43,7 @@ interface SidebarProps {
 
 const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onOpenDirectory, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
   const { t } = useI18n();
+  const showCodingView = useGeneralSettingsStore(state => state.showCodingView);
   const navigate = useNavigate();
   const location = useLocation();
   const [chats, setChats] = useState<any[]>([]);
@@ -130,10 +132,15 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       if (detail?.panel === 'preview') { setShowLivePreview(true); }
+      if (detail?.panel === 'browser' && /^https?:\/\//i.test(detail.url || '')) {
+        setBrowserUrl(detail.url);
+        setShowBrowser(true);
+        if (isCollapsed) toggleSidebar();
+      }
     };
     window.addEventListener('request-open-panel', handler as EventListener);
     return () => window.removeEventListener('request-open-panel', handler as EventListener);
-  }, []);
+  }, [isCollapsed, toggleSidebar]);
 
   // Escape key closes any open panel
   useEffect(() => {
@@ -524,6 +531,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           }}
         >
           <EmbeddedBrowser
+            key={browserUrl}
             initialUrl={browserUrl}
             onClose={() => setShowBrowser(false)}
             className="flex-1"
@@ -580,7 +588,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       )}
 
       {/* Agent View Panel */}
-      {showAgentView && !isCollapsed && (
+      {showCodingView && showAgentView && !isCollapsed && (
         <div
           className="fixed z-40 border-l border-claude-border bg-claude-bg flex flex-col shadow-2xl transition-all duration-300 ease-in-out"
           style={{

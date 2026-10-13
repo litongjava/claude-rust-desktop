@@ -53,11 +53,14 @@ const MODE_OPTIONS: PermissionModeOption[] = [
 
 interface PermissionModeSelectorProps {
   className?: string;
+  value?: PermissionMode;
+  onChange?: (mode: PermissionMode) => void;
 }
 
-export default function PermissionModeSelector({ className = '' }: PermissionModeSelectorProps) {
+export default function PermissionModeSelector({ className = '', value, onChange }: PermissionModeSelectorProps) {
   const { t } = useI18n();
-  const permissionMode = useChatStore((s) => s.permissionMode);
+  const activePermissionMode = useChatStore((s) => s.permissionMode);
+  const permissionMode = value ?? activePermissionMode;
   const setPermissionMode = useChatStore((s) => s.setPermissionMode);
   const [isOpen, setIsOpen] = useState(false);
   const [showBypassWarning, setShowBypassWarning] = useState(false);
@@ -127,6 +130,11 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
         return;
       }
     }
+    if (onChange) {
+      onChange(mode);
+      setIsOpen(false);
+      return;
+    }
     setPermissionMode(mode as PermissionMode);
     setIsOpen(false);
     localStorage.setItem('permission_mode', mode);
@@ -137,8 +145,9 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
 
   const confirmBypass = () => {
     localStorage.setItem('permission_bypass_confirmed', 'true');
-    setPermissionMode('bypass_permissions');
     setShowBypassWarning(false);
+    if (onChange) { onChange('bypass_permissions'); return; }
+    setPermissionMode('bypass_permissions');
     invoke('set_permission_mode', { mode: 'bypass_permissions' }).catch((err) => {
       console.warn('[PermissionMode] Failed to sync mode to backend:', err);
     });
