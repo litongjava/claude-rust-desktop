@@ -37,6 +37,8 @@ export interface RequestSnapshot {
   cacheReadTokens?: number | null;
   cacheWriteTokens?: number | null;
   maxOutputTokens?: number | null;
+  contextWindow?: number | null;
+  reservedForCompletion?: number | null;
   effort?: string | null;
   finishReason?: string | null;
   timingSource?: string;

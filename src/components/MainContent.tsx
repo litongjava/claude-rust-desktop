@@ -75,6 +75,7 @@ import { useDraftPersistence } from '../features/chat/useDraftPersistence';
 import { submitBusyMessage } from '../features/chat/submitBusyMessage';
 
 import { SkillInputOverlay } from '../features/input-bar/SkillInputOverlay';
+import SessionUsageBar from '../features/usage/SessionUsageBar';
 
 interface MainContentProps {
   onNewChat: () => void; // Callback to tell sidebar to refresh
@@ -621,6 +622,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         }).catch(() => {});
       } else {
         setLoading(false);
+        setMessages([]);
         loadConversation(activeId);
         // Check if server has an active stream we can reconnect to
         const convId = activeId;
@@ -2101,32 +2103,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       />
                     )}
                     {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
-                    {contextInfo && contextInfo.tokens > 0 && (() => {
-                      const pct = Math.min(contextInfo.tokens / contextInfo.limit!, 1);
-                      const color = pct > 0.8 ? '#dc2626' : pct > 0.5 ? '#d97706' : '#6b7280';
-                      const r = 7, c = 2 * Math.PI * r, dash = pct * c;
-                      const label = contextInfo.tokens.toLocaleString() + ' tokens';
-                      const pctLabel = (pct * 100).toFixed(1) + '% 上下文已使用';
-                      return (
-                        <div className="flex items-center gap-1 ml-1 select-none" title={pctLabel}>
-                          <svg width="18" height="18" viewBox="0 0 18 18">
-                            <circle cx="9" cy="9" r={r} fill="none" stroke="#d4d4d4" strokeWidth="2" />
-                            <circle cx="9" cy="9" r={r} fill="none" stroke={color} strokeWidth="2"
-                              strokeDasharray={`${dash} ${c}`} strokeLinecap="round"
-                              transform="rotate(-90 9 9)" />
-                          </svg>
-                          <span className="text-[11px] whitespace-nowrap" style={{ color: '#6b7280' }}>{label}</span>
-                        </div>
-                      );
-                    })()}
-                    {tokenUsage && (tokenUsage.input_tokens! > 0 || tokenUsage.output_tokens! > 0) && (
-                      <div className="flex items-center gap-1 ml-1 select-none" title={`Input: ${tokenUsage.input_tokens!.toLocaleString()} | Output: ${tokenUsage.output_tokens!.toLocaleString()}`}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-                        <span className="text-[11px] whitespace-nowrap" style={{ color: '#6b7280' }}>
-                          {(tokenUsage.input_tokens! + tokenUsage.output_tokens!).toLocaleString()} tokens
-                        </span>
-                      </div>
-                    )}
+
                   </div>
                   <div className="flex items-center gap-3">
                     {activeId && queues[activeId]?.length > 0 && <div className="max-w-[200px] text-xs text-claude-textSecondary">
@@ -2191,6 +2168,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   </div>
                 </div>
               </div>
+              <SessionUsageBar key={activeId || 'new'} messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />
               {false && (
                 <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs pointer-events-auto">
                   <span>您当前没有可用套餐，无法发送消息</span>
