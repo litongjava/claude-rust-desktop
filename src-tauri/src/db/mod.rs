@@ -25,7 +25,9 @@ impl DbManager {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let manager = SqliteConnectionManager::file(&path);
+        let manager = SqliteConnectionManager::file(&path).with_init(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        });
         let pool = Pool::builder()
             .max_size(10)
             .min_idle(Some(2))

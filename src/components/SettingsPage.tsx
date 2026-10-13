@@ -1,6 +1,6 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu, UserRound, Info } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
@@ -318,12 +318,9 @@ const SettingsPage = () => {
             {t('settings.title')}
           </h2>
 
-          {(['account', 'about'] as const).map(item => (
-            <button key={item} onClick={() => setTab(item)}
-              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === item ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
-              {t(`settings.${item}`)}
-            </button>
-          ))}
+          <button onClick={() => setTab('account')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'account' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <UserRound size={16} />{t('settings.account')}
+          </button>
           <button
             onClick={() => setTab('general')}
             className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
@@ -366,6 +363,9 @@ const SettingsPage = () => {
           >
             <Clock size={16} />
             {t('tasks.title')}
+          </button>
+          <button onClick={() => setTab('about')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'about' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <Info size={16} />{t('settings.about')}
           </button>
         </div>
 

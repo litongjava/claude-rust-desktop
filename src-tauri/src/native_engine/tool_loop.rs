@@ -21,6 +21,7 @@ use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
+    RequestSnapshot(Value),
     Text(String),
     Thinking(String),
     ToolUseStart {
@@ -913,6 +914,16 @@ impl ToolLoopExecutor {
             }
 
             self.streaming_tool_args.clear();
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "number": iteration + 1,
+                "startedAt": chrono::Utc::now().timestamp_millis(),
+                "model": self.provider.model.id,
+                "systemPrompt": self.system_prompt,
+                "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
+                "tools": tools,
+                "source": "native_engine"
+            }))).await;
             let stream = self.anthropic_client
                 .send_message_stream_with_thinking(
                     &self.provider,
@@ -1367,6 +1378,16 @@ impl ToolLoopExecutor {
             }
 
             self.streaming_tool_args.clear();
+            let _ = self.event_tx.send(EngineEvent::RequestSnapshot(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "number": iteration + 1,
+                "startedAt": chrono::Utc::now().timestamp_millis(),
+                "model": self.provider.model.id,
+                "systemPrompt": self.system_prompt,
+                "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
+                "tools": tools,
+                "source": "native_engine"
+            }))).await;
             let stream = self.openai_client
                 .send_message_stream(
                     &self.provider,

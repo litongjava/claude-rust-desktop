@@ -61,7 +61,7 @@ import VoiceInput from './VoiceInput';
 import { useVoiceInput } from '../features/voice/useVoiceInput';
 import { useFileUpload, ACCEPTED_TYPES } from '../features/file-upload/useFileUpload';
 import { useModelCatalog } from '../features/model-catalog/useModelCatalog';
-import TabBar from './TabBar';
+import TrajectoryView from '../features/trajectory/TrajectoryView';
 import { getCrossModeOverride, setCrossModeOverride, clearCrossModeOverride } from '../features/cross-mode/crossModeStorage';
 import { useI18n } from '../hooks/useI18n';
 import { trackMessageSent, trackConversationCreated } from '../hooks/useAnalytics';
@@ -89,6 +89,9 @@ interface MainContentProps {
 
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
+  const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
+  const [conversationView, setConversationView] = useState<'chat' | 'trajectory'>('chat');
+  const [inspectId, setInspectId] = useState<string | null>(null);
   const busySendBehavior = useGeneralSettingsStore(state => state.busySendBehavior);
   const queues = useBusySendStore(state => state.queues);
   const queueProcessing = useRef(false);
@@ -208,6 +211,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const isChat = !!(activeId || messages.length > 0);
     onChatModeChange?.(isChat);
   }, [activeId, messages.length, onChatModeChange]);
+
+  useEffect(() => { setConversationView('chat'); setInspectId(null); }, [activeId]);
 
   // Sync active conversation with tabs
   useEffect(() => {
@@ -389,6 +394,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const [showH5Panel, setShowH5Panel] = useState(false);
   const [showTerminalPanel, setShowTerminalPanel] = useState(false);
+  useEffect(() => {
+    const handler = (event: Event) => {
+      if ((event as CustomEvent).detail === 'terminal') setShowTerminalPanel(true);
+      if ((event as CustomEvent).detail === 'h5') setShowH5Panel(true);
+    };
+    window.addEventListener('chat-header-action', handler);
+    return () => window.removeEventListener('chat-header-action', handler);
+  }, []);
+
   const [showComputerUsePanel, setShowComputerUsePanel] = useState(false);
 
   // 草稿持久化 refs（跟踪最新值，供 effect cleanup 读取）
@@ -1950,31 +1964,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 2: Chat Interface (Has ID or Messages)
   return (
     <div className="flex-1 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
-      {/* TabBar for conversation switching */}
-      <TabBar
-        onNewChat={handleNewChat}
-        rightActions={
-          <div className="flex items-center gap-0.5 mr-1">
-            <button
-              onClick={() => setShowH5Panel(true)}
-              className="flex-shrink-0 w-8 h-8 flex items-center justify-center text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-md transition-colors"
-              title="H5 远程访问"
-            >
-              <Smartphone size={16} />
-            </button>
-            <button
-              onClick={() => setShowTerminalPanel(true)}
-              className="flex-shrink-0 w-8 h-8 flex items-center justify-center text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-md transition-colors"
-              title="终端"
-            >
-              <Terminal size={16} />
-            </button>
-          </div>
-        }
-      />
+      {showCodingView && <div className="flex shrink-0 gap-5 border-b border-claude-border px-5 text-sm" role="tablist" aria-label="会话视图">
+        {(['chat', 'trajectory'] as const).map(view => <button type="button" key={view} role="tab" aria-selected={conversationView === view} onClick={() => setConversationView(view)} className={`py-3 ${conversationView === view ? 'border-b-2 border-blue-500 text-blue-500' : 'text-claude-textSecondary'}`}>{view === 'chat' ? 'Chat' : 'Trajectory'}</button>)}
+      </div>}
+      {showCodingView && conversationView === 'trajectory' && <div className="min-h-0 flex-1"><TrajectoryView messages={messages} loading={loading} focusId={inspectId} /></div>}
 
       {/* Content area - positioning container for scroll + bottom bars */}
-      <div className="flex-1 min-h-0 relative">
+      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : ''}`}>
         <div
           className="absolute inset-0 overflow-y-auto chat-scroll"
           style={{ paddingBottom: `${inputHeight}px` }}
@@ -1986,6 +1982,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ maxWidth: `${tunerConfig?.mainContentWidth || 768}px` }}
           >
             <MessageList
+              onInspect={id => { setInspectId(id); setConversationView('trajectory'); }}
               messages={messages}
               loading={loading}
               expandedMessages={expandedMessages}

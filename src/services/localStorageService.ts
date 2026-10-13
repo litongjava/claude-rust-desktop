@@ -33,6 +33,11 @@ export interface LocalMessage {
   is_compact_boundary?: number;
   sort_order: number;
   toolCalls?: any[];
+  processSteps?: import('../features/trajectory/model').ProcessStep[];
+  processStartedAt?: number;
+  processEndedAt?: number;
+  toolTextEndOffset?: number;
+  requestSnapshots?: import('../features/trajectory/model').RequestSnapshot[];
 }
 
 function safeGet<T>(key: string, fallback: T): T {

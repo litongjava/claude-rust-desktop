@@ -56,7 +56,8 @@ async fn chat_handler(
     {
         let db = state.db_manager.clone();
         let conv_id_save = conv_id.clone();
-        let user_msgs = messages.clone();
+        // The request contains conversation history; only append the current user turn.
+        let user_msgs: Vec<_> = messages.iter().rev().find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user")).cloned().into_iter().collect();
         let model_save = model.clone();
         let _ = tokio::task::spawn_blocking(move || {
             db.with_conn(|conn| {
@@ -65,7 +66,7 @@ async fn chat_handler(
 
                 // Step 1: Ensure conversation exists FIRST (before inserting messages)
                 let existing = crate::db::conversation_repo::get_conversation(conn, &conv_id_save).ok();
-                if existing.is_none() {
+                if existing.flatten().is_none() {
                     tracing::info!(module = "BridgeDB", "Conversation not found, creating new one: id={}, model={}", conv_id_save, model_save);
                     let _ = crate::db::conversation_repo::insert_conversation(
                         conn, &conv_id_save, None, Some(&model_save), None, None, None,
@@ -224,7 +225,7 @@ async fn chat_handler(
 
             tracing::info!(module = "Chat", "[6/7] Calling engine.send_message...");
 
-            match engine.send_message(chat_req).await {
+            match engine.send_message_with_history(chat_req, false).await {
                 Ok(rx) => {
                     tracing::info!(module = "Chat", "[6/7] send_message SUCCESS, got event receiver");
                     Some(rx)
@@ -256,6 +257,9 @@ async fn chat_handler(
             }
         };
 
+        let assistant_id = uuid::Uuid::new_v4().to_string();
+        let mut request_snapshots = Vec::<serde_json::Value>::new();
+        let mut terminal_event = None;
         let mut full_text = String::new();
         let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
 
@@ -280,6 +284,25 @@ async fn chat_handler(
                 }
             };
             let event_data = match event {
+                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(snapshot) => {
+                    request_snapshots.push(snapshot.clone());
+                    let db = db_clone.clone();
+                    let message_id = assistant_id.clone();
+                    let conversation_id = conv_id.clone();
+                    let snapshots = serde_json::json!(request_snapshots);
+                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| -> anyhow::Result<()> {
+                        let tx = conn.unchecked_transaction()?;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        tx.execute("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'assistant', '', ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))",
+                            rusqlite::params![message_id, conversation_id, now])?;
+                        crate::db::message_repo::save_request_snapshots(&tx, &message_id, &snapshots)?;
+                        tx.commit()?;
+                        Ok(())
+                    })).await;
+                    let persisted = matches!(saved, Ok(Ok(Ok(()))));
+                    if !persisted { tracing::error!("Could not persist trajectory request: {:?}", saved); }
+                    Some(serde_json::json!({"type": "request_snapshot", "snapshot": snapshot, "persisted": persisted}))
+                }
                 crate::native_engine::tool_loop::EngineEvent::MessageStart { model } => {
                     Some(serde_json::json!({
                         "type": "message_start",
@@ -349,11 +372,9 @@ async fn chat_handler(
                         context_manager.after_response(&conv, &user_msg, &assistant_message).await;
                     });
 
-                    yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
-                        "type": "message_stop",
-                        "stop_reason": stop_reason,
-                        "full_text": full_text.clone(),
-                    }).to_string()));
+                    terminal_event = Some(serde_json::json!({
+                        "type": "message_stop", "stop_reason": stop_reason, "full_text": full_text.clone(),
+                    }));
                     break;
                 }
                 crate::native_engine::tool_loop::EngineEvent::Error(err) => {
@@ -417,10 +438,8 @@ async fn chat_handler(
             if let Some(data) = event_data {
                 let is_stop = data.get("type").and_then(|t| t.as_str()) == Some("message_stop")
                     || data.get("type").and_then(|t| t.as_str()) == Some("error");
+                if is_stop { terminal_event = Some(data); break; }
                 yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
-                if is_stop {
-                    break;
-                }
             }
         }
 
@@ -429,7 +448,7 @@ async fn chat_handler(
         crate::metrics::ACTIVE_SSE_CONNECTIONS.dec();
 
         // Save assistant message to SQLite after stream ends
-        if !full_text.is_empty() {
+        if !full_text.is_empty() || !request_snapshots.is_empty() || !collected_tool_calls.is_empty() {
             let db = db_clone;
             let conv_id_save = conv_id.clone();
             let assistant_text = full_text.clone();
@@ -437,15 +456,17 @@ async fn chat_handler(
             let _ = tokio::task::spawn_blocking(move || {
                 db.with_conn(|conn| {
                     tracing::info!(module = "BridgeDB", "Saving assistant message for conv_id={}", conv_id_save);
-                    let msg_id = uuid::Uuid::new_v4().to_string();
+                    let msg_id = assistant_id;
                     let now = chrono::Utc::now().to_rfc3339();
                     let sort_order = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
                         .unwrap_or_default()
                         .len() as i64;
                     tracing::info!(module = "BridgeDB", "Inserting assistant message: id={}, content_len={}, sort_order={}", msg_id, assistant_text.len(), sort_order);
-                    let insert_result = crate::db::message_repo::insert_message(
-                        conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order,
-                    );
+                    let insert_result = if crate::db::message_repo::get_message(conn, &msg_id)?.is_some() {
+                        crate::db::message_repo::update_message_content(conn, &msg_id, &assistant_text)
+                    } else {
+                        crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order)
+                    };
                     tracing::info!(module = "BridgeDB", "Assistant message insert result: {:?}", insert_result.is_ok());
 
                     // Save tool calls for this message
@@ -481,9 +502,22 @@ async fn chat_handler(
                 })
             }).await;
         }
+        if let Some(event) = terminal_event {
+            yield Ok::<Event, Infallible>(Event::default().data(event.to_string()));
+        }
     };
 
-    let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    // Keep collecting and persisting engine events if the WebView disconnects.
+    // The transport must not own the lifetime of the database writer.
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            let _ = sse_tx.send(event).await;
+        }
+    });
+    let mut response = Sse::new(tokio_stream::wrappers::ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()).into_response();
     set_sse_content_type(&mut response);
     response
 }

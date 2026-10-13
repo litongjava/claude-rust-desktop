@@ -45,13 +45,14 @@ beforeEach(() => {
 });
 
 describe('general preferences', () => {
-  it('places Account and About before General and separates their content', async () => {
+  it('places Account first and About after the other navigation items', async () => {
     await renderSettings();
     const account = screen.getByRole('button', { name: en.settings.account });
     const about = screen.getByRole('button', { name: en.settings.about });
     const general = screen.getByRole('button', { name: en.settings.general });
     expect(account.compareDocumentPosition(about) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(about.compareDocumentPosition(general) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(general.compareDocumentPosition(about) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('button', { name: en.tasks.title }).compareDocumentPosition(about) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.queryByRole('heading', { name: en.settings.personalInfo })).not.toBeInTheDocument();
     const fontSize = screen.getByText(en.general.fontSize);
     const chatFont = screen.getByRole('heading', { name: en.settings.chatFont });

@@ -1,3 +1,4 @@
+import { processMetadata, restoreProcessMetadata } from './features/trajectory/model';
 import { useWorkspaceModeStore, conversationWorkspaceMode } from './stores/useWorkspaceModeStore';
 import { splitModelKey } from './utils/modelConfig';
 import { getErrorMessage } from './utils/errorHelpers';
@@ -817,6 +818,7 @@ export async function getConversation(id: string) {
         throw new Error('Conversation not found');
       }
       const data = await res.json();
+      const cachedMessages = getLocalMessages(id);
       console.log('[API] getConversation from SQLite, messages:', data.messages?.length || 0);
       return {
         id: data.id,
@@ -832,7 +834,7 @@ export async function getConversation(id: string) {
         created_at: data.created_at,
         updated_at: data.updated_at,
         message_count: data.message_count,
-        messages: (data.messages || []).map((m: any) => {
+        messages: (data.messages || []).map((m: any, index: number) => {
           let toolCalls: any[] = [];
           if (m.tool_calls) {
             if (typeof m.tool_calls === 'string') {
@@ -841,7 +843,8 @@ export async function getConversation(id: string) {
               toolCalls = m.tool_calls;
             }
           }
-          return {
+          return restoreProcessMetadata({
+            requestSnapshots: m.requestSnapshots,
             id: m.id,
             role: m.role || 'assistant',
             content: m.content,
@@ -850,7 +853,7 @@ export async function getConversation(id: string) {
             is_compact_boundary: m.is_compact_boundary,
             sort_order: m.sort_order,
             toolCalls,
-          };
+          }, index, cachedMessages);
         }),
       };
     } catch (e) {
@@ -884,6 +887,7 @@ export async function getConversation(id: string) {
       is_compact_boundary: m.is_compact_boundary,
       sort_order: m.sort_order,
       toolCalls: m.toolCalls || [],
+      ...processMetadata(m),
     })),
   };
 }
@@ -1254,7 +1258,7 @@ export function reconnectStream(
               onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input });
             }
             if (parsed.type === 'tool_use_done' && onToolUse) {
-              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content, is_error: parsed.is_error });
             }
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
@@ -1262,6 +1266,7 @@ export function reconnectStream(
             if (parsed.type === 'tool_permission' && onSystem) {
               onSystem('tool_permission', '', parsed);
             }
+            if (parsed.type === 'request_snapshot' && onSystem) onSystem('request_snapshot', '', parsed);
             if (parsed.type === 'message_start' && onSystem) {
               onSystem('message_start', '', parsed);
             }
@@ -1301,7 +1306,7 @@ export function reconnectStream(
 export function persistMessages(conversationId: string, messages: any[]) {
   if (isTauriApp) return;
   const mapped = messages.map((m, i) => ({
-    id: m.id || crypto.randomUUID(),
+    id: m.id || (m.id = crypto.randomUUID()),
     conversation_id: conversationId,
     role: m.role,
     content: m.content || '',
@@ -1310,6 +1315,7 @@ export function persistMessages(conversationId: string, messages: any[]) {
     is_compact_boundary: m.is_compact_boundary,
     sort_order: m.sort_order !== undefined ? m.sort_order : i,
     toolCalls: m.toolCalls || [],
+    ...processMetadata(m),
   }));
   saveLocalMessages(conversationId, mapped);
 }
@@ -1882,6 +1888,7 @@ export async function sendMessageNative(
               scheduleFlush();
             } else if (event.type === 'content_block_start') {
               if (event.content_block?.type === 'tool_use') {
+                flushPending();
                 onToolUse?.({
                   type: 'start',
                   tool_use_id: event.content_block.id || '',
@@ -1900,6 +1907,7 @@ export async function sendMessageNative(
               }
             } else if (event.type === 'content_block_stop') {
             } else if (event.type === 'tool_use_start') {
+              flushPending();
               onToolUse?.({
                 type: 'start',
                 tool_use_id: event.tool_use_id || '',
@@ -1909,6 +1917,7 @@ export async function sendMessageNative(
                 is_error: false,
               });
             } else if (event.type === 'tool_use_done') {
+              flushPending();
               onToolUse?.({
                 type: 'done',
                 tool_use_id: event.tool_use_id || '',
@@ -1918,6 +1927,9 @@ export async function sendMessageNative(
                 is_error: event.is_error === true,
               });
             } else if (event.type === 'tool_arg_delta') {
+            } else if (event.type === 'request_snapshot') {
+              flushPending();
+              onSystem?.('request_snapshot', '', event);
             } else if (event.type === 'message_start') {
               onSystem?.('message_start', '', { model: event.message?.model });
             } else if (event.type === 'message_delta') {
@@ -2398,6 +2410,11 @@ export async function sendMessage(
           }
 
           // Handle message_start with usage data
+          if (parsed.type === 'request_snapshot') {
+            flushPending();
+            onSystem?.('request_snapshot', '', parsed);
+            continue;
+          }
           if (parsed.type === 'message_start') {
             if (onSystem) {
               try { onSystem('message_start', '', parsed); } catch (err) { console.error('[API] onSystem message_start callback error:', err); }
@@ -2423,13 +2440,15 @@ export async function sendMessage(
 
           // Handle tool use events
           if (parsed.type === 'tool_use_start' && onToolUse) {
+            flushPending();
             try { onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' }); } catch (err) { console.error('[API] onToolUse start callback error:', err); }
           }
           if (parsed.type === 'tool_use_input' && onToolUse) {
             try { onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input }); } catch (err) { console.error('[API] onToolUse input callback error:', err); }
           }
           if (parsed.type === 'tool_use_done' && onToolUse) {
-            try { onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content || parsed.output, is_error: parsed.is_error }); } catch (err) { console.error('[API] onToolUse done callback error:', err); }
+            flushPending();
+            try { onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content || parsed.output, is_error: parsed.is_error }); } catch (err) { console.error('[API] onToolUse done callback error:', err); }
           }
 
           // Research mode events — forward as system events for MainContent to handle

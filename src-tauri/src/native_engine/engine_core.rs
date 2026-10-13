@@ -319,7 +319,12 @@ impl QueryEngine {
         Ok(())
     }
 
-    pub async fn send_message(&self, mut request: ChatRequest) -> Result<mpsc::Receiver<EngineEvent>> {
+    pub async fn send_message(&self, request: ChatRequest) -> Result<mpsc::Receiver<EngineEvent>> {
+        self.send_message_with_history(request, true).await
+    }
+
+    /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
+    pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
         let conv_id = request.conversation_id.clone();
         let db = self.db_manager.clone();
         let project_conv_id = conv_id.clone();
@@ -476,7 +481,7 @@ impl QueryEngine {
             match exec_result {
                 Ok((full_text, _stop_reason)) => {
                     tracing::info!(module = "EngineCore", "Executor completed for {}, full_text_len={}", conv_id_clone, full_text.len());
-                    if !full_text.is_empty() {
+                    if save_response && !full_text.is_empty() {
                         let conv_id = conv_id_clone.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             db.with_conn(|conn| {

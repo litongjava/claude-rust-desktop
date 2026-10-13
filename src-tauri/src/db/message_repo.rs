@@ -2,6 +2,19 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+/// Request snapshots belong to the assistant message and follow its deletion lifecycle.
+pub fn save_request_snapshots(conn: &Connection, message_id: &str, snapshots: &serde_json::Value) -> Result<()> {
+    conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
+        params![message_id, serde_json::to_string(snapshots)?])?;
+    Ok(())
+}
+
+pub fn get_request_snapshots(conn: &Connection, message_id: &str) -> Result<serde_json::Value> {
+    use rusqlite::OptionalExtension;
+    let raw: Option<String> = conn.query_row("SELECT requests_json FROM message_trajectory WHERE message_id = ?1", params![message_id], |row| row.get(0)).optional()?;
+    Ok(match raw { Some(raw) => serde_json::from_str(&raw)?, None => serde_json::json!([]) })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRow {
     pub id: String,

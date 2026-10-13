@@ -83,6 +83,7 @@ async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>)
                 let tool_calls = crate::db::message_repo::get_tool_calls_for_message(conn, &msg.id)
                     .unwrap_or_default();
                 let mut msg_json = serde_json::to_value(msg).unwrap_or(serde_json::json!({}));
+                msg_json["requestSnapshots"] = crate::db::message_repo::get_request_snapshots(conn, &msg.id).unwrap_or_else(|_| serde_json::json!([]));
                 if !tool_calls.is_empty() {
                     // Format as the frontend expects: array of { name, input (parsed), result, status }
                     let formatted_tool_calls: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {

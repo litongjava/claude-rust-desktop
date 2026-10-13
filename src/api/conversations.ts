@@ -1,3 +1,4 @@
+import { processMetadata, restoreProcessMetadata } from '../features/trajectory/model';
 import { useWorkspaceModeStore, conversationWorkspaceMode } from '../stores/useWorkspaceModeStore';
 import { request, API_BASE, getToken, waitForApiReady, isTauriApp, getUserModeForConversation, resolveEnvCreds } from './client';
 import {
@@ -153,19 +154,21 @@ export async function getConversation(id: string) {
               thinking: m.thinking || null, created_at: m.created_at,
               is_compact_boundary: m.is_compact_boundary, sort_order: m.sort_order,
               toolCalls: m.toolCalls || [],
+              ...processMetadata(m),
             })),
           };
         }
         throw new Error('Conversation not found');
       }
       const data = await res.json();
+      const cachedMessages = getLocalMessages(id);
       console.log('[API] getConversation from SQLite, messages:', data.messages?.length || 0);
       return {
         id: data.id, title: data.title, model: data.model,
         workspace_mode: conversationWorkspaceMode(data),
         workspace_path: data.workspace_path, created_at: data.created_at,
         updated_at: data.updated_at, message_count: data.message_count,
-        messages: (data.messages || []).map((m: any) => {
+        messages: (data.messages || []).map((m: any, index: number) => {
           let toolCalls: any[] = [];
           if (m.tool_calls) {
             if (typeof m.tool_calls === 'string') {
@@ -174,12 +177,13 @@ export async function getConversation(id: string) {
               toolCalls = m.tool_calls;
             }
           }
-          return {
+          return restoreProcessMetadata({
+            requestSnapshots: m.requestSnapshots,
             id: m.id, role: m.role || 'assistant', content: m.content,
             thinking: m.thinking || null, created_at: m.created_at,
             is_compact_boundary: m.is_compact_boundary, sort_order: m.sort_order,
             toolCalls,
-          };
+          }, index, cachedMessages);
         }),
       };
     } catch (e) {
@@ -197,6 +201,7 @@ export async function getConversation(id: string) {
             thinking: m.thinking || null, created_at: m.created_at,
             is_compact_boundary: m.is_compact_boundary, sort_order: m.sort_order,
             toolCalls: m.toolCalls || [],
+            ...processMetadata(m),
           })),
         };
       }
@@ -217,6 +222,7 @@ export async function getConversation(id: string) {
       thinking: m.thinking || null, created_at: m.created_at,
       is_compact_boundary: m.is_compact_boundary, sort_order: m.sort_order,
       toolCalls: m.toolCalls || [],
+      ...processMetadata(m),
     })),
   };
 }
@@ -272,7 +278,7 @@ export async function updateConversation(id: string, data: any) {
 
 export function persistMessages(conversationId: string, messages: any[]) {
   const mapped = messages.map((m, i) => ({
-    id: m.id || crypto.randomUUID(),
+    id: m.id || (m.id = crypto.randomUUID()),
     conversation_id: conversationId,
     role: m.role,
     content: m.content || '',
@@ -281,6 +287,7 @@ export function persistMessages(conversationId: string, messages: any[]) {
     is_compact_boundary: m.is_compact_boundary,
     sort_order: m.sort_order !== undefined ? m.sort_order : i,
     toolCalls: m.toolCalls || [],
+    ...processMetadata(m),
   }));
   saveLocalMessages(conversationId, mapped);
 }
@@ -541,7 +548,7 @@ export async function reconnectStream(
               onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input });
             }
             if (parsed.type === 'tool_use_done' && onToolUse) {
-              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content, is_error: parsed.is_error });
             }
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
@@ -549,6 +556,7 @@ export async function reconnectStream(
             if (parsed.type === 'tool_permission' && onSystem) {
               onSystem('tool_permission', '', parsed);
             }
+            if (parsed.type === 'request_snapshot' && onSystem) onSystem('request_snapshot', '', parsed);
             if (parsed.type === 'message_start' && onSystem) {
               onSystem('message_start', '', parsed);
             }
