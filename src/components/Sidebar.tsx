@@ -31,7 +31,6 @@ import type { FeishuChatMapping } from '../utils/tauriAPI';
 
 import SearchModal from './SearchModal';
 import RenameModal from './RenameModal';
-import CostTracker from './CostTracker';
 import EmbeddedBrowser from './EmbeddedBrowser';
 import SwarmCollaboration from './SwarmCollaboration';
 import FileExplorer from './FileExplorer';
@@ -60,9 +59,11 @@ interface SidebarProps {
   setTunerConfig?: (config: any) => void;
   titleBarHeight?: number;
   activeConversationId?: string;
+  showHelpModal: boolean;
+  onHelpModalChange: (open: boolean) => void;
 }
 
-const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onOpenDirectory, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId }: SidebarProps) => {
+const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onOpenDirectory, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
   const { t } = useI18n();
   const navigate = useNavigate();
   const location = useLocation();
@@ -76,7 +77,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [userUser, setUserUser] = useState<any>(null);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-  const [showHelpModal, setShowHelpModal] = useState(false);
   const [userMenuPos, setUserMenuPos] = useState<{ bottom: number; left: number } | null>(null);
   const [planLabel, setPlanLabel] = useState('Free plan');
   const [usageData, setUsageData] = useState<{ token_used: number; token_quota: number } | null>(null);
@@ -517,30 +517,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           h-screen bg-claude-sidebar border-r border-claude-border flex-shrink-0 text-claude-text antialiased flex flex-col transition-all duration-200 ease-in-out overflow-hidden relative
         `}
         style={{
+          paddingTop: `${titleBarHeight || 44}px`,
           width: isCollapsed ? '46px' : (showBrowser ? `${tunerConfig?.sidebarWidth || 280}px` : `${tunerConfig?.sidebarWidth || 280}px`)
         }}
       >
-        {/* Version indicator — always visible */}
-        {!isCollapsed && (
-          <div
-            className="flex-shrink-0 flex items-center gap-2 px-3"
-            style={{ marginTop: `${titleBarHeight || 44}px`, paddingTop: '10px', paddingBottom: '4px' }}
-          >
-            <span className="w-[6px] h-[6px] rounded-full bg-blue-500 flex-shrink-0" />
-            <span className="text-[11px] font-semibold text-claude-textSecondary tracking-wide select-none">
-              Claude rust <span className="text-blue-400 font-bold">v{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '2.5'}</span>
-            </span>
-          </div>
-        )}
-        {isCollapsed && (
-          <div
-            className="flex-shrink-0 flex items-center justify-center"
-            style={{ marginTop: `${titleBarHeight || 44}px`, paddingTop: '10px', paddingBottom: '4px', height: '28px' }}
-          >
-            <span className="w-[6px] h-[6px] rounded-full bg-blue-500" />
-          </div>
-        )}
-
         {/* New Tab Navigation - Chat/Cowork/Code */}
         {!isCollapsed && (
           <div
@@ -1149,16 +1129,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           </button>
         </div>
 
-        {/* Bridge Connection Status */}
-        {!isCollapsed && (
-          <div className="px-3 py-1.5 border-t border-claude-border/50 flex items-center gap-2">
-            <span className={`w-1.5 h-1.5 rounded-full ${bridgeHealthy ? 'bg-green-500' : 'bg-amber-500'} flex-shrink-0`} />
-            <span className="text-[10px] text-claude-textSecondary/60 truncate">
-              {bridgePort ? `Bridge :${bridgePort}` : 'Connecting...'}
-            </span>
-          </div>
-        )}
-
         {/* User Profile Footer */}
         <div
           className={`${!updateStatus || isCollapsed || (updateStatus.type !== 'available' && updateStatus.type !== 'progress' && updateStatus.type !== 'downloaded') ? 'mt-auto' : ''} border-t border-claude-border flex-shrink-0 relative transition-all duration-200`}
@@ -1169,7 +1139,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             paddingRight: isCollapsed ? '0px' : `${tunerConfig?.profilePx || 12}px`,
           }}
         >
-          {!isCollapsed && <CostTracker conversationId={activeConversationId} compact />}
           <button
             ref={userBtnRef}
             onClick={() => {
@@ -1504,10 +1473,26 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       {showHelpModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40" onClick={() => setShowHelpModal(false)}>
           <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-dialog-title"
             className="bg-claude-input rounded-2xl shadow-xl w-[360px] p-6"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 className="text-[16px] font-semibold text-claude-text mb-2">{t('sidebar.supportTitle')}</h3>
+            <h3 id="help-dialog-title" className="text-[16px] font-semibold text-claude-text mb-2">{t('sidebar.supportTitle')}</h3>
+            <div className="mb-4 rounded-xl border border-claude-border p-3 space-y-2 text-[13px]">
+              <div className="flex items-center justify-between gap-4">
+                <span className="font-medium text-claude-text">Claude Rust</span>
+                <span className="text-claude-textSecondary">v{__APP_VERSION__}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-claude-textSecondary">Bridge</span>
+                <span className="flex items-center gap-2 text-claude-text">
+                  <span className={`w-1.5 h-1.5 rounded-full ${bridgeHealthy ? 'bg-green-500' : 'bg-amber-500'}`} />
+                  {bridgePort ? `:${bridgePort}` : 'Connecting...'}
+                </span>
+              </div>
+            </div>
             <p className="text-[14px] text-claude-textSecondary mb-3">{t('sidebar.supportQQLabel')}</p>
             <div className="px-4 py-3 mb-6 rounded-xl bg-claude-btn-hover text-[20px] font-semibold tracking-wide text-claude-text text-center select-all">
               629466903
