@@ -42,7 +42,7 @@ export default function AppTitleBar({ children, height = 44 }: {
   };
 
   return (
-    <div dir="ltr" className="absolute top-0 left-0 w-full z-[10000] flex items-center select-none bg-claude-bg border-b border-claude-border" style={{ height }}>
+    <div dir="ltr" data-app-titlebar className="absolute top-0 left-0 w-full z-[10000] flex items-center select-none bg-claude-bg border-b border-claude-border" style={{ height }}>
       {children}
       {/* Tauri handles native dragging and double-click maximize on this region. */}
       <div data-tauri-drag-region={custom ? true : undefined} className="h-full flex-1 min-w-4" />

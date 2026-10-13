@@ -1,9 +1,10 @@
 import React from 'react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { RequestSnapshot } from '../trajectory/model';
 import { aggregateUsage, contextBreakdown, sessionStatistics } from './model';
 import SessionUsageBar from './SessionUsageBar';
+import UsagePopover from './UsagePopover';
 
 const request = (override: Partial<RequestSnapshot> = {}): RequestSnapshot => ({ id: 'request-1', number: 1, model: 'model', startedAt: 1000, tools: [], systemPrompt: '', systemMessages: [], ...override });
 describe('session usage', () => {
@@ -60,5 +61,39 @@ describe('context window', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Context window' }));
     fireEvent.click(screen.getByRole('button', { name: 'See detailed breakdown' }));
     expect(screen.getByText('System prompt and instructions')).toBeInTheDocument();
+  });
+  it('keeps an expanding popover inside the available viewport and restores keyboard focus', () => {
+    vi.stubGlobal('innerHeight', 850);
+    render(<UsagePopover label="Viewport test" trigger="Open"><details><summary>More details</summary><div style={{ height: 900 }}>Long breakdown</div></details></UsagePopover>);
+    const trigger = screen.getByRole('button', { name: 'Viewport test' });
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue({ top: 450, bottom: 478, left: 100, right: 220, width: 120, height: 28, x: 100, y: 450, toJSON: () => ({}) });
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole('dialog', { name: 'Viewport test' });
+    expect(dialog.style.bottom).toBe('408px');
+    expect(dialog.style.maxHeight).toBe('430px');
+    expect(dialog).toHaveFocus();
+    fireEvent.click(screen.getByText('More details'));
+    expect(dialog.style.maxHeight).toBe('430px');
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Viewport test' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    vi.unstubAllGlobals();
+  });
+  it('keeps the panel below the measured application titlebar', () => {
+    vi.stubGlobal('innerHeight', 850);
+    const titlebar = document.createElement('div');
+    titlebar.setAttribute('data-app-titlebar', '');
+    document.body.append(titlebar);
+    vi.spyOn(titlebar, 'getBoundingClientRect').mockReturnValue({ top: 0, bottom: 44, left: 0, right: 1000, width: 1000, height: 44, x: 0, y: 0, toJSON: () => ({}) });
+    render(<UsagePopover label="Titlebar test" trigger="Open">Details</UsagePopover>);
+    const trigger = screen.getByRole('button', { name: 'Titlebar test' });
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue({ top: 450, bottom: 478, left: 100, right: 220, width: 120, height: 28, x: 100, y: 450, toJSON: () => ({}) });
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole('dialog', { name: 'Titlebar test' });
+    expect(dialog.style.bottom).toBe('408px');
+    expect(dialog.style.maxHeight).toBe('386px');
+    expect(850 - parseFloat(dialog.style.bottom) - parseFloat(dialog.style.maxHeight)).toBe(56);
+    titlebar.remove();
+    vi.unstubAllGlobals();
   });
 });
