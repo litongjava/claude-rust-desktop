@@ -46,32 +46,30 @@ describe('settings interface language', () => {
     localStorage.setItem('language', 'zh');
     await renderSettings();
 
-    expect(screen.getByRole('combobox', { name: en.settings.languageLabel })).toHaveValue('en');
+    expect(screen.getByRole('button', { name: /^Interface Language/ })).toHaveTextContent('English (United States)');
     expect(screen.getByRole('heading', { name: en.settings.title })).toBeInTheDocument();
   });
 
   it('updates translations across consumers immediately, persists the choice, and supports switching back', async () => {
     const view = await renderSettings();
-    fireEvent.change(screen.getByRole('combobox', { name: en.settings.languageLabel }), {
-      target: { value: 'zh' },
-    });
+    fireEvent.click(screen.getByRole('button', { name: /^Interface Language/ }));
+    fireEvent.click(screen.getByRole('button', { name: /简体中文（中国大陆）/ }));
 
     expect(screen.getByRole('heading', { name: zh.settings.title })).toBeInTheDocument();
-    expect(screen.getByRole('combobox', { name: zh.settings.languageLabel })).toHaveValue('zh');
+    expect(screen.getByRole('button', { name: /^界面语言/ })).toHaveTextContent('简体中文（中国大陆）');
     expect(screen.getByTestId('other-consumer')).toHaveTextContent(zh.common.newChat);
     expect(localStorage.getItem('app_language')).toBe('zh');
-    expect(document.documentElement.lang).toBe('zh');
+    expect(document.documentElement.lang).toBe('zh-CN');
 
     view.unmount();
     await renderSettings();
-    expect(screen.getByRole('combobox', { name: zh.settings.languageLabel })).toHaveValue('zh');
+    expect(screen.getByRole('button', { name: /^界面语言/ })).toHaveTextContent('简体中文（中国大陆）');
 
-    fireEvent.change(screen.getByRole('combobox', { name: zh.settings.languageLabel }), {
-      target: { value: 'en' },
-    });
+    fireEvent.click(screen.getByRole('button', { name: /^界面语言/ }));
+    fireEvent.click(screen.getByRole('button', { name: /English \(United States\)/ }));
     expect(screen.getByRole('heading', { name: en.settings.title })).toBeInTheDocument();
     expect(screen.getByTestId('other-consumer')).toHaveTextContent(en.common.newChat);
     expect(localStorage.getItem('app_language')).toBe('en');
-    expect(document.documentElement.lang).toBe('en');
+    expect(document.documentElement.lang).toBe('en-US');
   });
 });

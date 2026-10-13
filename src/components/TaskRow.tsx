@@ -20,7 +20,7 @@ function formatLastRun(lastRunAt: string, lastRunStatus: string | null, language
 }
 
 export default function TaskRow({ task, onToggle, onEdit, onDelete, onExecute }: TaskRowProps) {
-  const { t, language } = useI18n();
+  const { t, locale } = useI18n();
   const statusColor = task.is_enabled
     ? 'text-green-600 dark:text-green-400'
     : 'text-claude-textSecondary';
@@ -37,7 +37,7 @@ export default function TaskRow({ task, onToggle, onEdit, onDelete, onExecute }:
 
       <div className="flex items-center gap-1 text-[11px] text-claude-textSecondary shrink-0">
         <Clock size={12} />
-        <span>{task.last_run_at ? formatLastRun(task.last_run_at, task.last_run_status, language) : t('tasks.notRun')}</span>
+        <span>{task.last_run_at ? formatLastRun(task.last_run_at, task.last_run_status, locale) : t('tasks.notRun')}</span>
       </div>
 
       <div className="flex items-center gap-0.5 shrink-0">

@@ -1,4 +1,23 @@
 {
+  "languagePicker": {
+    "title": "Choose your language",
+    "search": "Search languages",
+    "noResults": "No matching languages",
+    "selected": "Selected"
+  },
+  "occupations": {
+    "software": "Software engineering",
+    "product": "Product management",
+    "data": "Data science",
+    "marketing": "Marketing",
+    "design": "Design",
+    "research": "Research",
+    "education": "Education",
+    "finance": "Finance",
+    "law": "Law",
+    "healthcare": "Healthcare",
+    "other": "Other"
+  },
   "common": {
     "save": "Save",
     "cancel": "Cancel",
@@ -365,6 +384,10 @@
     "currentVersion": "Current Version",
     "hours": "h ",
     "minutes": "m ",
+    "minutesReset": "m until reset",
+    "monthSlash": "/",
+    "dayLabel": "",
+    "reset": "reset",
     "month": "/",
     "day": "",
     "freePlan": "Free Plan",

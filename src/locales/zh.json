@@ -1,4 +1,23 @@
 {
+  "languagePicker": {
+    "title": "选择语言",
+    "search": "搜索语言",
+    "noResults": "没有匹配的语言",
+    "selected": "已选择"
+  },
+  "occupations": {
+    "software": "软件工程",
+    "product": "产品管理",
+    "data": "数据科学",
+    "marketing": "市场营销",
+    "design": "设计",
+    "research": "研究",
+    "education": "教育",
+    "finance": "金融",
+    "law": "法律",
+    "healthcare": "医疗健康",
+    "other": "其他"
+  },
   "common": {
     "save": "保存",
     "cancel": "取消",
@@ -368,6 +387,8 @@
     "minutesReset": "分钟后重置",
     "monthSlash": "月",
     "dayLabel": "日",
+    "month": "月",
+    "day": "日",
     "reset": "重置",
     "freePlan": "免费套餐",
     "activeLabel": "生效中",

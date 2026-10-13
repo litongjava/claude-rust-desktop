@@ -9,17 +9,21 @@ import TaskList from './TaskList';
 import NewTaskModal from './NewTaskModal';
 import { taskAPI, TaskInfo } from '../utils/tauriAPI';
 import { useI18n } from '../hooks/useI18n';
+import LanguagePicker from './LanguagePicker';
 
 const WORK_OPTIONS = [
-  '', '软件工程', '产品管理', '数据科学',
-  '市场营销', '设计', '研究', '教育', '金融',
-  '法律', '医疗健康', '其他',
+  { value: '软件工程', key: 'software' }, { value: '产品管理', key: 'product' },
+  { value: '数据科学', key: 'data' }, { value: '市场营销', key: 'marketing' },
+  { value: '设计', key: 'design' }, { value: '研究', key: 'research' },
+  { value: '教育', key: 'education' }, { value: '金融', key: 'finance' },
+  { value: '法律', key: 'law' }, { value: '医疗健康', key: 'healthcare' },
+  { value: '其他', key: 'other' },
 ];
 
 type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tasks';
 
 const SettingsPage = () => {
-  const { t, language, setLanguage } = useI18n();
+  const { t, locale } = useI18n();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('general');
   const [profile, setProfile] = useState<any>(null);
@@ -468,13 +472,12 @@ const SettingsPage = () => {
       const d = new Date(timeStr);
       if (isNaN(d.getTime())) return 'Invalid Date';
 
-      return d.toLocaleString('en-US', {
+      return d.toLocaleString(locale, {
         month: 'short',
         day: 'numeric',
         year: 'numeric',
         hour: 'numeric',
         minute: '2-digit',
-        hour12: true
       });
     };
 
@@ -671,25 +674,7 @@ const SettingsPage = () => {
         {/* Language Selector */}
         <section>
           <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.language')}</h3>
-          <div>
-            <label htmlFor="interface-language" className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.languageLabel')}</label>
-            <div className="relative w-full max-w-xs">
-              <select
-                id="interface-language"
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                className="w-full pl-3 pr-8 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
-              >
-                <option value="zh">{t('settings.chinese')}</option>
-                <option value="en">{t('settings.english')}</option>
-              </select>
-              <div aria-hidden="true" className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
-                <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </div>
-            </div>
-          </div>
+          <LanguagePicker />
         </section>
 
         <hr className="border-claude-border" />
@@ -740,7 +725,7 @@ const SettingsPage = () => {
                   className="w-full px-3 py-2.5 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all appearance-none cursor-pointer"
                 >
                   <option value="">{t('settings.occupationPlaceholder')}</option>
-                  {WORK_OPTIONS.filter(Boolean).map(o => <option key={o} value={o}>{o}</option>)}
+                  {WORK_OPTIONS.map(option => <option key={option.key} value={option.value}>{t(`occupations.${option.key}`)}</option>)}
                 </select>
                 <ChevronRight size={16} className="absolute right-3 top-1/2 -translate-y-1/2 rotate-90 text-claude-textSecondary pointer-events-none" />
               </div>
