@@ -31,7 +31,6 @@ import ChatsPage from './components/ChatsPage';
 import CustomizePage from './components/CustomizePage';
 import ProjectsPage from './components/ProjectsPage';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import ModelsPage from './components/ModelsPage';
 import DesignPage from './components/DesignPage';
 import MemoryPanel from './components/MemoryPanel';
 import DirectoryModal from './components/DirectoryModal';
@@ -72,11 +71,9 @@ const Layout = () => {
     setAuthValid(hasGatewayKey);
     setAuthChecked(true);
   }, []);
-  const setShowSettings = useUIStore(s => s.setShowSettings);
   const setShowUpgrade = useUIStore(s => s.setShowUpgrade);
   const setShowAgentPanel = useUIStore(s => s.setShowAgentPanel);
   const setShowAnalyticsPanel = useUIStore(s => s.setShowAnalyticsPanel);
-  const showSettings = useUIStore(s => s.showSettings);
   const showUpgrade = useUIStore(s => s.showUpgrade);
   const showAgentPanel = useUIStore(s => s.showAgentPanel);
   const showAnalyticsPanel = useUIStore(s => s.showAnalyticsPanel);
@@ -167,7 +164,6 @@ const Layout = () => {
   };
 
   useEffect(() => {
-    setShowSettings(false);
     setShowUpgrade(false);
     if (documentPanelDoc || showArtifacts) {
       setDocumentPanelDoc(null);
@@ -177,7 +173,7 @@ const Layout = () => {
   }, [location.pathname]);
 
   useEffect(() => {
-    const handler = () => { setShowUpgrade(true); setShowSettings(false); };
+    const handler = () => { setShowUpgrade(true); };
     window.addEventListener('open-upgrade', handler);
     return () => window.removeEventListener('open-upgrade', handler);
   }, []);
@@ -243,7 +239,6 @@ const Layout = () => {
   const handleNewChat = () => {
     setNewChatKey(prev => prev + 1);
     setRefreshTrigger(prev => prev + 1);
-    setShowSettings(false);
     setShowUpgrade(false);
     if (documentPanelDoc || showArtifacts) {
       setDocumentPanelDoc(null);
@@ -402,17 +397,17 @@ const Layout = () => {
             <Tooltip content="终端 (Ctrl+`)"><button onClick={() => setShowTerminal(!showTerminal)} className={`p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors ${showTerminal ? 'text-[#C6613F]' : 'text-claude-textSecondary hover:text-claude-text'}`}><Terminal size={16} strokeWidth={1.5} /></button></Tooltip>
           </div>
         </div>
-        <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { setShowSettings(true); setShowUpgrade(false); }} onOpenUpgrade={() => { setShowUpgrade(true); setShowSettings(false); }} onOpenDirectory={() => setShowDirectoryModal(true)} onCloseOverlays={() => { setShowSettings(false); setShowUpgrade(false); }} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} />
+        <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { navigate('/settings'); setShowUpgrade(false); }} onOpenUpgrade={() => setShowUpgrade(true)} onOpenDirectory={() => setShowDirectoryModal(true)} onCloseOverlays={() => setShowUpgrade(false)} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} />
         <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden relative" style={{ paddingTop: `${titleBarHeight}px` }}>
-          {isChatMode && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && location.pathname !== '/artifacts' && (
+          {isChatMode && !showUpgrade && (location.pathname === '/' || location.pathname.startsWith('/chat/')) && (
             <ChatHeader title={currentChatTitle} showArtifacts={showArtifacts} documentPanelDoc={documentPanelDoc} onOpenArtifacts={handleOpenArtifacts} hasArtifacts={artifacts.length > 0} onTitleRename={handleTitleChange} />
           )}
           <div className="flex-1 flex overflow-hidden relative" ref={contentContainerRef}>
             <div className="flex-1 flex flex-col h-full min-w-0">
-              {showSettings ? (
-                <SettingsPage onClose={() => setShowSettings(false)} />
-              ) : showUpgrade ? (
+              {showUpgrade ? (
                 <UpgradePlan onClose={() => setShowUpgrade(false)} />
+              ) : location.pathname === '/settings' ? (
+                <SettingsPage />
               ) : location.pathname === '/chats' ? (
                 <ChatsPage />
               ) : location.pathname === '/customize' ? (
@@ -430,8 +425,6 @@ const Layout = () => {
                   handleNewChat();
                   window.location.hash = '#/';
                 }} />
-              ) : location.pathname === '/models' ? (
-                <ModelsPage />
               ) : location.pathname === '/design' ? (
                 <DesignPage />
               ) : location.pathname === '/memory' ? (
@@ -519,7 +512,7 @@ const App = () => {
           <Route path="/customize" element={<Layout />} />
           <Route path="/projects" element={<Layout />} />
           <Route path="/artifacts" element={<Layout />} />
-          <Route path="/models" element={<Layout />} />
+          <Route path="/settings" element={<Layout />} />
           <Route path="/design" element={<Layout />} />
           <Route path="/memory" element={<Layout />} />
           <Route path="/code" element={<Layout />} />

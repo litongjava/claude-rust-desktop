@@ -3,7 +3,6 @@ import { subscribeWithSelector } from 'zustand/middleware';
 
 interface UIState {
   sidebarCollapsed: boolean;
-  showSettings: boolean;
   showUpgrade: boolean;
   showPlusMenu: boolean;
   showAgentPanel: boolean;
@@ -29,7 +28,6 @@ interface UIState {
 
   toggleSidebar: () => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
-  setShowSettings: (show: boolean) => void;
   setShowUpgrade: (show: boolean) => void;
   setShowPlusMenu: (show: boolean | ((prev: boolean) => boolean)) => void;
   setShowAgentPanel: (show: boolean) => void;
@@ -65,7 +63,6 @@ const getInitialLanguage = (): string => {
 export const useUIStore = create<UIState>()(
   subscribeWithSelector((set) => ({
     sidebarCollapsed: false,
-    showSettings: false,
     showUpgrade: false,
     showPlusMenu: false,
     showAgentPanel: false,
@@ -91,7 +88,6 @@ export const useUIStore = create<UIState>()(
 
     toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
     setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
-    setShowSettings: (showSettings) => set({ showSettings }),
     setShowUpgrade: (showUpgrade) => set({ showUpgrade }),
     setShowPlusMenu: (showPlusMenu) =>
       set((state) => ({
@@ -133,7 +129,6 @@ export const useUIStore = create<UIState>()(
 // ── Selector hooks — subscribe to individual fields ──
 
 export function useSidebarCollapsed() { return useUIStore(s => s.sidebarCollapsed); }
-export function useShowSettings() { return useUIStore(s => s.showSettings); }
 export function useShowAgentPanel() { return useUIStore(s => s.showAgentPanel); }
 export function useShowMcpPanel() { return useUIStore(s => s.showMcpPanel); }
 export function useShowTerminalPanel() { return useUIStore(s => s.showTerminalPanel); }

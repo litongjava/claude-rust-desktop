@@ -15,7 +15,6 @@ import {
   IconStarOutline,
   IconPencil,
   IconTrash,
-  IconModels,
   IconPalette,
   IconDirectory,
   IconBrain
@@ -205,7 +204,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       case 'Chats': return <IconChatBubble size={size} className={pngClass} />;
       case 'Projects': return <IconProjects size={size} className={pngClass} />;
       case 'Artifacts': return <IconArtifactsExact size={size} className={pngClass} />;
-      case 'Models': return <IconModels size={size} className={svgClass} />;
       case 'Design': return <IconPalette size={size} className={svgClass} />;
       case 'Directory': return <IconDirectory size={size} className={svgClass} />;
       case 'Memory': return <IconBrain size={size} className={svgClass} />;
@@ -231,7 +229,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     Chats: () => navigate('/chats'),
     Projects: () => navigate('/projects'),
     Artifacts: () => navigate('/artifacts'),
-    Models: () => navigate('/models'),
     Design: () => navigate('/design'),
     Memory: () => navigate('/memory'),
     Code: () => navigate('/code'),

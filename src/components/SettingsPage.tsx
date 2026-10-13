@@ -1,6 +1,7 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
 import McpSettingsPage from './McpSettingsPage';
@@ -8,10 +9,6 @@ import TaskList from './TaskList';
 import NewTaskModal from './NewTaskModal';
 import { taskAPI, TaskInfo } from '../utils/tauriAPI';
 import { useI18n } from '../hooks/useI18n';
-
-interface SettingsPageProps {
-  onClose: () => void;
-}
 
 const WORK_OPTIONS = [
   '', '软件工程', '产品管理', '数据科学',
@@ -21,8 +18,9 @@ const WORK_OPTIONS = [
 
 type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tasks';
 
-const SettingsPage = ({ onClose }: SettingsPageProps) => {
+const SettingsPage = () => {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('general');
   const [profile, setProfile] = useState<any>(null);
   const [usage, setUsage] = useState<any>(null);
@@ -314,99 +312,110 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
 
   // Font selector options
   return (
-    <div className="flex-1 flex h-full overflow-hidden bg-claude-bg text-claude-text">
-      {/* Left Sidebar Navigation */}
-      <div className="w-[200px] flex-shrink-0 pt-16 pl-8 flex flex-col gap-1">
-        <h2
-          className="font-[Spectral] text-[28px] text-claude-text px-3 mb-6"
-          style={{
-            fontWeight: 500,
-            WebkitTextStroke: '0.5px currentColor'
-          }}
-        >
-          {t('settings.title')}
-        </h2>
-
+    <div className="flex-1 flex flex-col min-h-0 h-full overflow-hidden bg-claude-bg text-claude-text">
+      <div className="shrink-0 px-6 pt-8 pb-6 md:px-8">
         <button
-          onClick={() => setTab('general')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
+          onClick={() => navigate('/')}
+          className="flex items-center gap-1.5 text-[14px] text-claude-textSecondary hover:text-claude-text transition-colors"
         >
-          <Settings size={16} />
-          {t('settings.general')}
-        </button>
-        {localStorage.getItem('user_mode') === 'selfhosted' && (
-          <button
-            onClick={() => setTab('models')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            <Cpu size={16} />
-            {t('settings.models')}
-          </button>
-        )}
-        {localStorage.getItem('user_mode') !== 'selfhosted' && (
-          <button
-            onClick={() => setTab('account')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'account' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.account')}
-          </button>
-        )}
-        {localStorage.getItem('user_mode') !== 'selfhosted' && (
-          <button
-            onClick={() => setTab('usage')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.usage')}
-          </button>
-        )}
-        <button
-          onClick={() => setTab('mcp')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'mcp' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
-        >
-          <Server size={16} />
-          {t('settings.mcpServers')}
-        </button>
-        <button
-          onClick={() => setTab('tasks')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'tasks' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
-        >
-          <Clock size={16} />
-          Scheduled Tasks
+          <ArrowLeft size={16} />
+          <span>{t('common.back')}</span>
         </button>
       </div>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {/* Left Sidebar Navigation */}
+        <div className="w-[180px] md:w-[200px] flex-shrink-0 pl-4 md:pl-8 pb-8 overflow-y-auto flex flex-col gap-1">
+          <h2
+            className="font-[Spectral] text-[28px] text-claude-text px-3 mb-6"
+            style={{
+              fontWeight: 500,
+              WebkitTextStroke: '0.5px currentColor'
+            }}
+          >
+            {t('settings.title')}
+          </h2>
 
-      {/* Right Content Area */}
-      <div className="flex-1 overflow-y-auto min-w-0">
-        <div className="max-w-6xl pt-16 pl-12 pb-32 pr-12">
-          {tab === 'general' && renderGeneral()}
-          {tab === 'models' && <ProviderSettings />}
-          {tab === 'account' && renderAccount()}
-          {tab === 'usage' && renderUsage()}
-          {tab === 'mcp' && <McpSettingsPage />}
-          {tab === 'tasks' && (
-            <div className="h-full flex flex-col">
-              {tasksLoading ? (
-                <div className="flex items-center justify-center h-full">
-                  <span className="text-[13px] text-claude-textSecondary">Loading tasks...</span>
-                </div>
-              ) : (
-                <TaskList
-                  tasks={tasks}
-                  onEdit={handleEditTask}
-                  onDelete={handleDeleteTask}
-                  onExecute={handleExecuteNow}
-                  onToggle={handleToggleTask}
-                  onAdd={handleAddTask}
-                />
-              )}
-            </div>
+          <button
+            onClick={() => setTab('general')}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Settings size={16} />
+            {t('settings.general')}
+          </button>
+          {localStorage.getItem('user_mode') === 'selfhosted' && (
+            <button
+              onClick={() => setTab('models')}
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+                }`}
+            >
+              <Cpu size={16} />
+              {t('settings.models')}
+            </button>
           )}
+          {localStorage.getItem('user_mode') !== 'selfhosted' && (
+            <button
+              onClick={() => setTab('account')}
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'account' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+                }`}
+            >
+              {t('settings.account')}
+            </button>
+          )}
+          {localStorage.getItem('user_mode') !== 'selfhosted' && (
+            <button
+              onClick={() => setTab('usage')}
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+                }`}
+            >
+              {t('settings.usage')}
+            </button>
+          )}
+          <button
+            onClick={() => setTab('mcp')}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'mcp' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Server size={16} />
+            {t('settings.mcpServers')}
+          </button>
+          <button
+            onClick={() => setTab('tasks')}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'tasks' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Clock size={16} />
+            Scheduled Tasks
+          </button>
+        </div>
+
+        {/* Right Content Area */}
+        <div className="flex-1 overflow-y-auto min-w-0">
+          <div className="max-w-6xl px-6 lg:px-12 pb-32">
+            {tab === 'general' && renderGeneral()}
+            {tab === 'models' && <ProviderSettings />}
+            {tab === 'account' && renderAccount()}
+            {tab === 'usage' && renderUsage()}
+            {tab === 'mcp' && <McpSettingsPage />}
+            {tab === 'tasks' && (
+              <div className="h-full flex flex-col">
+                {tasksLoading ? (
+                  <div className="flex items-center justify-center h-full">
+                    <span className="text-[13px] text-claude-textSecondary">Loading tasks...</span>
+                  </div>
+                ) : (
+                  <TaskList
+                    tasks={tasks}
+                    onEdit={handleEditTask}
+                    onDelete={handleDeleteTask}
+                    onExecute={handleExecuteNow}
+                    onToggle={handleToggleTask}
+                    onAdd={handleAddTask}
+                  />
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
