@@ -8,12 +8,10 @@ use axum::{
 use axum::response::IntoResponse;
 use serde_json;
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use super::super::{AppState, StreamQuery, set_sse_content_type};
-use crate::memory::MemExClient;
 use crate::native_engine::NativeEngine;
 use crate::native_engine::engine_core::ChatRequest;
 use crate::streaming::{StreamManager, SSE_IDLE_TIMEOUT_SECS, SSE_MAX_DURATION_SECS};
@@ -171,23 +169,6 @@ async fn chat_handler(
     };
     tracing::info!(module = "Chat", "[3/7] Providers synced: count={}", providers_to_sync.len());
 
-    tracing::info!(module = "Chat", "[3.5/7] Querying MemEx for relevant memories...");
-    let conv_id_for_memex = conv_id.clone();
-    let memex_injected_context = {
-        let memex: Arc<MemExClient> = state.memex_client.clone();
-        let context_manager = crate::memory::ContextManager::new(memex);
-        let user_message = messages.last()
-            .and_then(|m| m.get("content").and_then(|c: &serde_json::Value| c.as_str()))
-            .unwrap_or_default()
-            .to_string();
-        tokio::spawn(async move {
-            context_manager.before_api_call(&conv_id_for_memex, &user_message).await
-        }).await.unwrap_or_default()
-    };
-    if let Some(mem_context) = &memex_injected_context {
-        tracing::info!(module = "Chat", "[3.5/7] MemEx injected {} chars of context", mem_context.len());
-    }
-
     tracing::info!(module = "Chat", "[4/7] Locking native_engine...");
     let mut start_error = "Native engine is not initialized".to_string();
     let rx_opt = {
@@ -200,20 +181,10 @@ async fn chat_handler(
             // Sync latest providers
             engine.sync_providers(providers_to_sync).await;
 
-            let mut enhanced_messages = messages.clone();
-
-            if let Some(mem_context) = &memex_injected_context {
-                let memory_message = serde_json::json!({
-                    "role": "system",
-                    "content": mem_context
-                });
-                enhanced_messages.insert(0, memory_message);
-            }
-
             let chat_req = crate::native_engine::engine_core::ChatRequest {
                 provider_id: req.provider_id.clone(), effort: req.effort.clone(),
                 conversation_id: conv_id.clone(),
-                messages: enhanced_messages,
+                messages: messages.clone(),
                 model: if model.is_empty() { "claude-sonnet-4-6".to_string() } else { model.clone() },
                 system_prompt: req.system_prompt.clone(),
                 max_tokens: req.max_tokens,
@@ -372,18 +343,6 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::MessageStop { full_text: _, stop_reason } => {
-                    let assistant_message = full_text.clone();
-                    let user_msg = messages.last()
-                        .and_then(|m| m.get("content").and_then(|c: &serde_json::Value| c.as_str()))
-                        .unwrap_or_default()
-                        .to_string();
-                    let conv = conv_id.clone();
-                    tokio::spawn(async move {
-                        let memex: Arc<MemExClient> = state.memex_client.clone();
-                        let context_manager = crate::memory::ContextManager::new(memex);
-                        context_manager.after_response(&conv, &user_msg, &assistant_message).await;
-                    });
-
                     terminal_event = Some(serde_json::json!({
                         "type": "message_stop", "stop_reason": stop_reason, "full_text": full_text.clone(),
                     }));

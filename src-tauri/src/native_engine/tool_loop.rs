@@ -390,9 +390,13 @@ impl ToolLoopExecutor {
             .rev()
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
             .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+            .map(|content| {
+                if let Some(text) = content.as_str() { return text.to_string(); }
+                content.as_array().map(|blocks| blocks.iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>().join("\n")).unwrap_or_default()
+            })
+            .unwrap_or_default();
         tracing::info!(module = "ToolLoop", "[E3] Last user msg len={}", last_user_msg.len());
 
         if let Some(ref prefetch) = self.prefetch_engine {
@@ -461,6 +465,12 @@ impl ToolLoopExecutor {
         match &loop_result {
             Ok((full_text, stop_reason)) => {
                 tracing::info!(module = "ToolLoop", "[E6] API loop COMPLETED, full_text_len={}", full_text.len());
+                // Persist before announcing completion so the next session can recall this turn.
+                if !matches!(stop_reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations")) {
+                    if let Some(ctx_mgr) = &self.context_manager {
+                        ctx_mgr.after_response(&conv_id, &last_user_msg, full_text).await;
+                    }
+                }
                 let _ = self.event_tx.send(EngineEvent::MessageStop {
                     full_text: full_text.clone(),
                     stop_reason: stop_reason.clone(),
@@ -476,15 +486,6 @@ impl ToolLoopExecutor {
                     stop_reason: Some("error".to_string()),
                 }).await;
                 tracing::info!(module = "ToolLoop", "[E7] Error + MessageStop sent (failure)");
-            }
-        }
-
-        // 回复后：存储记忆
-        if let Some(ctx_mgr) = &self.context_manager {
-            if !last_user_msg.is_empty() {
-                if let Ok((ref full_text, _)) = loop_result {
-                    ctx_mgr.after_response(&conv_id, &last_user_msg, full_text).await;
-                }
             }
         }
 
@@ -1234,6 +1235,7 @@ impl ToolLoopExecutor {
             }
 
             if iteration == self.max_tool_iterations - 1 {
+                stop_reason = Some("max_iterations".to_string());
                 let _ = self.event_tx.send(EngineEvent::Error("Max tool iterations reached".to_string())).await;
                 let _ = self.event_tx.send(EngineEvent::MessageStop {
                     full_text: full_text.clone(),
@@ -1692,6 +1694,7 @@ impl ToolLoopExecutor {
             }
 
             if iteration == self.max_tool_iterations - 1 {
+                stop_reason = Some("max_iterations".to_string());
                 let _ = self.event_tx.send(EngineEvent::Error("Max tool iterations reached".to_string())).await;
                 let _ = self.event_tx.send(EngineEvent::MessageStop {
                     full_text: full_text.clone(),
