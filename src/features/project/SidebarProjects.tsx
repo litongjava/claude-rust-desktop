@@ -43,13 +43,14 @@ import CreateProjectDialog from "./CreateProjectDialog";
 import EditProjectDialog from "./EditProjectDialog";
 import TrustProjectDialog from "./TrustProjectDialog";
 import {
-  chatTitle,
+  chatTitle as getChatTitle,
   SidebarChat,
   useSidebarPreferences,
   visibleChats,
 } from "./sidebarModel";
 import "./sidebarProjects.css";
 import { useDialogFocus } from "./useDialogFocus";
+import { useI18n } from "../../hooks/useI18n";
 
 type Popup = {
   kind: "project" | "chat" | "details";
@@ -197,6 +198,8 @@ export default function SidebarProjects({
   streamingIds: Set<string>;
 }) {
   const navigate = useNavigate();
+  const { t } = useI18n();
+  const chatTitle = (chat: SidebarChat) => getChatTitle(chat, t("common.newChat"));
   const location = useLocation();
   const mode = useWorkspaceModeStore((state) => state.mode);
   const recentsCollapsed = useWorkspaceModeStore(
@@ -356,7 +359,7 @@ export default function SidebarProjects({
       );
       await writeText(text);
     } else await navigator.clipboard.writeText(text);
-    setNotice("Copied to clipboard");
+    setNotice(t("sidebar.copied"));
   };
   const copyLink = (chat: SidebarChat) =>
     perform(() =>
@@ -402,9 +405,9 @@ export default function SidebarProjects({
   const openFolder = (path?: string | null) =>
     perform(async () => {
       if (!path)
-        throw new Error("No working directory is associated with this item.");
+        throw new Error(t("sidebar.noDirectory"));
       if (!tauriAPI.isTauri)
-        throw new Error("Open in Explorer is available in the desktop app.");
+        throw new Error(t("sidebar.explorerDesktopOnly"));
       await tauriAPI.openFolder(path);
     });
   const withTrust = (project: Project, action: () => Promise<void>) => {
@@ -533,7 +536,7 @@ export default function SidebarProjects({
         {(streamingIds.has(chat.id) ||
           preferences.unreadChats.includes(chat.id)) && (
           <span
-            aria-label={streamingIds.has(chat.id) ? "Running" : "Unread"}
+            aria-label={streamingIds.has(chat.id) ? t("sidebar.running") : t("sidebar.unread")}
             className={`h-1.5 w-1.5 shrink-0 rounded-full bg-claude-text ${streamingIds.has(chat.id) ? "animate-pulse" : ""}`}
           />
         )}
@@ -542,7 +545,7 @@ export default function SidebarProjects({
       <div className="project-row-actions">
         <button
           type="button"
-          aria-label={`Chat options for ${chatTitle(chat)}`}
+          aria-label={t("sidebar.chatOptions", { name: chatTitle(chat) })}
           onClick={(event) => menuClick(event, "chat", chat.id)}
         >
           <MoreHorizontal size={14} />
@@ -551,8 +554,8 @@ export default function SidebarProjects({
           <button
             type="button"
             disabled={busy}
-            title="Unpin chat"
-            aria-label={`Unpin ${chatTitle(chat)}`}
+            title={t("sidebar.unpinChat")}
+            aria-label={t("sidebar.unpinNamed", { name: chatTitle(chat) })}
             onClick={() => void togglePin(chat)}
           >
             <Pin size={13} fill="currentColor" />
@@ -578,7 +581,7 @@ export default function SidebarProjects({
             )
           }
         >
-          {expandedLists.includes(key) ? "Show less" : "Show more"}
+          {expandedLists.includes(key) ? t("sidebar.showLess") : t("sidebar.showMore")}
         </button>
       )}
     </>
@@ -586,7 +589,7 @@ export default function SidebarProjects({
 
   const projectMenu = (project: Project): MenuItem[] => [
     {
-      label: preferences.pinnedProjects.includes(project.id) ? "Unpin" : "Pin",
+      label: preferences.pinnedProjects.includes(project.id) ? t("sidebar.unpin") : t("sidebar.pin"),
       icon: <Pin size={15} />,
       action: () => {
         preferences.toggle("pinnedProjects", project.id);
@@ -594,7 +597,7 @@ export default function SidebarProjects({
       },
     },
     {
-      label: "Edit",
+      label: t("sidebar.edit"),
       icon: <Settings size={15} />,
       action: () => {
         setEditing(project);
@@ -602,14 +605,14 @@ export default function SidebarProjects({
       },
     },
     {
-      label: "Open in Explorer",
+      label: t("sidebar.openExplorer"),
       icon: <FolderOpen size={15} />,
       separator: true,
       action: () => void openFolder(project.workspace_path),
       disabled: !project.workspace_path,
     },
     {
-      label: "Archive chats",
+      label: t("sidebar.archiveChats"),
       icon: <Archive size={15} />,
       separator: true,
       action: () =>
@@ -627,7 +630,7 @@ export default function SidebarProjects({
         }),
     },
     {
-      label: "Remove project",
+      label: t("sidebar.removeProject"),
       icon: <X size={15} />,
       separator: true,
       action: () => {
@@ -638,27 +641,27 @@ export default function SidebarProjects({
   ];
   const chatMenu = (chat: SidebarChat): MenuItem[] => [
     {
-      label: "Rename",
+      label: t("common.rename"),
       icon: <Pencil size={15} />,
       shortcut: "Ctrl+Alt+R",
       action: () => rename(chat),
     },
     {
-      label: chat.pinned ? "Unpin" : "Pin",
+      label: chat.pinned ? t("sidebar.unpin") : t("sidebar.pin"),
       icon: chat.pinned ? <PinOff size={15} /> : <Pin size={15} />,
       shortcut: "Ctrl+Alt+P",
       action: () => void togglePin(chat),
     },
     {
       label: preferences.unreadChats.includes(chat.id)
-        ? "Mark as read"
-        : "Mark as unread",
+        ? t("sidebar.markRead")
+        : t("sidebar.markUnread"),
       icon: <Eye size={15} />,
       shortcut: "Ctrl+Shift+U",
       action: () => markUnread(chat),
     },
     {
-      label: "Project",
+      label: t("sidebar.project"),
       icon: <FolderSymlink size={15} />,
       children: [
         ...projects.map((project) => ({
@@ -675,7 +678,7 @@ export default function SidebarProjects({
         ...(chat.project_id
           ? [
               {
-                label: `Remove from ${projects.find((project) => project.id === chat.project_id)?.name || "project"}`,
+                label: t("sidebar.removeFrom", { name: projects.find((project) => project.id === chat.project_id)?.name || t("sidebar.project") }),
                 icon: <FolderMinus size={15} />,
                 separator: true,
                 action: () =>
@@ -686,23 +689,23 @@ export default function SidebarProjects({
       ],
     },
     {
-      label: "Copy",
+      label: t("sidebar.copy"),
       icon: <Copy size={15} />,
       separator: true,
       children: [
         {
-          label: "Copy deeplink",
+          label: t("sidebar.copyDeeplink"),
           icon: <Copy size={15} />,
           shortcut: "Ctrl+Alt+L",
           action: () => void copyLink(chat),
         },
         {
-          label: "Copy as Markdown",
+          label: t("sidebar.copyMarkdown"),
           icon: <Copy size={15} />,
           action: () => void copyMarkdown(chat),
         },
         {
-          label: "Copy working directory",
+          label: t("sidebar.copyDirectory"),
           icon: <Copy size={15} />,
           shortcut: "Ctrl+Shift+C",
           disabled: !pathFor(chat),
@@ -711,12 +714,12 @@ export default function SidebarProjects({
       ],
     },
     {
-      label: "Open in",
+      label: t("sidebar.openIn"),
       icon: <ArrowUpRight size={15} />,
       separator: true,
       children: [
         {
-          label: "File Explorer",
+          label: t("sidebar.fileExplorer"),
           icon: <FolderOpen size={15} />,
           disabled: !pathFor(chat),
           action: () => void openFolder(pathFor(chat)),
@@ -724,7 +727,7 @@ export default function SidebarProjects({
       ],
     },
     {
-      label: "Archive",
+      label: t("sidebar.archive"),
       icon: <Archive size={15} />,
       separator: true,
       shortcut: "Ctrl+Shift+A",
@@ -737,14 +740,14 @@ export default function SidebarProjects({
   return (
     <div className="project-sidebar-tree" aria-busy={busy}>
       {!!pinned.length && (
-        <section aria-label="Pinned chats" className="mb-4">
+        <section aria-label={t("sidebar.pinnedChats")} className="mb-4">
           <button
             type="button"
             className="project-section-heading"
             aria-expanded={!preferences.pinnedCollapsed}
             onClick={() => preferences.collapse("pinnedCollapsed")}
           >
-            Pinned
+            {t("sidebar.pinned")}
             <ChevronDown
               size={13}
               className={preferences.pinnedCollapsed ? "-rotate-90" : ""}
@@ -753,7 +756,7 @@ export default function SidebarProjects({
           {!preferences.pinnedCollapsed && chatList(pinned, "pinned")}
         </section>
       )}
-      <section aria-label="Projects">
+      <section aria-label={t("sidebar.projects")}>
         <div className="flex items-center">
           <button
             type="button"
@@ -761,7 +764,7 @@ export default function SidebarProjects({
             aria-expanded={!preferences.projectsCollapsed}
             onClick={() => preferences.collapse("projectsCollapsed")}
           >
-            Projects
+            {t("sidebar.projects")}
             <ChevronDown
               size={13}
               className={preferences.projectsCollapsed ? "-rotate-90" : ""}
@@ -772,12 +775,12 @@ export default function SidebarProjects({
             onClick={() => navigate("/projects")}
             className="mr-1 rounded px-1 py-1 text-[11px] text-claude-textSecondary hover:bg-claude-hover hover:text-claude-text"
           >
-            All projects
+            {t("sidebar.allProjects")}
           </button>
           <button
             type="button"
-            aria-label="Create project"
-            title="Create project"
+            aria-label={t("sidebar.createProject")}
+            title={t("sidebar.createProject")}
             className="rounded p-1 text-claude-textSecondary hover:bg-claude-hover"
             onClick={() => setCreating(true)}
           >
@@ -848,7 +851,7 @@ export default function SidebarProjects({
                     <div className="project-row-actions">
                       <button
                         type="button"
-                        aria-label={`Project options for ${project.name}`}
+                        aria-label={t("sidebar.projectOptions", { name: project.name })}
                         onClick={(event) =>
                           menuClick(event, "project", project.id)
                         }
@@ -857,8 +860,8 @@ export default function SidebarProjects({
                       </button>
                       <button
                         type="button"
-                        aria-label={`New chat in ${project.name}`}
-                        title="New chat"
+                        aria-label={t("sidebar.newChatIn", { name: project.name })}
+                        title={t("sidebar.newChat")}
                         disabled={busy}
                         onClick={() => {
                           stopHover();
@@ -870,7 +873,7 @@ export default function SidebarProjects({
                     </div>
                   </div>
                   {expanded && (sessions.length ? chatList(sessions, project.id, true) : (
-                    <p className="py-1.5 pl-8 text-xs text-claude-textSecondary">No chats in this project</p>
+                    <p className="py-1.5 pl-8 text-xs text-claude-textSecondary">{t("sidebar.noProjectChats")}</p>
                   ))}
                 </div>
               );
@@ -879,7 +882,7 @@ export default function SidebarProjects({
         )}
       </section>
         <section
-          aria-label="Recent chats"
+          aria-label={t("sidebar.recentChats")}
           className="mt-4"
           data-recents-mode={mode}
         >
@@ -889,14 +892,14 @@ export default function SidebarProjects({
             aria-expanded={!recentsCollapsed}
             onClick={() => toggleRecents(mode)}
           >
-            Recents
+            {t("sidebar.recents")}
             <ChevronDown
               size={13}
               className={recentsCollapsed ? "-rotate-90" : ""}
             />
           </button>
           {!recentsCollapsed && (recent.length ? chatList(recent, "recents") : (
-            <p className="px-2 py-1.5 text-xs text-claude-textSecondary">No recent chats</p>
+            <p className="px-2 py-1.5 text-xs text-claude-textSecondary">{t("sidebar.noRecentChats")}</p>
           ))}
         </section>
       {error && (
@@ -907,7 +910,7 @@ export default function SidebarProjects({
           <span className="min-w-0 flex-1 break-words">{error}</span>
           <button
             type="button"
-            aria-label="Dismiss error"
+            aria-label={t("sidebar.dismissError")}
             onClick={() => setError("")}
           >
             <X size={14} />
@@ -962,8 +965,8 @@ export default function SidebarProjects({
                     type="button"
                     title={
                       preferences.pinnedProjects.includes(popupProject.id)
-                        ? "Unpin project"
-                        : "Pin project"
+                        ? t("sidebar.unpinProject")
+                        : t("sidebar.pinProject")
                     }
                     onClick={() =>
                       preferences.toggle("pinnedProjects", popupProject.id)
@@ -987,7 +990,7 @@ export default function SidebarProjects({
                         chat.project_id === popupProject.id && !chat.archived,
                     ).length
                   }{" "}
-                  tasks
+                  {t("sidebar.tasks")}
                 </div>
                 <div className="border-y border-claude-border py-2 max-h-28 overflow-auto">
                   {(popupProject.folders || []).map((folder) => (
@@ -1014,7 +1017,7 @@ export default function SidebarProjects({
                   }}
                 >
                   <Settings size={14} />
-                  Edit project
+                  {t("sidebar.editProject")}
                 </button>
               </div>
             )}
@@ -1099,17 +1102,16 @@ export default function SidebarProjects({
                 id="sidebar-dialog-title"
                 className="mb-4 text-lg font-semibold"
               >
-                {removing ? `Remove ${removing.name}?` : "Rename chat"}
+                {removing ? t("sidebar.removeNamedProject", { name: removing.name }) : t("sidebar.renameChat")}
               </h2>
               {removing ? (
                 <p className="text-sm text-claude-textSecondary">
-                  This removes the project from this app. Your chats are kept in
-                  Recents, and files on disk are not deleted.
+                  {t("sidebar.removeProjectDescription")}
                 </p>
               ) : (
                 <input
                   autoFocus
-                  aria-label="Chat name"
+                  aria-label={t("sidebar.chatName")}
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                   className="w-full rounded-lg border border-claude-border bg-claude-input px-3 py-2 outline-none focus:border-blue-500"
@@ -1130,14 +1132,14 @@ export default function SidebarProjects({
                     setRenaming(null);
                   }}
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="submit"
                   disabled={busy || (!!renaming && !name.trim())}
                   className="rounded-lg bg-claude-text px-4 py-2 text-claude-bg disabled:opacity-40"
                 >
-                  {busy ? "Saving…" : removing ? "Remove project" : "Save"}
+                  {busy ? t("sidebar.saving") : removing ? t("sidebar.removeProject") : t("common.save")}
                 </button>
               </div>
             </form>

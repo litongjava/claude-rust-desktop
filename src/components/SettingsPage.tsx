@@ -19,7 +19,7 @@ const WORK_OPTIONS = [
 type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tasks';
 
 const SettingsPage = () => {
-  const { t } = useI18n();
+  const { t, language, setLanguage } = useI18n();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('general');
   const [profile, setProfile] = useState<any>(null);
@@ -51,7 +51,6 @@ const SettingsPage = () => {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
   const [sendKey, setSendKey] = useState(localStorage.getItem('sendKey') || 'enter'); // enter or ctrl+enter
   const [newlineKey, setNewlineKey] = useState(localStorage.getItem('newlineKey') || (localStorage.getItem('sendKey') === 'enter' ? 'shift_enter' : 'enter'));
-  const [language, setLanguage] = useState(localStorage.getItem('language') || 'zh');
 
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
@@ -239,7 +238,7 @@ const SettingsPage = () => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to create task:', e);
-      window.alert('Failed to create task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.createFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -266,7 +265,7 @@ const SettingsPage = () => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to update task:', e);
-      window.alert('Failed to update task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.updateFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -276,7 +275,7 @@ const SettingsPage = () => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to delete task:', e);
-      window.alert('Failed to delete task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.deleteFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -286,7 +285,7 @@ const SettingsPage = () => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to execute task:', e);
-      window.alert('Failed to execute task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.executeFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -296,7 +295,7 @@ const SettingsPage = () => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to toggle task:', e);
-      window.alert('Failed to toggle task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.toggleFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -385,7 +384,7 @@ const SettingsPage = () => {
               }`}
           >
             <Clock size={16} />
-            Scheduled Tasks
+            {t('tasks.title')}
           </button>
         </div>
 
@@ -401,7 +400,7 @@ const SettingsPage = () => {
               <div className="h-full flex flex-col">
                 {tasksLoading ? (
                   <div className="flex items-center justify-center h-full">
-                    <span className="text-[13px] text-claude-textSecondary">Loading tasks...</span>
+                    <span className="text-[13px] text-claude-textSecondary">{t('tasks.loading')}</span>
                   </div>
                 ) : (
                   <TaskList
@@ -673,17 +672,18 @@ const SettingsPage = () => {
         <section>
           <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.language')}</h3>
           <div>
-            <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.languageLabel')}</label>
-            <div className="relative">
+            <label htmlFor="interface-language" className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.languageLabel')}</label>
+            <div className="relative w-full max-w-xs">
               <select
+                id="interface-language"
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
-                className="w-full max-w-xs px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
+                className="w-full pl-3 pr-8 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
               >
                 <option value="zh">{t('settings.chinese')}</option>
                 <option value="en">{t('settings.english')}</option>
               </select>
-              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
+              <div aria-hidden="true" className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
                 <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
                   <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>

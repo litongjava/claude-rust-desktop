@@ -18,8 +18,8 @@ export interface SidebarChat {
   created_at?: string;
 }
 
-export const chatTitle = (chat: SidebarChat) =>
-  chat.title || chat.first_message?.slice(0, 40) || "New Chat";
+export const chatTitle = (chat: SidebarChat, fallback = "New Chat") =>
+  chat.title || chat.first_message?.slice(0, 40) || fallback;
 export function visibleChats(chats: SidebarChat[], mode?: WorkspaceMode) {
   return chats
     .filter(

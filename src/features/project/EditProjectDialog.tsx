@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useI18n } from "../../hooks/useI18n";
 import { Folder, X } from "lucide-react";
 import { Project, updateProject } from "../../api";
 import FolderFields from "./FolderFields";
@@ -13,6 +14,7 @@ export default function EditProjectDialog({
   onClose: () => void;
   onRemove: () => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState(project.name);
   const [folders, setFolders] = useState(
     project.folders?.map((folder) => folder.path) || [],
@@ -54,12 +56,12 @@ export default function EditProjectDialog({
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 id="edit-project-title" className="text-lg font-semibold">
-            Edit project
+            {t("sidebar.editProject")}
           </h2>
           <button
             type="button"
             disabled={busy}
-            aria-label="Close edit project"
+            aria-label={t("projectDialogs.closeEdit")}
             onClick={onClose}
           >
             <X size={16} />
@@ -69,7 +71,7 @@ export default function EditProjectDialog({
           <Folder size={16} />
           <input
             autoFocus
-            aria-label="Project name"
+            aria-label={t("projectDialogs.name")}
             value={name}
             disabled={busy}
             onChange={(event) => setName(event.target.value)}
@@ -94,7 +96,7 @@ export default function EditProjectDialog({
             onClick={onRemove}
             className="mr-auto rounded-lg bg-red-500/10 px-3 py-2 text-red-500"
           >
-            Remove local project
+            {t("projectDialogs.removeLocal")}
           </button>
           <button
             type="button"
@@ -102,14 +104,14 @@ export default function EditProjectDialog({
             onClick={onClose}
             className="text-claude-textSecondary"
           >
-            Cancel
+            {t("common.cancel")}
           </button>
           <button
             type="submit"
             disabled={busy || !name.trim() || !folders.length}
             className="rounded-lg bg-claude-text px-4 py-2 text-claude-bg disabled:opacity-40"
           >
-            {busy ? "Saving…" : "Save"}
+            {busy ? t("sidebar.saving") : t("common.save")}
           </button>
         </div>
       </form>

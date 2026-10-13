@@ -49,7 +49,14 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [userMenuPos, setUserMenuPos] = useState<{ bottom: number; left: number } | null>(null);
-  const [planLabel, setPlanLabel] = useState('Free plan');
+  const [planName, setPlanName] = useState('');
+  const planKeys: Record<string, string> = {
+    '体验包': 'sidebar.trailPlan',
+    '基础月卡': 'sidebar.proPlan',
+    '专业月卡': 'sidebar.maxX5Plan',
+    '尊享月卡': 'sidebar.maxX20Plan',
+  };
+  const planLabel = planName ? (planKeys[planName] ? t(planKeys[planName]) : planName) : t('sidebar.freePlan');
   const [usageData, setUsageData] = useState<{ token_used: number; token_quota: number } | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
@@ -259,17 +266,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         token_used: Number(data?.token_used) || 0,
         token_quota: Number(data?.token_quota) || 0,
       });
-      if (data.plan && data.plan.name) {
-        const nameMap: Record<string, string> = {
-          '体验包': t('sidebar.trailPlan'),
-          '基础月卡': t('sidebar.proPlan'),
-          '专业月卡': t('sidebar.maxX5Plan'),
-          '尊享月卡': t('sidebar.maxX20Plan'),
-        };
-        setPlanLabel(nameMap[data.plan.name] || data.plan.name);
-      } else {
-        setPlanLabel(t('sidebar.freePlan'));
-      }
+      setPlanName(data.plan?.name || '');
     } catch (e) {
       // 获取失败保持默认
     }
@@ -321,11 +318,11 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       >
         {!isCollapsed && (
           <div className="flex-shrink-0 border-b border-claude-border px-2 py-2 mt-1.5">
-            <div className="flex rounded-lg bg-[var(--bg-mode-tabs)] p-0.5" role="group" aria-label="Workspace mode">
+            <div className="flex rounded-lg bg-[var(--bg-mode-tabs)] p-0.5" role="group" aria-label={t('sidebar.workspaceMode')}>
               {[
-                { id: 'chat' as const, icon: <MessageSquare size={15} />, label: 'Chat' },
-                { id: 'cowork' as const, icon: <Users size={15} />, label: 'Cowork' },
-                { id: 'code' as const, icon: <IconCode size={15} />, label: 'Code' },
+                { id: 'chat' as const, icon: <MessageSquare size={15} />, label: t('sidebar.chatMode') },
+                { id: 'cowork' as const, icon: <Users size={15} />, label: t('sidebar.coworkMode') },
+                { id: 'code' as const, icon: <IconCode size={15} />, label: t('sidebar.code') },
               ].map(tab => (
                 <button key={tab.id} type="button" aria-pressed={activeTab === tab.id}
                   onClick={() => setActiveTab(tab.id)}
@@ -424,7 +421,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   className="font-medium text-claude-text leading-tight"
                   style={{ fontSize: `${tunerConfig?.userNameSize || 15}px`, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}
                 >
-                  {userUser?.display_name || userUser?.full_name || userUser?.nickname || 'User'}
+                  {userUser?.display_name || userUser?.full_name || userUser?.nickname || t('sidebar.user')}
                 </div>
                 {localStorage.getItem('user_mode') === 'selfhosted' ? (
                   <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{t('sidebar.selfHosted')}</div>
@@ -455,7 +452,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             >
               {/* User info header */}
               <div className="px-4 py-2.5 border-b border-claude-border">
-                <div className="text-[13px] font-medium text-claude-text">{userUser?.display_name || userUser?.full_name || userUser?.nickname || 'User'}</div>
+                <div className="text-[13px] font-medium text-claude-text">{userUser?.display_name || userUser?.full_name || userUser?.nickname || t('sidebar.user')}</div>
                 <div className="text-[12px] text-claude-textSecondary mt-0.5">{userUser?.email || ''}</div>
               </div>
               {/* Menu items */}
