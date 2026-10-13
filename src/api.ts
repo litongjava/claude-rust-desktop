@@ -1045,11 +1045,16 @@ export async function compactConversation(
 
 export async function branchConversation(
   conversationId: string,
-  fromMessageId?: string
+  fromMessageId?: string,
+  fromMessageIndex?: number
 ): Promise<{ success: boolean; new_conversation_id: string }> {
+  if (!isTauriApp && !useDevProxy) {
+    const { branchConversation: branchLocalConversation } = await import('./api/conversations');
+    return branchLocalConversation(conversationId, fromMessageId, fromMessageIndex);
+  }
   const res = await request(`/conversations/${conversationId}/branch`, {
     method: 'POST',
-    body: JSON.stringify({ from_message_id: fromMessageId }),
+    body: JSON.stringify({ from_message_id: fromMessageId, from_message_index: fromMessageIndex }),
   });
   return res.json();
 }

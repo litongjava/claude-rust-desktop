@@ -1,5 +1,6 @@
 import React from 'react';
 import WorkDetails from '../trajectory/WorkDetails';
+import ResponseFooter from './ResponseFooter';
 import { useGeneralSettingsStore } from '../../stores/useGeneralSettingsStore';
 import { openChatLink } from '../../utils/chatLinks';
 import {
@@ -35,6 +36,7 @@ export const draftsStore = new Map<string, { text: string; files: PendingFile[];
 
 /** Memoized message list — skips re-render when only inputText changes */
 interface MessageListProps {
+  conversationId?: string | null;
   messages: any[];
   loading: boolean;
   expandedMessages: Set<number>;
@@ -49,7 +51,7 @@ interface MessageListProps {
   onResend: (content: string, idx: number) => void;
   onEdit: (content: string, idx: number) => void;
   onCopy: (content: string, idx: number) => void;
-  onBranch: (idx: number) => void;
+  onBranch: (idx: number) => void | Promise<void>;
   onOpenDocument?: (doc: DocumentInfo) => void;
   onSetMessages: (messages: any[] | ((prev: any[]) => any[])) => void;
   messageContentRefs: React.MutableRefObject<Map<number, HTMLDivElement>>;
@@ -59,7 +61,7 @@ interface MessageListProps {
 }
 
 const MessageList = React.memo<MessageListProps>(({
-  messages, loading, expandedMessages, editingMessageIdx, editingContent,
+  conversationId, messages, loading, expandedMessages, editingMessageIdx, editingContent,
   copiedMessageIdx, compactStatus, onSetEditingContent, onEditCancel, onEditSave,
   onToggleExpand, onResend, onEdit, onCopy, onBranch, onOpenDocument, onSetMessages,
   messageContentRefs, onOpenResearch, onInspect, t,
@@ -397,7 +399,10 @@ const MessageList = React.memo<MessageListProps>(({
                   <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
                 </span>
               )}
-              {!loading && idx === messages.length - 1 && msg.content && (
+              {!isCurrentlyStreaming && (msg.content || msg.thinking || msg.toolCalls?.length) && (
+                <ResponseFooter key={`${conversationId || 'unsaved'}:${msg.id || idx}`} message={msg} index={idx} conversationId={conversationId} disabled={loading} onBranch={onBranch} />
+              )}
+              {!loading && idx === messages.length - 1 && msg.content && compactStatus.state === 'compacting' && (
                 <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
                   <ClaudeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
                   {compactStatus.state === 'compacting' && <CompactingStatus />}

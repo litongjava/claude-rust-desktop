@@ -2,6 +2,120 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+/// Copy history through the selected response, keeping the source session intact.
+pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Option<&str>, message_index: Option<usize>) -> Result<String> {
+    use super::message_repo;
+    let transaction = conn.unchecked_transaction()?;
+    let source = get_conversation(&transaction, source_id)?.ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
+    let mut messages = message_repo::get_messages_by_conversation(&transaction, source_id)?;
+    let index = message_id.and_then(|id| messages.iter().position(|message| message.id == id)).or(message_index);
+    if let Some(index) = index {
+        anyhow::ensure!(index < messages.len(), "Branch message not found");
+        messages.truncate(index + 1);
+    } else {
+        anyhow::ensure!(message_id.is_none(), "Branch message not found");
+    }
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = format!("{} (branch)", source.title.as_deref().unwrap_or("Conversation"));
+    insert_conversation(&transaction, &new_id, Some(&title), source.model.as_deref(), source.provider.as_deref(),
+        source.workspace_path.as_deref(), source.project_id.as_deref(), source.research_mode, false, false,
+        &now, &now, messages.len() as i64)?;
+    set_workspace_mode(&transaction, &new_id, &source.workspace_mode)?;
+    for message in messages {
+        let new_message_id = uuid::Uuid::new_v4().to_string();
+        message_repo::insert_message(&transaction, &new_message_id, &new_id, &message.role, &message.content,
+            message.thinking.as_deref(), &message.created_at, message.is_compact_boundary, message.sort_order)?;
+        let mut tool_ids = std::collections::HashMap::new();
+        for tool in message_repo::get_tool_calls_for_message(&transaction, &message.id)? {
+            let new_tool_id = uuid::Uuid::new_v4().to_string();
+            message_repo::insert_tool_call(&transaction, &new_tool_id, &new_message_id, &tool.name,
+                tool.input.as_deref(), tool.output.as_deref(), tool.is_error, tool.sort_order)?;
+            tool_ids.insert(tool.id, new_tool_id);
+        }
+        let mut snapshots = message_repo::get_request_snapshots(&transaction, &message.id)?;
+        if let Some(requests) = snapshots.as_array_mut() {
+            for request in requests {
+                request["id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+                if let Some(blocks) = request.get_mut("responseBlocks").and_then(|value| value.as_array_mut()) {
+                    for block in blocks {
+                        if let Some(new_tool_id) = block.get("id").and_then(|id| id.as_str()).and_then(|id| tool_ids.get(id)) {
+                            block["id"] = serde_json::json!(new_tool_id);
+                        }
+                    }
+                }
+            }
+        }
+        message_repo::save_request_snapshots(&transaction, &new_message_id, &snapshots)?;
+        transaction.execute("INSERT INTO attachments (id, message_id, file_name, file_type, mime_type, file_size, source)
+            SELECT lower(hex(randomblob(16))), ?1, file_name, file_type, mime_type, file_size, source FROM attachments WHERE message_id = ?2",
+            params![new_message_id, message.id])?;
+    }
+    transaction.commit()?;
+    Ok(new_id)
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+    use crate::db::{message_repo, schema::SCHEMA_SQL};
+
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        migrate_workspace_mode(&conn).unwrap();
+        insert_conversation(&conn, "source", Some("Source"), Some("model"), Some("provider"), Some("D:/project"), None,
+            false, false, false, "now", "now", 3).unwrap();
+        set_workspace_mode(&conn, "source", "code").unwrap();
+        for (index, role) in ["user", "assistant", "user"].iter().enumerate() {
+            message_repo::insert_message(&conn, &format!("m{index}"), "source", role, &format!("content{index}"), None, "now", false, index as i64).unwrap();
+        }
+        message_repo::insert_tool_call(&conn, "tool", "m1", "Read", Some("{}"), Some("result"), false, 0).unwrap();
+        message_repo::save_request_snapshots(&conn, "m1", &serde_json::json!([{
+            "id": "request", "number": 1, "model": "model", "inputTokens": 100, "outputTokens": 20,
+            "responseBlocks": [{"type": "tool_call", "id": "tool", "name": "Read"}]
+        }])).unwrap();
+        conn.execute("INSERT INTO attachments (id, message_id, file_name, source) VALUES ('attachment', 'm0', 'notes.txt', 'notes')", []).unwrap();
+        conn
+    }
+
+    #[test]
+    fn branch_includes_selected_answer_and_copies_metadata_without_reassigning_source_requests() {
+        let conn = fixture();
+        let id = branch_conversation(&conn, "source", Some("m1"), None).unwrap();
+        let branch = get_conversation(&conn, &id).unwrap().unwrap();
+        assert_eq!(branch.workspace_mode, "code");
+        assert_eq!(branch.workspace_path.as_deref(), Some("D:/project"));
+        assert_eq!(branch.provider.as_deref(), Some("provider"));
+        assert_eq!(branch.message_count, 2);
+        let messages = message_repo::get_messages_by_conversation(&conn, &id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "content1");
+        let tools = message_repo::get_tool_calls_for_message(&conn, &messages[1].id).unwrap();
+        assert_eq!(tools[0].output.as_deref(), Some("result"));
+        let snapshots = message_repo::get_request_snapshots(&conn, &messages[1].id).unwrap();
+        assert_ne!(snapshots[0]["id"], "request");
+        assert_eq!(snapshots[0]["outputTokens"], 20);
+        assert_eq!(snapshots[0]["responseBlocks"][0]["id"], tools[0].id);
+        let source_owner: String = conn.query_row("SELECT message_id FROM model_requests WHERE id = 'request'", [], |row| row.get(0)).unwrap();
+        assert_eq!(source_owner, "m1");
+        let attachments: i64 = conn.query_row("SELECT COUNT(*) FROM attachments WHERE message_id = ?1", params![messages[0].id], |row| row.get(0)).unwrap();
+        assert_eq!(attachments, 1);
+        assert_eq!(message_repo::get_messages_by_conversation(&conn, "source").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn branch_uses_optimistic_position_and_invalid_boundary_creates_nothing() {
+        let conn = fixture();
+        let id = branch_conversation(&conn, "source", Some("temporary-id"), Some(1)).unwrap();
+        assert_eq!(message_repo::get_messages_by_conversation(&conn, &id).unwrap().len(), 2);
+        assert!(branch_conversation(&conn, "source", Some("missing"), None).is_err());
+        assert!(branch_conversation(&conn, "source", None, Some(99)).is_err());
+        assert!(branch_conversation(&conn, "missing", None, None).is_err());
+        assert_eq!(list_conversations(&conn).unwrap().len(), 2);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceMode {

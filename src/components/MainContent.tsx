@@ -1506,12 +1506,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (!activeId || loading) return;
     const msg = messages[idx];
     try {
-      const result = await branchConversation(activeId, msg.id);
+      const result = await branchConversation(activeId, msg.id, idx);
       if (result.success && result.new_conversation_id) {
         window.dispatchEvent(new CustomEvent('conversationCreated', { detail: { id: result.new_conversation_id } }));
+        navigate(`/chat/${result.new_conversation_id}`);
+      } else {
+        throw new Error('Failed to create conversation branch');
       }
     } catch (err) {
       console.error('Failed to branch conversation:', err);
+      throw err;
     }
   };
 
@@ -1981,6 +1985,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ maxWidth: `${tunerConfig?.mainContentWidth || 768}px` }}
           >
             <MessageList
+              conversationId={activeId}
               onInspect={id => { setInspectId(id); setConversationView('trajectory'); }}
               messages={messages}
               loading={loading}

@@ -289,6 +289,7 @@ async fn conversation_messages_tail_delete(
 #[derive(Deserialize)]
 struct BranchRequest {
     from_message_id: Option<String>,
+    from_message_index: Option<usize>,
 }
 
 async fn conversation_branch_handler(
@@ -299,28 +300,7 @@ async fn conversation_branch_handler(
     let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            let now = chrono::Utc::now().to_rfc3339();
-            let source = crate::db::conversation_repo::get_conversation(conn, &id)?;
-            let title = source.as_ref().and_then(|c| c.title.as_deref()).unwrap_or("Branched conversation");
-            let model = source.as_ref().and_then(|c| c.model.as_deref());
-            crate::db::conversation_repo::insert_conversation(
-                conn, &new_id, Some(&format!("{} (branch)", title)), model, None, None, None, false, false, false, &now, &now, 0,
-            )?;
-            crate::db::conversation_repo::set_workspace_mode(conn, &new_id, source.as_ref().map(|c| c.workspace_mode.as_str()).unwrap_or("chat"))?;
-            let mut messages = crate::db::message_repo::get_messages_by_conversation(conn, &id)?;
-            if let Some(mid) = req.from_message_id.as_deref() {
-                if let Some(m) = crate::db::message_repo::get_message(conn, mid)? {
-                    messages.retain(|msg| msg.sort_order < m.sort_order);
-                }
-            }
-            for msg in &messages {
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                crate::db::message_repo::insert_message(
-                    conn, &msg_id, &new_id, &msg.role, &msg.content, msg.thinking.as_deref(), &msg.created_at, msg.is_compact_boundary, msg.sort_order,
-                )?;
-            }
-            Ok::<String, anyhow::Error>(new_id)
+            crate::db::conversation_repo::branch_conversation(conn, &id, req.from_message_id.as_deref(), req.from_message_index)
         })
     }).await;
     match result {

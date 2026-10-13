@@ -415,11 +415,30 @@ export async function compactConversation(
 
 export async function branchConversation(
   conversationId: string,
-  fromMessageId?: string
+  fromMessageId?: string,
+  fromMessageIndex?: number
 ): Promise<{ success: boolean; new_conversation_id: string }> {
+  if (!isTauriApp) {
+    const source = getLocalConversation(conversationId);
+    if (!source) throw new Error('Conversation not found');
+    const messages = getLocalMessages(conversationId);
+    const matchingIndex = fromMessageId ? messages.findIndex(message => message.id === fromMessageId) : -1;
+    const index = matchingIndex >= 0 ? matchingIndex : fromMessageIndex;
+    if (index !== undefined && (!Number.isInteger(index) || index < 0 || index >= messages.length)) throw new Error('Branch message not found');
+    if (fromMessageId && index === undefined) throw new Error('Branch message not found');
+    const branchMessages = index === undefined ? messages : messages.slice(0, index + 1);
+    const branch = createLocalConversation(`${source.title || 'Conversation'} (branch)`, source.model, {
+      research_mode: source.research_mode, workspace_mode: source.workspace_mode,
+    });
+    updateLocalConversation(branch.id, {
+      provider: source.provider, workspace_path: source.workspace_path, project_id: source.project_id,
+    });
+    saveLocalMessages(branch.id, branchMessages.map(message => ({ ...message, id: crypto.randomUUID(), conversation_id: branch.id })));
+    return { success: true, new_conversation_id: branch.id };
+  }
   const res = await request(`/conversations/${conversationId}/branch`, {
     method: 'POST',
-    body: JSON.stringify({ from_message_id: fromMessageId }),
+    body: JSON.stringify({ from_message_id: fromMessageId, from_message_index: fromMessageIndex }),
   });
   return res.json();
 }
