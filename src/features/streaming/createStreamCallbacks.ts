@@ -263,9 +263,11 @@ export function createStreamCallbacks(ctx: StreamContext) {
       const existing = snapshots.findIndex((r: any) => r.id === data.snapshot.id);
       if (existing >= 0) snapshots[existing] = { ...snapshots[existing], ...data.snapshot, persisted: data.persisted };
       else {
-        if (tail && tail.endedAt == null) tail.endedAt = Date.now();
+        if (data.snapshot.source !== 'web_search') {
+          if (tail && tail.endedAt == null) tail.endedAt = Date.now();
+          last.currentRequestId = data.snapshot.id;
+        }
         snapshots.push({ ...data.snapshot, persisted: data.persisted });
-        last.currentRequestId = data.snapshot.id;
       }
       last.requestSnapshots = snapshots;
       return next;

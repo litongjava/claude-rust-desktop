@@ -11,6 +11,7 @@ export interface ProcessStep {
 }
 export interface RequestSnapshot {
   id: string;
+  source?: 'native_engine' | 'conversation' | 'web_search';
   number: number;
   startedAt: number;
   model: string;
@@ -165,7 +166,8 @@ export function recordTool(message: any, tool: any, now = Date.now()) {
 }
 export function messageSteps(message: any): ProcessStep[] {
   const recorded: ProcessStep[] = message.processSteps || [];
-  const snapshots: RequestSnapshot[] = message.requestSnapshots || [];
+  // Auxiliary search completions belong to the tool, not the visible answer.
+  const snapshots: RequestSnapshot[] = (message.requestSnapshots || []).filter((request: RequestSnapshot) => request.source !== 'web_search');
   if (snapshots.some(request => request.responseBlocks?.length)) {
     const usedTools = new Set<number>();
     const reconstructed = snapshots.flatMap(request => request.responseBlocks?.length ? request.responseBlocks.flatMap<ProcessStep>((block, index) => {
@@ -258,7 +260,7 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
           : { type: s.kind === 'thinking' ? 'thinking' : 'text', text: s.text || '' });
         const assistant: TraceRecord = {
           id: recordId(i, `response:${request.id}`), kind: 'text', role: 'assistant', turn, step: 0,
-          title: 'Assistant', text: blocks.filter(block => block.type === 'text').map(block => block.text || '').join(''),
+          title: request.source === 'web_search' ? 'WebSearch request' : 'Assistant', text: blocks.filter(block => block.type === 'text').map(block => block.text || '').join(''),
           requestId: request.id, request, blocks, aliases: related.filter(s => s.role === 'assistant').map(s => s.id),
           status: request.status === 'completed' ? 'done' : request.status === 'running' && !running ? 'interrupted' : request.status || (running ? 'running' : 'done'),
           startedAt: request.startedAt, endedAt: request.endedAt ?? undefined,

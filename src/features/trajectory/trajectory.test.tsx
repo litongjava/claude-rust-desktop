@@ -45,6 +45,15 @@ describe('WebFetch output', () => {
 });
 
 describe('ordered process events', () => {
+  it('keeps auxiliary search output out of the reply while preserving its detailed request', () => {
+    const base = { number: 1, startedAt: 100, model: 'test', systemPrompt: '', systemMessages: [], tools: [] };
+    const message = { role: 'assistant', content: 'Answer.', requestSnapshots: [
+      { ...base, id: 'main', responseBlocks: [{ type: 'text', text: 'Answer.' }] },
+      { ...base, id: 'search', source: 'web_search', responseBlocks: [{ type: 'text', text: 'Internal search summary' }] },
+    ] };
+    expect(messageSteps(message).map(step => step.text)).toEqual(['Answer.']);
+    expect(buildTrace([message]).find(record => record.requestId === 'search')).toMatchObject({ title: 'WebSearch request', text: 'Internal search summary' });
+  });
   it('repairs a buffered preamble recorded after its tool using persisted response blocks', () => {
     const message: any = { role: 'assistant', content: 'I will check.Done.', toolCalls: [{ id: 'tool', name: 'Read', input: {}, status: 'done' }],
       processSteps: [{ id: 'tool:tool', kind: 'tool', toolId: 'tool', requestId: 'first' }, { id: 'late', kind: 'text', text: 'I will check.Done.', requestId: 'second' }],

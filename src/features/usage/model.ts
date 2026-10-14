@@ -68,7 +68,9 @@ export function estimateTokens(value: unknown): number {
   return Math.ceil((text.length - cjk) / 4 + cjk);
 }
 export function contextBreakdown(messages: any[], limit?: number | null) {
-  const requests = sessionRequests(messages);
+  // Search has its own short prompt; it contributes usage but cannot replace
+  // the main conversation's active context, model capacity or completion reserve.
+  const requests = sessionRequests(messages).filter(request => request.source !== 'web_search');
   const latest = requests[requests.length - 1];
   const tools = (latest?.tools || []).map(tool => ({ name: tool.name, tokens: estimateTokens(tool), mcp: /^mcp(?:_|__|\.)/i.test(tool.name), description: tool.description }));
   const system = [latest?.systemPrompt, ...(latest?.systemMessages || []).map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content))].filter(Boolean).join('\n');

@@ -19,6 +19,23 @@ function harness() {
   return { callbacks: createStreamCallbacks(ctx), message: () => messages[messages.length - 1] };
 }
 describe('stream process recording', () => {
+  it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s records search usage without closing or reassigning conversation steps', callback => {
+    const { callbacks: c, message } = harness();
+    c[callback]('request_snapshot', '', { snapshot: { id: 'main', tools: [] }, persisted: true });
+    c.onDelta('Searching.', 'Searching.');
+    c.onToolUse({ type: 'start', tool_use_id: 'search-tool', tool_name: 'WebSearch', tool_input: { query: 'weather' } });
+    const search = { id: 'search', source: 'web_search', tools: [], status: 'running' };
+    c[callback]('request_snapshot', '', { snapshot: search, persisted: true });
+    c[callback]('request_snapshot', '', { snapshot: { ...search, status: 'completed', inputTokens: 50, outputTokens: 20 }, persisted: true });
+    expect(message().requestSnapshots).toHaveLength(2);
+    expect(message().requestSnapshots[1]).toMatchObject({ source: 'web_search', inputTokens: 50, outputTokens: 20, persisted: true });
+    expect(message().currentRequestId).toBe('main');
+    expect(message().processSteps.at(-1)).toMatchObject({ kind: 'tool', requestId: 'main' });
+    expect(message().processSteps.at(-1).endedAt).toBeUndefined();
+    c.onToolUse({ type: 'done', tool_use_id: 'search-tool', tool_name: 'WebSearch', content: 'Found a source', is_error: false });
+    c.onDelta('Done.', 'Searching.Done.');
+    expect(message().processSteps.at(-1)).toMatchObject({ kind: 'text', requestId: 'main', text: 'Done.' });
+  });
   it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s updates the same request on response completion without ending or reassigning tool steps', callback => {
     const { callbacks: c, message } = harness();
     const request = { id: 'request-1', number: 27, startedAt: 1000, model: 'test', status: 'running', systemPrompt: 'test', tools: [], responseBlocks: [] };

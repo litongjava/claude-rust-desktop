@@ -30,6 +30,14 @@ describe('usage provider names', () => {
   });
 });
 describe('session usage', () => {
+  it('counts auxiliary search usage and steps without replacing the conversation context', () => {
+    const main = request({ inputTokens: 1000, outputTokens: 50, contextWindow: 80000, reservedForCompletion: 8192, systemPrompt: 'Conversation instructions', totalDurationMs: 500 });
+    const search = request({ id: 'search', source: 'web_search', apiFormat: 'anthropic', inputTokens: 100, cacheReadTokens: 20, outputTokens: 30, contextWindow: 16000, systemPrompt: 'Search instructions', totalDurationMs: 800 });
+    const messages = [{ role: 'user', content: 'Search the web' }, { role: 'assistant', requestSnapshots: [main, { ...search, outputTokens: null }, search] }];
+    expect(aggregateUsage(messages)).toMatchObject({ total: 1200, uncachedInput: 1100, cachedInput: 20, output: 80, measuredRequests: 2 });
+    expect(sessionStatistics(messages)).toMatchObject({ turns: 1, steps: 2, llmMs: 1300 });
+    expect(contextBreakdown(messages)).toMatchObject({ used: 1050, limit: 80000, buffer: 8192, latest: main, system: 'Conversation instructions' });
+  });
   it('normalizes Anthropic cache-exclusive input and OpenAI cache-inclusive input', () => {
     const usage = aggregateUsage([{ requestSnapshots: [request({ apiFormat: 'anthropic', inputTokens: 100, cacheReadTokens: 300, cacheWriteTokens: 20, outputTokens: 50 }), request({ id: 'request-2', apiFormat: 'openai', inputTokens: 420, cacheReadTokens: 300, cacheWriteTokens: 20, outputTokens: 50 })] }]);
     expect(usage).toMatchObject({ uncachedInput: 200, cachedInput: 600, cacheWrite: 40, output: 100, total: 940, available: true });
@@ -49,6 +57,11 @@ describe('session usage', () => {
   });
 });
 describe('context window', () => {
+  it('estimates conversation context when only an auxiliary search snapshot exists', () => {
+    const context = contextBreakdown([{ role: 'user', content: 'hello' }, { role: 'assistant', requestSnapshots: [request({ source: 'web_search', inputTokens: 9999, contextWindow: 80000 })] }]);
+    expect(context).toMatchObject({ estimated: true, limit: null, latest: undefined });
+    expect(context.used).toBeLessThan(9999);
+  });
   it('uses latest context rather than cumulative session input after compaction', () => {
     const context = contextBreakdown([{ requestSnapshots: [request({ inputTokens: 10000, outputTokens: 100 }), request({ id: 'compacted', inputTokens: 900, outputTokens: 100, systemPrompt: '<skills>use this skill</skills>prompt', tools: [{ name: 'mcp__search', description: 'Search', input_schema: {} }, { name: 'Read', description: 'Read file', input_schema: {} }] })] }], 2000);
     expect(context.used).toBe(1000);
