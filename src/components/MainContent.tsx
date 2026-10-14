@@ -7,6 +7,7 @@ import { getConversation, sendMessage, createConversation, getUser, updateConver
 import PermissionDialog, { ApprovalInfo } from './PermissionDialog';
 import { permissionApprovalAPI } from '../utils/tauriAPI';
 import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
+import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
 import { useBusySendStore } from '../stores/useBusySendStore';
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
@@ -92,6 +93,7 @@ interface MainContentProps {
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
   const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
+  const isCodeMode = useWorkspaceModeStore(s => s.mode === 'code');
   const [conversationView, setConversationView] = useState<'chat' | 'trajectory'>('chat');
   const [inspectId, setInspectId] = useState<string | null>(null);
   const busySendBehavior = useGeneralSettingsStore(state => state.busySendBehavior);
@@ -1776,20 +1778,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 1: Landing Page (No ID)
   if (!activeId && messages.length === 0) {
     return (
-      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-y-auto overflow-x-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
+      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative ${isCodeMode ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden'} text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
 
         {/* Centered Content */}
         <div
-          className="flex flex-col items-center shrink-0 min-w-0 w-full mx-auto my-auto px-4 py-10"
+          className={`flex flex-col items-center min-w-0 w-full mx-auto px-4 ${isCodeMode ? 'flex-1 min-h-0 pt-6' : 'shrink-0 my-auto py-10'}`}
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
-            paddingTop: `${40 + (tunerConfig?.mainContentMt || 0)}px`,
+            paddingTop: isCodeMode ? '24px' : `${40 + (tunerConfig?.mainContentMt || 0)}px`,
           }}
         >
 
           <div
-            className="flex items-center justify-center gap-4 w-full min-w-0"
-            style={{ marginBottom: `${tunerConfig?.welcomeMb || 40}px` }}
+            className="flex items-center justify-center gap-4 w-full min-w-0 shrink-0"
+            style={{ marginBottom: isCodeMode ? 0 : `${tunerConfig?.welcomeMb || 40}px` }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
               <ClaudeLogo color="#D97757" maxScale={0.17} />
@@ -1808,7 +1810,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group">
+          <div ref={slashCommandAnchorRef} className={`w-full relative z-20 group ${isCodeMode ? 'order-2 shrink-0 bg-claude-bg pt-2' : ''}`}>
             <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading} />
             {filteredCommands.length > 0 && (
               <SlashCommandSuggestions
@@ -1945,12 +1947,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 </button>
               </div>
             )}
+            {isCodeMode && <SessionUsageBar messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />}
           </div>
-          <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
-            setInputText(prompt);
-            setSlashCommandFilter(null);
-            inputRef.current?.focus();
-          }} />
+          <div className={isCodeMode ? 'order-1 flex-1 min-h-0 w-full overflow-y-auto pb-4' : 'w-full'}>
+            <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
+              setInputText(prompt);
+              setSlashCommandFilter(null);
+              inputRef.current?.focus();
+            }} />
+          </div>
         </div>
         <AddFromGithubModal
           isOpen={showGithubModal}
@@ -1966,17 +1971,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // MODE 2: Chat Interface (Has ID or Messages)
   return (
-    <div className="flex-1 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
+    <div className="flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
       {showCodingView && <div className="flex shrink-0 gap-5 border-b border-claude-border px-5 text-sm" role="tablist" aria-label="会话视图">
         {(['chat', 'trajectory'] as const).map(view => <button type="button" key={view} role="tab" aria-selected={conversationView === view} onClick={() => setConversationView(view)} className={`py-3 ${conversationView === view ? 'border-b-2 border-blue-500 text-blue-500' : 'text-claude-textSecondary'}`}>{view === 'chat' ? 'Chat' : 'Trajectory'}</button>)}
       </div>}
       {showCodingView && conversationView === 'trajectory' && <div className="min-h-0 flex-1"><TrajectoryView messages={messages} loading={loading} focusId={inspectId} /></div>}
 
       {/* Content area - positioning container for scroll + bottom bars */}
-      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : ''}`}>
+      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : isCodeMode ? 'flex flex-col' : ''}`}>
         <div
-          className="absolute inset-0 overflow-y-auto chat-scroll"
-          style={{ paddingBottom: `${inputHeight}px` }}
+          className={`${isCodeMode ? 'flex-1 min-h-0' : 'absolute inset-0'} overflow-y-auto chat-scroll`}
+          style={{ paddingBottom: isCodeMode ? 0 : `${inputHeight}px` }}
           ref={scrollContainerRef}
           onScroll={handleScroll}
         >
@@ -2012,13 +2017,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
         </div>
 
-        {/* 免责声明 - 固定在最底部 */}
-        <div className="absolute bottom-0 left-0 z-10 bg-claude-bg flex items-center justify-center text-[12px] text-claude-textSecondary h-7 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
+        {!isCodeMode && <div className="absolute bottom-0 left-0 z-10 bg-claude-bg flex items-center justify-center text-[12px] text-claude-textSecondary h-7 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
           Claude is AI and can make mistakes. Please double-check responses.
-        </div>
+        </div>}
 
-        {/* 输入框 - 浮动在内容上方，底部距离可调 */}
-        <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ bottom: `${inputBarBottom + 28}px`, paddingLeft: '16px', paddingRight: `${16 + scrollbarWidth}px` }}>
+        {/* Code keeps the complete opaque composer below the message scroller. */}
+        <div className={isCodeMode ? 'relative shrink-0 z-20 bg-claude-bg pt-2' : 'absolute left-0 right-0 z-20 pointer-events-none'} style={{ bottom: isCodeMode ? undefined : `${inputBarBottom + 28}px`, paddingLeft: '16px', paddingRight: isCodeMode ? '16px' : `${16 + scrollbarWidth}px` }}>
           <div
             className="mx-auto pointer-events-auto"
             style={{ maxWidth: `${inputBarWidth}px` }}
