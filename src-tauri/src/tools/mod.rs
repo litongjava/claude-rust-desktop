@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 pub mod macros;
 mod utf8;
 mod web;
+pub(crate) mod provider_search;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -152,7 +153,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebSearch".to_string(),
-            description: "Search the web for information.".to_string(),
+            description: "Search the web using the configured search service. Cite returned source URLs. DeepSeek models use separate search credentials configured in System settings > Web search. If configuration or native search support is missing, relay the tool's setup instructions to the user; do not claim a search succeeded or retry unchanged requests.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1166,7 +1167,9 @@ fn tool_list_dir(input: serde_json::Value, _cwd: &str) -> Result<serde_json::Val
 
 fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> { web::fetch_blocking(input) }
 async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Value> { web::fetch(input).await }
-fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Value> { web::search_blocking(input) }
+fn tool_web_search_blocking(_input: serde_json::Value) -> Result<serde_json::Value> {
+    Err(anyhow!("WebSearch requires a conversation provider and its search settings. Start search from a conversation."))
+}
 
 pub fn run_git_command(args: &[&str], cwd: &str) -> Result<std::process::Output> {
     let mut cmd = std::process::Command::new("git");
@@ -1430,4 +1433,6 @@ fn tool_git_add(input: serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
-async fn tool_web_search_async(input: serde_json::Value) -> Result<serde_json::Value> { web::search(input).await }
+async fn tool_web_search_async(input: serde_json::Value) -> Result<serde_json::Value> { tool_web_search_blocking(input) }
+
+pub(crate) async fn execute_public_web_search(input: serde_json::Value) -> Result<serde_json::Value> { web::search(input).await }

@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio::time::{timeout, Duration};
 
+#[cfg(test)]
+#[path = "search_integration_tests.rs"]
+mod search_integration_tests;
+
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     RequestSnapshot(Value),
@@ -100,6 +104,7 @@ pub struct ToolLoopExecutor {
     context_manager: Option<ContextManager>,
     reasoning_mode: ReasoningMode,
     prefetch_engine: Option<Arc<PrefetchEngine>>,
+    search_config_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +150,92 @@ fn compact_tool_output(tool_name: &str, output: &str) -> String {
     }
 }
 
+fn uses_independent_deepseek_search(provider: &ResolvedProvider) -> bool {
+    match provider.provider.web_search_strategy.as_deref().unwrap_or("auto") {
+        "deepseek_native" | "deepseek" => true,
+        "auto" | "" => provider.model.id.to_ascii_lowercase().contains("deepseek")
+            || provider.provider.builtin_id.as_deref() == Some("deepseek")
+            || reqwest::Url::parse(&provider.provider.base_url).ok()
+                .and_then(|url| url.host_str().map(String::from)).as_deref() == Some("api.deepseek.com"),
+        _ => false,
+    }
+}
+
+async fn independent_search_provider(path: Option<&std::path::Path>) -> Result<ResolvedProvider> {
+    // Read at call time so saving settings takes effect without restarting a turn.
+    let settings = if let Some(path) = path {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => serde_json::from_slice::<crate::config::AppConfig>(&bytes)
+                .map_err(|_| anyhow!("无法读取联网搜索设置，请在系统设置 → 联网搜索中重新保存 DeepSeek 配置。"))?
+                .deepseek_search,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(_) => return Err(anyhow!("无法读取联网搜索设置，请检查应用配置文件权限。")),
+        }
+    } else { Default::default() };
+    settings.resolved_provider()
+}
+
+/// Provider credentials are request-scoped, including parallel tool execution.
+async fn execute_builtin_tool(
+    name: &str,
+    input: Value,
+    cwd: &str,
+    provider: &ResolvedProvider,
+    event_tx: &mpsc::Sender<EngineEvent>,
+    search_config_path: Option<&std::path::Path>,
+) -> Result<Value> {
+    if name != "WebSearch" {
+        return crate::tools::execute_tool_async(name, input, cwd).await;
+    }
+    if crate::tools::provider_search::uses_public_search(provider) {
+        return crate::tools::execute_public_web_search(input).await;
+    }
+
+    let independent;
+    let provider = if uses_independent_deepseek_search(provider) {
+        independent = independent_search_provider(search_config_path).await?;
+        &independent
+    } else { provider };
+
+    let mut trace = RequestTrace::new(json!({
+        "id": uuid::Uuid::new_v4().to_string(), "number": 0,
+        "startedAt": chrono::Utc::now().timestamp_millis(),
+        "model": provider.model.id, "providerId": provider.provider.id,
+        "providerName": provider.provider.name, "apiFormat": provider.provider.api_format,
+        "source": "web_search", "systemPrompt": null, "systemMessages": [], "tools": [],
+        "searchQuery": input["query"]
+    }));
+    let _ = event_tx.send(EngineEvent::RequestSnapshot(trace.started())).await;
+    let result = crate::tools::provider_search::search(input, provider).await;
+    let snapshot = match &result {
+        Ok(value) => {
+            trace.observe_openai(&json!({"usage": value["usage"], "model": value["model"], "id": value["response_id"]}));
+            trace.mark_completed();
+            let mut snapshot = trace.finish("completed", None);
+            snapshot["apiFormat"] = value["api_format"].clone();
+            if let Some(tokens) = snapshot["totalTokens"].as_f64() {
+                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+            }
+            snapshot
+        }
+        Err(error) => {
+            if let Some(response) = error.downcast_ref::<crate::tools::provider_search::SearchResponseError>() {
+                trace.observe_openai(&json!({"usage": response.usage, "model": response.model, "id": response.response_id}));
+            }
+            let mut snapshot = trace.finish("error", Some(&error.to_string()));
+            if let Some(response) = error.downcast_ref::<crate::tools::provider_search::SearchResponseError>() {
+                snapshot["apiFormat"] = json!(response.api_format);
+            }
+            if let Some(tokens) = snapshot["totalTokens"].as_f64() {
+                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+            }
+            snapshot
+        }
+    };
+    let _ = event_tx.send(EngineEvent::RequestSnapshot(snapshot)).await;
+    result
+}
+
 async fn execute_tool_standalone(
     tool_name: String,
     tool_input: Value,
@@ -156,6 +247,8 @@ async fn execute_tool_standalone(
     conv_id: Option<String>,
     completed_count: Arc<AtomicUsize>,
     total_count: usize,
+    provider: ResolvedProvider,
+    search_config_path: Option<std::path::PathBuf>,
 ) -> (String, String, Value, String, bool) {
     crate::metrics::TOOL_CALLS_TOTAL.inc();
     let _tool_timer = crate::metrics::TOOL_CALL_DURATION.start_timer();
@@ -229,14 +322,14 @@ async fn execute_tool_standalone(
                 Err(e) => (format!("Error: {}", e), true),
             }
         } else {
-            let result = crate::tools::execute_tool_async(&tool_name, tool_input.clone(), &workspace_cwd).await;
+            let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref()).await;
             match &result {
                 Ok(val) => (serde_json::to_string_pretty(val).unwrap_or_default(), false),
                 Err(e) => (format!("Error: {}", e), true),
             }
         }
     } else {
-        let result = crate::tools::execute_tool_async(&tool_name, tool_input.clone(), &workspace_cwd).await;
+        let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref()).await;
         match &result {
             Ok(val) => (serde_json::to_string_pretty(val).unwrap_or_default(), false),
             Err(e) => (format!("Error: {}", e), true),
@@ -293,7 +386,13 @@ impl ToolLoopExecutor {
             context_manager: None,
             reasoning_mode,
             prefetch_engine: None,
+            search_config_path: None,
         }
+    }
+
+    pub fn with_search_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.search_config_path = Some(path);
+        self
     }
 
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
@@ -539,7 +638,7 @@ impl ToolLoopExecutor {
                 };
             } else {
                 let cwd = self.get_workspace_cwd().to_string();
-                let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &cwd).await;
+                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
                 output_str = match &result {
                     Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                     Err(e) => format!("Error: {}", e),
@@ -548,7 +647,7 @@ impl ToolLoopExecutor {
             }
         } else {
             let cwd = self.get_workspace_cwd().to_string();
-            let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &cwd).await;
+            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
             output_str = match &result {
                 Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                 Err(e) => format!("Error: {}", e),
@@ -769,7 +868,7 @@ impl ToolLoopExecutor {
                 is_error = result.is_err();
             } else {
                 let cwd = self.get_workspace_cwd().to_string();
-                let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &cwd).await;
+                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
                 output_str = match &result {
                     Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                     Err(e) => format!("Error: {}", e),
@@ -778,7 +877,7 @@ impl ToolLoopExecutor {
             }
         } else {
             let cwd = self.get_workspace_cwd().to_string();
-            let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &cwd).await;
+            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
             output_str = match &result {
                 Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                 Err(e) => format!("Error: {}", e),
@@ -1204,6 +1303,8 @@ impl ToolLoopExecutor {
                             conv_id_clone.clone(),
                             completed_count.clone(),
                             total + serial_calls.len(),
+                            self.provider.clone(),
+                            self.search_config_path.clone(),
                         );
                         futures.push(fut);
                     }
@@ -1662,6 +1763,8 @@ impl ToolLoopExecutor {
                             conv_id_clone.clone(),
                             completed_count.clone(),
                             total + serial_calls.len(),
+                            self.provider.clone(),
+                            self.search_config_path.clone(),
                         );
                         futures.push(fut);
                     }

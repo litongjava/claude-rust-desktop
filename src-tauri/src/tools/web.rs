@@ -395,14 +395,6 @@ pub(super) async fn search(input: Value) -> Result<Value> {
     .await
 }
 
-pub(super) fn search_blocking(input: Value) -> Result<Value> {
-    // Blocking tool dispatch runs on a worker thread. Use the same bounded provider race.
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(search(input))
-}
-
 trait SafeError {
     fn without_url_if_reqwest(&self) -> String;
 }

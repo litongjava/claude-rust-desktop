@@ -425,6 +425,8 @@ impl QueryEngine {
             if estimated + max_tokens as u64 > context as u64 { anyhow::bail!("Input plus output budget exceeds the configured context window; compact the conversation or lower max output tokens"); }
         }
 
+        let search_config_path = self.provider_manager.lock().await.config_path()
+            .parent().unwrap_or(std::path::Path::new(".")).join("config.json");
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -437,6 +439,7 @@ impl QueryEngine {
         .with_memex(crate::memory::MemExClient::with_path(
             self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir).join("memory.sqlite3"), None,
         ))
+        .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_manager(self.permission_manager.clone())
