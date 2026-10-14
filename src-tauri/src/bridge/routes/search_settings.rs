@@ -2,7 +2,7 @@ use super::super::AppState;
 use crate::config::{ConfigManager, DeepSeekSearchConfig};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -69,6 +69,20 @@ async fn get_settings(State(state): State<AppState>) -> ApiResult {
     Ok(Json(public_settings(&manager.get_config().deepseek_search)))
 }
 
+fn key_response(config: &DeepSeekSearchConfig) -> (HeaderMap, Json<Value>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    (headers, Json(json!({"apiKey": config.api_key})))
+}
+
+// Read the saved key only when the user explicitly chooses View or Copy.
+async fn get_key(State(state): State<AppState>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let guard = state.config_manager.lock().await;
+    let manager = guard.as_ref()
+        .ok_or_else(|| failure(StatusCode::SERVICE_UNAVAILABLE, "配置服务暂不可用"))?;
+    Ok(key_response(&manager.get_config().deepseek_search))
+}
+
 async fn update_settings(State(state): State<AppState>, Json(value): Json<Value>) -> ApiResult {
     let mut guard = state.config_manager.lock().await;
     let manager = guard
@@ -129,11 +143,23 @@ pub fn routes() -> Router<AppState> {
             get(get_settings).patch(update_settings),
         )
         .route("/api/search-settings/test", post(test_settings))
+        .route("/api/search-settings/key", post(get_key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_key_response_is_not_cacheable_and_normal_settings_stay_masked() {
+        let config = DeepSeekSearchConfig { api_key: "saved-search-key".into(), ..Default::default() };
+        let (headers, Json(body)) = key_response(&config);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(body["apiKey"], "saved-search-key");
+        assert!(public_settings(&config).get("apiKey").is_none());
+        assert!(!public_settings(&config).to_string().contains("saved-search-key"));
+        assert_eq!(key_response(&DeepSeekSearchConfig::default()).1.0["apiKey"], "");
+    }
 
     #[test]
     fn search_settings_preserve_replace_and_clear_key_without_echoing_it() {

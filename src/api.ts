@@ -1181,6 +1181,11 @@ function searchSettingsResult(data: SearchSettings): SearchSettings {
 export async function getSearchSettings(): Promise<SearchSettings> {
   return searchSettingsResult(await providerRequest('/search-settings'));
 }
+export async function getSearchApiKey(): Promise<string> {
+  const data = await providerRequest('/search-settings/key', 'POST');
+  if (typeof data.apiKey !== 'string' || !data.apiKey) throw new Error('无法读取搜索密钥，请重试');
+  return data.apiKey;
+}
 export async function updateSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettings> {
   return searchSettingsResult(await providerRequest('/search-settings', 'PATCH', settings));
 }

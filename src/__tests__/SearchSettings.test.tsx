@@ -4,13 +4,15 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SearchSettings from '../components/SearchSettings';
 import SettingsPage from '../components/SettingsPage';
-import { getProviders, getSearchSettings, updateSearchSettings, testSearchSettings, type SearchSettings as SearchSettingsData, type SearchSettingsTestResult } from '../api';
+import { getProviders, getSearchSettings, getSearchApiKey, updateSearchSettings, testSearchSettings, type SearchSettings as SearchSettingsData, type SearchSettingsTestResult } from '../api';
+import { copyToClipboard } from '../utils/clipboard';
 
 vi.mock('../api', () => ({
-  getSearchSettings: vi.fn(), updateSearchSettings: vi.fn(), testSearchSettings: vi.fn(), getProviders: vi.fn(),
+  getSearchSettings: vi.fn(), getSearchApiKey: vi.fn(), updateSearchSettings: vi.fn(), testSearchSettings: vi.fn(), getProviders: vi.fn(),
   getUserProfile: vi.fn().mockResolvedValue({}), getUserUsage: vi.fn().mockResolvedValue({}),
   getSessions: vi.fn().mockResolvedValue({ sessions: [] }), getProviderModels: vi.fn().mockResolvedValue([]),
 }));
+vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn() }));
 vi.mock('../components/ProviderSettings', () => ({ default: () => null }));
 vi.mock('../components/McpSettingsPage', () => ({ default: () => null }));
 vi.mock('../components/TaskList', () => ({ default: () => null }));
@@ -30,6 +32,8 @@ describe('independent DeepSeek search settings', () => {
     localStorage.clear();
     vi.clearAllMocks();
     vi.mocked(getSearchSettings).mockResolvedValue(existing);
+    vi.mocked(getSearchApiKey).mockResolvedValue('saved-search-secret');
+    vi.mocked(copyToClipboard).mockResolvedValue(true);
     vi.mocked(testSearchSettings).mockResolvedValue(searchSuccess);
     vi.mocked(updateSearchSettings).mockImplementation(async patch => ({
       baseUrl: patch.baseUrl, model: patch.model, hasApiKey: !patch.clearApiKey,
@@ -42,6 +46,7 @@ describe('independent DeepSeek search settings', () => {
     await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
     expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
     expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'password');
+    expect(getSearchApiKey).not.toHaveBeenCalled();
     await user.clear(screen.getByLabelText('搜索模型'));
     await user.type(screen.getByLabelText('搜索模型'), 'deepseek-custom');
     await user.click(screen.getByRole('button', { name: '保存联网搜索设置' }));
@@ -131,5 +136,92 @@ describe('independent DeepSeek search settings', () => {
     expect(testSearchSettings).toHaveBeenCalledWith({ baseUrl: existing.baseUrl, model: existing.model, clearApiKey: true });
     expect(updateSearchSettings).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: '测试搜索' })).toBeEnabled();
+  });
+
+  it('reveals and hides the saved key only on demand, preserving blank-save semantics', async () => {
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    expect(getSearchApiKey).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '查看搜索密钥' }));
+    expect(await screen.findByDisplayValue('saved-search-secret')).toHaveAttribute('type', 'text');
+    await user.click(screen.getByRole('button', { name: '隐藏搜索密钥' }));
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'password');
+    await user.click(screen.getByRole('button', { name: '查看搜索密钥' }));
+    await user.click(screen.getByRole('button', { name: '保存联网搜索设置' }));
+    expect(updateSearchSettings).toHaveBeenCalledWith({ baseUrl: existing.baseUrl, model: existing.model });
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'password');
+    expect(localStorage.setItem).not.toHaveBeenCalled();
+  });
+
+  it('copies the saved key without revealing or changing the draft', async () => {
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.click(screen.getByRole('button', { name: '复制搜索密钥' }));
+    expect(await screen.findByText('已复制')).toBeInTheDocument();
+    expect(copyToClipboard).toHaveBeenCalledWith('saved-search-secret');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'password');
+    await user.click(screen.getByRole('button', { name: '保存联网搜索设置' }));
+    expect(updateSearchSettings).toHaveBeenCalledWith({ baseUrl: existing.baseUrl, model: existing.model });
+    expect(localStorage.setItem).not.toHaveBeenCalled();
+  });
+
+  it('views and copies a typed draft before the saved key', async () => {
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.type(screen.getByLabelText('搜索 API 密钥'), 'new-key');
+    await user.click(screen.getByRole('button', { name: '查看搜索密钥' }));
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'text');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('new-key');
+    await user.click(screen.getByRole('button', { name: '复制搜索密钥' }));
+    expect(copyToClipboard).toHaveBeenCalledWith('new-key');
+    expect(getSearchApiKey).not.toHaveBeenCalled();
+    await user.click(screen.getByLabelText('保存时清除搜索密钥'));
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveAttribute('type', 'password');
+    expect(screen.getByRole('button', { name: '查看搜索密钥' })).toBeDisabled();
+  });
+
+  it.each(['查看搜索密钥', '复制搜索密钥'])('shows a generic retrieval error for %s', async label => {
+    vi.mocked(getSearchApiKey).mockRejectedValue(new Error('secret-from-response'));
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.click(screen.getByRole('button', { name: label }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法读取搜索密钥，请重试');
+    expect(screen.queryByText('secret-from-response')).not.toBeInTheDocument();
+    expect(copyToClipboard).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+  });
+
+  it('reports clipboard failure without exposing the key', async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(false);
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.click(screen.getByRole('button', { name: '复制搜索密钥' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('复制失败，请重试');
+    expect(screen.queryByText('已复制')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+  });
+
+  it('prevents edits and competing key actions while reading the saved key', async () => {
+    let finish!: (value: string) => void;
+    vi.mocked(getSearchApiKey).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.click(screen.getByRole('button', { name: '查看搜索密钥' }));
+    expect(screen.getByLabelText('搜索 API 密钥')).toBeDisabled();
+    expect(screen.getByRole('button', { name: '复制搜索密钥' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存联网搜索设置' })).toBeDisabled();
+    await act(async () => { finish('saved-search-secret'); });
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('saved-search-secret');
+    expect(screen.getByLabelText('搜索 API 密钥')).toBeEnabled();
   });
 });
