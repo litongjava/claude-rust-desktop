@@ -147,6 +147,7 @@ export async function getConversation(id: string) {
           const localMessages = getLocalMessages(id);
           return {
             id: localConv.id, title: localConv.title, model: localConv.model,
+            workspace_mode: conversationWorkspaceMode(localConv), project_id: localConv.project_id,
             workspace_path: localConv.workspace_path, created_at: localConv.created_at,
             updated_at: localConv.updated_at, message_count: localConv.message_count,
             messages: localMessages.map(m => ({
@@ -166,6 +167,7 @@ export async function getConversation(id: string) {
       return {
         id: data.id, title: data.title, model: data.model,
         workspace_mode: conversationWorkspaceMode(data),
+        project_id: data.project_id,
         workspace_path: data.workspace_path, created_at: data.created_at,
         updated_at: data.updated_at, message_count: data.message_count,
         messages: (data.messages || []).map((m: any, index: number) => {
@@ -194,6 +196,7 @@ export async function getConversation(id: string) {
         console.log('[API] getConversation fallback to localStorage, messages:', localMessages.length);
         return {
           id: localConv.id, title: localConv.title, model: localConv.model,
+          workspace_mode: conversationWorkspaceMode(localConv), project_id: localConv.project_id,
           workspace_path: localConv.workspace_path, created_at: localConv.created_at,
           updated_at: localConv.updated_at, message_count: localConv.message_count,
           messages: localMessages.map(m => ({
@@ -215,6 +218,7 @@ export async function getConversation(id: string) {
   console.log('[API] getConversation from localStorage, messages:', messages.length);
   return {
     id: conv.id, title: conv.title, model: conv.model,
+    workspace_mode: conversationWorkspaceMode(conv), project_id: conv.project_id,
     workspace_path: conv.workspace_path, created_at: conv.created_at,
     updated_at: conv.updated_at, message_count: conv.message_count,
     messages: messages.map(m => ({

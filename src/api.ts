@@ -873,6 +873,7 @@ export async function getConversation(id: string) {
     provider: conv.provider,
     workspace_path: conv.workspace_path,
     project_id: conv.project_id,
+    workspace_mode: conversationWorkspaceMode(conv),
     research_mode: conv.research_mode,
     pinned: conv.pinned,
     archived: conv.archived,
