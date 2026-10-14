@@ -7,7 +7,7 @@ import { getConversation, sendMessage, createConversation, getUser, updateConver
 import PermissionDialog, { ApprovalInfo } from './PermissionDialog';
 import { permissionApprovalAPI } from '../utils/tauriAPI';
 import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
-import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
+import { useWorkspaceModeStore, conversationWorkspaceMode } from '../stores/useWorkspaceModeStore';
 import { useBusySendStore } from '../stores/useBusySendStore';
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
@@ -18,6 +18,7 @@ import { useToolStore } from '../stores/useToolStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import PermissionModeSelector from './PermissionModeSelector';
+import HomeModeSelector, { type HomeMode } from './HomeModeSelector';
 import PromptSuggestionsPanel from './PromptSuggestionsPanel';
 import FileUploadPreview, { PendingFile } from './FileUploadPreview';
 import AddFromGithubModal from './AddFromGithubModal';
@@ -93,7 +94,10 @@ interface MainContentProps {
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
   const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
-  const isCodeMode = useWorkspaceModeStore(s => s.mode === 'code');
+  const workspaceMode = useWorkspaceModeStore(s => s.mode);
+  const isCodeMode = workspaceMode === 'code';
+  const [modeChanging, setModeChanging] = useState(false);
+  const [modeError, setModeError] = useState('');
   const [conversationView, setConversationView] = useState<'chat' | 'trajectory'>('chat');
   const [inspectId, setInspectId] = useState<string | null>(null);
   const busySendBehavior = useGeneralSettingsStore(state => state.busySendBehavior);
@@ -298,7 +302,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const inputBarWidth = 768;
   const inputBarMinHeight = 32;
   const inputBarRadius = 22;
-  const inputBarBottom = 0;
   const inputBarBaseHeight = inputBarMinHeight + 16; // border-box: content + padding (pt-4=16px + pb-0=0px)
   const textareaHeightVal = useRef(inputBarBaseHeight);
 
@@ -365,7 +368,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const {
     scrollContainerRef,
     isAtBottomRef,
-    scrollbarWidth,
     scrollToBottom,
     scheduleScrollToBottomAfterRender,
     handleScroll,
@@ -448,14 +450,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   }, [id]);
 
-  // 动态调整 paddingBottom，使聊天列表能滚到输入框上方
+  // Keep bottom-follow behavior in sync with composer height changes.
   useEffect(() => {
     const el = inputWrapperRef.current;
     if (!el) return;
 
     const updateHeight = () => {
-      // 底部留白 = 输入框高度 + 底部边距(48px)
-      setInputHeight(el.offsetHeight + 48);
+      setInputHeight(el.offsetHeight);
     };
 
     // 初始测量
@@ -620,7 +621,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           if (data?.model && viewingIdRef.current === buffConvId) {
             setCurrentModelString(isModelSelectable(data.model) ? data.model : resolveModelForNewChat(data.model));
           }
-          if (viewingIdRef.current === buffConvId) setReadyConversationId(buffConvId);
+          if (viewingIdRef.current === buffConvId) {
+            useWorkspaceModeStore.getState().setMode(conversationWorkspaceMode(data));
+            setReadyConversationId(buffConvId);
+          }
         }).catch(() => {});
       } else {
         setLoading(false);
@@ -837,6 +841,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
       }
+      useWorkspaceModeStore.getState().setMode(conversationWorkspaceMode(data));
       // Restore research mode toggle
       setResearchMode(!!data.research_mode);
       const normalizedMessages = (data.messages || []).map((msg: any) => {
@@ -985,6 +990,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
+  const handleHomeModeChange = async (mode: HomeMode) => {
+    if (modeChanging || loading || workspaceMode === mode || (activeId && readyConversationId !== activeId)) return;
+    const conversationId = activeId;
+    setModeChanging(true);
+    setModeError('');
+    try {
+      if (conversationId) await updateConversation(conversationId, { workspace_mode: mode });
+      if (viewingIdRef.current === (conversationId || null) && useWorkspaceModeStore.getState().mode !== 'code') {
+        useWorkspaceModeStore.getState().setMode(mode);
+      }
+      window.dispatchEvent(new CustomEvent('conversationUpdated', { detail: { id: conversationId } }));
+    } catch (error) {
+      setModeError(error instanceof Error ? error.message : 'Could not change mode');
+    } finally {
+      setModeChanging(false);
+    }
+  };
+
   const handleAttachToProject = async (project: Project) => {
     setShowPlusMenu(false);
     setShowProjectsSubmenu(false);
@@ -1015,6 +1038,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   };
 
   const handleSend = async (overrideText?: string, queuedFiles?: PendingFile[], queuedMessageId?: string) => {
+    if (modeChanging) return;
     try {
     const files = queuedFiles ?? pendingFiles;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
@@ -1778,20 +1802,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 1: Landing Page (No ID)
   if (!activeId && messages.length === 0) {
     return (
-      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative ${isCodeMode ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden'} text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
+      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
 
         {/* Centered Content */}
         <div
-          className={`flex flex-col items-center min-w-0 w-full mx-auto px-4 ${isCodeMode ? 'flex-1 min-h-0 pt-6' : 'shrink-0 my-auto py-10'}`}
+          className="flex flex-col items-center min-w-0 w-full mx-auto px-4 flex-1 min-h-0 pt-6"
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
-            paddingTop: isCodeMode ? '24px' : `${40 + (tunerConfig?.mainContentMt || 0)}px`,
+            paddingTop: '24px',
           }}
         >
 
           <div
             className="flex items-center justify-center gap-4 w-full min-w-0 shrink-0"
-            style={{ marginBottom: isCodeMode ? 0 : `${tunerConfig?.welcomeMb || 40}px` }}
+            style={{ marginBottom: 0 }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
               <ClaudeLogo color="#D97757" maxScale={0.17} />
@@ -1810,8 +1834,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div ref={slashCommandAnchorRef} className={`w-full relative z-20 group ${isCodeMode ? 'order-2 shrink-0 bg-claude-bg pt-2' : ''}`}>
-            <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading} />
+          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group order-2 shrink-0 bg-claude-bg pt-2">
+            {isCodeMode && <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading} />}
             {filteredCommands.length > 0 && (
               <SlashCommandSuggestions
                 anchorRef={slashCommandAnchorRef}
@@ -1903,10 +1927,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       {...plusMenuCallbacks}
                     />
                   )}
+                  {!isCodeMode && <HomeModeSelector mode={workspaceMode} onChange={handleHomeModeChange} disabled={loading || modeChanging} />}
                   {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
                 </div>
                 <div className="flex flex-wrap justify-end items-center gap-2 ml-auto">
-                  <PermissionModeSelector />
+                  {isCodeMode && <PermissionModeSelector neutral />}
                   <ModelSelector
                     currentModelString={currentModelString}
                     models={selectorModels}
@@ -1947,9 +1972,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 </button>
               </div>
             )}
-            {isCodeMode && <SessionUsageBar messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />}
+            {!isCodeMode && <div className="mt-2"><ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging} /></div>}
+            {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
+            <SessionUsageBar messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />
+            {!isCodeMode && <p className="pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
           </div>
-          <div className={isCodeMode ? 'order-1 flex-1 min-h-0 w-full overflow-y-auto pb-4' : 'w-full'}>
+          <div className="order-1 flex-1 min-h-0 w-full overflow-y-auto pb-4">
             <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
               setInputText(prompt);
               setSlashCommandFilter(null);
@@ -1978,10 +2006,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       {showCodingView && conversationView === 'trajectory' && <div className="min-h-0 flex-1"><TrajectoryView messages={messages} loading={loading} focusId={inspectId} /></div>}
 
       {/* Content area - positioning container for scroll + bottom bars */}
-      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : isCodeMode ? 'flex flex-col' : ''}`}>
+      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : 'flex flex-col'}`}>
         <div
-          className={`${isCodeMode ? 'flex-1 min-h-0' : 'absolute inset-0'} overflow-y-auto chat-scroll`}
-          style={{ paddingBottom: isCodeMode ? 0 : `${inputHeight}px` }}
+          className="flex-1 min-h-0 overflow-y-auto chat-scroll"
           ref={scrollContainerRef}
           onScroll={handleScroll}
         >
@@ -2017,18 +2044,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
         </div>
 
-        {!isCodeMode && <div className="absolute bottom-0 left-0 z-10 bg-claude-bg flex items-center justify-center text-[12px] text-claude-textSecondary h-7 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
-          Claude is AI and can make mistakes. Please double-check responses.
-        </div>}
-
-        {/* Code keeps the complete opaque composer below the message scroller. */}
-        <div className={isCodeMode ? 'relative shrink-0 z-20 bg-claude-bg pt-2' : 'absolute left-0 right-0 z-20 pointer-events-none'} style={{ bottom: isCodeMode ? undefined : `${inputBarBottom + 28}px`, paddingLeft: '16px', paddingRight: isCodeMode ? '16px' : `${16 + scrollbarWidth}px` }}>
+        {/* Keep the complete opaque composer below the message scroller. */}
+        <div className="relative shrink-0 z-20 bg-claude-bg pt-2 px-4">
           <div
             className="mx-auto pointer-events-auto"
             style={{ maxWidth: `${inputBarWidth}px` }}
           >
             <div className="w-full relative group" ref={inputWrapperRef}>
-              <ProjectWorkspaceBar projectId={currentProjectId} onSelect={handleAttachToProject} disabled={loading} />
+              {isCodeMode && <ProjectWorkspaceBar projectId={currentProjectId} onSelect={handleAttachToProject} disabled={loading} />}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -2086,7 +2109,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     onPaste={handlePaste}
                   />
                 </div>
-                <div className="px-4 pb-3 pt-1 flex items-center justify-between">
+                <div className="px-4 pb-3 pt-1 flex flex-wrap gap-2 items-center justify-between">
                   <div className="relative flex items-center">
                     <button
                       ref={plusBtnRef}
@@ -2111,10 +2134,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         {...plusMenuCallbacks}
                       />
                     )}
+                    {!isCodeMode && <HomeModeSelector mode={workspaceMode} onChange={handleHomeModeChange} disabled={loading || modeChanging} />}
                     {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
-
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap justify-end items-center gap-3 ml-auto">
                     {activeId && queues[activeId]?.length > 0 && <div className="max-w-[200px] text-xs text-claude-textSecondary">
                       <span>{t('general.queued')} ({queues[activeId].length})</span>
                       {queues[activeId].map(message => <div key={message.id} className="flex items-center gap-1">
@@ -2122,7 +2145,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <button aria-label={t('general.cancelQueued')} onClick={() => useBusySendStore.getState().cancel(activeId, message.id)}>&times;</button>
                       </div>)}
                     </div>}
-                    <PermissionModeSelector />
+                    {isCodeMode && <PermissionModeSelector neutral />}
                     <ModelSelector
                       currentModelString={currentModelString}
                       models={selectorModels}
@@ -2177,7 +2200,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   </div>
                 </div>
               </div>
+              {!isCodeMode && <div className="mt-2"><ProjectWorkspaceBar projectId={currentProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging} /></div>}
+              {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
               <SessionUsageBar key={activeId || 'new'} messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />
+              {!isCodeMode && <p className="pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
               {false && (
                 <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs pointer-events-auto">
                   <span>您当前没有可用套餐，无法发送消息</span>

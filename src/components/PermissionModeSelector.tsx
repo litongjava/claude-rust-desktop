@@ -52,12 +52,13 @@ const MODE_OPTIONS: PermissionModeOption[] = [
 ];
 
 interface PermissionModeSelectorProps {
+  neutral?: boolean;
   className?: string;
   value?: PermissionMode;
   onChange?: (mode: PermissionMode) => void;
 }
 
-export default function PermissionModeSelector({ className = '', value, onChange }: PermissionModeSelectorProps) {
+export default function PermissionModeSelector({ className = '', value, onChange, neutral = false }: PermissionModeSelectorProps) {
   const { t } = useI18n();
   const activePermissionMode = useChatStore((s) => s.permissionMode);
   const permissionMode = value ?? activePermissionMode;
@@ -174,7 +175,7 @@ export default function PermissionModeSelector({ className = '', value, onChange
           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium bg-claude-input border border-claude-border hover:bg-claude-hover transition-colors"
         >
           {currentMode.icon}
-          <span className={getModeBadgeColor(permissionMode as PermissionMode)}>{currentMode.label}</span>
+          <span className={neutral ? 'text-claude-text' : getModeBadgeColor(permissionMode as PermissionMode)}>{currentMode.label}</span>
           <svg width="10" height="6" viewBox="0 0 10 6" fill="none" className={`text-claude-textSecondary transition-transform ${isOpen ? 'rotate-180' : ''}`}>
             <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
@@ -218,7 +219,7 @@ export default function PermissionModeSelector({ className = '', value, onChange
                   {permissionMode === option.value && (
                     <div className="flex-shrink-0 mt-1">
                       <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                        <path d="M2 7L5.5 10.5L12 3.5" stroke="#387ee0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M2 7L5.5 10.5L12 3.5" stroke={neutral ? 'currentColor' : '#387ee0'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </div>
                   )}
