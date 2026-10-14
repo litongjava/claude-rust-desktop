@@ -1,12 +1,34 @@
 import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { RequestSnapshot } from '../trajectory/model';
 import { aggregateUsage, contextBreakdown, sessionStatistics } from './model';
 import SessionUsageBar from './SessionUsageBar';
 import UsagePopover from './UsagePopover';
+import TokenUsageDetails from './TokenUsageDetails';
+import { useChatStore } from '../../stores/useChatStore';
 
 const request = (override: Partial<RequestSnapshot> = {}): RequestSnapshot => ({ id: 'request-1', number: 1, model: 'model', startedAt: 1000, tools: [], systemPrompt: '', systemMessages: [], ...override });
+beforeEach(() => useChatStore.setState({ providersCache: [] }));
+describe('usage provider names', () => {
+  it('keeps the recorded provider name when the provider was renamed or deleted', () => {
+    useChatStore.setState({ providersCache: [{ id: 'provider-uuid', name: 'Renamed provider', enabled: true }] });
+    render(<TokenUsageDetails showModels usage={aggregateUsage([{ requestSnapshots: [request({ providerId: 'provider-uuid', providerName: 'DeepSeek Official', responseModel: 'deepseek-flash' })] }])} />);
+    expect(screen.getByText('DeepSeek Official / deepseek-flash')).toBeInTheDocument();
+    expect(screen.queryByText(/provider-uuid/)).not.toBeInTheDocument();
+  });
+  it('resolves older snapshots through the provider catalog', () => {
+    useChatStore.setState({ providersCache: [{ id: 'provider-uuid', name: 'My provider', enabled: true }] });
+    render(<TokenUsageDetails showModels usage={aggregateUsage([{ requestSnapshots: [request({ providerId: 'provider-uuid', model: 'model-v2' })] }])} />);
+    expect(screen.getByText('My provider / model-v2')).toBeInTheDocument();
+    expect(screen.queryByText(/provider-uuid/)).not.toBeInTheDocument();
+  });
+  it('shows a meaningful fallback without exposing an unresolved provider UUID', () => {
+    render(<TokenUsageDetails showModels usage={aggregateUsage([{ requestSnapshots: [request({ providerId: 'deleted-provider-uuid', model: 'model-v2' })] }])} />);
+    expect(screen.getByText('Unknown provider / model-v2')).toBeInTheDocument();
+    expect(screen.queryByText(/deleted-provider-uuid/)).not.toBeInTheDocument();
+  });
+});
 describe('session usage', () => {
   it('normalizes Anthropic cache-exclusive input and OpenAI cache-inclusive input', () => {
     const usage = aggregateUsage([{ requestSnapshots: [request({ apiFormat: 'anthropic', inputTokens: 100, cacheReadTokens: 300, cacheWriteTokens: 20, outputTokens: 50 }), request({ id: 'request-2', apiFormat: 'openai', inputTokens: 420, cacheReadTokens: 300, cacheWriteTokens: 20, outputTokens: 50 })] }]);

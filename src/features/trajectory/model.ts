@@ -20,6 +20,7 @@ export interface RequestSnapshot {
   persisted?: boolean;
   status?: 'running' | 'completed' | 'error' | 'interrupted';
   providerId?: string;
+  providerName?: string;
   apiFormat?: string;
   responseModel?: string;
   responseId?: string | null;
