@@ -1,3 +1,4 @@
+import { pendingMarkerLength } from './utils/streamMarkers';
 import { processMetadata, restoreProcessMetadata } from './features/trajectory/model';
 import { useWorkspaceModeStore, conversationWorkspaceMode } from './stores/useWorkspaceModeStore';
 import { splitModelKey } from './utils/modelConfig';
@@ -2179,7 +2180,7 @@ export async function sendMessage(
               appendVisibleText(inlineArtifactBuffer);
               inlineArtifactBuffer = '';
             } else {
-              const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_OPEN.length - 1);
+              const keep = pendingMarkerLength(inlineArtifactBuffer, INLINE_ARTIFACT_OPEN);
               const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
               if (emit) appendVisibleText(emit);
               inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
@@ -2223,7 +2224,7 @@ export async function sendMessage(
             emitInlineArtifactDraft(true);
             activeInlineArtifact = null;
           } else {
-            const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_CLOSE.length - 1);
+            const keep = pendingMarkerLength(inlineArtifactBuffer, INLINE_ARTIFACT_CLOSE);
             const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
             if (emit) appendInlineArtifactPreview(emit);
             inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
@@ -2416,6 +2417,7 @@ export async function sendMessage(
 
           // Handle message_start with usage data
           if (parsed.type === 'request_snapshot') {
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
             flushPending();
             onSystem?.('request_snapshot', '', parsed);
             continue;
@@ -2445,6 +2447,7 @@ export async function sendMessage(
 
           // Handle tool use events
           if (parsed.type === 'tool_use_start' && onToolUse) {
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
             flushPending();
             try { onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' }); } catch (err) { console.error('[API] onToolUse start callback error:', err); }
           }
@@ -2452,6 +2455,7 @@ export async function sendMessage(
             try { onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input }); } catch (err) { console.error('[API] onToolUse input callback error:', err); }
           }
           if (parsed.type === 'tool_use_done' && onToolUse) {
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
             flushPending();
             try { onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content || parsed.output, is_error: parsed.is_error }); } catch (err) { console.error('[API] onToolUse done callback error:', err); }
           }
