@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "Çalışma alanı modu",
+    "homeMode": "Ana Sayfa",
     "chatMode": "Sohbet",
     "coworkMode": "İş birliği",
     "code": "Kod",

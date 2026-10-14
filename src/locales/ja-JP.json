@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "ワークスペースモード",
+    "homeMode": "ホーム",
     "chatMode": "チャット",
     "coworkMode": "共同作業",
     "code": "コード",

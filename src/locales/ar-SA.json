@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "وضع مساحة العمل",
+    "homeMode": "الرئيسية",
     "chatMode": "المحادثة",
     "coworkMode": "التعاون",
     "code": "البرمجة",

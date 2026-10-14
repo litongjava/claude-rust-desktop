@@ -23,7 +23,7 @@ export const chatTitle = (chat: SidebarChat, fallback = "New Chat") =>
 export function visibleChats(chats: SidebarChat[], mode?: WorkspaceMode) {
   return chats
     .filter(
-      (chat) => !chat.archived && (!mode || conversationWorkspaceMode(chat) === mode),
+      (chat) => !chat.archived && (!mode || (conversationWorkspaceMode(chat) === 'code') === (mode === 'code')),
     )
     .sort((a, b) =>
       (b.updated_at || b.created_at || "").localeCompare(

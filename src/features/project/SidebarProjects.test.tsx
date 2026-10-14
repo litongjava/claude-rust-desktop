@@ -72,7 +72,7 @@ beforeEach(() => {
   localStorage.clear();
   useWorkspaceModeStore.setState({
     mode: "code",
-    recentsCollapsed: { chat: false, cowork: false, code: false },
+    recentsCollapsed: { chat: false, work: false, study: false, code: false },
   });
   useSidebarPreferences.setState({
     pinnedProjects: [],
@@ -108,7 +108,7 @@ const projectMenu = () =>
   );
 
 describe("project sidebar", () => {
-  it.each(["chat", "cowork", "code"] as const)("keeps empty Recents visible in %s", async mode => {
+  it.each(["chat", "work", "study", "code"] as const)("keeps empty Recents visible in %s", async mode => {
     useWorkspaceModeStore.setState({ mode });
     await setup([]);
     const recents = screen.getByRole("region", { name: "Recent chats" });
@@ -118,7 +118,7 @@ describe("project sidebar", () => {
     expect(within(recents).queryByText("No recent chats")).not.toBeInTheDocument();
     expect(within(recents).getByRole("button", { name: "Recents" })).toBeInTheDocument();
   });
-  it.each(["chat", "cowork", "code"] as const)("includes project sessions in %s Recents without mixing modes", async mode => {
+  it.each(["chat", "work", "study", "code"] as const)("includes project sessions in %s Recents without mixing Home and Code", async mode => {
     useWorkspaceModeStore.setState({ mode });
     await setup([
       { id: "own", title: "Current project task", project_id: "p1", workspace_mode: mode },
@@ -130,6 +130,29 @@ describe("project sidebar", () => {
     expect(within(recents).queryByText("Other mode task")).not.toBeInTheDocument();
     expect(screen.queryByText("Archived")).not.toBeInTheDocument();
     expect(within(recents).getByText("Current project task").closest(".project-sidebar-row")).not.toHaveClass("project-session-row");
+  });
+  it.each(["chat", "work", "study"] as const)("combines Home conversations and pins while composing in %s", async mode => {
+    useWorkspaceModeStore.setState({ mode });
+    await setup([
+      { id: "chat", title: "Chat session", workspace_mode: "chat" },
+      { id: "work", title: "Work session", workspace_mode: "work", project_id: "p1" },
+      { id: "study", title: "Study session", workspace_mode: "study", project_id: "p1" },
+      { id: "legacy", title: "Legacy cowork session", workspace_mode: "cowork" },
+      { id: "pin", title: "Study pin", workspace_mode: "study", pinned: true },
+      { id: "code", title: "Code session", workspace_mode: "code" },
+      { id: "code-pin", title: "Code pin", workspace_mode: "code", pinned: true },
+    ]);
+    const recents = screen.getByRole("region", { name: "Recent chats" });
+    for (const title of ["Chat session", "Work session", "Study session", "Legacy cowork session"]) {
+      expect(within(recents).getByText(title)).toBeInTheDocument();
+    }
+    expect(within(recents).queryByText("Code session")).not.toBeInTheDocument();
+    const pinned = screen.getByRole("region", { name: "Pinned chats" });
+    expect(within(pinned).getByText("Study pin")).toBeInTheDocument();
+    expect(within(pinned).queryByText("Code pin")).not.toBeInTheDocument();
+    fireEvent.click(within(recents).getByRole("button", { name: "Recents" }));
+    expect(useWorkspaceModeStore.getState().recentsCollapsed.chat).toBe(true);
+    expect(useWorkspaceModeStore.getState().recentsCollapsed.code).toBe(false);
   });
   it("expands a Code project's sessions in Chat, including pinned sessions, and opens the selected chat", async () => {
     useWorkspaceModeStore.setState({ mode: "chat" });

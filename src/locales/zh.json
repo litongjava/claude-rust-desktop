@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "工作区模式",
+    "homeMode": "Home",
     "chatMode": "聊天",
     "coworkMode": "协作",
     "code": "代码",

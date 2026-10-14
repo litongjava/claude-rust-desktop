@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "Chế độ không gian làm việc",
+    "homeMode": "Trang chủ",
     "chatMode": "Trò chuyện",
     "coworkMode": "Cộng tác",
     "code": "Mã",

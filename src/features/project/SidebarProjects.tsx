@@ -202,8 +202,9 @@ export default function SidebarProjects({
   const chatTitle = (chat: SidebarChat) => getChatTitle(chat, t("common.newChat"));
   const location = useLocation();
   const mode = useWorkspaceModeStore((state) => state.mode);
+  const recentsMode = mode === 'code' ? 'code' : 'chat';
   const recentsCollapsed = useWorkspaceModeStore(
-    (state) => state.recentsCollapsed[state.mode],
+    (state) => state.recentsCollapsed[recentsMode],
   );
   const toggleRecents = useWorkspaceModeStore((state) => state.toggleRecents);
   const preferences = useSidebarPreferences();
@@ -227,7 +228,7 @@ export default function SidebarProjects({
   const popupAnchor = useRef<HTMLElement | null>(null);
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const busyRef = useRef(false);
-  // Projects span workspace modes; Recents and Pinned belong to the active mode.
+  // Projects span workspace modes; Home combines Chat, Work, and Study sessions.
   const currentChats = visibleChats(chats, mode);
   const projectChats = visibleChats(chats);
   const activeId = location.pathname.match(/^\/chat\/([^/]+)/)?.[1];
@@ -884,13 +885,13 @@ export default function SidebarProjects({
         <section
           aria-label={t("sidebar.recentChats")}
           className="mt-4"
-          data-recents-mode={mode}
+          data-recents-mode={mode === 'code' ? 'code' : 'home'}
         >
           <button
             type="button"
             className="project-section-heading"
             aria-expanded={!recentsCollapsed}
-            onClick={() => toggleRecents(mode)}
+            onClick={() => toggleRecents(recentsMode)}
           >
             {t("sidebar.recents")}
             <ChevronDown

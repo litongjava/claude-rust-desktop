@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "कार्यक्षेत्र मोड",
+    "homeMode": "होम",
     "chatMode": "चैट",
     "coworkMode": "सहयोग",
     "code": "कोड",

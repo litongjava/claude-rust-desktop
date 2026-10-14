@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "Режим рабочей области",
+    "homeMode": "Главная",
     "chatMode": "Чат",
     "coworkMode": "Совместная работа",
     "code": "Код",

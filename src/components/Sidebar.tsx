@@ -5,7 +5,7 @@ import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
 import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 import { useI18n } from '../hooks/useI18n';
 import { IconCode } from './Icons';
-import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Pin, PinOff, X, MessageSquare, Users } from 'lucide-react';
+import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Pin, PinOff, X, Home } from 'lucide-react';
 import { getConversations, getUser, getUserUsage, logout, getUserProfile } from '../api';
 
 import SearchModal from './SearchModal';
@@ -63,6 +63,8 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [isAdmin, setIsAdmin] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const activeTab = useWorkspaceModeStore(s => s.mode);
+  const activeSection = activeTab === 'code' ? 'code' : 'home';
+  const lastHomeMode = useWorkspaceModeStore(s => s.lastHomeMode);
   const setActiveTab = useWorkspaceModeStore(s => s.setMode);
   const [showSwarm, setShowSwarm] = useState(false);
   const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set(useStreamingStore.getState().streamingIds));
@@ -327,13 +329,16 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           <div className="flex-shrink-0 border-b border-claude-border px-2 py-2 mt-1.5">
             <div className="flex rounded-lg bg-[var(--bg-mode-tabs)] p-0.5" role="group" aria-label={t('sidebar.workspaceMode')}>
               {[
-                { id: 'chat' as const, icon: <MessageSquare size={15} />, label: t('sidebar.chatMode') },
-                { id: 'cowork' as const, icon: <Users size={15} />, label: t('sidebar.coworkMode') },
+                { id: 'home' as const, icon: <Home size={15} />, label: t('sidebar.homeMode') },
                 { id: 'code' as const, icon: <IconCode size={15} />, label: t('sidebar.code') },
               ].map(tab => (
-                <button key={tab.id} type="button" aria-pressed={activeTab === tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex-1 flex items-center justify-center gap-1.5 h-7 px-1.5 rounded-md text-[13px] font-normal text-claude-text transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-textSecondary ${activeTab === tab.id ? 'bg-[var(--bg-mode-tab-active)] shadow-sm' : 'hover:bg-claude-btnHover'}`}>
+                <button key={tab.id} type="button" aria-pressed={activeSection === tab.id}
+                  onClick={() => {
+                    if (tab.id === activeSection) return;
+                    setActiveTab(tab.id === 'code' ? 'code' : lastHomeMode);
+                    handleNewChat();
+                  }}
+                  className={`flex-1 flex items-center justify-center gap-1.5 h-7 px-1.5 rounded-md text-[13px] font-normal text-claude-text transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-textSecondary ${activeSection === tab.id ? 'bg-[var(--bg-mode-tab-active)] shadow-sm' : 'hover:bg-claude-btnHover'}`}>
                   {tab.icon}{tab.label}
                 </button>
               ))}
@@ -343,8 +348,8 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         <div ref={scrollRef} className="flex-1 overflow-y-auto sidebar-scroll min-h-0 px-2 pt-3 pb-4">
           <SidebarNavigation collapsed={isCollapsed} onNewChat={handleNewChat} onSearch={() => setShowSearch(true)} onPanel={panel => openPanel(panel as Parameters<typeof openPanel>[0])} onNavigate={handleNavClick} onSwarm={() => setShowSwarm(true)} />
           {!isCollapsed && <SidebarProjects chats={chats} streamingIds={streamingIds} onOpenChat={id => { onCloseOverlays?.(); navigate(`/chat/${id}`); }} />}
-          {!isCollapsed && activeTab === 'cowork' && (
-            <div className="mt-3 border-t border-claude-border pt-3" data-sidebar-panel="cowork">
+          {!isCollapsed && activeTab === 'work' && (
+            <div className="mt-3 border-t border-claude-border pt-3" data-sidebar-panel="work">
               <SwarmCollaboration />
             </div>
           )}

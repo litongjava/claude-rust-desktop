@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "작업 공간 모드",
+    "homeMode": "홈",
     "chatMode": "채팅",
     "coworkMode": "협업",
     "code": "코드",

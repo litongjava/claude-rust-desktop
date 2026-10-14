@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "[0034] Tryb przestrzeni roboczej",
+    "homeMode": "Strona główna",
     "chatMode": "Czat",
     "coworkMode": "Współpraca",
     "code": "Kod",

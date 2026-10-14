@@ -72,6 +72,7 @@
   },
   "sidebar": {
     "workspaceMode": "Modo de espacio de trabajo",
+    "homeMode": "Inicio",
     "chatMode": "Chat",
     "coworkMode": "Colaboración",
     "code": "Código",
