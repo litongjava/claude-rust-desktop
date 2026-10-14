@@ -90,8 +90,21 @@ export function commandStreams(value: unknown): { stdout: string; stderr: string
 }
 export function toolOutput(tool: any): string {
   const result = tool.result ?? tool.output ?? tool.error;
+  const webContent = webFetchContent(tool.name || '', result);
+  if (webContent !== null) return webContent;
   const streams = toolCategory(tool.name || '') === 'Ran commands' ? commandStreams(result) : null;
   return streams ? [streams.stdout, streams.stderr].filter(Boolean).join('\n') : rawText(result);
+}
+/** Successful fetches display/copy the readable page, not transport metadata. */
+export function webFetchContent(name: string, value: unknown): string | null {
+  if (!/^web_?fetch$/i.test(name)) return null;
+  let result: any = value;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch { return null; }
+  }
+  if (!result || typeof result !== 'object' || result.success === false || result.is_error === true || result.isError === true
+    || result.error || Number(result.status_code ?? result.status) >= 400) return null;
+  return typeof result.content === 'string' || Array.isArray(result.content) ? extractTextContent(result.content) : null;
 }
 export function requestSystemPrompt(request: RequestSnapshot): string {
   const contentText = (value: unknown): string => Array.isArray(value)
@@ -151,11 +164,11 @@ export function recordTool(message: any, tool: any, now = Date.now()) {
   message.processStartedAt ??= now;
 }
 export function messageSteps(message: any): ProcessStep[] {
-  if (message.processSteps?.length) return message.processSteps;
+  const recorded: ProcessStep[] = message.processSteps || [];
   const snapshots: RequestSnapshot[] = message.requestSnapshots || [];
   if (snapshots.some(request => request.responseBlocks?.length)) {
     const usedTools = new Set<number>();
-    return snapshots.flatMap(request => (request.responseBlocks || []).flatMap<ProcessStep>((block, index) => {
+    const reconstructed = snapshots.flatMap(request => request.responseBlocks?.length ? request.responseBlocks.flatMap<ProcessStep>((block, index) => {
       const base = { requestId: request.id, startedAt: request.firstTokenAt ?? request.startedAt, endedAt: request.endedAt ?? undefined };
       if (block.type === 'tool_call') {
         const tools = message.toolCalls || [];
@@ -167,17 +180,41 @@ export function messageSteps(message: any): ProcessStep[] {
         const tool = message.toolCalls[toolIndex];
         return [{ ...base, id: `tool:${tool.id || toolIndex}`, kind: 'tool', toolId: tool.id || String(toolIndex) }];
       }
+      if (block.type !== 'text' && block.type !== 'thinking') return [];
       return [{ ...base, id: `response:${request.id}:block:${index}`, kind: block.type === 'thinking' ? 'thinking' : 'text', text: block.text || '' }];
-    }));
+    }) : recorded.filter(step => step.requestId === request.id));
+    const full = extractTextContent(message.content);
+    const matches = (steps: ProcessStep[]) => {
+      const text = steps.filter(step => step.kind === 'text').map(step => step.text || '').join('');
+      const toolIds = new Set(steps.filter(step => step.kind === 'tool').map(step => step.toolId));
+      return text === full && (message.toolCalls || []).every((tool: any, index: number) => toolIds.has(tool.id || String(index)));
+    };
+    // Provider response blocks retain the true text/tool boundaries. Older local
+    // events may have recorded buffered preamble text after its tool. Prefer the
+    // complete authoritative order, while retaining live steps for running requests.
+    // Matching visible text prevents reintroducing filtered inline artifacts.
+    if (matches(reconstructed)) return reconstructed;
+    reconstructed.push(...recorded.filter(step => !snapshots.some(request => request.id === step.requestId)));
+    if (matches(reconstructed)) return reconstructed;
+    const snapshotText = reconstructed.filter(step => step.kind === 'text').map(step => step.text || '').join('');
+    if (!recorded.length && full.startsWith(snapshotText)) {
+      const tail = full.slice(snapshotText.length);
+      if (tail) reconstructed.push({ id: 'live-answer', kind: 'text', text: tail, requestId: snapshots[snapshots.length - 1]?.id });
+      if (matches(reconstructed)) return reconstructed;
+    }
   }
+  if (recorded.length) return recorded;
   const steps: ProcessStep[] = [];
   if (message.thinking) steps.push({ id: 'thinking', kind: 'thinking', text: message.thinking });
   const tools = message.toolCalls || [];
   let prefix = '';
   tools.forEach((tool: any, i: number) => {
     if (tool.textBefore) {
-      steps.push({ id: `before:${i}`, kind: 'text', text: tool.textBefore });
-      prefix += tool.textBefore;
+      // Native tool events carry a cumulative prefix; legacy events may instead
+      // contain only the commentary since the previous tool.
+      const text = tool.textBefore.startsWith(prefix) ? tool.textBefore.slice(prefix.length) : tool.textBefore;
+      if (text) steps.push({ id: `before:${i}`, kind: 'text', text });
+      prefix += text;
     }
     steps.push({ id: `tool:${tool.id || i}`, kind: 'tool', toolId: tool.id || String(i), startedAt: tool.startedAt, endedAt: tool.endedAt });
   });

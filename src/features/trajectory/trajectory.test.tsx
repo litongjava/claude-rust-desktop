@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { buildTrace, finishProcess, messageSteps, recordText, recordTool, restoreProcessMetadata } from './model';
+import { buildTrace, finishProcess, messageSteps, recordText, recordTool, restoreProcessMetadata, toolOutput } from './model';
+import ToolOutput from './ToolOutput';
 import WorkDetails from './WorkDetails';
 import TrajectoryView from './TrajectoryView';
 import { useGeneralSettingsStore } from '../../stores/useGeneralSettingsStore';
@@ -26,7 +27,56 @@ beforeEach(() => {
   useGeneralSettingsStore.setState({ workDetails: 'standard', showCodingView: true });
 });
 
+describe('WebFetch output', () => {
+  it.each(['object', 'json'])('shows and copies only successful page content from %s results', format => {
+    const value = { success: true, url: 'https://example.com', status: 200, content: 'Readable article\nSecond paragraph', truncated: false };
+    const result = format === 'json' ? JSON.stringify(value) : value;
+    const { container } = render(<ToolOutput name="WebFetch" result={result} />);
+    expect(container.textContent).toBe(value.content);
+    expect(container.textContent).not.toMatch(/success|https|truncated/);
+    expect(toolOutput({ name: 'WebFetch', result })).toBe(value.content);
+  });
+  it.each([{ success: false, content: 'Unavailable', error: 'HTTP 403 Forbidden' }, { status: 500, content: 'Server error' }])('preserves failed fetch details', result => {
+    const { container } = render(<ToolOutput name="WebFetch" result={JSON.stringify(result)} />);
+    expect(container.textContent).toContain(result.content);
+    expect(container.textContent).toContain('error' in result ? result.error : '500');
+    expect(toolOutput({ name: 'WebFetch', result })).toContain('error' in result ? result.error : '500');
+  });
+});
+
 describe('ordered process events', () => {
+  it('repairs a buffered preamble recorded after its tool using persisted response blocks', () => {
+    const message: any = { role: 'assistant', content: 'I will check.Done.', toolCalls: [{ id: 'tool', name: 'Read', input: {}, status: 'done' }],
+      processSteps: [{ id: 'tool:tool', kind: 'tool', toolId: 'tool', requestId: 'first' }, { id: 'late', kind: 'text', text: 'I will check.Done.', requestId: 'second' }],
+      requestSnapshots: [{ id: 'first', responseBlocks: [{ type: 'text', text: 'I will check.' }, { type: 'tool_call', id: 'tool', name: 'Read', input: {} }] },
+        { id: 'second', responseBlocks: [{ type: 'text', text: 'Done.' }] }] };
+    const steps = messageSteps(message);
+    expect(steps.map(step => step.kind)).toEqual(['text', 'tool', 'text']);
+    expect(steps.filter(step => step.kind === 'text').map(step => step.text)).toEqual(['I will check.', 'Done.']);
+    expect(messageSteps({ ...message, processSteps: undefined })).toEqual(steps);
+    expect(messageSteps({ ...message, processSteps: message.processSteps.map((step: any) => ({ ...step, requestId: undefined })) })).toEqual(steps);
+    const { container } = render(<WorkDetails message={message} index={0} live={false} />);
+    const text = container.textContent || '';
+    expect(text.indexOf('I will check.')).toBeLessThan(text.indexOf('Read files'));
+    expect(text.indexOf('Read files')).toBeLessThan(text.indexOf('Done.'));
+    expect(screen.getAllByText('I will check.')).toHaveLength(1);
+  });
+  it('keeps the currently streaming suffix after completed request tools and on reconnect', () => {
+    const message: any = { content: 'Before.After', toolCalls: [{ id: 't', name: 'Bash', input: {} }], requestSnapshots: [
+      { id: 'first', responseBlocks: [{ type: 'text', text: 'Before.' }, { type: 'tool_call', id: 't', name: 'Bash', input: {} }] },
+      { id: 'second', responseBlocks: [] },
+    ], processSteps: [{ id: 'tail', kind: 'text', text: 'After', requestId: 'second' }] };
+    expect(messageSteps(message).map(step => step.kind)).toEqual(['text', 'tool', 'text']);
+    expect(messageSteps(message).slice(-1)[0]?.text).toBe('After');
+    expect(messageSteps({ ...message, processSteps: undefined }).slice(-1)[0]?.text).toBe('After');
+  });
+  it('does not repeat cumulative tool preambles in legacy history', () => {
+    const steps = messageSteps({ content: 'First.Second.Final.', toolCalls: [
+      { id: 'a', name: 'Read', textBefore: 'First.' }, { id: 'b', name: 'Read', textBefore: 'First.Second.' },
+    ] });
+    expect(steps.map(step => step.kind)).toEqual(['text', 'tool', 'text', 'tool', 'text']);
+    expect(steps.filter(step => step.kind === 'text').map(step => step.text)).toEqual(['First.', 'Second.', 'Final.']);
+  });
   it('matches repeated tool arguments by call ID before historical input fallback', () => {
     const input = { command: 'pwd' };
     const steps = messageSteps({ requestSnapshots: [{ id: 'request', responseBlocks: [
