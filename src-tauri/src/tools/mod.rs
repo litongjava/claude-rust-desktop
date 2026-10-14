@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 
 pub mod macros;
 mod utf8;
+mod web;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -136,12 +137,15 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebFetch".to_string(),
-            description: "Fetch content from a URL.".to_string(),
+            description: "Fetch readable text and links from a web page. Removes page scripts and navigation. Output is bounded; use next_offset to read more, or raw=true to inspect markup.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "The URL to fetch" },
-                    "headers": { "type": "object", "description": "Optional HTTP headers" }
+                    "headers": { "type": "object", "description": "Optional HTTP headers" },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 50000, "description": "Maximum returned characters (default 12000, hard limit 50000)" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Character offset in extracted text; use next_offset to continue" },
+                    "raw": { "type": "boolean", "description": "Return raw markup instead of readable text (default false); size limits still apply" }
                 },
                 "required": ["url"]
             }),
@@ -1160,205 +1164,9 @@ fn tool_list_dir(input: serde_json::Value, _cwd: &str) -> Result<serde_json::Val
     Ok(serde_json::json!({ "entries": entries }))
 }
 
-fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> {
-    let url = input["url"].as_str().ok_or_else(|| anyhow!("url required"))?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let mut request = client.get(url);
-    if let Some(headers) = input.get("headers").and_then(|h| h.as_object()) {
-        for (key, value) in headers {
-            if let Some(value_str) = value.as_str() {
-                request = request.header(key.as_str(), value_str);
-            }
-        }
-    }
-
-    let response = request.send()?;
-
-    if !response.status().is_success() {
-        return Ok(serde_json::json!({
-            "error": format!("HTTP error: {}", response.status()),
-            "status": response.status().as_u16()
-        }));
-    }
-
-    let content_type = response.headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/plain")
-        .to_string();
-
-    let body = response.text()?;
-
-    Ok(serde_json::json!({
-        "content": body,
-        "content_type": content_type,
-        "url": url
-    }))
-}
-
-async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Value> {
-    let url = input["url"].as_str().ok_or_else(|| anyhow!("url required"))?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let mut request = client.get(url);
-    if let Some(headers) = input.get("headers").and_then(|h| h.as_object()) {
-        for (key, value) in headers {
-            if let Some(value_str) = value.as_str() {
-                request = request.header(key.as_str(), value_str);
-            }
-        }
-    }
-
-    let response = request.send().await?;
-
-    if !response.status().is_success() {
-        return Ok(serde_json::json!({
-            "error": format!("HTTP error: {}", response.status()),
-            "status": response.status().as_u16()
-        }));
-    }
-
-    let content_type = response.headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/plain")
-        .to_string();
-
-    let body = response.text().await?;
-
-    Ok(serde_json::json!({
-        "content": body,
-        "content_type": content_type,
-        "url": url
-    }))
-}
-
-fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Value> {
-    let query = input["query"].as_str().ok_or_else(|| anyhow!("query required"))?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let searx_url = format!(
-        "https://searx.be/search?q={}&format=json",
-        urlencoding::encode(query)
-    );
-
-    if let Ok(response) = client.get(&searx_url).send() {
-        if response.status().is_success() {
-            if let Ok(data) = response.json::<serde_json::Value>() {
-                if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
-                    let search_results: Vec<serde_json::Value> = results
-                        .iter()
-                        .filter(|r| r.get("url").and_then(|u| u.as_str()).map(|u| !u.is_empty()).unwrap_or(false))
-                        .take(10)
-                        .map(|r| serde_json::json!({
-                            "title": r.get("title").and_then(|t| t.as_str()).unwrap_or(""),
-                            "url": r.get("url").and_then(|u| u.as_str()).unwrap_or(""),
-                            "snippet": r.get("content").and_then(|c| c.as_str()).unwrap_or("")
-                        }))
-                        .collect();
-
-                    if !search_results.is_empty() {
-                        return Ok(serde_json::json!({
-                            "results": search_results,
-                            "query": query,
-                            "source": "searx"
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    let ddg_url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        urlencoding::encode(query)
-    );
-
-    let response = match client.get(&ddg_url).send() {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(serde_json::json!({
-                "error": format!("Search failed: {}", e),
-                "results": [],
-                "query": query
-            }));
-        }
-    };
-
-    if !response.status().is_success() {
-        return Ok(serde_json::json!({
-            "error": format!("Search failed: {}", response.status()),
-            "results": [],
-            "query": query
-        }));
-    }
-
-    let data: serde_json::Value = match response.json() {
-        Ok(d) => d,
-        Err(_) => {
-            return Ok(serde_json::json!({
-                "error": "Failed to parse search response",
-                "results": [],
-                "query": query
-            }));
-        }
-    };
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-
-    if let Some(topics) = data.get("RelatedTopics").and_then(|t| t.as_array()) {
-        for topic in topics {
-            if let Some(text) = topic.get("Text").and_then(|t| t.as_str()) {
-                let url = topic.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("");
-                results.push(serde_json::json!({
-                    "title": text,
-                    "url": url,
-                    "snippet": ""
-                }));
-            }
-            if let Some(nested) = topic.get("Topics").and_then(|t| t.as_array()) {
-                for sub in nested {
-                    if let Some(text) = sub.get("Text").and_then(|t| t.as_str()) {
-                        let url = sub.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("");
-                        results.push(serde_json::json!({
-                            "title": text,
-                            "url": url,
-                            "snippet": ""
-                        }));
-                    }
-                }
-            }
-            if results.len() >= 10 { break; }
-        }
-    }
-
-    if let Some(abstract_text) = data.get("AbstractText").and_then(|t| t.as_str()) {
-        if !abstract_text.is_empty() {
-            let abstract_url = data.get("AbstractURL").and_then(|u| u.as_str()).unwrap_or("");
-            results.insert(0, serde_json::json!({
-                "title": data.get("Heading").and_then(|h| h.as_str()).unwrap_or(query),
-                "url": abstract_url,
-                "snippet": abstract_text
-            }));
-        }
-    }
-
-    Ok(serde_json::json!({
-        "results": results,
-        "query": query,
-        "source": "duckduckgo"
-    }))
-}
+fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> { web::fetch_blocking(input) }
+async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Value> { web::fetch(input).await }
+fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Value> { web::search_blocking(input) }
 
 pub fn run_git_command(args: &[&str], cwd: &str) -> Result<std::process::Output> {
     let mut cmd = std::process::Command::new("git");
@@ -1622,122 +1430,4 @@ fn tool_git_add(input: serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
-async fn tool_web_search_async(input: serde_json::Value) -> Result<serde_json::Value> {
-    let query = input["query"].as_str().ok_or_else(|| anyhow!("query required"))?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let searx_url = format!(
-        "https://searx.be/search?q={}&format=json",
-        urlencoding::encode(query)
-    );
-
-    if let Ok(response) = client.get(&searx_url).send().await {
-        if response.status().is_success() {
-            if let Ok(data) = response.json::<serde_json::Value>().await {
-                if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
-                    let search_results: Vec<serde_json::Value> = results
-                        .iter()
-                        .filter(|r| r.get("url").and_then(|u| u.as_str()).map(|u| !u.is_empty()).unwrap_or(false))
-                        .take(10)
-                        .map(|r| serde_json::json!({
-                            "title": r.get("title").and_then(|t| t.as_str()).unwrap_or(""),
-                            "url": r.get("url").and_then(|u| u.as_str()).unwrap_or(""),
-                            "snippet": r.get("content").and_then(|c| c.as_str()).unwrap_or("")
-                        }))
-                        .collect();
-
-                    if !search_results.is_empty() {
-                        return Ok(serde_json::json!({
-                            "results": search_results,
-                            "query": query,
-                            "source": "searx"
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    let ddg_url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        urlencoding::encode(query)
-    );
-
-    let response = match client.get(&ddg_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(serde_json::json!({
-                "error": format!("Search failed: {}", e),
-                "results": [],
-                "query": query
-            }));
-        }
-    };
-
-    if !response.status().is_success() {
-        return Ok(serde_json::json!({
-            "error": format!("Search failed: {}", response.status()),
-            "results": [],
-            "query": query
-        }));
-    }
-
-    let data: serde_json::Value = match response.json().await {
-        Ok(d) => d,
-        Err(_) => {
-            return Ok(serde_json::json!({
-                "error": "Failed to parse search response",
-                "results": [],
-                "query": query
-            }));
-        }
-    };
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-
-    if let Some(topics) = data.get("RelatedTopics").and_then(|t| t.as_array()) {
-        for topic in topics {
-            if let Some(text) = topic.get("Text").and_then(|t| t.as_str()) {
-                let url = topic.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("");
-                results.push(serde_json::json!({
-                    "title": text,
-                    "url": url,
-                    "snippet": ""
-                }));
-            }
-            if let Some(nested) = topic.get("Topics").and_then(|t| t.as_array()) {
-                for sub in nested {
-                    if let Some(text) = sub.get("Text").and_then(|t| t.as_str()) {
-                        let url = sub.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("");
-                        results.push(serde_json::json!({
-                            "title": text,
-                            "url": url,
-                            "snippet": ""
-                        }));
-                    }
-                }
-            }
-            if results.len() >= 10 { break; }
-        }
-    }
-
-    if let Some(abstract_text) = data.get("AbstractText").and_then(|t| t.as_str()) {
-        if !abstract_text.is_empty() {
-            let abstract_url = data.get("AbstractURL").and_then(|u| u.as_str()).unwrap_or("");
-            results.insert(0, serde_json::json!({
-                "title": data.get("Heading").and_then(|h| h.as_str()).unwrap_or(query),
-                "url": abstract_url,
-                "snippet": abstract_text
-            }));
-        }
-    }
-
-    Ok(serde_json::json!({
-        "results": results,
-        "query": query,
-        "source": "duckduckgo"
-    }))
-}
+async fn tool_web_search_async(input: serde_json::Value) -> Result<serde_json::Value> { web::search(input).await }
