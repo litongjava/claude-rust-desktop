@@ -1,5 +1,5 @@
 import type { Provider, ProviderModel } from '../api/providers';
-import type { WorkspaceMode } from '../stores/useWorkspaceModeStore';
+import { conversationWorkspaceMode, type WorkspaceMode } from '../stores/useWorkspaceModeStore';
 
 const KEYS = {
   providers: 'app_providers',
@@ -109,7 +109,10 @@ export function deleteLocalProvider(id: string): void {
 // ============ Conversations ============
 
 export function getLocalConversations(): LocalConversation[] {
-  return safeGet<LocalConversation[]>(KEYS.conversations, []);
+  return safeGet<LocalConversation[]>(KEYS.conversations, []).map(conversation => ({
+    ...conversation,
+    workspace_mode: conversationWorkspaceMode(conversation),
+  }));
 }
 
 export function saveLocalConversations(convs: LocalConversation[]): void {

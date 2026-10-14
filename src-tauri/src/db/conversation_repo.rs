@@ -121,13 +121,15 @@ mod branch_tests {
 pub enum WorkspaceMode {
     #[default]
     Chat,
-    Cowork,
+    #[serde(alias = "cowork")]
+    Work,
+    Study,
     Code,
 }
 
 impl WorkspaceMode {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Chat => "chat", Self::Cowork => "cowork", Self::Code => "code" }
+        match self { Self::Chat => "chat", Self::Work => "work", Self::Study => "study", Self::Code => "code" }
     }
 }
 
@@ -137,13 +139,32 @@ pub fn migrate_workspace_mode(conn: &Connection) -> Result<()> {
         [], |row| row.get(0),
     )?;
     if !exists {
-        conn.execute("ALTER TABLE conversations ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'cowork', 'code'))", [])?;
+        conn.execute("ALTER TABLE conversations ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'work', 'study', 'code'))", [])?;
+    } else {
+        let schema: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversations'", [], |row| row.get(0))?;
+        if schema.contains("'cowork'") && !schema.contains("'study'") {
+            // Replace only the constrained column, keeping the table and all foreign-key
+            // references intact. A savepoint also works inside the startup transaction.
+            conn.execute_batch("SAVEPOINT workspace_mode_upgrade;")?;
+            let result = conn.execute_batch(
+                "ALTER TABLE conversations RENAME COLUMN workspace_mode TO legacy_workspace_mode;
+                 ALTER TABLE conversations ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'work', 'study', 'code'));
+                 UPDATE conversations SET workspace_mode = CASE legacy_workspace_mode WHEN 'cowork' THEN 'work' ELSE legacy_workspace_mode END;
+                 ALTER TABLE conversations DROP COLUMN legacy_workspace_mode;"
+            );
+            if let Err(error) = result {
+                conn.execute_batch("ROLLBACK TO workspace_mode_upgrade; RELEASE workspace_mode_upgrade;")?;
+                return Err(error.into());
+            }
+            conn.execute_batch("RELEASE workspace_mode_upgrade;")?;
+        }
     }
     Ok(())
 }
 
 pub fn set_workspace_mode(conn: &Connection, id: &str, mode: &str) -> Result<()> {
-    anyhow::ensure!(matches!(mode, "chat" | "cowork" | "code"), "Invalid workspace mode");
+    let mode = if mode == "cowork" { "work" } else { mode };
+    anyhow::ensure!(matches!(mode, "chat" | "work" | "study" | "code"), "Invalid workspace mode");
     conn.execute("UPDATE conversations SET workspace_mode = ?1 WHERE id = ?2", params![mode, id])?;
     Ok(())
 }
@@ -331,7 +352,7 @@ mod workspace_mode_tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(crate::db::schema::SCHEMA_SQL).unwrap();
-            for mode in ["chat", "cowork", "code"] {
+            for mode in ["chat", "work", "study", "code"] {
                 insert_conversation(&conn, mode, Some("Same title"), None, None, None, None, false, false, false, "now", "now", 0).unwrap();
                 set_workspace_mode(&conn, mode, mode).unwrap();
             }
@@ -339,11 +360,46 @@ mod workspace_mode_tests {
         }
         let conn = Connection::open(path).unwrap();
         let conversations = list_conversations(&conn).unwrap();
-        assert_eq!(conversations.len(), 3);
-        for mode in ["chat", "cowork", "code"] {
+        assert_eq!(conversations.len(), 4);
+        for mode in ["chat", "work", "study", "code"] {
             assert_eq!(conversations.iter().filter(|c| c.workspace_mode == mode).count(), 1);
             assert_eq!(get_conversation(&conn, mode).unwrap().unwrap().workspace_mode, mode);
         }
+    }
+
+    #[test]
+    fn cowork_upgrade_preserves_related_history_inside_startup_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;
+            CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT, workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'cowork', 'code')));
+            CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE, content TEXT);
+            CREATE INDEX conversation_titles ON conversations(title);
+            INSERT INTO conversations VALUES ('old', 'Existing work', 'cowork');
+            INSERT INTO messages VALUES ('message', 'old', 'Preserve this history');
+            BEGIN;").unwrap();
+        migrate_workspace_mode(&conn).unwrap();
+        migrate_workspace_mode(&conn).unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+        let mode: String = conn.query_row("SELECT workspace_mode FROM conversations WHERE id = 'old'", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "work");
+        let content: String = conn.query_row("SELECT content FROM messages WHERE conversation_id = 'old'", [], |row| row.get(0)).unwrap();
+        assert_eq!(content, "Preserve this history");
+        set_workspace_mode(&conn, "old", "study").unwrap();
+        set_workspace_mode(&conn, "old", "cowork").unwrap();
+        assert!(conn.execute("UPDATE conversations SET workspace_mode = 'invalid'", []).is_err());
+        let index_count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'conversation_titles'", [], |row| row.get(0)).unwrap();
+        assert_eq!(index_count, 1);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn mode_requests_accept_legacy_cowork_and_serialize_canonical_values() {
+        for (input, expected) in [("chat", "chat"), ("cowork", "work"), ("work", "work"), ("study", "study"), ("code", "code")] {
+            let mode: WorkspaceMode = serde_json::from_value(serde_json::json!(input)).unwrap();
+            assert_eq!(mode.as_str(), expected);
+            assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(expected));
+        }
+        assert!(serde_json::from_value::<WorkspaceMode>(serde_json::json!("invalid")).is_err());
     }
 }
 

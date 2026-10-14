@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     provider TEXT,
     workspace_path TEXT,
     project_id TEXT,
-    workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'cowork', 'code')),
+    workspace_mode TEXT NOT NULL DEFAULT 'chat' CHECK (workspace_mode IN ('chat', 'work', 'study', 'code')),
     research_mode INTEGER DEFAULT 0,
     pinned INTEGER DEFAULT 0,
     archived INTEGER DEFAULT 0,

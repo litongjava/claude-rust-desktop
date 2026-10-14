@@ -30,7 +30,7 @@ describe('last Code project', () => {
     expect(project.folders[0].trusted).toBe(false);
   });
 
-  it.each(['chat', 'cowork'] as const)('does not apply the Code default in %s mode', mode => {
+  it.each(['chat', 'work', 'study'] as const)('does not apply the Code default in %s mode', mode => {
     useWorkspaceModeStore.setState({ mode });
     renderHook(() => useLastCodeProject(null));
     expect(getProjects).not.toHaveBeenCalled();

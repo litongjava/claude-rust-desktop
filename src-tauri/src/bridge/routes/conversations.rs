@@ -136,6 +136,11 @@ async fn conversation_update(Path(id): Path<String>, State(state): State<AppStat
             let transaction = conn.unchecked_transaction()?;
             let conn = &transaction;
             anyhow::ensure!(crate::db::conversation_repo::get_conversation(conn, &id_clone)?.is_some(), "Conversation not found");
+            if let Some(mode) = body.get("workspace_mode") {
+                let mode: crate::db::conversation_repo::WorkspaceMode = serde_json::from_value(mode.clone())?;
+                crate::db::conversation_repo::set_workspace_mode(conn, &id_clone, mode.as_str())?;
+                crate::db::conversation_repo::update_conversation_timestamp(conn, &id_clone, &chrono::Utc::now().to_rfc3339())?;
+            }
             if let Some(pinned) = body.get("pinned").and_then(|v| v.as_bool()) {
                 crate::db::conversation_repo::pin_conversation(conn, &id_clone, pinned)?;
             }
