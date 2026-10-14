@@ -48,6 +48,7 @@ pub struct Session {
 
 impl Session {
     pub async fn open(cli: &Cli, paths: &RuntimePaths, selection: Selection) -> Result<Self> {
+        claude_core::config::OrchestrationConfig::init_global()?;
         let db = paths.open_database()?;
         let store = SessionStore::new(db.clone());
         let id = if let Some(id) = &cli.resume {

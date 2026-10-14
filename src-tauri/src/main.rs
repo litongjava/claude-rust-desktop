@@ -141,6 +141,7 @@ fn main() {
         .manage(Arc::new(Mutex::new(None::<SessionManager>)))
         .manage(Arc::new(Mutex::new(None::<Arc<PermissionManager>>)))
         .setup(|app| {
+            app.manage(commands::peripheral::PeripheralHost::default());
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
             tracing::info!(module = "App", "Data dir: {:?}", data_dir);
 
@@ -603,6 +604,7 @@ fn main() {
                 let window_clone = window.clone();
                 tauri::async_runtime::spawn(async move {
                     cleanup_all_processes(&app_handle).await;
+                    commands::peripheral::shutdown(&app_handle).await;
                     window_clone.destroy().unwrap_or_else(|e| {
                         tracing::error!(module = "Shutdown", error = %e);
                     });
@@ -610,6 +612,12 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::peripheral::peripheral_command,
+            commands::peripheral::peripheral_credential,
+            commands::peripheral::peripheral_credential_delete,
+            commands::peripheral::voice_begin,
+            commands::peripheral::voice_cancel,
+            commands::peripheral::voice_transcribe,
             commands::get_platform,
             commands::select_directory,
             commands::show_item_in_folder,

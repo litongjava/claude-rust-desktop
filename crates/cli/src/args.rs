@@ -77,6 +77,35 @@ pub enum PermissionModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Capture real microphone audio or transcribe a recording with the configured backend.
+    Voice {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(short = 'p', long)]
+        push_to_talk: bool,
+        #[arg(long)]
+        continuous: bool,
+        /// Send each transcript through the current shared engine session.
+        #[arg(long)]
+        send: bool,
+    },
+    VoiceConfig {
+        endpoint: String,
+        #[arg(long, default_value = "whisper-1")]
+        model: String,
+        #[arg(long, default_value = "VOICE_API_KEY")]
+        credential: String,
+        #[arg(long)]
+        language: Option<String>,
+    },
+    TeamSync {
+        #[command(subcommand)]
+        action: TeamCommands,
+    },
+    Services {
+        #[command(subcommand)]
+        action: ServiceCommands,
+    },
     /// Start an interactive session; `rust` remains a legacy alias.
     #[command(alias = "rust")]
     Repl {
@@ -110,6 +139,78 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TeamCommands {
+    Status,
+    Auth {
+        team_id: String,
+        #[arg(long, env = "TEAM_SYNC_URL")]
+        endpoint: String,
+        #[arg(long, default_value = "TEAM_SYNC_TOKEN")]
+        credential: String,
+    },
+    Sync,
+    List {
+        #[arg(long)]
+        include_deleted: bool,
+    },
+    Create {
+        title: String,
+        #[arg(short, long)]
+        content: String,
+        #[arg(short, long)]
+        tags: Option<String>,
+    },
+    Update {
+        id: String,
+        title: String,
+        #[arg(short, long)]
+        content: String,
+        #[arg(short, long)]
+        tags: Option<String>,
+    },
+    Delete {
+        id: String,
+    },
+    Conflicts,
+    Resolve {
+        id: String,
+        #[arg(long, value_parser = ["local", "remote"])]
+        keep: String,
+    },
+    /// Import an explicit legacy .claude-code/team directory; source and tokens remain untouched.
+    ImportLegacy {
+        source: PathBuf,
+        #[arg(long)]
+        preview: bool,
+    },
+    /// Start a standalone protocol server. Operator supplies a token-to-team JSON map in an environment variable.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: std::net::SocketAddr,
+        #[arg(long, default_value = "TEAM_SERVER_TOKENS")]
+        tokens_env: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommands {
+    Status,
+    /// Run a foreground host until Ctrl+C or a stop command from another process.
+    Start {
+        #[arg(default_value="team-sync",value_parser=["team-sync"])]
+        name: String,
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
+    Stop {
+        #[arg(default_value = "team-sync")]
+        name: String,
+    },
+    TeamSync,
+    Voice,
 }
 
 #[derive(Debug, Subcommand)]

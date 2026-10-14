@@ -84,7 +84,61 @@ REPL 支持 `/help`、`/status`、`/history`、`/tools`、`/exit`；Ctrl+C 取�
 
 旧仓库完整的自有 Rust 源码和测试保存在 `legacy/claude-code-cli`，不参与发布构建。活跃 CLI 保留 `query -p`、`repl -p`、`rust`（REPL 别名）、`--model`、`--verbose`、`--no-interactive`、`--info`、配置、MCP、技能和项目初始化入口，改用共享引擎；根级项目路径短参数现在为 `-C`，长参数 `--path` 保留。
 
-旧 `voice`、`services`、`magic-docs`、`team-sync`、`plugin`、`agent`、`stress-test`、旧 JSON memory 管理及原 GUI/Web/WASM 前端保留在源码快照中，**没有宣称这些命令已接入新 CLI**。旧配置导入目前迁移 provider、模型与 token 上限；旧 memory/session、插件和 MCP 数据不会自动转换。这样既保留旧实现，又避免两套模型和工具引擎在正式产物中并存。
+`voice`、`team-sync` 和团队同步宿主已接入共享核心，详见下文。`services` 当前只运行 `team-sync`，其他旧服务不会显示为可启动。`magic-docs`、`plugin`、`agent`、`stress-test`、旧 JSON memory 管理及原 GUI/Web/WASM 的独有能力仍待迁移。旧配置导入目前迁移 provider、模型与 token 上限；旧团队记忆支持显式导入，旧个人 memory/session、插件和 MCP 数据不会自动转换。完整映射见 [能力矩阵](cli-desktop-capability-matrix.md)。
+
+## 语音
+
+使用原生 CPAL 麦克风采集（Windows WASAPI），把 PCM 编码为 WAV；文件输入支持 WAV、WebM、Ogg、MP3、MP4/M4A。识别走 **OpenAI-compatible 音频转写 multipart API**，不会向聊天 API 发送音频占位字符串。后端必须提供 `file`、`model`、`response_format=json` 接口并返回 `{"text":"..."}`；可部署自己的兼容 STT 服务。没有配置后端或凭据时明确报错，不自动连接付费服务。
+
+```powershell
+$env:VOICE_API_KEY = '<audio backend credential>'
+claude-code voice-config https://your-stt-host/v1/audio/transcriptions --model whisper-1 --credential VOICE_API_KEY
+claude-code voice --file D:\audio\recording.wav
+claude-code voice --push-to-talk
+claude-code voice --push-to-talk --continuous --send
+claude-code --resume <session-id> voice --file D:\audio\recording.wav --send
+```
+
+`--push-to-talk`（兼容 `-p`）以 Enter 开始/停止一段录音；`--continuous` 连续采集多个片段，`/exit` 退出。`--send` 将识别文本交给同一个共享引擎会话；不指定时输出 JSON 转写结果。Ctrl+C 取消采集或转写，采集线程退出并释放设备。录音/文件上限 25 MiB；转写请求超时 120 秒。原生音频依赖已包含在 CLI 构建中；Linux 构建需 ALSA 开发库，macOS 使用 CoreAudio，两平台尚未验收。
+
+Desktop 在「设置 → 服务与团队」配置地址、模型及凭据（系统安全存储或宿主环境变量，失败不会降级写入配置文件），再点聊天输入框麦克风。MediaRecorder 采集真实音频，每段最多 60 秒；停止后释放设备，再转写。支持编辑结果、继续录音、使用文本和取消。关闭面板或组件卸载会释放麦克风并取消转写。Windows 原生麦克风采集/再次打开已测试；WebView2 的真实权限交互和真实 STT 识别仍需验收。
+
+## 团队同步与服务宿主
+
+仓库提供独立的 protocol v1 服务端。服务端由运维提供 token-to-team 映射，每个 bearer token 只能访问一个团队；客户端 `auth` 必须经过真实 HTTP 验证后才保存配置。它是自部署协议，**不是 Claude.ai Team OAuth**。生产部署需配置 HTTPS 反向代理、凭据、数据目录备份和端点；默认仅绑定回环地址。
+
+```powershell
+# 独立终端启动服务端。此 JSON 是运维配置的凭据映射，不会自动生成有效云端 token。
+$env:TEAM_SERVER_TOKENS = '{"replace-with-operator-issued-token":"engineering"}'
+claude-code --data-dir D:\team-server team-sync serve --bind 127.0.0.1:38080
+
+# 客户端使用自己的数据目录，不依赖 Desktop 或 30085。
+$env:TEAM_SYNC_TOKEN = 'replace-with-operator-issued-token'
+claude-code --data-dir D:\team-client-a team-sync auth engineering --endpoint http://127.0.0.1:38080
+claude-code --data-dir D:\team-client-a team-sync create 'Architecture' --content 'Use Rust' --tags 'decision,backend'
+claude-code --data-dir D:\team-client-a team-sync sync
+claude-code --data-dir D:\team-client-a team-sync list
+claude-code --data-dir D:\team-client-a team-sync update <id> 'Architecture' --content 'Revised decision'
+claude-code --data-dir D:\team-client-a team-sync delete <id>
+claude-code --data-dir D:\team-client-a team-sync conflicts
+claude-code --data-dir D:\team-client-a team-sync resolve <id> --keep local
+claude-code --data-dir D:\team-client-a team-sync sync
+
+# 前台常驻；另一终端可控制同一实例。
+claude-code --data-dir D:\team-client-a services start team-sync --interval 60
+claude-code --data-dir D:\team-client-a services status
+claude-code --data-dir D:\team-client-a services stop team-sync
+
+# 旧团队 JSON：预览不写入；正式导入先备份目标，再原子导入。
+claude-code --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team --preview
+claude-code --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team
+```
+
+只同步用户显式创建/导入的团队记忆（ID、标题、内容、标签、版本、删除标记），不读取个人记忆、provider 配置或模型密钥；团队记忆暂不自动注入模型上下文。不同团队的数据、游标和冲突隔离。团队绑定服务端地址，切换到另一个服务端需隔离数据目录，避免复用旧游标。冲突保留双方版本；`--keep local` 重新基于远端版本上传，`--keep remote` 接受远端（包括删除）。删除以 tombstone 传播。超时或离线不清空本地待上传内容；再次 `sync` 或宿主下次轮询重试。同一 mutation ID 重发不会重复创建/增加版本。
+
+宿主默认前台运行，不隐式后台化。`stop` 等待实例实际退出；Ctrl+C 中断请求并释放租约。进程异常退出后租约最多 15 秒失效。Desktop「设置 → 服务与团队」可认证、增改删、同步、处理冲突、预览/导入旧团队数据及启动/停止自动同步；SQLite 租约让 CLI 和 Desktop 使用同一数据目录时只有一个同步宿主。关闭 Desktop 会停止它自己持有的宿主。认证和服务错误会显示，失败不会报告同步成功。
+
+导入保留旧 ID，并将旧 author/time/etag 等原始载荷留在 `team_import_sources`；旧 etag 不用作远端版本，旧 `.team_token` 不导入。导入遇到 ID 内容冲突整体回滚，不覆盖当前记忆；重复导入相同载荷跳过。备份保存在所选 `RuntimePaths.data_dir/backups`，源目录保持不变。
 
 ## 验证
 

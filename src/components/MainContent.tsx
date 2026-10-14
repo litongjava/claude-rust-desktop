@@ -1800,6 +1800,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // Shared overlays rendered in both MODE 1 and MODE 2
   const sharedProjectOverlays = (
     <>
+      <VoiceInput isOpen={showVoicePanel} onResult={handleVoiceResult} onClose={closeVoicePanel} />
       {showNewProjectDialog && (
         <CreateProjectDialog onCreated={async project => {
           setProjectList(prev => [project, ...prev.filter(p => p.id !== project.id)]);

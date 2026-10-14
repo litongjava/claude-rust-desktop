@@ -8,7 +8,7 @@ description = "Shared model, tool, session and persistence engine for CLI and De
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "blocking"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls", "blocking"], default-features = false }
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }

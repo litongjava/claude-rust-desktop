@@ -3,6 +3,8 @@ mod config;
 #[allow(dead_code)]
 mod legacy_api_config;
 mod session;
+mod services;
+mod voice;
 #[allow(dead_code)]
 mod terminal;
 
@@ -62,6 +64,26 @@ async fn run(cli: &Cli) -> Result<()> {
     }
     let mut skill_prompt = None;
     match &cli.command {
+        Some(Commands::VoiceConfig { endpoint, model, credential, language }) => {
+            let context = services::context(&paths)?;
+            let config = claude_core::services::voice::VoiceConfig {
+                endpoint: endpoint.clone(), model: model.clone(),
+                credential: credential.clone(), language: language.clone(),
+            };
+            config.validate()?;
+            context.save_setting("voice", &config)?;
+            return services::print(&config);
+        }
+        Some(Commands::Voice { file, push_to_talk, continuous, send }) => {
+            let context = services::context(&paths)?;
+            return voice::run(cli, &paths, &context, file, *push_to_talk, *continuous, *send).await;
+        }
+        Some(Commands::TeamSync { action }) => {
+            return services::team(&services::context(&paths)?, action).await;
+        }
+        Some(Commands::Services { action }) => {
+            return services::services(&services::context(&paths)?, action).await;
+        }
         Some(Commands::Config { action }) => return config::run(&paths, action),
         Some(Commands::Mcp { action }) => return mcp(&paths, action).await,
         Some(Commands::Sessions { action }) => {
@@ -202,7 +224,6 @@ async fn run(cli: &Cli) -> Result<()> {
         resumed.as_ref().and_then(|s| s.model.as_deref()),
         resumed.as_ref().and_then(|s| s.provider.as_deref()),
     )?;
-    let _ = claude_core::config::OrchestrationConfig::init_global();
     let session = session::Session::open(cli, &paths, selection).await?;
     let mut input = if single {
         None

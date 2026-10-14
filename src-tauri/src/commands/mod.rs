@@ -1,4 +1,5 @@
 pub mod knowledge;
+pub mod peripheral;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
 use crate::db::DbManager;
 use crate::db::diff_repo::CodeDiffRow;

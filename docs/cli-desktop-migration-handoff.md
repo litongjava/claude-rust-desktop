@@ -1,12 +1,12 @@
 # CLI / Desktop 外围功能迁移交接
 
-更新日期：2026-10-14。本文是后续实施清单，未勾选项目尚未完成。
+更新日期：2026-10-15。本文是持续实施清单，未勾选项目尚未完整验收。P0/P1 已有首批实际实现，详见第 9 节与 [能力矩阵](cli-desktop-capability-matrix.md)；P2–P4 仍需继续实施。
 
 ## 1. 用户目标与约束
 
 用户明确要求：**旧 CLI 的语音、团队同步等外围功能必须在 `claude-rust-desktop` 中具备真实可用的实现，不能以保留历史源码代替功能迁移。**
 
-后续按共享业务实现、CLI 命令和 Desktop 图形入口一起交付。旧前端的具体技术栈无需原样搬入，但旧功能需要逐项映射，不能遗漏。当前 session 只整理交接文档，功能实现留给新 session。
+后续按共享业务实现、CLI 命令和 Desktop 图形入口一起交付。旧前端的具体技术栈无需原样搬入，但旧功能需要逐项映射，不能遗漏。初稿 session 只整理交接文档；2026-10-15 已开始实际实施，记录见第 9 节。
 
 - 工作仓库：`D:\code\project\project-harven\claude-rust-desktop`。
 - 已创建并正在使用的分支：`feat/shared-core-cli-desktop`。
@@ -160,3 +160,39 @@ git diff --check
 旧语音、团队同步、插件市场有未完成/占位实现，需补真实功能，不能原样复制后报告可用。
 每完成一项更新交接文档，记录实现路径、测试和仍缺的外部配置。完成后跑相关测试与统一构建，说明尚未验收的平台或外部环境。
 ```
+
+## 9. 2026-10-15 实施进度（P0/P1）
+
+此批完成公共服务基础、团队同步协议及双端入口，并接入真实音频采集/转写。**整份迁移尚未完成，主表不提前勾选需要真实 GUI/STT 验收或其余服务宿主的项目。**旧命令与扩展能力盘点见 [能力矩阵](cli-desktop-capability-matrix.md)，新增用法见 [cli.md](cli.md)。
+
+- [x] P0 公共基础：`crates/core/src/services/mod.rs` 的 RuntimePaths/数据库/宿主凭据接口；外围表迁移版本 1–3。`lifecycle.rs` 提供进程 PID、唯一 owner、15 秒租约、250 ms 停止检查、完成次数和错误。网络请求不持有数据库锁；重复宿主不能启动，崩溃后租约可恢复。
+- [x] P0 真实运行/停止链路：CLI `services start team-sync` 前台常驻；第二终端 `stop` 请求并等待同一实例退出。Desktop 持有任务句柄，关闭时中止并等待自己的任务；也能通过数据库控制 CLI 宿主。当前仅支持 team-sync，**尚无其他旧服务宿主**。
+- [x] P1 团队同步业务与双端入口：`team.rs`、`team_server.rs` 实现独立服务、真实 bearer 验证、团队隔离/服务端绑定、增量游标、版本检查、tombstone、持久化冲突、去重 mutation ID、离线保留和重试。服务端不是旧占位的 Claude.ai OAuth。CLI 增加 update/conflicts/resolve/serve；Desktop 在「设置 → 服务与团队」接相同规则。
+- [x] P1 最小团队数据迁移：显式 `team-sync import-legacy <旧 team 目录> [--preview]`；先完整 SQLite 备份，事务导入，重复载荷去重，ID 内容冲突全部回滚。源不修改，旧 ID 保留，原始 author/time/etag 载荷留存；旧 etag/`.team_token` 不作有效远端状态或凭据。个人 memory/session 导入仍待 P2/P3。
+- [x] P1 音频业务与双端入口：CLI CPAL/WASAPI 采集、PCM WAV 编码、25 MiB 限制、线程停止/等待；共享 `services/voice.rs` 向音频 multipart endpoint 上传。支持文件/Enter 按键输入/连续输入/当前共享会话发送。Desktop MediaRecorder 接相同模块，提供录音/处理中/错误/文本编辑状态、设备释放和请求取消；修复 MainContent 导入面板却未渲染的接线问题。
+- [x] 原生 Windows 设备采集检查：`cargo test --locked -p claude-code-cli native_microphone_capture_releases_the_device -- --ignored` 成功采集 250 ms PCM，再次打开设备成功。仅在内存测试，不上传此设备采样。
+- [ ] 语音完整外部验收：未提供真实 STT endpoint/token，没有真实语音识别质量结论；WebView2 权限接受/拒绝、无设备及录音 GUI 仍需现场验收。缺配置会明确报错。
+- [ ] 团队生产部署与 Windows GUI 手工验收：本地独立服务端/真实 HTTP 已测试，生产 HTTPS 端点、运维凭据与安全存储/UI 手工操作尚未验收；不能宣称云端已经部署。
+- [ ] P2 个人记忆导入/导出/整理/AutoDream、Magic Docs、agent 类型/别名与自定义定义。
+- [ ] P3 插件加载/执行生命周期、跨进程 MCP restart、压测、真实更新检查、专题帮助及剩余数据/扩展能力逐项审计。
+- [ ] P4 全部外围能力的最终 GUI、远端、macOS/Linux 验收与完整发布。此次新包只包含本节已实现功能。
+
+自动化测试位置：
+
+- `crates/core/tests/peripheral_services.rs`：隔离客户端与独立 HTTP 服务的增改删、认证/隔离/冲突、离线恢复、mutation 重发、重启、共享租约、真实宿主停止、卡住请求取消、导入预览/备份/幂等/回滚、音频 multipart 和错误。
+- `crates/cli/tests/peripheral.rs`：实际启动独立 CLI server 和 host 进程，第二终端停止、两客户端同步/删除；音频文件送达后端并把转写送进 NativeEngine 会话。不使用 Desktop/30085。
+- `src/components/VoiceInput.test.tsx`、`ServicesSettings.test.tsx`：上传字节、文本只使用一次、权限拒绝、迟到转写不插入、迟到 getUserMedia 释放设备、服务命令与认证失败呈现。
+
+仍缺外部配置：音频转写 URL/model/token；生产团队 HTTPS 端点/token-to-team 配置。CLI 凭据来自命名环境变量；Desktop 使用同名环境变量或安全存储的独立 peripheral 命名空间，核心不依赖 AppHandle，不读取 provider 同步载荷。团队记忆暂不自动注入个人模型上下文。
+
+本轮最终验证（2026-10-15，Windows x64）：
+
+- 核心：138 个单元测试 + 1 个取消集成测试 + 6 个外围服务集成测试通过，2 忽略；CLI：1 个 WAV 单元测试 + 7 个进程集成测试通过，1 个设备测试默认忽略。设备测试另行显式执行通过。
+- Desktop Rust：`check --all-targets` 及 49 个库/集成测试通过。常规 Rust 合计 **202 通过，3 忽略**；另有 1 个真实麦克风设备测试通过。
+- `npx.cmd tsc --noEmit` 通过；语音、服务及设置页定向测试 **16 通过**。最终完整前端测试 **290 通过，17 失败**；失败全部在未改动的 `src/locales/languages.test.ts`。已逐文件与 `HEAD` 核对（忽略 CRLF/LF）：17 个旧字典原本各缺 53 个 `sessionGit` / 插件分类词条。未将此既有失败记为全套测试通过。
+- CLI 依赖树无 Tauri/Wry/WebKit；`git diff --check` 通过；原 CLI 仓库与 legacy 快照未修改。
+- `npm.cmd run build:all` 成功生成最终 CLI、Desktop、MSI、NSIS：`artifacts/3.1.0-release-2026-10-14T16-25-46-199Z/`。四个程序/安装包及两份 provider runtime 共 6 组 SHA256 均与源产物一致，记录在该目录 `checksums.json`。打包后的 CLI 命令帮助及失败认证不留有效配置也已验证。
+- CPAL 0.15.3 包含于 CLI 默认构建；Windows 用 WASAPI，不需额外音频采集工具；STT 后端自行配置。内置 provider runtime 仍需 Node.js 22+（本机 22.23.2）。Linux ALSA、macOS CoreAudio 和 WebView2 现场操作尚未验收。
+- 新凭据先保存到独立安全存储名称；认证/配置失败会清理该项，保持原有效凭据。CLI 使用环境凭据，不读取 Desktop 安全存储；共享配置中的 credential 名称可通过 status 查看，也可在 CLI 重新 auth 选择自己的环境变量。
+
+验证日志保存在 `artifacts/validation/`。该批提交只覆盖本节 P0/P1 实施，**不是 P2–P4 或整份清单完成声明**。
