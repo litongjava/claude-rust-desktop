@@ -9,6 +9,7 @@ use crate::permissions::{PermissionManager, PermissionResult};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::sse_parser::{consume_sse_payloads, merge_tool_args, recover_malformed_tool_input};
 use crate::tools::get_tool_definitions;
+use crate::prompt::{PromptProfile, code::{adapt_tools, is_memory_tool}};
 use crate::mcp::McpToolRegistry;
 use crate::memory::{ContextManager, MemExClient, TieredCompressor};
 use anyhow::{anyhow, Result};
@@ -23,6 +24,10 @@ use tokio::time::{timeout, Duration};
 #[cfg(test)]
 #[path = "search_integration_tests.rs"]
 mod search_integration_tests;
+
+#[cfg(test)]
+#[path = "code_prompt_tests.rs"]
+mod code_prompt_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -102,6 +107,7 @@ pub struct ToolLoopExecutor {
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
     context_manager: Option<ContextManager>,
+    prompt_profile: PromptProfile,
     reasoning_mode: ReasoningMode,
     prefetch_engine: Option<Arc<PrefetchEngine>>,
     search_config_path: Option<std::path::PathBuf>,
@@ -384,6 +390,7 @@ impl ToolLoopExecutor {
             permission_manager: None,
             memex_client: None,
             context_manager: None,
+            prompt_profile: PromptProfile::Desktop,
             reasoning_mode,
             prefetch_engine: None,
             search_config_path: None,
@@ -424,6 +431,15 @@ impl ToolLoopExecutor {
         self.context_manager = Some(ContextManager::new(client_arc));
         self.memex_client = Some(client);
         self
+    }
+
+    pub fn with_prompt_profile(mut self, profile: PromptProfile) -> Self {
+        self.prompt_profile = profile;
+        self
+    }
+
+    fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
+        adapt_tools(get_tool_definitions(), self.prompt_profile)
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -893,7 +909,7 @@ impl ToolLoopExecutor {
         let mut conversation_messages: Vec<AnthropicMessage> = self.build_anthropic_messages();
         tracing::info!(module = "AnthropicLoop", "Messages built, count={}", conversation_messages.len());
 
-        let tools = get_tool_definitions();
+        let tools = self.tool_definitions();
         tracing::info!(module = "AnthropicLoop", "Tool definitions loaded, count={}, mode={:?}", tools.len(), self.reasoning_mode);
 
         if matches!(self.reasoning_mode, ReasoningMode::Deep) {
@@ -1202,7 +1218,9 @@ impl ToolLoopExecutor {
                                 let name = current_tool_name.clone().unwrap_or_default();
                                 let input = self.finalize_streaming_tool_args(&id);
 
+                                // Memory calls need this executor's configured client, not a generic stub.
                                 let requires_user_interaction = name == "AskUserQuestion"
+                                    || is_memory_tool(&name)
                                     || self.check_permission_requires_confirmation(&name, &input);
 
                                 assistant_blocks.push(ContentBlock::ToolUse {
@@ -1364,7 +1382,7 @@ impl ToolLoopExecutor {
         let mut conversation_messages: Vec<OpenAIMessage> = self.build_openai_messages();
         tracing::info!(module = "OpenAILoop", "Messages built, count={}", conversation_messages.len());
 
-        let tools = get_tool_definitions();
+        let tools = self.tool_definitions();
         tracing::info!(module = "OpenAILoop", "Tool definitions loaded, count={}, mode={:?}", tools.len(), self.reasoning_mode);
 
         if matches!(self.reasoning_mode, ReasoningMode::Deep) {
@@ -1696,7 +1714,9 @@ impl ToolLoopExecutor {
                         text_before: full_text.clone(),
                     }).await;
 
+                    // Memory calls need this executor's configured client, not a generic stub.
                     let requires_user_interaction = name == "AskUserQuestion"
+                        || is_memory_tool(&name)
                         || self.check_permission_requires_confirmation(name, &input);
 
                     assistant_tool_calls.push(crate::native_engine::openai_client::OpenAIToolCall {

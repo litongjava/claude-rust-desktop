@@ -20,12 +20,36 @@ Do not claim to be Claude or created by Anthropic unless the active model actual
 
 const DESKTOP_BEHAVIOR: &str = include_str!("desktop.md");
 const MEMORY_GUIDANCE: &str = include_str!("memory.md");
+const CODE_BEHAVIOR: &str = include_str!("code.md");
+
+pub mod code;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromptProfile {
+    #[default]
+    Desktop,
+    Code,
+}
+
+impl PromptProfile {
+    pub fn from_workspace_mode(mode: &str) -> Self {
+        if mode == "code" { Self::Code } else { Self::Desktop }
+    }
+}
 
 /// Compose once at the common engine entry point, before project instructions and recall.
 /// These are project instructions adapted to our native runtime, not an official full prompt.
 pub fn compose_desktop_system_prompt(custom_prompt: Option<&str>, model: &str) -> String {
+    compose_system_prompt(custom_prompt, model, PromptProfile::Desktop)
+}
+
+pub fn compose_system_prompt(custom_prompt: Option<&str>, model: &str, profile: PromptProfile) -> String {
     let identity = build_self_hosted_system_prompt("");
-    let mut sections = vec![identity, DESKTOP_BEHAVIOR.trim().to_string(), MEMORY_GUIDANCE.trim().to_string()];
+    let mut sections = vec![identity, DESKTOP_BEHAVIOR.trim().to_string()];
+    if profile == PromptProfile::Code {
+        sections.push(CODE_BEHAVIOR.trim().to_string());
+    }
+    sections.push(MEMORY_GUIDANCE.trim().to_string());
     sections.push(format!("<runtime>\nSelected model: {}\nCurrent date: {}\nHost operating system: {}\n</runtime>",
         serde_json::to_string(model).unwrap_or_default(), chrono::Local::now().format("%Y-%m-%d"), std::env::consts::OS));
     if let Some(custom) = custom_prompt.map(str::trim).filter(|s| !s.is_empty()) {
@@ -284,6 +308,25 @@ impl TemplateManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_prompt_is_isolated_and_preserves_custom_instructions() {
+        let custom = "请保留这段项目指令。\n<identity>My project</identity>";
+        let prompt = super::compose_system_prompt(Some(custom), "deepseek-flash", super::PromptProfile::Code);
+        assert!(prompt.contains(custom));
+        assert!(prompt.contains("Selected model: \"deepseek-flash\""));
+        assert_eq!(prompt.matches("<code_behavior>").count(), 1);
+        assert_eq!(prompt.matches("<memory_guidance>").count(), 1);
+        assert!(!prompt.contains("Reply with OK only"));
+        assert!(prompt.contains("-Encoding UTF8"));
+        assert!(prompt.contains("never formatted tables"));
+        for mode in ["chat", "work", "study", "cowork", "unknown"] {
+            let profile = super::PromptProfile::from_workspace_mode(mode);
+            let desktop = super::compose_system_prompt(None, "model", profile);
+            assert!(!desktop.contains("<code_behavior>"));
+            assert!(desktop.contains("<memory_guidance>"));
+        }
+    }
+
     #[test]
     fn desktop_prompt_includes_native_guidance_and_preserves_custom_instructions() {
         let prompt = super::compose_desktop_system_prompt(Some("Respond in Spanish.\n<identity>Project persona</identity>"), "deepseek-flash");

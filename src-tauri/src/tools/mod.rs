@@ -1097,18 +1097,20 @@ pub fn find_shell(shell_name: &str) -> Option<String> {
 fn tool_glob(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let pattern = input["pattern"].as_str().ok_or_else(|| anyhow!("pattern required"))?;
     let base_path = input["path"].as_str().unwrap_or(cwd);
+    let base_path = resolve_path(base_path, cwd)?;
+    let glob_pattern = glob::Pattern::new(&pattern.replace('\\', "/"))?;
 
     let mut matches: Vec<String> = Vec::new();
-    for entry in walkdir::WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(&base_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if let Some(path_str) = path.to_str() {
-            if let Ok(glob_pattern) = glob::Pattern::new(pattern) {
-                if glob_pattern.matches(path_str) {
-                    matches.push(path_str.to_string());
-                }
-            }
+        if !path.is_file() { continue; }
+        let relative = path.strip_prefix(&base_path).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let absolute = path.to_string_lossy().replace('\\', "/");
+        if glob_pattern.matches(&relative) || glob_pattern.matches(&absolute) {
+            matches.push(path.to_string_lossy().into_owned());
         }
     }
+    matches.sort();
 
     Ok(serde_json::json!({
         "files": matches,
@@ -1119,14 +1121,24 @@ fn tool_glob(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
 fn tool_grep(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let pattern = input["pattern"].as_str().ok_or_else(|| anyhow!("pattern required"))?;
     let search_path = input["path"].as_str().unwrap_or(cwd);
+    let search_path = resolve_path(search_path, cwd)?;
+    let include = input["include"].as_str().map(glob::Pattern::new).transpose()?;
 
     let re = regex::Regex::new(pattern)?;
     let mut results: Vec<serde_json::Value> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(search_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(&search_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if !path.is_file() {
             continue;
+        }
+        if let Some(include) = &include {
+            let relative = path.strip_prefix(&search_path).unwrap_or(path);
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !include.matches(&relative) && !include.matches(&name) {
+                continue;
+            }
         }
 
         if let Ok(content) = fs::read_to_string(path) {

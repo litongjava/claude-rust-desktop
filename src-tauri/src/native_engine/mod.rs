@@ -9,5 +9,6 @@ pub mod request_trace;
 pub mod token_counter;
 pub mod task_context;
 pub mod context_compressor;
+pub mod workspace;
 
 pub use engine_core::NativeEngine;

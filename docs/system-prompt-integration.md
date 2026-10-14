@@ -6,12 +6,14 @@ Composition order:
 
 1. Project identity (provider-neutral; does not impersonate Anthropic for non-Claude models).
 2. `src-tauri/src/prompt/desktop.md`: conversation, execution, permissions, files, skills, and truthful usage reporting.
-3. `src-tauri/src/prompt/memory.md`: durable memories and how the native memory tools work.
+3. For saved Code conversations, `src-tauri/src/prompt/code.md`: reviewed coding/tool guidance adapted from the user's tool-prompt sample. All modes include `memory.md` for native memory guidance.
 4. Actual selected model, current local date, and host OS.
 5. The request's optional custom `system_prompt`, preserved verbatim.
-6. Existing trusted-project instructions and folders, followed by the executor's retrieved memory context.
+6. Existing trusted-project instructions and folders, followed by retrieved memory context according to the existing memory configuration. All modes support automatic recall, ingestion, and memory tools; no mode-specific memory restrictions apply.
 
-The engine passes this prompt to the tool loop; Anthropic and OpenAI clients send it as their native system field/message, and the JavaScript provider runtime consumes the same prompt. Request trace snapshots capture it, so the context-window detailed breakdown and trajectory inspector expose what was actually sent. Edit the two Markdown files and rebuild to change the application defaults. Callers may still append task-specific instructions via `system_prompt`.
+The common entry point resolves the persisted conversation `workspace_mode` before composing the prompt. The same `PromptProfile` controls the prompt and both protocol tool loops. Code tool descriptions are adapted to actual native schemas in `prompt/code.rs`; no tools or captured probe messages are imported from the sample. `ScheduleWakeup.reason` telemetry and host session/account/settings collection conventions are excluded. The full Chinese explanation is in the documentation workspace at `development/code-prompt.md`.
+
+The engine passes this prompt to the tool loop; Anthropic and OpenAI clients send it as their native system field/message, and the JavaScript provider runtime consumes the same prompt. Request trace snapshots capture it, so the context-window detailed breakdown and trajectory inspector expose what was actually sent. Edit the relevant prompt Markdown files and rebuild to change the application defaults. Callers may still append task-specific instructions via `system_prompt`.
 
 ## Original desktop resources inspected
 
