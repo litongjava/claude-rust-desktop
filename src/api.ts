@@ -1125,19 +1125,20 @@ export interface ProviderModel {
   contextWindow?: number; maxTokens?: number; inputTypes?: string[];
   api?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, string | null>;
 }
+export type WebSearchStrategy = 'auto' | 'openai_native' | 'anthropic_native' | 'deepseek_native' | 'public' | 'disabled' | 'dashscope' | 'bigmodel';
 export interface Provider {
   id: string; name: string; apiKey: string; baseUrl: string;
   format: 'anthropic' | 'openai' | 'harness'; category?: 'builtin' | 'custom'; builtinId?: string; models: ProviderModel[]; enabled: boolean;
   icon?: string;
   supportsWebSearch?: boolean;
-  webSearchStrategy?: 'dashscope' | 'bigmodel' | 'anthropic_native' | null;
+  webSearchStrategy?: WebSearchStrategy | null;
   webSearchTestedAt?: number;
   webSearchTestReason?: string | null;
 }
 
 export interface WebSearchTestResult {
   ok: boolean;
-  strategy?: 'dashscope' | 'bigmodel' | 'anthropic_native' | null;
+  strategy?: WebSearchStrategy | null;
   hitCount?: number;
   reason?: string;
 }
@@ -1161,6 +1162,27 @@ async function providerRequest(path: string, method = 'GET', body?: unknown) {
   try { data = JSON.parse(text); } catch { throw new Error(`本地后端暂不可用（HTTP ${response.status}），请等待项目启动后重试`); }
   if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
+}
+
+export interface SearchSettings {
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+}
+export interface SearchSettingsUpdate {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+function searchSettingsResult(data: SearchSettings): SearchSettings {
+  return { baseUrl: data.baseUrl, model: data.model, hasApiKey: data.hasApiKey };
+}
+export async function getSearchSettings(): Promise<SearchSettings> {
+  return searchSettingsResult(await providerRequest('/search-settings'));
+}
+export async function updateSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettings> {
+  return searchSettingsResult(await providerRequest('/search-settings', 'PATCH', settings));
 }
 
 let providerMigration: Promise<void> | undefined;

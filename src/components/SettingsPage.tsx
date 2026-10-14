@@ -4,6 +4,7 @@ import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizonta
 import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
+import SearchSettings from './SearchSettings';
 import McpSettingsPage from './McpSettingsPage';
 import TaskList from './TaskList';
 import NewTaskModal from './NewTaskModal';
@@ -22,7 +23,7 @@ const WORK_OPTIONS = [
   { value: '其他', key: 'other' },
 ];
 
-type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tasks';
+type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'mcp' | 'tasks';
 
 const SettingsPage = () => {
   const { t, locale } = useI18n();
@@ -339,6 +340,9 @@ const SettingsPage = () => {
               {t('settings.models')}
             </button>
           )}
+          <button onClick={() => setTab('search')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'search' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <Globe size={16} />联网搜索
+          </button>
           {localStorage.getItem('user_mode') !== 'selfhosted' && (
             <button
               onClick={() => setTab('usage')}
@@ -375,6 +379,7 @@ const SettingsPage = () => {
             {tab === 'general' && renderGeneral()}
             {tab === 'about' && renderAbout()}
             {tab === 'models' && <ProviderSettings />}
+            {tab === 'search' && <SearchSettings />}
             {tab === 'account' && renderAccount()}
             {tab === 'usage' && renderUsage()}
             {tab === 'mcp' && <McpSettingsPage />}

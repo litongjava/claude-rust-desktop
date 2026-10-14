@@ -963,7 +963,12 @@ async fn config_get(State(state): State<AppState>) -> Json<serde_json::Value> {
     let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
-        return Json(serde_json::to_value(m.get_config()).unwrap_or_default());
+        let mut value = serde_json::to_value(m.get_config()).unwrap_or_default();
+        if let Some(search) = value["deepseek_search"].as_object_mut() {
+            search.remove("api_key");
+            search.insert("has_api_key".into(), serde_json::json!(!m.get_config().deepseek_search.api_key.trim().is_empty()));
+        }
+        return Json(value);
     }
     Json(serde_json::json!({}))
 }
@@ -972,7 +977,12 @@ async fn config_update(State(state): State<AppState>, Json(config): Json<AppConf
     let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
-        let _ = m.update_config(|c| *c = config);
+        let _ = m.update_config(|c| {
+            // Only /api/search-settings may modify independent search credentials.
+            let search = c.deepseek_search.clone();
+            *c = config;
+            c.deepseek_search = search;
+        });
     }
     Json(serde_json::json!({ "ok": true }))
 }

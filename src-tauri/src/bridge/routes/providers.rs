@@ -56,6 +56,30 @@ fn parse_provider(v: Value, old: Option<&ProviderConfig>) -> Result<ProviderConf
     if !["openai", "anthropic", "harness"].contains(&p.provider_type.as_str()) { return Err("Unsupported protocol".into()); }
     if let Some(key) = v.get("apiKey").and_then(Value::as_str) { p.api_key = Some(key.to_string()); }
     if let Some(enabled) = v.get("enabled").and_then(Value::as_bool) { p.enabled = enabled; }
+    if let Some(value) = v.get("webSearchStrategy") {
+        let strategy = match value {
+            Value::Null => None,
+            Value::String(value) => {
+                let strategy = match value.as_str() {
+                    "openai" => "openai_native",
+                    "anthropic" => "anthropic_native",
+                    "deepseek" => "deepseek_native",
+                    other => other,
+                };
+                if !["auto", "openai_native", "anthropic_native", "deepseek_native", "public", "disabled", "dashscope", "bigmodel"].contains(&strategy) {
+                    return Err("Unsupported web search strategy".into());
+                }
+                Some(strategy.to_string())
+            }
+            _ => return Err("Web search strategy must be a string or null".into()),
+        };
+        if p.web_search_strategy != strategy {
+            p.supports_web_search = false;
+            p.web_search_tested_at = None;
+            p.web_search_test_reason = None;
+        }
+        p.web_search_strategy = strategy;
+    }
     for key in ["category", "builtinId"] { if let Some(value) = v.get(key) { p.settings.insert(key.into(), value.clone()); } }
     if p.provider_type == "harness" && p.settings.get("builtinId").and_then(Value::as_str).filter(|s| !s.is_empty()).is_none() { return Err("Built-in provider is required".into()); }
     if p.provider_type == "harness" {
@@ -129,9 +153,33 @@ pub fn routes() -> Router<AppState> {
 mod provider_configuration_tests {
     use super::*;
     #[test]
+    fn web_search_strategy_is_validated_and_preserved() {
+        let mut provider = parse_provider(json!({"id":"search","name":"Search","baseUrl":"https://gateway.example/v1","webSearchStrategy":"deepseek_native"}), None).unwrap();
+        provider.supports_web_search = true;
+        provider.web_search_tested_at = Some(123);
+        provider.web_search_test_reason = Some("previous probe".into());
+        let unchanged = parse_provider(json!({"name":"Renamed"}), Some(&provider)).unwrap();
+        assert_eq!(unchanged.web_search_strategy.as_deref(), Some("deepseek_native"));
+        assert_eq!(unchanged.web_search_tested_at, Some(123));
+        for strategy in ["auto", "openai_native", "anthropic_native", "deepseek_native", "public", "disabled", "dashscope", "bigmodel"] {
+            let parsed = parse_provider(json!({"webSearchStrategy":strategy}), Some(&provider)).unwrap();
+            assert_eq!(provider_json(&parsed)["webSearchStrategy"], strategy);
+        }
+        let changed = parse_provider(json!({"webSearchStrategy":"openai"}), Some(&provider)).unwrap();
+        assert_eq!(changed.web_search_strategy.as_deref(), Some("openai_native"));
+        assert!(!changed.supports_web_search);
+        assert!(changed.web_search_tested_at.is_none());
+        assert!(changed.web_search_test_reason.is_none());
+        assert!(parse_provider(json!({"webSearchStrategy":null}), Some(&provider)).unwrap().web_search_strategy.is_none());
+        for invalid in [json!("unknown"), json!(true), json!(7), json!({})] {
+            assert!(parse_provider(json!({"webSearchStrategy":invalid}), Some(&provider)).is_err());
+        }
+    }
+    #[test]
     fn provider_configuration_roundtrip_and_validation() {
         let input = json!({"id":"test-local","name":"Test","baseUrl":"http://127.0.0.1:8317/v1","apiKey":"test-key","format":"openai","models":[{"id":"same-model","name":"Model","contextWindow":1000000,"maxTokens":32000,"inputTypes":["text","image"]}]});
-        let provider = parse_provider(input.clone(), None).unwrap();
+        let mut provider = parse_provider(input.clone(), None).unwrap();
+        provider = parse_provider(json!({"webSearchStrategy":"deepseek_native"}), Some(&provider)).unwrap();
         assert_eq!(provider.models[0].context_window, Some(1000000));
         assert!(provider.models[0].supports_vision);
         let patch = parse_provider(json!({"models":[{"id":"same-model","name":"Renamed"}]}), Some(&provider)).unwrap();
@@ -149,6 +197,7 @@ mod provider_configuration_tests {
         config.update_config(|c| c.providers[0].name = "Updated".into()).unwrap();
         let reloaded = crate::config::ConfigManager::new(dir.clone());
         assert_eq!(reloaded.get_provider("test-local").unwrap().name,"Updated");
+        assert_eq!(reloaded.get_provider("test-local").unwrap().web_search_strategy.as_deref(),Some("deepseek_native"));
         assert_eq!(reloaded.get_provider("test-local").unwrap().models[0].context_window,Some(1000000));
         std::fs::remove_dir_all(dir).unwrap();
         let path = std::env::temp_dir().join(format!("provider-fail-{}",uuid::Uuid::new_v4()));

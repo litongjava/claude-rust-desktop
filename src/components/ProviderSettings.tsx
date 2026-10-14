@@ -6,7 +6,7 @@ import { formatTokenLimit, parseTokenLimit } from '../utils/modelConfig';
 
 const inputClass = 'w-full bg-transparent border border-claude-border rounded-lg px-3 py-2 text-[13px] text-claude-text outline-none focus:border-[#387ee0]';
 const buttonClass = 'px-3 py-2 rounded-lg border border-claude-border text-[13px] hover:bg-claude-hover disabled:opacity-40';
-const emptyProvider = (): Provider => ({ id: '', name: '', baseUrl: '', apiKey: '', format: 'openai', category: 'custom', enabled: true, models: [] });
+const emptyProvider = (): Provider => ({ id: '', name: '', baseUrl: '', apiKey: '', format: 'openai', category: 'custom', enabled: true, models: [], webSearchStrategy: 'auto' });
 
 function TokenField({ label, value, onChange }: { label: string; value?: number; onChange: (value?: number) => void }) {
   const [text, setText] = useState(formatTokenLimit(value));
@@ -103,6 +103,18 @@ export default function ProviderSettings() {
           <label className="block text-xs text-claude-textSecondary">API 地址<input required={draft.category !== 'builtin'} type="url" aria-label="API 地址" className={`${inputClass} mt-1 font-mono`} value={draft.baseUrl} onChange={e => edit({ baseUrl: e.target.value })} placeholder="https://api.example.com/v1" /></label>
           <label className="block text-xs text-claude-textSecondary">API 密钥<span className="flex items-center gap-2 mt-1"><input aria-label="API 密钥" type={showKey ? 'text' : 'password'} className={inputClass} value={draft.apiKey || ''} onChange={e => edit({ apiKey: e.target.value })} placeholder={draft.category === 'builtin' ? 'API key，留空则使用环境认证' : 'API key（本地免认证服务可留空）'} autoComplete="off" /><button type="button" aria-label="显示或隐藏密钥" onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></span></label>
           <label className="block text-xs text-claude-textSecondary">Protocol{draft.category === 'builtin' ? <div className="mt-2 text-claude-text">{[...new Set(draft.models.map(m => m.api))].filter(Boolean).join(', ') || '供应商原生协议'}</div> : <select aria-label="Protocol" className={`${inputClass} mt-1`} value={draft.format} onChange={e => edit({ format: e.target.value as Provider['format'] })}><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select>}</label>
+          <div>
+            <label className="block text-xs text-claude-textSecondary">联网搜索<select aria-label="联网搜索" aria-describedby="web-search-help" className={`${inputClass} mt-1`} value={draft.webSearchStrategy || 'auto'} onChange={e => edit({ webSearchStrategy: e.target.value as Provider['webSearchStrategy'] })}>
+              <option value="auto">自动使用模型供应商搜索（默认）</option>
+              <option value="openai_native">OpenAI 原生搜索</option>
+              <option value="anthropic_native">Anthropic 原生搜索</option>
+              <option value="deepseek_native">DeepSeek 原生搜索</option>
+              <option value="public">公共网页搜索（DuckDuckGo / Bing）</option>
+              <option value="disabled">关闭联网搜索</option>
+              {(draft.webSearchStrategy === 'dashscope' || draft.webSearchStrategy === 'bigmodel') && <option value={draft.webSearchStrategy}>{draft.webSearchStrategy}（旧配置，请重新选择）</option>}
+            </select></label>
+            <p id="web-search-help" className="mt-2 text-xs text-claude-textSecondary">自动模式下的 DeepSeek 模型和手动选择 DeepSeek 原生搜索，均使用系统设置 → 联网搜索中的独立地址、模型和密钥。其他原生搜索使用此供应商的 API 地址和认证。搜索可能产生额外费用；服务不支持时会提示错误，不会自动改用公共搜索。</p>
+          </div>
           <div className="border-t border-claude-border pt-4 space-y-3">
             <div className="flex items-center gap-2"><h4 className="text-sm font-medium flex-1">模型列表</h4><button type="button" disabled={busy || (adding && draft.category !== 'builtin')} onClick={fetchModels} className={buttonClass}><RefreshCw size={12} className="inline mr-1" />获取模型列表</button><button type="button" onClick={() => { edit({ models: [...draft.models, { id: `model-${Date.now()}`, name: '新模型', enabled: true, inputTypes: ['text'], api: draft.category === 'builtin' ? draft.models[0]?.api : undefined }] }); setSearch(''); setPage(Math.floor(draft.models.length / pageSize)); }} className={buttonClass}>添加模型</button></div>
             <input aria-label="搜索模型" className={inputClass} value={search} placeholder="搜索模型" onChange={e => { setSearch(e.target.value); setPage(0); }} />
