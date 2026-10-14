@@ -1,9 +1,12 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { useUIStore } from './useUIStore';
+import type { WorkspaceMode } from './useWorkspaceModeStore';
 
 export type WorkDetails = 'compact' | 'standard' | 'detailed' | 'verbose';
 export type PermissionMode = 'ask_permissions' | 'accept_edits' | 'plan_mode' | 'bypass_permissions';
+export type HomeModelMode = Exclude<WorkspaceMode, 'code'>;
+export interface ModeModel { providerId: string; modelId: string }
 export interface GeneralSettings {
   defaultPermissionMode: PermissionMode;
   theme: 'light' | 'dark' | 'system';
@@ -14,6 +17,7 @@ export interface GeneralSettings {
   busySendBehavior: 'queue' | 'steer';
   sendKey: string;
   newlineKey: string;
+  defaultModelByMode: Record<HomeModelMode, ModeModel | null>;
 }
 
 const permissions = ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_permissions'];
@@ -23,6 +27,7 @@ const defaults: GeneralSettings = {
   defaultPermissionMode: 'accept_edits', theme: 'light', fontSize: 14,
   workDetails: 'detailed', showCodingView: true, chatLinks: 'sidebar',
   busySendBehavior: 'queue', sendKey: 'enter', newlineKey: 'shift_enter',
+  defaultModelByMode: { chat: null, work: null, study: null },
 };
 
 export function normalizeGeneralSettings(value: unknown): GeneralSettings {
@@ -37,6 +42,12 @@ export function normalizeGeneralSettings(value: unknown): GeneralSettings {
     busySendBehavior: v.busySendBehavior === 'steer' ? 'steer' : 'queue',
     sendKey: sendKeys.includes(v.sendKey || '') ? v.sendKey! : defaults.sendKey,
     newlineKey: newlineKeys.includes(v.newlineKey || '') && v.newlineKey !== v.sendKey ? v.newlineKey! : 'shift_enter',
+    defaultModelByMode: Object.fromEntries((['chat', 'work', 'study'] as const).map(mode => {
+      const model = v.defaultModelByMode?.[mode];
+      return [mode, model && typeof model.providerId === 'string' && model.providerId.trim()
+        && typeof model.modelId === 'string' && model.modelId.trim()
+        ? { providerId: model.providerId.trim(), modelId: model.modelId.trim() } : null];
+    })) as Record<HomeModelMode, ModeModel | null>,
   };
 }
 

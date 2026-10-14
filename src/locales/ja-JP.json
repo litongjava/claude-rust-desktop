@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "モード別の既定モデル",
+    "modeModelsDescription": "新しい Chat、Work、Study セッションのプロバイダーとモデルを選択します。変更は自動保存され、セッション開始前のモード切り替えで既定モデルが適用されます。",
+    "modelProvider": "プロバイダー",
+    "useCurrentModel": "現在のモデルを使用",
+    "modelUnavailable": "利用不可",
     "openConfiguration": "設定ファイルを開く",
     "permission": "権限",
     "permissionDescription": "新しいセッションの既定の権限モードを選択",

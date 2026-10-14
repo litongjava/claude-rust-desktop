@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "各模式默认模型",
+    "modeModelsDescription": "分别选择新 Chat、Work、Study 会话的供应商和模型，修改后自动保存；开始会话前切换模式会应用对应默认值。",
+    "modelProvider": "供应商",
+    "useCurrentModel": "使用当前模型",
+    "modelUnavailable": "不可用",
     "openConfiguration": "打开配置文件",
     "permission": "权限",
     "permissionDescription": "选择新会话的默认权限模式",

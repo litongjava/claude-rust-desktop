@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "各模式預設模型",
+    "modeModelsDescription": "分別選擇新 Chat、Work、Study 工作階段的供應商與模型。變更自動儲存；開始工作階段前切換模式會套用對應預設值。",
+    "modelProvider": "供應商",
+    "useCurrentModel": "使用目前模型",
+    "modelUnavailable": "無法使用",
     "openConfiguration": "開啟設定檔",
     "permission": "權限",
     "permissionDescription": "選擇新工作階段的預設權限模式",

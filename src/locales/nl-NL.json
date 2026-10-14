@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Standaardmodellen per modus",
+    "modeModelsDescription": "Kies een aanbieder en model voor nieuwe Chat-, Work- en Study-sessies. Wijzigingen worden automatisch opgeslagen; wisselen van modus vóór de sessie past het standaardmodel toe.",
+    "modelProvider": "Aanbieder",
+    "useCurrentModel": "Huidig model gebruiken",
+    "modelUnavailable": "Niet beschikbaar",
     "openConfiguration": "Configuratiebestand openen",
     "permission": "Machtigingen",
     "permissionDescription": "Kies de standaardmachtigingen voor nieuwe sessies",

@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Default models by mode",
+    "modeModelsDescription": "Choose a provider and model for new Chat, Work and Study sessions. Changes save automatically; switching modes before starting a session applies its default.",
+    "modelProvider": "Provider",
+    "useCurrentModel": "Use current model",
+    "modelUnavailable": "Unavailable",
     "openConfiguration": "Open configuration file",
     "permission": "Permission",
     "permissionDescription": "Choose the default permission mode for new sessions",

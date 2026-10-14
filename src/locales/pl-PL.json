@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Modele domyślne dla trybów",
+    "modeModelsDescription": "Wybierz dostawcę i model dla nowych sesji Chat, Work i Study. Zmiany zapisują się automatycznie; zmiana trybu przed sesją stosuje jego model domyślny.",
+    "modelProvider": "Dostawca",
+    "useCurrentModel": "Użyj bieżącego modelu",
+    "modelUnavailable": "Niedostępny",
     "openConfiguration": "Otwórz plik konfiguracji",
     "permission": "Uprawnienia",
     "permissionDescription": "Wybierz domyślny tryb uprawnień dla nowych sesji",

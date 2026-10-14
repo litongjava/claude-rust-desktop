@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "النماذج الافتراضية لكل وضع",
+    "modeModelsDescription": "اختر مزودًا ونموذجًا لجلسات Chat وWork وStudy الجديدة. تُحفظ التغييرات تلقائيًا؛ تبديل الوضع قبل بدء الجلسة يطبق نموذجه الافتراضي.",
+    "modelProvider": "المزود",
+    "useCurrentModel": "استخدام النموذج الحالي",
+    "modelUnavailable": "غير متاح",
     "openConfiguration": "فتح ملف الإعدادات",
     "permission": "الأذونات",
     "permissionDescription": "اختر وضع الأذونات الافتراضي للجلسات الجديدة",

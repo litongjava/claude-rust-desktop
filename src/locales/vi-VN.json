@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Mô hình mặc định theo chế độ",
+    "modeModelsDescription": "Chọn nhà cung cấp và mô hình cho phiên Chat, Work và Study mới. Thay đổi được lưu tự động; chuyển chế độ trước khi bắt đầu phiên sẽ áp dụng mô hình mặc định của chế độ đó.",
+    "modelProvider": "Nhà cung cấp",
+    "useCurrentModel": "Dùng mô hình hiện tại",
+    "modelUnavailable": "Không khả dụng",
     "openConfiguration": "Mở tệp cấu hình",
     "permission": "Quyền",
     "permissionDescription": "Chọn chế độ quyền mặc định cho phiên mới",

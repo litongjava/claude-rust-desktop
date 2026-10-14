@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Modlara göre varsayılan modeller",
+    "modeModelsDescription": "Yeni Chat, Work ve Study oturumları için sağlayıcı ve model seçin. Değişiklikler otomatik kaydedilir; oturumdan önce mod değiştirmek varsayılan modelini uygular.",
+    "modelProvider": "Sağlayıcı",
+    "useCurrentModel": "Geçerli modeli kullan",
+    "modelUnavailable": "Kullanılamıyor",
     "openConfiguration": "Yapılandırma dosyasını aç",
     "permission": "İzinler",
     "permissionDescription": "Yeni oturumlar için varsayılan izin modunu seçin",

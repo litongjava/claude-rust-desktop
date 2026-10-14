@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Model default per mode",
+    "modeModelsDescription": "Pilih penyedia dan model untuk sesi Chat, Work, dan Study baru. Perubahan disimpan otomatis; mengganti mode sebelum memulai sesi menerapkan model defaultnya.",
+    "modelProvider": "Penyedia",
+    "useCurrentModel": "Gunakan model saat ini",
+    "modelUnavailable": "Tidak tersedia",
     "openConfiguration": "Buka berkas konfigurasi",
     "permission": "Izin",
     "permissionDescription": "Pilih mode izin default untuk sesi baru",

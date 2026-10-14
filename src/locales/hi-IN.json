@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "मोड के अनुसार डिफ़ॉल्ट मॉडल",
+    "modeModelsDescription": "नए Chat, Work और Study सत्रों के लिए प्रदाता और मॉडल चुनें। बदलाव अपने आप सहेजे जाते हैं; सत्र शुरू होने से पहले मोड बदलने पर उसका डिफ़ॉल्ट मॉडल लागू होता है।",
+    "modelProvider": "प्रदाता",
+    "useCurrentModel": "वर्तमान मॉडल उपयोग करें",
+    "modelUnavailable": "अनुपलब्ध",
     "openConfiguration": "कॉन्फ़िगरेशन फ़ाइल खोलें",
     "permission": "अनुमतियाँ",
     "permissionDescription": "नए सत्रों के लिए डिफ़ॉल्ट अनुमति मोड चुनें",

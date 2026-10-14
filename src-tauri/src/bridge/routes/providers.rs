@@ -129,6 +129,54 @@ async fn providers_models_list(State(state): State<AppState>) -> ApiResult {
     let models: Vec<Value> = cm.get_config().providers.iter().filter(|p| p.enabled).flat_map(|p| p.models.iter().filter(|m| m.enabled).map(|m| { let mut v = model_json(m); v["providerId"] = json!(p.id); v["providerName"] = json!(p.name); v })).collect();
     Ok(Json(json!({"models":models})))
 }
+fn discovery_token(value: &Value) -> Option<u32> {
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).ok().filter(|n| *n > 0);
+    }
+    let text = value.as_str()?.trim().to_ascii_lowercase();
+    let (number, multiplier) = if let Some(n) = text.strip_suffix('k') { (n, 1000.0) }
+        else if let Some(n) = text.strip_suffix('m') { (n, 1000000.0) } else { (text.as_str(), 1.0) };
+    let n = number.trim().parse::<f64>().ok()? * multiplier;
+    (n.is_finite() && n >= 1.0 && n <= u32::MAX as f64 && n.fract() == 0.0).then_some(n as u32)
+}
+
+fn discovered_model(model: &Value) -> Option<Value> {
+    let id = model["id"].as_str()?;
+    let mut result = json!({"id":id,"name":model["name"].as_str().or(model["display_name"].as_str()).unwrap_or(id),"enabled":true});
+    for (target, paths) in [
+        ("contextWindow", &["/contextWindow", "/context_window", "/context_length", "/max_context_length", "/max_input_tokens", "/input_token_limit", "/inputTokenLimit", "/limits/context", "/limits/context_length", "/top_provider/context_length"] as &[&str]),
+        ("maxTokens", &["/maxTokens", "/max_tokens", "/max_output_tokens", "/output_token_limit", "/outputTokenLimit", "/limits/output", "/top_provider/max_completion_tokens"] as &[&str]),
+    ] {
+        if let Some(value) = paths.iter().filter_map(|path| model.pointer(path).and_then(discovery_token)).next() {
+            result[target] = json!(value);
+        }
+    }
+    let modalities = ["/inputTypes", "/input_types", "/input_modalities", "/architecture/input_modalities", "/modalities/input", "/capabilities/input_modalities"]
+        .iter().filter_map(|path| model.pointer(path).and_then(Value::as_array)).find(|values| !values.is_empty());
+    if let Some(values) = modalities {
+        let input: Vec<&str> = ["text", "image"].into_iter().filter(|kind| values.iter().any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(kind)))).collect();
+        if !input.is_empty() { result["inputTypes"] = json!(input); }
+    } else if let Some(modality) = model.pointer("/architecture/modality").and_then(Value::as_str) {
+        let input: Vec<&str> = modality.split("->").next().unwrap_or("").split('+').filter(|s| ["text", "image"].contains(s)).collect();
+        if !input.is_empty() { result["inputTypes"] = json!(input); }
+    }
+    if result.get("inputTypes").is_none() {
+        if let Some(vision) = ["/supports_vision", "/supportsVision", "/vision", "/capabilities/vision"]
+            .iter().find_map(|path| model.pointer(path).and_then(Value::as_bool)) {
+            let text = ["/supports_text", "/supportsText", "/capabilities/text"].iter()
+                .find_map(|path| model.pointer(path).and_then(Value::as_bool)).unwrap_or(true);
+            let mut input = Vec::new();
+            if text { input.push("text"); }
+            if vision { input.push("image"); }
+            if !input.is_empty() { result["inputTypes"] = json!(input); }
+        }
+    }
+    if let (Some(context), Some(output)) = (result["contextWindow"].as_u64(), result["maxTokens"].as_u64()) {
+        result["maxTokens"] = json!(output.min(context));
+    }
+    Some(result)
+}
+
 async fn fetch_models(Path(id): Path<String>, State(state): State<AppState>) -> ApiResult {
     let provider = { let guard = state.config_manager.lock().await; guard.as_ref().and_then(|cm| cm.get_provider(&id)).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "Provider not found"))? };
     let base = provider.base_url.trim_end_matches('/');
@@ -139,7 +187,7 @@ async fn fetch_models(Path(id): Path<String>, State(state): State<AppState>) -> 
     let response = request.send().await.map_err(io_error)?;
     if !response.status().is_success() { return Err(bad(format!("Model discovery returned HTTP {}", response.status()))); }
     let data: Value = response.json().await.map_err(io_error)?;
-    let models: Vec<Value> = data["data"].as_array().ok_or_else(|| bad("Invalid models response"))?.iter().filter_map(|m| m["id"].as_str().map(|id| json!({"id":id,"name":m["name"].as_str().or(m["display_name"].as_str()).unwrap_or(id),"enabled":true,"inputTypes":["text"]}))).collect();
+    let models: Vec<Value> = data["data"].as_array().ok_or_else(|| bad("Invalid models response"))?.iter().filter_map(discovered_model).collect();
     Ok(Json(json!({"models":models})))
 }
 pub fn routes() -> Router<AppState> {
@@ -152,6 +200,31 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod provider_configuration_tests {
     use super::*;
+    #[test]
+    fn provider_discovery_keeps_metadata_and_missing_fields_distinct() {
+        let bare = discovered_model(&json!({"id":"gpt-4o"})).unwrap();
+        assert!(bare.get("inputTypes").is_none());
+        assert!(bare.get("contextWindow").is_none());
+        let metadata = discovered_model(&json!({"id":"gateway-model","display_name":"Gateway Model","context_length":256000,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"top_provider":{"max_completion_tokens":32000}})).unwrap();
+        assert_eq!(metadata["name"], "Gateway Model");
+        assert_eq!(metadata["contextWindow"], 256000);
+        assert_eq!(metadata["maxTokens"], 32000);
+        assert_eq!(metadata["inputTypes"], json!(["text", "image"]));
+        assert!(discovered_model(&json!({"name":"missing id"})).is_none());
+    }
+    #[test]
+    fn provider_discovery_parses_limits_and_only_input_modalities() {
+        let model = discovered_model(&json!({"id":"image-generator","context_window":"1.5M","max_output_tokens":"32K","architecture":{"modality":"text->image"}})).unwrap();
+        assert_eq!(model["contextWindow"], 1500000);
+        assert_eq!(model["maxTokens"], 32000);
+        assert_eq!(model["inputTypes"], json!(["text"]));
+        let text_only = discovered_model(&json!({"id":"vision-name","supports_vision":false,"limits":{"context":1000,"output":2000}})).unwrap();
+        assert_eq!(text_only["inputTypes"], json!(["text"]));
+        assert_eq!(text_only["maxTokens"], 1000);
+        for invalid in [json!(0), json!(-1), json!("NaN"), json!(4294967296_u64), json!("1.1")] {
+            assert!(discovery_token(&invalid).is_none());
+        }
+    }
     #[test]
     fn web_search_strategy_is_validated_and_preserved() {
         let mut provider = parse_provider(json!({"id":"search","name":"Search","baseUrl":"https://gateway.example/v1","webSearchStrategy":"deepseek_native"}), None).unwrap();

@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Modelos predeterminados por modo",
+    "modeModelsDescription": "Elige un proveedor y modelo para nuevas sesiones Chat, Work y Study. Los cambios se guardan automáticamente; cambiar de modo antes de iniciar la sesión aplica su modelo predeterminado.",
+    "modelProvider": "Proveedor",
+    "useCurrentModel": "Usar modelo actual",
+    "modelUnavailable": "No disponible",
     "openConfiguration": "Abrir archivo de configuración",
     "permission": "Permisos",
     "permissionDescription": "Elige el modo de permisos predeterminado para las sesiones nuevas",

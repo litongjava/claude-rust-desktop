@@ -271,6 +271,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     selectorModels,
     isModelSelectable,
     resolveModelForNewChat,
+    resolveModelForMode,
     currentProviderSupportsWebSearch,
     isSelfHostedMode,
   } = useModelCatalog(viewingIdRef);
@@ -999,6 +1000,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       if (conversationId) await updateConversation(conversationId, { workspace_mode: mode });
       if (viewingIdRef.current === (conversationId || null) && useWorkspaceModeStore.getState().mode !== 'code') {
         useWorkspaceModeStore.getState().setMode(mode);
+        if (!conversationId) setCurrentModelString(resolveModelForMode(mode, currentModelString));
       }
       window.dispatchEvent(new CustomEvent('conversationUpdated', { detail: { id: conversationId } }));
     } catch (error) {

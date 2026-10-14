@@ -11,6 +11,15 @@ beforeEach(() => {
 });
 afterEach(() => { delete (window as any).__TAURI_INTERNALS__; });
 
+it('validates provider/model defaults per mode and saves them to desktop configuration', async () => {
+  const settings = normalizeGeneralSettings({ defaultModelByMode: { chat: { providerId: ' a ', modelId: 'same' }, work: { providerId: '', modelId: 'bad' }, study: 'bad' } });
+  expect(settings.defaultModelByMode).toEqual({ chat: { providerId: 'a', modelId: 'same' }, work: null, study: null });
+  vi.mocked(invoke).mockResolvedValue(null);
+  useGeneralSettingsStore.getState().update({ defaultModelByMode: settings.defaultModelByMode });
+  await openGeneralConfiguration();
+  expect(invoke).toHaveBeenCalledWith('write_general_settings', expect.objectContaining({ settings: expect.objectContaining({ defaultModelByMode: settings.defaultModelByMode }) }));
+});
+
 it('loads a desktop configuration, validates it, and applies language and appearance', async () => {
   vi.mocked(invoke).mockResolvedValue({ defaultPermissionMode: 'plan_mode', theme: 'dark', fontSize: 99, language: 'zh', chatFont: 'sans', workDetails: 'verbose', busySendBehavior: 'steer' });
   await initializeGeneralSettings();

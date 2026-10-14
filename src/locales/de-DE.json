@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "Standardmodelle je Modus",
+    "modeModelsDescription": "Anbieter und Modell für neue Chat-, Work- und Study-Sitzungen wählen. Änderungen werden automatisch gespeichert; ein Moduswechsel vor Sitzungsbeginn übernimmt dessen Standardmodell.",
+    "modelProvider": "Anbieter",
+    "useCurrentModel": "Aktuelles Modell verwenden",
+    "modelUnavailable": "Nicht verfügbar",
     "openConfiguration": "Konfigurationsdatei öffnen",
     "permission": "Berechtigungen",
     "permissionDescription": "Standardberechtigungen für neue Sitzungen wählen",

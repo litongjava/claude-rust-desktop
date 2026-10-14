@@ -1,5 +1,10 @@
 {
   "general": {
+    "modeModels": "โมเดลเริ่มต้นตามโหมด",
+    "modeModelsDescription": "เลือกผู้ให้บริการและโมเดลสำหรับเซสชัน Chat, Work และ Study ใหม่ ระบบบันทึกการเปลี่ยนแปลงอัตโนมัติ การเปลี่ยนโหมดก่อนเริ่มเซสชันจะใช้โมเดลเริ่มต้นของโหมดนั้น",
+    "modelProvider": "ผู้ให้บริการ",
+    "useCurrentModel": "ใช้โมเดลปัจจุบัน",
+    "modelUnavailable": "ไม่พร้อมใช้งาน",
     "openConfiguration": "เปิดไฟล์การตั้งค่า",
     "permission": "สิทธิ์",
     "permissionDescription": "เลือกโหมดสิทธิ์เริ่มต้นสำหรับเซสชันใหม่",
