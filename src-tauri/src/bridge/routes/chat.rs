@@ -146,35 +146,7 @@ async fn chat_handler(
     let providers_to_sync = {
         let cm_guard: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
         if let Some(cm) = cm_guard.as_ref() {
-            cm.get_config().providers.iter().map(|p| {
-                crate::native_engine::provider_manager::Provider {
-                    id: p.id.clone(),
-                    builtin_id: p.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
-                    name: p.name.clone(),
-                    base_url: p.base_url.clone(),
-                    api_key: p.api_key.clone().unwrap_or_default(),
-                    api_format: {
-                        // DeepSeek uses OpenAI-compatible API even if user selected wrong format
-                        let is_deepseek = p.base_url.contains("deepseek");
-                        if p.provider_type == "anthropic" && !is_deepseek {
-                            crate::native_engine::provider_manager::ApiFormat::Anthropic
-                        } else {
-                            crate::native_engine::provider_manager::ApiFormat::OpenAI
-                        }
-                    },
-                    models: p.models.iter().map(|m| crate::native_engine::provider_manager::ModelConfig {
-                        id: m.id.clone(),
-                        name: m.name.clone(),
-                        enabled: m.enabled,
-                        max_tokens: m.max_tokens,
-                        supports_vision: m.supports_vision,
-                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None,
-                        supports_web_search: false,
-                    }).collect(),
-                    enabled: p.enabled,
-                    web_search_strategy: p.web_search_strategy.clone(),
-                }
-            }).collect::<Vec<_>>()
+            cm.get_config().providers.iter().map(crate::runtime::provider_from_config).collect::<Vec<_>>()
         } else {
             Vec::new()
         }

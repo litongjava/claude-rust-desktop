@@ -10,7 +10,11 @@
     "tauri": "tauri",
     "test": "vitest",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "build:all": "node scripts/build-all.mjs",
+    "build:cli": "node scripts/build-all.mjs --cli-only",
+    "build:desktop": "node scripts/build-all.mjs --desktop-only",
+    "check:rust": "node scripts/build-all.mjs --check"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.85.1",

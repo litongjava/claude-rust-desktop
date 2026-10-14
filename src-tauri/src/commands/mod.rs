@@ -1,3 +1,4 @@
+pub mod knowledge;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
 use crate::db::DbManager;
 use crate::db::diff_repo::CodeDiffRow;
@@ -266,10 +267,10 @@ pub async fn native_engine_init(
         let permission_manager = Arc::new(crate::permissions::PermissionManager::new(
             Arc::new(crate::permissions::AuditLogger::new(1000)),
         ));
-        let engine = crate::native_engine::NativeEngine::new(
-            provider_manager,
+        let engine = crate::runtime::create_engine(
+            &crate::runtime::RuntimePaths { data_dir },
             db_manager,
-            data_dir.join("workspaces"),
+            provider_manager,
             permission_manager,
             Arc::new(crate::cache::FileCache::new()),
         );

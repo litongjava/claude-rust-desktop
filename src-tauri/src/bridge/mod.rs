@@ -255,10 +255,10 @@ impl BridgeServer {
         let file_cache = Arc::new(FileCache::new());
         tracing::info!(module = "Bridge", "FileCache initialized");
 
-        let native_engine = Arc::new(Mutex::new(Some(NativeEngine::new(
-            provider_manager,
+        let native_engine = Arc::new(Mutex::new(Some(crate::runtime::create_engine(
+            &crate::runtime::RuntimePaths { data_dir: data_dir.clone() },
             db_manager.clone(),
-            data_dir.join("workspaces"),
+            provider_manager,
             permission_manager,
             file_cache.clone(),
         ))));

@@ -1,0 +1,278 @@
+mod args;
+mod config;
+#[allow(dead_code)]
+mod legacy_api_config;
+mod session;
+#[allow(dead_code)]
+mod terminal;
+
+use anyhow::{bail, ensure, Context, Result};
+use args::{Cli, Commands, McpCommands, OutputFormat, SessionCommands, SkillsCommands};
+use clap::Parser;
+use claude_core::{
+    mcp::{McpServerConfig, McpServerManager},
+    runtime::{RuntimePaths, SessionStore},
+    skills::SkillsManager,
+};
+use std::{
+    collections::HashMap,
+    io::{self, IsTerminal, Read, Write},
+    path::PathBuf,
+};
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(if cli.verbose { "info" } else { "error" })
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .init();
+    if let Err(error) = run(&cli).await {
+        eprintln!("Error: {error:#}");
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+fn absolute(path: PathBuf) -> Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+async fn run(cli: &Cli) -> Result<()> {
+    let data_dir = match &cli.data_dir {
+        Some(path) => path.clone(),
+        None => RuntimePaths::default_data_dir()?,
+    };
+    let paths = RuntimePaths::new(absolute(data_dir)?)?;
+    if let Some(path) = &cli.path {
+        std::env::set_current_dir(path).context("Cannot open project directory")?;
+    }
+    if cli.info {
+        println!("claude-code {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
+        return Ok(());
+    }
+    let mut skill_prompt = None;
+    match &cli.command {
+        Some(Commands::Config { action }) => return config::run(&paths, action),
+        Some(Commands::Mcp { action }) => return mcp(&paths, action).await,
+        Some(Commands::Sessions { action }) => {
+            let db = paths.open_database()?;
+            let value = match action {
+                SessionCommands::List => serde_json::to_value(
+                    db.with_conn(claude_core::db::conversation_repo::list_conversations)??,
+                )?,
+                SessionCommands::Show { id } => {
+                    let store = SessionStore::new(db);
+                    serde_json::json!({"session":store.resume(id)?,"messages":store.history(id)?})
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        Some(Commands::Init { name }) => {
+            let cwd = std::env::current_dir()?;
+            terminal::init::ensure_directories(&cwd)?;
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(cwd.join("CLAUDE.md"));
+            match file {
+                Ok(mut file) => writeln!(
+                    file,
+                    "# {}\n\nAdd project instructions and verification commands here.",
+                    name.as_deref().unwrap_or("Project")
+                )?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+            eprintln!("Initialized {}", cwd.display());
+            return Ok(());
+        }
+        Some(Commands::Skills { action }) => {
+            let manager = SkillsManager::new();
+            let skills = manager.load_skills().await?;
+            match action {
+                SkillsCommands::List => {
+                    println!("{}", serde_json::to_string_pretty(&skills)?);
+                    return Ok(());
+                }
+                SkillsCommands::Search { query } => {
+                    let query = query.to_lowercase();
+                    let selected: Vec<_> = skills
+                        .iter()
+                        .filter(|s| {
+                            format!("{} {}", s.name, s.description)
+                                .to_lowercase()
+                                .contains(&query)
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&selected)?);
+                    return Ok(());
+                }
+                SkillsCommands::Help { skill } | SkillsCommands::Execute { skill, .. } => {
+                    let found = skills
+                        .iter()
+                        .find(|s| &s.id == skill || &s.name == skill)
+                        .context("Skill not found")?;
+                    let content = manager.get_skill_content(&found.id, "SKILL.md")?;
+                    if let SkillsCommands::Execute { args, .. } = action {
+                        skill_prompt = Some(format!(
+                            "Use this skill for the following task:\n\n{content}\n\nTask: {}",
+                            args.join(" ")
+                        ));
+                    } else {
+                        println!("{content}");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let explicit_repl = matches!(cli.command, Some(Commands::Repl { .. }));
+    let single = cli.print
+        || cli.no_interactive
+        || matches!(cli.command, Some(Commands::Query { .. }))
+        || skill_prompt.is_some()
+        || !io::stdin().is_terminal();
+    ensure!(
+        !explicit_repl || !single,
+        "repl requires interactive stdin; use query or --print for scripts"
+    );
+    ensure!(
+        single || cli.output_format == OutputFormat::Text,
+        "JSON output requires --print or query"
+    );
+    let mut prompt = skill_prompt
+        .or_else(|| match &cli.command {
+            Some(Commands::Repl { prompt }) | Some(Commands::Query { prompt }) => prompt.clone(),
+            _ => cli.prompt.clone(),
+        })
+        .unwrap_or_default();
+    if !io::stdin().is_terminal() {
+        let mut piped = String::new();
+        io::stdin().read_to_string(&mut piped)?;
+        if !piped.trim().is_empty() {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(&piped);
+        }
+    }
+    ensure!(
+        !single || !prompt.trim().is_empty(),
+        "A prompt or piped stdin is required"
+    );
+    let resumed = if let Some(id) = &cli.resume {
+        Some(SessionStore::new(paths.open_database()?).resume(id)?)
+    } else {
+        None
+    };
+    if let Some(resumed) = &resumed {
+        let db = paths.open_database()?;
+        let (workspace, _) = db.with_conn(|conn| {
+            claude_core::native_engine::workspace::resolve_workspace(
+                conn,
+                &paths.data_dir.join("workspaces"),
+                &resumed.id,
+                None,
+            )
+        })??;
+        if cli.path.is_some() {
+            ensure!(
+                std::fs::canonicalize(&workspace)?
+                    == std::fs::canonicalize(std::env::current_dir()?)?,
+                "--path differs from the resumed session's project"
+            );
+        }
+        std::env::set_current_dir(workspace)?;
+    }
+    let selection = config::select(
+        cli,
+        &paths,
+        resumed.as_ref().and_then(|s| s.model.as_deref()),
+        resumed.as_ref().and_then(|s| s.provider.as_deref()),
+    )?;
+    let _ = claude_core::config::OrchestrationConfig::init_global();
+    let session = session::Session::open(cli, &paths, selection).await?;
+    let mut input = if single {
+        None
+    } else {
+        Some(session::terminal_input())
+    };
+    let result = async {
+        if !single { eprintln!("Claude Rust {} — session {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.id); }
+        if !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
+        if single { return Ok(()); }
+        loop {
+            eprint!("\n> "); io::stderr().flush()?;
+            let line = tokio::select! {
+                line = input.as_mut().expect("interactive reader").recv() => match line { Some(line) => line, None => break },
+                _ = tokio::signal::ctrl_c() => break,
+            };
+            match line.trim() {
+                "" => continue,
+                "/exit" | "exit" | "quit" | ".exit" | ":q" => break,
+                "/help" | "help" | ".help" | ":h" => eprintln!("/exit  /status  /history  /tools\nConfigure providers with `claude-code config`; resume with --resume ID."),
+                "/status" | "status" | ".status" => eprintln!("Session: {}\nProject: {}\nData: {}", session.id, std::env::current_dir()?.display(), paths.data_dir.display()),
+                "/history" | "history" | ".history" => println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
+                "/tools" | "tools" | ".tools" => for tool in claude_core::tools::get_tool_definitions() { eprintln!("{}: {}", tool.name, tool.description); },
+                line => if let Err(error) = session.turn(cli, line, &mut input).await { eprintln!("Error: {error:#}"); },
+            }
+        }
+        Ok(())
+    }.await;
+    let shutdown = session.close().await;
+    result.and(shutdown)
+}
+
+async fn mcp(paths: &RuntimePaths, action: &McpCommands) -> Result<()> {
+    std::fs::create_dir_all(&paths.data_dir)?;
+    let manager = McpServerManager::new(paths.data_dir.join("mcp-servers.json"));
+    manager.initialize().await?;
+    match action {
+        McpCommands::List => {
+            let mut value = serde_json::to_value(manager.list_servers().await)?;
+            config::redact(&mut value);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        McpCommands::Add {
+            name,
+            command,
+            args,
+        } => {
+            ensure!(
+                manager.get_server(name).await.is_none(),
+                "MCP server already exists"
+            );
+            manager
+                .add_server(McpServerConfig {
+                    id: name.clone(),
+                    name: name.clone(),
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: HashMap::new(),
+                    enabled: true,
+                })
+                .await?;
+            eprintln!("Added {name}");
+        }
+        McpCommands::Remove { name } => {
+            if manager.get_server(name).await.is_none() {
+                bail!("MCP server not found");
+            }
+            manager.remove_server(name).await?;
+            eprintln!("Removed {name}");
+        }
+    }
+    manager.shutdown_all().await
+}

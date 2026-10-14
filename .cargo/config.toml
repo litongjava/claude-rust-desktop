@@ -1,0 +1,3 @@
+# Preserve existing Tauri caches and bundle paths.
+[build]
+target-dir = "src-tauri/target"
