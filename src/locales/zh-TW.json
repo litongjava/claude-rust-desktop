@@ -39,6 +39,10 @@
     "worktreeHint": "根據所選分支的提交建立獨立工作階段分支，不複製未提交修改；專案中的其他目錄仍共用。"
   },
   "general": {
+    "showUsage": "用量統計",
+    "showUsageDescription": "分別設定各模式是否在輸入框下方顯示會話用量統計",
+    "showAiDisclaimer": "顯示 AI 提醒",
+    "showAiDisclaimerDescription": "在 Home 輸入框下方顯示核查 AI 回覆的提醒",
     "modeModels": "各模式預設模型",
     "modeModelsDescription": "分別選擇新 Chat、Work、Study 工作階段的供應商與模型。變更自動儲存；開始工作階段前切換模式會套用對應預設值。",
     "modelProvider": "供應商",
@@ -456,6 +460,7 @@
     "usageTitle": "使用量"
   },
   "chat": {
+    "selectCodeProject": "在 Code 模式傳送訊息前，請先選擇專案",
     "inputPlaceholder": "我今天能幫你什麼？",
     "send": "發送",
     "stop": "停止",
@@ -502,6 +507,18 @@
   },
   "customize": {
     "title": "自訂",
+    "plugins": "外掛程式",
+    "pluginsDescription": "瀏覽外掛程式分類，暫不支援安裝和啟用。",
+    "searchPlugins": "搜尋外掛程式…",
+    "noPluginsFound": "沒有符合的外掛程式分類",
+    "pluginCategories": {
+      "webTools": { "name": "網頁工具", "description": "瀏覽器自動化、網頁擷取與線上服務整合。" },
+      "codeTools": { "name": "程式碼工具", "description": "程式碼檢查、格式化與程式碼產生工具。" },
+      "aiModels": { "name": "AI 模型", "description": "面向專門任務的其他 AI 模型與服務。" },
+      "fileTools": { "name": "檔案工具", "description": "檔案轉換、文件處理與媒體工具。" },
+      "communication": { "name": "通訊協作", "description": "訊息、郵件與團隊協作工具。" },
+      "dataAnalytics": { "name": "資料分析", "description": "資料分析、報表與商業智慧工具。" }
+    },
     "skills": "技能",
     "connectors": "連接器",
     "filterSkills": "篩選技能...",

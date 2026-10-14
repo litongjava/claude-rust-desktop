@@ -25,7 +25,7 @@ export default function TraceInspector({ record: r, onClose, onSelectRequest }: 
   </dl>;
   const preview = r.blocks ? <AssistantResponse blocks={r.blocks} streaming={r.status === 'running'} /> : <div className="min-w-0 break-words"><MarkdownRenderer content={r.text || ''} isStreaming={r.status === 'running'} /></div>;
   return <aside className="flex min-h-0 max-h-[60%] w-full shrink-0 flex-col border-t border-claude-border lg:max-h-none lg:w-[42%] lg:border-l lg:border-t-0" aria-label="过程详情">
-    <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs"><b>{r.role.toUpperCase()}</b><span className="text-claude-textSecondary">Turn {r.turn} · Step {r.step}</span><button type="button" aria-label="关闭详情" className="ml-auto" onClick={onClose}><X size={16} /></button></div>
+    <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs"><b>{r.role === 'tool' ? 'TOOL CALL' : r.role.toUpperCase()}</b><span className="text-claude-textSecondary">Turn {r.turn} · Step {r.step}</span><button type="button" aria-label="关闭详情" className="ml-auto" onClick={onClose}><X size={16} /></button></div>
     <div className="flex overflow-x-auto border-b border-claude-border" role="tablist">{tabs.map(t => <button type="button" key={t} role="tab" aria-selected={tab === t} onClick={() => setChosen(t)} className={`whitespace-nowrap px-3 py-2 text-xs ${tab === t ? 'border-b-2 border-blue-500 text-blue-500' : 'text-claude-textSecondary'}`}>{t}</button>)}</div>
     <div className="min-h-0 flex-1 overflow-auto p-3 text-sm" role="tabpanel">
       {tab === 'Summary' && <>

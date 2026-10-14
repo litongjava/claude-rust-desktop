@@ -17,7 +17,6 @@ import H5AccessPanel from './H5AccessPanel';
 import TerminalPanel from './TerminalPanel';
 import ComputerUsePanel from './ComputerUsePanel';
 import IMIntegrationPanel from './IMIntegrationPanel';
-import McpManagementPanel from './McpManagementPanel';
 import AgentExecutionView from './AgentExecutionView';
 import KnowledgePanel from './KnowledgePanel';
 import AppStudioPanel from './AppStudioPanel';
@@ -31,7 +30,6 @@ interface SidebarProps {
   onNewChatClick?: () => void;
   onOpenSettings?: () => void;
   onOpenUpgrade?: () => void;
-  onOpenDirectory?: () => void;
   onCloseOverlays?: () => void;
   tunerConfig?: any;
   setTunerConfig?: (config: any) => void;
@@ -41,7 +39,7 @@ interface SidebarProps {
   onHelpModalChange: (open: boolean) => void;
 }
 
-const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onOpenDirectory, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
+const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
   const { t } = useI18n();
   const showCodingView = useGeneralSettingsStore(state => state.showCodingView);
   const navigate = useNavigate();
@@ -90,12 +88,11 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [showTerminalPanel, setShowTerminalPanel] = useState(false);
   const [showAgentView, setShowAgentView] = useState(false);
   const [showLivePreview, setShowLivePreview] = useState(false);
-  const [showMcpPanel, setShowMcpPanel] = useState(false);
   const [showKnowledgePanel, setShowKnowledgePanel] = useState(false);
   const [showGitHubHub, setShowGitHubHub] = useState(false);
   const [showAppStudio, setShowAppStudio] = useState(false);
 
-  const openPanel = (panel: 'browser' | 'h5' | 'computerUse' | 'im' | 'terminal' | 'agent' | 'preview' | 'mcp' | 'knowledge' | 'github' | 'appstudio') => {
+  const openPanel = (panel: 'browser' | 'h5' | 'computerUse' | 'im' | 'terminal' | 'agent' | 'preview' | 'knowledge' | 'github' | 'appstudio') => {
     setShowBrowser(panel === 'browser' ? !showBrowser : false);
     setShowH5Panel(panel === 'h5' ? !showH5Panel : false);
     setShowComputerUse(panel === 'computerUse' ? !showComputerUse : false);
@@ -103,7 +100,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     setShowTerminalPanel(panel === 'terminal' ? !showTerminalPanel : false);
     setShowAgentView(panel === 'agent' ? !showAgentView : false);
     setShowLivePreview(panel === 'preview' ? !showLivePreview : false);
-    setShowMcpPanel(panel === 'mcp' ? !showMcpPanel : false);
     setShowKnowledgePanel(panel === 'knowledge' ? !showKnowledgePanel : false);
     setShowGitHubHub(panel === 'github' ? !showGitHubHub : false);
     setShowAppStudio(panel === 'appstudio' ? !showAppStudio : false);
@@ -155,7 +151,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         if (showTerminalPanel) setShowTerminalPanel(false);
         if (showAgentView) setShowAgentView(false);
         if (showLivePreview) setShowLivePreview(false);
-        if (showMcpPanel) setShowMcpPanel(false);
         if (showKnowledgePanel) setShowKnowledgePanel(false);
         if (showGitHubHub) setShowGitHubHub(false);
         if (showAppStudio) setShowAppStudio(false);
@@ -163,7 +158,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showComputerUse, showBrowser, showH5Panel, showIMPanel, showTerminalPanel, showAgentView, showLivePreview, showMcpPanel, showKnowledgePanel, showGitHubHub, showAppStudio]);
+  }, [showComputerUse, showBrowser, showH5Panel, showIMPanel, showTerminalPanel, showAgentView, showLivePreview, showKnowledgePanel, showGitHubHub, showAppStudio]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
@@ -184,7 +179,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   };
 
   const handleNavClick = (label: string) => {
-    if (label === 'Directory') { onOpenDirectory?.(); return; }
     NAV_ROUTES[label]?.();
   };
 
@@ -621,14 +615,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           }}
         >
           <LivePreviewRenderer onClose={() => setShowLivePreview(false)} />
-        </div>
-      )}
-
-      {/* MCP Management Panel */}
-      {showMcpPanel && !isCollapsed && (
-        <div className="fixed z-40 border-l border-claude-border bg-claude-sidebar flex flex-col shadow-2xl transition-all duration-300 ease-in-out"
-          style={{ top: `${titleBarHeight || 44}px`, left: `${tunerConfig?.sidebarWidth || 280}px`, width: 'min(500px, 50vw)', height: `calc(100vh - ${titleBarHeight || 44}px)`, borderRadius: '0 12px 12px 0' }}>
-          <McpManagementPanel onClose={() => setShowMcpPanel(false)} />
         </div>
       )}
 

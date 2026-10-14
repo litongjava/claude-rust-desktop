@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "إحصاءات الاستخدام",
+    "showUsageDescription": "اختر عرض إحصاءات الاستخدام أسفل مربع الإدخال في كل وضع",
+    "showAiDisclaimer": "عرض تذكير الذكاء الاصطناعي",
+    "showAiDisclaimerDescription": "عرض تذكير أسفل إدخال Home للتحقق من إجابات الذكاء الاصطناعي",
     "modeModels": "النماذج الافتراضية لكل وضع",
     "modeModelsDescription": "اختر مزودًا ونموذجًا لجلسات Chat وWork وStudy الجديدة. تُحفظ التغييرات تلقائيًا؛ تبديل الوضع قبل بدء الجلسة يطبق نموذجه الافتراضي.",
     "modelProvider": "المزود",
@@ -417,6 +421,7 @@
     "usageTitle": "الاستخدام"
   },
   "chat": {
+    "selectCodeProject": "اختر مشروعًا قبل إرسال الرسائل في وضع Code",
     "inputPlaceholder": "كيف يمكنني مساعدتك اليوم؟",
     "send": "أرسل",
     "stop": "توقف",

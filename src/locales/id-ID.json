@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Statistik penggunaan",
+    "showUsageDescription": "Pilih apakah statistik penggunaan ditampilkan di bawah kotak input pada setiap mode",
+    "showAiDisclaimer": "Tampilkan pengingat AI",
+    "showAiDisclaimerDescription": "Tampilkan pengingat untuk memeriksa jawaban AI di bawah kotak input Home",
     "modeModels": "Model default per mode",
     "modeModelsDescription": "Pilih penyedia dan model untuk sesi Chat, Work, dan Study baru. Perubahan disimpan otomatis; mengganti mode sebelum memulai sesi menerapkan model defaultnya.",
     "modelProvider": "Penyedia",
@@ -417,6 +421,7 @@
     "usageTitle": "Penggunaan"
   },
   "chat": {
+    "selectCodeProject": "Pilih proyek sebelum mengirim pesan dalam mode Code",
     "inputPlaceholder": "Apa yang bisa saya bantu hari ini?",
     "send": "Kirim",
     "stop": "Berhenti",

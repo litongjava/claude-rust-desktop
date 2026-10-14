@@ -493,8 +493,6 @@ export function createStreamCallbacks(ctx: StreamContext) {
     }
     if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
     if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
-    const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-    if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
 
     setMessagesFor(conversationId, prev => {
       const newMsgs = [...prev];

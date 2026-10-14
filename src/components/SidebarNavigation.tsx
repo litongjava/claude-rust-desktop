@@ -28,8 +28,6 @@ export default function SidebarNavigation({ collapsed, onNewChat, onSearch, onPa
   ];
   const extensions = [
     { label: t('sidebar.customize'), icon: Puzzle, action: () => navigate('/customize') },
-    { label: t('sidebar.directory'), icon: Folder, action: () => onNavigate('Directory') },
-    { label: 'MCP', icon: Wrench, action: () => onPanel('mcp') },
     { label: t('sidebar.imIntegration'), icon: Network, action: () => onPanel('im') },
     { label: t('sidebar.h5Access'), icon: Smartphone, action: () => onPanel('h5') },
     { label: 'GitHub', icon: Github, action: () => onPanel('github') },

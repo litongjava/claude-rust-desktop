@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Estatísticas de uso",
+    "showUsageDescription": "Escolha se as estatísticas aparecem abaixo da caixa de entrada em cada modo",
+    "showAiDisclaimer": "Mostrar lembrete de IA",
+    "showAiDisclaimerDescription": "Mostrar abaixo da entrada Home um lembrete para verificar as respostas da IA",
     "modeModels": "Modelos padrão por modo",
     "modeModelsDescription": "Escolha um provedor e modelo para novas sessões Chat, Work e Study. As alterações são salvas automaticamente; trocar de modo antes de iniciar a sessão aplica o modelo padrão.",
     "modelProvider": "Provedor",
@@ -417,6 +421,7 @@
     "usageTitle": "Uso"
   },
   "chat": {
+    "selectCodeProject": "Selecione um projeto antes de enviar mensagens no modo Code",
     "inputPlaceholder": "Como posso ajudá-lo hoje?",
     "send": "Enviar",
     "stop": "Parar",

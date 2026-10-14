@@ -1,21 +1,10 @@
 import React, { useState } from 'react';
 import { ChevronLeft, ChevronRight, Lightbulb, BookOpen, Gamepad2, Palette, Trees } from 'lucide-react';
-import inspirationsData from '../data/inspirations.json';
-
-interface InspirationItem {
-  artifact_id: string;
-  chat_id: string;
-  category: string;
-  name: string;
-  description: string;
-  starting_prompt: string;
-  img_src: string;
-  content_uuid: string;
-  code_file: string;
-}
+import { codeSuggestions, homeSuggestions } from '../data/promptSuggestions';
 
 interface PromptSuggestionsPanelProps {
   onSelectPrompt: (prompt: string) => void;
+  mode?: 'home' | 'code';
 }
 
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
@@ -36,11 +25,11 @@ const CATEGORY_LABELS: Record<string, string> = {
 
 const CATEGORY_ORDER = ['learn', 'life-hacks', 'games', 'creative', 'touch-grass'];
 
-const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelectPrompt }) => {
+const PromptSuggestionsPanel: React.FC<PromptSuggestionsPanelProps> = ({ onSelectPrompt, mode = 'home' }) => {
   const [activeCategory, setActiveCategory] = useState<string>('life-hacks');
   const [page, setPage] = useState(0);
 
-  const items = (inspirationsData as { items: InspirationItem[] }).items;
+  const items = mode === 'code' ? codeSuggestions : homeSuggestions;
   const categoryItems = items.filter(item => item.category === activeCategory);
 
   const pageCount = Math.ceil(categoryItems.length / 3);

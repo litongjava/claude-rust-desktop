@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Thống kê sử dụng",
+    "showUsageDescription": "Chọn hiển thị thống kê sử dụng dưới ô nhập cho từng chế độ",
+    "showAiDisclaimer": "Hiện nhắc nhở AI",
+    "showAiDisclaimerDescription": "Hiện lời nhắc kiểm tra câu trả lời AI dưới ô nhập Home",
     "modeModels": "Mô hình mặc định theo chế độ",
     "modeModelsDescription": "Chọn nhà cung cấp và mô hình cho phiên Chat, Work và Study mới. Thay đổi được lưu tự động; chuyển chế độ trước khi bắt đầu phiên sẽ áp dụng mô hình mặc định của chế độ đó.",
     "modelProvider": "Nhà cung cấp",
@@ -417,6 +421,7 @@
     "usageTitle": "Cách sử dụng"
   },
   "chat": {
+    "selectCodeProject": "Chọn dự án trước khi gửi tin nhắn trong chế độ Code",
     "inputPlaceholder": "Hôm nay tôi có thể giúp gì cho bạn?",
     "send": "Gửi",
     "stop": "Dừng lại",

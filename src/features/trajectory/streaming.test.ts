@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createStreamCallbacks } from '../streaming/createStreamCallbacks';
+import { useWorkspaceModeStore } from '../../stores/useWorkspaceModeStore';
+import { persistMessages } from '../../api/conversations';
+import { buildTrace } from './model';
 vi.mock('../../api', () => ({ getConversation: vi.fn(), getContextSize: vi.fn(), getAttachmentUrl: vi.fn(), compactConversation: vi.fn() }));
 vi.mock('../../api/conversations', () => ({ persistMessages: vi.fn() }));
 vi.mock('../../pyodideRunner', () => ({ executeCode: vi.fn(), sendCodeResult: vi.fn() }));
@@ -19,6 +22,20 @@ function harness() {
   return { callbacks: createStreamCallbacks(ctx), message: () => messages[messages.length - 1] };
 }
 describe('stream process recording', () => {
+  it.each(['chat', 'work', 'study', 'code'] as const)('records regular and task tool calls in %s, independently of presentation', mode => {
+    useWorkspaceModeStore.setState({ mode });
+    const { callbacks: c, message } = harness();
+    for (const name of ['Read', 'TaskCreate', 'EnterPlanMode']) {
+      c.onToolUse({ type: 'start', tool_use_id: name, tool_name: name, tool_input: { description: name } });
+      c.onToolUse({ type: 'done', tool_use_id: name, tool_name: name, content: `${name} result`, is_error: false });
+    }
+    expect(message().toolCalls.map((tool: any) => tool.name)).toEqual(['Read', 'TaskCreate', 'EnterPlanMode']);
+    expect(message().toolCalls.every((tool: any) => tool.status === 'done')).toBe(true);
+    const calls = vi.mocked(persistMessages).mock.calls;
+    const savedMessages = calls[calls.length - 1]![1];
+    expect(buildTrace(JSON.parse(JSON.stringify(savedMessages))).filter(record => record.role === 'tool').map(record => record.result))
+      .toEqual(['Read result', 'TaskCreate result', 'EnterPlanMode result']);
+  });
   it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s records search usage without closing or reassigning conversation steps', callback => {
     const { callbacks: c, message } = harness();
     c[callback]('request_snapshot', '', { snapshot: { id: 'main', tools: [] }, persisted: true });

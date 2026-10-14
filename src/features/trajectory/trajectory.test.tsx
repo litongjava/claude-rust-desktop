@@ -6,6 +6,7 @@ import WorkDetails from './WorkDetails';
 import TrajectoryView from './TrajectoryView';
 import { useGeneralSettingsStore } from '../../stores/useGeneralSettingsStore';
 import { useTabStore } from '../../stores/useTabStore';
+import { useWorkspaceModeStore } from '../../stores/useWorkspaceModeStore';
 
 vi.mock('../../components/MarkdownRenderer', () => ({ default: ({ content }: { content: string }) => <p>{content}</p> }));
 vi.mock('../../components/ToolDiffView', () => ({ default: () => null, shouldUseDiffView: () => false }));
@@ -24,7 +25,8 @@ function sample() {
 beforeEach(() => {
   writeText.mockClear();
   Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
-  useGeneralSettingsStore.setState({ workDetails: 'standard', showCodingView: true });
+  useWorkspaceModeStore.setState({ mode: 'chat' });
+  useGeneralSettingsStore.setState({ workDetailsByMode: { chat: 'standard', work: 'standard', study: 'standard', code: 'detailed' }, showCodingView: true });
 });
 
 describe('WebFetch output', () => {
@@ -45,6 +47,23 @@ describe('WebFetch output', () => {
 });
 
 describe('ordered process events', () => {
+  it('switches detail levels with the workspace mode without losing tool records', () => {
+    useGeneralSettingsStore.getState().update({ workDetailsByMode: { chat: 'compact', work: 'standard', study: 'standard', code: 'detailed' } });
+    const message = sample();
+    render(<WorkDetails message={message} index={0} live={false} />);
+    expect(screen.getByRole('button', { name: /Worked for/ })).toBeInTheDocument();
+    expect(screen.queryByText('Think')).not.toBeInTheDocument();
+    for (const mode of ['work', 'study'] as const) {
+      act(() => useWorkspaceModeStore.getState().setMode(mode));
+      expect(screen.queryByRole('button', { name: /Worked for/ })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /列出文件/ })).toBeInTheDocument();
+      expect(screen.queryByText('Think')).not.toBeInTheDocument();
+    }
+    act(() => useWorkspaceModeStore.getState().setMode('code'));
+    expect(screen.getByText('Think')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /pwsh.*列出文件/ })).toBeInTheDocument();
+    expect(buildTrace([message]).filter(record => record.role === 'tool')).toHaveLength(1);
+  });
   it('keeps auxiliary search output out of the reply while preserving its detailed request', () => {
     const base = { number: 1, startedAt: 100, model: 'test', systemPrompt: '', systemMessages: [], tools: [] };
     const message = { role: 'assistant', content: 'Answer.', requestSnapshots: [
@@ -149,6 +168,38 @@ describe('ordered process events', () => {
 });
 
 describe('work details and inspect', () => {
+  it('shows all snapshot tool calls before results arrive and replaces placeholders without duplicates', () => {
+    const calls = ['ListDir', 'Read', 'Glob', 'Glob', 'Glob'].map((name, index) => ({
+      type: 'tool_call', id: `call-${index}`, name, input: { path: index ? `file-${index}` : '.' },
+    }));
+    const request = { id: 'five-tools', number: 2, startedAt: 1000, endedAt: 1200, model: 'test',
+      systemPrompt: null, systemMessages: [], tools: [], status: 'completed', responseBlocks: calls };
+    const message = { role: 'assistant', content: '', requestSnapshots: [request] };
+    const records = buildTrace([{ role: 'user', content: 'Inspect' }, message]);
+    expect(records.filter(r => r.role === 'assistant')).toHaveLength(1);
+    expect(records.filter(r => r.role === 'tool').map(r => r.title)).toEqual(calls.map(call => call.name));
+    for (const record of records.filter(r => r.role === 'tool')) {
+      expect(record.status).toBe('未记录结果');
+      expect(record.startedAt).toBeUndefined();
+      expect(record.result).toBeUndefined();
+    }
+    const withResults = buildTrace([{ ...message, toolCalls: calls.map(call => ({ ...call, result: `result:${call.id}`, status: 'done' })) }]);
+    expect(withResults.filter(r => r.role === 'tool')).toHaveLength(5);
+    expect(withResults.filter(r => r.role === 'tool').every(r => r.result && r.status === 'done')).toBe(true);
+    render(<TrajectoryView messages={[message]} loading={false} focusId={null} />);
+    expect(screen.getAllByText('TOOL CALL')).toHaveLength(5);
+    expect(screen.getByText('5 tool calls · ListDir, Read, Glob, Glob, Glob')).toBeInTheDocument();
+  });
+
+  it('associates legacy tool results even when snapshot text differs from filtered message content', () => {
+    const request = { id: 'request', number: 1, startedAt: 100, model: 'test', systemPrompt: null, systemMessages: [], tools: [],
+      responseBlocks: [{ type: 'text', text: 'Unfiltered text' }, { type: 'tool_call', id: 'provider-call', name: 'Read', input: { path: 'a' } }] };
+    const records = buildTrace([{ role: 'assistant', content: 'Filtered text', requestSnapshots: [request],
+      toolCalls: [{ id: 'sqlite-row', name: 'Read', input: { path: 'a' }, result: 'file contents', status: 'done' }] }]);
+    expect(records.filter(r => r.role === 'tool')).toHaveLength(1);
+    expect(records.find(r => r.role === 'tool')).toMatchObject({ result: 'file contents', requestId: 'request' });
+  });
+
   it('shows an unfinished historical request as interrupted', () => {
     const request = { id: 'unfinished', number: 1, startedAt: 1000, model: 'test', status: 'running',
       systemPrompt: null, systemMessages: [], tools: [], responseBlocks: [{ type: 'text', text: 'Partial' }] };
@@ -226,7 +277,7 @@ describe('work details and inspect', () => {
     expect(screen.queryByRole('button', { name: 'Turn 2' })).not.toBeInTheDocument();
   });
   it.each(['standard', 'detailed', 'verbose'] as const)('%s copies the full command and output independently', async level => {
-    useGeneralSettingsStore.setState({ workDetails: level });
+    useGeneralSettingsStore.getState().update({ workDetailsByMode: { ...useGeneralSettingsStore.getState().workDetailsByMode, chat: level } });
     render(<WorkDetails message={sample()} index={1} live={false} />);
     if (level !== 'verbose') fireEvent.click(screen.getByRole('button', { name: /列出文件/ }));
     const commandCopy = screen.getByRole('button', { name: '复制命令' });
@@ -263,7 +314,7 @@ describe('work details and inspect', () => {
     expect(group.classList.contains('text-red-500')).toBe(failed);
   });
   it('compact groups consecutive shell calls and keeps commentary visible', () => {
-    useGeneralSettingsStore.setState({ workDetails: 'compact' });
+    useGeneralSettingsStore.getState().update({ workDetailsByMode: { ...useGeneralSettingsStore.getState().workDetailsByMode, chat: 'compact' } });
     render(<WorkDetails index={0} live={false} message={{ role: 'assistant', content: '完成', toolCalls: [{ id: 'a', name: 'pwsh', textBefore: '检查目录' }, { id: 'b', name: 'Bash' }] }} />);
     expect(screen.getByText('检查目录')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Ran commands · 2/ })).toHaveAttribute('aria-expanded', 'false');

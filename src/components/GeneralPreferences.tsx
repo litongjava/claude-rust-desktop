@@ -70,11 +70,33 @@ export default function GeneralPreferences({ chatFont }: { chatFont?: React.Reac
         setFontInput(String(useGeneralSettingsStore.getState().fontSize));
       }} className={`${control} w-20 text-center`} /><span className="text-claude-textSecondary">px</span></div>)}
       {chatFont}
-      {row('workDetails', 'workDetailsDescription', <select aria-label={t('general.workDetails')} className={control} value={settings.workDetails} onChange={event => settings.update({ workDetails: event.target.value as typeof settings.workDetails })}>
-        {['compact', 'standard', 'detailed', 'verbose'].map(value => <option key={value} value={value}>{t(`general.${value}`)}</option>)}
-      </select>)}
+      <fieldset className="min-w-0 border-b border-claude-border py-6">
+        <legend className="float-left w-full text-[16px] text-claude-text">{t('general.workDetails')}</legend>
+        <p className="clear-both pt-2 text-[14px] text-claude-textSecondary">{t('general.workDetailsDescription')}</p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          {(['chat', 'work', 'study', 'code'] as const).map(mode => <label key={mode} className="flex items-center justify-between gap-3 rounded-xl border border-claude-border p-3">
+            <span className="text-[15px]">{mode[0].toUpperCase() + mode.slice(1)}</span>
+            <select aria-label={`${mode[0].toUpperCase() + mode.slice(1)} · ${t('general.workDetails')}`} className={control} value={settings.workDetailsByMode[mode]} onChange={event => settings.update({ workDetailsByMode: { ...settings.workDetailsByMode, [mode]: event.target.value as typeof settings.workDetailsByMode[typeof mode] } })}>
+              {['compact', 'standard', 'detailed', 'verbose'].map(value => <option key={value} value={value}>{t(`general.${value}`)}</option>)}
+            </select>
+          </label>)}
+        </div>
+      </fieldset>
       {row('codingView', 'codingViewDescription', <button role="switch" aria-label={t('general.codingView')} aria-checked={settings.showCodingView} onClick={() => settings.update({ showCodingView: !settings.showCodingView })}
         className={`relative h-6 w-11 rounded-full transition-colors ${settings.showCodingView ? 'bg-claude-text' : 'bg-claude-border'}`}><span className={`absolute top-0.5 h-5 w-5 rounded-full bg-claude-bg shadow transition-transform ${settings.showCodingView ? 'left-0.5 translate-x-5' : 'left-0.5'}`} /></button>)}
+      <fieldset className="min-w-0 border-b border-claude-border py-6">
+        <legend className="float-left w-full text-[16px] text-claude-text">{t('general.showUsage')}</legend>
+        <p className="clear-both pt-2 text-[14px] text-claude-textSecondary">{t('general.showUsageDescription')}</p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          {(['chat', 'work', 'study', 'code'] as const).map(mode => <div key={mode} className="flex items-center justify-between gap-3 rounded-xl border border-claude-border p-3">
+            <span className="text-[15px]">{mode[0].toUpperCase() + mode.slice(1)}</span>
+            <button type="button" role="switch" aria-label={`${mode[0].toUpperCase() + mode.slice(1)} · ${t('general.showUsage')}`} aria-checked={settings.showUsageByMode[mode]} onClick={() => settings.update({ showUsageByMode: { ...settings.showUsageByMode, [mode]: !settings.showUsageByMode[mode] } })}
+              className={`relative h-6 w-11 rounded-full transition-colors ${settings.showUsageByMode[mode] ? 'bg-claude-text' : 'bg-claude-border'}`}><span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-claude-bg shadow transition-transform ${settings.showUsageByMode[mode] ? 'translate-x-5' : ''}`} /></button>
+          </div>)}
+        </div>
+      </fieldset>
+      {row('showAiDisclaimer', 'showAiDisclaimerDescription', <button type="button" role="switch" aria-label={t('general.showAiDisclaimer')} aria-checked={settings.showAiDisclaimer} onClick={() => settings.update({ showAiDisclaimer: !settings.showAiDisclaimer })}
+        className={`relative h-6 w-11 rounded-full transition-colors ${settings.showAiDisclaimer ? 'bg-claude-text' : 'bg-claude-border'}`}><span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-claude-bg shadow transition-transform ${settings.showAiDisclaimer ? 'translate-x-5' : ''}`} /></button>)}
       {row('shortcuts', 'shortcutsDescription', <button className={control} onClick={() => setShortcutsOpen(true)}>{t('general.editShortcuts')}</button>)}
       {row('chatLinks', 'chatLinksDescription', <select aria-label={t('general.chatLinks')} className={control} value={settings.chatLinks} onChange={event => settings.update({ chatLinks: event.target.value as typeof settings.chatLinks })}>
         <option value="sidebar">{t('general.sidebar')}</option><option value="browser">{t('general.browser')}</option>

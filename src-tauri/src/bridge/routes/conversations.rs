@@ -91,7 +91,7 @@ async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>)
                             .and_then(|s| serde_json::from_str(s).ok())
                             .unwrap_or(serde_json::json!({}));
                         serde_json::json!({
-                            "id": tc.id,
+                            "id": tc.id.strip_prefix(&format!("{}:", msg.id)).unwrap_or(&tc.id),
                             "name": tc.name,
                             "input": input_parsed,
                             "result": tc.output,

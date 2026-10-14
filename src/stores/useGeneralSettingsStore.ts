@@ -11,8 +11,11 @@ export interface GeneralSettings {
   defaultPermissionMode: PermissionMode;
   theme: 'light' | 'dark' | 'system';
   fontSize: number;
-  workDetails: WorkDetails;
+  typographyVersion: number;
+  workDetailsByMode: Record<WorkspaceMode, WorkDetails>;
   showCodingView: boolean;
+  showUsageByMode: Record<WorkspaceMode, boolean>;
+  showAiDisclaimer: boolean;
   chatLinks: 'sidebar' | 'browser';
   busySendBehavior: 'queue' | 'steer';
   sendKey: string;
@@ -24,20 +27,34 @@ const permissions = ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_per
 const sendKeys = ['enter', 'ctrl_enter', 'cmd_enter', 'alt_enter'];
 const newlineKeys = [...sendKeys, 'shift_enter'];
 const defaults: GeneralSettings = {
-  defaultPermissionMode: 'accept_edits', theme: 'light', fontSize: 14,
-  workDetails: 'detailed', showCodingView: true, chatLinks: 'sidebar',
+  defaultPermissionMode: 'accept_edits', theme: 'light', fontSize: 16, typographyVersion: 1,
+  workDetailsByMode: { chat: 'compact', work: 'standard', study: 'standard', code: 'detailed' },
+  showCodingView: true, chatLinks: 'sidebar',
+  showUsageByMode: { chat: false, work: false, study: false, code: true }, showAiDisclaimer: true,
   busySendBehavior: 'queue', sendKey: 'enter', newlineKey: 'shift_enter',
   defaultModelByMode: { chat: null, work: null, study: null },
 };
 
 export function normalizeGeneralSettings(value: unknown): GeneralSettings {
   const v = value && typeof value === 'object' ? value as Partial<GeneralSettings> : {};
+  // Upgrade the previous default once; subsequent explicit 14px choices remain valid.
+  const fontSize = !v.typographyVersion && v.fontSize === 14 ? defaults.fontSize : v.fontSize;
   return {
     defaultPermissionMode: permissions.includes(v.defaultPermissionMode || '') ? v.defaultPermissionMode! : defaults.defaultPermissionMode,
     theme: ['light', 'dark', 'system'].includes(v.theme || '') ? v.theme! : defaults.theme,
-    fontSize: typeof v.fontSize === 'number' && Number.isFinite(v.fontSize) ? Math.min(32, Math.max(10, Math.round(v.fontSize))) : defaults.fontSize,
-    workDetails: ['compact', 'standard', 'detailed', 'verbose'].includes(v.workDetails || '') ? v.workDetails! : defaults.workDetails,
+    fontSize: typeof fontSize === 'number' && Number.isFinite(fontSize) ? Math.min(32, Math.max(10, Math.round(fontSize))) : defaults.fontSize,
+    typographyVersion: 1,
+    // The old global preference is replaced by mode-specific defaults on upgrade.
+    workDetailsByMode: Object.fromEntries((['chat', 'work', 'study', 'code'] as const).map(mode => {
+      const level = v.workDetailsByMode?.[mode];
+      return [mode, level && ['compact', 'standard', 'detailed', 'verbose'].includes(level) ? level : defaults.workDetailsByMode[mode]];
+    })) as Record<WorkspaceMode, WorkDetails>,
     showCodingView: typeof v.showCodingView === 'boolean' ? v.showCodingView : defaults.showCodingView,
+    showUsageByMode: Object.fromEntries((['chat', 'work', 'study', 'code'] as const).map(mode => {
+      const visible = v.showUsageByMode?.[mode];
+      return [mode, typeof visible === 'boolean' ? visible : defaults.showUsageByMode[mode]];
+    })) as Record<WorkspaceMode, boolean>,
+    showAiDisclaimer: typeof v.showAiDisclaimer === 'boolean' ? v.showAiDisclaimer : defaults.showAiDisclaimer,
     chatLinks: v.chatLinks === 'browser' ? 'browser' : 'sidebar',
     busySendBehavior: v.busySendBehavior === 'steer' ? 'steer' : 'queue',
     sendKey: sendKeys.includes(v.sendKey || '') ? v.sendKey! : defaults.sendKey,

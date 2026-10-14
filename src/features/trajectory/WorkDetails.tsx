@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronRight, Code2, Terminal, Brain } from 'lucide-react';
 import { useGeneralSettingsStore, type WorkDetails as DetailLevel } from '../../stores/useGeneralSettingsStore';
+import { useWorkspaceModeStore } from '../../stores/useWorkspaceModeStore';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import ToolDiffView, { shouldUseDiffView } from '../../components/ToolDiffView';
 import CopyButton from './CopyButton';
@@ -73,7 +74,8 @@ function ToolGroup({ steps, message, index, level, live, onInspect }: { steps: P
 }
 export default function WorkDetails({ message, index, live, onInspect }: { message: any; index: number; live: boolean; onInspect?: (id: string) => void }) {
   const [workCollapsed, setWorkCollapsed] = useState(false);
-  const level = useGeneralSettingsStore(s => s.workDetails);
+  const mode = useWorkspaceModeStore(s => s.mode);
+  const level = useGeneralSettingsStore(s => s.workDetailsByMode[mode]);
   const coding = useGeneralSettingsStore(s => s.showCodingView);
   const steps = messageSteps(message);
   const items: ProcessStep[][] = [];

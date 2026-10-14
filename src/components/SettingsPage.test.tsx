@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SettingsPage from './SettingsPage';
@@ -13,9 +13,11 @@ vi.mock('../api', () => ({
   getUserUsage: vi.fn(async () => ({})),
   getSessions: vi.fn(async () => ({ sessions: [] })),
   getProviderModels: vi.fn(async () => []),
+  getSkills: vi.fn(async () => ({ examples: [], my_skills: [] })),
+  getGithubStatus: vi.fn(async () => ({ connected: false })),
 }));
 vi.mock('./ProviderSettings', () => ({ default: () => null }));
-vi.mock('./McpSettingsPage', () => ({ default: () => null }));
+vi.mock('./McpSettingsPage', () => ({ default: () => <h2>MCP Servers</h2> }));
 vi.mock('./TaskList', () => ({ default: () => null }));
 vi.mock('./NewTaskModal', () => ({ default: () => null }));
 
@@ -45,6 +47,33 @@ beforeEach(() => {
 });
 
 describe('general preferences', () => {
+  it('manages all four customization sections inside settings and filters plugin categories', async () => {
+    await renderSettings();
+    expect(screen.queryByRole('button', { name: en.settings.mcpServers })).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.customize.title })));
+    const nav = within(screen.getByRole('navigation', { name: en.customize.title }));
+    fireEvent.click(nav.getByRole('button', { name: en.customize.plugins }));
+    expect(screen.getAllByRole('article')).toHaveLength(6);
+    fireEvent.change(screen.getByRole('searchbox', { name: en.customize.searchPlugins }), { target: { value: 'formatting' } });
+    expect(screen.getAllByRole('article')).toHaveLength(1);
+    expect(screen.getByRole('heading', { name: 'Code Tools' })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'no-such-category' } });
+    expect(screen.getByRole('status')).toHaveTextContent(en.customize.noPluginsFound);
+    fireEvent.click(nav.getByRole('button', { name: 'MCP' }));
+    expect(screen.getByRole('heading', { name: 'MCP Servers' })).toBeInTheDocument();
+    fireEvent.click(nav.getByRole('button', { name: en.customize.connectors }));
+    expect(screen.getByText(en.customize.notConnectedGithub)).toBeInTheDocument();
+    await act(async () => fireEvent.click(nav.getByRole('button', { name: en.customize.skills })));
+    expect(screen.getByText(en.customize.noSkillsFound)).toBeInTheDocument();
+    const customizeBack = screen.getAllByRole('button', { name: en.customize.title }).find(button => button.getAttribute('aria-current') !== 'page')!;
+    fireEvent.click(customizeBack);
+    fireEvent.click(customizeBack);
+    expect(screen.getByRole('spinbutton', { name: 'Font size' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: en.settings.general }));
+    expect(screen.queryByRole('navigation', { name: en.customize.title })).not.toBeInTheDocument();
+    expect(screen.getByRole('spinbutton', { name: 'Font size' })).toBeInTheDocument();
+  });
+
   it('places Account first and About after the other navigation items', async () => {
     await renderSettings();
     const account = screen.getByRole('button', { name: en.settings.account });
@@ -67,17 +96,40 @@ describe('general preferences', () => {
     expect(screen.queryByRole('heading', { name: en.settings.personalInfo })).not.toBeInTheDocument();
   });
 
-  it('persists all four work detail choices and Queue / Steer across remounts', async () => {
+  it('persists independent mode details and Queue / Steer across remounts', async () => {
     const view = await renderSettings();
-    const details = screen.getByRole('combobox', { name: 'Work details' });
+    const details = screen.getByRole('combobox', { name: 'Chat · Work details' });
+    expect(details).toHaveValue('compact');
+    expect(screen.getByRole('combobox', { name: 'Work · Work details' })).toHaveValue('standard');
+    expect(screen.getByRole('combobox', { name: 'Study · Work details' })).toHaveValue('standard');
+    expect(screen.getByRole('combobox', { name: 'Code · Work details' })).toHaveValue('detailed');
     expect(Array.from(details.querySelectorAll('option')).map(option => option.textContent)).toEqual(['Compact', 'Standard', 'Detailed', 'Verbose']);
     fireEvent.change(details, { target: { value: 'verbose' } });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Code · Work details' }), { target: { value: 'compact' } });
     fireEvent.change(screen.getByRole('combobox', { name: 'Send behavior while busy' }), { target: { value: 'steer' } });
-    expect(JSON.parse(localStorage.getItem('general_settings')!)).toMatchObject({ workDetails: 'verbose', busySendBehavior: 'steer' });
+    expect(JSON.parse(localStorage.getItem('general_settings')!)).toMatchObject({ workDetailsByMode: { chat: 'verbose', work: 'standard', study: 'standard', code: 'compact' }, busySendBehavior: 'steer' });
     view.unmount();
     await renderSettings();
-    expect(screen.getByRole('combobox', { name: 'Work details' })).toHaveValue('verbose');
+    expect(screen.getByRole('combobox', { name: 'Chat · Work details' })).toHaveValue('verbose');
+    expect(screen.getByRole('combobox', { name: 'Code · Work details' })).toHaveValue('compact');
+    expect(screen.getByRole('combobox', { name: 'Work · Work details' })).toHaveValue('standard');
+    expect(screen.getByRole('combobox', { name: 'Study · Work details' })).toHaveValue('standard');
     expect(screen.getByRole('combobox', { name: 'Send behavior while busy' })).toHaveValue('steer');
+  });
+
+  it('toggles usage independently for all modes and preserves choices across remounts', async () => {
+    const view = await renderSettings();
+    for (const mode of ['Chat', 'Work', 'Study', 'Code']) {
+      expect(screen.getByRole('switch', { name: `${mode} · Usage statistics` })).toHaveAttribute('aria-checked', mode === 'Code' ? 'true' : 'false');
+    }
+    fireEvent.click(screen.getByRole('switch', { name: 'Work · Usage statistics' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Code · Usage statistics' }));
+    expect(JSON.parse(localStorage.getItem('general_settings')!)).toMatchObject({ showUsageByMode: { chat: false, work: true, study: false, code: false } });
+    view.unmount();
+    await renderSettings();
+    for (const mode of ['Chat', 'Work', 'Study', 'Code']) {
+      expect(screen.getByRole('switch', { name: `${mode} · Usage statistics` })).toHaveAttribute('aria-checked', mode === 'Work' ? 'true' : 'false');
+    }
   });
 
   it('changes the default permission without modifying an active session', async () => {

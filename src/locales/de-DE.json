@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Nutzungsstatistik",
+    "showUsageDescription": "Für jeden Modus wählen, ob Nutzungsstatistiken unter dem Eingabefeld angezeigt werden",
+    "showAiDisclaimer": "KI-Hinweis anzeigen",
+    "showAiDisclaimerDescription": "Unter dem Home-Eingabefeld daran erinnern, KI-Antworten zu prüfen",
     "modeModels": "Standardmodelle je Modus",
     "modeModelsDescription": "Anbieter und Modell für neue Chat-, Work- und Study-Sitzungen wählen. Änderungen werden automatisch gespeichert; ein Moduswechsel vor Sitzungsbeginn übernimmt dessen Standardmodell.",
     "modelProvider": "Anbieter",
@@ -417,6 +421,7 @@
     "usageTitle": "Verwendung"
   },
   "chat": {
+    "selectCodeProject": "Vor dem Senden im Code-Modus ein Projekt auswählen",
     "inputPlaceholder": "Wie kann ich Ihnen heute helfen?",
     "send": "Senden",
     "stop": "Stopp",

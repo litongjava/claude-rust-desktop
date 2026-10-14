@@ -389,9 +389,10 @@ const MessageList = React.memo<MessageListProps>(({
                 </div>
               )}
               {loading && idx === messages.length - 1 && !msg.content && !msg.thinking && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(msg.toolCalls && msg.toolCalls.length > 0) && (
-                <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-                  <ClaudeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
-                </span>
+                <div role="status" className="flex items-center gap-2 ml-1 text-[14px] text-claude-textSecondary font-sans">
+                  <span aria-hidden="true" className="shrink-0"><ClaudeLogo breathe style={{ width: '40px', height: '40px' }} /></span>
+                  <span>Working on it...</span>
+                </div>
               )}
               {loading && idx === messages.length - 1 && !msg.isThinking && (msg.content || (msg.searchStatus && msg.content)) && (
                 <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>

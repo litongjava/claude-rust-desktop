@@ -5,7 +5,12 @@ import TraceInspector from './TraceInspector';
 
 const colors: Record<string, string> = { input: 'bg-emerald-500', model: 'bg-purple-400', tools: 'bg-amber-500' };
 const lane = (r: TraceRecord) => r.role === 'tool' ? 'tools' : r.role === 'assistant' ? 'model' : 'input';
-const preview = (r: TraceRecord) => r.text || `${r.title} · ${rawText(r.input)}`;
+const preview = (r: TraceRecord) => {
+  if (r.text) return r.text;
+  const calls = r.blocks?.filter(block => block.type === 'tool_call');
+  if (calls?.length) return `${calls.length} tool calls · ${calls.map(call => call.name || 'Tool').join(', ')}`;
+  return [r.title, rawText(r.input)].filter(Boolean).join(' · ');
+};
 export default function TrajectoryView({ messages, loading, focusId }: { messages: any[]; loading: boolean; focusId: string | null }) {
   const records = buildTrace(messages, loading);
   const [selectedId, setSelectedId] = useState<string | null>(focusId);
@@ -59,7 +64,7 @@ export default function TrajectoryView({ messages, loading, focusId }: { message
         {groups.map(({ turn, rows }) => <div key={turn}>
           {rows.filter(r => q || !collapsed.has(turn) || r.role === 'user').map(r => <div key={r.id}><button type="button" ref={el => { if (el) rowRefs.current.set(r.id, el); else rowRefs.current.delete(r.id); }} aria-pressed={r.id === resolvedId} onClick={() => setSelectedId(r.id)} className={`flex w-full min-w-0 items-center gap-3 border-b border-claude-border px-3 py-1.5 text-left text-xs ${r.id === resolvedId ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-400' : 'hover:bg-claude-hover'}`}>
           <span className="w-24 shrink-0 whitespace-nowrap text-[10px] text-claude-textSecondary">Turn {r.turn} · Step {r.step}</span>
-          <span className={`w-20 shrink-0 rounded px-1.5 py-0.5 text-center font-semibold ${r.role === 'tool' ? 'bg-amber-500/10 text-amber-600' : r.role === 'assistant' ? 'bg-purple-500/10 text-purple-500' : 'bg-blue-500/10 text-blue-500'}`}>{r.role.toUpperCase()}</span>
+          <span className={`w-20 shrink-0 rounded px-1.5 py-0.5 text-center font-semibold ${r.role === 'tool' ? 'bg-amber-500/10 text-amber-600' : r.role === 'assistant' ? 'bg-purple-500/10 text-purple-500' : 'bg-blue-500/10 text-blue-500'}`}>{r.role === 'tool' ? 'TOOL CALL' : r.role.toUpperCase()}</span>
           <span className={`min-w-0 flex-1 truncate ${r.status === 'error' ? 'text-red-500' : ''}`}>{(r.role === 'system' ? r.title : preview(r)) || '(无内容)'}</span>{r.status === 'running' && <span className="animate-pulse">运行中</span>}
         </button>{r.role === 'user' && turn > 0 && collapsed.has(turn) && !q && !selected && <button type="button" aria-label={`Turn ${turn}`} aria-expanded={false} onClick={() => toggleTurn(turn)} className="flex w-full items-center gap-2 border-b border-claude-border px-3 py-1.5 text-xs text-claude-textSecondary hover:bg-claude-hover"><ChevronRight size={12} /><b>Turn {turn}</b><span>{rows.filter(row => row.role === 'assistant' || row.role === 'tool').length} steps</span><span>· {rows.filter(row => row.role === 'tool').length} tool calls</span></button>}</div>)}</div>)}
         {!filtered.length && <p className="p-6 text-sm text-claude-textSecondary">{query ? '没有匹配的过程' : '暂无过程记录'}</p>}

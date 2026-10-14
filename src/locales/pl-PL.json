@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Statystyki użycia",
+    "showUsageDescription": "Wybierz, czy statystyki użycia mają być widoczne pod polem wpisywania w każdym trybie",
+    "showAiDisclaimer": "Pokaż przypomnienie o AI",
+    "showAiDisclaimerDescription": "Pokaż pod polem Home przypomnienie o sprawdzaniu odpowiedzi AI",
     "modeModels": "Modele domyślne dla trybów",
     "modeModelsDescription": "Wybierz dostawcę i model dla nowych sesji Chat, Work i Study. Zmiany zapisują się automatycznie; zmiana trybu przed sesją stosuje jego model domyślny.",
     "modelProvider": "Dostawca",
@@ -417,6 +421,7 @@
     "usageTitle": "Zastosowanie"
   },
   "chat": {
+    "selectCodeProject": "Wybierz projekt przed wysłaniem wiadomości w trybie Code",
     "inputPlaceholder": "[0333] Jak mogę Ci dzisiaj pomóc?",
     "send": "Wyślij",
     "stop": "[0335] Zatrzymaj się",

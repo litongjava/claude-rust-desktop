@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Statistiques d’utilisation",
+    "showUsageDescription": "Choisissez si les statistiques apparaissent sous la zone de saisie dans chaque mode",
+    "showAiDisclaimer": "Afficher le rappel IA",
+    "showAiDisclaimerDescription": "Afficher sous la zone de saisie Home un rappel de vérifier les réponses de l’IA",
     "modeModels": "Modèles par défaut par mode",
     "modeModelsDescription": "Choisissez un fournisseur et un modèle pour les nouvelles sessions Chat, Work et Study. Les changements sont enregistrés automatiquement ; changer de mode avant une session applique son modèle par défaut.",
     "modelProvider": "Fournisseur",
@@ -417,6 +421,7 @@
     "usageTitle": "Utilisation"
   },
   "chat": {
+    "selectCodeProject": "Sélectionnez un projet avant d’envoyer des messages en mode Code",
     "inputPlaceholder": "Comment puis-je vous aider aujourd'hui ?",
     "send": "Envoyer",
     "stop": "Arrêter",

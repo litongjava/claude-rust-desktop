@@ -253,6 +253,7 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
       };
     });
     if (snapshots.length) {
+      const claimedTools = new Set<string>();
       const responses = snapshots.flatMap<TraceRecord>(request => {
         const related = steps.filter(s => s.request?.id === request.id);
         const blocks: ResponseBlock[] = request.responseBlocks?.length ? request.responseBlocks : related.map(s => s.role === 'tool'
@@ -265,9 +266,33 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
           status: request.status === 'completed' ? 'done' : request.status === 'running' && !running ? 'interrupted' : request.status || (running ? 'running' : 'done'),
           startedAt: request.startedAt, endedAt: request.endedAt ?? undefined,
         };
-        return [assistant, ...related.filter(s => s.role === 'tool')];
+        // Request snapshots can arrive before tool events, or survive a reload
+        // without the tool-result rows. Never drop the calls in those snapshots.
+        const calls = blocks.flatMap<TraceRecord>((block, index) => {
+          if (block.type !== 'tool_call') return [];
+          const candidates = steps.filter(s => s.role === 'tool' && !claimedTools.has(s.id)
+            && (!s.request || s.request.id === request.id));
+          const input = block.input ?? toolInput({ input: block.arguments });
+          const recorded = candidates.find(s => block.id && s.toolId === block.id)
+            ?? candidates.find(s => s.title === block.name && canonical(toolInput({ input: s.input })) === canonical(input));
+          if (recorded) {
+            claimedTools.add(recorded.id);
+            return [{ ...recorded, requestId: request.id, request,
+              schema: recorded.schema ?? request.tools?.find(tool => tool.name === block.name)?.input_schema }];
+          }
+          const toolId = block.id || `${request.id}:${index}`;
+          return [{ id: recordId(i, `tool:${toolId}`), kind: 'tool', toolId, role: 'tool', turn, step: 0,
+            title: block.name || 'Tool call', input, requestId: request.id, request,
+            schema: request.tools?.find(tool => tool.name === block.name)?.input_schema,
+            status: '未记录结果' }];
+        });
+        for (const tool of related.filter(s => s.role === 'tool' && !claimedTools.has(s.id))) {
+          claimedTools.add(tool.id);
+          calls.push(tool);
+        }
+        return [assistant, ...calls];
       });
-      steps = [...responses, ...steps.filter(s => !s.request)];
+      steps = [...responses, ...steps.filter(s => !s.request && !claimedTools.has(s.id))];
     }
     steps = steps.map(s => ({ ...s, step: ++step }));
     const headers: TraceRecord[] = snapshots.flatMap(request => {

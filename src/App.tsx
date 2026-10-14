@@ -35,7 +35,6 @@ import ProjectsPage from './components/ProjectsPage';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import DesignPage from './components/DesignPage';
 import MemoryPanel from './components/MemoryPanel';
-import DirectoryModal from './components/DirectoryModal';
 import { tauriAPI } from './utils/tauriAPI';
 import ChatHeader from './components/ChatHeader';
 import Tooltip from './components/ui/Tooltip';
@@ -99,7 +98,6 @@ const Layout = () => {
   const showOnboarding = useUIStore(s => s.showOnboarding);
   const setShowOnboarding = useUIStore(s => s.setShowOnboarding);
   const [needsGitBash, setNeedsGitBash] = useState(false);
-  const [showDirectoryModal, setShowDirectoryModal] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -262,6 +260,12 @@ const Layout = () => {
     }
   };
 
+  const handleCreateSkillWithClaude = () => {
+    sessionStorage.setItem('prefill_input', '让我们一起使用你的 skill-creator skill 来创建一个 skill 吧。请先问我这个 skill 应该做什么。');
+    handleNewChat();
+    navigate('/');
+  };
+
   const handleOpenDocument = useCallback((doc: DocumentInfo) => {
     if (!documentPanelDoc && !showArtifacts) {
       sidebarWasCollapsedRef.current = isSidebarCollapsed;
@@ -413,7 +417,7 @@ const Layout = () => {
             <Tooltip content="帮助"><button type="button" aria-label="帮助" aria-haspopup="dialog" aria-expanded={showHelpModal} onClick={() => setShowHelpModal(true)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"><HelpCircle size={16} strokeWidth={1.5} /></button></Tooltip>
           </div>
         </AppTitleBar>
-        <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { navigate('/settings'); setShowUpgrade(false); }} onOpenUpgrade={() => setShowUpgrade(true)} onOpenDirectory={() => setShowDirectoryModal(true)} onCloseOverlays={() => setShowUpgrade(false)} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} showHelpModal={showHelpModal} onHelpModalChange={setShowHelpModal} />
+        <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { navigate('/settings'); setShowUpgrade(false); }} onOpenUpgrade={() => setShowUpgrade(true)} onCloseOverlays={() => setShowUpgrade(false)} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} showHelpModal={showHelpModal} onHelpModalChange={setShowHelpModal} />
         <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden relative" style={{ paddingTop: `${titleBarHeight}px` }}>
           {isChatMode && !showUpgrade && (location.pathname === '/' || location.pathname.startsWith('/chat/')) && (
             <ChatHeader title={currentChatTitle} showArtifacts={showArtifacts} documentPanelDoc={documentPanelDoc} onOpenArtifacts={handleOpenArtifacts} hasArtifacts={artifacts.length > 0} onTitleRename={handleTitleChange} />
@@ -423,15 +427,11 @@ const Layout = () => {
               {showUpgrade ? (
                 <UpgradePlan onClose={() => setShowUpgrade(false)} />
               ) : location.pathname === '/settings' ? (
-                <SettingsPage />
+                <SettingsPage onCreateWithClaude={handleCreateSkillWithClaude} />
               ) : location.pathname === '/chats' ? (
                 <ChatsPage />
               ) : location.pathname === '/customize' ? (
-                <CustomizePage onCreateWithClaude={() => {
-                  sessionStorage.setItem('prefill_input', '让我们一起使用你的 skill-creator skill 来创建一个 skill 吧。请先问我这个 skill 应该做什么。');
-                  handleNewChat();
-                  window.location.hash = '#/';
-                }} />
+                <CustomizePage onCreateWithClaude={handleCreateSkillWithClaude} />
               ) : location.pathname === '/projects' ? (
                 <ProjectsPage />
               ) : location.pathname === '/artifacts' ? (
@@ -503,7 +503,6 @@ const Layout = () => {
           <TerminalPanel onClose={() => setShowTerminal(false)} />
         </div>
       )}
-      <DirectoryModal isOpen={showDirectoryModal} onClose={() => setShowDirectoryModal(false)} />
     </>
   );
 };

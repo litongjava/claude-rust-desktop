@@ -1,11 +1,11 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock, Settings, Cpu, UserRound, Info } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Puzzle, Globe, Clock, Settings, Cpu, UserRound, Info } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
 import SearchSettings from './SearchSettings';
-import McpSettingsPage from './McpSettingsPage';
+import CustomizePage from './CustomizePage';
 import TaskList from './TaskList';
 import NewTaskModal from './NewTaskModal';
 import { taskAPI, TaskInfo } from '../utils/tauriAPI';
@@ -23,9 +23,9 @@ const WORK_OPTIONS = [
   { value: '其他', key: 'other' },
 ];
 
-type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'mcp' | 'tasks';
+type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'customize' | 'tasks';
 
-const SettingsPage = () => {
+const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void }) => {
   const { t, locale } = useI18n();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('general');
@@ -353,12 +353,13 @@ const SettingsPage = () => {
             </button>
           )}
           <button
-            onClick={() => setTab('mcp')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'mcp' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+            onClick={() => setTab('customize')}
+            aria-current={tab === 'customize' ? 'page' : undefined}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'customize' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
               }`}
           >
-            <Server size={16} />
-            {t('settings.mcpServers')}
+            <Puzzle size={16} />
+            {t('customize.title')}
           </button>
           <button
             onClick={() => setTab('tasks')}
@@ -374,15 +375,14 @@ const SettingsPage = () => {
         </div>
 
         {/* Right Content Area */}
-        <div className="flex-1 overflow-y-auto min-w-0">
-          <div className="max-w-6xl px-6 lg:px-12 pb-32">
+        <div className={`flex-1 min-w-0 ${tab === 'customize' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+          {tab === 'customize' ? <CustomizePage onBack={() => setTab('general')} onCreateWithClaude={onCreateWithClaude} /> : <div className="max-w-6xl px-6 lg:px-12 pb-32">
             {tab === 'general' && renderGeneral()}
             {tab === 'about' && renderAbout()}
             {tab === 'models' && <ProviderSettings />}
             {tab === 'search' && <SearchSettings />}
             {tab === 'account' && renderAccount()}
             {tab === 'usage' && renderUsage()}
-            {tab === 'mcp' && <McpSettingsPage />}
             {tab === 'tasks' && (
               <div className="h-full flex flex-col">
                 {tasksLoading ? (
@@ -401,7 +401,7 @@ const SettingsPage = () => {
                 )}
               </div>
             )}
-          </div>
+          </div>}
         </div>
       </div>
     </div>
@@ -664,13 +664,14 @@ const SettingsPage = () => {
             <div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 {([
-                  { value: 'default', label: t('settings.default'), sample: 'Aa', font: 'font-serif-claude' },
-                  { value: 'sans', label: t('settings.sans'), sample: 'Aa', font: 'font-sans' },
-                  { value: 'system', label: t('settings.system'), sample: 'Aa', font: 'font-system' }, // approximations for preview
-                  { value: 'dyslexic', label: t('settings.readingDisability'), sample: 'Aa', font: 'font-serif' },
+                  { value: 'default', label: 'Anthropic Serif', sample: 'Aa', font: 'font-serif-claude' },
+                  { value: 'sans', label: 'Anthropic Sans', sample: 'Aa', font: 'font-sans-claude' },
+                  { value: 'system', label: 'System', sample: 'Aa', font: 'font-system' },
+                  { value: 'dyslexic', label: 'OpenDyslexic', sample: 'Aa', font: 'font-dyslexic' },
                 ] as const).map(opt => (
                   <button
                     key={opt.value}
+                    aria-pressed={chatFont === opt.value}
                     onClick={() => applyFont(opt.value)}
                     className={`
                       w-full flex flex-col items-center gap-2 py-3 px-2 rounded-lg border transition-all

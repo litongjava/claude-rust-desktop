@@ -41,6 +41,18 @@ async fn chat_handler(
 
     tracing::info!(module = "Chat", "Handler ENTRY POINT");
 
+    // Reject invalid Code/project requests before persisting messages or invoking a model.
+    let db = state.db_manager.clone();
+    let project_conversation_id = req.conversation_id.clone();
+    let project_check = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
+        crate::native_engine::workspace::conversation_project(conn, &project_conversation_id)
+    })).await;
+    match project_check {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(error))) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error.to_string()}))).into_response(),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not validate conversation project"}))).into_response(),
+    }
+
     let native_engine = state.native_engine.clone();
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
@@ -326,6 +338,19 @@ async fn chat_handler(
                     tracing::info!(module = "Chat", "Tool use completed: {} ({}) is_error={}", tool_name, tool_use_id, is_error);
                     let input_json = serde_json::to_string(&tool_input).unwrap_or_default();
                     collected_tool_calls.push((tool_use_id.clone(), tool_name.clone(), input_json, Some(output.clone()), is_error));
+                    let db = db_clone.clone();
+                    let conversation_id = conv_id.clone();
+                    let message_id = assistant_id.clone();
+                    let content = full_text.clone();
+                    let tool = crate::db::message_repo::ToolCallRow {
+                        id: format!("{assistant_id}:{tool_use_id}"), message_id: message_id.clone(), name: tool_name.clone(),
+                        input: Some(serde_json::to_string(&tool_input).unwrap_or_default()), output: Some(output.clone()),
+                        is_error, sort_order: (collected_tool_calls.len() - 1) as i64,
+                    };
+                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
+                        crate::db::message_repo::save_stream_tool_result(conn, &conversation_id, &message_id, &content, &tool)
+                    })).await;
+                    if !matches!(saved, Ok(Ok(Ok(())))) { tracing::error!("Could not persist tool result: {:?}", saved); }
                     Some(serde_json::json!({
                         "type": "tool_use_done",
                         "tool_use_id": tool_use_id,
@@ -457,8 +482,8 @@ async fn chat_handler(
                     // Save tool calls for this message
                     if insert_result.is_ok() {
                         crate::db::message_repo::save_request_snapshots(conn, &msg_id, &snapshots_save)?;
-                        for (i, (_tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
-                            let tc_row_id = uuid::Uuid::new_v4().to_string();
+                        for (i, (tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
+                            let tc_row_id = format!("{msg_id}:{tc_id}");
                             let _ = crate::db::message_repo::insert_tool_call(
                                 conn,
                                 &tc_row_id,

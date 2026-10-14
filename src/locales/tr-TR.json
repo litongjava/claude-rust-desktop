@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Kullanım istatistikleri",
+    "showUsageDescription": "Her modda giriş kutusunun altında kullanım istatistiklerinin gösterilip gösterilmeyeceğini seçin",
+    "showAiDisclaimer": "AI hatırlatıcısını göster",
+    "showAiDisclaimerDescription": "Home girişinin altında AI yanıtlarını kontrol etme hatırlatıcısını göster",
     "modeModels": "Modlara göre varsayılan modeller",
     "modeModelsDescription": "Yeni Chat, Work ve Study oturumları için sağlayıcı ve model seçin. Değişiklikler otomatik kaydedilir; oturumdan önce mod değiştirmek varsayılan modelini uygular.",
     "modelProvider": "Sağlayıcı",
@@ -417,6 +421,7 @@
     "usageTitle": "Kullanım"
   },
   "chat": {
+    "selectCodeProject": "Code modunda mesaj göndermeden önce bir proje seçin",
     "inputPlaceholder": "Bugün size nasıl yardımcı olabilirim?",
     "send": "Gönder",
     "stop": "Durdur",

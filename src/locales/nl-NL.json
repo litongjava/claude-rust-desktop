@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Gebruiksstatistieken",
+    "showUsageDescription": "Kies per modus of gebruiksstatistieken onder het invoerveld worden getoond",
+    "showAiDisclaimer": "AI-herinnering tonen",
+    "showAiDisclaimerDescription": "Toon onder het Home-invoerveld een herinnering om AI-antwoorden te controleren",
     "modeModels": "Standaardmodellen per modus",
     "modeModelsDescription": "Kies een aanbieder en model voor nieuwe Chat-, Work- en Study-sessies. Wijzigingen worden automatisch opgeslagen; wisselen van modus vóór de sessie past het standaardmodel toe.",
     "modelProvider": "Aanbieder",
@@ -417,6 +421,7 @@
     "usageTitle": "Gebruik"
   },
   "chat": {
+    "selectCodeProject": "Selecteer een project voordat je berichten verstuurt in de Code-modus",
     "inputPlaceholder": "Hoe kan ik u vandaag helpen?",
     "send": "Verzenden",
     "stop": "Stop",

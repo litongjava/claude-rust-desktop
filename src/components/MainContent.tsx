@@ -98,7 +98,9 @@ interface MainContentProps {
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
   const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
+  const showAiDisclaimer = useGeneralSettingsStore(s => s.showAiDisclaimer);
   const workspaceMode = useWorkspaceModeStore(s => s.mode);
+  const showUsage = useGeneralSettingsStore(s => s.showUsageByMode[workspaceMode]);
   const isCodeMode = workspaceMode === 'code';
   const [modeChanging, setModeChanging] = useState(false);
   const [modeError, setModeError] = useState('');
@@ -184,6 +186,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const conversationGit = useConversationGit(activeId, isCodeMode ? currentProjectId : null, loading);
   useEffect(() => { setShowGitChanges(false); }, [activeId, currentProjectId, isCodeMode]);
   const gitSetupPending = !activeId && isCodeMode && !!pendingProjectId && (sessionGit?.projectId !== pendingProjectId || !sessionGit.ready);
+  const codeProjectRequired = isCodeMode && !(activeId ? currentProjectId : pendingProjectId);
 
   useEffect(() => {
     if (!pendingProjectId) setSessionGit(null);
@@ -741,8 +744,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               (toolEvent) => {
                 if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
                 if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
-                const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-                if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
@@ -1059,8 +1060,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const files = queuedFiles ?? pendingFiles;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
     const selectedProjectId = activeId ? currentProjectId : pendingProjectId;
+    if (isCodeMode && !selectedProjectId) {
+      setProjectAddToast(t('chat.selectCodeProject'));
+      return;
+    }
     if (selectedProjectId) {
       const project: Project = await getProject(selectedProjectId);
+      if (project.is_archived) { setProjectAddToast(t('chat.selectCodeProject')); return; }
       if (!project.folders?.length) { setProjectAddToast('Add a source folder before sending'); return; }
       if (project.folders.some(folder => !folder.trusted)) { setProjectToTrust(project); return; }
     }
@@ -1821,7 +1827,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
         {/* Centered Content */}
         <div
-          className="flex flex-col items-center min-w-0 w-full mx-auto px-4 flex-1 min-h-0 pt-6"
+          className="flex flex-col items-center min-w-0 w-full mx-auto px-4 py-6 flex-1 min-h-0 overflow-y-auto"
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
             paddingTop: '24px',
@@ -1829,7 +1835,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         >
 
           <div
-            className="flex items-center justify-center gap-4 w-full min-w-0 shrink-0"
+            className="flex items-center justify-center gap-4 w-full min-w-0 shrink-0 mt-auto"
             style={{ marginBottom: 0 }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
@@ -1849,10 +1855,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group order-2 shrink-0 bg-claude-bg pt-2">
-            {isCodeMode && <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
-              {pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
-            </ProjectWorkspaceBar>}
+          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group shrink-0 bg-claude-bg pt-2">
+            <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
+              {isCodeMode && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+            </ProjectWorkspaceBar>
+            {codeProjectRequired && <p className="mb-2 text-xs text-claude-textSecondary">{t('chat.selectCodeProject')}</p>}
             {filteredCommands.length > 0 && (
               <SlashCommandSuggestions
                 anchorRef={slashCommandAnchorRef}
@@ -1888,12 +1895,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <div className="relative">
                   <SkillInputOverlay
                     text={inputText}
-                    className="pl-5 pr-4 pt-5 pb-1 text-[16px] font-sans font-[350] overflow-hidden"
+                    className="pl-5 pr-4 pt-5 pb-1 text-[16px] font-sans font-normal overflow-hidden"
                     style={{ minHeight: '48px' }}
                   />
                   <textarea
                     ref={inputRef}
-                    className={`w-full pl-5 pr-4 pt-5 pb-1 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans font-[350] ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
+                    className={`w-full pl-5 pr-4 pt-5 pb-1 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans font-normal ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
                     style={{ minHeight: '48px', borderRadius: `${tunerConfig?.inputRadius || 16}px ${tunerConfig?.inputRadius || 16}px 0 0` }}
                     placeholder={selectedSkill ? `Describe what you want ${selectedSkill.name} to do...` : t('chat.inputPlaceholder')}
                     value={inputText}
@@ -1944,6 +1951,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       {...plusMenuCallbacks}
                     />
                   )}
+                  {!isCodeMode && <button type="button" onClick={() => fileInputRef.current?.click()} aria-label={t('chat.addAttachment')} title={t('chat.addAttachment')}
+                    className="p-2 text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-lg transition-colors">
+                    <Paperclip size={20} />
+                  </button>}
                   {!isCodeMode && <HomeModeSelector mode={workspaceMode} onChange={handleHomeModeChange} disabled={loading || modeChanging} />}
                   {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
                 </div>
@@ -1970,7 +1981,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   <button
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => handleSend()}
-                    disabled={gitSetupPending || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                    disabled={codeProjectRequired || gitSetupPending || modeChanging || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                    title={codeProjectRequired ? t('chat.selectCodeProject') : t('chat.send')}
                     className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUp size={22} strokeWidth={2.5} />
@@ -1989,13 +2001,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 </button>
               </div>
             )}
-            {!isCodeMode && <div className="mt-2"><ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging} /></div>}
             {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
-            <SessionUsageBar messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />
-            {!isCodeMode && <p className="pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
+            {!isCodeMode && showAiDisclaimer && <p className="pt-2 pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
           </div>
-          <div className="order-1 flex-1 min-h-0 w-full overflow-y-auto pb-4">
-            <PromptSuggestionsPanel onSelectPrompt={(prompt) => {
+          <div className="w-full shrink-0 mb-auto pb-4">
+            <PromptSuggestionsPanel key={isCodeMode ? 'code' : 'home'} mode={isCodeMode ? 'code' : 'home'} onSelectPrompt={(prompt) => {
               setInputText(prompt);
               setSlashCommandFilter(null);
               inputRef.current?.focus();
@@ -2069,10 +2079,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ maxWidth: `${inputBarWidth}px` }}
           >
             <div className="w-full relative group" ref={inputWrapperRef}>
-              {isCodeMode && (activeId && currentProjectId ? <ConversationWorkspaceBar key={activeId} id={activeId} projectId={currentProjectId} data={conversationGit.data} error={conversationGit.error} disabled={loading || modeChanging} onSelect={handleAttachToProject} onViewChanges={() => { setShowGitChanges(true); conversationGit.refresh(); }} onRefresh={conversationGit.refresh} /> :
+              {activeId && isCodeMode && currentProjectId ? <ConversationWorkspaceBar key={activeId} id={activeId} projectId={currentProjectId} data={conversationGit.data} error={conversationGit.error} disabled={loading || modeChanging} onSelect={handleAttachToProject} onViewChanges={() => { setShowGitChanges(true); conversationGit.refresh(); }} onRefresh={conversationGit.refresh} /> :
                 <ProjectWorkspaceBar projectId={activeId ? currentProjectId : pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
-                  {!activeId && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
-                </ProjectWorkspaceBar>)}
+                  {!activeId && isCodeMode && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+                </ProjectWorkspaceBar>}
+              {codeProjectRequired && <p className="mb-2 text-xs text-claude-textSecondary">{t('chat.selectCodeProject')}</p>}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -2095,12 +2106,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <div className="relative">
                   <SkillInputOverlay
                     text={inputText}
-                    className="px-4 pt-4 pb-0 text-[16px] font-sans font-[350]"
+                    className="px-4 pt-4 pb-0 text-[16px] font-sans font-normal"
                     style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflow: 'hidden' }}
                   />
                   <textarea
                     ref={inputRef}
-                    className={`w-full px-4 pt-4 pb-0 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-[350] ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
+                    className={`w-full px-4 pt-4 pb-0 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-normal ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
                     style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflowY: 'hidden' }}
                     placeholder={selectedSkill ? `Describe what you want ${selectedSkill.name} to do...` : t('chat.inputPlaceholder')}
                     value={inputText}
@@ -2155,7 +2166,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         {...plusMenuCallbacks}
                       />
                     )}
-                    {!isCodeMode && <HomeModeSelector mode={workspaceMode} onChange={handleHomeModeChange} disabled={loading || modeChanging} />}
+                    {!isCodeMode && <button type="button" onClick={() => fileInputRef.current?.click()} aria-label={t('chat.addAttachment')} title={t('chat.addAttachment')}
+                      className="p-2 text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-lg transition-colors">
+                      <Paperclip size={20} />
+                    </button>}
                     {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
                   </div>
                   <div className="flex flex-wrap justify-end items-center gap-3 ml-auto">
@@ -2211,7 +2225,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <button
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => handleSend()}
-                        disabled={gitSetupPending || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                        disabled={codeProjectRequired || gitSetupPending || modeChanging || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                        title={codeProjectRequired ? t('chat.selectCodeProject') : t('chat.send')}
                         className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <ArrowUp size={22} strokeWidth={2.5} />
@@ -2221,10 +2236,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   </div>
                 </div>
               </div>
-              {!isCodeMode && <div className="mt-2"><ProjectWorkspaceBar projectId={currentProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging} /></div>}
               {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
-              <SessionUsageBar key={activeId || 'new'} messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />
-              {!isCodeMode && <p className="pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
+              {showUsage && messages.some(message => message.role === 'user') && <SessionUsageBar key={activeId || 'new'} messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />}
+              {!isCodeMode && showAiDisclaimer && <p className="pt-2 pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
               {false && (
                 <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs pointer-events-auto">
                   <span>您当前没有可用套餐，无法发送消息</span>

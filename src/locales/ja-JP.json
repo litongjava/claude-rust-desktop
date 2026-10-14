@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "使用状況の統計",
+    "showUsageDescription": "各モードの入力欄の下に使用状況の統計を表示するか選択します",
+    "showAiDisclaimer": "AI の注意書きを表示",
+    "showAiDisclaimerDescription": "Home の入力欄の下に AI の回答を確認するよう促す注意書きを表示します",
     "modeModels": "モード別の既定モデル",
     "modeModelsDescription": "新しい Chat、Work、Study セッションのプロバイダーとモデルを選択します。変更は自動保存され、セッション開始前のモード切り替えで既定モデルが適用されます。",
     "modelProvider": "プロバイダー",
@@ -417,6 +421,7 @@
     "usageTitle": "使用法"
   },
   "chat": {
+    "selectCodeProject": "Code モードでメッセージを送る前にプロジェクトを選択してください",
     "inputPlaceholder": "今日はどのようにお手伝いできますか?",
     "send": "送信",
     "stop": "停止",

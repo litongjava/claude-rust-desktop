@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "उपयोग आँकड़े",
+    "showUsageDescription": "हर मोड में इनपुट बॉक्स के नीचे उपयोग आँकड़े दिखाने का विकल्प चुनें",
+    "showAiDisclaimer": "AI अनुस्मारक दिखाएँ",
+    "showAiDisclaimerDescription": "Home इनपुट बॉक्स के नीचे AI उत्तरों की जाँच करने का अनुस्मारक दिखाएँ",
     "modeModels": "मोड के अनुसार डिफ़ॉल्ट मॉडल",
     "modeModelsDescription": "नए Chat, Work और Study सत्रों के लिए प्रदाता और मॉडल चुनें। बदलाव अपने आप सहेजे जाते हैं; सत्र शुरू होने से पहले मोड बदलने पर उसका डिफ़ॉल्ट मॉडल लागू होता है।",
     "modelProvider": "प्रदाता",
@@ -417,6 +421,7 @@
     "usageTitle": "उपयोग"
   },
   "chat": {
+    "selectCodeProject": "Code मोड में संदेश भेजने से पहले प्रोजेक्ट चुनें",
     "inputPlaceholder": "आज मैं आपकी कैसे मदद कर सकता हूं?",
     "send": "भेजें",
     "stop": "रुकें",

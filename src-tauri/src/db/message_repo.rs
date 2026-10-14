@@ -180,3 +180,45 @@ pub fn insert_tool_call(
     ])?;
     Ok(())
 }
+
+/// Save each result as it arrives, rather than waiting for the whole assistant turn.
+pub fn save_stream_tool_result(conn: &Connection, conversation_id: &str, message_id: &str, content: &str, tool: &ToolCallRow) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order)
+        VALUES (?1, ?2, 'assistant', ?3, ?4, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))
+        ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+        params![message_id, conversation_id, content, chrono::Utc::now().to_rfc3339()])?;
+    insert_tool_call(&tx, &tool.id, message_id, &tool.name, tool.input.as_deref(), tool.output.as_deref(), tool.is_error, tool.sort_order)?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod stream_tool_tests {
+    use super::*;
+
+    #[test]
+    fn results_survive_reload_before_turn_completion_and_updates_do_not_duplicate() {
+        for mode in ["chat", "work", "study", "code"] {
+            verify_stream_tool_persistence(mode);
+        }
+    }
+
+    fn verify_stream_tool_persistence(mode: &str) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA_SQL).unwrap();
+        crate::db::conversation_repo::migrate_workspace_mode(&conn).unwrap();
+        crate::db::conversation_repo::insert_conversation(&conn, "conv", None, None, None, None, None, false, false, false, "now", "now", 0).unwrap();
+        crate::db::conversation_repo::set_workspace_mode(&conn, "conv", mode).unwrap();
+        let mut tool = ToolCallRow { id: "assistant:call-1".into(), message_id: "assistant".into(), name: "Read".into(), input: Some("{}".into()), output: Some("first".into()), is_error: false, sort_order: 0 };
+        save_stream_tool_result(&conn, "conv", "assistant", "Checking", &tool).unwrap();
+        assert_eq!(get_tool_calls_for_message(&conn, "assistant").unwrap()[0].output.as_deref(), Some("first"));
+        tool.output = Some("updated".into());
+        save_stream_tool_result(&conn, "conv", "assistant", "Checking again", &tool).unwrap();
+        let calls = get_tool_calls_for_message(&conn, "assistant").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].output.as_deref(), Some("updated"));
+        assert_eq!(get_messages_by_conversation(&conn, "conv").unwrap().len(), 1);
+        assert_eq!(get_message(&conn, "assistant").unwrap().unwrap().content, "Checking again");
+    }
+}

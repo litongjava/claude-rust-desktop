@@ -1,5 +1,9 @@
 {
   "general": {
+    "showUsage": "Statistiche di utilizzo",
+    "showUsageDescription": "Scegli se mostrare le statistiche sotto il campo di input in ciascuna modalità",
+    "showAiDisclaimer": "Mostra promemoria IA",
+    "showAiDisclaimerDescription": "Mostra sotto il campo Home un promemoria per verificare le risposte dell’IA",
     "modeModels": "Modelli predefiniti per modalità",
     "modeModelsDescription": "Scegli un fornitore e un modello per le nuove sessioni Chat, Work e Study. Le modifiche si salvano automaticamente; cambiare modalità prima della sessione applica il suo modello predefinito.",
     "modelProvider": "Fornitore",
@@ -417,6 +421,7 @@
     "usageTitle": "Utilizzo"
   },
   "chat": {
+    "selectCodeProject": "Seleziona un progetto prima di inviare messaggi in modalità Code",
     "inputPlaceholder": "Come posso aiutarti oggi?",
     "send": "Invia",
     "stop": "Fermati",
