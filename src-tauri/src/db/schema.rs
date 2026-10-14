@@ -15,6 +15,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS conversation_worktrees (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,

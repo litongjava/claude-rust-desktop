@@ -34,9 +34,17 @@ pub fn resolve_workspace(
     id: &str,
     requested: Option<&str>,
 ) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
-    if let Some(project) = conversation_project(conn, id)? {
+    if let Some(mut project) = conversation_project(conn, id)? {
         let path = project.workspace_path.as_deref().context("Project has no working directory")?;
         ensure!(Path::new(path).is_absolute() && Path::new(path).is_dir(), "Project folder is unavailable");
+        if let Some(worktree) = crate::worktree::session::resolve(conn, id, &project.id, Path::new(path))? {
+            // The prompt and tools must agree on the actual working folder.
+            project.workspace_path = Some(worktree.to_string_lossy().into_owned());
+            if let Some(folder) = project.folders.first_mut() {
+                folder.path = worktree.to_string_lossy().into_owned();
+            }
+            return Ok((worktree, Some(project)));
+        }
         return Ok((PathBuf::from(path), Some(project)));
     }
 

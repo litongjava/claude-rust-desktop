@@ -22,6 +22,7 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
         source.workspace_path.as_deref(), source.project_id.as_deref(), source.research_mode, false, false,
         &now, &now, messages.len() as i64)?;
     set_workspace_mode(&transaction, &new_id, &source.workspace_mode)?;
+    transaction.execute("INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2", rusqlite::params![new_id, source_id])?;
     for message in messages {
         let new_message_id = uuid::Uuid::new_v4().to_string();
         message_repo::insert_message(&transaction, &new_message_id, &new_id, &message.role, &message.content,

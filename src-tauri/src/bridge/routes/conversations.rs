@@ -150,9 +150,11 @@ async fn conversation_update(Path(id): Path<String>, State(state): State<AppStat
             if let Some(project_id) = body.get("project_id") {
                 if let Some(project_id) = project_id.as_str() {
                     let project = crate::db::project_repo::require_trusted(conn, project_id)?;
-                    conn.execute("UPDATE conversations SET project_id = ?1, workspace_path = ?2, updated_at = ?3 WHERE id = ?4",
+                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1 AND project_id != ?2", rusqlite::params![&id_clone, project_id])?;
+                    conn.execute("UPDATE conversations SET project_id = ?1, workspace_path = COALESCE((SELECT path FROM conversation_worktrees WHERE conversation_id = ?4), ?2), updated_at = ?3 WHERE id = ?4",
                         rusqlite::params![project_id, project.workspace_path, chrono::Utc::now().to_rfc3339(), &id_clone])?;
                 } else if project_id.is_null() {
+                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1", rusqlite::params![&id_clone])?;
                     conn.execute("UPDATE conversations SET project_id = NULL, workspace_path = NULL WHERE id = ?1", rusqlite::params![&id_clone])?;
                 }
             }

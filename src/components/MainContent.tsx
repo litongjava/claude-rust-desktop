@@ -26,6 +26,10 @@ import CompactingStatus from '../features/compact/CompactingStatus';
 import CompactDialog from '../features/compact/CompactDialog';
 import CreateProjectDialog from '../features/project/CreateProjectDialog';
 import ProjectWorkspaceBar from '../features/project/ProjectWorkspaceBar';
+import SessionGitSettings, { type SessionGitSelection } from '../features/project/SessionGitSettings';
+import ConversationWorkspaceBar from '../features/project/ConversationWorkspaceBar';
+import GitChangesPanel from '../features/project/GitChangesPanel';
+import { useConversationGit } from '../features/project/useConversationGit';
 import TrustProjectDialog from '../features/project/TrustProjectDialog';
 import { useLastCodeProject } from '../features/project/useLastCodeProject';
 import MessageList, { draftsStore } from '../features/message-list/MessageList';
@@ -175,6 +179,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   } = useToolStore();
 
   const [permissionApproval, setPermissionApproval] = useState<ApprovalInfo | null>(null);
+  const [sessionGit, setSessionGit] = useState<SessionGitSelection | null>(null);
+  const [showGitChanges, setShowGitChanges] = useState(false);
+  const conversationGit = useConversationGit(activeId, isCodeMode ? currentProjectId : null, loading);
+  useEffect(() => { setShowGitChanges(false); }, [activeId, currentProjectId, isCodeMode]);
+  const gitSetupPending = !activeId && isCodeMode && !!pendingProjectId && (sessionGit?.projectId !== pendingProjectId || !sessionGit.ready);
+
+  useEffect(() => {
+    if (!pendingProjectId) setSessionGit(null);
+  }, [pendingProjectId]);
 
 
   // Initialize providersCache
@@ -502,6 +515,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   useEffect(() => {
     if (resetKey && resetKey !== lastResetKeyRef.current) {
       lastResetKeyRef.current = resetKey;
+      setSessionGit(null);
       setLocalId(null);
       setMessages([]);
       setCurrentModelString(resolveModelForNewChat());
@@ -1040,7 +1054,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   };
 
   const handleSend = async (overrideText?: string, queuedFiles?: PendingFile[], queuedMessageId?: string) => {
-    if (modeChanging) return;
+    if (modeChanging || (!activeId && isCreatingRef.current) || gitSetupPending) return;
     try {
     const files = queuedFiles ?? pendingFiles;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
@@ -1214,6 +1228,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // If no ID, create conversation first
     if (!conversationId) {
       isCreatingRef.current = true; // Block useEffect fetch
+      setLoading(true);
       try {
         const modelForCreate = isModelSelectable(currentModelString)
           ? currentModelString
@@ -1224,7 +1239,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         // 不传临时标题，让后端生成
         console.log("Creating conversation with model:", modelForCreate);
         const newConv = pendingProjectId
-          ? await createProjectConversation(pendingProjectId, undefined, modelForCreate)
+          ? await createProjectConversation(pendingProjectId, undefined, modelForCreate, isCodeMode && sessionGit?.projectId === pendingProjectId ? { branch: sessionGit.branch, use_worktree: sessionGit.use_worktree } : undefined)
           : await createConversation(undefined, modelForCreate, { research_mode: researchMode });
         console.log("Created conversation response:", newConv);
 
@@ -1263,15 +1278,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       } catch (err: any) {
         console.error("Failed to create conversation", err);
         isCreatingRef.current = false;
-        setMessages(prev => {
-          const newMsgs = [...prev];
-          // Find the last assistant message (placeholder) and update it
-          if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'assistant') {
-            const errorMsg = err.message || String(err);
-            newMsgs[newMsgs.length - 1].content = "Error: Failed to create conversation. " + errorMsg + " Please check your model provider settings in Settings > Models.";
-          }
-          return newMsgs;
-        });
+        setLoading(false);
+        // Keep the draft available for retry after a Git setup error.
+        setMessages(messages);
+        setInputText(effectiveText);
+        setPendingFiles(files);
+        setProjectAddToast(err.message || String(err));
+        setTimeout(() => setProjectAddToast(null), 8000);
         return;
       }
     }
@@ -1837,7 +1850,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
           {/* 输入框区域 */}
           <div ref={slashCommandAnchorRef} className="w-full relative z-20 group order-2 shrink-0 bg-claude-bg pt-2">
-            {isCodeMode && <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading} />}
+            {isCodeMode && <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
+              {pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+            </ProjectWorkspaceBar>}
             {filteredCommands.length > 0 && (
               <SlashCommandSuggestions
                 anchorRef={slashCommandAnchorRef}
@@ -1955,7 +1970,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   <button
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => handleSend()}
-                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                    disabled={gitSetupPending || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
                     className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUp size={22} strokeWidth={2.5} />
@@ -2001,6 +2016,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // MODE 2: Chat Interface (Has ID or Messages)
   return (
+    <div className="relative flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
     <div className="flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
       {showCodingView && <div className="flex shrink-0 gap-5 border-b border-claude-border px-5 text-sm" role="tablist" aria-label="会话视图">
         {(['chat', 'trajectory'] as const).map(view => <button type="button" key={view} role="tab" aria-selected={conversationView === view} onClick={() => setConversationView(view)} className={`py-3 ${conversationView === view ? 'border-b-2 border-blue-500 text-blue-500' : 'text-claude-textSecondary'}`}>{view === 'chat' ? 'Chat' : 'Trajectory'}</button>)}
@@ -2053,7 +2069,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ maxWidth: `${inputBarWidth}px` }}
           >
             <div className="w-full relative group" ref={inputWrapperRef}>
-              {isCodeMode && <ProjectWorkspaceBar projectId={currentProjectId} onSelect={handleAttachToProject} disabled={loading} />}
+              {isCodeMode && (activeId && currentProjectId ? <ConversationWorkspaceBar key={activeId} id={activeId} projectId={currentProjectId} data={conversationGit.data} error={conversationGit.error} disabled={loading || modeChanging} onSelect={handleAttachToProject} onViewChanges={() => { setShowGitChanges(true); conversationGit.refresh(); }} onRefresh={conversationGit.refresh} /> :
+                <ProjectWorkspaceBar projectId={activeId ? currentProjectId : pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
+                  {!activeId && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+                </ProjectWorkspaceBar>)}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -2192,7 +2211,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <button
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => handleSend()}
-                        disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                        disabled={gitSetupPending || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
                         className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <ArrowUp size={22} strokeWidth={2.5} />
@@ -2515,6 +2534,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         inputRef={inputRef}
         activeId={activeId}
       />
+    </div>
+    {showGitChanges && activeId && <GitChangesPanel key={activeId} id={activeId} data={conversationGit.data} error={conversationGit.error} onRefresh={conversationGit.refresh} onClose={() => setShowGitChanges(false)} />}
     </div>
   );
 };

@@ -654,10 +654,10 @@ export async function getProjectConversations(projectId: string) {
   return res.json();
 }
 
-export async function createProjectConversation(projectId: string, title?: string, model?: string) {
+export async function createProjectConversation(projectId: string, title?: string, model?: string, gitOptions?: import('./api/projects').ProjectGitOptions) {
   const res = await request(`/projects/${projectId}/conversations`, {
     method: 'POST',
-    body: JSON.stringify({ title, model, workspace_mode: useWorkspaceModeStore.getState().mode }),
+    body: JSON.stringify({ title, model, workspace_mode: useWorkspaceModeStore.getState().mode, ...gitOptions }),
   });
   return res.json();
 }
