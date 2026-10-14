@@ -1184,6 +1184,16 @@ export async function getSearchSettings(): Promise<SearchSettings> {
 export async function updateSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettings> {
   return searchSettingsResult(await providerRequest('/search-settings', 'PATCH', settings));
 }
+export interface SearchSettingsTestResult {
+  ok: true;
+  model: string;
+  resultCount: number;
+  elapsedMs: number;
+  results: Array<{ title: string; url: string; snippet: string }>;
+}
+export async function testSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettingsTestResult> {
+  return providerRequest('/search-settings/test', 'POST', settings);
+}
 
 let providerMigration: Promise<void> | undefined;
 async function migrateLegacyProviders() {

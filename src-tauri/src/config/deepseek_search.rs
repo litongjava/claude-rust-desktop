@@ -26,7 +26,7 @@ impl Default for DeepSeekSearchConfig {
         Self {
             base_url: "https://api.deepseek.com/anthropic/v1".into(),
             api_key: String::new(),
-            model: "deepseek-v4-flash".into(),
+            model: "deepseek-flash".into(),
         }
     }
 }
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn old_config_gets_search_defaults_and_independent_key_is_required() {
         let config: crate::config::AppConfig = serde_json::from_str(r#"{"providers":[]}"#).unwrap();
-        assert_eq!(config.deepseek_search.model, "deepseek-v4-flash");
+        assert_eq!(config.deepseek_search.model, "deepseek-flash");
         assert!(config
             .deepseek_search
             .resolved_provider()

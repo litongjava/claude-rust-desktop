@@ -1,13 +1,13 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SearchSettings from '../components/SearchSettings';
 import SettingsPage from '../components/SettingsPage';
-import { getProviders, getSearchSettings, updateSearchSettings, type SearchSettings as SearchSettingsData } from '../api';
+import { getProviders, getSearchSettings, updateSearchSettings, testSearchSettings, type SearchSettings as SearchSettingsData, type SearchSettingsTestResult } from '../api';
 
 vi.mock('../api', () => ({
-  getSearchSettings: vi.fn(), updateSearchSettings: vi.fn(), getProviders: vi.fn(),
+  getSearchSettings: vi.fn(), updateSearchSettings: vi.fn(), testSearchSettings: vi.fn(), getProviders: vi.fn(),
   getUserProfile: vi.fn().mockResolvedValue({}), getUserUsage: vi.fn().mockResolvedValue({}),
   getSessions: vi.fn().mockResolvedValue({ sessions: [] }), getProviderModels: vi.fn().mockResolvedValue([]),
 }));
@@ -18,7 +18,11 @@ vi.mock('../components/NewTaskModal', () => ({ default: () => null }));
 vi.mock('../components/GeneralPreferences', () => ({ default: () => null }));
 
 const existing: SearchSettingsData = {
-  baseUrl: 'https://search.example/anthropic/v1', model: 'deepseek-v4-flash', hasApiKey: true,
+  baseUrl: 'https://search.example/anthropic/v1', model: 'deepseek-flash', hasApiKey: true,
+};
+const searchSuccess: SearchSettingsTestResult = {
+  ok: true, model: 'deepseek-flash', resultCount: 1, elapsedMs: 1250,
+  results: [{ title: 'DeepSeek documentation', url: 'https://api-docs.deepseek.com/', snippet: 'Official documentation' }],
 };
 
 describe('independent DeepSeek search settings', () => {
@@ -26,6 +30,7 @@ describe('independent DeepSeek search settings', () => {
     localStorage.clear();
     vi.clearAllMocks();
     vi.mocked(getSearchSettings).mockResolvedValue(existing);
+    vi.mocked(testSearchSettings).mockResolvedValue(searchSuccess);
     vi.mocked(updateSearchSettings).mockImplementation(async patch => ({
       baseUrl: patch.baseUrl, model: patch.model, hasApiKey: !patch.clearApiKey,
     }));
@@ -78,5 +83,53 @@ describe('independent DeepSeek search settings', () => {
     await user.click(screen.getByRole('button', { name: '联网搜索' }));
     expect(await screen.findByRole('heading', { name: 'DeepSeek 联网搜索' })).toBeInTheDocument();
     await waitFor(() => expect(getSearchSettings).toHaveBeenCalledTimes(1));
+  });
+
+  it('tests unsaved address, model and manual key without saving or caching credentials', async () => {
+    let finish!: (result: SearchSettingsTestResult) => void;
+    vi.mocked(testSearchSettings).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    expect(screen.getByLabelText('搜索模型')).toHaveAttribute('placeholder', 'deepseek-flash');
+    await user.clear(screen.getByLabelText('搜索 API 地址'));
+    await user.type(screen.getByLabelText('搜索 API 地址'), 'https://test.example/v1');
+    await user.clear(screen.getByLabelText('搜索模型'));
+    await user.type(screen.getByLabelText('搜索模型'), 'deepseek-test');
+    await user.type(screen.getByLabelText('搜索 API 密钥'), 'unsaved-test-key');
+    await user.click(screen.getByRole('button', { name: '测试搜索' }));
+    expect(testSearchSettings).toHaveBeenCalledWith({ baseUrl: 'https://test.example/v1', model: 'deepseek-test', apiKey: 'unsaved-test-key' });
+    expect(screen.getByRole('button', { name: '测试中…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存联网搜索设置' })).toBeDisabled();
+    await act(async () => { finish({ ...searchSuccess, model: 'deepseek-test' }); });
+    expect(await screen.findByText('搜索测试成功：1 条结果 · 1.3 秒 · deepseek-test')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'DeepSeek documentation' })).toHaveAttribute('href', 'https://api-docs.deepseek.com/');
+    expect(updateSearchSettings).not.toHaveBeenCalled();
+    expect(localStorage.setItem).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('unsaved-test-key');
+    await user.type(screen.getByLabelText('搜索模型'), '-changed');
+    expect(screen.queryByText(/搜索测试成功/)).not.toBeInTheDocument();
+  });
+
+  it('tests with the saved key when the password input is blank', async () => {
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await waitFor(() => expect(screen.getByLabelText('搜索 API 地址')).toHaveValue(existing.baseUrl));
+    await user.click(screen.getByRole('button', { name: '测试搜索' }));
+    await waitFor(() => expect(testSearchSettings).toHaveBeenCalledWith({ baseUrl: existing.baseUrl, model: existing.model }));
+    expect(updateSearchSettings).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('搜索 API 密钥')).toHaveValue('');
+  });
+
+  it('tests explicit key removal and displays a failed search without saving', async () => {
+    vi.mocked(testSearchSettings).mockRejectedValue(new Error('请配置搜索 API 密钥'));
+    const user = userEvent.setup();
+    render(<SearchSettings />);
+    await user.click(await screen.findByLabelText('保存时清除搜索密钥'));
+    await user.click(screen.getByRole('button', { name: '测试搜索' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('请配置搜索 API 密钥');
+    expect(testSearchSettings).toHaveBeenCalledWith({ baseUrl: existing.baseUrl, model: existing.model, clearApiKey: true });
+    expect(updateSearchSettings).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '测试搜索' })).toBeEnabled();
   });
 });

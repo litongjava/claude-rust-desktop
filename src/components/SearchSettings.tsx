@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { getSearchSettings, updateSearchSettings, type SearchSettings as SearchSettingsData } from '../api';
+import { getSearchSettings, updateSearchSettings, testSearchSettings, type SearchSettings as SearchSettingsData, type SearchSettingsUpdate, type SearchSettingsTestResult } from '../api';
 
 const inputClass = 'w-full bg-transparent border border-claude-border rounded-lg px-3 py-2 text-[13px] text-claude-text outline-none focus:border-[#387ee0]';
-const defaults: SearchSettingsData = { baseUrl: 'https://api.deepseek.com/anthropic/v1', model: 'deepseek-v4-flash', hasApiKey: false };
+const defaults: SearchSettingsData = { baseUrl: 'https://api.deepseek.com/anthropic/v1', model: 'deepseek-flash', hasApiKey: false };
 
 export default function SearchSettings() {
   const [settings, setSettings] = useState(defaults);
@@ -10,6 +10,8 @@ export default function SearchSettings() {
   const [clearApiKey, setClearApiKey] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<SearchSettingsTestResult | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -23,15 +25,23 @@ export default function SearchSettings() {
     finally { setBusy(false); }
   };
   useEffect(() => { void load(); }, []);
+  const edited = () => { setNotice(''); setTestResult(null); setError(''); };
+  const currentSettings = (): SearchSettingsUpdate => ({
+    baseUrl: settings.baseUrl.trim(), model: settings.model.trim(),
+    ...(clearApiKey ? { clearApiKey: true } : apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+  });
+  const testSearch = async () => {
+    setTesting(true); setError(''); setTestResult(null); setNotice('');
+    try { setTestResult(await testSearchSettings(currentSettings())); }
+    catch (err) { setError((err as Error).message); }
+    finally { setTesting(false); }
+  };
 
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setBusy(true); setError(''); setNotice('');
     try {
-      const result = await updateSearchSettings({
-        baseUrl: settings.baseUrl.trim(), model: settings.model.trim(),
-        ...(clearApiKey ? { clearApiKey: true } : apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-      });
+      const result = await updateSearchSettings(currentSettings());
       setSettings({ baseUrl: result.baseUrl, model: result.model, hasApiKey: result.hasApiKey });
       setApiKey(''); setClearApiKey(false);
       setNotice('联网搜索设置已保存');
@@ -47,19 +57,28 @@ export default function SearchSettings() {
     {error && <div role="alert" className="rounded-lg bg-red-500/10 text-red-500 p-3 text-sm">{error}</div>}
     {!loaded && !busy && <button type="button" onClick={() => void load()} className="text-sm text-claude-text underline">重新加载</button>}
     <form onSubmit={save} className="space-y-5 rounded-2xl border border-claude-border bg-claude-input p-6">
-      <fieldset disabled={!loaded || busy} className="space-y-5 disabled:opacity-60">
-        <label className="block text-xs text-claude-textSecondary">搜索 API 地址<input required type="url" aria-label="搜索 API 地址" value={settings.baseUrl} onChange={event => { setSettings({ ...settings, baseUrl: event.target.value }); setNotice(''); }} className={`${inputClass} mt-1 font-mono`} placeholder={defaults.baseUrl} /></label>
-        <label className="block text-xs text-claude-textSecondary">搜索模型<input required aria-label="搜索模型" value={settings.model} onChange={event => { setSettings({ ...settings, model: event.target.value }); setNotice(''); }} className={`${inputClass} mt-1`} placeholder={defaults.model} /></label>
+      <fieldset disabled={!loaded || busy || testing} className="space-y-5 disabled:opacity-60">
+        <label className="block text-xs text-claude-textSecondary">搜索 API 地址<input required type="url" aria-label="搜索 API 地址" value={settings.baseUrl} onChange={event => { setSettings({ ...settings, baseUrl: event.target.value }); edited(); }} className={`${inputClass} mt-1 font-mono`} placeholder={defaults.baseUrl} /></label>
+        <label className="block text-xs text-claude-textSecondary">搜索模型<input required aria-label="搜索模型" value={settings.model} onChange={event => { setSettings({ ...settings, model: event.target.value }); edited(); }} className={`${inputClass} mt-1`} placeholder={defaults.model} /></label>
         <div>
-          <label className="block text-xs text-claude-textSecondary">搜索 API 密钥<input type="password" aria-label="搜索 API 密钥" autoComplete="new-password" value={apiKey} disabled={clearApiKey} onChange={event => { setApiKey(event.target.value); setNotice(''); }} className={`${inputClass} mt-1`} placeholder={settings.hasApiKey ? '已配置，留空保留现有密钥' : '手动输入独立的 DeepSeek API 密钥'} /></label>
+          <label className="block text-xs text-claude-textSecondary">搜索 API 密钥<input type="password" aria-label="搜索 API 密钥" autoComplete="new-password" value={apiKey} disabled={clearApiKey} onChange={event => { setApiKey(event.target.value); edited(); }} className={`${inputClass} mt-1`} placeholder={settings.hasApiKey ? '已配置，留空保留现有密钥' : '手动输入独立的 DeepSeek API 密钥'} /></label>
           <p className="mt-2 text-xs text-claude-textSecondary">{settings.hasApiKey ? '已配置密钥，保存后不会在此显示。' : '尚未配置搜索密钥。'}</p>
-          {settings.hasApiKey && <label className="mt-3 flex items-center gap-2 text-xs text-claude-textSecondary"><input type="checkbox" checked={clearApiKey} onChange={event => { setClearApiKey(event.target.checked); setApiKey(''); setNotice(''); }} />保存时清除搜索密钥</label>}
+          {settings.hasApiKey && <label className="mt-3 flex items-center gap-2 text-xs text-claude-textSecondary"><input type="checkbox" checked={clearApiKey} onChange={event => { setClearApiKey(event.target.checked); setApiKey(''); edited(); }} />保存时清除搜索密钥</label>}
         </div>
+        <p className="text-xs text-claude-textSecondary">测试搜索使用当前填写的设置，不会自动保存。</p>
         <div className="flex items-center justify-end gap-3 border-t border-claude-border pt-4">
           <span role="status" className="flex-1 text-xs text-claude-textSecondary">{notice}</span>
+          <button type="button" onClick={event => { if (event.currentTarget.form?.reportValidity()) void testSearch(); }} className="rounded-lg border border-claude-border px-4 py-2 text-sm text-claude-text">{testing ? '测试中…' : '测试搜索'}</button>
           <button type="submit" className="rounded-lg bg-claude-text px-4 py-2 text-sm text-claude-bg">{busy ? '保存中…' : '保存联网搜索设置'}</button>
         </div>
       </fieldset>
     </form>
+    {testResult && <div className="space-y-3 rounded-lg border border-claude-border p-4 text-sm">
+      <p role="status" className="text-claude-text">搜索测试成功：{testResult.resultCount} 条结果 · {(testResult.elapsedMs / 1000).toFixed(1)} 秒 · {testResult.model}</p>
+      {testResult.results.filter(result => /^https?:\/\//i.test(result.url)).slice(0, 3).map((result, index) => <div key={`${result.url}-${index}`}>
+        <a href={result.url} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{result.title || result.url}</a>
+        {result.snippet && <p className="mt-1 line-clamp-2 text-xs text-claude-textSecondary">{result.snippet}</p>}
+      </div>)}
+    </div>}
   </section>;
 }
