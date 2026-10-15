@@ -448,6 +448,11 @@ impl Session {
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
         use std::io::IsTerminal;
+        // Frontends record original human input before skill expansion/worker handoff.
+        // A worker receives synthesized context and must never re-label it as user intent.
+        if std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
+            claude_core::services::permission_authority::record_user(&self.store.db, &self.id, self.sdk_content.as_ref().unwrap_or(&json!(prompt)))?;
+        }
         if self.sdk_content.is_some() {return self.run_turn(cli,prompt,input).await;}
         let prepared = tokio::select! {
             prepared = crate::skill_commands::prepare_invocation(cli, self, prompt, input) => prepared?,

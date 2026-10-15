@@ -925,6 +925,7 @@ async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_fail
                 assert_eq!(headers["authorization"], "Bearer isolated-classifier-fixture");
                 assert_eq!(body["model"], "explicit-classifier");
                 assert!(body.get("tools").is_none());
+                assert!(body.to_string().contains("SDK_AUTHORITY_TEXT"));
                 observed.lock().unwrap().push(body);
                 if outcome == "unavailable" { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
                 if outcome == "timeout" { tokio::time::sleep(Duration::from_millis(300)).await; }
@@ -944,7 +945,7 @@ async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_fail
         let mut client = Client::start(root.path(), &server, &["--permission-mode", "dontAsk"]);
         client.send(json!({"type":"control_request","request_id":"auto","request":{"subtype":"set_permission_mode","mode":"auto"}})).await;
         assert_eq!(client.frame("control_response").await["response"]["subtype"], "success");
-        client.send(user("Write approval.txt with the requested content")).await;
+        client.send(json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Write approval.txt with the requested content"},{"type":"text","text":"SDK_AUTHORITY_TEXT: only edit that requested file"}]}})).await;
         loop {
             let line = tokio::time::timeout(Duration::from_secs(20), client.output.next_line()).await.unwrap().unwrap().unwrap();
             let frame: Value = serde_json::from_str(&line).unwrap();

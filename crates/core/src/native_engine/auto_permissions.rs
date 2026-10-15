@@ -243,11 +243,25 @@ pub async fn authorize(
             None,
         );
     }
+    // Protocol role=user also carries peer messages, summaries and tool data.
+    // Positive persisted provenance is the only source of user authorization.
+    let mut authorized_messages = match crate::services::permission_authority::history(&context.db, &tool.conversation_id, config.max_input_tokens as usize) {
+        Ok(history) if !history.is_empty() => history,
+        Ok(_) => return AutoAuthorization::plain(denied("No verified user authorization is recorded for this session; provide a new explicit user request before using Auto"),None),
+        Err(error) => return AutoAuthorization::plain(denied(&format!("Verified user authorization could not be loaded: {error}")),None),
+    };
+    let expected_authority = authorized_messages.clone();
+    authorized_messages.extend(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .cloned(),
+    );
     let expected_provider = serde_json::to_value((&provider.provider, &provider.model)).ok();
     let classifier = AutoClassifier::new(config.clone(), provider);
     let outcome = classifier
         .classify_started(
-            messages,
+            &authorized_messages,
             &tool.tool_name,
             &tool.tool_input,
             tool.workspace_path.as_deref().unwrap_or(""),
@@ -291,6 +305,14 @@ pub async fn authorize(
                         == expected_provider
             });
     if !selection_unchanged
+        || crate::services::permission_authority::history(
+            &context.db,
+            &tool.conversation_id,
+            config.max_input_tokens as usize,
+        )
+        .ok()
+        .as_ref()
+            != Some(&expected_authority)
         || manager
             .evaluate_stable(tool)
             .is_none_or(|(latest, snapshot)| snapshot != expected || !latest.classifier_eligible)

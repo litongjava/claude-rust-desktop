@@ -237,7 +237,7 @@ impl ToolLoopExecutor {
             self.pending_plan_reset = Some((boundary, message));
         }
         let mode = if choice == Choice::Manual { PermissionMode::AskPermissions } else { PermissionMode::AcceptEdits };
-        if !clear { plan_approval::commit_approved_mode(&context, &session, &manager, expected_mode, mode)?; }
+        if !clear { plan_approval::commit_approved_mode(&context, &session, &manager, expected_mode, mode, &plan)?; }
         // The old project-wide plan record is a compatibility mirror, never the
         // authority for permission changes. Update only after approval commits.
         let legacy_warning = if tool_name == "plan_mode" {
@@ -379,6 +379,8 @@ mod tests {
             Some("legacy"),
         ] {
             let root = tempfile::tempdir().unwrap();
+            let context=crate::services::session_messages::context(root.path()).unwrap();
+            context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('plan-session','','')",[])).unwrap().unwrap();
             let manager = crate::runtime::default_permissions();
             manager.set_mode(PermissionMode::BypassPermissions);
             let provider = ResolvedProvider {
@@ -517,6 +519,8 @@ mod tests {
         Arc<crate::permissions::PermissionManager>,
     ) {
         crate::config::OrchestrationConfig::init_global().unwrap();
+        let context=crate::services::session_messages::context(root).unwrap();
+        context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('file-session','','')",[])).unwrap().unwrap();
         let manager = crate::runtime::default_permissions();
         manager.set_mode(PermissionMode::PlanMode);
         let provider = ResolvedProvider {

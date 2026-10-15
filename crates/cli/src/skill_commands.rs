@@ -335,6 +335,7 @@ fn isolated_child(
     context: &claude_core::services::ServiceContext,
 ) -> anyhow::Result<String> {
     let child = store.clear(parent)?;
+    claude_core::services::permission_authority::inherit(&store.db, parent, &child)?;
     crate::session_commands::copy_settings(&store.db, parent, &child)?;
     // A parent autonomous goal must not turn a bounded skill into unrelated work.
     let setting = format!("cli.session.{child}");
@@ -508,7 +509,9 @@ mod tests {
             "PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","shell":if cfg!(windows){"powershell"}else{"sh"},"command":command("pre.json",&pre_output)}]}],
             "PermissionDenied":[{"matcher":"^Bash$","hooks":[{"type":"command","shell":if cfg!(windows){"powershell"}else{"sh"},"command":command("denied.json",&denied_output)}]}]
         }}).to_string()).unwrap();
-        let result=prepare_invocation(&cli,&session,"/permission-fixture",&mut None).await;
+        let result=session.turn(&cli,"/permission-fixture",&mut None).await;
+        let authority=claude_core::services::permission_authority::history(&session.store.db,&session.id,8192).unwrap();
+        assert_eq!(authority,vec![serde_json::json!({"role":"user","content":"/permission-fixture"})]);
         let error=match result {Err(error)=>error.to_string(),Ok(_)=>panic!("classifier denied shell must not run")};
         assert!(error.contains("PermissionDenied hook suggests"),"{error}");
         let read=|name:&str|serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(temp.path().join(name)).unwrap()).unwrap();

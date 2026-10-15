@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS session_permission_authority (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK (source IN ('user', 'approved_plan')),
+    origin_id TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    UNIQUE(conversation_id, origin_id)
+);
+CREATE INDEX IF NOT EXISTS idx_permission_authority_session ON session_permission_authority(conversation_id, id);
+
 CREATE TABLE IF NOT EXISTS message_trajectory (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     requests_json TEXT NOT NULL

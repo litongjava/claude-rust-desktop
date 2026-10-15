@@ -244,6 +244,9 @@ impl ToolLoopExecutor {
             current["parent_session_id"] == parent && current["status"] == "completed",
             "Child was stopped or ownership changed before resume"
         );
+        // Refresh verified owner constraints on every resume, without promoting
+        // the model-generated resume prompt or peer inbox data to user authority.
+        crate::services::permission_authority::inherit(&context.db, &parent, id)?;
         let sessions = SessionStore::new(context.db.clone());
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;

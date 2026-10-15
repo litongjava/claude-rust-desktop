@@ -798,7 +798,9 @@ impl ToolLoopExecutor {
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::Auto) {
             let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Auto permissions require a configured data directory"))?;
             let context = crate::services::session_messages::context(root)?;
-            super::auto_permissions::configured(&context, &self.provider)?;
+            let (config, _) = super::auto_permissions::configured(&context, &self.provider)?;
+            let authority = crate::services::permission_authority::history(&context.db, self.conv_id.as_deref().unwrap_or(""), config.max_input_tokens as usize)?;
+            anyhow::ensure!(!authority.is_empty(), "No verified user authorization is recorded for this session; provide a new explicit user request before using Auto");
         }
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.

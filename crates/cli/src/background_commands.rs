@@ -57,6 +57,7 @@ pub async fn handle(
             }
             let child_id = session.store.fork(&session.id)?;
             copy_settings(session, &child_id)?;
+            claude_core::services::permission_authority::record_user(&session.store.db, &child_id, &serde_json::json!(prompt))?;
             let workspace = session
                 .store
                 .workspace(&child_id, &paths.data_dir.join("workspaces"))?;

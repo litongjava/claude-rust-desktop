@@ -67,6 +67,10 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
             SELECT lower(hex(randomblob(16))), ?1, file_name, file_type, mime_type, file_size, source FROM attachments WHERE message_id = ?2",
             params![new_message_id, message.id])?;
     }
+    // A full fork copies all explicit intent. Partial Desktop branches are not Auto-enabled.
+    if message_id.is_none() && message_index.is_none() {
+        crate::services::permission_authority::inherit_conn(&transaction, source_id, &new_id)?;
+    }
     transaction.commit()?;
     Ok(new_id)
 }

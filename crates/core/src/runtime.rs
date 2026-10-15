@@ -345,6 +345,7 @@ impl SessionStore {
                 let actual = crate::native_engine::workspace::resolve_workspace(&tx, root, &new_id, None)?.0;
                 ensure!(actual.canonicalize()? == expected.canonicalize()?, "Child workspace differs from its parent binding");
             }
+            if owned.is_some() { crate::services::permission_authority::inherit_conn(&tx, id, &new_id)?; }
             tx.commit()?;
             Ok(new_id)
         })?

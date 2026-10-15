@@ -30,6 +30,22 @@ fn executor(
         },
     )
     .unwrap();
+    context
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations(id,created_at,updated_at) VALUES('auto-session','','')",
+                [],
+            )
+        })
+        .unwrap()
+        .unwrap();
+    crate::services::permission_authority::record_user(
+        &context.db,
+        "auto-session",
+        &json!("Write the requested fixture file"),
+    )
+    .unwrap();
     let provider = ResolvedProvider { provider:serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":endpoint,"api_key":"fixture-only","api_format":"openai","models":[],"enabled":true})).unwrap(),model:serde_json::from_value(json!({"id":"classifier","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap() };
     let manager = crate::runtime::default_permissions();
     manager.set_mode(PermissionMode::Auto);
@@ -125,7 +141,14 @@ async fn auto_executes_only_authorized_actual_writes_and_never_creates_unresolve
 #[tokio::test]
 async fn auto_discards_allow_after_rule_mode_or_config_changes_and_cancellation() {
     for mutation in [
-        "rule", "runtime", "callback", "mode", "config", "provider", "cancel",
+        "rule",
+        "runtime",
+        "callback",
+        "mode",
+        "config",
+        "provider",
+        "authority",
+        "cancel",
     ] {
         let root = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -201,6 +224,16 @@ async fn auto_discards_allow_after_rule_mode_or_config_changes_and_cancellation(
                 let context =
                     crate::services::session_messages::context(&root.path().join("data")).unwrap();
                 auto_config::save(&context, &AutoConfig::default()).unwrap();
+            }
+            "authority" => {
+                let context =
+                    crate::services::session_messages::context(&root.path().join("data")).unwrap();
+                crate::services::permission_authority::record_user(
+                    &context.db,
+                    "auto-session",
+                    &json!("Do not write any files"),
+                )
+                .unwrap();
             }
             "cancel" => pending.abort(),
             _ => unreachable!(),

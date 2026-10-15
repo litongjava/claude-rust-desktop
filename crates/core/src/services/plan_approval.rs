@@ -70,10 +70,12 @@ pub fn commit_approved_mode(
     manager: &crate::permissions::PermissionManager,
     expected: crate::permissions::manager::ModeSnapshot,
     mode: crate::permissions::PermissionMode,
+    approved_plan: &str,
 ) -> Result<()> {
     context.db.with_conn(|conn| -> Result<()> {
         let tx=conn.unchecked_transaction()?;
         tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("cli.permission-mode.{session}"),super::session_permission_mode::name(mode)])?;
+        super::permission_authority::record_conn(&tx,session,super::permission_authority::Source::ApprovedPlan,&serde_json::json!(approved_plan))?;
         manager.commit_mode_transition(expected,mode,||{tx.commit()?;Ok(())})
     })?
 }
@@ -110,6 +112,7 @@ fn commit_boundary_inner(
         crate::db::conversation_repo::increment_message_count(&tx, session)?;
         tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("plan.context_boundary.{session}"),serde_json::json!({"boundary_id":id}).to_string()])?;
         if let Some((manager, expected)) = transition {
+            super::permission_authority::record_conn(&tx,session,super::permission_authority::Source::ApprovedPlan,&serde_json::json!(content))?;
             tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,'accept-edits') ON CONFLICT(key) DO UPDATE SET value=excluded.value",[format!("cli.permission-mode.{session}")])?;
             manager.commit_mode_transition(expected, crate::permissions::PermissionMode::AcceptEdits, || { tx.commit()?; Ok(()) })?;
         } else { tx.commit()?; }

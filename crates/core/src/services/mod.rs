@@ -4,6 +4,7 @@ pub mod deep_research;
 pub mod compaction;
 pub mod plans;
 pub mod plan_approval;
+pub mod permission_authority;
 pub mod session_workspace;
 pub mod session_trust;
 pub mod session_permission_mode;
