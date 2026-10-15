@@ -36,6 +36,7 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 enigo = "0.2"
 base64 = "0.22"
+ring = "0.17"
 windows = { version = "0.58", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 cron = "0.12"
 diffy = "0.4"

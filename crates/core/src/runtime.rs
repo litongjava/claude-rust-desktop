@@ -36,8 +36,8 @@ impl RuntimePaths {
     }
 
     pub fn open_database(&self) -> Result<Arc<DbManager>> {
-        let db = Arc::new(DbManager::new(self.data_dir.join("claude_desktop.db"))?);
-        db.init()?;
+        let db = Arc::new(DbManager::new(self.data_dir.join("claude_desktop.db")).context("Opening shared database pool")?);
+        db.init().context("Initializing shared database schema")?;
         Ok(db)
     }
 
@@ -144,7 +144,8 @@ impl SessionStore {
         let path = workspace.to_string_lossy().into_owned();
         let id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
-            let tx = conn.unchecked_transaction()?;
+            // Acquire the writer before reading project state, avoiding a stale WAL snapshot upgrade.
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let project = project_repo::list_projects(&tx)?.into_iter().find(|p| {
                 !p.is_archived
                     && p.workspace_path
@@ -252,7 +253,8 @@ impl SessionStore {
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {
         let message_id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
-            let tx = conn.unchecked_transaction()?;
+            // Message ordering is a read/modify/write operation shared by CLI and Desktop hosts.
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let order: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?1",
                 [id],

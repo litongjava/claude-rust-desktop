@@ -32,7 +32,6 @@ if (args.has('--check')) {
   process.exit(0);
 }
 
-run(process.execPath, ['scripts/build-provider-runtime.mjs']);
 const metadata = JSON.parse(run('cargo', ['metadata', '--no-deps', '--format-version', '1'], true));
 const target = join(metadata.target_directory, profile);
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version;
@@ -44,13 +43,9 @@ const products = [];
 if (cli) {
   run('cargo', ['build', '--locked', '-p', 'claude-code-cli', ...(debug ? [] : ['--release'])]);
   const cliDir = join(output, 'cli');
-  mkdirSync(join(cliDir, 'runtime'), { recursive: true });
+  mkdirSync(cliDir, { recursive: true });
   copyFileSync(join(target, `claude-code${exe}`), join(cliDir, `claude-code${exe}`));
-  copyFileSync('dist-runtime/provider-runtime.mjs', join(cliDir, 'runtime', 'provider-runtime.mjs'));
   copyFileSync('crates/cli/LICENSE', join(cliDir, 'LICENSE'));
-  // Make a directly built CLI work with built-in providers as well.
-  mkdirSync(join(target, 'runtime'), { recursive: true });
-  copyFileSync('dist-runtime/provider-runtime.mjs', join(target, 'runtime', 'provider-runtime.mjs'));
   products.push('cli');
 }
 if (desktop) {
@@ -59,9 +54,8 @@ if (desktop) {
   const started = Date.now();
   run(process.execPath, [tauri, 'build', '--ci', ...(debug ? ['--debug'] : []), ...(args.has('--no-bundle') ? ['--no-bundle'] : []), '--', '--locked']);
   const desktopDir = join(output, 'desktop');
-  mkdirSync(join(desktopDir, 'runtime'), { recursive: true });
+  mkdirSync(desktopDir, { recursive: true });
   copyFileSync(join(target, `claude-desktop-tauri${exe}`), join(desktopDir, `claude-desktop-tauri${exe}`));
-  copyFileSync('dist-runtime/provider-runtime.mjs', join(desktopDir, 'runtime', 'provider-runtime.mjs'));
   if (!args.has('--no-bundle')) {
     const bundle = join(target, 'bundle');
     let copied = 0;

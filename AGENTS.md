@@ -22,7 +22,7 @@ Use Node.js 22+, Rust, and the platform's Tauri prerequisites.
 - `cargo test --locked -p claude-core --lib --tests`: run core tests; use `-p claude-code-cli` or `-p claude-desktop-tauri` for those packages.
 - `cargo check --locked -p claude-desktop-tauri --all-targets`: check Desktop targets.
 
-Cargo output is configured under `src-tauri/target/`.
+Cargo output is configured under the workspace root `target/`.
 
 ## Coding Style & Naming
 

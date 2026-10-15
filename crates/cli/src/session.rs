@@ -41,9 +41,10 @@ pub struct Session {
     pub store: SessionStore,
     pub engine: NativeEngine,
     mcp: Arc<McpServerManager>,
-    model: String,
-    provider_id: String,
-    auto_route: bool,
+    pub(crate) model: String,
+    pub(crate) provider_id: String,
+    pub(crate) auto_route: bool,
+    providers: Arc<Mutex<ProviderManager>>,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
 }
 
@@ -60,7 +61,7 @@ impl Session {
                 &std::env::current_dir()?,
                 &selection.model,
                 &selection.provider_id,
-            )?
+            ).context("Creating CLI session")?
         };
         store.db.with_conn(|conn| {
             conn.execute(
@@ -110,7 +111,7 @@ impl Session {
         let engine = runtime::create_engine(
             paths,
             db,
-            providers,
+            providers.clone(),
             permissions,
             Arc::new(FileCache::new()),
         )
@@ -125,9 +126,40 @@ impl Session {
             mcp,
             model: selection.model,
             provider_id: selection.provider_id,
+            providers,
             auto_route: cli.auto_route,
             api_format,
         })
+    }
+
+    pub async fn switch(&mut self, paths: &RuntimePaths, selection: Selection) -> Result<()> {
+        let api_format = selection
+            .providers
+            .iter()
+            .find(|p| p.id == selection.provider_id)
+            .context("Selected provider unavailable")?
+            .api_format
+            .clone();
+        let next =
+            ProviderManager::in_memory(selection.providers, paths.data_dir.join("providers.json"));
+        anyhow::ensure!(
+            next.resolve_selected(&selection.provider_id, &selection.model)
+                .is_some(),
+            "Selected model unavailable"
+        );
+        let mut manager = self.providers.lock().await;
+        self.store.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE conversations SET model = ?1, provider = ?2 WHERE id = ?3",
+                [&selection.model, &selection.provider_id, &self.id],
+            )
+        })??;
+        *manager = next;
+        self.model = selection.model;
+        self.provider_id = selection.provider_id;
+        self.api_format = api_format;
+        self.auto_route = false;
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -155,7 +187,7 @@ impl Session {
                 ));
             }
         }
-        self.store.append(&self.id, "user", prompt)?;
+        self.store.append(&self.id, "user", prompt).context("Persisting CLI user message")?;
         let mut events = self
             .engine
             .send_message_with_history(

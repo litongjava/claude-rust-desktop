@@ -34,7 +34,7 @@ fn save_preferences(paths: &RuntimePaths, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn provider_template(model: &str) -> ProviderConfig {
+pub(crate) fn provider_template(model: &str) -> ProviderConfig {
     let model = ApiConfig::resolve_model_alias(model);
     let metadata = ApiConfig::get_provider_metadata(&model);
     let anthropic = model.starts_with("claude");
@@ -147,15 +147,34 @@ pub fn select(
         "Model exists in several providers; select --provider or provider::model"
     );
     let metadata = ApiConfig::get_provider_metadata(&model);
-    let key_env = cli.api_key_env.as_deref().unwrap_or_else(|| {
-        if model.starts_with("deepseek") {
-            "DEEPSEEK_API_KEY"
-        } else {
-            metadata.map(|m| m.auth_env).unwrap_or("OPENAI_API_KEY")
-        }
-    });
+    let builtin_key_env = matching
+        .first()
+        .and_then(|index| providers[*index].builtin_id.as_deref())
+        .map(claude_core::native_engine::provider_runtime::credential_env);
+    let configured_key_env = matching
+        .first()
+        .and_then(|index| {
+            config
+                .providers
+                .iter()
+                .find(|p| p.id == providers[*index].id)
+        })
+        .and_then(|p| p.settings.get("apiKeyEnv"))
+        .and_then(Value::as_str);
+    let key_env = cli
+        .api_key_env
+        .as_deref()
+        .or(configured_key_env)
+        .or(builtin_key_env.as_deref())
+        .unwrap_or_else(|| {
+            if model.starts_with("deepseek") {
+                "DEEPSEEK_API_KEY"
+            } else {
+                metadata.map(|m| m.auth_env).unwrap_or("OPENAI_API_KEY")
+            }
+        });
     let key = std::env::var(key_env).ok().filter(|s| !s.is_empty());
-    if cli.api_key_env.is_some() {
+    if cli.api_key_env.is_some() || configured_key_env.is_some() {
         ensure!(
             key.is_some(),
             "API key environment variable {key_env} is empty or unset"
@@ -194,7 +213,7 @@ pub fn select(
         };
         p.builtin_id = None;
     }
-    ensure!(!p.api_key.trim().is_empty(), "No API key configured; set {key_env}, use --api-key-env, or configure a provider in Desktop");
+    ensure!(!p.api_key.trim().is_empty() || matches!(p.builtin_id.as_deref(),Some("amazon-bedrock"|"google-vertex")), "No API key configured; set {key_env}, use --api-key-env, or configure a provider in Desktop");
     if let Some(limit) = cli.max_tokens {
         p.models
             .iter_mut()

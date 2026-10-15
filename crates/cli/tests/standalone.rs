@@ -113,6 +113,25 @@ async fn execute(mut command: Command) -> Output {
         .unwrap()
 }
 
+#[tokio::test]
+async fn builtin_provider_and_shared_tools_run_without_node_on_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(temp.path().join("fixture.txt"),"native-only fixture").unwrap();
+    let (url, fixture, task) = server(Some("Read"), false).await;
+    let providers = json!([{"id":"builtin","name":"Built-in DeepSeek","base_url":format!("{url}/v1"),"api_key":"fixture-only-secret","api_format":"openai","builtin_id":"deepseek","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false,"max_tokens":8192,"api":"openai-completions"}]}]);
+    std::fs::write(data.join("providers.json"),providers.to_string()).unwrap();
+    let mut cli = command(&data,temp.path());
+    cli.env("PATH","").args(["--provider","builtin","--model","fixture-model","--api-key-env","CLAUDE_FIXTURE_KEY","--output-format","json","--permission-mode","accept-edits","query","-p","Read the fixture"]);
+    let output = execute(cli).await;
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output["result"].as_str().unwrap().contains("native-only fixture"));
+    assert_eq!(fixture.requests.lock().unwrap().len(),2);
+    task.abort();
+}
+
 fn query(data: &Path, project: &Path, url: &str) -> Command {
     let mut command = command(data, project);
     command.args([

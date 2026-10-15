@@ -148,7 +148,7 @@ impl OpenAIClient {
             let mut stream = super::provider_runtime::stream(provider, messages, system_prompt, tools, max_tokens).await?;
             let mut text = String::new();
             let mut thinking = String::new();
-            let mut calls = Vec::new();
+            let mut calls = std::collections::BTreeMap::<usize, Value>::new();
             let mut native = None;
             let mut usage = None;
             let mut finish = None;
@@ -161,7 +161,16 @@ impl OpenAIClient {
                 if let Some(part) = choice["delta"]["content"].as_str() { text.push_str(part); }
                 if let Some(part) = choice["delta"]["reasoning_content"].as_str() { thinking.push_str(part); }
                 if let Some(items) = choice["delta"]["tool_calls"].as_array() {
-                    for item in items { calls.push(serde_json::from_value(item.clone())?); }
+                    for item in items {
+                        let index = item["index"].as_u64().unwrap_or_default() as usize;
+                        let call = calls.entry(index).or_insert_with(|| json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
+                        if let Some(id) = item["id"].as_str() { call["id"] = json!(id); }
+                        for field in ["name", "arguments"] {
+                            if let Some(delta) = item["function"][field].as_str() {
+                                call["function"][field] = json!(format!("{}{}", call["function"][field].as_str().unwrap_or_default(), delta));
+                            }
+                        }
+                    }
                 }
                 if let Some(reason) = choice["finish_reason"].as_str() { finish = Some(reason.to_string()); }
                 if value.get("provider_content").is_some() { native = Some(value["provider_content"].clone()); }
@@ -169,7 +178,7 @@ impl OpenAIClient {
             }
             return Ok(OpenAIResponse { id: uuid::Uuid::new_v4().to_string(), object: "chat.completion".into(), created: 0, model: provider.model.id.clone(),
                 choices: vec![OpenAIChoice { index: 0, finish_reason: finish, message: OpenAIMessage { role: "assistant".into(), content: OpenAIContent::Text(text),
-                    tool_calls: if calls.is_empty() { None } else { Some(calls) }, tool_call_id: None,
+                    tool_calls: if calls.is_empty() { None } else { Some(calls.into_values().map(serde_json::from_value).collect::<std::result::Result<Vec<_>,_>>()?) }, tool_call_id: None,
                     reasoning_content: if thinking.is_empty() { None } else { Some(thinking) }, provider_content: native } }], usage });
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);

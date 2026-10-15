@@ -1,3 +1,4 @@
+mod interactive_config;
 mod args;
 mod migration;
 mod config;
@@ -262,18 +263,22 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         std::env::set_current_dir(workspace)?;
     }
+    let mut input = if single { None } else { Some(session::terminal_input()) };
     let selection = config::select(
         cli,
         &paths,
         resumed.as_ref().and_then(|s| s.model.as_deref()),
         resumed.as_ref().and_then(|s| s.provider.as_deref()),
-    )?;
-    let session = session::Session::open(cli, &paths, selection).await?;
-    let mut input = if single {
-        None
-    } else {
-        Some(session::terminal_input())
+    );
+    let selection = match selection {
+        Ok(selection) => selection,
+        Err(error) if !single => {
+            eprintln!("Provider setup required: {error:#}");
+            interactive_config::setup(&paths, input.as_mut().unwrap()).await?
+        },
+        Err(error) => return Err(error),
     };
+    let mut session = session::Session::open(cli, &paths, selection).await?;
     let result = async {
         if !single { eprintln!("Claude Rust {} — session {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.id); }
         if !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
@@ -284,11 +289,16 @@ async fn run(cli: &Cli) -> Result<()> {
                 line = input.as_mut().expect("interactive reader").recv() => match line { Some(line) => line, None => break },
                 _ = tokio::signal::ctrl_c() => break,
             };
+            match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
+                Ok(true) => continue,
+                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Ok(false) => {},
+            }
             match line.trim() {
                 "" => continue,
                 "/exit" | "exit" | "quit" | ".exit" | ":q" => break,
-                "/help" | "help" | ".help" | ":h" => eprintln!("/exit  /status  /history  /tools\nConfigure providers with `claude-code config`; resume with --resume ID."),
-                "/status" | "status" | ".status" => eprintln!("Session: {}\nProject: {}\nData: {}", session.id, std::env::current_dir()?.display(), paths.data_dir.display()),
+                "/help" | "help" | ".help" | ":h" => eprintln!("/exit  /status  /history  /tools\n/provider [ID|add|edit ID]  /model [ID]  /test\nSwitches preserve history; /test makes an isolated text request. Resume with --resume ID."),
+                "/status" | "status" | ".status" => { eprintln!("Session: {}\nProject: {}\nData: {}", session.id, std::env::current_dir()?.display(), paths.data_dir.display()); interactive_config::status(&session); },
                 "/history" | "history" | ".history" => println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
                 "/tools" | "tools" | ".tools" => for tool in claude_core::tools::get_tool_definitions() { eprintln!("{}: {}", tool.name, tool.description); },
                 line => if let Err(error) = session.turn(cli, line, &mut input).await { eprintln!("Error: {error:#}"); },
