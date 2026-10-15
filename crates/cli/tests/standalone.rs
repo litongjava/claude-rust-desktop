@@ -617,3 +617,38 @@ async fn compact_command_generates_summary_and_resume_uses_boundary() {
     assert_eq!(store.history(id).unwrap().len(), 5);
     task.abort();
 }
+
+
+#[tokio::test]
+async fn session_lifecycle_hooks_run_once_per_frontend_and_resume_context_reaches_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(temp.path().join("session-hook.cjs"), r#"const fs=require('fs');let text='';process.stdin.on('data',x=>text+=x);process.stdin.on('end',()=>{const v=JSON.parse(text);fs.appendFileSync('session-events.jsonl',JSON.stringify(v)+'\n');if(v.hook_event_name==='SessionStart')console.log('LIFECYCLE_CONTEXT:'+v.source);});"#).unwrap();
+    std::fs::write(data.join("settings.json"),json!({"hooks":{
+        "SessionStart":[{"matcher":"startup|resume","hooks":[{"type":"command","command":"node session-hook.cjs"}]}],
+        "SessionEnd":[{"matcher":"other","hooks":[{"type":"command","command":"node session-hook.cjs"}]}]
+    }}).to_string()).unwrap();
+    let (url,fixture,server)=server(None,false).await;
+    let mut cli=query(&data,temp.path(),&url);
+    cli.args(["query","-p","hello"]);
+    let output=execute(cli).await;
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let output:Value=serde_json::from_slice(&output.stdout).unwrap();
+    let session=output["session_id"].as_str().unwrap();
+    let mut cli=query(&data,temp.path(),&url);
+    cli.args(["--resume",session,"query","-p","continue"]);
+    let output=execute(cli).await;
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let events:Vec<Value>=std::fs::read_to_string(temp.path().join("session-events.jsonl")).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(events.len(),4);
+    assert_eq!(events[0]["source"],"startup");
+    assert_eq!(events[2]["source"],"resume");
+    assert_eq!(events[1]["hook_event_name"],"SessionEnd");
+    assert_eq!(events[3]["session_id"],session);
+    let requests=fixture.requests.lock().unwrap();
+    assert!(requests[0]["messages"][0]["content"].as_str().unwrap().contains("LIFECYCLE_CONTEXT:startup"));
+    assert!(requests[1]["messages"][0]["content"].as_str().unwrap().contains("LIFECYCLE_CONTEXT:resume"));
+    assert!(!requests[1]["messages"][0]["content"].as_str().unwrap().contains("LIFECYCLE_CONTEXT:startup"));
+    server.abort();
+}

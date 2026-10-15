@@ -14,11 +14,14 @@ use std::{
     },
 };
 use tokio::sync::{oneshot, Mutex};
+#[path = "sdk_permission_updates.rs"]
+mod permission_updates;
 
 #[derive(Default)]
 pub struct Permissions {
     pending: Mutex<HashMap<String, (Value, Option<String>, oneshot::Sender<Result<String>>)>>,
     closed: AtomicBool,
+    updates: Option<Arc<permission_updates::Updates>>,
 }
 impl Permissions {
     pub async fn ask(
@@ -129,19 +132,21 @@ impl Permissions {
                 response["error"]
             );
             let result = &response["response"];
-            ensure!(
-                result
-                    .get("updatedPermissions")
-                    .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
-                "SDK updatedPermissions is not supported; no permission was granted"
-            );
             match result["behavior"].as_str() {
                 Some("allow") => {
-                    if let Some(question) = question.as_deref() {
-                        return question_answer(&input, question, &result["updatedInput"]);
+                    let answer = if let Some(question) = question.as_deref() {
+                        question_answer(&input, question, &result["updatedInput"])?
+                    } else {
+                        ensure!(result.get("updatedInput").is_none_or(|v|v==&input),"SDK updatedInput differs from reviewed tool input; no permission was granted");
+                        "yes".into()
+                    };
+                    if let Some(updates) = result.get("updatedPermissions") {
+                        self.updates
+                            .as_ref()
+                            .context("SDK session permission updates unavailable")?
+                            .apply(updates)?;
                     }
-                    ensure!(result.get("updatedInput").is_none_or(|v|v==&input),"SDK updatedInput differs from reviewed tool input; no permission was granted");
-                    Ok("yes".into())
+                    Ok(answer)
                 }
                 Some("deny") if question.is_some() => bail!("SDK host declined the user question"),
                 Some("deny") => Ok("no".into()),
@@ -186,6 +191,41 @@ fn question_answer(input: &Value, question: &str, updated: &Value) -> Result<Str
 #[cfg(test)]
 mod question_tests {
     use super::*;
+    #[tokio::test]
+    async fn rewritten_input_cannot_apply_permission_updates() {
+        use claude_core::permissions::{
+            AuditLogger, PermissionContext, PermissionManager, PermissionMode, PermissionResult,
+        };
+        let manager = Arc::new(PermissionManager::new(Arc::new(AuditLogger::new(16))));
+        manager.set_mode(PermissionMode::AskPermissions);
+        let updates = Arc::new(permission_updates::Updates::new(
+            manager.clone(),
+            "one".into(),
+        ));
+        let permissions = Permissions {
+            updates: Some(updates),
+            ..Permissions::default()
+        };
+        let (tx, rx) = oneshot::channel();
+        permissions
+            .pending
+            .lock()
+            .await
+            .insert("request".into(), (json!({"path":"first"}), None, tx));
+        permissions.respond(&json!({"response":{"subtype":"success","request_id":"request","response":{"behavior":"allow","updatedInput":{"path":"second"},"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await.unwrap();
+        assert!(rx.await.unwrap().is_err());
+        let context = PermissionContext {
+            tool_name: "Write".into(),
+            tool_input: json!({"path":"first"}),
+            conversation_id: "one".into(),
+            user_id: None,
+            workspace_path: None,
+        };
+        assert!(matches!(
+            manager.check_permission(&context),
+            PermissionResult::RequiresConfirmation(_)
+        ));
+    }
     #[test]
     fn answer_requires_exact_question_and_unchanged_input() {
         let input =
@@ -269,7 +309,15 @@ async fn idle_control(session: &mut Session, frame: &Value) -> Result<()> {
     response(&frame["request_id"], result)
 }
 pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
-    let permissions = Arc::new(Permissions::default());
+    let updates = Arc::new(permission_updates::Updates::new(
+        session.permissions.clone(),
+        session.id.clone(),
+    ));
+    let _cleanup = permission_updates::Cleanup(updates.clone());
+    let permissions = Arc::new(Permissions {
+        updates: Some(updates),
+        ..Permissions::default()
+    });
     session.sdk_permissions = Some(permissions.clone());
     let mut frames = crate::sdk_input::stdin();
     let mut queue = VecDeque::<UserMessage>::new();

@@ -480,6 +480,16 @@ pub enum SkillsCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommands {
+    /// Stop an idle persistent worker without opening its session.
+    ShutdownWorker { id: String },
+    /// Request cancellation of one task owned by this saved session.
+    StopTask { id: String, task_id: String },
+    /// Restore trust for one saved session; explicitly list every project root.
+    Trust {
+        id: String,
+        #[arg(long = "folder", required = true)]
+        folders: Vec<PathBuf>,
+    },
     ImportLegacy {source:PathBuf,#[arg(long)] preview:bool},
     List,
     Show { id: String },

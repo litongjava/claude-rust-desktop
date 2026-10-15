@@ -340,6 +340,12 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     let session = store
         .create(&workspace, "fixture-one", "cli-runtime")
         .unwrap();
+    let hook_service = claude_core::services::ServiceContext {
+        paths: paths.clone(), db: store.db.clone(), credentials: Arc::new(claude_core::services::EnvironmentCredentials),
+    };
+    std::fs::write(workspace.join("lifecycle.cjs"), "require('fs').appendFileSync('lifecycle-count','start\\n'); console.log('WORKER_HOOK_CONTEXT');").unwrap();
+    std::fs::write(paths.data_dir.join("settings.json"), json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node lifecycle.cjs"}]}]}}).to_string()).unwrap();
+    claude_core::services::session_hooks::start(&hook_service, &workspace, &session, "startup", "fixture-one").await.unwrap();
     let marker = temp.path().join("starts.txt");
     let script = temp.path().join("mcp.cjs");
     std::fs::write(&script,r#"require('fs').appendFileSync(process.env.START_MARKER,'start\n');require('readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id!==undefined)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'fixture',version:'1'},tools:[],resources:[]}})+'\n');});"#).unwrap();
@@ -386,6 +392,8 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     }
     {
         let requests = requests.lock().unwrap();
+        assert_eq!(std::fs::read_to_string(workspace.join("lifecycle-count")).unwrap(), "start\n");
+        assert!(requests[0]["messages"][0]["content"].as_str().unwrap().contains("WORKER_HOOK_CONTEXT"));
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[2]["model"], "fixture-two");
         assert_eq!(requests[2]["max_tokens"], 96);

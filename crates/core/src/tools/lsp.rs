@@ -713,6 +713,22 @@ async fn start_server(
 mod tests {
     use super::*;
 
+    // Passive feedback deliberately skips busy pool locks and waits only a few
+    // milliseconds for push notifications. Synchronize on the observable
+    // diagnostic, not scheduler timing, while retaining a hard failure bound.
+    async fn await_feedback(cwd: &str, file: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(value) = passive_feedback(cwd, file).await {
+                    return value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Approved server did not publish expected diagnostics within 5 seconds")
+    }
+
     #[tokio::test]
     async fn passive_feedback_reuses_approved_server_versions_deduplicates_and_clears() {
         let dir = tempfile::tempdir().unwrap();
@@ -734,23 +750,32 @@ mod tests {
    const version=m.params.textDocument.version;
    const diagnostic={message:'新的诊断😀',severity:1,range:{start:{line:0,character:4},end:{line:0,character:6}}};
    send({method:'textDocument/publishDiagnostics',params:{uri,version:version-1,diagnostics:[{message:'STALE'}]}});
-   send({method:'textDocument/publishDiagnostics',params:{uri,version,diagnostics:m.params.contentChanges[0].text==='fixed'?[]:[diagnostic]}});
+   const result={method:'textDocument/publishDiagnostics',params:{uri,version,diagnostics:m.params.contentChanges[0].text==='fixed'?[]:[diagnostic]}};
+   if(m.params.contentChanges[0].text.startsWith('changed')){
+     // Hold the current-version notification until the test releases it, so
+     // the first passive deadline deterministically sees only stale data.
+     let released=false;
+     const release=()=>{if(!released && fs.existsSync('release-diagnostic')){released=true;watcher.close();send(result);}};
+     const watcher=fs.watch('.',release); release();
+   } else { send(result); }
    continue;
  }
  if(m.method==='exit')"#);
         let input = json!({"server":"node","args":["-e",script],"filePath":"test.ts","operation":"hover","line":1,"character":1,"timeout_secs":10});
         execute(input.clone(), cwd).await.unwrap();
-        let first = passive_feedback(cwd, "test.ts").await.unwrap();
+        let first = await_feedback(cwd, "test.ts").await;
         assert_eq!(first["diagnostics"][0]["message"], "fixture diagnostic");
         assert!(passive_feedback(cwd, "test.ts").await.is_none());
         std::fs::write(&path, "changed 中文😀").unwrap();
-        let changed = passive_feedback(cwd, "test.ts").await.unwrap();
+        assert!(passive_feedback(cwd, "test.ts").await.is_none());
+        std::fs::write(dir.path().join("release-diagnostic"), "release").unwrap();
+        let changed = await_feedback(cwd, "test.ts").await;
         assert_eq!(changed["diagnostics"][0]["message"], "新的诊断😀");
         assert_eq!(changed["diagnostics"][0]["range"]["start"]["character"], 4);
         assert!(!changed.to_string().contains("STALE"));
         assert!(passive_feedback(cwd, "test.ts").await.is_none());
         std::fs::write(&path, "fixed").unwrap();
-        let cleared = passive_feedback(cwd, "test.ts").await.unwrap();
+        let cleared = await_feedback(cwd, "test.ts").await;
         assert_eq!(cleared["cleared"], true);
         assert!(passive_feedback(cwd, "test.ts").await.is_none());
         let mut close = input;
@@ -769,29 +794,41 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_partial_frame_preserves_unicode_message() {
-        let (mut sender, receiver) = tokio::io::duplex(4096);
-        let mut reader = BufReader::new(receiver);
-        let mut pending = Vec::new();
-        let value = json!({"result":"中文😀"});
+        let value = json!({"result":"\u{4e2d}\u{6587}\u{1f600}"});
         let body = serde_json::to_vec(&value).unwrap();
         let frame = [
             format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
             body,
         ]
         .concat();
-        let split = frame.len() - 3;
-        sender.write_all(&frame[..split]).await.unwrap();
-        assert!(tokio::time::timeout(
-            Duration::from_millis(5),
-            receive_buffered(&mut reader, &mut pending)
-        )
-        .await
-        .is_err());
-        sender.write_all(&frame[split..]).await.unwrap();
-        assert_eq!(
-            receive_buffered(&mut reader, &mut pending).await.unwrap(),
-            value
-        );
+        // Cancel inside every header/body position, including a split UTF-8
+        // codepoint, then verify the next coalesced frame remains aligned.
+        for split in 1..frame.len() {
+            let (mut sender, receiver) = tokio::io::duplex(4096);
+            let mut reader = BufReader::new(receiver);
+            let mut pending = Vec::new();
+            sender.write_all(&frame[..split]).await.unwrap();
+            let mut read = Box::pin(receive_buffered(&mut reader, &mut pending));
+            // Poll until Pending after consuming the available prefix; no clock
+            // delay is required to establish that cancellation occurs mid-frame.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(read);
+            assert_eq!(pending, frame[..split]);
+            sender.write_all(&frame[split..]).await.unwrap();
+            sender.write_all(&frame).await.unwrap();
+            assert_eq!(
+                receive_buffered(&mut reader, &mut pending).await.unwrap(),
+                value
+            );
+            assert_eq!(
+                receive_buffered(&mut reader, &mut pending).await.unwrap(),
+                value
+            );
+        }
     }
 
     // The mock enforces initialization and document synchronization, and records the

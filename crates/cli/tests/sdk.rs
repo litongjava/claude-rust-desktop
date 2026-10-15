@@ -633,6 +633,22 @@ async fn controls_replay_and_live_permission_decisions_use_actual_engine() {
 }
 
 #[tokio::test]
+async fn session_permission_updates_authorize_later_turn_without_another_prompt() {
+    let server = Server::start(false, Mode::Approval).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+    client.send(user("Write a file")).await;
+    let permission = client.frame("control_request").await;
+    client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":"allow","updatedInput":permission["request"]["input"],"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await;
+    assert_eq!(client.result().await["is_error"], false);
+    std::fs::remove_file(root.path().join("approval.txt")).unwrap();
+    client.send(user("Write the file again using the session grant")).await;
+    assert_eq!(client.result().await["is_error"], false);
+    assert_eq!(std::fs::read_to_string(root.path().join("approval.txt")).unwrap(), "ACTUAL_APPROVED_WRITE");
+    assert!(client.finish().await.0.success());
+}
+
+#[tokio::test]
 async fn interrupt_cancels_pending_approval_and_session_accepts_next_message() {
     let server = Server::start(false, Mode::Approval).await;
     let root = tempfile::tempdir().unwrap();

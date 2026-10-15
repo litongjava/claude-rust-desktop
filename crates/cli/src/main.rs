@@ -22,6 +22,7 @@ mod compaction;
 mod skill_commands;
 mod extended_commands;
 mod session_commands;
+mod session_trust;
 mod display_commands;
 mod background_commands;
 mod batch_commands;
@@ -176,11 +177,19 @@ async fn run(cli: &Cli) -> Result<()> {
         Some(Commands::Config { action }) => return config::run(&paths, action),
         Some(Commands::Mcp { action }) => return mcp(&paths, action).await,
         Some(Commands::Sessions { action }) => {
+            if let SessionCommands::ShutdownWorker { id } = action {
+                return session_trust::shutdown_worker(&paths, id).await;
+            }
+            if let SessionCommands::StopTask { id, task_id } = action {
+                return session_trust::stop_task(&paths, id, task_id).await;
+            }
             if let SessionCommands::Compact { id, instructions } = action {
                 return compaction::run(cli, &paths, id, instructions).await;
             }
             let db = paths.open_database()?;
             let value = match action {
+                SessionCommands::ShutdownWorker { .. } | SessionCommands::StopTask { .. } => unreachable!(),
+                SessionCommands::Trust { id, folders } => serde_json::to_value(claude_core::services::session_trust::repair(&db, &paths.data_dir, id, folders).map_err(|error| session_trust::repair_error(&paths, id, error))?)?,
                 SessionCommands::Compact { .. } => unreachable!(),
                 SessionCommands::ImportLegacy {source,preview} => serde_json::to_value(claude_core::services::session_import::import(&services::context(&paths)?,source,&std::env::current_dir()?,*preview)?)?,
                 SessionCommands::List => serde_json::to_value(
@@ -299,7 +308,8 @@ async fn run(cli: &Cli) -> Result<()> {
         "A prompt or piped stdin is required"
     );
     let resumed = if let Some(id) = &cli.resume {
-        Some(SessionStore::new(paths.open_database()?).resume(id)?)
+        let store = SessionStore::new(paths.open_database()?);
+        Some(store.resume(id).map_err(|error| session_trust::diagnose(&store.db, &paths, id, error))?)
     } else if cli.continue_session {
         Some(SessionStore::new(paths.open_database()?).latest(&std::env::current_dir()?)?
             .context("No resumable Code session in this directory")?)
@@ -345,6 +355,7 @@ async fn run(cli: &Cli) -> Result<()> {
     startup_options::apply(cli, &mut session).await?;
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     let result = async {
+        session.start_hooks(if resumed.is_some() { "resume" } else { "startup" }).await?;
         if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
         if !sdk_stream && !prompt.trim().is_empty() {
             if !single {
@@ -498,6 +509,7 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         Ok(())
     }.await;
+    session.end_hooks(if result.is_ok() && !single { "prompt_input_exit" } else { "other" }).await;
     let shutdown = session.close().await;
     // A completed single turn already wrote its terminal result. Shutdown may
     // still fail, but stdout must not acquire a second result record.

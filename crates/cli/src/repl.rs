@@ -82,7 +82,7 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
         "/clear" => {
             ensure!(argument.trim().is_empty(), "Usage: /clear");
             let previous = session.id.clone();
-            session.clear()?;
+            session.clear().await?;
             eprintln!(
                 "New session: {}. Previous history retained: {previous}",
                 session.id

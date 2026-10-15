@@ -12,6 +12,22 @@ mod notifications;
 pub use notifications::collect_completed;
 tokio::task_local! { static CONTEXT: Option<(PathBuf, String)>; }
 
+/// Shared status presentation without loading process logs.
+pub fn task_status(root: &Path, session: &str, task: &Value) -> Result<String> {
+    let session = uuid::Uuid::parse_str(session)?.to_string();
+    let id = uuid::Uuid::parse_str(task["id"].as_str().context("Task ID missing")?)?.to_string();
+    let fresh = std::fs::metadata(root.join("shell-tasks").join(session).join(id).join("heartbeat"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(10));
+    Ok(if task["status"] == "running" && !fresh {
+        "unresponsive".into()
+    } else {
+        task["status"].as_str().unwrap_or("unknown").to_owned()
+    })
+}
+
 pub(crate) async fn scope<F: Future>(context: Option<(PathBuf, String)>, future: F) -> F::Output {
     CONTEXT.scope(context, future).await
 }
@@ -145,16 +161,7 @@ pub(super) fn control(
         .join("shell-tasks")
         .join(session.to_string())
         .join(id.to_string());
-    let fresh = std::fs::metadata(directory.join("heartbeat"))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|time| time.elapsed().ok())
-        .is_some_and(|age| age < Duration::from_secs(10));
-    let status = if task["status"] == "running" && !fresh {
-        json!("unresponsive")
-    } else {
-        task["status"].clone()
-    };
+    let status = json!(task_status(root, &session.to_string(), &task)?);
     if name == "TaskStop" {
         let active = task["status"] == "running";
         if active {

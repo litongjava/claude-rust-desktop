@@ -44,6 +44,7 @@ pub struct Session {
     pub(crate) auto_route: bool,
     providers: Arc<Mutex<ProviderManager>>,
     pub(crate) workspace: std::path::PathBuf,
+    lifecycle_owned: bool,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
 }
 
@@ -105,7 +106,7 @@ impl Session {
         let db = paths.open_database()?;
         let store = SessionStore::new(db.clone());
         let id = if let Some(id) = resumed_id {
-            store.resume(id)?;
+            store.resume(id).map_err(|error| crate::session_trust::diagnose(&store.db, paths, id, error))?;
             id.to_owned()
         } else {
             store.create_with_id(
@@ -132,7 +133,7 @@ impl Session {
                 *existing = model;
             }
         }
-        let workspace = store.workspace(&id, &paths.data_dir.join("workspaces"))?;
+        let workspace = store.workspace(&id, &paths.data_dir.join("workspaces")).map_err(|error| crate::session_trust::diagnose(&store.db, paths, &id, error))?;
         store.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE conversations SET model = ?1, provider = ?2 WHERE id = ?3",
@@ -192,6 +193,7 @@ impl Session {
             auto_route,
             sdk_permissions: None,
             sdk_content: None,
+            lifecycle_owned: false,
             api_format,
         })
     }
@@ -226,27 +228,87 @@ impl Session {
         Ok(())
     }
 
-    pub fn clear(&mut self) -> Result<String> {
+    pub async fn start_hooks(&mut self, source: &str) -> Result<()> {
+        use claude_core::services::session_hooks;
+        if self.lifecycle_owned {
+            return Ok(());
+        }
+        let context = self.hook_service_context();
+        if !session_hooks::owns_lifecycle(&context, &self.id)? {
+            return Ok(());
+        }
+        self.lifecycle_owned = true;
+        let outcome = tokio::select! {
+            result = session_hooks::start(&context, &self.workspace, &self.id, source, &self.model) => result,
+            _ = tokio::signal::ctrl_c() => anyhow::bail!("SessionStart hooks interrupted"),
+            _ = claude_core::services::background_sessions::wait_for_cancellation() => anyhow::bail!("SessionStart hooks cancelled"),
+        };
+        match outcome {
+            Ok(warnings) => {
+                for warning in warnings {
+                    eprintln!("Hook: {warning}");
+                }
+            }
+            Err(error) => eprintln!("SessionStart hook: {error:#}"),
+        }
+        Ok(())
+    }
+
+    pub async fn end_hooks(&mut self, reason: &str) {
+        if !std::mem::take(&mut self.lifecycle_owned) {
+            return;
+        }
+        let context = self.hook_service_context();
+        for warning in claude_core::services::session_hooks::end(
+            &context,
+            &self.workspace,
+            &self.id,
+            reason,
+            claude_core::services::session_hooks::end_timeout(),
+        )
+        .await
+        {
+            eprintln!("Hook: {warning}");
+        }
+    }
+
+    fn hook_service_context(&self) -> claude_core::services::ServiceContext {
+        claude_core::services::ServiceContext {
+            paths: self.paths.clone(),
+            db: self.store.db.clone(),
+            credentials: Arc::new(claude_core::services::EnvironmentCredentials),
+        }
+    }
+
+    pub async fn clear(&mut self) -> Result<String> {
         let id = self.store.clear(&self.id)?;
         crate::session_commands::copy_settings(&self.store.db, &self.id, &id)?;
+        let lifecycle_owned = self.lifecycle_owned;
+        self.end_hooks("clear").await;
         self.id = id.clone();
+        if lifecycle_owned {
+            self.start_hooks("clear").await?;
+        }
         Ok(id)
     }
 
     /// Validate the project and provider before replacing the current session.
     pub async fn resume_saved(&mut self, paths: &RuntimePaths, id: &str) -> Result<()> {
-        let saved = self.store.resume(id)?;
-        let workspace = self.store.workspace(id, &paths.data_dir.join("workspaces"))?;
+        let saved = self.store.resume(id).map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
+        let workspace = self.store.workspace(id, &paths.data_dir.join("workspaces")).map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
         let model = saved.model.context("Saved session has no model")?;
         let provider_id = saved.provider.context("Saved session has no provider")?;
         let resolved = self.providers.lock().await.resolve_selected(&provider_id, &model)
             .context("Saved provider/model is unavailable; current session retained")?;
+        let lifecycle_owned = self.lifecycle_owned;
+        self.end_hooks("other").await;
         self.workspace = workspace;
         self.api_format = resolved.provider.api_format;
         self.model = model;
         self.provider_id = provider_id;
         self.auto_route = false;
         self.id = id.to_owned();
+        if lifecycle_owned { self.start_hooks("resume").await?; }
         Ok(())
     }
 
@@ -357,6 +419,8 @@ impl Session {
         let mut history = self.store.model_history(&self.id, &self.api_format)?;
         history.push(json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))}));
         let mut system = cli.system_prompt_text()?;
+        let hook_context = claude_core::services::session_hooks::context(&self.hook_service_context(), &self.id)?;
+        if !hook_context.is_empty() { system.push_str("\nSessionStart hook context:\n"); system.push_str(&hook_context); system.push('\n'); }
         system.push_str(&crate::display_commands::style_prompt(self)?);
         system.push_str(&crate::ide_commands::selection_prompt(self).await?);
         if let Some(goal) = crate::session_commands::goal_prompt(self)? {

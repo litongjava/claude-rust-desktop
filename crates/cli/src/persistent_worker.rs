@@ -70,6 +70,7 @@ pub async fn run_from_env() -> Result<bool> {
                     Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
                     Request::Shutdown=>{
                         if active.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker has an active turn; cancel or detach it explicitly")).await;}
+                        else if claude_core::tools::background_shell::has_active() {let _=service::reply(stream,&Reply::error("Session worker owns running background shell tasks; stop them explicitly before shutdown")).await;}
                         else {let _=service::reply(stream,&Reply::ok(None)).await;break;}
                     },
                     Request::Submit{id,prompt,arguments,environment}=>{

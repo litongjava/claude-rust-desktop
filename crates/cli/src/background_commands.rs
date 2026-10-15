@@ -85,12 +85,20 @@ pub async fn handle(
                         .into_iter()
                         .filter(|job| workflow_matches(&job.status, filter))
                         .collect::<Vec<_>>();
+                    let shells = if command == "/tasks" {
+                        managed_shell_records(paths, &session.id)?
+                            .into_iter()
+                            .filter(|task| workflow_matches(task["status"].as_str().unwrap_or("unknown"), filter))
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                     if command == "/workflows" {
                         eprintln!(
                             "Background workflows: single-task agent runs started by this session."
                         );
                     }
-                    if jobs.is_empty() {
+                    if jobs.is_empty() && shells.is_empty() {
                         eprintln!("No background processes started by this session.");
                     }
                     for job in jobs {
@@ -101,6 +109,14 @@ pub async fn handle(
                         if let Some(question) = background_sessions::pending_question(&paths.data_dir, &job.id, &session.id)? {
                             eprintln!("  awaiting {}: {} (use /tasks pending {})", question.kind, question.request_id, job.id);
                         }
+                    }
+                    for task in shells {
+                        eprintln!("{}  {}  {}\n  shell · /tasks show {} · /tasks cancel {}",
+                            task["id"].as_str().unwrap_or("?"),
+                            task["status"].as_str().unwrap_or("unknown"),
+                            safe_output(task["subject"].as_str().unwrap_or("Background shell")),
+                            task["id"].as_str().unwrap_or("?"),
+                            task["id"].as_str().unwrap_or("?"));
                     }
                 }
                 "shutdown-worker" => {
@@ -134,6 +150,16 @@ pub async fn handle(
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("Usage: /tasks show ID"))?;
                     ensure!(parts.next().is_none(), "Usage: /tasks show ID");
+                    if command == "/tasks" && managed_shell_records(paths, &session.id)?.iter().any(|task| task["id"] == id) {
+                        let output = shell_control(paths, &session.id, id, false).await?;
+                        eprintln!("Shell {id} · {}", output["status"].as_str().unwrap_or("unknown"));
+                        for stream in ["stdout", "stderr"] {
+                            if let Some(text) = output[stream].as_str().filter(|text| !text.is_empty()) {
+                                println!("{}", safe_output(text));
+                            }
+                        }
+                        return Ok(true);
+                    }
                     let job = background_sessions::get(&paths.data_dir, id)?;
                     ensure!(
                         job.parent_session_id == session.id,
@@ -153,6 +179,12 @@ pub async fn handle(
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("Usage: /tasks cancel ID"))?;
                     ensure!(parts.next().is_none(), "Usage: /tasks cancel ID");
+                    if command == "/tasks" && managed_shell_records(paths, &session.id)?.iter().any(|task| task["id"] == id) {
+                        let output = shell_control(paths, &session.id, id, true).await?;
+                        let action = if output["cancellation_requested"] == true { "Cancellation requested" } else { "No cancellation needed" };
+                        eprintln!("{action} for shell {id} (reported {}). Use /tasks show {id} for confirmed status and output.", output["status"].as_str().unwrap_or("unknown"));
+                        return Ok(true);
+                    }
                     ensure!(
                         background_sessions::get(&paths.data_dir, id)?.parent_session_id
                             == session.id,
@@ -169,6 +201,30 @@ pub async fn handle(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+fn safe_output(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t')).collect()
+}
+
+fn managed_shell_records(paths: &RuntimePaths, session: &str) -> Result<Vec<serde_json::Value>> {
+    let value = claude_core::tools::tasks::execute_for_session(
+        "TaskList", serde_json::json!({}), &paths.data_dir, session,
+    )?;
+    value["tasks"].as_array().into_iter().flatten()
+        .filter(|task| task["metadata"]["managed_shell"] == true)
+        .cloned().map(|mut task| {
+            task["status"] = serde_json::json!(claude_core::tools::background_shell::task_status(&paths.data_dir, session, &task)?);
+            Ok(task)
+        }).collect()
+}
+
+async fn shell_control(paths: &RuntimePaths, session: &str, id: &str, stop: bool) -> Result<serde_json::Value> {
+    claude_core::tools::tasks::execute_for_session_async(
+        if stop { "TaskStop" } else { "TaskOutput" },
+        if stop { serde_json::json!({"task_id":id}) } else { serde_json::json!({"task_id":id,"block":false}) },
+        &paths.data_dir, session,
+    ).await
 }
 
 pub(crate) fn worker_environment(

@@ -49,16 +49,26 @@ pub struct PermissionManager {
     confirmations: Mutex<HashMap<String, bool>>,
     mode: Mutex<PermissionMode>,
     session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
+    runtime_rules: Mutex<HashMap<String, Vec<HashMap<String, PermissionAction>>>>,
     always_allow_checker: Mutex<Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>>,
 }
 
 impl PermissionManager {
+    /// Ephemeral host rules, independent of persisted session configuration.
+    pub fn set_runtime_rules(&self, conversation: &str, rules: Vec<HashMap<String, PermissionAction>>) {
+        self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation.to_owned(), rules);
+    }
+    pub fn clear_runtime_rules(&self, conversation: &str) {
+        self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner()).remove(conversation);
+    }
     pub fn set_session_rules(&self, conversation: &str, rules: HashMap<String, PermissionAction>) {
         self.session_rules.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation.to_owned(), rules);
     }
     pub(crate) fn inherit_session_rules(&self, parent: &str, child: &str) {
         let mut sessions = self.session_rules.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rules) = sessions.get(parent).cloned() { sessions.insert(child.to_owned(), rules); }
+        let mut runtime = self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rules) = runtime.get(parent).cloned() { runtime.insert(child.to_owned(), rules); }
     }
 
     /// Independent mutable authority for a delegated session; read-only policy
@@ -73,6 +83,7 @@ impl PermissionManager {
             confirmations: Mutex::new(HashMap::new()),
             mode: Mutex::new(self.get_mode()),
             session_rules: Mutex::new(HashMap::from([(child.to_owned(), rules)])),
+            runtime_rules: Mutex::new(HashMap::from([(child.to_owned(), self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner()).get(parent).cloned().unwrap_or_default())])),
             always_allow_checker: Mutex::new(self.always_allow_checker.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
@@ -85,6 +96,7 @@ impl PermissionManager {
             confirmations: Mutex::new(HashMap::new()),
             mode: Mutex::new(PermissionMode::default()),
             session_rules: Mutex::new(HashMap::new()),
+            runtime_rules: Mutex::new(HashMap::new()),
             always_allow_checker: Mutex::new(None),
         };
         manager.load_default_rules();
@@ -164,6 +176,12 @@ impl PermissionManager {
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
         let explicit = self.session_rules.lock().unwrap_or_else(|e| e.into_inner())
             .get(&context.conversation_id).and_then(|rules| super::patterns::matching_action(rules, context));
+        let runtime = self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner());
+        let explicit = runtime.get(&context.conversation_id).into_iter().flatten()
+            .filter_map(|rules| super::patterns::matching_action(rules, context))
+            .chain(explicit)
+            .max_by_key(|action| match action { PermissionAction::Deny => 3, PermissionAction::Confirm => 2, PermissionAction::Allow => 1 });
+        drop(runtime);
         if explicit == Some(PermissionAction::Deny) {
             return PermissionResult::Denied("Explicit session tool deny rule".into());
         }
@@ -401,6 +419,20 @@ pub type PermissionManagerRef = Arc<PermissionManager>;
 #[cfg(test)]
 mod session_rule_tests {
     use super::*;
+
+    #[test]
+    fn runtime_rules_fork_independently_and_preserve_plan_mode() {
+        let manager = PermissionManager::new(Arc::new(super::super::AuditLogger::new(16)));
+        manager.set_mode(PermissionMode::AskPermissions);
+        manager.set_runtime_rules("parent", vec![HashMap::from([("Write".into(), PermissionAction::Allow)])]);
+        let child = manager.fork_session("parent", "child");
+        manager.clear_runtime_rules("parent");
+        let context = PermissionContext { tool_name:"Write".into(), tool_input:serde_json::json!({"path":"test"}), conversation_id:"child".into(), user_id:None, workspace_path:None };
+        assert_eq!(child.check_permission(&context), PermissionResult::Granted);
+        child.set_mode(PermissionMode::PlanMode);
+        assert!(matches!(child.check_permission(&context), PermissionResult::Denied(_)));
+        assert!(matches!(manager.check_permission(&PermissionContext { conversation_id:"parent".into(), ..context }), PermissionResult::RequiresConfirmation(_)));
+    }
 
     #[test]
     fn pattern_rules_enforce_denies_and_complex_shell_confirmation() {

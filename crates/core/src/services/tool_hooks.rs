@@ -24,6 +24,8 @@ pub enum HookEvent {
     Stop,
     WorktreeCreate,
     WorktreeRemove,
+    SessionStart,
+    SessionEnd,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -34,6 +36,8 @@ impl HookEvent {
             Self::Stop => "Stop",
             Self::WorktreeCreate => "WorktreeCreate",
             Self::WorktreeRemove => "WorktreeRemove",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
         }
     }
 }
@@ -140,6 +144,8 @@ impl HookRunner {
                     "Stop" => HookEvent::Stop,
                     "WorktreeCreate" => HookEvent::WorktreeCreate,
                     "WorktreeRemove" => HookEvent::WorktreeRemove,
+                    "SessionStart" => HookEvent::SessionStart,
+                    "SessionEnd" => HookEvent::SessionEnd,
                     _ => continue,
                 };
                 for group in groups {
@@ -228,20 +234,39 @@ impl HookRunner {
         input.insert("session_id".into(), json!(session_id));
         input.insert("cwd".into(), json!(self.workspace));
         input.insert("hook_event_name".into(), json!(event.name()));
+        let lifecycle = matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd);
+        let match_key = match event {
+            HookEvent::SessionStart => "source",
+            HookEvent::SessionEnd => "reason",
+            _ => "tool_name",
+        };
         let name = input
-            .get("tool_name")
+            .get(match_key)
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
         let mut result = HookOutcome::default();
         for hook in self.hooks.iter().filter(|h| h.event == event) {
-            if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
+            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse))
                 && !matches_tool(&hook.matcher, &name)?
             {
                 continue;
             }
-            let output = execute(hook, &self.workspace, &Value::Object(input.clone())).await?;
-            let outcome = parse_output(event, output.0, &output.1, &output.2)?;
+            let outcome = async {
+                let output = execute(hook, &self.workspace, &Value::Object(input.clone())).await?;
+                parse_output(event, output.0, &output.1, &output.2)
+            }
+            .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) if lifecycle => {
+                    result
+                        .warnings
+                        .push(format!("{} hook: {error:#}", event.name()));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             result.additional_context.extend(outcome.additional_context);
             result.warnings.extend(outcome.warnings);
             result.ask_permission |= outcome.ask_permission;
@@ -249,6 +274,10 @@ impl HookRunner {
             if let Some(updated) = outcome.updated_input {
                 input.insert("tool_input".into(), updated.clone());
                 result.updated_input = Some(updated);
+            }
+            if outcome.blocked && lifecycle {
+                result.warnings.push(outcome.reason);
+                continue;
             }
             if outcome.blocked {
                 result.blocked = true;
@@ -286,7 +315,7 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     if !output.starts_with('{') {
-        if event == HookEvent::UserPromptSubmit {
+        if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart) {
             result.additional_context.push(output.into());
         }
         return Ok(result);

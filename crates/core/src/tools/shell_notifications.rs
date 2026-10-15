@@ -45,7 +45,7 @@ pub fn collect_completed(root: &Path, session: &str) -> Result<Vec<String>> {
             .filter(|ch| !ch.is_control())
             .take(160)
             .collect();
-        notices.push(format!("Background shell {status}: {title} ({id}). Output: /tasks records or TaskOutput(task_id=\"{id}\", block=false)."));
+        notices.push(format!("Background shell {status}: {title}\n  /tasks show {id}"));
     }
     tx.commit()?;
     Ok(notices)
