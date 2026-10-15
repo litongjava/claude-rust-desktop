@@ -74,7 +74,8 @@ pub async fn handle(
             );
             if argument.is_empty() && session.permission_mode() != "plan" {
                 session.set_permission_mode("plan").await?;
-                eprintln!("Plan mode enabled. Describe the task; Claude will submit a plan for approval before implementation.");
+                let path = claude_core::services::plans::path(&paths.data_dir, &session.id)?;
+                eprintln!("Plan mode enabled. Plan file: {}. Claude will submit it for approval before implementation.", path.display());
             } else {
                 let path = claude_core::services::plans::path(&paths.data_dir, &session.id)?;
                 let plan = claude_core::services::plans::read(&paths.data_dir, &session.id)?;
@@ -85,7 +86,7 @@ pub async fn handle(
                 } else if let Some(plan) = plan {
                     println!("Current Plan\n{}\n\n{plan}", path.display());
                 } else {
-                    eprintln!("No plan written yet. Describe the task in plan mode first.");
+                    eprintln!("No plan written yet. Plan file: {}. Describe the task in plan mode first.", path.display());
                 }
             }
         }

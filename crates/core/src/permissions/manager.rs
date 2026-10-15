@@ -174,6 +174,15 @@ impl PermissionManager {
     }
 
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
+        self.check_permission_inner(context, false)
+    }
+
+    /// Called only after the engine verifies the trusted session plan path.
+    pub(crate) fn check_plan_document_permission(&self, context: &PermissionContext) -> PermissionResult {
+        self.check_permission_inner(context, true)
+    }
+
+    fn check_permission_inner(&self, context: &PermissionContext, plan_document: bool) -> PermissionResult {
         let explicit = self.session_rules.lock().unwrap_or_else(|e| e.into_inner())
             .get(&context.conversation_id).and_then(|rules| super::patterns::matching_action(rules, context));
         let runtime = self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner());
@@ -186,7 +195,7 @@ impl PermissionManager {
             return PermissionResult::Denied("Explicit session tool deny rule".into());
         }
         if explicit == Some(PermissionAction::Confirm)
-            && (self.get_mode() != PermissionMode::PlanMode || Self::is_read_only_tool(&context.tool_name))
+            && (self.get_mode() != PermissionMode::PlanMode || Self::is_read_only_tool(&context.tool_name) || plan_document)
         {
             return self.request_confirmation(context);
         }
@@ -213,7 +222,7 @@ impl PermissionManager {
 
         // Plan mode: only read-only operations allowed
         if mode == PermissionMode::PlanMode {
-            if read_only {
+            if read_only || plan_document {
                 tracing::info!(module = "Permission", "Plan mode: {} auto-approved (read-only)", context.tool_name);
                 self.audit_logger.log(
                     AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)

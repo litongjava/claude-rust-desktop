@@ -1,10 +1,17 @@
 //! Background CLI sessions run in an independent supervisor process.
 use crate::{args::Cli, session::Session};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use claude_core::{
     runtime::RuntimePaths,
     services::background_sessions::{self, Launch},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    NotHandled,
+    Handled,
+    Exit,
+}
 
 pub async fn handle(
     cli: &Cli,
@@ -13,7 +20,7 @@ pub async fn handle(
     paths: &RuntimePaths,
     session: &mut Session,
     input: &mut Option<crate::terminal::input::TerminalInput>,
-) -> Result<bool> {
+) -> Result<Outcome> {
     match command {
         "/btw" => {
             ensure!(!argument.trim().is_empty(), "Usage: /btw QUESTION");
@@ -26,19 +33,30 @@ pub async fn handle(
         }
         "/fork" | "/subtask" | "/background" => {
             let prompt = argument.trim();
-            ensure!(command == "/fork" || !prompt.is_empty(),
-                "Usage: {command} PROMPT. During a running foreground turn, use /background or Ctrl+B without a prompt to detach.");
-            // An empty fork is still a useful persistent copy, but is deliberately
-            // not advertised as an actively running background process.
+            if prompt.is_empty() {
+                ensure!(command != "/subtask", "Usage: /subtask PROMPT");
+                let context = crate::services::context(paths)?;
+                claude_core::services::session_parking::validate_idle(&context, &session.id, &session.id)?;
+                let target = if command == "/fork" {
+                    let child = session.store.fork(&session.id)?;
+                    copy_settings(session, &child).with_context(||format!("Copied session {child}, but settings could not be copied"))?;
+                    child
+                } else {session.id.clone()};
+                let executable = std::env::current_exe()?;
+                claude_core::services::session_parking::park(&context, &session.id, &target, &executable).await
+                    .with_context(||format!("Session {target} remains saved; idle worker preparation failed"))?;
+                eprintln!("Session {target}: idle worker waiting for input. No model request or task was started. Worker exits after 5 idle minutes; the saved session remains resumable.");
+                eprintln!("Resume: claude-code --data-dir \"{}\" --resume {target}", paths.data_dir.display());
+                eprintln!("Saved provider: {}; model: {}. Temporary provider credentials must be supplied again when resuming. Bypass permissions require explicit opt-in on resume.", session.provider_id, session.model);
+                if command == "/background" {
+                    eprintln!("Current session moved to the background; returning this terminal to the shell.");
+                    return Ok(Outcome::Exit);
+                }
+                eprintln!("Copied session is ready; current session {} retained. /tasks sessions shows live worker state; /tasks stop-session {target} stops its idle worker.", session.id);
+                return Ok(Outcome::Handled);
+            }
             let child_id = session.store.fork(&session.id)?;
             copy_settings(session, &child_id)?;
-            if prompt.is_empty() {
-                if command == "/subtask" {
-                    anyhow::bail!("Usage: /subtask PROMPT");
-                }
-                eprintln!("Copied conversation to {child_id}; current session retained. No task started. Use /resume {child_id}, or /fork PROMPT to run a background task.");
-                return Ok(true);
-            }
             let workspace = session
                 .store
                 .workspace(&child_id, &paths.data_dir.join("workspaces"))?;
@@ -64,6 +82,18 @@ pub async fn handle(
         "/tasks" | "/workflows" => {
             let mut parts = argument.split_whitespace();
             match parts.next().unwrap_or("list") {
+                "sessions" => {
+                    ensure!(parts.next().is_none(), "Usage: /tasks sessions");
+                    let reports = claude_core::services::session_parking::list(&crate::services::context(paths)?, &session.id).await?;
+                    if reports.is_empty() { eprintln!("No saved background sessions registered by this session."); }
+                    for report in reports { print_parked(&report); }
+                }
+                "stop-session" => {
+                    let id = parts.next().context("Usage: /tasks stop-session SESSION_ID")?;
+                    ensure!(parts.next().is_none(), "Usage: /tasks stop-session SESSION_ID");
+                    claude_core::services::session_parking::stop(&crate::services::context(paths)?, &session.id, id).await?;
+                    eprintln!("Worker stopped for session {id}; conversation remains saved. Resume with /resume {id}.");
+                }
                 "records" => {
                     let legacy = parts.next();
                     ensure!((legacy.is_none() || legacy == Some("legacy")) && parts.next().is_none(), "Usage: /tasks records [legacy]");
@@ -79,7 +109,7 @@ pub async fn handle(
                 filter @ ("list" | "running" | "completed" | "failed") => {
                     ensure!(
                         parts.next().is_none(),
-                        "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|shutdown-worker]"
+                        "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]"
                     );
                     let jobs = background_sessions::list(&paths.data_dir, Some(&session.id))?
                         .into_iter()
@@ -98,7 +128,10 @@ pub async fn handle(
                             "Background workflows: single-task agent runs started by this session."
                         );
                     }
-                    if jobs.is_empty() && shells.is_empty() {
+                    let parked = if filter == "list" && command == "/tasks" {
+                        claude_core::services::session_parking::list(&crate::services::context(paths)?, &session.id).await?
+                    } else { Vec::new() };
+                    if jobs.is_empty() && shells.is_empty() && parked.is_empty() {
                         eprintln!("No background processes started by this session.");
                     }
                     for job in jobs {
@@ -110,6 +143,7 @@ pub async fn handle(
                             eprintln!("  awaiting {}: {} (use /tasks pending {})", question.kind, question.request_id, job.id);
                         }
                     }
+                    for report in parked { print_parked(&report); }
                     for task in shells {
                         eprintln!("{}  {}  {}\n  shell · /tasks show {} · /tasks cancel {}",
                             task["id"].as_str().unwrap_or("?"),
@@ -158,7 +192,7 @@ pub async fn handle(
                                 println!("{}", safe_output(text));
                             }
                         }
-                        return Ok(true);
+                        return Ok(Outcome::Handled);
                     }
                     let job = background_sessions::get(&paths.data_dir, id)?;
                     ensure!(
@@ -183,7 +217,7 @@ pub async fn handle(
                         let output = shell_control(paths, &session.id, id, true).await?;
                         let action = if output["cancellation_requested"] == true { "Cancellation requested" } else { "No cancellation needed" };
                         eprintln!("{action} for shell {id} (reported {}). Use /tasks show {id} for confirmed status and output.", output["status"].as_str().unwrap_or("unknown"));
-                        return Ok(true);
+                        return Ok(Outcome::Handled);
                     }
                     ensure!(
                         background_sessions::get(&paths.data_dir, id)?.parent_session_id
@@ -194,13 +228,38 @@ pub async fn handle(
                     eprintln!("Cancellation requested for {id}; /tasks shows the confirmed terminal state.");
                 }
                 _ => anyhow::bail!(
-                    "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|shutdown-worker]"
+                    "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]"
                 ),
             }
         }
-        _ => return Ok(false),
+        _ => return Ok(Outcome::NotHandled),
     }
-    Ok(true)
+    Ok(Outcome::Handled)
+}
+
+fn print_parked(report: &claude_core::services::session_parking::ParkedStatus) {
+    eprintln!(
+        "Session {} | {} | worker {}{}",
+        report.session.session_id,
+        match report.activity.as_str() {
+            "waiting_for_input" => "waiting for input (no model task)",
+            "active_task" => "active task",
+            "session_unavailable" => "session unavailable",
+            _ => "session saved; worker unavailable",
+        },
+        report.worker_state,
+        report
+            .worker_pid
+            .map(|pid| format!(" (PID {pid})"))
+            .unwrap_or_default()
+    );
+    if let Some(id) = &report.active_job {
+        eprintln!("  task: {id}");
+    }
+    eprintln!(
+        "  resume: /resume {} | permission mode on resume: {}",
+        report.session.session_id, report.resume_permission_mode
+    );
 }
 
 fn safe_output(text: &str) -> String {
@@ -310,7 +369,13 @@ pub(crate) fn arguments(
 
 /// Preserve behavioral and display settings without sharing mutable state.
 pub fn copy_settings(session: &Session, child: &str) -> Result<()> {
-    crate::session_commands::copy_settings(&session.store.db, &session.id, child)
+    crate::session_commands::copy_settings(&session.store.db, &session.id, child)?;
+    if let Some(plan) = claude_core::services::plans::read(&session.paths.data_dir, &session.id)?
+        .filter(|plan| !plan.trim().is_empty())
+    {
+        claude_core::services::plans::save(&session.paths.data_dir, child, &plan)?;
+    }
+    Ok(())
 }
 
 fn workflow_matches(status: &str, filter: &str) -> bool {

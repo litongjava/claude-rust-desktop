@@ -4,7 +4,7 @@
 use crossterm::{
     cursor::{position, MoveDown, MoveToColumn, MoveUp},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
@@ -417,9 +417,9 @@ fn move_screen_row(out: &mut impl Write, current: &mut usize, target: usize) -> 
     Ok(())
 }
 
-fn read_editor_event() -> io::Result<Event> {
+fn read_editor_event(reader: &mut crate::terminal::paste_input::Reader) -> io::Result<Option<Event>> {
     loop {
-        let event = event::read()?;
+        let Some(event) = reader.next(std::time::Duration::from_millis(100))? else {return Ok(None);};
         if let Event::Mouse(mouse) = &event {
             if !matches!(
                 mouse.kind,
@@ -430,7 +430,7 @@ fn read_editor_event() -> io::Result<Event> {
                 continue;
             }
         }
-        return Ok(event);
+        return Ok(Some(event));
     }
 }
 
@@ -480,6 +480,7 @@ impl PromptEditor {
     pub fn readline(&mut self, prompt: &str) -> io::Result<Option<super::PromptEvent>> {
         terminal::enable_raw_mode()?;
         let _raw = RawMode;
+        let mut input_reader = crate::terminal::paste_input::Reader::new()?;
         execute!(io::stderr(), EnableBracketedPaste)?;
         if !self.details.entries.is_empty() {
             execute!(io::stderr(), EnableMouseCapture)?;
@@ -651,10 +652,8 @@ impl PromptEditor {
                 ));
             }
             screen.draw(&lines, panel_height + cursor_row - first + 1, cursor_col)?;
-            if !event::poll(std::time::Duration::from_millis(100))? {
-                continue;
-            }
-            match read_editor_event()? {
+            let Some(event) = read_editor_event(&mut input_reader)? else {continue;};
+            match event {
                 Event::Resize(_, new_rows) => {
                     // Dimensions changed: every row needs repainting. Clamp the
                     // anchor to the cursor's actual visible row after a resize.

@@ -38,7 +38,7 @@ pub struct Session {
     pub(crate) permissions: Arc<claude_core::permissions::PermissionManager>,
     pub(crate) ide: Arc<claude_core::services::ide::IdeClient>,
     mcp: Arc<McpServerManager>,
-    mcp_ready: tokio::sync::OnceCell<()>,
+    mcp_ready: Arc<tokio::sync::OnceCell<()>>,
     pub(crate) model: String,
     pub(crate) provider_id: String,
     pub(crate) auto_route: bool,
@@ -58,6 +58,15 @@ impl Session {
         let paths=self.paths.clone();
         self.switch(&paths,selection).await
     }
+    pub fn runtime_status_source(&self) -> claude_core::services::runtime_status::RuntimeSource {
+        claude_core::services::runtime_status::RuntimeSource {
+            mcp: self.mcp.clone(),
+            mcp_ready: self.mcp_ready.clone(),
+            workspace: self.workspace.clone(),
+            data_dir: self.paths.data_dir.clone(),
+        }
+    }
+
     pub async fn selected_provider(&self) -> Result<claude_core::native_engine::provider_manager::ResolvedProvider> {
         self.providers.lock().await.resolve_selected(&self.provider_id, &self.model).context("Selected provider/model is unavailable")
     }
@@ -197,7 +206,7 @@ impl Session {
             store,
             engine,
             mcp,
-            mcp_ready: tokio::sync::OnceCell::new(),
+            mcp_ready: Arc::new(tokio::sync::OnceCell::new()),
             model: selection.model,
             provider_id: selection.provider_id,
             providers,
@@ -544,6 +553,11 @@ impl Session {
                         continue;
                     },
                 };
+                // Parallel execution reports both the ordinary completion and a
+                // pipeline completion. Publish and retain each identical result once.
+                if duplicate_tool_result(&event, &tools) {
+                    continue;
+                }
                 if cli.output_format == OutputFormat::StreamJson {
                     if let Some(value) = event_json(&event) { emit_json(&value)?; }
                 }
@@ -605,7 +619,11 @@ impl Session {
                     | EngineEvent::PipelineToolResult { tool_use_id, tool_name, tool_input, output, is_error, .. } => {
                         // The baseline is captured before the turn. Attribute changed paths to
                         // the actual post-hook input, including tools that partially fail.
-                        if let Some(capture) = checkpoint.as_mut() {
+                        // Dedicated session plans are runtime data, outside code rewind.
+                        let plan_document = claude_core::services::plans::is_document_tool(
+                            &self.paths.data_dir, &self.id, &tool_name, &tool_input,
+                        );
+                        if let Some(capture) = checkpoint.as_mut().filter(|_| !plan_document) {
                             if let Err(error) = capture.record_tool(&tool_name, &tool_input) {
                                 progress.notice(&format!("Cannot checkpoint this tool's file: {error:#}"));
                             }
@@ -613,8 +631,10 @@ impl Session {
                         if matches!(tool_name.as_str(), "EnterPlanMode" | "ExitPlanMode" | "plan_mode") {
                             progress.set_permission_mode(self.permission_mode());
                         }
-                        progress.tool_finished(&tool_use_id, &tool_name, &output, is_error);
-                        tools.push(message_repo::ToolCallRow { id: tool_use_id, message_id: String::new(), name: tool_name, input: Some(tool_input.to_string()), output: Some(output), is_error, sort_order: tools.len() as i64 });
+                        progress.tool_finished(&tool_use_id, &tool_name, &tool_input, &output, is_error);
+                        let position = tools.iter().position(|tool| tool.id == tool_use_id);
+                        let row = message_repo::ToolCallRow { id: tool_use_id, message_id: String::new(), name: tool_name, input: Some(tool_input.to_string()), output: Some(output), is_error, sort_order: position.unwrap_or(tools.len()) as i64 };
+                        if let Some(position) = position { tools[position] = row; } else { tools.push(row); }
                     },
                     EngineEvent::RequestSnapshot(snapshot) => {
                         if let Some(old) = snapshots.iter_mut().find(|s| s["id"] == snapshot["id"]) { *old = snapshot; } else { snapshots.push(snapshot); }
@@ -756,6 +776,36 @@ pub(crate) fn emit_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn duplicate_tool_result(event: &EngineEvent, tools: &[message_repo::ToolCallRow]) -> bool {
+    let (id, name, input, output, is_error) = match event {
+        EngineEvent::ToolUseDone {
+            tool_use_id,
+            tool_name,
+            tool_input,
+            output,
+            is_error,
+        }
+        | EngineEvent::PipelineToolResult {
+            tool_use_id,
+            tool_name,
+            tool_input,
+            output,
+            is_error,
+            ..
+        } => (tool_use_id, tool_name, tool_input, output, is_error),
+        _ => return false,
+    };
+    tools
+        .iter()
+        .find(|tool| tool.id == *id)
+        .is_some_and(|tool| {
+            tool.name == *name
+                && tool.is_error == *is_error
+                && tool.output.as_deref() == Some(output.as_str())
+                && tool.input.as_deref() == Some(input.to_string().as_str())
+        })
+}
+
 fn event_json(event: &EngineEvent) -> Option<Value> {
     Some(match event {
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
@@ -807,6 +857,53 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
 #[cfg(test)]
 mod event_tests {
     use super::*;
+    #[test]
+    fn duplicate_pipeline_completion_does_not_hide_distinct_results() {
+        let saved = vec![message_repo::ToolCallRow {
+            id: "read-1".into(),
+            message_id: String::new(),
+            name: "Read".into(),
+            input: Some(json!({"file_path":"a.txt"}).to_string()),
+            output: Some("contents".into()),
+            is_error: false,
+            sort_order: 0,
+        }];
+        let result =
+            |id: &str, path: &str, output: &str, is_error| EngineEvent::PipelineToolResult {
+                tool_use_id: id.into(),
+                tool_name: "Read".into(),
+                tool_input: json!({"file_path":path}),
+                output: output.into(),
+                is_error,
+                completed_count: 1,
+                total_count: 1,
+            };
+        assert!(duplicate_tool_result(
+            &result("read-1", "a.txt", "contents", false),
+            &saved
+        ));
+        assert!(!duplicate_tool_result(
+            &result("read-2", "a.txt", "contents", false),
+            &saved
+        ));
+        assert!(!duplicate_tool_result(
+            &result("read-1", "b.txt", "contents", false),
+            &saved
+        ));
+        assert!(!duplicate_tool_result(
+            &result("read-1", "a.txt", "changed", false),
+            &saved
+        ));
+        assert!(!duplicate_tool_result(
+            &result("read-1", "a.txt", "contents", true),
+            &saved
+        ));
+        assert!(!duplicate_tool_result(
+            &EngineEvent::Text("contents".into()),
+            &saved
+        ));
+    }
+
     #[tokio::test]
     async fn persisted_permission_mode_restores_unless_explicit_cli_overrides() {
         let root = tempfile::tempdir().unwrap();

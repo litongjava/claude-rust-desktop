@@ -36,6 +36,7 @@ pub struct Worker {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    RuntimeStatus,
     SetPermissionMode { job_id: String, mode: String },
     GetPermissionMode { job_id: String },
     Submit {
@@ -53,6 +54,8 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_status: Option<super::runtime_status::RuntimeStatus>,
 }
 impl Reply {
     pub fn ok(id: Option<String>) -> Self {
@@ -61,6 +64,7 @@ impl Reply {
             job_id: id,
             error: None,
             permission_mode: None,
+            runtime_status: None,
         }
     }
     pub fn error(error: impl ToString) -> Self {
@@ -69,6 +73,7 @@ impl Reply {
             job_id: None,
             error: Some(error.to_string()),
             permission_mode: None,
+            runtime_status: None,
         }
     }
 }
@@ -481,6 +486,59 @@ pub async fn shutdown(root: &Path, session: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkerRuntimeStatus {
+    pub state: String,
+    pub pid: Option<u32>,
+    pub tools: Option<super::runtime_status::RuntimeStatus>,
+}
+
+/// Probe only an existing worker. Never spawns one and supports older binaries
+/// by returning a bounded unavailable/incompatible observation.
+pub async fn runtime_status(root: &Path, session: &str) -> WorkerRuntimeStatus {
+    let mut report = WorkerRuntimeStatus {
+        state: "not_started".into(),
+        pid: None,
+        tools: None,
+    };
+    let worker = match current(root, session) {
+        Ok(Some(worker)) => worker,
+        Ok(None) => return report,
+        Err(_) => {
+            report.state = "metadata_unreadable".into();
+            return report;
+        }
+    };
+    if worker.session_id != session || worker.root != root {
+        report.state = "metadata_mismatch".into();
+        return report;
+    }
+    report.pid = worker.child_pid;
+    if worker.status == "stopped" {
+        report.state = "stopped".into();
+        return report;
+    }
+    match tokio::time::timeout(
+        Duration::from_millis(1200),
+        call(&worker, &Request::RuntimeStatus),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => {
+            report.state = if reply.runtime_status.is_some() {
+                "reachable"
+            } else {
+                "unsupported_status_protocol"
+            }
+            .into();
+            report.tools = reply.runtime_status;
+        }
+        Ok(Err(_)) => report.state = "unavailable_or_incompatible".into(),
+        Err(_) => report.state = "probe_timeout".into(),
+    }
+    report
+}
+
 pub async fn set_permission_mode(root: &Path, session: &str, job_id: &str, mode: &str) -> Result<()> {
     ensure!(matches!(mode, "ask" | "accept-edits" | "plan"), "Live mode switching supports ask, accept-edits and plan; bypass requires explicit configuration");
     let worker = current(root, session)?.context("Session has no persistent worker")?;
@@ -731,6 +789,77 @@ mod tests {
             .unwrap();
             CloseHandle(token).unwrap();
             let _ = LocalFree(HLOCAL(descriptor.0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_status_tests {
+    use super::*;
+    #[tokio::test]
+    async fn runtime_status_never_starts_worker_and_bounds_old_or_unresponsive_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            runtime_status(dir.path(), &session).await.state,
+            "not_started"
+        );
+        assert!(!dir.path().join("session-workers").exists());
+        for behavior in ["old", "unresponsive"] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let endpoint = if cfg!(windows) {
+                format!(r"\\.\pipe\claude-status-{id}")
+            } else {
+                dir.path()
+                    .join(format!("{id}.sock"))
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let worker = Worker {
+                id: id.clone(),
+                session_id: session.clone(),
+                root: dir.path().into(),
+                workspace: dir.path().into(),
+                executable: std::env::current_exe().unwrap(),
+                endpoint,
+                status: "running".into(),
+                supervisor_pid: None,
+                child_pid: None,
+                heartbeat_ms: 0,
+                active_job: None,
+                error: None,
+            };
+            std::fs::create_dir_all(directory(&worker)).unwrap();
+            jobs::save(&directory(&worker).join("worker.json"), &worker).unwrap();
+            jobs::save(
+                &worker_path(dir.path(), &session)
+                    .unwrap()
+                    .join("current.json"),
+                &id,
+            )
+            .unwrap();
+            let mut listener = Listener::bind(&worker).unwrap();
+            let server = tokio::spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let (stream, _) = read_request(stream).await.unwrap();
+                if behavior == "old" {
+                    reply(stream, &Reply::ok(None)).await.unwrap();
+                } else {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                }
+            });
+            let report = runtime_status(dir.path(), &session).await;
+            assert_eq!(
+                report.state,
+                if behavior == "old" {
+                    "unsupported_status_protocol"
+                } else {
+                    "probe_timeout"
+                }
+            );
+            assert!(report.tools.is_none());
+            server.abort();
         }
     }
 }

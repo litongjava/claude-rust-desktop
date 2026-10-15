@@ -610,7 +610,7 @@ impl ToolLoopExecutor {
 
     pub fn with_permission_manager(mut self, manager: Arc<PermissionManager>) -> Self {
         if manager.get_mode() == crate::permissions::PermissionMode::PlanMode {
-            self.system_prompt.get_or_insert_with(String::new).push_str("\nThis turn starts in read-only plan mode. Investigate without modifying project files until ExitPlanMode succeeds. Submit a concrete Markdown implementation and verification plan via ExitPlanMode(plan). It saves the session plan and requests explicit user approval before returning to normal ask permissions. Do not claim approval without a successful ExitPlanMode result.\n");
+            self.system_prompt.get_or_insert_with(String::new).push_str("\nThis turn starts in read-only plan mode. Investigate without modifying project files until ExitPlanMode succeeds. Write a concrete Markdown implementation and verification plan to the dedicated session plan file using Write/Edit, then call ExitPlanMode (the legacy plan text parameter is also accepted). It requests explicit user approval before returning to normal ask permissions. Do not claim approval without a successful ExitPlanMode result.\n");
         }
         self.permission_manager = Some(manager);
         self
@@ -653,7 +653,11 @@ impl ToolLoopExecutor {
                 user_id: None,
                 workspace_path,
             };
-            pm.check_permission(&context)
+            if self.is_plan_document_tool(tool_name, tool_input) {
+                pm.check_plan_document_permission(&context)
+            } else {
+                pm.check_permission(&context)
+            }
         } else {
             PermissionResult::Granted
         }
@@ -677,6 +681,13 @@ impl ToolLoopExecutor {
     }
 
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
+            if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+                let path = crate::services::plans::path(root, session)?;
+                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nThe only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit; all other file changes remain prohibited.\n", path.display()));
+            }
+        }
+
         if !self.durable_user_input {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(|p| p.parent()), self.conv_id.as_deref()) {
                 self.durable_user_input = crate::services::background_sessions::worker_directory(root, session)?.is_some();
@@ -832,6 +843,10 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
         if self.allowed_tools.as_ref().is_some_and(|names| !names.iter().any(|name| name == tool_name)) { return (tool_input.clone(), "Tool is not allowed by this agent definition".into(), true); }
+        if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
+            && (matches!(tool_name, "Write" | "Edit") || (tool_name == "Read" && self.is_plan_document_tool(tool_name, tool_input))) {
+            return self.execute_plan_document(tool_name, tool_input, _tool_use_id).await;
+        }
         if matches!(tool_name, "EnterPlanMode" | "ExitPlanMode") || (tool_name == "plan_mode" && matches!(tool_input["operation"].as_str(), Some("enter" | "exit"))) {
             return self.execute_plan_transition(tool_name, tool_input, _tool_use_id).await;
         }
@@ -1518,6 +1533,7 @@ impl ToolLoopExecutor {
                                 // Memory calls need this executor's configured client, not a generic stub.
                                 let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                                     || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
+                                    || self.is_plan_document_tool(&name, &input)
                                     || self.check_permission_requires_confirmation(&name, &input);
 
                                 assistant_blocks.push(ContentBlock::ToolUse {
@@ -2014,6 +2030,7 @@ impl ToolLoopExecutor {
                     // Memory calls need this executor's configured client, not a generic stub.
                     let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                         || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
+                        || self.is_plan_document_tool(name, &input)
                         || self.check_permission_requires_confirmation(name, &input);
 
                     assistant_tool_calls.push(crate::native_engine::openai_client::OpenAIToolCall {

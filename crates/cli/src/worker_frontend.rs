@@ -366,26 +366,59 @@ fn permission_event(event: &Value) -> bool {
 }
 
 async fn refresh_permission_mode(session: &Session, job: &jobs::Job) -> Result<&'static str> {
-    use claude_core::services::{session_permission_mode, session_worker};
+    refresh_permission_mode_with_query(
+        session,
+        job,
+        claude_core::services::session_worker::permission_mode(
+            &session.paths.data_dir,
+            &session.id,
+            &job.id,
+        ),
+    )
+    .await
+}
+
+async fn refresh_permission_mode_with_query(
+    session: &Session,
+    job: &jobs::Job,
+    query: impl std::future::Future<Output = Result<String>>,
+) -> Result<&'static str> {
+    use claude_core::services::session_permission_mode;
     ensure!(
         job.session_id == session.id,
         "Permission mode belongs to another session"
     );
-    // Historical ToolResult data is only a refresh trigger. It must never
-    // overwrite a later mode acknowledged by the live worker.
-    let mode = if job.finished_ms.is_some()
-        && matches!(job.status.as_str(), "completed" | "failed" | "cancelled")
-    {
+    let terminal = |job: &jobs::Job| {
+        job.finished_ms.is_some()
+            && matches!(job.status.as_str(), "completed" | "failed" | "cancelled")
+    };
+    let persisted = || {
         session_permission_mode::load(&session.store.db, &session.id)?
-            .ok_or_else(|| anyhow::anyhow!("Final permission mode unavailable"))?
+            .ok_or_else(|| anyhow::anyhow!("Final permission mode unavailable"))
+    };
+    // Historical events only trigger a query; their old mode is never applied.
+    let mode = if terminal(job) {
+        persisted()?
     } else {
-        let mode =
-            session_worker::permission_mode(&session.paths.data_dir, &session.id, &job.id).await?;
-        session_permission_mode::parse(&mode)?
+        match query.await {
+            Ok(mode) => session_permission_mode::parse(&mode)?,
+            Err(error) => {
+                // The worker can finish after the poll reads a running snapshot.
+                // Only a fresh terminal record for this session authorizes the
+                // persisted fallback; active IPC failures remain visible.
+                let finished = jobs::get(&session.paths.data_dir, &job.id)
+                    .is_ok_and(|latest| latest.session_id == session.id && terminal(&latest));
+                if !finished {
+                    return Err(error);
+                }
+                persisted()?
+            }
+        }
     };
     session.permissions.set_mode(mode);
     Ok(session.permission_mode())
 }
+
 
 fn plan_event_mode(event: &Value) -> Option<claude_core::permissions::PermissionMode> {
     use claude_core::permissions::PermissionMode;
@@ -443,6 +476,7 @@ fn render(display: &mut TurnDisplay, event: &Value) {
         "tool_result" => display.tool_finished(
             text("id"),
             text("name"),
+            &event["input"],
             text("output"),
             event["is_error"].as_bool().unwrap_or(false),
         ),
@@ -492,6 +526,19 @@ fn failure_message(id: &str, status: &str, diagnostic: &str) -> String {
                     .flatten()
                     .filter(|code| (400..600).contains(code))
             });
+        if http.is_none()
+            && (lower.contains("output token limit")
+                || (lower.contains("max_tokens")
+                    && (lower.contains("stopped")
+                        || lower.contains("stop_reason")
+                        || lower.contains("finish_reason"))))
+        {
+            // Static text only: provider diagnostics can contain credentials.
+            // Do not append an endpoint or truncate the task inspection command.
+            return format!(
+                "Output token limit reached; send a follow-up to continue. Details: /tasks show {id}"
+            );
+        }
         http.map(|code| format!("HTTP {code}"))
             .unwrap_or_else(|| "Request failed".into())
     };
@@ -662,6 +709,154 @@ mod failure_tests {
         assert!(std::fs::read_to_string(directory.join("stderr.log"))
             .unwrap()
             .contains("Invalid background stream JSON"));
+    }
+
+    #[tokio::test]
+    async fn permission_refresh_recovers_completion_race_but_preserves_active_errors() {
+        use clap::Parser;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = claude_core::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let mut provider = claude_core::runtime::provider_from_config(
+            &crate::config::provider_template("fixture"),
+        );
+        provider.id = "fixture".into();
+        let cli = Cli::try_parse_from(["claude-code"]).unwrap();
+        let session = Session::open(
+            &cli,
+            &paths,
+            crate::config::Selection {
+                providers: vec![provider],
+                model: "fixture".into(),
+                provider_id: "fixture".into(),
+            },
+            Some(&parent),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = paths.data_dir.join("background-tasks").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let job = jobs::Job {
+            id: id.clone(),
+            foreground: true,
+            parent_session_id: parent.clone(),
+            session_id: parent,
+            title: "still working".into(),
+            status: "running".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            started_ms: 1,
+            heartbeat_ms: chrono::Utc::now().timestamp_millis() as u64,
+            finished_ms: None,
+            exit_code: None,
+            error: None,
+        };
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        use claude_core::{permissions::PermissionMode, services::session_permission_mode};
+        // The poll already captured this running job. Change its durable state
+        // inside the query future to deterministically reproduce the IPC race.
+        let old = job.clone();
+        for status in ["completed", "failed", "cancelled"] {
+            session.permissions.set_mode(PermissionMode::PlanMode);
+            let refreshed = refresh_permission_mode_with_query(&session, &old, async {
+                session_permission_mode::set(
+                    &session.store.db,
+                    &session.id,
+                    &session.permissions,
+                    PermissionMode::AskPermissions,
+                )?;
+                session.permissions.set_mode(PermissionMode::PlanMode);
+                let mut completed = old.clone();
+                completed.status = status.into();
+                completed.finished_ms = Some(3);
+                std::fs::write(
+                    directory.join("state.json"),
+                    serde_json::to_vec(&completed)?,
+                )?;
+                anyhow::bail!("Session worker has no active initialized turn")
+            })
+            .await
+            .unwrap();
+            assert_eq!(refreshed, "ask");
+        }
+        // A still-running worker must not fall back to even a valid saved mode.
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        session.permissions.set_mode(PermissionMode::PlanMode);
+        let error = refresh_permission_mode_with_query(&session, &old, async {
+            anyhow::bail!("real active IPC failure")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "real active IPC failure");
+        assert_eq!(session.permission_mode(), "plan");
+        // Terminal state belonging to another session is never authoritative.
+        let mut foreign = old.clone();
+        foreign.session_id = uuid::Uuid::new_v4().to_string();
+        foreign.status = "completed".into();
+        foreign.finished_ms = Some(3);
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        assert!(refresh_permission_mode_with_query(&session, &old, async {
+            anyhow::bail!("wrong session")
+        })
+        .await
+        .is_err());
+        assert_eq!(session.permission_mode(), "plan");
+    }
+
+    #[test]
+    fn failure_message_explains_output_limits_without_leaking_diagnostics() {
+        let id = "94727627-adc5-474f-9650-8143c8a6741f";
+        for diagnostic in [
+            "Incomplete response: provider stopped at the output token limit (max_tokens). Partial output was retained; send a follow-up to continue.",
+            "Provider stopped: MAX_TOKENS https://user:secret@example.com/private?key=secret",
+            "Incomplete response: stop_reason=max_tokens; private response body",
+            "Incomplete response: finish_reason=max_tokens",
+            "Incomplete response: provider stopped at the output token limit (length). Partial output was retained; send a follow-up to continue.",
+        ] {
+            assert_eq!(
+                failure_message(id, "failed", diagnostic),
+                format!("Output token limit reached; send a follow-up to continue. Details: /tasks show {id}")
+            );
+        }
+        for (status, diagnostic, expected) in [
+            ("cancelled", "output token limit", "Interrupted"),
+            (
+                "failed",
+                "output token limit request timeout",
+                "Request timed out. Details: /tasks show id",
+            ),
+            (
+                "failed",
+                "API HTTP 400 invalid max_tokens",
+                "HTTP 400. Details: /tasks show id",
+            ),
+            (
+                "failed",
+                "HTTP 429 output token limit",
+                "HTTP 429. Details: /tasks show id",
+            ),
+            (
+                "failed",
+                "unknown private credential max_tokens",
+                "Request failed. Details: /tasks show id",
+            ),
+        ] {
+            assert_eq!(failure_message("id", status, diagnostic), expected);
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Ephemeral activity output. Only the event consumer writes to the terminal;
 //! the timer never races the editor or response stream.
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,7 @@ pub struct TurnProgress {
     line_open: bool,
     usage: ReportedUsage,
     tools: HashMap<String, Instant>,
-    finished_tools: HashSet<String>,
+    finished_tools: HashMap<String, (String, Value, String, bool)>,
     agents: HashMap<String, Instant>,
 }
 
@@ -56,7 +56,7 @@ impl TurnProgress {
             line_open: false,
             usage: ReportedUsage::default(),
             tools: HashMap::new(),
-            finished_tools: HashSet::new(),
+            finished_tools: HashMap::new(),
             agents: HashMap::new(),
         };
         progress.set_activity("Waiting for response");
@@ -88,7 +88,7 @@ impl TurnProgress {
     }
 
     pub fn tool_started(&mut self, id: &str, name: &str, input: &Value) {
-        if self.tools.contains_key(id) || self.finished_tools.contains(id) {
+        if self.tools.contains_key(id) || self.finished_tools.contains_key(id) {
             return;
         }
         self.tools.insert(id.into(), Instant::now());
@@ -101,17 +101,32 @@ impl TurnProgress {
         self.set_activity(&label);
     }
 
-    pub fn tool_finished(&mut self, id: &str, name: &str, output: &str, failed: bool) {
+    pub fn tool_finished(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &Value,
+        output: &str,
+        failed: bool,
+    ) {
         // The pipeline can mirror ToolUseDone with PipelineToolResult. Each
         // unique tool call gets one completion line and retains its timing.
-        if !self.finished_tools.insert(id.into()) {
+        if self.finished_tools.get(id).is_some_and(|previous| {
+            previous.0 == name
+                && previous.1 == *input
+                && previous.2 == output
+                && previous.3 == failed
+        }) {
             return;
         }
+        self.finished_tools.insert(
+            id.into(),
+            (name.into(), input.clone(), output.into(), failed),
+        );
         let elapsed = self.tools.remove(id).map(|start| start.elapsed());
         self.notice(&tool_result_summary(name, output, failed, elapsed));
         self.set_activity("Working");
     }
-
     pub fn agent_progress(&mut self, id: &str, agent_type: &str, status: &str, tool: Option<&str>) {
         if status == "started" {
             self.agents.insert(id.into(), Instant::now());
@@ -761,7 +776,7 @@ mod tests {
         progress.tool_started("one", "Bash", &serde_json::json!({"command": "echo hi"}));
         assert_eq!(progress.tools.len(), 1);
         assert!(!progress.visible);
-        progress.tool_finished("one", "Bash", "hi", false);
+        progress.tool_finished("one", "Bash", &serde_json::json!({"command":"echo hi"}), "hi", false);
         assert!(progress.tools.is_empty());
         assert!(!progress.visible);
     }
@@ -789,13 +804,29 @@ mod tests {
         let started = progress.tools["read-1"];
         progress.tool_started("read-1", "Read", &input);
         assert_eq!(progress.tools["read-1"], started);
-        progress.tool_finished("read-1", "Read", "content", false);
+        progress.tool_finished("read-1", "Read", &input, "content", false);
         progress.tool_started("read-2", "Read", &input);
-        progress.tool_finished("read-1", "Read", "content", false);
+        progress.tool_finished("read-1", "Read", &input, "content", false);
         assert_eq!(progress.activity, "Working: Read");
         assert_eq!(progress.finished_tools.len(), 1);
         assert!(progress.tools.contains_key("read-2"));
         progress.tool_started("read-1", "Read", &input);
         assert!(!progress.tools.contains_key("read-1"));
     }
+    #[test]
+    fn changed_completion_preserves_latest_input_and_one_tool_count_in_fallback() {
+        let mut progress = TurnProgress::new(false);
+        let old = serde_json::json!({"file_path":"a.txt"});
+        let revised = serde_json::json!({"file_path":"b.txt"});
+        progress.tool_started("one", "Read", &old);
+        progress.tool_finished("one", "Read", &old, "old", false);
+        progress.tool_finished("one", "Other", &revised, "changed", true);
+        assert_eq!(progress.finished_tools.len(), 1);
+        assert_eq!(progress.finished_tools["one"], ("Other".into(), revised.clone(), "changed".into(), true));
+        assert!(progress.tools.is_empty());
+        progress.set_activity("Another task");
+        progress.tool_finished("one", "Other", &revised, "changed", true);
+        assert_eq!(progress.activity, "Another task");
+    }
+
 }

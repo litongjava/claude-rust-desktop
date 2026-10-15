@@ -1,7 +1,72 @@
 use super::*;
 use crate::{permissions::PermissionMode, services::plans};
+use anyhow::Context;
 
 impl ToolLoopExecutor {
+    pub(super) fn is_plan_document_tool(&self, tool: &str, input: &Value) -> bool {
+        let Some(root) = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        else {
+            return false;
+        };
+        let Some(session) = self.conv_id.as_deref() else {
+            return false;
+        };
+        self.permission_manager
+            .as_ref()
+            .is_some_and(|pm| pm.get_mode() == PermissionMode::PlanMode)
+            && plans::is_document_tool(root, session, tool, input)
+    }
+
+    pub(super) async fn execute_plan_document(
+        &mut self,
+        tool: &str,
+        input: &Value,
+        id: &str,
+    ) -> (Value, String, bool) {
+        let result = async {
+            match self.check_permission(tool, input).await {
+                PermissionResult::Denied(reason) => anyhow::bail!("{reason}"),
+                PermissionResult::RequiresConfirmation(_) => {
+                    let request = uuid::Uuid::new_v4().to_string();
+                    let (tx, rx) = oneshot::channel();
+                    self.answer_waiters.lock().await.insert(request.clone(), tx);
+                    if self.event_tx.send(EngineEvent::ToolPermission {request_id:request.clone(),tool_use_id:id.into(),tool_name:tool.into(),input:input.clone()}).await.is_err() {
+                        self.answer_waiters.lock().await.remove(&request);
+                        anyhow::bail!("Approval host disconnected");
+                    }
+                    let answer = self.wait_for_user_answer(rx).await;
+                    self.answer_waiters.lock().await.remove(&request);
+                    anyhow::ensure!(answer.ok().and_then(|v|v.ok()).is_some_and(|v|matches!(v.trim().to_lowercase().as_str(),"yes"|"y"|"allow"|"approved"|"\u{5141}\u{8bb8}"|"\u{540c}\u{610f}"|"\u{662f}")), "Plan file change was not approved");
+                }
+                PermissionResult::Granted => {}
+            }
+            if let PermissionResult::Denied(reason) = self.check_permission(tool, input).await { anyhow::bail!("{reason}"); }
+            anyhow::ensure!(self.is_plan_document_tool(tool, input), "Plan permission or file path changed; retry the operation");
+            let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).context("Plan storage unavailable")?;
+            let session = self.conv_id.as_deref().context("Plan session unavailable")?;
+            if tool == "Read" {
+                let content = plans::read(root, session)?.context("Plan file does not exist")?;
+                let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
+                let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
+                let lines: Vec<_> = content.lines().collect();
+                let selected: Vec<_> = lines.iter().skip(offset.saturating_sub(1)).take(limit).enumerate().map(|(i,line)|format!("{:>6}\t{}", i+offset, line)).collect();
+                return Ok(json!({"content":selected.join("\n"),"total_lines":lines.len(),"file_path":plans::path(root, session)?}));
+            }
+            plans::edit_document(root, session, tool, input)
+        }.await;
+        (
+            input.clone(),
+            match &result {
+                Ok(value) => value.to_string(),
+                Err(error) => format!("Plan file: {error:#}"),
+            },
+            result.is_err(),
+        )
+    }
+
     pub(super) async fn execute_plan_transition(
         &mut self,
         tool_name: &str,
@@ -85,7 +150,7 @@ impl ToolLoopExecutor {
             manager.set_mode(PermissionMode::PlanMode);
             return Ok(
                 json!({"mode":"plan","planFilePath":path,"plan":plans::read(&root,&session)?,
-                "message":"Read-only planning enabled. Submit Markdown with ExitPlanMode(plan); do not modify project files."}),
+                "message":"Planning enabled. Write/edit only planFilePath with Write or Edit, then call ExitPlanMode to request approval. Do not modify project files."}),
             );
         }
         anyhow::ensure!(
@@ -118,7 +183,7 @@ impl ToolLoopExecutor {
         }
         let plan = plans::read(&root, &session)?
             .filter(|plan| !plan.trim().is_empty())
-            .ok_or_else(|| anyhow!("No plan written yet; supply ExitPlanMode(plan)"))?;
+            .ok_or_else(|| anyhow!("No plan written yet; write the session plan file, then call ExitPlanMode (or supply plan text)"))?;
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.answer_waiters
@@ -431,6 +496,340 @@ mod tests {
             );
             assert!(waiters.lock().await.is_empty());
             assert!(plans::read(root.path(), "plan-session").unwrap().is_some());
+        }
+    }
+    fn document_executor(
+        root: &std::path::Path,
+    ) -> (
+        ToolLoopExecutor,
+        mpsc::Receiver<EngineEvent>,
+        Arc<crate::permissions::PermissionManager>,
+    ) {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let manager = crate::runtime::default_permissions();
+        manager.set_mode(PermissionMode::PlanMode);
+        let provider = ResolvedProvider {
+            provider: serde_json::from_value(json!({"id":"plan-test","name":"plan-test","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),
+            model: serde_json::from_value(json!({"id":"plan-test","name":"plan-test","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap(),
+        };
+        let workspace = root.join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let executor = ToolLoopExecutor::new(
+            provider,
+            vec![],
+            None,
+            128,
+            tx,
+            workspace.to_string_lossy().into_owned(),
+            ReasoningMode::Standard,
+        )
+        .with_conv_id("file-session".into())
+        .with_search_config_path(root.join("settings.json"))
+        .with_permission_manager(manager.clone());
+        (executor, rx, manager)
+    }
+
+    #[tokio::test]
+    async fn dedicated_file_write_read_edit_and_exit_require_real_plan_approval() {
+        for answer in [Some("yes"), Some("no"), None] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut executor, mut rx, manager) = document_executor(root.path());
+            let target = plans::path(root.path(), "file-session").unwrap();
+            let (_, out, failed) = executor
+                .execute_tool_call(
+                    "Write",
+                    &json!({"file_path":target,"content":"# File plan\nRun checks"}),
+                    "write",
+                )
+                .await;
+            assert!(!failed, "{out}");
+            let (_, out, failed) = executor
+                .execute_tool_call(
+                    "Read",
+                    &json!({"file_path":target,"offset":2,"limit":1}),
+                    "read",
+                )
+                .await;
+            assert!(!failed, "{out}");
+            assert!(out.contains("Run checks"));
+            for denied in [
+                plans::path(root.path(), "other-session").unwrap(),
+                root.path().join("project/code.rs"),
+            ] {
+                let (_, _, failed) = executor
+                    .execute_tool_call(
+                        "Write",
+                        &json!({"file_path":denied,"content":"bad"}),
+                        "denied",
+                    )
+                    .await;
+                assert!(failed);
+                assert!(!denied.exists());
+            }
+            manager.set_session_rules(
+                "file-session",
+                std::collections::HashMap::from([(
+                    "Edit".into(),
+                    crate::permissions::rules::PermissionAction::Deny,
+                )]),
+            );
+            let edit = json!({"file_path":target,"old_string":"Run checks","new_string":"Run regression checks"});
+            assert!(
+                executor
+                    .execute_tool_call("Edit", &edit, "denied-edit")
+                    .await
+                    .2
+            );
+            manager.set_session_rules("file-session", Default::default());
+            let (_, out, failed) = executor.execute_tool_call("Edit", &edit, "edit").await;
+            assert!(!failed, "{out}");
+            let waiters = executor.get_answer_waiters();
+            let task = tokio::spawn(async move {
+                executor
+                    .execute_tool_call("ExitPlanMode", &json!({}), "exit")
+                    .await
+            });
+            let EngineEvent::ToolPermission {
+                request_id, input, ..
+            } = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            assert_eq!(input["planFilePath"], json!(target));
+            assert_eq!(input["plan"], "# File plan\nRun regression checks");
+            assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+            let sender = waiters.lock().await.remove(&request_id).unwrap();
+            if let Some(answer) = answer {
+                sender.send(answer.into()).unwrap();
+            } else {
+                drop(sender);
+            }
+            let (_, out, failed) = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed, answer != Some("yes"), "{out}");
+            assert_eq!(
+                manager.get_mode(),
+                if failed {
+                    PermissionMode::PlanMode
+                } else {
+                    PermissionMode::AskPermissions
+                }
+            );
+            assert!(waiters.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_file_explicit_ask_rule_denial_cancellation_and_mode_changes_are_respected() {
+        for answer in [
+            Some("yes"),
+            Some("no"),
+            None,
+            Some("mode-change"),
+            Some("deny-change"),
+            Some("?"),
+            Some("??"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut executor, mut rx, manager) = document_executor(root.path());
+            let target = plans::path(root.path(), "file-session").unwrap();
+            manager.set_session_rules(
+                "file-session",
+                std::collections::HashMap::from([(
+                    "Write".into(),
+                    crate::permissions::rules::PermissionAction::Confirm,
+                )]),
+            );
+            let waiters = executor.get_answer_waiters();
+            let requested = target.clone();
+            let task = tokio::spawn(async move {
+                executor
+                    .execute_tool_call(
+                        "Write",
+                        &json!({"file_path":requested,"content":"# Approved write"}),
+                        "write",
+                    )
+                    .await
+            });
+            let EngineEvent::ToolPermission { request_id, .. } =
+                timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            assert!(!target.exists());
+            if answer == Some("mode-change") {
+                manager.set_mode(PermissionMode::AcceptEdits);
+            }
+            if answer == Some("deny-change") {
+                manager.set_session_rules(
+                    "file-session",
+                    std::collections::HashMap::from([(
+                        "Write".into(),
+                        crate::permissions::rules::PermissionAction::Deny,
+                    )]),
+                );
+            }
+            let sender = waiters.lock().await.remove(&request_id).unwrap();
+            if let Some(answer) = answer {
+                sender
+                    .send(
+                        if answer.ends_with("change") {
+                            "yes"
+                        } else {
+                            answer
+                        }
+                        .into(),
+                    )
+                    .unwrap();
+            } else {
+                drop(sender);
+            }
+            let (_, out, failed) = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed, answer != Some("yes"), "{out}");
+            assert_eq!(target.exists(), answer == Some("yes"));
+            assert!(waiters.lock().await.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn model_streams_route_plan_file_tools_through_session_executor_on_both_protocols() {
+        use axum::{http::header, routing::post, Json, Router};
+        for format in ["anthropic", "openai"] {
+            for answer in ["yes", "no"] {
+                let root = tempfile::tempdir().unwrap();
+                let target = plans::path(root.path(), "file-session").unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+                let recorded = requests.clone();
+                let requested_path = target.clone();
+                let app = Router::new().route(if format == "anthropic" {"/v1/messages"} else {"/v1/chat/completions"}, post(move |Json(body): Json<Value>| {
+                    let recorded = recorded.clone();
+                    let requested_path = requested_path.clone();
+                    async move {
+                        let mut recorded = recorded.lock().await;
+                        let step = recorded.len();
+                        recorded.push(body);
+                        let (name, input) = match step {
+                            0 => ("Write", json!({"file_path":requested_path,"content":"# Stream plan\nCheck code"})),
+                            1 => ("Edit", json!({"file_path":requested_path,"old_string":"Check code","new_string":"Run regression tests"})),
+                            2 => ("Read", json!({"file_path":requested_path})),
+                            _ => ("ExitPlanMode", json!({})),
+                        };
+                        let events = if format == "anthropic" {
+                            if step < 4 {
+                                vec![json!({"type":"message_start","message":{"id":format!("m{step}"),"model":"plan-test","usage":{"input_tokens":10}}}),
+                                    json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":format!("t{step}"),"name":name,"input":{}}}),
+                                    json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
+                                    json!({"type":"content_block_stop","index":0}),
+                                    json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"})]
+                            } else {
+                                vec![json!({"type":"message_start","message":{"id":"done","model":"plan-test","usage":{"input_tokens":10}}}),
+                                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"finished"}}),
+                                    json!({"type":"content_block_stop","index":0}),
+                                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"})]
+                            }
+                        } else if step < 4 {
+                            vec![json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("t{step}"),"type":"function","function":{"name":name,"arguments":input.to_string()}}]},"finish_reason":null}]}),
+                                json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})]
+                        } else {
+                            vec![json!({"choices":[{"index":0,"delta":{"content":"finished"},"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})]
+                        };
+                        let mut stream = events.into_iter().map(|event|format!("data: {event}\n\n")).collect::<String>();
+                        if format == "openai" {stream.push_str("data: [DONE]\n\n");}
+                        ([(header::CONTENT_TYPE, "text/event-stream")], stream)
+                    }
+                }));
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let (mut executor, mut events, manager) = document_executor(root.path());
+                executor.provider.provider.base_url = base;
+                executor.provider.provider.api_format = if format == "anthropic" {
+                    crate::native_engine::provider_manager::ApiFormat::Anthropic
+                } else {
+                    crate::native_engine::provider_manager::ApiFormat::OpenAI
+                };
+                executor.messages =
+                    vec![json!({"role":"user","content":"Write and review a plan"})];
+                let waiters = executor.get_answer_waiters();
+                let event_reader = tokio::spawn(async move {
+                    let mut results = Vec::new();
+                    let mut approvals = 0;
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            EngineEvent::ToolPermission {
+                                request_id,
+                                tool_name,
+                                input,
+                                ..
+                            } => {
+                                assert_eq!(tool_name, "ExitPlanMode");
+                                assert_eq!(input["plan"], "# Stream plan\nRun regression tests");
+                                approvals += 1;
+                                waiters
+                                    .lock()
+                                    .await
+                                    .remove(&request_id)
+                                    .unwrap()
+                                    .send(answer.into())
+                                    .unwrap();
+                            }
+                            EngineEvent::ToolUseDone {
+                                tool_name,
+                                output,
+                                is_error,
+                                ..
+                            } => results.push((tool_name, output, is_error)),
+                            _ => {}
+                        }
+                    }
+                    (results, approvals)
+                });
+                let result = timeout(Duration::from_secs(15), executor.execute())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(executor);
+                let (results, approvals) = event_reader.await.unwrap();
+                server.abort();
+                assert_eq!(result.0, "finished", "{format}/{answer}");
+                assert_eq!(approvals, 1);
+                assert_eq!(results.len(), 4);
+                for (name, output, failed) in &results[..3] {
+                    assert!(!failed, "{format} {name}: {output}");
+                }
+                assert_eq!(results[3].2, answer != "yes");
+                assert_eq!(
+                    manager.get_mode(),
+                    if answer == "yes" {
+                        PermissionMode::AskPermissions
+                    } else {
+                        PermissionMode::PlanMode
+                    }
+                );
+                assert_eq!(
+                    plans::read(root.path(), "file-session").unwrap().unwrap(),
+                    "# Stream plan\nRun regression tests"
+                );
+                let requests = requests.lock().await;
+                assert_eq!(requests.len(), 5);
+                assert!(requests[3]["messages"]
+                    .to_string()
+                    .contains("Run regression tests"));
+            }
         }
     }
 }

@@ -24,9 +24,14 @@ pub(super) fn capture(path: &Path) -> Option<String> {
     }
 }
 pub(super) fn completed(path: &Path, before: Option<String>) -> Value {
+    let after = if path.is_file() { capture(path) } else { None };
+    completed_text(path, before, after)
+}
+
+/// Callers with protected storage must supply snapshots read through that storage.
+pub(crate) fn completed_text(path: &Path, before: Option<String>, after: Option<String>) -> Value {
     let base = json!({"version":1,"path":path.to_string_lossy(),"verified":true});
     let mut result = base;
-    let after = if path.is_file() { capture(path) } else { None };
     let Some((before, after)) = before.zip(after) else {
         result["notice"] = json!("Diff omitted: binary, unavailable, or larger than 256 KiB");
         return result;

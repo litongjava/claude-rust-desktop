@@ -23,6 +23,7 @@ mod skill_commands;
 mod extended_commands;
 mod session_commands;
 mod session_trust;
+mod status_commands;
 mod display_commands;
 mod background_commands;
 mod batch_commands;
@@ -480,9 +481,10 @@ async fn run(cli: &Cli) -> Result<()> {
                 Ok(false) => {},
             }
             match background_commands::handle(cli, command, argument, &paths, &mut session, &mut input).await {
-                Ok(true) => continue,
+                Ok(background_commands::Outcome::Handled) => continue,
+                Ok(background_commands::Outcome::Exit) => break,
                 Err(error) => { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } continue; },
-                Ok(false) => {},
+                Ok(background_commands::Outcome::NotHandled) => {},
             }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
                 Ok(true) => continue,
@@ -501,7 +503,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     eprintln!("{}", command_catalog::help());
                     for (name, description) in &skills { eprintln!("  {name:<24} {description}"); }
                 },
-                "/status" | "status" | ".status" => { eprintln!("Session: {}\nProject: {}\nData: {}", session.id, session.workspace.display(), paths.data_dir.display()); interactive_config::status(&session); },
+                "status" | ".status" => { if let Err(error) = status_commands::run(&session, "").await { eprintln!("Status: {error:#}"); } },
                 "/history" | "history" | ".history" => println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
                 "/tools" | "tools" | ".tools" => for tool in claude_core::tools::get_tool_definitions() { eprintln!("{}: {}", tool.name, tool.description); },
                 command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {

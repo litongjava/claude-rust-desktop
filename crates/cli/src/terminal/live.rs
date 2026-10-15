@@ -2,7 +2,7 @@
 use super::change_view;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, terminal,
@@ -154,6 +154,13 @@ struct Draft {
     cursor: usize,
 }
 impl Draft {
+    fn insert_paste(&mut self, text: &str) -> bool {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let count = normalized.chars().filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t')).count();
+        if self.characters.len().saturating_add(count) > 32_768 { return false; }
+        self.insert(&normalized);
+        true
+    }
     fn insert(&mut self, text: &str) {
         for ch in text
             .replace("\r\n", "\n")
@@ -628,6 +635,7 @@ fn run(
     actions: async_mpsc::UnboundedSender<Action>,
 ) -> io::Result<()> {
     let mut last_tick = Instant::now();
+    let mut input_reader = super::paste_input::Reader::new()?;
     screen.draw(state)?;
     loop {
         let mut dirty = false;
@@ -744,8 +752,8 @@ fn run(
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         }
-        if event::poll(Duration::from_millis(25))? {
-            match event::read()? {
+        if let Some(event) = input_reader.next(Duration::from_millis(25))? {
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let key = match state.bindings.resolve(key, &mut state.key_pending) {
                         crate::keybindings::Resolution::Key(key) => key,
@@ -898,7 +906,9 @@ fn run(
                     }
                 }
                 Event::Paste(text) => {
-                    state.draft.insert(&text);
+                    if !state.draft.insert_paste(&text) {
+                        screen.log("Paste not inserted: the active draft limit is 32768 characters. Shorten the text and paste again.")?;
+                    }
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -919,6 +929,14 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_paste_is_rejected_without_partial_draft_changes() {
+        let mut draft=Draft::default();draft.insert("keep");
+        assert!(!draft.insert_paste(&"x".repeat(32_768)));
+        assert_eq!(draft.take(),"keep");
+        assert!(draft.insert_paste("first\r\n\n中文"));
+        assert_eq!(draft.take(),"first\n\n中文");
+    }
     #[test]
     fn permission_cycle_preserves_pending_answer_and_queued_draft() {
         let mut state = State::new("ask".into());
@@ -1103,7 +1121,7 @@ pub struct TurnDisplay {
     pub live: Option<LiveTurn>,
     fallback: super::progress::TurnProgress,
     tools: std::collections::HashMap<String, (Instant, String)>,
-    finished: std::collections::HashSet<String>,
+    finished: std::collections::HashMap<String, (String, Value, String, bool)>,
 }
 impl TurnDisplay {
     pub fn new(
@@ -1170,7 +1188,7 @@ impl TurnDisplay {
     }
     pub fn tool_started(&mut self, id: &str, name: &str, input: &Value) {
         if let Some(live) = &self.live {
-            if self.tools.contains_key(id) || self.finished.contains(id) {
+            if self.tools.contains_key(id) || self.finished.contains_key(id) {
                 return;
             }
             self.tools.insert(
@@ -1187,18 +1205,30 @@ impl TurnDisplay {
             self.fallback.tool_started(id, name, input);
         }
     }
-    pub fn tool_finished(&mut self, id: &str, name: &str, output: &str, failed: bool) {
+    pub fn tool_finished(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &Value,
+        output: &str,
+        failed: bool,
+    ) {
+        if self.finished.get(id).is_some_and(|previous| {
+            previous.0 == name
+                && previous.1 == *input
+                && previous.2 == output
+                && previous.3 == failed
+        }) {
+            return;
+        }
+        self.finished.insert(
+            id.to_owned(),
+            (name.into(), input.clone(), output.into(), failed),
+        );
         if let Some(live) = &self.live {
-            if !self.finished.insert(id.to_owned()) {
-                return;
-            }
             let previous = self.tools.remove(id);
             let elapsed = previous.as_ref().map(|(start, _)| start.elapsed());
-            let body = format!(
-                "{}\n\nOutput:\n{}",
-                previous.map(|(_, input)| input).unwrap_or_default(),
-                output
-            );
+            let body = format!("Input:\n{}\n\nOutput:\n{}", input, output);
             live.detail(
                 id,
                 &format!("{name} - {}", if failed { "error" } else { "completed" }),
@@ -1213,8 +1243,9 @@ impl TurnDisplay {
                     &format!("{name} - completed"),
                     &format!("{}\n\n{}", change_view::plain(&lines), body),
                 );
-                let display_lines = change_view::change_in_workspace(output, failed, self.workspace.as_deref())
-                    .unwrap_or_else(|| lines.clone());
+                let display_lines =
+                    change_view::change_in_workspace(output, failed, self.workspace.as_deref())
+                        .unwrap_or_else(|| lines.clone());
                 let mut preview = display_lines.iter().take(14).cloned().collect::<Vec<_>>();
                 if lines.len() > 14 {
                     preview.push(change_view::success("More changes in details (Ctrl+O)"));
@@ -1230,7 +1261,7 @@ impl TurnDisplay {
             }
             live.activity("Working");
         } else {
-            self.fallback.tool_finished(id, name, output, failed);
+            self.fallback.tool_finished(id, name, input, output, failed);
         }
     }
     pub fn agent_progress(&mut self, id: &str, kind: &str, status: &str, tool: Option<&str>) {
@@ -1273,6 +1304,83 @@ impl TurnDisplay {
         } else {
             self.fallback.finish(error);
             Vec::new()
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn distinct_results_update_live_details_with_actual_input_without_duplicate_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut display =
+            TurnDisplay::new(false, "ask", &temp.path().join("keys.json"), vec![]).unwrap();
+        let (send, receive) = mpsc::channel();
+        let (_, actions) = async_mpsc::unbounded_channel();
+        display.live = Some(LiveTurn {
+            updates: send,
+            actions,
+            worker: None,
+        });
+        let input = serde_json::json!({"file_path":"a.txt"});
+        display.tool_started("one", "Read", &input);
+        display.tool_finished("one", "Read", &input, "old", false);
+        let mut state = State::new("ask".into());
+        for update in receive.try_iter() {
+            if let Update::Detail(id, title, body) = update {
+                state.detail(id, title, body);
+            }
+        }
+        assert_eq!(state.detail_entries.len(), 1);
+        display.tool_finished("one", "Read", &input, "old", false);
+        assert!(
+            receive.try_recv().is_err(),
+            "identical mirror must not reset activity or redraw"
+        );
+        for (name, input, output, failed) in [
+            (
+                "Read",
+                serde_json::json!({"file_path":"a.txt"}),
+                "new",
+                false,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path":"b.txt"}),
+                "new",
+                false,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path":"b.txt"}),
+                "new",
+                true,
+            ),
+            (
+                "Other",
+                serde_json::json!({"file_path":"b.txt"}),
+                "new",
+                true,
+            ),
+        ] {
+            display.tool_finished("one", name, &input, output, failed);
+            let mut updated = false;
+            for update in receive.try_iter() {
+                if let Update::Detail(id, title, body) = update {
+                    assert!(body.contains(&input.to_string()));
+                    assert!(body.contains(output));
+                    assert!(title.contains(name));
+                    assert_eq!(title.contains("error"), failed);
+                    state.detail(id, title, body);
+                    updated = true;
+                }
+            }
+            assert!(updated);
+            assert_eq!(state.detail_entries.len(), 1);
+            assert_eq!(display.finished.len(), 1);
+            assert!(display.tools.is_empty());
         }
     }
 }

@@ -313,6 +313,29 @@ async fn added_directory_survives_worker_resume_without_granting_other_sessions(
             .filter(|m| m["role"] == "tool")
             .collect();
         assert_eq!(results.len(), 3, "{observed}");
+        let event_log = std::fs::read_to_string(
+            paths
+                .data_dir
+                .join("background-tasks")
+                .join(&job)
+                .join("output.jsonl"),
+        )
+        .unwrap();
+        let completions: Vec<serde_json::Value> = event_log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["type"] == "tool_result")
+            .collect();
+        assert_eq!(
+            completions.len(),
+            3,
+            "Each executed or denied tool has one completion"
+        );
+        let ids: std::collections::HashSet<_> = completions
+            .iter()
+            .map(|event| event["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
         assert_eq!(
             results[0]["content"]
                 .to_string()
@@ -417,6 +440,10 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     let host = worker::ensure_worker(&paths.data_dir, executable, &session, &workspace)
         .await
         .unwrap();
+    let initial_status=worker::runtime_status(&paths.data_dir,&session).await;
+    assert_eq!(initial_status.state,"reachable");
+    assert!(!initial_status.tools.unwrap().mcp_initialized);
+    assert!(!marker.exists(),"status must not launch MCP");
     let mut cleanup = Cleanup(vec![host.supervisor_pid.unwrap()]);
     for (prompt, model, tokens) in [
         ("first turn", "fixture-one", 64),
@@ -445,6 +472,13 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
         "start\n",
         "two tool turns reuse one language server"
     );
+    let tool_status=worker::runtime_status(&paths.data_dir,&session).await;
+    assert_eq!(tool_status.state,"reachable");
+    let tool_status=tool_status.tools.unwrap();
+    assert!(tool_status.mcp_initialized);
+    assert!(tool_status.mcp.iter().any(|server|server.name=="fixture" && server.state=="manager_reports_running"));
+    assert_eq!(tool_status.lsp_pooled.len(),1);
+    assert!(!serde_json::to_string(&tool_status).unwrap().contains("START_MARKER"));
     let slow = submit(&host, &endpoint, "slow cancellation", "fixture-two", 96).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         while requests.lock().unwrap().len() < 5 {
@@ -453,6 +487,9 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     })
     .await
     .unwrap();
+    let active_status=worker::runtime_status(&paths.data_dir,&session).await;
+    assert_eq!(active_status.state,"reachable", "runtime status must not wait for the active turn's Session mutex");
+    assert!(active_status.tools.unwrap().mcp_initialized);
     tokio::time::timeout(Duration::from_secs(2), worker::set_permission_mode(&paths.data_dir, &session, &slow, "plan")).await.unwrap().unwrap();
     assert_eq!(claude_core::services::session_permission_mode::load(&store.db, &session).unwrap(), Some(claude_core::permissions::PermissionMode::PlanMode));
     assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "plan");

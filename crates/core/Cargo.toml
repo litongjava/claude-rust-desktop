@@ -52,3 +52,6 @@ qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

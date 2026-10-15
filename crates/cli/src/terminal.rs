@@ -44,6 +44,7 @@ pub mod input;
 pub mod progress;
 pub mod prompt_display;
 pub mod live;
+pub(crate) mod paste_input;
 pub mod change_view;
 mod display_path;
 pub mod style;

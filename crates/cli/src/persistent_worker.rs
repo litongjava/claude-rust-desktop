@@ -19,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+type StatusTarget = Arc<std::sync::Mutex<Option<claude_core::services::runtime_status::RuntimeSource>>>;
 type ModeTarget = Arc<std::sync::Mutex<Option<(String, Arc<claude_core::permissions::PermissionManager>, Arc<claude_core::db::DbManager>)>>>;
 
 pub async fn run_from_env() -> Result<bool> {
@@ -35,6 +36,7 @@ pub async fn run_from_env() -> Result<bool> {
     let mut listener = service::Listener::bind(&worker)?;
     let session = Arc::new(tokio::sync::Mutex::new(None::<Session>));
     let mode_target: ModeTarget = Arc::new(std::sync::Mutex::new(None));
+    let status_target: StatusTarget = Arc::new(std::sync::Mutex::new(None));
     let active = Arc::new(AtomicBool::new(false));
     let fatal = Arc::new(AtomicBool::new(false));
     let mut idle = Instant::now();
@@ -68,6 +70,17 @@ pub async fn run_from_env() -> Result<bool> {
                         }
                 }
                 match request {
+                    Request::RuntimeStatus => {
+                        let source = status_target.lock().unwrap_or_else(|error|error.into_inner()).clone().unwrap_or_else(||claude_core::services::runtime_status::RuntimeSource {
+                            mcp: Arc::new(claude_core::mcp::McpServerManager::new(worker.root.join("mcp-servers.json"))),
+                            mcp_ready: Arc::new(tokio::sync::OnceCell::new()), workspace: worker.workspace.clone(), data_dir:worker.root.clone(),
+                        });
+                        let response = match tokio::time::timeout(Duration::from_secs(1), source.snapshot()).await {
+                            Ok(snapshot) => { let mut response=Reply::ok(None); response.runtime_status=Some(snapshot); response },
+                            Err(_) => Reply::error("Runtime status inspection timed out"),
+                        };
+                        let _ = service::reply(stream, &response).await;
+                    },
                     Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
                     Request::SetPermissionMode { job_id, mode } => {
                         let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
@@ -92,14 +105,14 @@ pub async fn run_from_env() -> Result<bool> {
                         if let Err(error)=service::begin_job(&worker,&id,&prompt) {
                             active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
                         }
-                        let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();
+                        let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();let status_target=status_target.clone();
                         tokio::spawn(async move {
                             let task_worker=worker.clone();let task_id=turn_id.clone();let task_mode_target=mode_target.clone();
-                            let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target).await}).await;
-                            *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = None;
+                            let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target,status_target).await}).await;
                             let error=match result {Ok(result)=>result.err().map(|error|format!("{error:#}")),Err(error)=>{fatal.store(true,Ordering::Release);Some(format!("Session turn panicked: {error}"))}};
                             if let Some(error)=&error {let _=service::emit_event(&serde_json::json!({"type":"error","error":error}));}
                             if service::finish_job(&worker,&turn_id,error).await.is_err() {fatal.store(true,Ordering::Release);}
+                            *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = None;
                             service::set_event_sink(None);
                             std::env::remove_var(jobs::CONTROL_ENV);
                             active.store(false,Ordering::Release);
@@ -125,6 +138,7 @@ async fn execute(
     environment: Vec<(String, String)>,
     sessions: Arc<tokio::sync::Mutex<Option<Session>>>,
     mode_target: ModeTarget,
+    status_target: StatusTarget,
 ) -> Result<()> {
     let dir = worker.root.join("background-tasks").join(id);
     service::set_event_sink(Some(dir.join("output.jsonl")));
@@ -193,6 +207,7 @@ async fn execute(
     }
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
     let session = current.as_ref().unwrap();
+    *status_target.lock().unwrap_or_else(|error|error.into_inner()) = Some(session.runtime_status_source());
     *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some((id.into(), session.permissions.clone(), session.store.db.clone()));
     let result = current
         .as_ref()

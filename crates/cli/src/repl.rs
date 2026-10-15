@@ -66,6 +66,7 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
         return Ok(true);
     }
     match command {
+        "/status" => crate::status_commands::run(session, argument).await?,
         "/compact" => {
             let context = crate::services::context(paths)?;
             let report = tokio::select! {

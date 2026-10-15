@@ -23,7 +23,7 @@ mod utf8;
 mod bash_process;
 pub mod background_shell;
 pub(crate) mod path_scope;
-mod file_change;
+pub(crate) mod file_change;
 mod web;
 pub(crate) mod provider_search;
 pub use provider_search::search as search_provider;

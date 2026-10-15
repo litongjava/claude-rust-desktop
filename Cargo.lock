@@ -1023,6 +1023,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "rusqlite",
+ "rustix 1.1.4",
  "scraper",
  "semver",
  "serde",
