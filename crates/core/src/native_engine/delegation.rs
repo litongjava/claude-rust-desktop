@@ -513,7 +513,7 @@ impl ToolLoopExecutor {
         context.save_setting(&state.key, &state.value)?;
         let _ = self.event_tx.send(state.progress("started", None)).await;
         let mut assistant_id = uuid::Uuid::new_v4().to_string();
-        let mut tool_index = 0;
+        let mut tool_rows: HashMap<String, crate::db::message_repo::ToolCallRow> = HashMap::new();
         let collect_web_evidence = child.response_schema.is_some();
         let mut web_evidence = Vec::new();
         let mut evidence_ids = std::collections::HashSet::new();
@@ -527,7 +527,7 @@ impl ToolLoopExecutor {
                         match event {
                             EngineEvent::ContextReset { .. } => {
                                 assistant_id = uuid::Uuid::new_v4().to_string();
-                                tool_index = 0;
+                                tool_rows.clear();
                             }
                             event @ (EngineEvent::AskUser {..} | EngineEvent::ToolPermission {..} | EngineEvent::Usage(_) | EngineEvent::AgentProgress {..}) => { let _ = self.event_tx.send(event).await; }
                             EngineEvent::ToolUseStart { tool_name, .. } => {
@@ -538,7 +538,15 @@ impl ToolLoopExecutor {
                                 if collect_web_evidence && matches!(tool_name.as_str(), "WebSearch" | "WebFetch") && evidence_ids.insert(tool_use_id.clone()) {
                                     web_evidence.push(json!({"tool_use_id":tool_use_id,"name":tool_name,"input":tool_input,"output":serde_json::from_str::<Value>(&output).unwrap_or_else(|_|Value::String(output.clone())),"is_error":is_error}));
                                 }
-                                let row = crate::db::message_repo::ToolCallRow { id: format!("{assistant_id}:{tool_use_id}"), message_id: assistant_id.clone(), name:tool_name, input:Some(tool_input.to_string()), output:Some(output), is_error, sort_order:tool_index };
+                                let row_id = format!("{assistant_id}:{tool_use_id}");
+                                let previous = tool_rows.get(&row_id);
+                                let sort_order = previous.map_or(tool_rows.len() as i64, |row| row.sort_order);
+                                let row = crate::db::message_repo::ToolCallRow { id: row_id, message_id: assistant_id.clone(), name:tool_name, input:Some(tool_input.to_string()), output:Some(output), is_error, sort_order };
+                                // Parallel execution emits both ordinary and pipeline completion.
+                                // Preserve one result position and one progress notice for the pair.
+                                if previous.is_some_and(|old| old.name == row.name && old.input == row.input && old.output == row.output && old.is_error == row.is_error) {
+                                    continue;
+                                }
                                 let persisted = (|| -> Result<()> {
                                     context.db.with_conn(|conn| crate::db::message_repo::save_stream_tool_result(conn, &id, &assistant_id, "", &row))??;
                                     Ok(())
@@ -548,7 +556,7 @@ impl ToolLoopExecutor {
                                     let _ = self.event_tx.send(state.progress("failed", None)).await;
                                     return Err(error);
                                 }
-                                tool_index += 1;
+                                tool_rows.insert(row.id.clone(), row.clone());
                                 let status = if is_error { "tool_failed" } else { "tool_completed" };
                                 let _ = self.event_tx.send(state.progress(status, Some(row.name.clone()))).await;
                             }
