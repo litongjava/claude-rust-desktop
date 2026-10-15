@@ -298,9 +298,24 @@ impl SessionStore {
     /// Copy bindings atomically so agent restrictions and worktrees survive clear.
     pub fn clear(&self, id: &str) -> Result<String> {
         self.resume(id)?;
+        self.derive_empty(id, None)
+    }
+
+    /// Derive a child without converting Desktop modes/private folders into Code projects.
+    pub fn derive_owned_child(&self, id: &str, workspaces_root: &Path, expected_cwd: &Path) -> Result<String> {
+        self.derive_empty(id, Some((workspaces_root, expected_cwd)))
+    }
+
+    fn derive_empty(&self, id: &str, owned: Option<(&Path, &Path)>) -> Result<String> {
         self.db.with_conn(|conn| -> Result<String> {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let source = conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
+            ensure!(!source.archived, "Parent session is archived");
+            crate::native_engine::workspace::conversation_project(&tx, id)?;
+            if let Some((root, expected)) = owned {
+                let actual = crate::native_engine::workspace::resolve_workspace(&tx, root, id, None)?.0;
+                ensure!(actual.canonicalize()? == expected.canonicalize()?, "Parent runtime workspace differs from its persisted binding");
+            }
             let new_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             conversation_repo::insert_conversation(
@@ -318,6 +333,18 @@ impl SessionStore {
                 "INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2",
                 rusqlite::params![new_id, id],
             )?;
+            tx.execute(
+                "INSERT INTO conversation_worktree_backends (conversation_id, backend, metadata) SELECT ?1, backend, metadata FROM conversation_worktree_backends WHERE conversation_id=?2",
+                rusqlite::params![new_id, id],
+            )?;
+            if owned.is_some() && source.project_id.as_deref().is_none_or(str::is_empty) {
+                ensure!(source.workspace_mode != "code", "Code children require a trusted project");
+                tx.execute("INSERT INTO conversation_private_workspace_bindings(child_id,parent_id) VALUES(?1,?2)", rusqlite::params![new_id,id])?;
+            }
+            if let Some((root, expected)) = owned {
+                let actual = crate::native_engine::workspace::resolve_workspace(&tx, root, &new_id, None)?.0;
+                ensure!(actual.canonicalize()? == expected.canonicalize()?, "Child workspace differs from its parent binding");
+            }
             tx.commit()?;
             Ok(new_id)
         })?

@@ -1,5 +1,5 @@
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 use crate::db::{conversation_repo, project_repo};
@@ -26,6 +26,26 @@ pub fn conversation_project(conn: &Connection, id: &str) -> Result<Option<projec
     Ok(None)
 }
 
+/// Explicit owned-child bindings are the only exception to one private directory per session.
+fn private_workspace_owner(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let binding = |id: &str| -> Result<Option<String>> {
+        Ok(conn.query_row("SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?1", [id], |row| row.get(0)).optional()?)
+    };
+    if binding(id)?.is_none() { return Ok(None); }
+    let child = conversation_repo::get_conversation(conn,id)?.context("Private child not found")?;
+    let mode = child.workspace_mode;
+    ensure!(mode != "code", "Code sessions cannot inherit a private workspace");
+    let mut current=id.to_owned();
+    let mut seen=std::collections::HashSet::new();
+    for _ in 0..16 {
+        ensure!(seen.insert(current.clone()), "Private workspace ownership cycle");
+        let session=conversation_repo::get_conversation(conn,&current)?.context("Private workspace owner not found")?;
+        ensure!(!session.archived && session.workspace_mode==mode && session.project_id.as_deref().is_none_or(str::is_empty), "Private workspace ownership mode/project/trust changed");
+        match binding(&current)? {Some(parent)=>current=parent,None=>return Ok(Some(current))}
+    }
+    anyhow::bail!("Private workspace ownership depth exceeded")
+}
+
 /// A Home conversation always owns its working directory. Legacy paths and client
 /// overrides must not turn an unassigned conversation into access to a source tree.
 pub fn resolve_workspace(
@@ -34,6 +54,7 @@ pub fn resolve_workspace(
     id: &str,
     requested: Option<&str>,
 ) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
+    let private_owner = private_workspace_owner(conn, id)?;
     if let Some(mut project) = conversation_project(conn, id)? {
         let path = project.workspace_path.as_deref().context("Project has no working directory")?;
         ensure!(Path::new(path).is_absolute() && Path::new(path).is_dir(), "Project folder is unavailable");
@@ -62,10 +83,14 @@ pub fn resolve_workspace(
     ensure!(workspaces_root.is_absolute(), "Application workspace directory must be absolute");
     std::fs::create_dir_all(workspaces_root).context("Could not create application workspace directory")?;
     let root = std::fs::canonicalize(workspaces_root)?;
-    let directory = root.join(id);
+    let owner_id = private_owner.as_deref().unwrap_or(id);
+    ensure!(!owner_id.is_empty() && owner_id.len()<=128 && owner_id.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-' || c==b'_'), "Invalid private owner workspace ID");
+    let expected = root.join(owner_id);
+    let directory = expected.clone();
     std::fs::create_dir_all(&directory).context("Could not create conversation workspace")?;
     let directory = std::fs::canonicalize(directory)?;
     ensure!(directory.starts_with(&root) && directory != root, "Conversation workspace is outside the application workspace directory");
+    if private_owner.is_some() { ensure!(directory == expected, "Private workspace owner path is redirected"); }
     if conversation.is_some() {
         conn.execute("UPDATE conversations SET workspace_path = ?1 WHERE id = ?2", params![directory.to_string_lossy(), id])?;
     }

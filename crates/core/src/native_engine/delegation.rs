@@ -158,7 +158,12 @@ impl ToolLoopExecutor {
         let id = if let Some(parent) = self.conv_id.as_deref() {
             // Preserve the parent's trusted source identity and managed worktree.
             // Creating from actual cwd would incorrectly trust a worktree as a new project.
-            let child = sessions.clear(parent)?;
+            let parent_row = context.db.with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, parent))??.context("Parent session not found")?;
+            let workspaces_root = if parent_row.project_id.as_deref().is_none_or(str::is_empty) {
+                // The engine may use a private root outside data_dir/workspaces.
+                std::path::Path::new(&self.workspace_cwd).parent().context("Private workspace has no root")?.to_path_buf()
+            } else { context.paths.data_dir.join("workspaces") };
+            let child = sessions.derive_owned_child(parent, &workspaces_root, std::path::Path::new(&self.workspace_cwd))?;
             context.db.with_conn(|conn| conn.execute(
                 "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
                 rusqlite::params![child, self.provider.model.id, self.provider.provider.id],
@@ -302,3 +307,7 @@ impl ToolLoopExecutor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_workspace_tests.rs"]
+mod workspace_tests;

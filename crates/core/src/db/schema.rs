@@ -15,6 +15,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS conversation_private_workspace_bindings (
+    child_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    -- Retain an invalid binding after parent deletion: never silently redirect a child.
+    parent_id TEXT NOT NULL,
+    CHECK(child_id <> parent_id)
+);
+
 CREATE TABLE IF NOT EXISTS conversation_worktrees (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     project_id TEXT NOT NULL,
