@@ -171,7 +171,7 @@ pub struct ToolLoopExecutor {
     learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     delegation_depth: usize,
     owned_children: delegation::OwnedChildren,
-    child_resumes: AtomicUsize,
+    child_resumes: Arc<AtomicUsize>,
     subagent_hook_context: Option<(String, String)>,
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
@@ -182,6 +182,7 @@ pub struct ToolLoopExecutor {
     manual_skill_active: bool,
     durable_user_input: bool,
     message_inbox: Option<crate::services::session_messages::Target>,
+    require_pending_peer_message: bool,
     execution_lease: Option<crate::services::session_messages::ExecutionLease>,
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
@@ -541,7 +542,7 @@ impl ToolLoopExecutor {
             learning_tools: None,
             delegation_depth: 0,
             owned_children: Default::default(),
-            child_resumes: AtomicUsize::new(0),
+            child_resumes: Arc::new(AtomicUsize::new(0)),
             subagent_hook_context: None,
             hooks: None,
             stop_hook_active: false,
@@ -552,6 +553,7 @@ impl ToolLoopExecutor {
             manual_skill_active: false,
             durable_user_input: false,
             message_inbox: None,
+            require_pending_peer_message: false,
             execution_lease: None,
             message_deliveries: 0,
             pending_plan_reset: None,
@@ -898,6 +900,12 @@ impl ToolLoopExecutor {
         self.message_inbox = inbox_owner.as_ref().map(|owner| owner.target.clone());
         self.message_deliveries = 0;
         self.child_resumes.store(0, Ordering::Relaxed);
+        if self.require_pending_peer_message {
+            let incoming = self.drain_peer_messages()?;
+            anyhow::ensure!(!incoming.is_empty(), "No trusted pending peer message remains; needs_resume");
+            self.messages.extend(incoming.into_iter().map(|content| json!({"role":"user","content":content})));
+            self.require_pending_peer_message = false;
+        }
 
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {

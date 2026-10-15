@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, Mutex, oneshot};
 use futures::FutureExt;
 use uuid::Uuid;
 
+#[path = "idle_children.rs"]
+mod idle_children;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningMode {
     #[serde(alias = "quick")]
@@ -562,6 +565,7 @@ impl QueryEngine {
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
         }
+        executor.share_owned_child_budget();
 
         let conv_id_clone = conv_id.clone();
         let active_turns_clone = self.active_turns.clone();

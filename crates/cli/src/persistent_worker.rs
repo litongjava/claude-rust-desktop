@@ -20,7 +20,18 @@ use std::{
     time::{Duration, Instant},
 };
 type StatusTarget = Arc<std::sync::Mutex<Option<claude_core::services::runtime_status::RuntimeSource>>>;
-type ModeTarget = Arc<std::sync::Mutex<Option<(String, Arc<claude_core::permissions::PermissionManager>, Arc<claude_core::db::DbManager>, claude_core::native_engine::provider_manager::ResolvedProvider)>>>;
+struct ModeControl {
+    job_id: String,
+    session_id: String,
+    manager: Arc<claude_core::permissions::PermissionManager>,
+    db: Arc<claude_core::db::DbManager>,
+    provider: claude_core::native_engine::provider_manager::ResolvedProvider,
+    owner_manager: Option<Arc<claude_core::permissions::PermissionManager>>,
+}
+type ModeTarget = Arc<std::sync::Mutex<Option<ModeControl>>>;
+
+#[path = "persistent_child.rs"]
+mod child;
 
 pub async fn run_from_env() -> Result<bool> {
     let Some(value) = std::env::var_os(service::HOST_ENV) else {
@@ -38,6 +49,7 @@ pub async fn run_from_env() -> Result<bool> {
     let mode_target: ModeTarget = Arc::new(std::sync::Mutex::new(None));
     let status_target: StatusTarget = Arc::new(std::sync::Mutex::new(None));
     let active = Arc::new(AtomicBool::new(false));
+    let idle_child_active = Arc::new(AtomicBool::new(false));
     let fatal = Arc::new(AtomicBool::new(false));
     let mut idle = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -51,7 +63,12 @@ pub async fn run_from_env() -> Result<bool> {
                 let turn_active = active.load(Ordering::Acquire);
                 let shell_active = claude_core::tools::background_shell::has_active();
                 if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
-                if turn_active || shell_active {idle=Instant::now();}
+                if (turn_active && !idle_child_active.load(Ordering::Acquire)) || shell_active {idle=Instant::now();}
+                if !turn_active && !fatal.load(Ordering::Acquire) {
+                    if let Err(error) = child::start_pending(&worker, &session, &active, &idle_child_active, &fatal, &mode_target).await {
+                        eprintln!("Owned child wake unavailable: {error:#}");
+                    }
+                }
             },
             stream=listener.accept()=>{
                 let stream=stream?;
@@ -84,12 +101,12 @@ pub async fn run_from_env() -> Result<bool> {
                     Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
                     Request::SetPermissionMode { job_id, mode } => {
                         let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
-                        let reply = match result { Ok(()) => Reply::ok(Some(job_id)), Err(error) => Reply::error(error) };
+                        let reply = match result { Ok(session_id) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_session_id=Some(session_id); reply }, Err(error) => Reply::error(error) };
                         let _ = service::reply(stream, &reply).await;
                     },
                     Request::GetPermissionMode { job_id } => {
                         let result = current_live_mode(&worker, &mode_target, &job_id);
-                        let reply = match result { Ok(mode) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_mode=Some(mode); reply }, Err(error)=>Reply::error(error) };
+                        let reply = match result { Ok((mode, session_id)) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_mode=Some(mode); reply.permission_session_id=Some(session_id); reply }, Err(error)=>Reply::error(error) };
                         let _ = service::reply(stream, &reply).await;
                     },
                     Request::Shutdown=>{
@@ -209,41 +226,46 @@ async fn execute(
     }
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
     let session = current.as_ref().unwrap();
+    session.engine.set_owned_child_idle_ready(&session.id, false);
     *status_target.lock().unwrap_or_else(|error|error.into_inner()) = Some(session.runtime_status_source());
     let current_provider = session.selected_provider().await?;
-    *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some((id.into(), session.permissions.clone(), session.store.db.clone(), current_provider));
+    *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some(ModeControl { job_id:id.into(), session_id:session.id.clone(), manager:session.permissions.clone(), db:session.store.db.clone(), provider:current_provider, owner_manager:None });
     let result = current
         .as_ref()
         .unwrap()
         .turn(&cli, &prompt, &mut None)
         .await;
+    session.engine.set_owned_child_idle_ready(&session.id, result.is_ok());
     let _mode_guard = mode_target.lock().unwrap_or_else(|e|e.into_inner());
     claude_core::services::session_permission_mode::set(&session.store.db, &session.id, &session.permissions, session.permissions.get_mode())?;
     result
 }
 
-fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &str) -> Result<()> {
+fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &str) -> Result<String> {
     ensure!(matches!(claude_core::services::session_permission_mode::parse(mode)?, claude_core::permissions::PermissionMode::AskPermissions | claude_core::permissions::PermissionMode::AcceptEdits | claude_core::permissions::PermissionMode::PlanMode | claude_core::permissions::PermissionMode::DontAsk | claude_core::permissions::PermissionMode::Auto), "Live switching cannot enable bypass permissions");
     let target = target.lock().unwrap_or_else(|e|e.into_inner());
-    let (active_job, manager, db, current_provider) = target.as_ref().context("Session worker has no active initialized turn")?;
-    ensure!(active_job == job_id, "Permission change targets a different job");
+    let control = target.as_ref().context("Session worker has no active initialized turn")?;
+    ensure!(control.job_id == job_id, "Permission change targets a different job");
+    if control.owner_manager.as_ref().is_some_and(|manager| manager.get_mode() == claude_core::permissions::PermissionMode::PlanMode) {
+        ensure!(claude_core::services::session_permission_mode::parse(mode)? == claude_core::permissions::PermissionMode::PlanMode, "Owner remains in plan mode; child mode cannot expand its authority");
+    }
     let job = jobs::get(&worker.root, job_id)?;
     ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Permission change targets an inactive session job");
     if claude_core::services::session_permission_mode::parse(mode)? == claude_core::permissions::PermissionMode::Auto {
-        claude_core::native_engine::auto_permissions::configured(&crate::services::context(&RuntimePaths::new(worker.root.clone())?)?, current_provider)?;
+        claude_core::native_engine::auto_permissions::configured(&crate::services::context(&RuntimePaths::new(worker.root.clone())?)?, &control.provider)?;
     }
-    claude_core::services::session_permission_mode::set(db, &worker.session_id, manager, claude_core::services::session_permission_mode::parse(mode)?)?;
-    let _ = service::emit_event(&serde_json::json!({"type":"permission_mode","mode":mode}));
-    Ok(())
+    claude_core::services::session_permission_mode::set(&control.db, &control.session_id, &control.manager, claude_core::services::session_permission_mode::parse(mode)?)?;
+    let _ = service::emit_event(&serde_json::json!({"type":"permission_mode","mode":mode,"session_id":control.session_id}));
+    Ok(control.session_id.clone())
 }
 
-fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<String> {
+fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<(String, String)> {
     let target = target.lock().unwrap_or_else(|e|e.into_inner());
-    let (active_job, manager, _, _) = target.as_ref().context("Session worker has no active initialized turn")?;
-    ensure!(active_job == job_id, "Mode query targets a different job");
+    let control = target.as_ref().context("Session worker has no active initialized turn")?;
+    ensure!(control.job_id == job_id, "Mode query targets a different job");
     let job = jobs::get(&worker.root, job_id)?;
     ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Mode query targets an inactive session job");
-    Ok(claude_core::services::session_permission_mode::name(manager.get_mode()).into())
+    Ok((claude_core::services::session_permission_mode::name(control.manager.get_mode()).into(), control.session_id.clone()))
 }
 
 fn should_expire(turn: bool, shell: bool, fatal: bool, idle: Duration) -> bool {

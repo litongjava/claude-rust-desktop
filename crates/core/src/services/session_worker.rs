@@ -55,6 +55,8 @@ pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<super::runtime_status::RuntimeStatus>,
 }
 impl Reply {
@@ -64,6 +66,7 @@ impl Reply {
             job_id: id,
             error: None,
             permission_mode: None,
+            permission_session_id: None,
             runtime_status: None,
         }
     }
@@ -73,6 +76,7 @@ impl Reply {
             job_id: None,
             error: Some(error.to_string()),
             permission_mode: None,
+            permission_session_id: None,
             runtime_status: None,
         }
     }
@@ -455,6 +459,20 @@ pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
     jobs::save(&active, &id)?;
     Ok(job)
 }
+
+/// The durable target lets historical task attachments avoid changing the owner UI state.
+pub fn job_execution_session(root: &Path, job: &Job) -> Result<String> {
+    let path = jobs::directory(root, &job.id)?.join("owned-child.json");
+    match fs::read(path) {
+        Ok(bytes) => {
+            let id: String = serde_json::from_slice(&bytes)?;
+            ensure!(uuid::Uuid::parse_str(&id).is_ok(), "Invalid owned child job target");
+            Ok(id)
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(job.session_id.clone()),
+        Err(error) => Err(error.into()),
+    }
+}
 pub async fn finish_job(worker: &Worker, id: &str, error: Option<String>) -> Result<()> {
     let dir = jobs::directory(&worker.root, id)?;
     jobs::save(&dir.join("completion.json"), &error)?;
@@ -549,10 +567,15 @@ pub async fn set_permission_mode(root: &Path, session: &str, job_id: &str, mode:
 }
 
 pub async fn permission_mode(root: &Path, session: &str, job_id: &str) -> Result<String> {
+    Ok(permission_mode_target(root, session, job_id).await?.0)
+}
+
+pub async fn permission_mode_target(root: &Path, session: &str, job_id: &str) -> Result<(String, String)> {
     let worker = current(root, session)?.context("Session has no persistent worker")?;
     let job = jobs::get(root, job_id)?;
     ensure!(job.session_id == session, "Mode query targets another session");
-    call(&worker, &Request::GetPermissionMode { job_id: job_id.into() }).await?.permission_mode.context("Worker did not return its permission mode")
+    let reply = call(&worker, &Request::GetPermissionMode { job_id: job_id.into() }).await?;
+    Ok((reply.permission_mode.context("Worker did not return its permission mode")?, reply.permission_session_id.unwrap_or_else(||session.to_owned())))
 }
 
 pub fn run_supervisor_from_env() -> Result<bool> {

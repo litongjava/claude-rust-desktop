@@ -201,7 +201,12 @@ async fn observe(
 ) -> Result<bool> {
     let root = &session.paths.data_dir;
     let initial_job = jobs::get(root, id)?;
-    let sync_mode = may_sync_permission_mode(&session.id, &initial_job.session_id, &initial_job.status, sync_plan_mode);
+    let execution_session = claude_core::services::session_worker::job_execution_session(root, &initial_job)?;
+    let child_target = (execution_session != initial_job.session_id).then_some(execution_session);
+    if let Some(child) = &child_target {
+        display.notice(&format!("Task controls apply to owned child session {child}."));
+    }
+    let sync_mode = child_target.is_none() && may_sync_permission_mode(&session.id, &initial_job.session_id, &initial_job.status, sync_plan_mode);
     let mut cursor = 0;
     let mut streamed = false;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -229,6 +234,14 @@ async fn observe(
                     match refresh_permission_mode(session, &job).await {
                         Ok(mode) => { display.set_permission_mode(mode); final_mode_synced = finished_mode; },
                         Err(error) => display.notice(&format!("Could not refresh permission mode; keeping last confirmed mode: {error:#}")),
+                    }
+                }
+                if let Some(child) = &child_target {
+                    if events.iter().any(|event| permission_event(event) || event["type"] == "owned_child_wake") || (finished_mode && !final_mode_synced) {
+                        match refresh_child_permission_mode(session, &job, child).await {
+                            Ok(mode) => { display.set_permission_mode(mode); final_mode_synced = finished_mode; },
+                            Err(error) => display.notice(&format!("Child {child} mode unavailable: {error:#}")),
+                        }
                     }
                 }
                 for event in events {
@@ -307,9 +320,14 @@ async fn observe(
                         let change = async {
                             let job = jobs::get(root, id)?;
                             ensure!(job.session_id == session.id, "Permission cycling applies to your current session; attach that session directly to change its mode");
-                            let mode = session.next_permission_mode();
+                            let target = claude_core::services::session_worker::job_execution_session(root, &job)?;
+                            let mode = if target != job.session_id {
+                                let current = refresh_child_permission_mode(session, &job, &target).await?;
+                                display.notice(&format!("Changing mode for owned child session {target}."));
+                                match current { "ask" => "accept-edits", "accept-edits" => "plan", _ => "ask" }
+                            } else { session.next_permission_mode() };
                             claude_core::services::session_worker::set_permission_mode(root, &session.id, id, mode).await?;
-                            session.permissions.set_mode(claude_core::services::session_permission_mode::parse(mode)?);
+                            if target == job.session_id { session.permissions.set_mode(claude_core::services::session_permission_mode::parse(mode)?); }
                             Ok::<_, anyhow::Error>(mode)
                         }.await;
                         match change {
@@ -414,6 +432,7 @@ fn permission_event(event: &Value) -> bool {
 }
 
 async fn refresh_permission_mode(session: &Session, job: &jobs::Job) -> Result<&'static str> {
+    ensure!(claude_core::services::session_worker::job_execution_session(&session.paths.data_dir, job)? == session.id, "Task controls target an owned child, not the owner");
     refresh_permission_mode_with_query(
         session,
         job,
@@ -424,6 +443,19 @@ async fn refresh_permission_mode(session: &Session, job: &jobs::Job) -> Result<&
         ),
     )
     .await
+}
+
+async fn refresh_child_permission_mode(session: &Session, job: &jobs::Job, child: &str) -> Result<&'static str> {
+    use claude_core::services::{session_permission_mode, session_worker};
+    ensure!(session_worker::job_execution_session(&session.paths.data_dir, job)? == child, "Child task target changed");
+    let mode = if job.finished_ms.is_some() {
+        session_permission_mode::load(&session.store.db, child)?.unwrap_or(session.permissions.get_mode())
+    } else {
+        let (mode, target) = session_worker::permission_mode_target(&session.paths.data_dir, &job.session_id, &job.id).await?;
+        ensure!(target == child, "Permission response targets a different session");
+        session_permission_mode::parse(&mode)?
+    };
+    Ok(session_permission_mode::name(mode))
 }
 
 async fn refresh_permission_mode_with_query(

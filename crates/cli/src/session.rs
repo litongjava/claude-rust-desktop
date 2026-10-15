@@ -960,7 +960,7 @@ fn duplicate_tool_result(event: &EngineEvent, tools: &[message_repo::ToolCallRow
         })
 }
 
-fn event_json(event: &EngineEvent) -> Option<Value> {
+pub(crate) fn event_json(event: &EngineEvent) -> Option<Value> {
     Some(match event {
         EngineEvent::ContextReset { session_id, boundary_id } => json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id}),
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),

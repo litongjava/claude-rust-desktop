@@ -13,6 +13,15 @@ use std::{
 
 struct Cleanup(Vec<u32>);
 
+fn test_cli_executable() -> std::path::PathBuf {
+    std::env::var_os("CLAUDE_SESSION_WORKER_TEST_EXE")
+        .map(Into::into)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code").into())
+}
+
+#[path = "support/session_worker_idle.rs"]
+mod idle;
+
 #[tokio::test]
 async fn live_mode_change_applies_to_tool_after_inflight_model_request() {
     let temp = tempfile::tempdir().unwrap();
@@ -39,7 +48,7 @@ async fn live_mode_change_applies_to_tool_after_inflight_model_request() {
     let endpoint=format!("http://{}",listener.local_addr().unwrap());
     let server=tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
     let executable=temp.path().join(if cfg!(windows){"live-mode.exe"}else{"live-mode"});
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"),&executable).unwrap();
+    std::fs::copy(test_cli_executable(),&executable).unwrap();
     let host=worker::ensure_worker(&paths.data_dir,&executable,&session,&workspace).await.unwrap();
     let _cleanup=Cleanup(vec![host.supervisor_pid.unwrap()]);
     let id=submit(&host,&endpoint,"check mode","fixture",128).await;
@@ -259,7 +268,7 @@ async fn added_directory_survives_worker_resume_without_granting_other_sessions(
     } else {
         "scope-worker"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    std::fs::copy(test_cli_executable(), &executable).unwrap();
     let output = tokio::process::Command::new(&executable)
         .current_dir(&workspace)
         .args([
@@ -435,7 +444,7 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     } else {
         "worker-fixture"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable_copy).unwrap();
+    std::fs::copy(test_cli_executable(), &executable_copy).unwrap();
     let executable = executable_copy.as_path();
     let host = worker::ensure_worker(&paths.data_dir, executable, &session, &workspace)
         .await

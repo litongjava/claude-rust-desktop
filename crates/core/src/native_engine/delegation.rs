@@ -17,9 +17,17 @@ pub(crate) type OwnedChildren = Arc<Mutex<HashMap<String, OwnedChild>>>;
 pub(crate) struct OwnedChild {
     executor: Box<ToolLoopExecutor>,
     pub(in crate::native_engine) parent: String,
+    pub(in crate::native_engine) owner_budget: Arc<std::sync::atomic::AtomicUsize>,
+    pub(in crate::native_engine) idle_ready: bool,
     policy: Value,
     binding: Value,
     retained: Instant,
+}
+
+impl OwnedChild {
+    pub(in crate::native_engine) fn permission_target(&self) -> Result<(Arc<crate::permissions::PermissionManager>, crate::native_engine::provider_manager::ResolvedProvider)> {
+        Ok((self.executor.permission_manager.clone().context("Owned child permissions unavailable")?, self.executor.provider.clone()))
+    }
 }
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
@@ -97,6 +105,41 @@ fn owned_binding(
 }
 
 impl ToolLoopExecutor {
+    /// The worker may coordinate only children whose original runtime it still owns.
+    /// This executor never executes a parent model turn or resolves new credentials.
+    pub(in crate::native_engine) fn idle_owner_for_child(
+        registry: OwnedChildren,
+        owner: &str,
+        child: &str,
+        events: tokio::sync::mpsc::Sender<EngineEvent>,
+    ) -> Result<Self> {
+        let entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries.get(child).context("Original child runtime is unavailable; needs_resume")?;
+        ensure!(entry.parent == owner, "Child belongs to another owner");
+        let mut host = Self::new(
+            entry.executor.provider.clone(),
+            Vec::new(),
+            None,
+            entry.executor.max_tokens,
+            events,
+            entry.executor.workspace_cwd.clone(),
+            entry.executor.reasoning_mode.clone(),
+        );
+        host.conv_id = Some(owner.into());
+        host.search_config_path = entry.executor.search_config_path.clone();
+        host.child_resumes = entry.owner_budget.clone();
+        drop(entries);
+        host.owned_children = registry;
+        Ok(host)
+    }
+
+    pub(in crate::native_engine) fn share_owned_child_budget(&self) {
+        let Some(owner) = self.conv_id.as_deref() else { return };
+        for child in self.owned_children.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
+            if child.parent == owner { child.owner_budget = self.child_resumes.clone(); }
+        }
+    }
+
     fn child_owner_policy(&self) -> Value {
         json!({"permissions":self.permission_manager.as_ref().map(|manager|manager.delegation_policy_snapshot(self.conv_id.as_deref().unwrap_or_default())),"tools":self.allowed_tools,"directories":self.allowed_directories})
     }
@@ -159,7 +202,7 @@ impl ToolLoopExecutor {
         }
     }
 
-    pub(super) async fn resume_owned_child(
+    pub(in crate::native_engine) async fn resume_owned_child(
         &self,
         id: &str,
         prompt: Option<&str>,
@@ -259,6 +302,7 @@ impl ToolLoopExecutor {
         entry.executor.permission_mailbox = self.permission_mailbox.clone();
         entry.executor.permission_host_available = self.permission_host_available;
         entry.executor.message_inbox = None;
+        entry.executor.require_pending_peer_message = automatic;
         entry.executor.stop_hook_active = false;
         if let Some(manager) = &entry.executor.permission_manager {
             manager.clear_all_confirmations();
@@ -729,6 +773,8 @@ impl ToolLoopExecutor {
                         OwnedChild {
                             executor: Box::new(child),
                             parent: self.conv_id.clone().unwrap_or_default(),
+                            owner_budget: self.child_resumes.clone(),
+                            idle_ready: false,
                             policy,
                             binding,
                             retained: Instant::now(),

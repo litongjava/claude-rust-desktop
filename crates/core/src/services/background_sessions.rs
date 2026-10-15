@@ -724,6 +724,7 @@ pub fn collect_completed(
         if exists {
             continue;
         }
+        let execution_session = super::session_worker::job_execution_session(root, &job)?;
         let (output, errors) = output(root, &job.id)?;
         let result = output
             .lines()
@@ -731,7 +732,12 @@ pub fn collect_completed(
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|event| event["type"] == "result")
             .and_then(|event| event["result"].as_str().map(str::to_owned));
-        let result = if job.session_id == parent {
+        let result = if execution_session != job.session_id {
+            Some(format!(
+                "Owned child {execution_session} ended with status {}. Its transcript remains in the child session; inspect /tasks show {} and /list-agents inbox for the result. {}",
+                job.status, job.id, job.error.as_deref().unwrap_or("")
+            ))
+        } else if job.session_id == parent {
             Some(if job.status == "completed" {
                 "The worker completed and stored its answer directly in this session. This notice does not duplicate that answer.".to_owned()
             } else {
@@ -750,7 +756,7 @@ pub fn collect_completed(
             })
         });
         let excerpt: String = body.chars().take(16384).collect();
-        let report = format!("[Background task report]\nTask: {}\nSource session: {}\nStatus: {}\nTitle: {}\n\n{}{}\n[End background task report]", job.id, job.session_id, job.status, job.title, excerpt, if excerpt.len()<body.len() { "\n[Excerpt truncated; use /tasks show for details.]" } else { "" });
+        let report = format!("[Background task report]\nTask: {}\nSource session: {}\nStatus: {}\nTitle: {}\n\n{}{}\n[End background task report]", job.id, execution_session, job.status, job.title, excerpt, if excerpt.len()<body.len() { "\n[Excerpt truncated; use /tasks show for details.]" } else { "" });
         let inserted = store.db.with_conn(|conn| -> Result<bool> {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
