@@ -34,7 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/memory", "Show or edit project instructions: [show|edit|local]"),
     ("/plugin", "Manage installed plugins: list|install|enable|disable|remove"),
     ("/reload-plugins", "Reload the currently enabled plugin configuration"),
-    ("/hooks", "Show active lifecycle hooks and their source files"),
+    ("/hooks", "Show lifecycle hooks, including auto-classifier PermissionDenied notifications"),
     ("/debug", "Write diagnostic logs to a local file: [on|off|status]"),
     ("/login", "Sign in to Anthropic for this application: [status]"),
     ("/logout", "Remove this application's Anthropic account credentials"),

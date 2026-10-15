@@ -21,6 +21,7 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    PermissionDenied,
     SubagentStart,
     SubagentStop,
     UserPromptSubmit,
@@ -38,6 +39,7 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::PermissionDenied => "PermissionDenied",
             Self::SubagentStart => "SubagentStart",
             Self::SubagentStop => "SubagentStop",
             Self::UserPromptSubmit => "UserPromptSubmit",
@@ -72,6 +74,8 @@ pub struct HookOutcome {
     /// An explicit hook request for approval must not become an automatic grant.
     pub ask_permission: bool,
     pub prevent_continuation: bool,
+    /// PermissionDenied advice, never an execution grant.
+    pub retry: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +155,7 @@ impl HookRunner {
                     "PreToolUse" => HookEvent::PreToolUse,
                     "PostToolUse" => HookEvent::PostToolUse,
                     "PostToolUseFailure" => HookEvent::PostToolUseFailure,
+                    "PermissionDenied" => HookEvent::PermissionDenied,
                     "SubagentStart" => HookEvent::SubagentStart,
                     "SubagentStop" => HookEvent::SubagentStop,
                     "UserPromptSubmit" => HookEvent::UserPromptSubmit,
@@ -251,7 +256,7 @@ impl HookRunner {
         input.insert("hook_event_name".into(), json!(event.name()));
         let lifecycle = matches!(
             event,
-            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact | HookEvent::SubagentStart | HookEvent::PostToolUseFailure
+            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact | HookEvent::SubagentStart | HookEvent::PostToolUseFailure | HookEvent::PermissionDenied
         );
         let match_key = match event {
             HookEvent::SessionStart => "source",
@@ -291,6 +296,7 @@ impl HookRunner {
             result.warnings.extend(outcome.warnings);
             result.ask_permission |= outcome.ask_permission;
             result.prevent_continuation |= outcome.prevent_continuation;
+            result.retry |= outcome.retry;
             if let Some(updated) = outcome.updated_input {
                 input.insert("tool_input".into(), updated.clone());
                 result.updated_input = Some(updated);
@@ -350,6 +356,16 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     let output: Value = serde_json::from_str(output).context("Hook returned invalid JSON")?;
+    if event == HookEvent::PermissionDenied {
+        if let Some(message) = string_field(&output, "systemMessage")? { result.warnings.push(message.into()); }
+        if let Some(specific) = output.get("hookSpecificOutput") {
+            ensure!(specific.is_object(), "hookSpecificOutput must be an object");
+            ensure!(string_field(specific, "hookEventName")? == Some(event.name()), "Hook returned an incorrect hookEventName");
+            if let Some(retry) = specific.get("retry") { result.retry = retry.as_bool().context("PermissionDenied retry must be boolean")?; }
+        }
+        // This notification cannot mutate input, permit execution or stop a turn.
+        return Ok(result);
+    }
     if let Some(value) = output.get("continue") {
         ensure!(value.is_boolean(), "Hook continue must be boolean");
         if value == false {
@@ -611,6 +627,14 @@ mod tests {
         )
         .is_err());
         assert!(parse_output(HookEvent::Stop, 0, r#"{"continue":"false"}"#, "").is_err());
+    }
+
+    #[test]
+    fn permission_denied_output_is_only_retry_advice() {
+        let outcome = parse_output(HookEvent::PermissionDenied, 0, r#"{"decision":"approve","continue":false,"hookSpecificOutput":{"hookEventName":"PermissionDenied","retry":true,"updatedInput":{"file_path":"unsafe"},"permissionDecision":"allow"}}"#, "").unwrap();
+        assert!(outcome.retry); assert!(!outcome.blocked); assert!(!outcome.prevent_continuation); assert!(outcome.updated_input.is_none()); assert!(!outcome.ask_permission);
+        for text in [r#"{"hookSpecificOutput":{"hookEventName":"PermissionDenied","retry":"true"}}"#, r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","retry":true}}"#, "{invalid"] { assert!(parse_output(HookEvent::PermissionDenied,0,text,"").is_err()); }
+        assert!(!parse_output(HookEvent::PermissionDenied,1,r#"{"hookSpecificOutput":{"hookEventName":"PermissionDenied","retry":true}}"#,"failed").unwrap().retry);
     }
 
     #[test]

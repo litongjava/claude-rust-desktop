@@ -347,7 +347,8 @@ impl ToolLoopExecutor {
     ) -> Result<Value> {
         if !preapproved {
             use crate::permissions::PermissionResult;
-            match self.check_permission("Agent", input).await {
+            let invocation_id = uuid::Uuid::new_v4().to_string();
+            match self.check_permission("Agent", input, &invocation_id).await {
                 PermissionResult::Denied(reason) => {
                     anyhow::bail!("Delegation permission denied: {reason}")
                 }
@@ -365,7 +366,7 @@ impl ToolLoopExecutor {
                     self.event_tx
                         .send(EngineEvent::ToolPermission {
                             request_id: request_id.clone(),
-                            tool_use_id: request_id.clone(),
+                            tool_use_id: invocation_id.clone(),
                             tool_name: "Agent".into(),
                             input: input.clone(),
                         })

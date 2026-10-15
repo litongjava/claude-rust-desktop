@@ -260,7 +260,7 @@ async fn auto_failure_fallback_requires_explicit_manual_config_and_interactive_h
                 user_id: None,
                 workspace_path: Some(root.path().to_string_lossy().into_owned()),
             };
-            let (result, _) = crate::native_engine::auto_permissions::authorize(
+            let authorization = crate::native_engine::auto_permissions::authorize(
                 &context,
                 &manager,
                 &tool,
@@ -271,7 +271,7 @@ async fn auto_failure_fallback_requires_explicit_manual_config_and_interactive_h
             .await;
             assert_eq!(
                 matches!(
-                    result,
+                    authorization.result,
                     crate::permissions::PermissionResult::RequiresConfirmation(_)
                 ),
                 manual && interactive
@@ -282,7 +282,7 @@ async fn auto_failure_fallback_requires_explicit_manual_config_and_interactive_h
                 "auto-session",
                 HashMap::from([("Bash".into(), PermissionAction::Confirm)]),
             );
-            let (explicit, _) = crate::native_engine::auto_permissions::authorize(
+            let explicit = crate::native_engine::auto_permissions::authorize(
                 &context,
                 &manager,
                 &tool,
@@ -292,7 +292,7 @@ async fn auto_failure_fallback_requires_explicit_manual_config_and_interactive_h
             )
             .await;
             assert!(matches!(
-                explicit,
+                explicit.result,
                 crate::permissions::PermissionResult::RequiresConfirmation(_)
             ));
             assert_eq!(

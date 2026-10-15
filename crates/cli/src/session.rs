@@ -409,14 +409,15 @@ impl Session {
         Ok(self.permission_mode())
     }
 
-    pub(crate) async fn check_host_shell_permission(&self, input: &Value, user_prompt: &str, interactive: bool) -> Result<claude_core::permissions::PermissionResult> {
+    pub(crate) async fn check_host_shell_permission(&self, input: &Value, user_prompt: &str, interactive: bool, hooks: &claude_core::services::tool_hooks::HookRunner, tool_use_id: &str) -> Result<claude_core::permissions::PermissionResult> {
         let context = crate::services::context(&self.paths)?;
         let provider = self.selected_provider().await?;
         let mut history = self.store.model_history(&self.id, &provider.provider.api_format)?;
         history.push(json!({"role":"user","content":user_prompt}));
         let tool = claude_core::permissions::PermissionContext { tool_name:"Bash".into(), tool_input:input.clone(), conversation_id:self.id.clone(), user_id:None, workspace_path:Some(self.workspace.to_string_lossy().into_owned()) };
-        let (decision, _) = claude_core::native_engine::auto_permissions::authorize(&context, &self.permissions, &tool, &provider, &history, interactive).await;
-        Ok(decision)
+        let authorization = claude_core::native_engine::auto_permissions::authorize(&context, &self.permissions, &tool, &provider, &history, interactive).await
+            .with_denial_hook(Some(hooks), &tool, tool_use_id).await;
+        Ok(authorization.result)
     }
 
     pub async fn set_permission_mode(&self, value: &str) -> Result<()> {

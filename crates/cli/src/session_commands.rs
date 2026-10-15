@@ -116,7 +116,7 @@ pub async fn handle(
                 &session.workspace,
             )?;
             println!("{}", serde_json::to_string_pretty(runner.list())?);
-            eprintln!("Effective command lifecycle hooks from settings.json and .claude/settings[.local].json.");
+            eprintln!("Effective command lifecycle hooks from settings.json and .claude/settings[.local].json. PermissionDenied runs only after an auto-classifier rejection; retry:true is advice to the model, never approval.");
         }
         "/cd" | "/add-dir" => {
             if argument.is_empty() {

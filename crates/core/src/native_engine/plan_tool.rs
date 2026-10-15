@@ -30,7 +30,7 @@ impl ToolLoopExecutor {
         id: &str,
     ) -> (Value, String, bool) {
         let result = async {
-            match self.check_permission(tool, input).await {
+            match self.check_permission(tool, input, id).await {
                 PermissionResult::Denied(reason) => anyhow::bail!("{reason}"),
                 PermissionResult::RequiresConfirmation(_) => {
                     let request = uuid::Uuid::new_v4().to_string();
@@ -47,7 +47,7 @@ impl ToolLoopExecutor {
                 }
                 PermissionResult::Granted => {}
             }
-            if let PermissionResult::Denied(reason) = self.check_permission(tool, input).await { anyhow::bail!("{reason}"); }
+            if let PermissionResult::Denied(reason) = self.check_permission(tool, input, id).await { anyhow::bail!("{reason}"); }
             anyhow::ensure!(self.is_plan_document_tool(tool, input), "Plan permission or file path changed; retry the operation");
             let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).context("Plan storage unavailable")?;
             let session = self.conv_id.as_deref().context("Plan session unavailable")?;
@@ -92,7 +92,7 @@ impl ToolLoopExecutor {
     async fn plan_transition(&mut self, tool_name: &str, input: &Value, id: &str) -> Result<Value> {
         let entering = tool_name == "EnterPlanMode"
             || (tool_name == "plan_mode" && input["operation"] == "enter");
-        match self.check_permission(tool_name, input).await {
+        match self.check_permission(tool_name, input, id).await {
             PermissionResult::Denied(reason) => anyhow::bail!("{reason}"),
             PermissionResult::RequiresConfirmation(_) if entering => {
                 let request = uuid::Uuid::new_v4().to_string();

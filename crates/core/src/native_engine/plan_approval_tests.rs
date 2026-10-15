@@ -113,7 +113,8 @@ async fn approval_choices_preserve_rules_cancel_waiters_and_rollback_failed_boun
             executor
                 .check_permission(
                     "Write",
-                    &json!({"file_path":executor.workspace_cwd.clone()+"/denied","content":"bad"})
+                    &json!({"file_path":executor.workspace_cwd.clone()+"/denied","content":"bad"}),
+                    "denied-after-plan"
                 )
                 .await,
             PermissionResult::Denied(_)

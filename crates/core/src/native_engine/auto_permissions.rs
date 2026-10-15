@@ -148,6 +148,64 @@ pub fn configured(
     Ok((config, selected))
 }
 
+/// Provenance exists only for a valid, current classifier rejection.
+#[derive(Clone, Debug)]
+pub struct ClassifierDenial {
+    reason: Reason,
+}
+
+pub struct AutoAuthorization {
+    pub result: crate::permissions::PermissionResult,
+    pub telemetry: Option<Value>,
+    pub classifier_denial: Option<ClassifierDenial>,
+}
+impl AutoAuthorization {
+    fn plain(result: crate::permissions::PermissionResult, telemetry: Option<Value>) -> Self {
+        Self {
+            result,
+            telemetry,
+            classifier_denial: None,
+        }
+    }
+
+    /// Consumes one outcome, so one invocation cannot dispatch its denial twice.
+    /// Retry is model-visible advice only; the original permission stays denied.
+    pub async fn with_denial_hook(
+        mut self,
+        hooks: Option<&crate::services::tool_hooks::HookRunner>,
+        tool: &crate::permissions::PermissionContext,
+        tool_use_id: &str,
+    ) -> Self {
+        use crate::services::tool_hooks::HookEvent;
+        let (Some(denial), Some(hooks)) = (self.classifier_denial.take(), hooks) else {
+            return self;
+        };
+        let crate::permissions::PermissionResult::Denied(message) = &mut self.result else {
+            return self;
+        };
+        let reason = serde_json::to_value(denial.reason)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "ambiguous".into());
+        let payload = json!({"tool_name":tool.tool_name,"tool_input":tool.tool_input,"tool_use_id":tool_use_id,"reason":reason,"permission_mode":"auto"});
+        match hooks
+            .run(HookEvent::PermissionDenied, &tool.conversation_id, payload)
+            .await
+        {
+            Ok(outcome) => {
+                for warning in outcome.warnings {
+                    tracing::warn!("PermissionDenied hook: {warning}");
+                }
+                if outcome.retry {
+                    message.push_str("\nThe configured PermissionDenied hook suggests trying this action again. Any new tool call still requires normal permission checks.");
+                }
+            }
+            Err(error) => tracing::warn!("PermissionDenied hook failed: {error:#}"),
+        }
+        self
+    }
+}
+
 pub async fn authorize(
     context: &crate::services::ServiceContext,
     manager: &crate::permissions::PermissionManager,
@@ -155,22 +213,22 @@ pub async fn authorize(
     current: &ResolvedProvider,
     messages: &[Value],
     interactive: bool,
-) -> (crate::permissions::PermissionResult, Option<Value>) {
+) -> AutoAuthorization {
     use crate::permissions::auto_config::FailurePolicy;
     use crate::permissions::{PermissionMode, PermissionResult};
     let denied = |message: &str| PermissionResult::Denied(message.into());
     let Some((decision, expected)) = manager.evaluate_stable(tool) else {
-        return (
+        return AutoAuthorization::plain(
             denied("Permission policy changed repeatedly; retry the action"),
             None,
         );
     };
     if expected.mode.mode != PermissionMode::Auto || !decision.classifier_eligible {
-        return (decision.result, None);
+        return AutoAuthorization::plain(decision.result, None);
     }
     let (config, provider) = match configured(context, current) {
         Ok(config) => config,
-        Err(_) => return (denied("Auto classifier configuration or selected provider is unavailable; review /permissions auto-config"), None),
+        Err(_) => return AutoAuthorization::plain(denied("Auto classifier configuration or selected provider is unavailable; review /permissions auto-config"), None),
     };
     let fallback = |message: &str| {
         if interactive && config.failure_policy == FailurePolicy::Manual {
@@ -180,7 +238,7 @@ pub async fn authorize(
         }
     };
     if manager.auto_stats(&tool.conversation_id).denial_limit() {
-        return (
+        return AutoAuthorization::plain(
             fallback("Auto permission denial limit reached; manual review is required"),
             None,
         );
@@ -237,13 +295,21 @@ pub async fn authorize(
             .evaluate_stable(tool)
             .is_none_or(|(latest, snapshot)| snapshot != expected || !latest.classifier_eligible)
     {
-        return (
+        return AutoAuthorization::plain(
             denied(
                 "Auto decision discarded because permission policy changed during classification",
             ),
             telemetry,
         );
     }
+    let classifier_denial = outcome
+        .verdict
+        .as_ref()
+        .ok()
+        .filter(|verdict| verdict.decision == Decision::Deny)
+        .map(|verdict| ClassifierDenial {
+            reason: verdict.reason_code,
+        });
     let result = match outcome.verdict {
         Ok(verdict) if verdict.decision == Decision::Allow => PermissionResult::Granted,
         Ok(verdict) => denied(&format!(
@@ -254,7 +320,11 @@ pub async fn authorize(
             "Auto classifier unavailable ({failure:?}); action requires manual permission"
         )),
     };
-    (result, telemetry)
+    AutoAuthorization {
+        result,
+        telemetry,
+        classifier_denial,
+    }
 }
 
 impl AutoClassifier {

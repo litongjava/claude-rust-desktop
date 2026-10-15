@@ -1,6 +1,9 @@
 #[cfg(test)]
 #[path = "auto_permission_tests.rs"]
 mod auto_permission_tests;
+#[cfg(test)]
+#[path = "permission_denied_tests.rs"]
+mod permission_denied_tests;
 #[path = "delegation.rs"]
 pub(crate) mod delegation;
 #[path = "deep_research.rs"]
@@ -726,7 +729,7 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
-    async fn check_permission(&self, tool_name: &str, tool_input: &Value) -> PermissionResult {
+    async fn check_permission(&self, tool_name: &str, tool_input: &Value, tool_use_id: &str) -> PermissionResult {
         if let Some(ref pm) = self.permission_manager {
             let conv_id = self.conv_id.clone().unwrap_or_default();
             let workspace_path = Some(self.workspace_cwd.clone());
@@ -743,9 +746,10 @@ impl ToolLoopExecutor {
             } else if pm.get_mode() == crate::permissions::PermissionMode::Auto {
                 let Some(root) = self.search_config_path.as_deref().and_then(std::path::Path::parent) else { return PermissionResult::Denied("Auto classifier requires a configured data directory".into()); };
                 let service = match crate::services::session_messages::context(root) { Ok(service) => service, Err(_) => return PermissionResult::Denied("Auto classifier settings unavailable".into()) };
-                let (decision, telemetry) = super::auto_permissions::authorize(&service, pm, &context, &self.provider, &self.auto_history, self.auto_manual_interactive).await;
-                if let Some(telemetry) = telemetry { let _ = self.event_tx.send(EngineEvent::Usage(telemetry)).await; }
-                decision
+                let authorization = super::auto_permissions::authorize(&service, pm, &context, &self.provider, &self.auto_history, self.auto_manual_interactive).await
+                    .with_denial_hook(self.hooks.as_deref(), &context, tool_use_id).await;
+                if let Some(telemetry) = authorization.telemetry { let _ = self.event_tx.send(EngineEvent::Usage(telemetry)).await; }
+                authorization.result
             } else {
                 pm.check_permission(&context)
             }
@@ -983,7 +987,7 @@ impl ToolLoopExecutor {
             return self.execute_plan_transition(tool_name, tool_input, _tool_use_id).await;
         }
         if matches!(tool_name, "Agent" | "Delegate" | "Worker") || (tool_name == "team" && tool_input["operation"] == "run") {
-            match self.check_permission(tool_name, tool_input).await {
+            match self.check_permission(tool_name, tool_input, _tool_use_id).await {
                 PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
                 PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
                 PermissionResult::Granted => {},
@@ -996,7 +1000,7 @@ impl ToolLoopExecutor {
             return (tool_input.clone(), output, failed);
         }
         if tool_name == "plan_mode" {
-            match self.check_permission(tool_name, tool_input).await {
+            match self.check_permission(tool_name, tool_input, _tool_use_id).await {
                 PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
                 PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
                 PermissionResult::Granted => {}
@@ -1007,7 +1011,7 @@ impl ToolLoopExecutor {
             return (tool_input.clone(), output, failed);
         }
         if tool_name == "SendMessage" {
-            let permission = self.check_permission(tool_name, tool_input).await;
+            let permission = self.check_permission(tool_name, tool_input, _tool_use_id).await;
             if !matches!(permission, PermissionResult::Granted) {
                 return (tool_input.clone(), "Team message access requires granted project tool permission".into(), true);
             }
@@ -1053,7 +1057,7 @@ impl ToolLoopExecutor {
         }
 
         if matches!(tool_name, "memory_search" | "memory_ingest") {
-            match self.check_permission(tool_name, tool_input).await {
+            match self.check_permission(tool_name, tool_input, _tool_use_id).await {
                 PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
                 PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
                 PermissionResult::Granted => {},
@@ -1067,7 +1071,7 @@ impl ToolLoopExecutor {
             return self.execute_memory_ingest(tool_input).await;
         }
 
-        let permission_result = self.check_permission(tool_name, tool_input).await;
+        let permission_result = self.check_permission(tool_name, tool_input, _tool_use_id).await;
         match permission_result {
             PermissionResult::Denied(reason) => {
                 return (tool_input.clone(), format!("Permission denied: {}", reason), true);
