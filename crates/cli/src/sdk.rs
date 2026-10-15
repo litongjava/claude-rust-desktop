@@ -300,7 +300,7 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
                 .as_array()
                 .filter(|blocks| blocks.iter().any(|b| b["type"] == "image_url"))
                 .map(|_| message.content.clone());
-            let turn = session.turn(cli, &message.text, &mut terminal);
+            let turn = Box::pin(session.turn(cli, &message.text, &mut terminal));
             tokio::pin!(turn);
             loop {
                 tokio::select! {

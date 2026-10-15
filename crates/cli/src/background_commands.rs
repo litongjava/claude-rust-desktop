@@ -12,6 +12,7 @@ pub async fn handle(
     argument: &str,
     paths: &RuntimePaths,
     session: &mut Session,
+    input: &mut Option<crate::terminal::input::TerminalInput>,
 ) -> Result<bool> {
     match command {
         "/btw" => {
@@ -126,7 +127,7 @@ pub async fn handle(
                 "attach" => {
                     let id = parts.next().ok_or_else(|| anyhow::anyhow!("Usage: /tasks attach ID"))?;
                     ensure!(parts.next().is_none(), "Usage: /tasks attach ID");
-                    attach(paths, &session.id, id).await?;
+                    crate::worker_frontend::attach(session, id, input).await?;
                 }
                 "show" | "logs" => {
                     let id = parts
@@ -230,7 +231,7 @@ pub(crate) fn arguments(
     if !provider.provider.api_key.is_empty() {
         args.extend(["--api-key-env".into(), "CLAUDE_RUST_CHILD_API_KEY".into()]);
     }
-    if let Some(value) = provider.model.effort.as_ref().or(cli.effort.as_ref()) {
+    if let Some(value) = cli.effort.as_ref().or(provider.model.effort.as_ref()) {
         args.extend(["--effort".into(), value.clone()]);
     }
     if let Some(value) = provider.model.max_tokens.or(cli.max_tokens) {
@@ -403,40 +404,34 @@ pub fn collect_completed(session: &Session) -> Result<Vec<String>> {
     background_sessions::collect_completed(&session.store, &session.paths.data_dir, &session.id)
 }
 
-async fn attach(paths: &RuntimePaths, parent: &str, id: &str) -> Result<()> {
-    use std::io::Write;
-    let mut cursor = 0;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
-    eprintln!("Read-only task attachment. Ctrl+C leaves this view; the task keeps running. Use /tasks cancel ID to stop it.");
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => { eprintln!("Detached from view; task unchanged."); break; },
-            _ = ticker.tick() => {
-                let (job, next, events) = background_sessions::events_since(&paths.data_dir, id, parent, cursor)?;
-                let drained = cursor == next;
-                cursor = next;
-                for event in events {
-                    let text = match event["type"].as_str().unwrap_or("") {
-                        "text" => event["delta"].as_str().unwrap_or("").to_owned(),
-                        "result" => format!("\nTask result: {}\n", event["result"].as_str().unwrap_or("")),
-                        _ => format!("\n{}\n", serde_json::to_string(&event)?),
-                    };
-                    print!("{}", text.chars().filter(|ch| !ch.is_control() || matches!(ch, '\n'|'\t')).collect::<String>());
-                }
-                std::io::stdout().flush()?;
-                if drained && !matches!(job.status.as_str(), "starting" | "running") {
-                    eprintln!("\nTask {}: {}{}", job.id, job.status, job.error.map(|error|format!(" - {error}")).unwrap_or_default());
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod worker_config_tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_effort_off_survives_worker_argument_roundtrip() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+        let provider = serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"anthropic","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        let selection = crate::config::Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture-model".into(),
+        };
+        let mut cli = Cli::parse_from(["claude-code", "--effort", "off"]);
+        let session = Session::open(&cli, &paths, selection, None).await.unwrap();
+        let mut resolved = session.selected_provider().await.unwrap();
+        resolved.model.effort = Some("high".into());
+        let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
+        let worker = Cli::parse_from(std::iter::once("claude-code".into()).chain(args));
+        assert_eq!(worker.effort.as_deref(), Some("off"));
+        cli.effort = None;
+        let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
+        let worker = Cli::parse_from(std::iter::once("claude-code".into()).chain(args));
+        assert_eq!(worker.effort.as_deref(), Some("high"));
+        session.close().await.unwrap();
+    }
+
     #[test]
     fn worker_snapshot_preserves_temporary_model_options_and_separates_credentials() {
         use claude_core::native_engine::provider_manager::{

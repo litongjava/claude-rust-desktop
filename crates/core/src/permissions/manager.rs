@@ -49,7 +49,7 @@ pub struct PermissionManager {
     confirmations: Mutex<HashMap<String, bool>>,
     mode: Mutex<PermissionMode>,
     session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
-    always_allow_checker: Mutex<Option<AlwaysAllowCheckerFn>>,
+    always_allow_checker: Mutex<Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>>,
 }
 
 impl PermissionManager {
@@ -59,6 +59,22 @@ impl PermissionManager {
     pub(crate) fn inherit_session_rules(&self, parent: &str, child: &str) {
         let mut sessions = self.session_rules.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rules) = sessions.get(parent).cloned() { sessions.insert(child.to_owned(), rules); }
+    }
+
+    /// Independent mutable authority for a delegated session; read-only policy
+    /// callback and audit sink may be shared, but mode/approvals/rules may not.
+    pub(crate) fn fork_session(&self, parent: &str, child: &str) -> Self {
+        let rules = self.session_rules.lock().unwrap_or_else(|e| e.into_inner())
+            .get(parent).cloned().unwrap_or_default();
+        Self {
+            ruleset: Mutex::new(self.ruleset.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            tool_permissions: Mutex::new(self.tool_permissions.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            audit_logger: self.audit_logger.clone(),
+            confirmations: Mutex::new(HashMap::new()),
+            mode: Mutex::new(self.get_mode()),
+            session_rules: Mutex::new(HashMap::from([(child.to_owned(), rules)])),
+            always_allow_checker: Mutex::new(self.always_allow_checker.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
     }
 
     pub fn new(audit_logger: AuditLoggerRef) -> Self {
@@ -77,7 +93,7 @@ impl PermissionManager {
 
     pub fn set_always_allow_checker(&self, checker: AlwaysAllowCheckerFn) {
         let mut guard = self.always_allow_checker.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(checker);
+        *guard = Some(Arc::from(checker));
         tracing::info!(module = "Permission", "Always allow checker registered");
     }
 
@@ -126,7 +142,7 @@ impl PermissionManager {
         matches!(
             tool_name,
             "Read" | "ListDir" | "Grep" | "Glob" | "WebFetch" | "WebSearch"
-                | "TodoRead" | "Skill" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "brief" | "SyntheticOutput"
+                | "TodoRead" | "Skill" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode" | "brief" | "SyntheticOutput"
         )
     }
 
@@ -147,14 +163,18 @@ impl PermissionManager {
 
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
         let explicit = self.session_rules.lock().unwrap_or_else(|e| e.into_inner())
-            .get(&context.conversation_id).and_then(|rules| rules.get(&context.tool_name)).cloned();
+            .get(&context.conversation_id).and_then(|rules| super::patterns::matching_action(rules, context));
         if explicit == Some(PermissionAction::Deny) {
             return PermissionResult::Denied("Explicit session tool deny rule".into());
+        }
+        if explicit == Some(PermissionAction::Confirm)
+            && (self.get_mode() != PermissionMode::PlanMode || Self::is_read_only_tool(&context.tool_name))
+        {
+            return self.request_confirmation(context);
         }
         if self.get_mode() != PermissionMode::PlanMode {
             match explicit {
                 Some(PermissionAction::Allow) => return PermissionResult::Granted,
-                Some(PermissionAction::Confirm) => return self.request_confirmation(context),
                 _ => {},
             }
         }
@@ -381,6 +401,25 @@ pub type PermissionManagerRef = Arc<PermissionManager>;
 #[cfg(test)]
 mod session_rule_tests {
     use super::*;
+
+    #[test]
+    fn pattern_rules_enforce_denies_and_complex_shell_confirmation() {
+        let manager = PermissionManager::new(Arc::new(super::super::AuditLogger::new(16)));
+        let mut context = PermissionContext { tool_name: "Bash".into(), tool_input: serde_json::json!({"command":"git status"}), conversation_id: "one".into(), user_id: None, workspace_path: None };
+        manager.set_session_rules("one", HashMap::from([("Bash(git *)".into(), PermissionAction::Allow), ("Bash(git push*)".into(), PermissionAction::Deny)]));
+        manager.set_mode(PermissionMode::BypassPermissions);
+        assert_eq!(manager.check_permission(&context), PermissionResult::Granted);
+        context.tool_input = serde_json::json!({"command":"git push origin main"});
+        assert!(matches!(manager.check_permission(&context), PermissionResult::Denied(_)));
+        manager.set_session_rules("one", HashMap::from([("Bash(git *)".into(), PermissionAction::Allow)]));
+        context.tool_input = serde_json::json!({"command":"git status; evil"});
+        assert!(matches!(manager.check_permission(&context), PermissionResult::RequiresConfirmation(_)));
+        manager.set_mode(PermissionMode::PlanMode);
+        assert!(matches!(manager.check_permission(&context), PermissionResult::Denied(_)));
+        context.tool_name = "Read".into();
+        manager.set_session_rules("one", HashMap::from([("Read".into(), PermissionAction::Confirm)]));
+        assert!(matches!(manager.check_permission(&context), PermissionResult::RequiresConfirmation(_)));
+    }
 
     #[test]
     fn explicit_denies_survive_bypass_and_allow_cannot_override_plan() {

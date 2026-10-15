@@ -69,11 +69,25 @@ pub async fn handle(
         }
         "/plan" => {
             ensure!(
-                argument.is_empty(),
-                "Usage: /plan; use /permissions ask to leave plan mode"
+                matches!(argument, "" | "show" | "open"),
+                "Usage: /plan [show|open]"
             );
-            session.set_permission_mode("plan").await?;
-            eprintln!("Plan mode enabled. Use /permissions ask to leave plan mode.");
+            if argument.is_empty() && session.permission_mode() != "plan" {
+                session.set_permission_mode("plan").await?;
+                eprintln!("Plan mode enabled. Describe the task; Claude will submit a plan for approval before implementation.");
+            } else {
+                let path = claude_core::services::plans::path(&paths.data_dir, &session.id)?;
+                let plan = claude_core::services::plans::read(&paths.data_dir, &session.id)?;
+                if argument == "open" {
+                    ensure!(plan.is_some(), "No plan written yet. Describe the task in plan mode first.");
+                    crate::display_commands::edit_file(&path, "").await?;
+                    eprintln!("Edited plan: {}. Claude must request approval of the updated document.", path.display());
+                } else if let Some(plan) = plan {
+                    println!("Current Plan\n{}\n\n{plan}", path.display());
+                } else {
+                    eprintln!("No plan written yet. Describe the task in plan mode first.");
+                }
+            }
         }
         "/terminal-setup" => {
             ensure!(argument.is_empty(), "Usage: /terminal-setup");

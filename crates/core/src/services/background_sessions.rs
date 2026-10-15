@@ -72,7 +72,9 @@ pub(crate) fn directory(root: &Path, id: &str) -> Result<PathBuf> {
     Ok(root.join("background-tasks").join(id))
 }
 pub(crate) fn read_job(dir: &Path) -> Result<Job> {
-    Ok(serde_json::from_slice(&fs::read(dir.join("state.json"))?)?)
+    let path = dir.join("state.json");
+    let bytes = fs::read(&path).with_context(|| format!("Reading task state {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("Parsing task state {}", path.display()))
 }
 fn observed(mut job: Job) -> Job {
     if matches!(job.status.as_str(), "starting" | "running")
@@ -369,7 +371,14 @@ pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let job = read_job(&entry.path())?;
+        let job = match read_job(&entry.path()) {
+            Ok(job) => job,
+            // A new supervisor creates its directory before publishing state.
+            // Another session's discovery must not fail during this window.
+            Err(error) if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
         if parent.map_or(true, |id| job.parent_session_id == id) {
             jobs.push(observed(job));
         }
@@ -764,6 +773,35 @@ mod tests {
         .unwrap();
         (root, dir, id)
     }
+    #[test]
+    fn discovery_tolerates_concurrent_unpublished_jobs_but_reports_bad_state() {
+        let (root, dir, id) = fixture("");
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_dir = directory(root.path(), &new_id).unwrap();
+        let (created, ready) = std::sync::mpsc::channel();
+        let (publish, allowed) = std::sync::mpsc::channel();
+        let mut next = read_job(&dir).unwrap();
+        next.id = new_id.clone();
+        next.parent_session_id = "other-session".into();
+        let writer = std::thread::spawn(move || {
+            fs::create_dir_all(&new_dir).unwrap();
+            created.send(()).unwrap();
+            allowed.recv().unwrap();
+            save(&new_dir.join("state.json"), &next).unwrap();
+        });
+        ready.recv().unwrap();
+        for _ in 0..50 {
+            let jobs = list(root.path(), Some("parent")).unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].id, id);
+        }
+        publish.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(list(root.path(), None).unwrap().len(), 2);
+        fs::write(directory(root.path(), &new_id).unwrap().join("state.json"), b"invalid").unwrap();
+        assert!(format!("{:#}", list(root.path(), None).unwrap_err()).contains("Parsing task state"));
+    }
+
     #[test]
     fn heartbeat_replacement_survives_concurrent_readers() {
         use std::sync::{

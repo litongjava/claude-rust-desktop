@@ -1,6 +1,6 @@
 //! Explicit per-session tool rules; plan mode remains read-only and deny wins.
 use crate::session::Session;
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use claude_core::permissions::rules::PermissionAction;
 use std::collections::HashMap;
 
@@ -15,14 +15,29 @@ pub fn load(session: &Session) -> Result<HashMap<String, PermissionAction>> {
     })?
 }
 
+fn words(argument: &str) -> Vec<&str> {
+    let argument = argument.trim();
+    let (first, rest) = argument
+        .split_once(char::is_whitespace)
+        .map(|(a, b)| (a, b.trim()))
+        .unwrap_or((argument, ""));
+    if first.is_empty() {
+        vec![]
+    } else if rest.is_empty() {
+        vec![first]
+    } else {
+        vec![first, rest]
+    }
+}
+
 pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
-    let words: Vec<_> = argument.split_whitespace().collect();
+    let words = words(argument);
     let mut rules = load(session)?;
     match words.as_slice() {
         [] | ["list"] => {},
         [mode @ ("ask" | "accept-edits" | "plan" | "bypass")] => session.set_permission_mode(mode).await?,
         [action @ ("allow" | "deny" | "ask" | "remove"), tool] => {
-            ensure!(tool.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':')), "Use an exact tool name; shell/path patterns are not supported here");
+            claude_core::permissions::patterns::validate(tool)?;
             match *action {
                 "remove" => { rules.remove(*tool); },
                 "allow" => { rules.insert((*tool).into(), PermissionAction::Allow); },
@@ -33,7 +48,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
             let value = serde_json::to_string(&rules)?;
             session.store.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("cli.permissions.{}",session.id),value]))??;
         }
-        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|allow TOOL|deny TOOL|ask TOOL|remove TOOL]"),
+        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|allow RULE|deny RULE|ask RULE|remove RULE]. Examples: allow Bash(git status *), deny Read(.env), ask Edit(src/**). Enter rules without outer shell quotes."),
     }
     session
         .permissions
@@ -46,4 +61,31 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
         eprintln!("  {tool}: {action:?}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_command_preserves_spaces_in_rule_and_serialization() {
+        assert_eq!(
+            words(" allow Bash(git status *) "),
+            vec!["allow", "Bash(git status *)"]
+        );
+        assert_eq!(
+            words("deny Read(my files/**)"),
+            vec!["deny", "Read(my files/**)"]
+        );
+        let rules = HashMap::from([
+            ("Bash(git status *)".to_string(), PermissionAction::Allow),
+            ("Read(my files/**)".to_string(), PermissionAction::Deny),
+        ]);
+        let restored: HashMap<String, PermissionAction> =
+            serde_json::from_str(&serde_json::to_string(&rules).unwrap()).unwrap();
+        assert_eq!(rules, restored);
+        for rule in restored.keys() {
+            claude_core::permissions::patterns::validate(rule).unwrap();
+        }
+    }
 }

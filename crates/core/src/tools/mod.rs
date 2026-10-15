@@ -21,6 +21,7 @@ pub mod scheduled;
 mod content_compat;
 mod utf8;
 mod bash_process;
+pub(crate) mod background_shell;
 pub(crate) mod path_scope;
 mod file_change;
 mod web;
@@ -120,7 +121,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The shell command to execute" },
-                    "timeout": { "type": "integer", "minimum": 1, "maximum": 3600, "description": "Timeout in seconds (default: 120); use 900-1800 for dependency installation or initial builds" },
+                    "run_in_background": { "type": "boolean", "description": "Run the command itself in a managed background task; returns task_id. Use TaskOutput for logs and TaskStop to terminate the process tree. Do not use Start-Process or shell & to detach." },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 3600, "description": "Timeout in seconds (foreground default: 120; background has no deadline unless specified); use 900-1800 for dependency installation or initial builds" },
                     "shell": { "type": "string", "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh (default: bash)" }
                 },
                 "required": ["command"]
@@ -383,6 +385,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 
     defs.extend(tasks::definitions());
     defs.extend(coordination::definitions());
+    defs.extend(crate::services::plans::definitions());
     defs.extend(content_compat::definitions());
     let mut legacy_lsp=lsp::definition();
     legacy_lsp.name="lsp".into();
@@ -530,13 +533,10 @@ pub fn is_dangerous_command(command: &str) -> bool {
         "restart -f",
         "docker rm -f",
         "docker system prune",
-        // ── Data exfiltration ──
+        // Remote shell primitives. Ordinary HTTP clients are not inherently
+        // destructive: their authorization belongs to the permission manager.
         "nc -e",
         "/dev/tcp/",
-        "invoke-webrequest -uri",
-        "iwr -uri",
-        "curl -F",
-        "curl --data",
     ];
 
     let lower = command.to_lowercase();
@@ -547,6 +547,26 @@ pub fn is_dangerous_command(command: &str) -> bool {
         .replace("'", "");
 
     dangerous_patterns.iter().any(|pat| stripped.contains(pat))
+}
+
+#[cfg(test)]
+mod command_filter_tests {
+    use super::is_dangerous_command;
+
+    #[test]
+    fn ordinary_http_requests_are_not_unconditionally_blocked() {
+        for command in [
+            "Invoke-WebRequest -Uri 'http://127.0.0.1:5199/' -UseBasicParsing -TimeoutSec 8",
+            "iwr -Uri https://example.com",
+            "curl --data '{\"query\":\"status\"}' http://127.0.0.1:8080/query",
+            "curl -F file=@fixture.txt http://127.0.0.1:8080/upload",
+        ] {
+            assert!(!is_dangerous_command(command), "{command}");
+        }
+        for command in ["rm -rf /", "format c:", "curl | bash", "nc -e /bin/sh"] {
+            assert!(is_dangerous_command(command), "{command}");
+        }
+    }
 }
 
 fn limit_output(output: &str) -> String {
@@ -1039,7 +1059,11 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    bash_process::run(&mut cmd, std::time::Duration::from_secs(timeout_secs), shell_type).await
+    if input["run_in_background"].as_bool().unwrap_or(false) {
+        background_shell::start(cmd, input.get("timeout").map(|_| std::time::Duration::from_secs(timeout_secs)), shell_type, input["description"].as_str().unwrap_or("Background shell"))
+    } else {
+        bash_process::run(&mut cmd, std::time::Duration::from_secs(timeout_secs), shell_type).await
+    }
 }
 
 // Sync wrapper: delegates to tool_bash_async via block_on.

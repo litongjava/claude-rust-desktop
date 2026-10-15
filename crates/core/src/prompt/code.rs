@@ -47,7 +47,7 @@ mod tests {
         }
         let bash = adapted.iter().find(|tool| tool.name == "Bash").unwrap();
         assert!(bash.description.contains("timeout uses seconds"));
-        assert!(bash.input_schema["properties"].get("run_in_background").is_none());
+        assert_eq!(bash.input_schema["properties"]["run_in_background"]["type"], "boolean");
         assert_eq!(serde_json::to_value(adapt_tools(native.clone(), PromptProfile::Desktop)).unwrap(), serde_json::to_value(native).unwrap());
     }
 }

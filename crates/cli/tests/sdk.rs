@@ -215,7 +215,7 @@ impl Client {
             .env("CLAUDE_SDK_FIXTURE_KEY", "fixture-only")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true);
         for key in [
             "ANTHROPIC_API_KEY",

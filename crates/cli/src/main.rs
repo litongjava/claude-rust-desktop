@@ -359,7 +359,7 @@ async fn run(cli: &Cli) -> Result<()> {
             session.turn(cli, &prompt, &mut input).await?;
         }
         if sdk_stream {
-            sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str())).await?;
+            Box::pin(sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str()))).await?;
         }
         if single { return Ok(()); }
         let mut skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
@@ -464,9 +464,9 @@ async fn run(cli: &Cli) -> Result<()> {
                 Err(error) => { eprintln!("Error: {error:#}"); continue; },
                 Ok(false) => {},
             }
-            match background_commands::handle(cli, command, argument, &paths, &mut session).await {
+            match background_commands::handle(cli, command, argument, &paths, &mut session, &mut input).await {
                 Ok(true) => continue,
-                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Err(error) => { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } continue; },
                 Ok(false) => {},
             }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {

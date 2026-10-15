@@ -12,7 +12,9 @@ async fn capture(
     mut pipe: impl AsyncRead + Unpin,
     output: &mut Vec<u8>,
     truncated: &mut bool,
+    log: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
+    let mut log = log.map(std::fs::File::create).transpose()?;
     let mut buffer = [0u8; 8192];
     loop {
         let count = pipe.read(&mut buffer).await?;
@@ -21,12 +23,24 @@ async fn capture(
         }
         let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.len()));
         output.extend_from_slice(&buffer[..keep]);
+        if let Some(log) = log.as_mut() {
+            std::io::Write::write_all(log, &buffer[..keep])?;
+        }
         *truncated |= keep < count;
     }
     Ok(())
 }
 
 pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -> Result<Value> {
+    run_logged(command, Some(timeout), shell, None).await
+}
+
+pub(super) async fn run_logged(
+    command: &mut Command,
+    timeout: Option<Duration>,
+    shell: &str,
+    logs: Option<(std::path::PathBuf, std::path::PathBuf)>,
+) -> Result<Value> {
     command
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -42,17 +56,23 @@ pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -
     let stderr = child.stderr.take().context("Shell stderr missing")?;
     let (mut stdout_bytes, mut stderr_bytes) = (Vec::new(), Vec::new());
     let (mut out_cut, mut err_cut) = (false, false);
-    let result = tokio::time::timeout(timeout, async {
+    let (out_log, err_log) = logs
+        .map(|(out, err)| (Some(out), Some(err)))
+        .unwrap_or_default();
+    let execution = async {
         let (status, out, err) = tokio::join!(
             child.wait(),
-            capture(stdout, &mut stdout_bytes, &mut out_cut),
-            capture(stderr, &mut stderr_bytes, &mut err_cut)
+            capture(stdout, &mut stdout_bytes, &mut out_cut, out_log),
+            capture(stderr, &mut stderr_bytes, &mut err_cut, err_log)
         );
         out?;
         err?;
         status
-    })
-    .await;
+    };
+    let result = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, execution).await,
+        None => Ok(execution.await),
+    };
     // Closing the process tree also terminates descendants holding inherited pipes.
     drop(tree);
     match result {
@@ -67,7 +87,7 @@ pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -
             let _ = child.kill().await;
             let _ = child.wait().await;
             Ok(
-                json!({"error":format!("Command timed out after {} seconds; descendants were terminated. For long installations/builds, set timeout explicitly (seconds, maximum 3600).",timeout.as_secs_f64()),"is_error":true,"timed_out":true,"shell":shell,"stdout":super::limit_output(&String::from_utf8_lossy(&stdout_bytes)),"stderr":super::limit_output(&String::from_utf8_lossy(&stderr_bytes)),"stdout_truncated":out_cut,"stderr_truncated":err_cut}),
+                json!({"error":format!("Command timed out after {} seconds; descendants were terminated. For long installations/builds, set timeout explicitly (seconds, maximum 3600).",timeout.unwrap().as_secs_f64()),"is_error":true,"timed_out":true,"shell":shell,"stdout":super::limit_output(&String::from_utf8_lossy(&stdout_bytes)),"stderr":super::limit_output(&String::from_utf8_lossy(&stderr_bytes)),"stdout_truncated":out_cut,"stderr_truncated":err_cut}),
             )
         }
     }

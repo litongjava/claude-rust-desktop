@@ -53,7 +53,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/tasks",
         "Manage background tasks: list|show|attach|pending|answer|cancel",
     ),
-    ("/plan", "Enable read-only plan permissions"),
+    ("/plan", "Enter planning mode, show the plan, or open it in an editor"),
     ("/reload-skills", "Reload installed skills from disk"),
     ("/resume", "List saved conversations or resume one: [ID]"),
     (

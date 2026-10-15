@@ -12,8 +12,8 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TaskUpdate", "Update a durable session task. Dependencies must exist and cannot form cycles.", json!({"id":{"type":"string"},"taskId":{"type":"string"},"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","running","completed","failed","cancelled","deleted"]},"output":{"type":"string"},"owner":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"},"addBlockedBy":{"type":"array","items":{"type":"string"}},"addBlocks":{"type":"array","items":{"type":"string"}}}),vec![]),
         ("TodoWrite", "Replace the session's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
-        ("TaskOutput", "Read the saved output of a task record.",json!({"id":{"type":"string"}}),vec!["id"]),
-        ("TaskStop", "Cancel a durable task record. This changes task metadata only and does not stop an executing worker; use host cancellation for running agents.",json!({"id":{"type":"string"}}),vec!["id"]),
+        ("TaskOutput", "Read current bounded logs and status of a managed background shell, or saved task output. Nonblocking; retry later if running.",json!({"id":{"type":"string"},"task_id":{"type":"string"}}),vec![]),
+        ("TaskStop", "Request cancellation of a managed background shell and its descendants. For other task records, changes metadata only; use host cancellation for running agents.",json!({"id":{"type":"string"},"task_id":{"type":"string"}}),vec![]),
         ("todo_write", "Manage durable todos using the legacy create/list/get/update/delete/complete/filter operations.",json!({"operation":{"type":"string","enum":["create","list","get","update","delete","complete","filter"]},"id":{"type":"string"},"content":{"type":"string"},"priority":{"type":"string","enum":["low","medium","high","urgent"]},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"tags":{"type":"array","items":{"type":"string"}},"filter_status":{"type":"string"},"filter_priority":{"type":"string"},"filter_tags":{"type":"array","items":{"type":"string"}}}),vec!["operation"]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).collect()
 }
@@ -41,6 +41,7 @@ fn readonly(name: &str, input: &Value) -> bool {
 
 pub fn execute_for_session(name: &str, input: Value, root: &Path, session: &str) -> Result<Value> {
     let session = uuid::Uuid::parse_str(session).context("Invalid task session ID")?;
+    if let Some(output) = super::background_shell::control(name, &input, root, &session.to_string())? { return Ok(output); }
     execute_at(
         name,
         input,
@@ -75,6 +76,7 @@ pub(super) fn execute(name: &str, input: Value, cwd: &str) -> Result<Value> {
 }
 
 fn execute_at(name: &str, mut input: Value, path: &Path) -> Result<Value> {
+    if input.get("id").is_none() { if let Some(id) = input.get("task_id").cloned() { input["id"] = id; } }
     if input.get("taskId").is_none() {
         if let Some(id) = input.get("id").cloned() {
             input["taskId"] = id;

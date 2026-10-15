@@ -42,7 +42,6 @@ pub struct Session {
     pub(crate) model: String,
     pub(crate) provider_id: String,
     pub(crate) auto_route: bool,
-    permission_mode: PermissionModeArg,
     providers: Arc<Mutex<ProviderManager>>,
     pub(crate) workspace: std::path::PathBuf,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
@@ -191,7 +190,6 @@ impl Session {
             providers,
             workspace,
             auto_route,
-            permission_mode: cli.permission_mode,
             sdk_permissions: None,
             sdk_content: None,
             api_format,
@@ -266,11 +264,11 @@ impl Session {
     }
 
     pub fn permission_mode(&self) -> &'static str {
-        match self.permission_mode {
-            PermissionModeArg::Ask => "ask",
-            PermissionModeArg::AcceptEdits => "accept-edits",
-            PermissionModeArg::Plan => "plan",
-            PermissionModeArg::Bypass => "bypass",
+        match self.permissions.get_mode() {
+            PermissionMode::AskPermissions => "ask",
+            PermissionMode::AcceptEdits => "accept-edits",
+            PermissionMode::PlanMode => "plan",
+            PermissionMode::BypassPermissions => "bypass",
         }
     }
 
@@ -284,7 +282,6 @@ impl Session {
             PermissionModeArg::Plan => PermissionMode::PlanMode,
             PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
         }).await;
-        self.permission_mode = mode;
         Ok(())
     }
 
@@ -469,7 +466,10 @@ impl Session {
                     },
                     EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input: tool_input } => {
                         progress.clear();
-                        let question = format!("Allow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?);
+                        let question = if tool_name == "ExitPlanMode" {
+                            format!("Review plan\n{}\n\n{}\n\nApprove this plan and leave plan mode? Implementation will use ask permissions. [y/N]",
+                                tool_input["planFilePath"].as_str().unwrap_or(""), tool_input["plan"].as_str().unwrap_or(""))
+                        } else { format!("Allow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?) };
                         let answer = if let Some(sdk)=&self.sdk_permissions { sdk.ask(&request_id,&tool_use_id,&tool_name,&tool_input).await? } else if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { answer } else {
                             anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
                             turn_answer(&mut progress, input, question).await?
@@ -686,6 +686,38 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
 #[cfg(test)]
 mod event_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plan_command_displays_saved_document_without_leaving_plan_mode() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(directory.path().join("data")).unwrap();
+        let provider = serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        let selection = Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture-model".into(),
+        };
+        let cli = Cli::parse_from(["claude-code", "--print", "--permission-mode", "bypass"]);
+        let mut session = Session::open(&cli, &paths, selection, None).await.unwrap();
+        crate::extended_commands::handle("/plan", "", &paths, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(session.permission_mode(), "plan");
+        claude_core::services::plans::save(&paths.data_dir, &session.id, "# Plan\nUTF-8 检查").unwrap();
+        crate::extended_commands::handle("/plan", "", &paths, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(session.permission_mode(), "plan");
+        // Tool-driven state changes must be reflected in UI and worker arguments.
+        session.permissions.set_mode(PermissionMode::AskPermissions);
+        assert_eq!(session.permission_mode(), "ask");
+        crate::extended_commands::handle("/plan", "show", &paths, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(session.permission_mode(), "ask");
+        session.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn context_suffix_survives_session_switch_resume_and_worker_snapshot(){

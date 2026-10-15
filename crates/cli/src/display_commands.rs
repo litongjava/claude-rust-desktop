@@ -422,7 +422,7 @@ pub fn split_arguments(text: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
-async fn edit_file(path: &Path, initial: &str) -> Result<()> {
+pub(crate) async fn edit_file(path: &Path, initial: &str) -> Result<()> {
     if !path.exists() {
         use std::io::Write;
         std::fs::OpenOptions::new()

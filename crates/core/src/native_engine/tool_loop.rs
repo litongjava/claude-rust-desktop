@@ -2,6 +2,8 @@
 mod delegation;
 #[path = "skill_tool.rs"]
 mod skill_tool;
+#[path = "plan_tool.rs"]
+mod plan_tool;
 
 use crate::native_engine::anthropic_client::{AnthropicClient, AnthropicContent, AnthropicMessage, ContentBlock};
 use crate::native_engine::engine_core::ReasoningMode;
@@ -45,6 +47,10 @@ mod builtin_failure_tests;
 #[cfg(test)]
 #[path = "turn_budget_tests.rs"]
 mod turn_budget_tests;
+
+#[cfg(test)]
+#[path = "durable_input_tests.rs"]
+mod durable_input_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -146,6 +152,7 @@ pub struct ToolLoopExecutor {
     skill_shell_active: bool,
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
+    durable_user_input: bool,
     allowed_directories: Vec<std::path::PathBuf>,
 }
 
@@ -481,6 +488,7 @@ impl ToolLoopExecutor {
             skill_shell_active: false,
             pending_user_skill: None,
             manual_skill_active: false,
+            durable_user_input: false,
             allowed_directories: Vec::new(),
         }
     }
@@ -521,7 +529,7 @@ impl ToolLoopExecutor {
 
     async fn execute_tool_call(&mut self, name: &str, input: &Value, id: &str) -> (Value, String, bool) {
         use crate::services::tool_hooks::HookEvent;
-        let Some(hooks) = self.hooks.clone() else { return self.execute_tool_call_inner(name, input, id).await; };
+        let Some(hooks) = self.hooks.clone() else { return Box::pin(self.execute_tool_call_inner(name, input, id)).await; };
         let session = self.conv_id.clone().unwrap_or_else(|| "unknown".into());
         let pre = match hooks.run(HookEvent::PreToolUse, &session, json!({"tool_name":name,"tool_input":input,"tool_use_id":id})).await {
             Ok(outcome) => outcome,
@@ -537,13 +545,13 @@ impl ToolLoopExecutor {
             let (tx, rx) = oneshot::channel();
             self.answer_waiters.lock().await.insert(request_id.clone(), tx);
             let _ = self.event_tx.send(EngineEvent::ToolPermission { request_id: request_id.clone(), tool_use_id: id.into(), tool_name: name.into(), input: input.clone() }).await;
-            let answer = timeout(Duration::from_secs(300), rx).await;
+            let answer = self.wait_for_user_answer(rx).await;
             self.answer_waiters.lock().await.remove(&request_id);
             let approved = answer.ok().and_then(|r| r.ok()).is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "yes"|"allow"|"ok"|"approved"|"always_allow"|"允许"|"是"|"确认"));
             if !approved { return (input, "Hook requested permission; operation was not approved".into(), true); }
         }
         // Updated arguments pass through the complete normal permission path.
-        let (actual, mut output, mut failed) = self.execute_tool_call_inner(name, &input, id).await;
+        let (actual, mut output, mut failed) = Box::pin(self.execute_tool_call_inner(name, &input, id)).await;
         for context in pre.additional_context { output.push_str(&format!("\nPreToolUse context: {context}")); }
         for warning in pre.warnings { tracing::warn!("PreToolUse hook: {warning}"); }
         match hooks.run(HookEvent::PostToolUse, &session, json!({"tool_name":name,"tool_input":actual,"tool_use_id":id,"tool_response":output,"is_error":failed})).await {
@@ -601,6 +609,9 @@ impl ToolLoopExecutor {
     }
 
     pub fn with_permission_manager(mut self, manager: Arc<PermissionManager>) -> Self {
+        if manager.get_mode() == crate::permissions::PermissionMode::PlanMode {
+            self.system_prompt.get_or_insert_with(String::new).push_str("\nThis turn starts in read-only plan mode. Investigate without modifying project files until ExitPlanMode succeeds. Submit a concrete Markdown implementation and verification plan via ExitPlanMode(plan). It saves the session plan and requests explicit user approval before returning to normal ask permissions. Do not claim approval without a successful ExitPlanMode result.\n");
+        }
         self.permission_manager = Some(manager);
         self
     }
@@ -666,8 +677,14 @@ impl ToolLoopExecutor {
     }
 
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        if !self.durable_user_input {
+            if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(|p| p.parent()), self.conv_id.as_deref()) {
+                self.durable_user_input = crate::services::background_sessions::worker_directory(root, session)?.is_some();
+            }
+        }
         let directories = self.allowed_directories.clone();
-        crate::tools::path_scope::scope(directories, self.execute_scoped()).await
+        let context = self.search_config_path.as_deref().and_then(|p| p.parent()).map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
+        crate::tools::background_shell::scope(context, crate::tools::path_scope::scope(directories, self.execute_scoped())).await
     }
 
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
@@ -815,6 +832,9 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
         if self.allowed_tools.as_ref().is_some_and(|names| !names.iter().any(|name| name == tool_name)) { return (tool_input.clone(), "Tool is not allowed by this agent definition".into(), true); }
+        if matches!(tool_name, "EnterPlanMode" | "ExitPlanMode") || (tool_name == "plan_mode" && matches!(tool_input["operation"].as_str(), Some("enter" | "exit"))) {
+            return self.execute_plan_transition(tool_name, tool_input, _tool_use_id).await;
+        }
         if tool_name == "team" && tool_input["operation"] == "run" {
             let result = Box::pin(self.execute_team(tool_input)).await;
             let failed = result.is_err();
@@ -822,10 +842,12 @@ impl ToolLoopExecutor {
             return (tool_input.clone(), output, failed);
         }
         if tool_name == "plan_mode" {
-            let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &self.workspace_cwd).await;
-            if result.is_ok() && tool_input["operation"] == "enter" {
-                if let Some(manager) = &self.permission_manager { manager.set_mode(crate::permissions::PermissionMode::PlanMode); }
+            match self.check_permission(tool_name, tool_input).await {
+                PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
+                PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
+                PermissionResult::Granted => {}
             }
+            let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &self.workspace_cwd).await;
             let failed = result.is_err();
             let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
             return (tool_input.clone(), output, failed);
@@ -947,7 +969,7 @@ impl ToolLoopExecutor {
             options: options.clone(),
         }).await;
 
-        match timeout(Duration::from_secs(300), rx).await {
+        match self.wait_for_user_answer(rx).await {
             Ok(Ok(answer)) => {
                 let result = serde_json::json!({
                     "type": "ask_user_question",
@@ -1048,6 +1070,15 @@ impl ToolLoopExecutor {
         }
     }
 
+    async fn wait_for_user_answer(&self, receiver: oneshot::Receiver<String>) -> std::result::Result<std::result::Result<String, oneshot::error::RecvError>, tokio::time::error::Elapsed> {
+        // A supervised worker owns a durable pending mailbox. Expiring only the
+        // engine waiter leaves that mailbox presenting an approval that no longer
+        // exists. Cancellation/shutdown aborts the owning turn and drops receiver;
+        // channel closure still resolves immediately without executing the tool.
+        if self.durable_user_input { Ok(receiver.await) }
+        else { timeout(Duration::from_secs(300), receiver).await }
+    }
+
     async fn execute_ask_user_confirmation(&mut self, tool_name: &str, tool_input: &Value, tool_use_id: &str, _message: &str) -> (Value, String, bool) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel::<String>();
@@ -1063,7 +1094,7 @@ impl ToolLoopExecutor {
             input: tool_input.clone(),
         }).await;
 
-        match timeout(Duration::from_secs(300), rx).await {
+        match self.wait_for_user_answer(rx).await {
             Ok(Ok(answer)) => {
                 let answer_lower = answer.trim().to_lowercase();
                 let is_allowed = matches!(answer_lower.as_str(),
@@ -1093,7 +1124,7 @@ impl ToolLoopExecutor {
                         pm.confirm_permission(&conv_id, tool_name);
                     }
 
-                    let result = self.execute_tool_call_unchecked(tool_name, tool_input, "").await;
+                    let result = Box::pin(self.execute_tool_call_unchecked(tool_name, tool_input, "")).await;
                     result
                 } else if is_denied {
                     (tool_input.clone(), "User denied the operation".to_string(), true)
@@ -1485,7 +1516,7 @@ impl ToolLoopExecutor {
                                 }).await;
 
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
+                                let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                                     || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                                     || self.check_permission_requires_confirmation(&name, &input);
 
@@ -1981,7 +2012,7 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
+                    let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                         || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                         || self.check_permission_requires_confirmation(name, &input);
 

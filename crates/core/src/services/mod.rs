@@ -1,6 +1,7 @@
 //! Peripheral services shared by CLI and Desktop. Hosts supply credentials/devices.
 pub mod lifecycle;
 pub mod compaction;
+pub mod plans;
 pub mod session_workspace;
 pub mod background_sessions;
 pub mod session_worker;

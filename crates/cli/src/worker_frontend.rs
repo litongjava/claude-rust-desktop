@@ -85,28 +85,63 @@ pub async fn turn(
             }
         }
     };
-    let result = observe(session, &job.id, input, &mut display).await;
-    if result.is_err() {
-        if jobs::get(root, &job.id)
-            .is_ok_and(|job| matches!(job.status.as_str(), "starting" | "running"))
-        {
-            // Only genuinely detached/unobserved completion gets a later notice.
-            let _ = jobs::detach(root, &job.id, &session.id);
-            match jobs::cancel(root, &job.id) {
-                Ok(_) => display.notice(&format!(
-                    "Cancellation requested for worker {} after a frontend error.",
-                    job.id
-                )),
-                Err(error) => display.notice(&format!(
-                    "Worker {} may still be running: {error:#}. Inspect /tasks.",
-                    job.id
-                )),
-            }
-        }
+    present(session, &job, input, &mut display, true).await
+}
+
+/// Attach to durable events only: never submit or recreate a worker request.
+pub async fn attach(session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
+    let job = jobs::get(&session.paths.data_dir, id)?;
+    authorize_attachment(&job, &session.id)?;
+    let mut display = TurnDisplay::new(
+        true,
+        session.permission_mode(),
+        &session.paths.data_dir.join("keybindings.json"),
+        Vec::new(),
+    )?;
+    display.notice(&format!(
+        "Attached to task {id}. Esc cancels; Ctrl+B or /background detaches without restarting."
+    ));
+    if job.session_id != session.id {
+        display.notice("Follow-up prompts are queued to your current session after this view closes; they do not steer the attached child. /btw uses your current session context.");
+    }
+    present(session, &job, input, &mut display, false).await
+}
+
+fn authorize_attachment(job: &jobs::Job, session: &str) -> Result<()> {
+    ensure!(
+        job.parent_session_id == session || job.session_id == session,
+        "Task belongs to another session"
+    );
+    Ok(())
+}
+
+async fn present(
+    session: &Session,
+    job: &jobs::Job,
+    input: &mut Option<TerminalInput>,
+    display: &mut TurnDisplay,
+    sync_plan_mode: bool,
+) -> Result<()> {
+    authorize_attachment(job, &session.id)?;
+    let root = &session.paths.data_dir;
+    let result = observe(session, &job.id, &job.parent_session_id, input, display, sync_plan_mode).await;
+    let still_running = result.is_err()
+        && jobs::get(root, &job.id)
+            .is_ok_and(|job| matches!(job.status.as_str(), "starting" | "running"));
+    if still_running {
+        // Observation is not execution: a failed view must never cancel work.
+        let _ = jobs::detach(root, &job.id, &job.parent_session_id);
+        display.notice(&format!("Task {} continues in the background after a view error. Use /tasks attach {} to return; /tasks show {} contains the original diagnostic.", job.id, job.id, job.id));
     }
     // Raw engine events and terminal error remain in the durable job logs.
     // The footer owns the single user-facing error; do not rethrow it to REPL.
     let error_text = result.as_ref().err().map(|error| {
+        if still_running {
+            return format!(
+                "Task view failed; worker continues. Details: /tasks show {}",
+                job.id
+            );
+        }
         let state = jobs::get(root, &job.id).ok();
         failure_message(
             &job.id,
@@ -157,8 +192,10 @@ fn restore(input: &mut Option<TerminalInput>, action: Action) {
 async fn observe(
     session: &Session,
     id: &str,
+    owner: &str,
     input: &mut Option<TerminalInput>,
     display: &mut TurnDisplay,
+    sync_plan_mode: bool,
 ) -> Result<bool> {
     let root = &session.paths.data_dir;
     let mut cursor = 0;
@@ -172,13 +209,15 @@ async fn observe(
     > = None;
     let mut cancelled = false;
     let mut notified = std::time::Instant::now();
+    let mut notification_error = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let (job, next, events) = jobs::events_since(root, id, &session.id, cursor)?;
+                let (job, next, events) = jobs::events_since(root, id, owner, cursor)?;
                 let drained = cursor == next;
                 cursor = next;
                 for event in events {
+                    sync_plan_event(&session.permissions, &event, sync_plan_mode && job.session_id == session.id);
                     if event["type"] == "text" { streamed = true; }
                     if event["type"] == "result" {
                         if let Some(text)=result_text(&event,streamed) {display.before_text(text);}
@@ -187,38 +226,54 @@ async fn observe(
                     render(display, &event);
                 }
                 if pending.is_none() {
-                    if let Some(question) = jobs::pending_question(root, id, &session.id)?.filter(|question| !answered.contains(&question.request_id)) {
+                    if let Some(question) = jobs::pending_question(root, id, owner)?.filter(|question| !answered.contains(&question.request_id)) {
                         if let Some(live) = &display.live {
                             pending = Some((question.request_id, live.question(question.question)));
                         } else if let Some(reader) = input.as_mut() {
                             if let Some(answer) = reader.read_answer(&question.question).await? {
-                                jobs::answer_question(root, id, &session.id, &question.request_id, &answer)?;
+                                jobs::answer_question(root, id, owner, &question.request_id, &answer)?;
                             }
                         }
                     }
                 }
                 if drained && !matches!(job.status.as_str(), "starting"|"running") {
-                    if matches!(job.status.as_str(),"completed"|"failed"|"cancelled") {jobs::acknowledge_foreground(root,id,&session.id)?;}
+                    if job.session_id == owner && matches!(job.status.as_str(),"completed"|"failed"|"cancelled") {jobs::acknowledge_foreground(root,id,owner)?;}
                     ensure!(job.status == "completed", "Worker {}: {}{}", id, job.status, job.error.map(|error|format!(" - {error}")).unwrap_or_default());
                     if side.is_none() { return Ok(false); }
                     display.set_activity("Main task complete - finishing side question");
                 }
                 if notified.elapsed() >= std::time::Duration::from_secs(1) {
-                    for notice in crate::background_commands::collect_completed(session)? { display.notice(&notice); }
+                    match crate::background_commands::collect_completed(session) {
+                        Ok(notices) => {
+                            notification_error = None;
+                            for notice in notices { display.notice(&notice); }
+                        },
+                        Err(error) => {
+                            // Other jobs' notification state is not this turn's failure.
+                            let diagnostic = format!("Background notifications unavailable: {error:#}");
+                            if notification_error.as_ref() != Some(&diagnostic) {
+                                display.notice(&diagnostic);
+                                notification_error = Some(diagnostic);
+                            }
+                        }
+                    }
                     notified = std::time::Instant::now();
                 }
             },
             answer = async { match pending.as_mut() { Some((_, answer)) => answer.await, None => std::future::pending().await } } => {
                 let (request, _) = pending.take().unwrap();
-                jobs::answer_question(root, id, &session.id, &request, &answer?)?;
+                jobs::answer_question(root, id, owner, &request, &answer?)?;
                 answered.insert(request);
                 display.set_activity("Working");
             },
             action = display.action() => {
                 match action {
                     Some(Action::Detach) => {
-                        jobs::detach(root, id, &session.id)?;
-                        display.notice(&format!("Task {id} continues in the background without restarting its request. Use /tasks attach {id} to view it. This session is occupied until completion; /clear starts a new session."));
+                        jobs::detach(root, id, owner)?;
+                        display.notice(&format!("Task {id} continues in the background without restarting its request. Use /tasks attach {id} to return."));
+                        if jobs::get(root, id)?.session_id == session.id {
+                            display.notice("This session is occupied until completion; /clear starts a new session.");
+                        }
                         return Ok(true);
                     },
                     Some(Action::Cancel) | None => {
@@ -239,6 +294,72 @@ async fn observe(
                 if !cancelled { jobs::cancel(root, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
             },
         }
+    }
+}
+
+fn sync_plan_event(manager: &claude_core::permissions::PermissionManager, event: &Value, current_foreground_turn: bool) {
+    // Attach replays a durable log, possibly from before a later /permissions
+    // command. Historical display must never restore obsolete authorization.
+    if current_foreground_turn {
+        if let Some(mode) = plan_event_mode(event) { manager.set_mode(mode); }
+    }
+}
+
+#[test]
+fn plan_history_replay_never_changes_current_permissions() {
+    use claude_core::permissions::PermissionMode;
+    use serde_json::json;
+    let manager = claude_core::runtime::default_permissions();
+    for initial in [PermissionMode::BypassPermissions, PermissionMode::PlanMode, PermissionMode::AskPermissions] {
+        manager.set_mode(initial);
+        for (name, output) in [("EnterPlanMode", r#"{"mode":"plan"}"#), ("ExitPlanMode", r#"{"approved":true,"mode":"ask"}"#)] {
+            let event = json!({"type":"tool_result","name":name,"output":output,"is_error":false});
+            sync_plan_event(&manager, &event, false);
+            assert_eq!(manager.get_mode(), initial);
+        }
+    }
+    sync_plan_event(&manager, &json!({"type":"tool_result","name":"EnterPlanMode","output":r#"{"mode":"plan"}"#,"is_error":false}), true);
+    assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+}
+
+fn plan_event_mode(event: &Value) -> Option<claude_core::permissions::PermissionMode> {
+    use claude_core::permissions::PermissionMode;
+    if event["type"] != "tool_result" || event["is_error"] != false {
+        return None;
+    }
+    let output: Value = serde_json::from_str(event["output"].as_str()?).ok()?;
+    match event["name"].as_str()? {
+        "EnterPlanMode" | "plan_mode" if output["mode"] == "plan" => Some(PermissionMode::PlanMode),
+        "ExitPlanMode" | "plan_mode" if output["approved"] == true && output["mode"] == "ask" => {
+            Some(PermissionMode::AskPermissions)
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn plan_worker_events_only_apply_successful_transitions() {
+    use claude_core::permissions::PermissionMode;
+    use serde_json::json;
+    let event = |name, output, failed| json!({"type":"tool_result","name":name,"output":output,"is_error":failed});
+    assert_eq!(
+        plan_event_mode(&event("EnterPlanMode", r#"{"mode":"plan"}"#, false)),
+        Some(PermissionMode::PlanMode)
+    );
+    assert_eq!(
+        plan_event_mode(&event(
+            "ExitPlanMode",
+            r#"{"approved":true,"mode":"ask"}"#,
+            false
+        )),
+        Some(PermissionMode::AskPermissions)
+    );
+    for (name, output, failed) in [
+        ("ExitPlanMode", r#"{"approved":true,"mode":"ask"}"#, true),
+        ("ExitPlanMode", r#"{"mode":"ask"}"#, false),
+        ("Read", r#"{"approved":true,"mode":"ask"}"#, false),
+    ] {
+        assert_eq!(plan_event_mode(&event(name, output, failed)), None);
     }
 }
 
@@ -344,6 +465,139 @@ fn result_text(event: &Value, streamed: bool) -> Option<&str> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[tokio::test]
+    async fn attachment_checks_owner_and_reads_completed_job_without_resubmission() {
+        use clap::Parser;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = claude_core::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let child = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let job = jobs::Job {
+            id: id.clone(),
+            foreground: false,
+            parent_session_id: parent.clone(),
+            session_id: child.clone(),
+            title: "already completed".into(),
+            status: "completed".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            started_ms: 1,
+            heartbeat_ms: 2,
+            finished_ms: Some(2),
+            exit_code: Some(0),
+            error: None,
+        };
+        assert!(authorize_attachment(&job, &parent).is_ok());
+        assert!(authorize_attachment(&job, &child).is_ok());
+        assert!(authorize_attachment(&job, "unrelated").is_err());
+        let directory = paths.data_dir.join("background-tasks").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = serde_json::to_vec(&job).unwrap();
+        std::fs::write(directory.join("state.json"), &state).unwrap();
+        let events = concat!(
+            "{\"type\":\"thinking\",\"delta\":\"thought\"}\n",
+            "{\"type\":\"text\",\"delta\":\"existing answer\"}\n",
+            "{\"type\":\"result\",\"result\":\"existing answer\"}\n"
+        );
+        std::fs::write(directory.join("output.jsonl"), events).unwrap();
+        let cli = Cli::try_parse_from(["claude-code"]).unwrap();
+        for session_id in [&parent, &child] {
+            let mut provider = claude_core::runtime::provider_from_config(
+                &crate::config::provider_template("fixture"),
+            );
+            provider.id = "fixture".into();
+            provider.base_url = "http://127.0.0.1:1".into();
+            let session = Session::open(
+                &cli,
+                &paths,
+                crate::config::Selection {
+                    providers: vec![provider],
+                    model: "fixture".into(),
+                    provider_id: "fixture".into(),
+                },
+                Some(session_id),
+            )
+            .await
+            .unwrap();
+            let before = session.store.history(session_id).unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                attach(&session, &id, &mut None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(session.store.history(session_id).unwrap(), before);
+        }
+        assert_eq!(std::fs::read(directory.join("state.json")).unwrap(), state);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("output.jsonl")).unwrap(),
+            events
+        );
+        assert!(!directory.join("cancel").exists());
+        assert!(!paths.data_dir.join("session-workers").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_observation_preserves_running_job_and_original_diagnostic() {
+        use clap::Parser;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = claude_core::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let mut provider = claude_core::runtime::provider_from_config(
+            &crate::config::provider_template("fixture"),
+        );
+        provider.id = "fixture".into();
+        let cli = Cli::try_parse_from(["claude-code"]).unwrap();
+        let session = Session::open(
+            &cli,
+            &paths,
+            crate::config::Selection {
+                providers: vec![provider],
+                model: "fixture".into(),
+                provider_id: "fixture".into(),
+            },
+            Some(&parent),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = paths.data_dir.join("background-tasks").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let job = jobs::Job {
+            id: id.clone(),
+            foreground: true,
+            parent_session_id: parent.clone(),
+            session_id: parent,
+            title: "still working".into(),
+            status: "running".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            started_ms: 1,
+            heartbeat_ms: chrono::Utc::now().timestamp_millis() as u64,
+            finished_ms: None,
+            exit_code: None,
+            error: None,
+        };
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("output.jsonl"), "broken-json\n").unwrap();
+        let error = attach(&session, &id, &mut None).await.unwrap_err();
+        assert!(error.to_string().contains("worker continues"));
+        assert_eq!(jobs::get(&paths.data_dir, &id).unwrap().status, "running");
+        assert!(!directory.join("cancel").exists());
+        assert!(directory.join("detached").exists());
+        assert!(std::fs::read_to_string(directory.join("stderr.log"))
+            .unwrap()
+            .contains("Invalid background stream JSON"));
+    }
+
     #[test]
     fn failed_results_do_not_repeat_engine_diagnostics_as_answer_text() {
         let event = serde_json::json!({"type":"result","is_error":true,"result":"Engine execution failed: API request failed: private endpoint","error":"diagnostic"});

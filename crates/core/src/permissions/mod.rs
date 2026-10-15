@@ -1,5 +1,6 @@
 pub mod manager;
 pub mod rules;
+pub mod patterns;
 pub mod audit;
 
 pub use manager::{PermissionManager, PermissionMode};
