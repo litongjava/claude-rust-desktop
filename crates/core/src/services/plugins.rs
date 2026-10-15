@@ -82,8 +82,7 @@ impl Bundle {
         ensure!(self.lsp_servers.len() <= 32, "Too many plugin language servers");
         for (name, config) in &self.lsp_servers {
             ensure!(valid_name(name) && config.is_object(), "Invalid language server configuration");
-            ensure!(config["command"].as_str().is_some_and(|s| !s.trim().is_empty()), "Language server command is required");
-            ensure!(config["extensionToLanguage"].as_object().is_some_and(|m| !m.is_empty()), "Language server extension mapping is required");
+            crate::tools::validate_lsp_configuration(config)?;
         }
         ensure!(valid_name(&self.id), "Invalid plugin ID");
         semver::Version::parse(&self.version)?;

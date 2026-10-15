@@ -4,13 +4,23 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SERVERS: usize = 8;
+#[cfg(test)]
+#[path = "lsp_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[derive(Debug)]
+struct Disconnected;
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("Language server closed stdout") }
+}
+impl std::error::Error for Disconnected {}
 
 struct Server {
     child: tokio::process::Child,
@@ -23,50 +33,95 @@ struct Server {
 }
 
 type Pool = HashMap<String, (Instant, Server)>;
+#[derive(Default)]
+struct WorkspaceConfiguration {
+    generation: u64,
+    servers: Vec<Value>,
+}
+#[derive(Default)]
+struct Runtime {
+    pool: tokio::sync::Mutex<Pool>,
+    configurations: std::sync::Mutex<HashMap<String, WorkspaceConfiguration>>,
+    recovery: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<u64>>>>,
+}
+fn runtime() -> &'static Arc<Runtime> {
+    static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
+    RUNTIME.get_or_init(Default::default)
+}
 fn pool() -> &'static tokio::sync::Mutex<Pool> {
-    static POOL: OnceLock<tokio::sync::Mutex<Pool>> = OnceLock::new();
-    POOL.get_or_init(Default::default)
+    &runtime().pool
 }
 
-fn configurations() -> &'static std::sync::Mutex<HashMap<String, Vec<Value>>> {
-    static CONFIGURATIONS: OnceLock<std::sync::Mutex<HashMap<String, Vec<Value>>>> =
-        OnceLock::new();
-    CONFIGURATIONS.get_or_init(Default::default)
+pub(crate) fn validate_configuration(server: &Value) -> Result<()> {
+    let fields = server.as_object().context("LSP server configuration must be an object")?;
+    for field in fields.keys() {
+        if !matches!(field.as_str(), "name" | "command" | "args" | "extensionToLanguage" | "transport" | "env" | "initializationOptions" | "settings" | "workspaceFolder" | "startupTimeout" | "maxRestarts" | "shutdownTimeout" | "restartOnCrash") { bail!("Unknown LSP configuration field: {field}"); }
+    }
+    if server["command"].as_str().is_none_or(|s| s.trim().is_empty()) {
+        bail!("LSP server configuration needs a command");
+    }
+    if !server["extensionToLanguage"].as_object().is_some_and(|entries| !entries.is_empty() && entries.iter().all(|(extension, language)| extension.starts_with('.') && extension.len() > 1 && !extension.contains(['/', '\\', ' ']) && language.as_str().is_some_and(|language| !language.trim().is_empty()))) {
+        bail!("LSP extensionToLanguage needs nonempty .extension to language mappings");
+    }
+    if server.get("transport").is_some_and(|value| value.as_str() != Some("stdio")) {
+        bail!("Only stdio LSP server transport is supported");
+    }
+    if server.get("args").is_some_and(|value| !value.as_array().is_some_and(|args| args.iter().all(|arg| arg.as_str().is_some_and(|arg| !arg.is_empty())))) {
+        bail!("LSP args must contain nonempty strings");
+    }
+    if server.get("env").is_some_and(|value| !value.as_object().is_some_and(|env| env.values().all(Value::is_string))) {
+        bail!("LSP env must contain strings");
+    }
+    if server.get("workspaceFolder").is_some_and(|value| !value.is_string()) {
+        bail!("LSP workspaceFolder must be a string");
+    }
+    lifecycle_options(server)?;
+    Ok(())
 }
 
 pub fn configure(workspace: &str, servers: Vec<Value>) -> Result<()> {
+    configure_in(runtime(), workspace, servers)
+}
+fn configure_in(runtime: &Arc<Runtime>, workspace: &str, servers: Vec<Value>) -> Result<()> {
     for server in &servers {
-        if server["command"].as_str().is_none_or(str::is_empty) {
-            bail!("LSP server configuration needs a command");
-        }
-        if !server["extensionToLanguage"].is_object() {
-            bail!("LSP server needs extensionToLanguage");
-        }
-        if server
-            .get("transport")
-            .and_then(Value::as_str)
-            .is_some_and(|transport| transport != "stdio")
-        {
-            bail!("Only stdio LSP server transport is supported");
-        }
-        if let Some(env) = server.get("env") {
-            if !env
-                .as_object()
-                .is_some_and(|env| env.values().all(Value::is_string))
-            {
-                bail!("LSP env must contain strings");
-            }
-        }
+        validate_configuration(server)?;
     }
     let workspace = std::path::Path::new(workspace)
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
-    configurations()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("LSP configuration lock poisoned"))?
-        .insert(workspace, servers);
+    let mut configurations = runtime.configurations.lock().map_err(|_| anyhow::anyhow!("LSP configuration lock poisoned"))?;
+    let current = configurations.entry(workspace.clone()).or_default();
+    if current.servers == servers { return Ok(()); }
+    current.generation = current.generation.checked_add(1).context("LSP configuration generation exhausted")?;
+    current.servers = servers;
+    runtime.recovery.lock().map_err(|_| anyhow::anyhow!("LSP recovery lock poisoned"))?.retain(|key, _| !identity_workspace(key, &workspace));
+    // This synchronous API never waits for the async pool. In-flight or busy
+    // entries are rejected by their generation before reuse/recycling.
+    if let Ok(mut pool) = runtime.pool.try_lock() {
+        pool.retain(|key, _| !identity_workspace(key, &workspace));
+    }
     Ok(())
+}
+fn identity_workspace(key: &str, workspace: &str) -> bool {
+    serde_json::from_str::<Value>(key).is_ok_and(|identity| identity["root"] == workspace)
+}
+fn current_generation(runtime: &Runtime, key: &str) -> bool {
+    let Ok(identity) = serde_json::from_str::<Value>(key) else { return false };
+    let Ok(configs) = runtime.configurations.lock() else { return false };
+    let generation = configs.get(identity["root"].as_str().unwrap_or("")).map_or(0, |config| config.generation);
+    identity["generation"].as_u64().unwrap_or(0) == generation
+}
+
+fn lifecycle_options(input: &Value) -> Result<(Option<Duration>, u64)> {
+    for unsupported in ["restartOnCrash", "shutdownTimeout"] {
+        if input.get(unsupported).is_some() { bail!("LSP {unsupported} is not implemented; remove this field from the configuration"); }
+    }
+    let startup = input.get("startupTimeout").map(|value| value.as_u64().filter(|value| *value > 0).context("LSP startupTimeout must be a positive integer in milliseconds")).transpose()?;
+    let restarts = input.get("maxRestarts").map(|value| value.as_u64().context("LSP maxRestarts must be a nonnegative integer")).transpose()?.unwrap_or(3);
+    let startup = startup.map(Duration::from_millis);
+    if startup.is_some_and(|duration| tokio::time::Instant::now().checked_add(duration).is_none()) { bail!("LSP startupTimeout exceeds the platform clock range"); }
+    Ok((startup, restarts))
 }
 
 /// Display-only metadata; environment variables and initialization settings are
@@ -76,17 +131,19 @@ pub fn configured(workspace: &str) -> Result<Vec<Value>> {
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
-    let configs = configurations()
+    let configs = runtime().configurations
         .lock()
         .map_err(|_| anyhow::anyhow!("LSP configuration lock poisoned"))?;
-    Ok(configs.get(&root).into_iter().flatten().map(|server|json!({"name":server["name"],"command":server["command"],"extensionToLanguage":server["extensionToLanguage"]})).collect())
+    Ok(configs.get(&root).into_iter().flat_map(|config| &config.servers).map(|server|json!({"name":server["name"],"command":server["command"],"extensionToLanguage":server["extensionToLanguage"],"startupTimeout":server["startupTimeout"],"maxRestarts":server.get("maxRestarts").cloned().unwrap_or(json!(3))})).collect())
 }
 
 pub async fn status(workspace: &str) -> Result<Value> {
     let root = std::path::Path::new(workspace).canonicalize()?;
     let configured = configured(workspace)?;
     let mut active = Vec::new();
-    for (key, (last_used, server)) in pool().lock().await.iter_mut() {
+    let mut pool = pool().lock().await;
+    pool.retain(|key, _| current_generation(runtime(), key));
+    for (key, (last_used, server)) in pool.iter_mut() {
         let key: Value = serde_json::from_str(key)?;
         if key["root"] != json!(root) {
             continue;
@@ -99,10 +156,7 @@ pub async fn status(workspace: &str) -> Result<Value> {
     )
 }
 
-fn apply_configuration(input: &mut Value, cwd: &str) -> Result<()> {
-    if input.get("server").is_some() {
-        return Ok(());
-    }
+fn apply_configuration(runtime: &Runtime, input: &mut Value, cwd: &str) -> Result<()> {
     let extension = std::path::Path::new(input["path"].as_str().unwrap_or(""))
         .extension()
         .and_then(|s| s.to_str())
@@ -112,11 +166,13 @@ fn apply_configuration(input: &mut Value, cwd: &str) -> Result<()> {
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
-    let configs = configurations()
+    let configs = runtime.configurations
         .lock()
         .map_err(|_| anyhow::anyhow!("LSP configuration lock poisoned"))?;
-    if let Some(server) = configs.get(&root).and_then(|servers| {
-        servers
+    input["_lsp_generation"] = json!(configs.get(&root).map_or(0, |config| config.generation));
+    if input.get("server").is_some() { return Ok(()); }
+    if let Some(server) = configs.get(&root).and_then(|config| {
+        config.servers
             .iter()
             .find(|server| server["extensionToLanguage"][&extension].is_string())
     }) {
@@ -126,6 +182,9 @@ fn apply_configuration(input: &mut Value, cwd: &str) -> Result<()> {
             ("env", "env"),
             ("initializationOptions", "initialization_options"),
             ("settings", "settings"),
+            ("workspaceFolder", "workspace_folder"),
+            ("startupTimeout", "startupTimeout"),
+            ("maxRestarts", "maxRestarts"),
         ] {
             if input.get(target).is_none() {
                 if let Some(value) = server.get(source) {
@@ -160,7 +219,10 @@ impl Server {
 /// Graceful application shutdown. In-flight requests are bounded and own their
 /// subprocesses; dropping a cancelled request kills its server as well.
 pub async fn shutdown_all() {
-    let servers = std::mem::take(&mut *pool().lock().await);
+    shutdown_in(runtime()).await;
+}
+async fn shutdown_in(runtime: &Arc<Runtime>) {
+    let servers = std::mem::take(&mut *runtime.pool.lock().await);
     for (_, (_, mut server)) in servers {
         server.shutdown().await;
     }
@@ -182,7 +244,7 @@ pub async fn passive_feedback(cwd: &str, file: &str) -> Option<Value> {
         let mut pool = pool().try_lock().ok()?;
         let key = pool.iter().find_map(|(key, (used, server))| {
             let identity: Value = serde_json::from_str(key).ok()?;
-            (identity["root"] == json!(root)
+            (current_generation(runtime(), key) && identity["root"] == json!(root)
                 && used.elapsed() < IDLE_TIMEOUT
                 && server.documents.contains_key(&uri))
             .then(|| key.clone())
@@ -191,6 +253,7 @@ pub async fn passive_feedback(cwd: &str, file: &str) -> Option<Value> {
         (key, server)
     };
     if server.child.try_wait().ok()?.is_some() {
+        record_passive_failure(&key);
         return None;
     }
     let outcome = tokio::time::timeout(Duration::from_millis(150), async {
@@ -235,19 +298,31 @@ pub async fn passive_feedback(cwd: &str, file: &str) -> Option<Value> {
     }).await;
     match outcome {
         Ok(Ok(value)) => {
-            recycle(key, server).await;
+            recycle(runtime().clone(), key, server).await;
             value
         }
         // A cancelled caller drops the server and its process tree immediately.
         // Errors must not invalidate the already successful Read/Edit/Write.
+        Ok(Err(error)) => {
+            if error.is::<Disconnected>() || error.is::<std::io::Error>() { record_passive_failure(&key); }
+            None
+        }
         _ => None,
     }
 }
 
-async fn recycle(key: String, server: Server) {
+fn record_passive_failure(key: &str) {
+    let recovery = runtime().recovery.lock().ok().and_then(|entries| entries.get(key).cloned());
+    if let Some(recovery) = recovery {
+        if let Ok(mut failures) = recovery.try_lock() { *failures = failures.saturating_add(1); }
+    }
+}
+
+async fn recycle(runtime: Arc<Runtime>, key: String, server: Server) {
     let inserted = Instant::now();
     let evicted = {
-        let mut pool = pool().lock().await;
+        let mut pool = runtime.pool.lock().await;
+        if !current_generation(&runtime, &key) { return; }
         let old = if pool.len() >= MAX_SERVERS {
             let oldest = pool
                 .iter()
@@ -272,7 +347,7 @@ async fn recycle(key: String, server: Server) {
     tokio::spawn(async move {
         tokio::time::sleep(IDLE_TIMEOUT).await;
         let expired = {
-            let mut pool = pool().lock().await;
+            let mut pool = runtime.pool.lock().await;
             if pool.get(&key).is_some_and(|(time, _)| *time == inserted) {
                 pool.remove(&key)
             } else {
@@ -411,7 +486,7 @@ async fn receive_buffered(
         }
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            bail!("Language server closed stdout");
+            return Err(Disconnected.into());
         }
         let count = available.len().min(8192);
         pending.extend_from_slice(&available[..count]);
@@ -440,7 +515,10 @@ async fn response(
     }
 }
 
-pub(super) async fn execute(mut input: Value, cwd: &str) -> Result<Value> {
+pub(super) async fn execute(input: Value, cwd: &str) -> Result<Value> {
+    execute_in(runtime(), input, cwd).await
+}
+async fn execute_in(runtime: &Arc<Runtime>, mut input: Value, cwd: &str) -> Result<Value> {
     let position_base = input
         .get("position_base")
         .and_then(Value::as_u64)
@@ -455,7 +533,8 @@ pub(super) async fn execute(mut input: Value, cwd: &str) -> Result<Value> {
     if input.get("path").is_none() {
         input["path"] = input["filePath"].clone();
     }
-    apply_configuration(&mut input, cwd)?;
+    apply_configuration(runtime, &mut input, cwd)?;
+    lifecycle_options(&input)?;
     if input.get("operation").is_none() {
         let action = input["action"]
             .as_str()
@@ -519,12 +598,12 @@ pub(super) async fn execute(mut input: Value, cwd: &str) -> Result<Value> {
     if !(1..=120).contains(&seconds) {
         bail!("LSP timeout must be 1–120 seconds");
     }
-    tokio::time::timeout(std::time::Duration::from_secs(seconds), session(input, cwd))
+    tokio::time::timeout(std::time::Duration::from_secs(seconds), session(runtime, input, cwd))
         .await
-        .context("Language server timed out")?
+        .context("Language server request timed out (total timeout_secs deadline)")?
 }
 
-async fn session(input: Value, cwd: &str) -> Result<Value> {
+async fn session(runtime: &Arc<Runtime>, input: Value, cwd: &str) -> Result<Value> {
     let executable = input["server"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -564,18 +643,27 @@ async fn session(input: Value, cwd: &str) -> Result<Value> {
         _ => bail!("Unknown LSP operation"),
     };
     let key = serde_json::to_string(
-        &json!({"root":root,"server":executable,"args":input["args"],"env":input["env"],"settings":input["settings"],"initialization_options":input["initialization_options"]}),
+        &json!({"root":root,"server":executable,"args":input["args"],"env":input["env"],"settings":input["settings"],"initialization_options":input["initialization_options"],"workspace_folder":input["workspace_folder"],"startupTimeout":input["startupTimeout"],"maxRestarts":input["maxRestarts"],"generation":input["_lsp_generation"]}),
     )?;
-    let cached = pool().lock().await.remove(&key).map(|(_, server)| server);
+    let recovery = runtime.recovery.lock().map_err(|_| anyhow::anyhow!("LSP recovery lock poisoned"))?.entry(key.clone()).or_default().clone();
+    let mut failures = recovery.lock().await;
+    if !current_generation(runtime, &key) { bail!("LSP configuration changed before this request started; retry the request"); }
+    let cached = {
+        let mut pool = runtime.pool.lock().await;
+        pool.retain(|key, _| current_generation(runtime, key));
+        pool.remove(&key).map(|(_, server)| server)
+    };
+    let (_, max_restarts) = lifecycle_options(&input)?;
     let mut server = match cached {
         Some(mut server) => {
             if server.child.try_wait()?.is_none() {
                 server
             } else {
-                start_server(&input, &root, &root_uri).await?
+                *failures = failures.saturating_add(1);
+                start_with_recovery(&input, &root, &root_uri, &mut failures, max_restarts).await?
             }
         }
-        _ => start_server(&input, &root, &root_uri).await?,
+        _ => start_with_recovery(&input, &root, &root_uri, &mut failures, max_restarts).await?,
     };
     let result=async {
         let Server { writer, reader, state, capabilities, documents, .. } = &mut server;
@@ -639,11 +727,22 @@ async fn session(input: Value, cwd: &str) -> Result<Value> {
         Ok::<_,anyhow::Error>(json!({"path":path,"operation":input["operation"],"result":value}))
     }.await;
     if result.is_ok() && input.get("reuse").and_then(Value::as_bool).unwrap_or(true) {
-        recycle(key, server).await;
+        recycle(runtime.clone(), key, server).await;
     } else {
+        if result.as_ref().err().is_some_and(|error| error.is::<Disconnected>() || error.is::<std::io::Error>()) || (result.is_err() && server.child.try_wait()?.is_some()) { *failures = failures.saturating_add(1); }
         server.shutdown().await;
     }
     result
+}
+
+async fn start_with_recovery(input: &Value, root: &std::path::Path, root_uri: &reqwest::Url, failures: &mut u64, max_restarts: u64) -> Result<Server> {
+    if *failures > max_restarts {
+        bail!("Language server exceeded maxRestarts ({max_restarts}) after {failures} consecutive failed starts/crashes; change its configuration or restart the application before retrying");
+    }
+    match start_server(input, root, root_uri).await {
+        Ok(server) => { *failures = 0; Ok(server) }
+        Err(error) => { *failures = failures.saturating_add(1); Err(error) }
+    }
 }
 
 async fn start_server(
@@ -651,6 +750,13 @@ async fn start_server(
     root: &std::path::Path,
     root_uri: &reqwest::Url,
 ) -> Result<Server> {
+    let workspace_override = input.get("workspace_folder").map(|value| -> Result<std::path::PathBuf> {
+        let path = std::path::Path::new(value.as_str().context("LSP workspaceFolder must be a string")?);
+        Ok(if path.is_absolute() { path.to_path_buf() } else { root.join(path) }.canonicalize()?)
+    }).transpose()?;
+    let workspace_uri = workspace_override.as_ref().map(|path| reqwest::Url::from_directory_path(path).map_err(|_| anyhow::anyhow!("Invalid LSP workspaceFolder URI"))).transpose()?;
+    let root = workspace_override.as_deref().unwrap_or(root);
+    let root_uri = workspace_uri.as_ref().unwrap_or(root_uri);
     let executable = input["server"].as_str().context("server is required")?;
     let mut command = tokio::process::Command::new(executable);
     if let Some(env) = input.get("env") {
@@ -684,7 +790,8 @@ async fn start_server(
         workspace_folders: json!([{"uri":root_uri.as_str(),"name":root.file_name().and_then(|n|n.to_str()).unwrap_or("workspace")}]),
         ..Default::default()
     };
-    send(&mut writer,&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":std::process::id(),"rootUri":root_uri.as_str(),"clientInfo":{"name":"claude-code-rust"},"initializationOptions":input.get("initialization_options"),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"diagnostic":{},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true},"hover":{"contentFormat":["markdown","plaintext"]},"callHierarchy":{}},"workspace":{"applyEdit":false,"configuration":true,"workspaceFolders":true}},"workspaceFolders":state.workspace_folders}})).await?;
+    let initialize = async {
+    send(&mut writer,&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":std::process::id(),"rootUri":root_uri.as_str(),"clientInfo":{"name":"claude-code-rust"},"initializationOptions":input.get("initialization_options").cloned().unwrap_or(json!({})),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"diagnostic":{},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true},"hover":{"contentFormat":["markdown","plaintext"]},"callHierarchy":{}},"workspace":{"applyEdit":false,"configuration":true,"workspaceFolders":true}},"workspaceFolders":state.workspace_folders}})).await?;
     let initialized = response(&mut reader, &mut writer, 1, &mut state).await?;
     if let Some(encoding) = initialized["capabilities"]["positionEncoding"].as_str() {
         if encoding != "utf-16" {
@@ -696,6 +803,11 @@ async fn start_server(
         &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
     )
     .await?;
+    Ok::<_, anyhow::Error>(initialized)
+    };
+    let initialized = if let Some(timeout) = lifecycle_options(input)?.0 {
+        tokio::time::timeout(timeout, initialize).await.with_context(|| format!("Language server initialization timed out after {}ms (startupTimeout)", timeout.as_millis()))??
+    } else { initialize.await? };
     send(&mut writer,&json!({"jsonrpc":"2.0","method":"workspace/didChangeConfiguration","params":{"settings":state.settings}})).await?;
 
     Ok(Server {

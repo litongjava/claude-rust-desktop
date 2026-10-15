@@ -14,6 +14,7 @@ pub mod tasks;
 mod lsp;
 pub use lsp::{configure as configure_lsp_servers, shutdown_all as shutdown_lsp_servers, status as lsp_status};
 pub(crate) use lsp::passive_feedback as lsp_passive_feedback;
+pub(crate) use lsp::validate_configuration as validate_lsp_configuration;
 mod worktrees;
 pub mod agent_messages;
 pub mod coordination;
