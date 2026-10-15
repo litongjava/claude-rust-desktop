@@ -11,6 +11,7 @@ pub mod composio;
 pub mod control;
 pub mod tool_executor;
 pub mod transfer;
+pub mod sdk;
 pub use tool_executor::McpToolRegistry;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

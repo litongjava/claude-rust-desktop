@@ -38,6 +38,7 @@ mod sdk;
 mod sdk_initialization;
 mod sdk_hooks;
 mod sdk_control;
+mod sdk_mcp;
 mod account_commands;
 mod design_commands;
 mod ide_commands;

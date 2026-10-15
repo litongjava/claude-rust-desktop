@@ -33,6 +33,8 @@ pub struct Session {
     pub(crate) sdk_content: Option<Value>,
     pub(crate) sdk_overrides: crate::sdk_initialization::Overrides,
     pub(crate) sdk_hooks: Option<crate::sdk_hooks::Runtime>,
+    pub(crate) sdk_mcp: Arc<claude_core::mcp::sdk::Runtime>,
+    pub(crate) sdk_mcp_transport: Option<Arc<crate::sdk_mcp::Transport>>,
     pub id: String,
     pub store: SessionStore,
     pub engine: NativeEngine,
@@ -51,6 +53,29 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) async fn validate_sdk_mcp_servers(&self, names: &[String]) -> Result<()> {
+        if names.is_empty() { return Ok(()); }
+        // Initialization validates persisted names without starting any process.
+        let path = self.paths.data_dir.join("mcp-servers.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let config: Value = serde_json::from_slice(&bytes)?;
+                if let Some(servers) = config["mcpServers"].as_object() {
+                    for (id, server) in servers {
+                        let name = server["name"].as_str().unwrap_or(id);
+                        anyhow::ensure!(!names.iter().any(|entry| entry == id || entry == name || format!("sdk:{entry}") == *id), "SDK MCP server conflicts with configured server: {name}");
+                    }
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+        for server in self.mcp.list_servers_full().await {
+            anyhow::ensure!(!names.iter().any(|name| name == &server.config.name || name == &server.config.id || format!("sdk:{name}") == server.config.id), "SDK MCP server conflicts with configured server: {}", server.config.name);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn sdk_models(&self) -> Vec<Value> {
         let providers = self.providers.lock().await;
         let qualify = providers
@@ -234,6 +259,7 @@ impl Session {
             paths.data_dir.join("mcp-servers.json"),
         ));
         let ide = Arc::new(claude_core::services::ide::IdeClient::default());
+        let sdk_mcp = Arc::new(claude_core::mcp::sdk::Runtime::default());
         let engine = runtime::create_engine(
             paths,
             db,
@@ -241,7 +267,7 @@ impl Session {
             permissions.clone(),
             Arc::new(FileCache::new()),
         )
-        .with_mcp_registry(Arc::new(McpToolRegistry::new(mcp.clone()).with_ide(ide.clone())))
+        .with_mcp_registry(Arc::new(McpToolRegistry::new(mcp.clone()).with_ide(ide.clone()).with_sdk(sdk_mcp.clone())))
         .with_skills_manager(Arc::new(Mutex::new(
             claude_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
         )));
@@ -263,6 +289,8 @@ impl Session {
             sdk_content: None,
             sdk_overrides: Default::default(),
             sdk_hooks: None,
+            sdk_mcp,
+            sdk_mcp_transport: None,
             lifecycle_owned: false,
             api_format,
         })

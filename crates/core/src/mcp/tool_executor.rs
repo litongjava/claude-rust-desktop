@@ -16,6 +16,7 @@ pub struct McpToolDefinition {
 pub struct McpToolRegistry {
     manager: Arc<McpServerManager>,
     ide: Option<Arc<crate::services::ide::IdeClient>>,
+    sdk: Option<Arc<super::sdk::Runtime>>,
     #[allow(dead_code)]
     active_connectors: Arc<Mutex<HashMap<String, Arc<Mutex<McpConnector>>>>>,
 }
@@ -25,12 +26,18 @@ impl McpToolRegistry {
         Self {
             manager,
             ide: None,
+            sdk: None,
             active_connectors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_ide(mut self, ide: Arc<crate::services::ide::IdeClient>) -> Self {
         self.ide = Some(ide);
+        self
+    }
+
+    pub fn with_sdk(mut self, sdk: Arc<super::sdk::Runtime>) -> Self {
+        self.sdk = Some(sdk);
         self
     }
 
@@ -76,6 +83,20 @@ impl McpToolRegistry {
         }
 
         if let Some(ide) = &self.ide { all_tools.extend(ide.tools().await); }
+        if let Some(sdk) = &self.sdk {
+            let names = sdk.names();
+            if !names.is_empty() {
+                let ids = names.iter().map(|name|format!("sdk:{name}")).collect::<Vec<_>>().join(", ");
+                for tool in all_tools.iter_mut().filter(|tool| matches!(tool.name.as_str(), "ListMcpResources" | "ReadMcpResource")) {
+                    tool.description.push_str(&format!(" Run-local SDK server IDs: {ids}."));
+                }
+            }
+            all_tools.extend(sdk.tools().await?);
+        }
+        let mut names = std::collections::HashSet::new();
+        for tool in &all_tools {
+            anyhow::ensure!(names.insert(&tool.name), "Conflicting MCP tool name: {}", tool.name);
+        }
         Ok(all_tools)
     }
 
@@ -90,10 +111,24 @@ impl McpToolRegistry {
         let manager = &self.manager;
         let servers = manager.list_servers_full().await;
 
+        if let Some(sdk) = &self.sdk {
+            if sdk.tools().await?.iter().any(|tool| tool.name == name) {
+                return sdk.call(name, arguments).await;
+            }
+        }
+
         if matches!(name, "ListMcpResources" | "ReadMcpResource") {
             let id = arguments["server_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("server_id is required"))?;
+            if let Some(server_name) = id.strip_prefix("sdk:") {
+                let sdk = self.sdk.as_ref().ok_or_else(|| anyhow::anyhow!("SDK MCP run unavailable"))?;
+                anyhow::ensure!(!server_name.is_empty(), "SDK MCP server name missing");
+                let uri = if name == "ReadMcpResource" {
+                    Some(arguments["uri"].as_str().ok_or_else(|| anyhow::anyhow!("uri is required"))?)
+                } else { None };
+                return sdk.resource(server_name, uri).await;
+            }
             let server = servers
                 .iter()
                 .find(|server| server.config.id == id)

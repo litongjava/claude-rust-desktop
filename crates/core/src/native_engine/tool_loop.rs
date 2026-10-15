@@ -156,6 +156,7 @@ pub struct ToolLoopExecutor {
     openai_client: OpenAIClient,
     workspace_cwd: String,
     mcp_registry: Option<Arc<McpToolRegistry>>,
+    mcp_tools: Vec<crate::tools::ToolDefinition>,
     streaming_tool_args: HashMap<String, StreamingToolCall>,
     conv_id: Option<String>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
@@ -447,7 +448,7 @@ async fn execute_tool_standalone(
         if registry.is_mcp_tool(&tool_name).await {
             let result = registry.execute_tool(&tool_name, tool_input.clone()).await;
             match result {
-                Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_default(), false),
+                Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_default(), val["isError"].as_bool().unwrap_or(false)),
                 Err(e) => (format!("Error: {}", e), true),
             }
         } else {
@@ -528,6 +529,7 @@ impl ToolLoopExecutor {
             openai_client: OpenAIClient::new(),
             workspace_cwd,
             mcp_registry: None,
+            mcp_tools: Vec::new(),
             streaming_tool_args: HashMap::new(),
             conv_id: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -770,6 +772,7 @@ impl ToolLoopExecutor {
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
         if !self.goal_proposals_available() { tools.retain(|tool| tool.name != "ProposeGoal"); }
+        tools.extend(self.mcp_tools.clone());
         if self.search_config_path.is_some() && self.delegation_depth < 2 {
             let mut definitions = delegation::definitions();
             if !self.runtime_agents.is_empty() {
@@ -938,9 +941,27 @@ impl ToolLoopExecutor {
                 self.durable_user_input = crate::services::background_sessions::worker_directory(root, session)?.is_some();
             }
         }
+        // MCP discovery is a live external exchange, so execution ownership and
+        // authority checks must succeed before any SDK/stdio server is contacted.
+        Box::pin(self.refresh_mcp_tools()).await?;
         let directories = self.allowed_directories.clone();
         let context = self.search_config_path.as_deref().and_then(|p| p.parent()).map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
         crate::tools::background_shell::scope(context, crate::tools::path_scope::scope(directories, self.execute_scoped())).await
+    }
+
+    async fn refresh_mcp_tools(&mut self) -> Result<()> {
+        self.mcp_tools.clear();
+        if let Some(registry) = &self.mcp_registry {
+            let mut builtin = get_tool_definitions();
+            builtin.extend(delegation::definitions());
+            builtin.push(deep_research::definition());
+            let builtin = builtin.into_iter().map(|tool| tool.name).collect::<std::collections::HashSet<_>>();
+            self.mcp_tools = registry.get_all_tools().await?.into_iter().map(|tool| {
+                anyhow::ensure!(!builtin.contains(&tool.name), "MCP tool conflicts with native tool: {}", tool.name);
+                Ok(crate::tools::ToolDefinition { name:tool.name, description:tool.description, input_schema:tool.input_schema })
+            }).collect::<Result<Vec<_>>>()?;
+        }
+        Ok(())
     }
 
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
@@ -1226,7 +1247,7 @@ impl ToolLoopExecutor {
                 match result {
                     Ok(val) => {
                         output_str = serde_json::to_string_pretty(&val).unwrap_or_default();
-                        is_error = false;
+                        is_error = val["isError"].as_bool().unwrap_or(false);
                     }
                     Err(e) => {
                         output_str = format!("Error: {}", e);

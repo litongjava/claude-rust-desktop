@@ -289,7 +289,7 @@ impl Client {
     }
     fn start(root: &Path, server: &Server, extra: &[&str]) -> Self {
         std::fs::write(root.join("fixture.txt"), "SDK_READ_SENTINEL").unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-code"));
+        let mut command = Command::new(std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code").into()));
         command
             .args([
                 "--data-dir",
@@ -1736,3 +1736,6 @@ async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publicatio
 
 #[path = "sdk/hook_callbacks.rs"]
 mod hook_callbacks;
+
+#[path = "sdk/mcp_transport.rs"]
+mod mcp_transport;

@@ -396,6 +396,10 @@ pub async fn run(
     // then this guard revokes callbacks. The engine prioritizes receiver closure.
     let cleanup = runtime.cleanup();
     session.sdk_hooks = Some(runtime);
+    session.sdk_mcp.clear();
+    let transport = Arc::new(crate::sdk_mcp::Transport::default());
+    let mcp_cleanup = crate::sdk_mcp::Cleanup { runtime:session.sdk_mcp.clone(), transport:transport.clone() };
+    session.sdk_mcp_transport = Some(transport);
     let result = Box::pin(run_inner(cli, session, initial, source)).await;
     if result.is_err() {
         session.engine.cancel_turn(&session.id).await;
@@ -403,6 +407,8 @@ pub async fn run(
     if let Some(runtime) = &session.sdk_hooks {
         runtime.broker.close();
     }
+    drop(mcp_cleanup);
+    session.sdk_mcp_transport.take();
     session
         .end_hooks(if result.is_ok() {
             "prompt_input_exit"
@@ -434,6 +440,7 @@ async fn run_inner(
         .context("SDK callback runtime unavailable")?
         .broker
         .clone();
+    let mcp = session.sdk_mcp_transport.as_ref().context("SDK MCP transport unavailable")?.broker.clone();
     let updates = Arc::new(permission_updates::Updates::new(
         session.permissions.clone(),
         session.id.clone(),
@@ -463,10 +470,11 @@ async fn run_inner(
             let requires_host = session
                 .sdk_hooks
                 .as_ref()
-                .is_some_and(|runtime| runtime.has_callbacks());
+                .is_some_and(|runtime| runtime.has_callbacks()) || !session.sdk_mcp.names().is_empty();
             pump_lifecycle(
                 Box::pin(session.start_hooks(source)),
                 &callbacks,
+                &mcp,
                 &permissions,
                 &mut frames,
                 &mut queue,
@@ -504,18 +512,18 @@ async fn run_inner(
                     frame=frames.recv(),if !eof=>match frame {
                         None=>{
                             eof=true;
-                            if callbacks.has_pending() || session.sdk_hooks.as_ref().is_some_and(|runtime| runtime.has_callbacks()) {
+                            if callbacks.has_pending() || mcp.has_pending() || session.sdk_hooks.as_ref().is_some_and(|runtime| runtime.has_callbacks()) || !session.sdk_mcp.names().is_empty() {
                                 session.engine.cancel_turn(&session.id).await;
-                                callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                                callbacks.close();mcp.close();session.sdk_mcp.clear();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
                                 failed=true;queue.clear();
-                                crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK input closed during hook callback"}))?;
+                                crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK input closed while a hook or MCP host was required"}))?;
                                 break;
                             }
-                            callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                            callbacks.close();mcp.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
                         },
-                        Some(Err(error))=>{session.engine.cancel_turn(&session.id).await;callbacks.cancel_all();permissions.cancel().await;return Err(error)},
+                        Some(Err(error))=>{session.engine.cancel_turn(&session.id).await;callbacks.cancel_all();mcp.cancel_all();permissions.cancel().await;return Err(error)},
                         Some(Ok(Frame::User(user)))=>{ensure!(queue.len()<32,"SDK pending user queue exceeds 32 messages");queue.push_back(user);},
-                        Some(Ok(Frame::Response(value)))=>{route_response(&permissions, &callbacks, &value).await?;},
+                        Some(Ok(Frame::Response(value)))=>{route_response(&permissions, &callbacks, &mcp, &value).await?;},
                         Some(Ok(Frame::Control(value)))=>{
                             if value["request"]["subtype"]=="initialize" {
                                 response(&value["request_id"],Err(anyhow::anyhow!("Already initialized")))?;
@@ -525,6 +533,7 @@ async fn run_inner(
                                 failed=true;
                                 session.engine.cancel_turn(&session.id).await;
                                 callbacks.cancel_all();
+                                mcp.cancel_all();
                                 permissions.cancel().await;
                                 response(&value["request_id"],Ok(json!({})))?;
                                 crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK turn interrupted"}))?;
@@ -535,6 +544,7 @@ async fn run_inner(
                     },
                 }
             }
+            mcp.cancel_all();
             permissions.cancel().await;
             continue;
         }
@@ -546,6 +556,8 @@ async fn run_inner(
             None => {
                 eof = true;
                 callbacks.close();
+                mcp.close();
+                session.sdk_mcp.clear();
             }
             Some(Err(error)) => return Err(error),
             Some(Ok(Frame::User(user))) => queue.push_back(user),
@@ -553,7 +565,7 @@ async fn run_inner(
                 idle_control(cli, &mut initialization, session, &value).await?
             }
             Some(Ok(Frame::Response(value))) => {
-                route_response(&permissions, &callbacks, &value).await?
+                route_response(&permissions, &callbacks, &mcp, &value).await?
             }
         }
     }
@@ -569,6 +581,7 @@ async fn run_inner(
 async fn route_response(
     permissions: &Permissions,
     callbacks: &crate::sdk_hooks::Broker,
+    mcp: &crate::sdk_control::Broker,
     value: &Value,
 ) -> Result<()> {
     let id = value["response"]["request_id"]
@@ -576,6 +589,8 @@ async fn route_response(
         .context("Missing response request_id")?;
     if callbacks.owns(id) {
         callbacks.respond(value)
+    } else if mcp.owns(id) {
+        mcp.respond(value)
     } else {
         permissions.respond(value).await
     }
@@ -586,6 +601,7 @@ async fn route_response(
 async fn pump_lifecycle(
     future: impl std::future::Future<Output = Result<()>>,
     callbacks: &crate::sdk_hooks::Broker,
+    mcp: &crate::sdk_control::Broker,
     permissions: &Permissions,
     frames: &mut tokio::sync::mpsc::Receiver<Result<Frame>>,
     queue: &mut VecDeque<UserMessage>,
@@ -601,15 +617,16 @@ async fn pump_lifecycle(
                 None => {
                     *eof = true;
                     let interrupted = requires_host && !queue.is_empty();
-                    callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                    callbacks.close();mcp.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
                     ensure!(!interrupted,"SDK input closed during startup hook callback");
                 },
                 Some(Err(error)) => return Err(error),
-                Some(Ok(Frame::Response(value))) => route_response(permissions,callbacks,&value).await?,
+                Some(Ok(Frame::Response(value))) => route_response(permissions,callbacks,mcp,&value).await?,
                 Some(Ok(Frame::User(user))) => { ensure!(queue.len()<32,"SDK pending user queue exceeds 32 messages");queue.push_back(user); },
                 Some(Ok(Frame::Control(value))) => {
                     if value["request"]["subtype"]=="interrupt" {
                         callbacks.cancel_all();
+                        mcp.cancel_all();
                         response(&value["request_id"],Ok(json!({})))?;
                         bail!("SDK startup interrupted");
                     }

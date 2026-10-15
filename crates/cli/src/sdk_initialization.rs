@@ -33,6 +33,10 @@ impl State {
     ) -> Result<Value> {
         ensure!(!self.initialized, "Already initialized");
         let overrides = validate(cli, request)?;
+        let servers = request.get("sdkMcpServers").map(claude_core::mcp::sdk::validate_names).transpose()?.unwrap_or_default();
+        session.validate_sdk_mcp_servers(&servers).await?;
+        let mcp_host = session.sdk_mcp_transport.clone().context("SDK MCP transport unavailable")?;
+        ensure!(session.sdk_hooks.is_some(), "SDK hook transport unavailable");
         let callbacks = request
             .get("hooks")
             .map(claude_core::services::hook_callbacks::validate)
@@ -53,6 +57,7 @@ impl State {
             entries.push(entry);
         }
         // Nothing above mutates the running session, including a failed metadata read.
+        session.sdk_mcp.install(servers, mcp_host)?;
         session
             .sdk_hooks
             .as_mut()
@@ -95,10 +100,7 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
             "hooks" => {
                 claude_core::services::hook_callbacks::validate(value)?;
             }
-            "sdkMcpServers" => ensure!(
-                value.as_array().is_some_and(Vec::is_empty),
-                "initialize.sdkMcpServers is not supported; only an empty array is accepted"
-            ),
+            "sdkMcpServers" => { claude_core::mcp::sdk::validate_names(value)?; },
             "promptSuggestions" | "agentProgressSummaries" => ensure!(
                 value == false,
                 "initialize.{key} is not supported; only false is accepted"
@@ -222,7 +224,7 @@ mod tests {
             json!({"unknown":false}),
             json!({"hooks":{"PreToolUse":[{"hookCallbackIds":[""]}]}}),
             json!({"agents":[]}),
-            json!({"sdkMcpServers":["host"]}),
+            json!({"sdkMcpServers":["host","host"]}),
             json!({"promptSuggestions":true}),
         ] {
             assert!(validate(&cli, &bad).is_err(), "{bad}");
