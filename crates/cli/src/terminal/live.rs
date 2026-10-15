@@ -469,7 +469,11 @@ impl Frame {
         let status = clip(
             &format!(
                 "* {} ({}s){usage}",
-                state.activity,
+                if state.answer.is_some() {
+                    "Waiting for your answer"
+                } else {
+                    &state.activity
+                },
                 if state.activity.contains("thinking") {
                     state.activity_started.elapsed().as_secs()
                 } else {

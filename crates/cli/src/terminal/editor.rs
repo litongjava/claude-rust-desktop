@@ -244,8 +244,13 @@ impl DetailsPanel {
         if self.entries.is_empty() || budget == 0 {
             return frame;
         }
+        let entry_label = if self.entries.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
         if !self.expanded || budget < 3 {
-            let prefix = format!("{} entries \u{00b7} ", self.entries.len());
+            let prefix = format!("{} {entry_label} \u{00b7} ", self.entries.len());
             let label = clipped(&format!("{prefix}Show more (Ctrl+O)"), width);
             frame.toggle = Some(HitTarget {
                 row: 0,
@@ -271,7 +276,7 @@ impl DetailsPanel {
         frame.lines.push((
             clipped(
                 &format!(
-                    "Details \u{00b7} {} entries \u{00b7} lines {}-{} / {}",
+                    "Details \u{00b7} {} {entry_label} \u{00b7} lines {}-{} / {}",
                     self.entries.len(),
                     self.scroll + 1,
                     (self.scroll + frame.viewport).min(self.wrapped.len()),
