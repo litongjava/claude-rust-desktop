@@ -464,7 +464,9 @@ impl Session {
         if std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
             claude_core::services::permission_authority::record_user(&self.store.db, &self.id, self.sdk_content.as_ref().unwrap_or(&json!(prompt)))?;
         }
-        if self.sdk_content.is_some() {return self.run_turn(cli,prompt,input).await;}
+        // Keep engine/goal futures out of the outer host stack. Debug builds on
+        // Windows otherwise exhaust the process stack before a worker can run.
+        if self.sdk_content.is_some() {return Box::pin(self.run_turn(cli,prompt,input)).await;}
         let prepared = tokio::select! {
             prepared = crate::skill_commands::prepare_invocation(cli, self, prompt, input) => prepared?,
             _ = tokio::signal::ctrl_c() => bail!("Skill invocation cancelled"),
@@ -495,11 +497,11 @@ impl Session {
                 }
             }
             let result = async {
-                self.run_turn(cli, &next, input).await?;
+                Box::pin(self.run_turn(cli, &next, input)).await?;
                 if (input.is_none() || cli.output_format != OutputFormat::Text) && std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
                     return Ok::<Option<String>,anyhow::Error>(None);
                 }
-                crate::session_commands::goal_check(self).await
+                Box::pin(crate::session_commands::goal_check(self)).await
             }.await;
             match result {
                 Ok(Some(followup)) => next = followup,
