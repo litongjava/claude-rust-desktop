@@ -262,11 +262,16 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
     paths.read_config()?; // Never overwrite a malformed Desktop config with defaults.
     match action {
         ConfigCommands::Show => {
-            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?});
+            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"permissions.auto":claude_core::permissions::auto_config::load(&crate::services::context(paths)?)?});
             redact(&mut value);
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         ConfigCommands::Set { key, value } => {
+            if key == claude_core::permissions::auto_config::KEY {
+                let config: claude_core::permissions::auto_config::AutoConfig = serde_json::from_str(value)?;
+                claude_core::permissions::auto_config::save(&crate::services::context(paths)?, &config)?;
+                return crate::services::print(&config);
+            }
             ensure!(
                 ["model", "base_url", "api_format", "api_key", "max_tokens"]
                     .contains(&key.as_str()),

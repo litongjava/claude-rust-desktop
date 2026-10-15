@@ -202,15 +202,11 @@ pub async fn prepare_invocation(
                 if let Some(updated) = pre.updated_input {
                     input = updated;
                 }
-                let mut decision = session
-                    .engine
-                    .check_tool_permission(
-                        "Bash",
-                        input.clone(),
-                        &session.id,
-                        Some(session.workspace.to_string_lossy().into_owned()),
-                    )
-                    .await;
+                let mut decision = if session.permissions.get_mode() == claude_core::permissions::PermissionMode::Auto && !pre.ask_permission {
+                    session.check_host_shell_permission(&input, line, terminal.is_some()).await?
+                } else {
+                    session.engine.check_tool_permission("Bash", input.clone(), &session.id, Some(session.workspace.to_string_lossy().into_owned())).await
+                };
                 if pre.ask_permission && decision == PermissionResult::Granted {
                     decision = if session.permissions.get_mode() == claude_core::permissions::PermissionMode::DontAsk {
                         PermissionResult::Denied("dontAsk mode: hook requested shell approval".into())
@@ -243,6 +239,7 @@ pub async fn prepare_invocation(
                 let permit = invocation::authorize(input.clone(), decision, confirmed)?;
                 eprintln!("Running skill /{name} shell expansion...");
                 let result = invocation::execute(permit, &session.workspace).await;
+                if result.is_ok() { session.permissions.record_tool_success(&session.id); }
                 let (event, payload) = match &result {
                     Ok(output) => (HookEvent::PostToolUse, serde_json::json!({"tool_name":"Bash","tool_input":input,"tool_use_id":request_id,"tool_response":output})),
                     Err(error) => (HookEvent::PostToolUseFailure, serde_json::json!({"tool_name":"Bash","tool_input":input,"tool_use_id":request_id,"error":format!("{error:#}"),"is_interrupt":false})),

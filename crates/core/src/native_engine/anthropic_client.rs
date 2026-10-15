@@ -121,6 +121,7 @@ use crate::performance::{retry_with_backoff, checked_response};
 pub struct AnthropicClient {
     client: Client,
     response_schema: Option<Value>,
+    retry_requests: bool,
 }
 
 impl AnthropicClient {
@@ -130,7 +131,13 @@ impl AnthropicClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client, response_schema: None }
+        Self { client, response_schema: None, retry_requests: true }
+    }
+
+    /// Isolated classifiers use one attempt and an outer cancellation deadline.
+    pub(crate) fn without_retries(mut self) -> Self {
+        self.retry_requests = false;
+        self
     }
 
     pub fn with_response_schema(mut self, schema: Option<Value>) -> Self {
@@ -185,7 +192,7 @@ impl AnthropicClient {
         if let Some(effort) = provider.model.effort.as_deref() { apply_effort(&mut body, effort, &provider.model.id, max_tokens)?; }
         self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
-        let data: AnthropicResponse = retry_with_backoff(|| async {
+        let request = || async {
             let request = self.client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
@@ -193,10 +200,14 @@ impl AnthropicClient {
                 .json(&body);
             let response = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?.send().await?;
 
+            if !self.retry_requests {
+                return super::auto_permissions::bounded_response(response).await;
+            }
             let response = checked_response(response).await?;
 
             response.json().await.map_err(|e| anyhow::anyhow!("{:#}", e))
-        }).await?;
+        };
+        let data: AnthropicResponse = if self.retry_requests { retry_with_backoff(request).await? } else { request().await? };
 
         Ok(data)
     }

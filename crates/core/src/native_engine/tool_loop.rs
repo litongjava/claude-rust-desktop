@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "auto_permission_tests.rs"]
+mod auto_permission_tests;
 #[path = "delegation.rs"]
 pub(crate) mod delegation;
 #[path = "deep_research.rs"]
@@ -131,6 +134,8 @@ pub enum EngineEvent {
 
 pub struct ToolLoopExecutor {
     provider: ResolvedProvider,
+    auto_manual_interactive: bool,
+    auto_history: Vec<Value>,
     messages: Vec<Value>,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -491,6 +496,8 @@ impl ToolLoopExecutor {
         reasoning_mode: ReasoningMode,
     ) -> Self {
         Self {
+            auto_manual_interactive: false,
+            auto_history: messages.clone(),
             provider,
             messages,
             system_prompt,
@@ -590,7 +597,8 @@ impl ToolLoopExecutor {
             if self.permission_manager.as_ref().is_some_and(|manager| manager.get_mode() == crate::permissions::PermissionMode::DontAsk) {
                 return (input, "dontAsk mode: hook requested permission; tool was not executed".into(), true);
             }
-            if let PermissionResult::Denied(reason) = self.check_permission(name, &input).await {
+            let hook_decision = self.permission_manager.as_ref().map(|pm| pm.check_permission(&crate::permissions::PermissionContext { tool_name:name.into(), tool_input:input.clone(), conversation_id:self.conv_id.clone().unwrap_or_default(), user_id:None, workspace_path:Some(self.workspace_cwd.clone()) })).unwrap_or(PermissionResult::Granted);
+            if let PermissionResult::Denied(reason) = hook_decision {
                 return (input, format!("Permission denied: {reason}"), true);
             }
             let request_id = uuid::Uuid::new_v4().to_string();
@@ -704,6 +712,20 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
+        self.auto_manual_interactive = interactive;
+        self
+    }
+
+    fn ensure_auto_not_exhausted(&self) -> Result<()> {
+        if !self.auto_manual_interactive {
+            if let Some(manager) = &self.permission_manager {
+                anyhow::ensure!(manager.get_mode() != crate::permissions::PermissionMode::Auto || !manager.auto_stats(self.conv_id.as_deref().unwrap_or("")).denial_limit(), "Auto permission denial limit reached; stopping the headless turn");
+            }
+        }
+        Ok(())
+    }
+
     async fn check_permission(&self, tool_name: &str, tool_input: &Value) -> PermissionResult {
         if let Some(ref pm) = self.permission_manager {
             let conv_id = self.conv_id.clone().unwrap_or_default();
@@ -718,6 +740,12 @@ impl ToolLoopExecutor {
             };
             if self.is_plan_document_tool(tool_name, tool_input) {
                 pm.check_plan_document_permission(&context)
+            } else if pm.get_mode() == crate::permissions::PermissionMode::Auto {
+                let Some(root) = self.search_config_path.as_deref().and_then(std::path::Path::parent) else { return PermissionResult::Denied("Auto classifier requires a configured data directory".into()); };
+                let service = match crate::services::session_messages::context(root) { Ok(service) => service, Err(_) => return PermissionResult::Denied("Auto classifier settings unavailable".into()) };
+                let (decision, telemetry) = super::auto_permissions::authorize(&service, pm, &context, &self.provider, &self.auto_history, self.auto_manual_interactive).await;
+                if let Some(telemetry) = telemetry { let _ = self.event_tx.send(EngineEvent::Usage(telemetry)).await; }
+                decision
             } else {
                 pm.check_permission(&context)
             }
@@ -728,6 +756,7 @@ impl ToolLoopExecutor {
 
     fn check_permission_requires_confirmation(&self, tool_name: &str, tool_input: &Value) -> bool {
         if let Some(ref pm) = self.permission_manager {
+            if pm.get_mode() == crate::permissions::PermissionMode::Auto { return true; }
             let conv_id = self.conv_id.clone().unwrap_or_default();
             let workspace_path = Some(self.workspace_cwd.clone());
             let context = crate::permissions::PermissionContext {
@@ -762,6 +791,11 @@ impl ToolLoopExecutor {
             (Some(root),Some(session))=>crate::services::session_messages::ExecutionLease::acquire(root,session)?,
             _=>None,
         }};
+        if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::Auto) {
+            let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Auto permissions require a configured data directory"))?;
+            let context = crate::services::session_messages::context(root)?;
+            super::auto_permissions::configured(&context, &self.provider)?;
+        }
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
@@ -948,6 +982,13 @@ impl ToolLoopExecutor {
         if matches!(tool_name, "EnterPlanMode" | "ExitPlanMode") || (tool_name == "plan_mode" && matches!(tool_input["operation"].as_str(), Some("enter" | "exit"))) {
             return self.execute_plan_transition(tool_name, tool_input, _tool_use_id).await;
         }
+        if matches!(tool_name, "Agent" | "Delegate" | "Worker") || (tool_name == "team" && tool_input["operation"] == "run") {
+            match self.check_permission(tool_name, tool_input).await {
+                PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
+                PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
+                PermissionResult::Granted => {},
+            }
+        }
         if tool_name == "team" && tool_input["operation"] == "run" {
             let result = Box::pin(self.execute_team(tool_input)).await;
             let failed = result.is_err();
@@ -1002,7 +1043,7 @@ impl ToolLoopExecutor {
             return (tool_input.clone(), output, failed);
         }
         if matches!(tool_name, "Agent" | "Delegate" | "Worker") {
-            let result = Box::pin(self.execute_delegated(tool_input)).await;
+            let result = Box::pin(self.execute_delegated_authorized(tool_input, None, None, true)).await;
             let failed = result.is_err();
             let output = match result { Ok(value) => value.to_string(), Err(error) => format!("Delegation failed: {error}") };
             return (tool_input.clone(), output, failed);
@@ -1011,6 +1052,13 @@ impl ToolLoopExecutor {
             return self.execute_ask_user_question(tool_input, _tool_use_id).await;
         }
 
+        if matches!(tool_name, "memory_search" | "memory_ingest") {
+            match self.check_permission(tool_name, tool_input).await {
+                PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
+                PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
+                PermissionResult::Granted => {},
+            }
+        }
         // Route memory_search and memory_ingest directly to MemEx backend
         if tool_name == "memory_search" {
             return self.execute_memory_search(tool_input).await;
@@ -1296,6 +1344,16 @@ impl ToolLoopExecutor {
         tool_input: &Value,
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
+        if tool_name == "memory_search" { return self.execute_memory_search(tool_input).await; }
+        if tool_name == "memory_ingest" { return self.execute_memory_ingest(tool_input).await; }
+        if matches!(tool_name, "Agent" | "Delegate" | "Worker") {
+            let result = Box::pin(self.execute_delegated_authorized(tool_input, None, None, true)).await;
+            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Delegation failed: {error:#}") }, result.is_err());
+        }
+        if tool_name == "team" && tool_input["operation"] == "run" {
+            let result = Box::pin(self.execute_team(tool_input)).await;
+            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Team failed: {error:#}") }, result.is_err());
+        }
         if tool_name == "Workflow" {
             let result = Box::pin(self.execute_workflow(tool_input)).await;
             return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Workflow failed: {error:#}") }, result.is_err());
@@ -1371,11 +1429,13 @@ impl ToolLoopExecutor {
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
 
         for iteration in 0..self.max_tool_iterations {
+            self.ensure_auto_not_exhausted()?;
             self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) });
             }
 
+            self.auto_history = conversation_messages.iter().filter_map(|message| serde_json::to_value(message).ok()).collect();
             if self.response_schema.is_some() { full_text.clear(); }
             let round_text_start = full_text.len();
             tracing::info!(module = "AnthropicLoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
@@ -1739,6 +1799,7 @@ impl ToolLoopExecutor {
 
                 for tc in &serial_calls {
                     let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
@@ -1871,11 +1932,13 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
 
         for iteration in 0..self.max_tool_iterations {
+            self.ensure_auto_not_exhausted()?;
             self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });
             }
 
+            self.auto_history = conversation_messages.iter().filter_map(|message| serde_json::to_value(message).ok()).collect();
             if self.response_schema.is_some() { full_text.clear(); }
             let round_text_start = full_text.len();
             tracing::info!(module = "OpenAILoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
@@ -2228,6 +2291,7 @@ impl ToolLoopExecutor {
 
                 for tc in &serial_calls {
                     let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
                         tool_name: tc.name.clone(),

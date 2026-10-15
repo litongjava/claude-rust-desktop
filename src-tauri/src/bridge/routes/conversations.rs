@@ -382,6 +382,7 @@ async fn conversation_warm_handler(
     // Only log permission mode changes, don't spam for every request
     if let Some(ref pm_str) = req.permission_mode {
         let perm_mode = PermissionMode::parse(pm_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if perm_mode == PermissionMode::Auto { return Err(StatusCode::NOT_IMPLEMENTED); }
         if let Some(engine) = state.native_engine.lock().await.as_ref() {
             engine.set_permission_mode(perm_mode).await;
             // Only log once per mode change, not for every conversation

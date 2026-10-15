@@ -203,6 +203,8 @@ pub enum PermissionModeArg {
     Bypass,
     #[value(alias = "dontAsk", alias = "dont_ask")]
     DontAsk,
+    /// Rust extension: requires an explicitly configured automatic classifier.
+    Auto,
 }
 
 #[derive(Debug, Subcommand)]
@@ -447,7 +449,7 @@ pub enum ServiceCommands {
 pub enum ConfigCommands {
     /// Show effective saved configuration with credentials redacted.
     Show,
-    /// Set model, base_url, api_format, api_key, or max_tokens for the CLI provider.
+    /// Set model, base_url, api_format, api_key, max_tokens, or permissions.auto for the CLI provider.
     Set { key: String, value: String },
     /// Remove only the CLI-managed provider and CLI preferences.
     Reset,

@@ -1,3 +1,4 @@
+pub mod auto_config;
 pub mod decision;
 pub use decision::{DecisionOrigin, PermissionDecision};
 pub mod manager;

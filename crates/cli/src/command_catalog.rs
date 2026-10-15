@@ -85,7 +85,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/permissions",
-        "Inspect/change mode: ask|accept-edits|plan|dont-ask|bypass",
+        "Inspect/change mode: ask|accept-edits|plan|dont-ask|bypass|auto; auto-config show|set JSON|off",
     ),
     ("/multiline", "Compose multiple lines; /end sends"),
     ("/end", "Send a multiline prompt"),

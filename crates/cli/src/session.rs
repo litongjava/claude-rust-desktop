@@ -160,6 +160,7 @@ impl Session {
             PermissionModeArg::Plan => PermissionMode::PlanMode,
             PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
             PermissionModeArg::DontAsk => PermissionMode::DontAsk,
+            PermissionModeArg::Auto => PermissionMode::Auto,
         };
         let explicit_mode = cli.permission_mode_explicit || cli.dangerously_skip_permissions || !matches!(cli.permission_mode, PermissionModeArg::Ask);
         let active_job = if internal_worker { None } else { claude_core::services::background_sessions::list(&paths.data_dir, None)?.into_iter().find(|job|job.session_id == id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) };
@@ -171,6 +172,11 @@ impl Session {
         } else {
             claude_core::services::session_permission_mode::load(&store.db, &id)?.filter(|mode| *mode != PermissionMode::BypassPermissions).unwrap_or(selected_mode)
         };
+        if selected_mode == PermissionMode::Auto {
+            let provider = selection.providers.iter().find(|p|p.id == selection.provider_id).context("Main provider unavailable")?;
+            let model = claude_core::native_engine::provider_manager::resolve_model_selection(&provider.models, &selection.model).context("Main model unavailable")?;
+            claude_core::native_engine::auto_permissions::configured(&crate::services::context(paths)?, &claude_core::native_engine::provider_manager::ResolvedProvider { provider:provider.clone(),model })?;
+        }
         if active_job.is_some() { permissions.set_mode(selected_mode); }
         else { claude_core::services::session_permission_mode::set(&store.db, &id, &permissions, selected_mode)?; }
         let api_format = selection
@@ -356,6 +362,7 @@ impl Session {
             PermissionMode::PlanMode => "plan",
             PermissionMode::BypassPermissions => "bypass",
             PermissionMode::DontAsk => "dont-ask",
+            PermissionMode::Auto => "auto",
         }
     }
 
@@ -373,6 +380,16 @@ impl Session {
         Ok(self.permission_mode())
     }
 
+    pub(crate) async fn check_host_shell_permission(&self, input: &Value, user_prompt: &str, interactive: bool) -> Result<claude_core::permissions::PermissionResult> {
+        let context = crate::services::context(&self.paths)?;
+        let provider = self.selected_provider().await?;
+        let mut history = self.store.model_history(&self.id, &provider.provider.api_format)?;
+        history.push(json!({"role":"user","content":user_prompt}));
+        let tool = claude_core::permissions::PermissionContext { tool_name:"Bash".into(), tool_input:input.clone(), conversation_id:self.id.clone(), user_id:None, workspace_path:Some(self.workspace.to_string_lossy().into_owned()) };
+        let (decision, _) = claude_core::native_engine::auto_permissions::authorize(&context, &self.permissions, &tool, &provider, &history, interactive).await;
+        Ok(decision)
+    }
+
     pub async fn set_permission_mode(&self, value: &str) -> Result<()> {
         if claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_none() {
             if let Some(job) = claude_core::services::background_sessions::list(&self.paths.data_dir, None)?.into_iter().find(|job|job.session_id == self.id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) {
@@ -380,6 +397,9 @@ impl Session {
             }
         }
         let mode = claude_core::services::session_permission_mode::parse(value)?;
+        if mode == PermissionMode::Auto {
+            claude_core::native_engine::auto_permissions::configured(&crate::services::context(&self.paths)?, &self.selected_provider().await?)?;
+        }
         claude_core::services::session_permission_mode::set(&self.store.db, &self.id, &self.permissions, mode)?;
         Ok(())
     }
@@ -472,6 +492,7 @@ impl Session {
             Err(error) => { if input.is_some() { eprintln!("Code checkpoint unavailable: {error:#}"); } None },
         };
         let interactive_display = input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short && !crate::display_commands::load(self)?.focus;
+        self.engine.set_auto_manual_interactive(input.is_some());
         let request = self
             .engine
             .send_message_with_history(

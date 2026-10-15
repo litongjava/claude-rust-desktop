@@ -107,6 +107,7 @@ pub struct ToolCallRecord {
 
 pub struct QueryEngine {
     owned_children: super::tool_loop::delegation::OwnedChildren,
+    auto_manual_interactive: std::sync::atomic::AtomicBool,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
     db_manager: Arc<DbManager>,
@@ -138,6 +139,7 @@ impl QueryEngine {
         file_cache: Arc<FileCache>,
     ) -> Self {
         Self {
+            auto_manual_interactive: std::sync::atomic::AtomicBool::new(false),
             bundled_resources: Arc::default(),
             owned_children: Default::default(),
             provider_manager,
@@ -168,6 +170,10 @@ impl QueryEngine {
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.cost_tracker = Some(tracker);
         self
+    }
+
+    pub fn set_auto_manual_interactive(&self, interactive: bool) {
+        self.auto_manual_interactive.store(interactive, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn check_tool_permission(
@@ -529,6 +535,7 @@ impl QueryEngine {
         .with_conv_id(conv_id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_manager(self.permission_manager.clone())
+        .with_auto_manual_interactive(self.auto_manual_interactive.load(std::sync::atomic::Ordering::Relaxed))
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(self.file_cache.clone(), workspace_path.clone())));
 
         if let Some(ref registry) = self.mcp_registry {

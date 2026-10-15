@@ -540,7 +540,7 @@ pub async fn runtime_status(root: &Path, session: &str) -> WorkerRuntimeStatus {
 }
 
 pub async fn set_permission_mode(root: &Path, session: &str, job_id: &str, mode: &str) -> Result<()> {
-    ensure!(matches!(super::session_permission_mode::parse(mode)?, crate::permissions::PermissionMode::AskPermissions | crate::permissions::PermissionMode::AcceptEdits | crate::permissions::PermissionMode::PlanMode | crate::permissions::PermissionMode::DontAsk), "Live mode switching supports ask, accept-edits, plan and dont-ask; bypass requires explicit configuration");
+    ensure!(matches!(super::session_permission_mode::parse(mode)?, crate::permissions::PermissionMode::AskPermissions | crate::permissions::PermissionMode::AcceptEdits | crate::permissions::PermissionMode::PlanMode | crate::permissions::PermissionMode::DontAsk | crate::permissions::PermissionMode::Auto), "Live mode switching supports ask, accept-edits, plan, dont-ask and configured auto; bypass requires explicit configuration");
     let worker = current(root, session)?.context("Session has no persistent worker")?;
     let job = jobs::get(root, job_id)?;
     ensure!(job.session_id == session && job.finished_ms.is_none(), "Mode change must target the active job in this session");

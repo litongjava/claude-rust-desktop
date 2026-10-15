@@ -334,6 +334,72 @@ impl ToolLoopExecutor {
         schema: Option<Value>,
         tools: Option<Vec<String>>,
     ) -> Result<Value> {
+        self.execute_delegated_authorized(input, schema, tools, false)
+            .await
+    }
+
+    pub(super) async fn execute_delegated_authorized(
+        &self,
+        input: &Value,
+        schema: Option<Value>,
+        tools: Option<Vec<String>>,
+        preapproved: bool,
+    ) -> Result<Value> {
+        if !preapproved {
+            use crate::permissions::PermissionResult;
+            match self.check_permission("Agent", input).await {
+                PermissionResult::Denied(reason) => {
+                    anyhow::bail!("Delegation permission denied: {reason}")
+                }
+                PermissionResult::RequiresConfirmation(_) => {
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    self.answer_waiters
+                        .lock()
+                        .await
+                        .insert(request_id.clone(), tx);
+                    let _guard = super::PermissionWaiterGuard {
+                        waiters: self.answer_waiters.clone(),
+                        request_id: request_id.clone(),
+                    };
+                    self.event_tx
+                        .send(EngineEvent::ToolPermission {
+                            request_id: request_id.clone(),
+                            tool_use_id: request_id.clone(),
+                            tool_name: "Agent".into(),
+                            input: input.clone(),
+                        })
+                        .await
+                        .context("Delegation approval host disconnected")?;
+                    let answer = self
+                        .wait_for_user_answer(rx)
+                        .await
+                        .context("Delegation approval timed out")??;
+                    ensure!(
+                        ["yes", "y", "allow", "approved", "always_allow"]
+                            .contains(&answer.trim().to_lowercase().as_str()),
+                        "Delegation not approved"
+                    );
+                    if let Some(manager) = &self.permission_manager {
+                        let context = crate::permissions::PermissionContext {
+                            tool_name: "Agent".into(),
+                            tool_input: input.clone(),
+                            conversation_id: self.conv_id.clone().unwrap_or_default(),
+                            user_id: None,
+                            workspace_path: Some(self.workspace_cwd.clone()),
+                        };
+                        ensure!(
+                            !matches!(
+                                manager.check_permission(&context),
+                                PermissionResult::Denied(_)
+                            ),
+                            "Delegation policy denied the action after approval"
+                        );
+                    }
+                }
+                PermissionResult::Granted => {}
+            }
+        }
         if let Some(id) = input["resume"].as_str() {
             return Box::pin(self.resume_owned_child(id, input["prompt"].as_str(), false)).await;
         }
@@ -442,6 +508,7 @@ impl ToolLoopExecutor {
         child.allowed_directories = self.allowed_directories.clone();
         child.delegation_depth = self.delegation_depth + 1;
         child.durable_user_input = self.durable_user_input;
+        child.auto_manual_interactive = self.auto_manual_interactive;
         child.permission_manager = self.permission_manager.as_ref().map(|manager| {
             Arc::new(manager.fork_session(self.conv_id.as_deref().unwrap_or_default(), &id))
         });
@@ -600,6 +667,8 @@ impl ToolLoopExecutor {
                     // Retain configuration/capabilities, not the last turn's transcript or handles.
                     child.messages.clear();
                     child.messages.shrink_to_fit();
+                    child.auto_history.clear();
+                    child.auto_history.shrink_to_fit();
                     child.streaming_tool_args.clear();
                     child.streaming_tool_args.shrink_to_fit();
                     child.message_inbox = None;

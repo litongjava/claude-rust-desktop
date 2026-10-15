@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 type StatusTarget = Arc<std::sync::Mutex<Option<claude_core::services::runtime_status::RuntimeSource>>>;
-type ModeTarget = Arc<std::sync::Mutex<Option<(String, Arc<claude_core::permissions::PermissionManager>, Arc<claude_core::db::DbManager>)>>>;
+type ModeTarget = Arc<std::sync::Mutex<Option<(String, Arc<claude_core::permissions::PermissionManager>, Arc<claude_core::db::DbManager>, claude_core::native_engine::provider_manager::ResolvedProvider)>>>;
 
 pub async fn run_from_env() -> Result<bool> {
     let Some(value) = std::env::var_os(service::HOST_ENV) else {
@@ -201,6 +201,7 @@ async fn execute(
                 PermissionModeArg::Plan => "plan",
                 PermissionModeArg::Bypass => "bypass",
                 PermissionModeArg::DontAsk => "dont-ask",
+                PermissionModeArg::Auto => "auto",
             })
             .await?;
     } else {
@@ -209,7 +210,8 @@ async fn execute(
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
     let session = current.as_ref().unwrap();
     *status_target.lock().unwrap_or_else(|error|error.into_inner()) = Some(session.runtime_status_source());
-    *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some((id.into(), session.permissions.clone(), session.store.db.clone()));
+    let current_provider = session.selected_provider().await?;
+    *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some((id.into(), session.permissions.clone(), session.store.db.clone(), current_provider));
     let result = current
         .as_ref()
         .unwrap()
@@ -221,12 +223,15 @@ async fn execute(
 }
 
 fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &str) -> Result<()> {
-    ensure!(matches!(claude_core::services::session_permission_mode::parse(mode)?, claude_core::permissions::PermissionMode::AskPermissions | claude_core::permissions::PermissionMode::AcceptEdits | claude_core::permissions::PermissionMode::PlanMode | claude_core::permissions::PermissionMode::DontAsk), "Live switching cannot enable bypass permissions");
+    ensure!(matches!(claude_core::services::session_permission_mode::parse(mode)?, claude_core::permissions::PermissionMode::AskPermissions | claude_core::permissions::PermissionMode::AcceptEdits | claude_core::permissions::PermissionMode::PlanMode | claude_core::permissions::PermissionMode::DontAsk | claude_core::permissions::PermissionMode::Auto), "Live switching cannot enable bypass permissions");
     let target = target.lock().unwrap_or_else(|e|e.into_inner());
-    let (active_job, manager, db) = target.as_ref().context("Session worker has no active initialized turn")?;
+    let (active_job, manager, db, current_provider) = target.as_ref().context("Session worker has no active initialized turn")?;
     ensure!(active_job == job_id, "Permission change targets a different job");
     let job = jobs::get(&worker.root, job_id)?;
     ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Permission change targets an inactive session job");
+    if claude_core::services::session_permission_mode::parse(mode)? == claude_core::permissions::PermissionMode::Auto {
+        claude_core::native_engine::auto_permissions::configured(&crate::services::context(&RuntimePaths::new(worker.root.clone())?)?, current_provider)?;
+    }
     claude_core::services::session_permission_mode::set(db, &worker.session_id, manager, claude_core::services::session_permission_mode::parse(mode)?)?;
     let _ = service::emit_event(&serde_json::json!({"type":"permission_mode","mode":mode}));
     Ok(())
@@ -234,7 +239,7 @@ fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &s
 
 fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<String> {
     let target = target.lock().unwrap_or_else(|e|e.into_inner());
-    let (active_job, manager, _) = target.as_ref().context("Session worker has no active initialized turn")?;
+    let (active_job, manager, _, _) = target.as_ref().context("Session worker has no active initialized turn")?;
     ensure!(active_job == job_id, "Mode query targets a different job");
     let job = jobs::get(&worker.root, job_id)?;
     ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Mode query targets an inactive session job");

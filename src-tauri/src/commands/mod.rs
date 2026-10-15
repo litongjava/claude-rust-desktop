@@ -1324,6 +1324,7 @@ pub async fn set_permission_mode(
     let permission_guard = permission_state.lock().await;
     if let Some(perm_mgr) = permission_guard.as_ref() {
         let mode_enum = PermissionMode::parse(&mode).map_err(|error| error.to_string())?;
+        if mode_enum == PermissionMode::Auto { return Err("Auto permissions are currently a CLI/SDK extension; Desktop requires session-specific authority before enabling this mode".into()); }
         perm_mgr.set_mode(mode_enum);
         Ok(())
     } else {

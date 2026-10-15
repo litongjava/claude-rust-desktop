@@ -9,6 +9,7 @@ pub enum DecisionOrigin {
     SavedApproval,
     Mode,
     DefaultRead,
+    DefaultDelegation,
     DefaultPrompt,
 }
 

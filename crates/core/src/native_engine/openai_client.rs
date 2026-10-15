@@ -126,6 +126,7 @@ use crate::performance::{retry_with_backoff, checked_response};
 pub struct OpenAIClient {
     client: Client,
     response_schema: Option<Value>,
+    retry_requests: bool,
 }
 
 impl OpenAIClient {
@@ -134,7 +135,13 @@ impl OpenAIClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client, response_schema: None }
+        Self { client, response_schema: None, retry_requests: true }
+    }
+
+    /// Isolated classifiers use one attempt and an outer cancellation deadline.
+    pub(crate) fn without_retries(mut self) -> Self {
+        self.retry_requests = false;
+        self
     }
 
     pub fn with_response_schema(mut self, schema: Option<Value>) -> Self {
@@ -230,7 +237,7 @@ impl OpenAIClient {
             body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}});
         }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
-        let data: OpenAIResponse = retry_with_backoff(|| async {
+        let request = || async {
             let response = self.client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", provider.provider.api_key))
@@ -239,10 +246,14 @@ impl OpenAIClient {
                 .send()
                 .await?;
 
+            if !self.retry_requests {
+                return super::auto_permissions::bounded_response(response).await;
+            }
             let response = checked_response(response).await?;
 
             response.json().await.map_err(|e| anyhow::anyhow!("{:#}", e))
-        }).await?;
+        };
+        let data: OpenAIResponse = if self.retry_requests { retry_with_backoff(request).await? } else { request().await? };
 
         Ok(data)
     }

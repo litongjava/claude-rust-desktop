@@ -32,7 +32,9 @@ pub async fn run(cli: &Cli, paths: &RuntimePaths, action: &MagicCommands) -> Res
         MagicCommands::Apply { id, yes } => {
             ensure!(*yes, "Inspect magic-docs previews then pass --yes to apply");
             let permissions = claude_core::runtime::default_permissions();
-            permissions.set_mode(if matches!(cli.permission_mode, PermissionModeArg::DontAsk) {
+            permissions.set_mode(if matches!(cli.permission_mode, PermissionModeArg::Auto) {
+                anyhow::bail!("Automatic permission classification is available in conversation tools; magic-docs apply requires an explicit non-auto mode")
+            } else if matches!(cli.permission_mode, PermissionModeArg::DontAsk) {
                 claude_core::permissions::PermissionMode::DontAsk
             } else if matches!(cli.permission_mode, PermissionModeArg::Plan) {
                 claude_core::permissions::PermissionMode::PlanMode

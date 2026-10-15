@@ -31,6 +31,25 @@ fn words(argument: &str) -> Vec<&str> {
 }
 
 pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
+    if let Some(action) = argument.trim().strip_prefix("auto-config").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        let context = crate::services::context(&session.paths)?;
+        let action = action.trim();
+        let mut config = claude_core::permissions::auto_config::load(&context)?;
+        match action {
+            "" | "show" => {},
+            "off" => {
+                config.enabled = false;
+                claude_core::permissions::auto_config::save(&context, &config)?;
+                if session.permissions.get_mode() == claude_core::permissions::PermissionMode::Auto { session.set_permission_mode("ask").await?; }
+            },
+            value if value.starts_with("set ") => {
+                config = serde_json::from_str(value[4..].trim())?;
+                claude_core::permissions::auto_config::save(&context, &config)?;
+            },
+            _ => anyhow::bail!("Usage: /permissions auto-config [show|set JSON|off]"),
+        }
+        return crate::services::print(&config);
+    }
     let words = words(argument);
     let mut rules = load(session)?;
     match words.as_slice() {
@@ -48,7 +67,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
             let value = serde_json::to_string(&rules)?;
             session.store.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("cli.permissions.{}",session.id),value]))??;
         }
-        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|dont-ask|allow RULE|deny RULE|ask RULE|remove RULE]. Examples: allow Bash(git status *), deny Read(.env), ask Edit(src/**). Enter rules without outer shell quotes."),
+        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|dont-ask|auto|auto-config show|auto-config set JSON|auto-config off|allow RULE|deny RULE|ask RULE|remove RULE]. Examples: allow Bash(git status *), deny Read(.env), ask Edit(src/**). Enter rules without outer shell quotes."),
     }
     session
         .permissions

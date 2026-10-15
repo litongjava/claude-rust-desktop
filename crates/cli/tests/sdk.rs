@@ -909,3 +909,51 @@ async fn sdk_plan_clear_boundary_survives_actual_cli_process() {
         assert!(!history.contains("OLD_HISTORY_SENTINEL"));
     }
 }
+
+#[tokio::test]
+async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_failure() {
+    for outcome in ["allow", "deny", "malformed", "unavailable", "timeout"] {
+        let server = Server::start(false, Mode::Approval).await;
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = requests.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer isolated-classifier-fixture");
+                assert_eq!(body["model"], "explicit-classifier");
+                assert!(body.get("tools").is_none());
+                observed.lock().unwrap().push(body);
+                if outcome == "unavailable" { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                if outcome == "timeout" { tokio::time::sleep(Duration::from_millis(300)).await; }
+                let content = if outcome == "malformed" { "not a classification".into() } else { json!({"decision":if outcome=="allow"{"allow"}else{"deny"},"reason_code":if outcome=="allow"{"authorized"}else{"outside_scope"}}).to_string() };
+                Json(json!({"id":"classifier","object":"chat.completion","created":0,"model":"explicit-classifier","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}})).into_response()
+            }
+        }));
+        let classifier = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let context = claude_core::services::session_messages::context(&root.path().join("data")).unwrap();
+        std::fs::write(root.path().join("data/providers.json"), json!([{"id":"classifier-only","name":"Fixture","base_url":endpoint,"api_key":"isolated-classifier-fixture","api_format":"openai","enabled":true,"models":[{"id":"explicit-classifier","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]}]).to_string()).unwrap();
+        claude_core::permissions::auto_config::save(&context, &claude_core::permissions::auto_config::AutoConfig {
+            enabled: true,
+            classifier: Some(claude_core::permissions::auto_config::ClassifierSelection::Named { provider_id:"classifier-only".into(), model_id:"explicit-classifier".into() }),
+            timeout_ms: if outcome=="timeout" {100} else {2000},
+            ..Default::default()
+        }).unwrap();
+        let mut client = Client::start(root.path(), &server, &["--permission-mode", "dontAsk"]);
+        client.send(json!({"type":"control_request","request_id":"auto","request":{"subtype":"set_permission_mode","mode":"auto"}})).await;
+        assert_eq!(client.frame("control_response").await["response"]["subtype"], "success");
+        client.send(user("Write approval.txt with the requested content")).await;
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(20), client.output.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            assert_ne!(frame["type"], "control_request", "headless auto never falls back to host approval: {frame}");
+            if frame["type"] == "result" { break; }
+        }
+        assert_eq!(root.path().join("approval.txt").exists(), outcome=="allow");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(client.finish().await.0.success());
+        classifier.abort();
+    }
+}

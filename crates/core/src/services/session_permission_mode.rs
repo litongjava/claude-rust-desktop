@@ -15,6 +15,7 @@ pub fn name(mode: PermissionMode) -> &'static str {
         PermissionMode::PlanMode => "plan",
         PermissionMode::BypassPermissions => "bypass",
         PermissionMode::DontAsk => "dont-ask",
+        PermissionMode::Auto => "auto",
     }
 }
 pub fn load(db: &DbManager, session: &str) -> Result<Option<PermissionMode>> {
