@@ -35,6 +35,7 @@ mod keybindings;
 mod permission_commands;
 mod sdk_input;
 mod sdk;
+mod sdk_initialization;
 mod account_commands;
 mod design_commands;
 mod ide_commands;

@@ -957,3 +957,266 @@ async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_fail
         classifier.abort();
     }
 }
+
+fn initialize_request(id: &str, mut fields: Value) -> Value {
+    fields["subtype"] = json!("initialize");
+    json!({"type":"control_request","request_id":id,"request":fields})
+}
+
+#[tokio::test]
+async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::SchemaGood).await;
+        let root = tempfile::tempdir().unwrap();
+        let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+        let context = claude_core::services::ServiceContext::open(
+            paths.clone(),
+            Arc::new(claude_core::services::EnvironmentCredentials),
+        )
+        .unwrap();
+        claude_core::services::agents::install(&context,serde_json::from_value(json!({"id":"sdk-fixture-agent","description":"Actual configured agent","system_prompt":"Use local fixtures","tools":["Read"]})).unwrap()).unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        context
+            .save_setting(
+                &format!("cli.display.{session}"),
+                &json!({"output_style":"learning"}),
+            )
+            .unwrap();
+        let style = root.path().join(".claude/output-styles");
+        std::fs::create_dir_all(&style).unwrap();
+        std::fs::write(
+            style.join("fixture-style.md"),
+            "Describe precise test results",
+        )
+        .unwrap();
+        let skill = root.path().join(".claude/skills/sdk-fixture-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"),"---\nname: sdk-fixture-skill\ndescription: Actual discovered SDK fixture\n---\nInspect fixture files.").unwrap();
+        let mut config = claude_core::config::AppConfig::default();
+        config.providers.push(serde_json::from_value(json!({"id":"sdk-fixture","name":"SDK fixture provider","provider_type":if anthropic {"anthropic"}else{"openai"},"base_url":server.url,"enabled":true,"is_default":false,"settings":{},"supports_web_search":false,"models":[{"id":"fixture-model","name":"Fixture primary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true},{"id":"fixture-second","name":"Fixture secondary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true},{"id":"fixture-disabled","name":"Hidden","enabled":false,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true}]})).unwrap());
+        let mut other = config.providers.last().unwrap().clone();
+        other.id = "other-fixture".into();
+        other.name = "Other fixture provider".into();
+        other.models.retain(|model| model.id == "fixture-second");
+        config.providers.push(other);
+        std::fs::write(
+            paths.data_dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let schema = json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false});
+        let mut client = Client::start(
+            root.path(),
+            &server,
+            &[
+                "--session-id",
+                &session,
+                "--system-prompt",
+                "CLI_BASE_REPLACED",
+                "--append-system-prompt",
+                "CLI_APPEND_REPLACED",
+                "--json-schema",
+                r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#,
+            ],
+        );
+        client.send(initialize_request("initialize",json!({"systemPrompt":"SDK_BASE_中文","appendSystemPrompt":"SDK_APPEND_MARKER","jsonSchema":schema,"hooks":{},"sdkMcpServers":[],"agents":{},"promptSuggestions":false,"agentProgressSummaries":false}))).await;
+        let response = client.frame("control_response").await;
+        assert_eq!(response["response"]["subtype"], "success", "{response}");
+        let metadata = &response["response"]["response"];
+        assert!(metadata["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "help"));
+        assert!(metadata["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "sdk-fixture-skill"));
+        assert!(metadata["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "sdk-fixture-agent"));
+        assert!(metadata["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "general"));
+        assert!(metadata["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["value"] == "sdk-fixture::fixture-second"));
+        assert!(metadata["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["value"] == "other-fixture::fixture-second"));
+        assert!(!metadata["models"].to_string().contains("fixture-disabled"));
+        assert!(!metadata.to_string().contains("fixture-only"));
+        assert_eq!(metadata["output_style"], "learning");
+        assert!(metadata["available_output_styles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fixture-style")));
+        client
+            .send(initialize_request(
+                "repeat",
+                json!({"systemPrompt":"REJECTED_REPEAT_MARKER"}),
+            ))
+            .await;
+        let repeat = client.frame("control_response").await;
+        assert_eq!(repeat["response"]["subtype"], "error");
+        assert!(repeat["response"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Already initialized"));
+        for prompt in ["Return the schema answer", "Return it again"] {
+            client.send(user(prompt)).await;
+            let result = client.result().await;
+            assert_eq!(result["is_error"], false, "{result}");
+            assert_eq!(result["structured_output"], json!({"answer":42}));
+        }
+        assert!(client.finish().await.0.success());
+        {
+            let requests = server.fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for request in requests.iter() {
+                let system = if anthropic {
+                    request["system"].to_string()
+                } else {
+                    request["messages"][0].to_string()
+                };
+                assert!(system.contains("SDK_BASE_中文") && system.contains("SDK_APPEND_MARKER"));
+                assert!(
+                    !system.contains("CLI_BASE_REPLACED")
+                        && !system.contains("CLI_APPEND_REPLACED")
+                        && !system.contains("REJECTED_REPEAT_MARKER")
+                );
+                let actual = if anthropic {
+                    &request["output_config"]["format"]["schema"]
+                } else {
+                    &request["response_format"]["json_schema"]["schema"]
+                };
+                assert_eq!(actual, &schema);
+            }
+        }
+        let mut fresh = Client::start(root.path(), &server, &[]);
+        fresh
+            .send(user("New process has no SDK initialization overrides"))
+            .await;
+        assert!(fresh.result().await["structured_output"].is_null());
+        fresh
+            .send(initialize_request(
+                "late",
+                json!({"systemPrompt":"LATE_REJECTED"}),
+            ))
+            .await;
+        let late = fresh.frame("control_response").await;
+        assert_eq!(late["response"]["subtype"], "error");
+        assert!(late["response"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Already initialized"));
+        assert!(fresh.finish().await.0.success());
+        let requests = server.fixture.requests.lock().unwrap();
+        let request = &requests[2];
+        assert!(!request.to_string().contains("SDK_BASE_中文"));
+        assert!(!request.to_string().contains("SDK_APPEND_MARKER"));
+        assert!(request.get("response_format").is_none());
+        assert!(request
+            .get("output_config")
+            .is_none_or(|value| value.get("format").is_none()));
+    }
+}
+
+#[tokio::test]
+async fn sdk_initialize_validation_is_atomic_and_does_not_consume_initialization() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::Text).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(
+            root.path(),
+            &server,
+            &[
+                "--system-prompt",
+                "CLI_BASE_PRESERVED",
+                "--append-system-prompt",
+                "CLI_APPEND_PRESERVED",
+            ],
+        );
+        for (index,fields) in [
+            json!({"systemPrompt":"INVALID_MARKER","jsonSchema":{"type":42}}),
+            json!({"systemPrompt":"INVALID_MARKER","unknown":null}),
+            json!({"systemPrompt":17}),
+            json!({"systemPrompt":"INVALID_MARKER","hooks":{"PreToolUse":[{"hookCallbackIds":["callback"]}]}}),
+            json!({"jsonSchema":{"$ref":"https://example.invalid/schema"}}),
+        ].into_iter().enumerate() {
+            client.send(initialize_request(&format!("bad-{index}"),fields)).await;
+            let response=client.frame("control_response").await;
+            assert_eq!(response["response"]["subtype"],"error","{response}");
+        }
+        assert!(server.fixture.requests.lock().unwrap().is_empty());
+        client
+            .send(initialize_request(
+                "valid",
+                json!({"appendSystemPrompt":"SDK_APPEND_ONLY"}),
+            ))
+            .await;
+        assert_eq!(
+            client.frame("control_response").await["response"]["subtype"],
+            "success"
+        );
+        client.send(user("Use the valid initialization only")).await;
+        assert_eq!(client.result().await["is_error"], false);
+        assert!(client.finish().await.0.success());
+        let requests = server.fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let system = if anthropic {
+            requests[0]["system"].to_string()
+        } else {
+            requests[0]["messages"][0].to_string()
+        };
+        assert!(system.contains("CLI_BASE_PRESERVED"));
+        assert!(system.contains("SDK_APPEND_ONLY"));
+        assert!(!system.contains("CLI_APPEND_PRESERVED"));
+        assert!(!system.contains("INVALID_MARKER"));
+        assert!(requests[0].get("response_format").is_none());
+        assert!(requests[0]
+            .get("output_config")
+            .is_none_or(|value| value.get("format").is_none()));
+    }
+}
+
+#[tokio::test]
+async fn sdk_initialize_is_rejected_during_an_implicitly_initialized_turn() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::Question).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(root.path(), &server, &[]);
+        client.send(user("Ask which language")).await;
+        let question = client.frame("control_request").await;
+        client
+            .send(initialize_request(
+                "too-late",
+                json!({"systemPrompt":"MUST_NOT_APPLY"}),
+            ))
+            .await;
+        let rejected = client.frame("control_response").await;
+        assert_eq!(rejected["response"]["subtype"], "error");
+        assert!(rejected["response"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Already initialized"));
+        let mut updated = question["request"]["input"].clone();
+        updated["answers"] = json!({"Which language?":"Rust"});
+        client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":question["request_id"],"response":{"behavior":"allow","updatedInput":updated}}})).await;
+        assert_eq!(client.result().await["is_error"], false);
+        assert!(client.finish().await.0.success());
+        let requests = server.fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[1].to_string().contains("MUST_NOT_APPLY"));
+        assert!(requests[1]["messages"].to_string().contains("Rust"));
+    }
+}

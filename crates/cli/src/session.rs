@@ -31,6 +31,7 @@ pub fn terminal_input() -> TerminalInput {
 pub struct Session {
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_content: Option<Value>,
+    pub(crate) sdk_overrides: crate::sdk_initialization::Overrides,
     pub id: String,
     pub store: SessionStore,
     pub engine: NativeEngine,
@@ -49,6 +50,33 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) async fn sdk_models(&self) -> Vec<Value> {
+        let providers = self.providers.lock().await;
+        let qualify = providers
+            .list_providers()
+            .iter()
+            .filter(|provider| provider.enabled)
+            .count()
+            > 1;
+        let mut models = Vec::new();
+        for provider in providers
+            .list_providers()
+            .iter()
+            .filter(|provider| provider.enabled)
+        {
+            for model in provider.models.iter().filter(|model| model.enabled) {
+                let value = if qualify {
+                    format!("{}::{}", provider.id, model.id)
+                } else {
+                    model.id.clone()
+                };
+                models.push(json!({"value":value,"displayName":model.name,
+                    "description":format!("{} / {}",provider.name,model.name)}));
+            }
+        }
+        models
+    }
+
     pub(crate) async fn sdk_set_model(&mut self, name: &str) -> Result<()> {
         let providers=self.providers.lock().await;
         let (provider,model)=name.split_once("::").unwrap_or((&self.provider_id,name));
@@ -221,6 +249,7 @@ impl Session {
             auto_route,
             sdk_permissions: None,
             sdk_content: None,
+            sdk_overrides: Default::default(),
             lifecycle_owned: false,
             api_format,
         })
@@ -475,7 +504,15 @@ impl Session {
         self.permissions.set_session_rules(&self.id, crate::permission_commands::load(self)?);
         let mut history = self.store.model_history(&self.id, &self.api_format)?;
         history.push(json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))}));
-        let mut system = cli.system_prompt_text()?;
+        let mut system = match &self.sdk_overrides.system_prompt {
+            Some(prompt) => prompt.clone(),
+            None => cli.system_prompt_text()?,
+        };
+        let response_schema = match &self.sdk_overrides.response_schema {
+            Some(schema) => Some(schema.clone()),
+            None => cli.response_schema()?,
+        };
+        let structured_output = response_schema.is_some();
         let hook_context = claude_core::services::session_hooks::context(&self.hook_service_context(), &self.id)?;
         if !hook_context.is_empty() { system.push_str("\nSessionStart hook context:\n"); system.push_str(&hook_context); system.push('\n'); }
         system.push_str(&crate::display_commands::style_prompt(self)?);
@@ -505,7 +542,7 @@ impl Session {
                     system_prompt: Some(system),
                     max_tokens: cli.max_tokens,
                     max_turns: cli.max_turns,
-                    response_schema: cli.response_schema()?,
+                    response_schema,
                     workspace_path: Some(cwd.to_string_lossy().into_owned()),
                     temperature: None,
                     top_p: None,
@@ -597,7 +634,7 @@ impl Session {
                     EngineEvent::Usage(value) => { progress.reported_usage(&value); if let Some(fields) = value.as_object() { for (key, value) in fields { usage[key] = value.clone(); } } },
                     EngineEvent::Error(message) => { progress.clear(); error = Some(message); },
                     EngineEvent::MessageStop { full_text, stop_reason } => {
-                        if cli.json_schema.is_some() { text = full_text.clone(); }
+                        if structured_output { text = full_text.clone(); }
                         if text.is_empty() && !full_text.is_empty() { if cli.output_format == OutputFormat::Text { progress.before_text(&full_text); if !progress.is_live() { print!("{full_text}"); } } text = full_text; }
                         if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning", "max_tokens", "length", "incomplete"].contains(&s)) {
                             error.get_or_insert_with(|| format!("Turn stopped: {}", stop_reason.unwrap()));
@@ -718,7 +755,7 @@ impl Session {
         match cli.output_format {
             OutputFormat::Text => { if !progress.is_live() { println!(); io::stdout().flush()?; } },
             _ => emit_json(
-                &json!({"type":"result","session_id":self.id,"result":text,"is_error":error.is_some(),"error":error,"usage":usage,"structured_output":if error.is_none() && cli.json_schema.is_some() {serde_json::from_str::<Value>(&text).ok()} else {None}}),
+                &json!({"type":"result","session_id":self.id,"result":text,"is_error":error.is_some(),"error":error,"usage":usage,"structured_output":if error.is_none() && structured_output {serde_json::from_str::<Value>(&text).ok()} else {None}}),
             )?,
         }
         if let Some(request) = side_request.take() {

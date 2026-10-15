@@ -1,0 +1,201 @@
+//! Per-run SDK initialization. Validate and gather metadata before publishing overrides.
+use crate::{args::Cli, session::Session};
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{json, Value};
+
+#[derive(Default)]
+pub struct State {
+    initialized: bool,
+}
+
+#[derive(Default)]
+pub struct Overrides {
+    pub system_prompt: Option<String>,
+    pub response_schema: Option<Value>,
+}
+
+impl State {
+    pub fn start_user_turn(&mut self) {
+        self.initialized = true;
+    }
+
+    pub async fn initialize(
+        &mut self,
+        cli: &Cli,
+        session: &mut Session,
+        request: &Value,
+    ) -> Result<Value> {
+        ensure!(!self.initialized, "Already initialized");
+        let overrides = validate(cli, request)?;
+        let response = metadata(session).await?;
+        // Nothing above mutates the running session, including a failed metadata read.
+        session.sdk_overrides = overrides;
+        self.initialized = true;
+        Ok(response)
+    }
+}
+
+fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
+    let fields = request
+        .as_object()
+        .context("initialize request must be an object")?;
+    let mut system = None;
+    let mut append = None;
+    let mut schema = None;
+    for (key, value) in fields {
+        match key.as_str() {
+            "subtype" => ensure!(value == "initialize", "Expected initialize subtype"),
+            "systemPrompt" | "appendSystemPrompt" => {
+                let text = value
+                    .as_str()
+                    .with_context(|| format!("initialize.{key} must be a string"))?;
+                ensure!(text.len() <= 1_048_576, "initialize.{key} exceeds 1 MiB");
+                if key == "systemPrompt" {
+                    system = Some(text.to_owned());
+                } else {
+                    append = Some(text.to_owned());
+                }
+            }
+            "jsonSchema" => {
+                claude_core::structured_output::validate_schema(value)
+                    .context("Invalid initialize.jsonSchema")?;
+                schema = Some(value.clone());
+            }
+            "hooks" | "agents" => ensure!(
+                value.as_object().is_some_and(|v| v.is_empty()),
+                "initialize.{key} is not supported; only an empty object is accepted"
+            ),
+            "sdkMcpServers" => ensure!(
+                value.as_array().is_some_and(Vec::is_empty),
+                "initialize.sdkMcpServers is not supported; only an empty array is accepted"
+            ),
+            "promptSuggestions" | "agentProgressSummaries" => ensure!(
+                value == false,
+                "initialize.{key} is not supported; only false is accepted"
+            ),
+            _ => bail!("Unknown initialize field: {key}"),
+        }
+    }
+    let system_prompt = if system.is_some() || append.is_some() {
+        let mut base = match system {
+            Some(value) => value,
+            None => match &cli.system_prompt_file {
+                Some(path) => {
+                    std::fs::read_to_string(path).context("Cannot read UTF-8 system prompt")?
+                }
+                None => cli.system_prompt.clone().unwrap_or_default(),
+            },
+        };
+        let suffix = match append {
+            Some(value) => value,
+            None => match &cli.append_system_prompt_file {
+                Some(path) => std::fs::read_to_string(path)
+                    .context("Cannot read UTF-8 appended system prompt")?,
+                None => cli.append_system_prompt.clone().unwrap_or_default(),
+            },
+        };
+        if !base.is_empty() && !suffix.is_empty() {
+            base.push_str("\n\n");
+        }
+        base.push_str(&suffix);
+        Some(base)
+    } else {
+        None
+    };
+    Ok(Overrides {
+        system_prompt,
+        response_schema: schema,
+    })
+}
+
+async fn metadata(session: &Session) -> Result<Value> {
+    let context = crate::services::context(&session.paths)?;
+    let skills =
+        crate::skill_commands::load_for_workspace(&session.paths, &session.workspace).await?;
+    let commands = crate::skill_commands::catalog(&skills).into_iter().map(|(name, description)| {
+        json!({"name":name.trim_start_matches('/'),"description":description,"argumentHint":""})
+    }).collect::<Vec<_>>();
+    let agents = claude_core::services::agents::list(&context)?
+        .into_iter()
+        .map(|agent| {
+            // Agent model overrides are not applied by the current execution engine.
+            json!({"name":agent.id,"description":agent.description})
+        })
+        .collect::<Vec<_>>();
+    let mut styles = std::collections::BTreeSet::from([
+        "default".to_owned(),
+        "explanatory".to_owned(),
+        "learning".to_owned(),
+    ]);
+    let directory = session.workspace.join(".claude/output-styles");
+    if directory.exists() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                    {
+                        styles.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({"commands":commands,"agents":agents,
+        "output_style":crate::display_commands::load(session)?.output_style,
+        "available_output_styles":styles,"models":session.sdk_models().await,
+        "account":{},"pid":std::process::id()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn overrides_preserve_unspecified_cli_parts_and_reject_unsupported_payloads() {
+        let cli = Cli::parse_from([
+            "claude-code",
+            "--system-prompt",
+            "CLI_BASE",
+            "--append-system-prompt",
+            "CLI_APPEND",
+        ]);
+        assert_eq!(
+            validate(&cli, &json!({"systemPrompt":"SDK"}))
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("SDK\n\nCLI_APPEND")
+        );
+        assert_eq!(
+            validate(&cli, &json!({"appendSystemPrompt":"SDK"}))
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("CLI_BASE\n\nSDK")
+        );
+        assert_eq!(
+            validate(&cli, &json!({"systemPrompt":"","appendSystemPrompt":""}))
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("")
+        );
+        for bad in [
+            json!({"systemPrompt":null}),
+            json!({"jsonSchema":{"type":42}}),
+            json!({"jsonSchema":{"$ref":"https://invalid/schema"}}),
+            json!({"unknown":false}),
+            json!({"hooks":{"PreToolUse":[]}}),
+            json!({"agents":{"custom":{}}}),
+            json!({"sdkMcpServers":["host"]}),
+            json!({"promptSuggestions":true}),
+        ] {
+            assert!(validate(&cli, &bad).is_err(), "{bad}");
+        }
+    }
+}

@@ -261,25 +261,16 @@ fn response(id: &Value, result: Result<Value>) -> Result<()> {
         }
     })
 }
-fn initialize(session: &Session, request: &Value) -> Result<Value> {
-    for (key, value) in request.as_object().context("request must be an object")? {
-        if key == "subtype" {
-            continue;
-        }
-        ensure!(
-            value.is_null() || value == &json!({}) || value == &json!([]) || value == &json!(false),
-            "initialize.{key} is not supported; use CLI configuration where available"
-        );
-    }
-    Ok(
-        json!({"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":session.model,"displayName":session.model,"description":"Current configured model"}],"account":{},"pid":std::process::id()}),
-    )
-}
-async fn idle_control(session: &mut Session, frame: &Value) -> Result<()> {
+async fn idle_control(
+    cli: &Cli,
+    initialization: &mut crate::sdk_initialization::State,
+    session: &mut Session,
+    frame: &Value,
+) -> Result<()> {
     let request = &frame["request"];
     let result = async {
         match request["subtype"].as_str().unwrap_or("") {
-            "initialize" => initialize(session, request),
+            "initialize" => initialization.initialize(cli, session, request).await,
             "interrupt" => Ok(json!({})),
             "set_permission_mode" => {
                 let mode = match request["mode"].as_str().context("mode is required")? {
@@ -309,6 +300,14 @@ async fn idle_control(session: &mut Session, frame: &Value) -> Result<()> {
     response(&frame["request_id"], result)
 }
 pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
+    let result = run_inner(cli, session, initial).await;
+    session.sdk_permissions = None;
+    session.sdk_content = None;
+    session.sdk_overrides = Default::default();
+    result
+}
+
+async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
     let updates = Arc::new(permission_updates::Updates::new(
         session.permissions.clone(),
         session.id.clone(),
@@ -319,6 +318,8 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
         ..Permissions::default()
     });
     session.sdk_permissions = Some(permissions.clone());
+    session.sdk_overrides = Default::default();
+    let mut initialization = crate::sdk_initialization::State::default();
     let mut frames = crate::sdk_input::stdin();
     let mut queue = VecDeque::<UserMessage>::new();
     if let Some(text) = initial {
@@ -330,6 +331,7 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
     let mut failed = false;
     loop {
         if let Some(message) = queue.pop_front() {
+            initialization.start_user_turn();
             ensure!(
                 message
                     .session_id
@@ -359,6 +361,10 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
                         Some(Ok(Frame::User(user)))=>{ensure!(queue.len()<32,"SDK pending user queue exceeds 32 messages");queue.push_back(user);},
                         Some(Ok(Frame::Response(value)))=>{permissions.respond(&value).await?;},
                         Some(Ok(Frame::Control(value)))=>{
+                            if value["request"]["subtype"]=="initialize" {
+                                response(&value["request_id"],Err(anyhow::anyhow!("Already initialized")))?;
+                                continue;
+                            }
                             if value["request"]["subtype"]=="interrupt" {
                                 failed=true;
                                 permissions.cancel().await;session.engine.cancel_turn(&session.id).await;
@@ -382,12 +388,12 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
             None => eof = true,
             Some(Err(error)) => return Err(error),
             Some(Ok(Frame::User(user))) => queue.push_back(user),
-            Some(Ok(Frame::Control(value))) => idle_control(session, &value).await?,
+            Some(Ok(Frame::Control(value))) => {
+                idle_control(cli, &mut initialization, session, &value).await?
+            }
             Some(Ok(Frame::Response(value))) => permissions.respond(&value).await?,
         }
     }
-    session.sdk_permissions = None;
-    session.sdk_content = None;
     if failed {
         return Err(crate::output::ReportedError(
             "One or more SDK turns failed or were interrupted".into(),
