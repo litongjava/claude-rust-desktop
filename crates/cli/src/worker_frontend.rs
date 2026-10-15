@@ -102,11 +102,11 @@ async fn single_turn(
         }
     };
     present(session, &job, input, &mut display, true, proposal_frontend.as_ref()).await?;
-    if jobs::get(root, &job.id)?.status == "completed" { activate_goal_proposal(session) } else { Ok(None) }
+    if jobs::get(root, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id) } else { Ok(None) }
 }
 
-fn activate_goal_proposal(session: &Session) -> Result<Option<String>> {
-    let kickoff = claude_core::services::goal_proposals::activate(&session.store.db, &session.id, &session.paths.data_dir, &session.workspace, &session.permissions)?;
+fn activate_goal_proposal(session: &Session, job: &str) -> Result<Option<String>> {
+    let kickoff = claude_core::services::goal_proposals::activate_from_job(&session.store.db, &session.id, &session.paths.data_dir, &session.workspace, &session.permissions, job)?;
     if kickoff.is_some() { crate::session_commands::goal_notice("Approved session goal is now active."); }
     Ok(kickoff)
 }
@@ -133,7 +133,7 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
         Some(claude_core::services::goal_proposals::Frontend::acquire(session.store.db.clone(), &session.id)?)
     } else { None };
     present(session, &job, input, &mut display, false, proposal_frontend.as_ref()).await?;
-    let kickoff = if main_execution && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session)? } else { None };
+    let kickoff = if main_execution && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id)? } else { None };
     drop(proposal_frontend);
     if let Some(kickoff) = kickoff { Box::pin(turn(cli, session, &kickoff, input)).await?; }
     Ok(())
@@ -724,7 +724,7 @@ fn result_text(event: &Value, streamed: bool) -> Option<&str> {
 mod failure_tests {
     use super::*;
     #[tokio::test]
-    async fn idle_child_attachment_never_consumes_parent_goal_and_main_cancel_revokes_it() {
+    async fn attachment_cannot_consume_another_tasks_goal_and_main_cancel_revokes_it() {
         use clap::Parser;
         use claude_core::services::{goal_proposals, session_goals};
         let temp = tempfile::tempdir().unwrap();
@@ -750,12 +750,33 @@ mod failure_tests {
         let mut job = jobs::Job { id: id.clone(), foreground: false, parent_session_id: parent.clone(), session_id: parent.clone(),
             title: "idle child".into(), status: "completed".into(), supervisor_pid: None, child_pid: None,
             started_ms: 1, heartbeat_ms: 2, finished_ms: Some(2), exit_code: Some(0), error: None };
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source_directory = paths.data_dir.join("background-tasks").join(&source_id);
+        std::fs::create_dir_all(&source_directory).unwrap();
+        let mut source_job = job.clone();
+        source_job.id = source_id.clone(); source_job.status = "running".into(); source_job.finished_ms = None;
+        source_job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
+        std::fs::write(source_directory.join("state.json"), serde_json::to_vec(&source_job).unwrap()).unwrap();
+        session.store.db.with_conn(|conn| -> anyhow::Result<()> {
+            let key = format!("session.goal-proposals.{parent}");
+            let text: String = conn.query_row("SELECT value FROM peripheral_settings WHERE key=?1", [&key], |row| row.get(0))?;
+            let mut value: Value = serde_json::from_str(&text)?;
+            value["pending"]["source_job"] = serde_json::json!(source_id);
+            conn.execute("UPDATE peripheral_settings SET value=?1 WHERE key=?2", [serde_json::to_string(&value)?, key])?;
+            Ok(())
+        }).unwrap().unwrap();
         std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();
         std::fs::write(directory.join("owned-child.json"), serde_json::to_vec(&child).unwrap()).unwrap();
         std::fs::write(directory.join("output.jsonl"), "").unwrap();
         assert!(!is_main_execution(&paths.data_dir, &job, &parent).unwrap());
         tokio::time::timeout(std::time::Duration::from_secs(3), attach(&cli, &session, &id, &mut None)).await.unwrap().unwrap();
         assert!(session_goals::active(&session.store.db, &parent).unwrap().is_none());
+        // A historical main job is also not the currently running proposal source.
+        std::fs::remove_file(directory.join("owned-child.json")).unwrap();
+        assert!(is_main_execution(&paths.data_dir, &job, &parent).unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(3), attach(&cli, &session, &id, &mut None)).await.unwrap().unwrap();
+        assert!(session_goals::active(&session.store.db, &parent).unwrap().is_none());
+        std::fs::write(directory.join("owned-child.json"), serde_json::to_vec(&child).unwrap()).unwrap();
         // Cancelling an idle child also leaves the parent's separate approval intact.
         job.status = "running".into(); job.finished_ms = None; job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
         std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();

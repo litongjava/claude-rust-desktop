@@ -458,6 +458,30 @@ pub fn activate(
     workspace: &Path,
     permissions: &PermissionManager,
 ) -> Result<Option<String>> {
+    activate_at_boundary(db, session, root, workspace, permissions, None)
+}
+
+/// A frontend may only complete consent originating from the job it observed.
+/// Missing source metadata is retained for compatibility with older proposals.
+pub fn activate_from_job(
+    db: &DbManager,
+    session: &str,
+    root: &Path,
+    workspace: &Path,
+    permissions: &PermissionManager,
+    job: &str,
+) -> Result<Option<String>> {
+    activate_at_boundary(db, session, root, workspace, permissions, Some(job))
+}
+
+fn activate_at_boundary(
+    db: &DbManager,
+    session: &str,
+    root: &Path,
+    workspace: &Path,
+    permissions: &PermissionManager,
+    expected_job: Option<&str>,
+) -> Result<Option<String>> {
     let pending = db.with_conn(|conn| -> Result<_> {
         Ok(read(conn, session)?.pending.filter(|p| p.approved))
     })??;
@@ -474,6 +498,14 @@ pub fn activate(
         else {
             return Ok(None);
         };
+        if expected_job.is_some_and(|expected| {
+            proposal
+                .source_job
+                .as_deref()
+                .is_some_and(|source| source != expected)
+        }) {
+            return Ok(None);
+        }
         if !source_job_allows_activation(root, session, proposal)
             || !policy
                 .as_ref()
@@ -631,8 +663,32 @@ mod tests {
             })
             .unwrap();
             drop(frontend); // A disappearing host does not itself revoke valid consent.
+            assert!(activate_from_job(
+                &f.db,
+                &f.session,
+                f.root.path(),
+                f.root.path(),
+                &f.permissions,
+                "historical-job"
+            )
+            .unwrap()
+            .is_none());
+            assert!(f.authority().is_empty());
             let allowed = matches!(status, "running" | "completed");
-            assert_eq!(f.activate().unwrap().is_some(), allowed, "{status}");
+            assert_eq!(
+                activate_from_job(
+                    &f.db,
+                    &f.session,
+                    f.root.path(),
+                    f.root.path(),
+                    &f.permissions,
+                    &job.id
+                )
+                .unwrap()
+                .is_some(),
+                allowed,
+                "{status}"
+            );
             assert_eq!(f.authority().len(), usize::from(allowed), "{status}");
             assert!(f.activate().unwrap().is_none());
         }
