@@ -114,10 +114,20 @@ struct Fixture {
 
 impl Fixture {
     async fn start(mode: &str, boundary_resume: bool) -> Self {
+        Self::start_with_hooks(mode, boundary_resume, None).await
+    }
+    async fn start_with_hooks(mode: &str, boundary_resume: bool, settings: Option<Value>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let context = session_messages::context(&temp.path().join("data")).unwrap();
+        if let Some(settings) = settings {
+            std::fs::write(
+                context.paths.data_dir.join("settings.json"),
+                settings.to_string(),
+            )
+            .unwrap();
+        }
         let store = SessionStore::new(context.db.clone());
         let owner = store.create(&workspace, "fixture", "cli-runtime").unwrap();
         let peer = store
@@ -248,6 +258,68 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+#[tokio::test]
+async fn idle_child_permission_hook_completes_without_blocking_the_engine_or_next_question() {
+    let decision = json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{"file_path":"hook-idle.txt","content":"HOOK_IDLE_WRITE"}}}});
+    let command = if cfg!(windows) {
+        format!("[Console]::Out.Write('{}')", decision)
+    } else {
+        format!("printf '%s' '{}'", decision)
+    };
+    let settings = json!({"hooks":{"PermissionRequest":[{"matcher":"Write","hooks":[{"type":"command","shell":if cfg!(windows){"powershell"}else{"sh"},"command":command}]}]}});
+    let fixture = Fixture::start_with_hooks("ask", false, Some(settings)).await;
+    fixture.send("IDLE_WRITE");
+    let job = fixture.next_job(1).await;
+    assert_eq!(
+        completed(&fixture.context.paths.data_dir, &job.id)
+            .await
+            .status,
+        "completed"
+    );
+    assert!(!fixture.workspace.join("idle.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("hook-idle.txt")).unwrap(),
+        "HOOK_IDLE_WRITE"
+    );
+    assert!(
+        jobs::pending_question(&fixture.context.paths.data_dir, &job.id, &fixture.owner)
+            .unwrap()
+            .is_none()
+    );
+
+    fixture.send("IDLE_QUESTION");
+    let next = fixture.next_job(2).await;
+    let question = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(question) =
+                jobs::pending_question(&fixture.context.paths.data_dir, &next.id, &fixture.owner)
+                    .unwrap()
+            {
+                break question;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(question.question.contains("Choose child response"));
+    jobs::answer_question(
+        &fixture.context.paths.data_dir,
+        &next.id,
+        &fixture.owner,
+        &question.request_id,
+        "2",
+    )
+    .unwrap();
+    assert_eq!(
+        completed(&fixture.context.paths.data_dir, &next.id)
+            .await
+            .status,
+        "completed"
+    );
+    fixture.stop().await;
 }
 
 #[tokio::test]

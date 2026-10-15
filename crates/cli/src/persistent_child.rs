@@ -148,26 +148,49 @@ async fn execute(
     )?;
     let (events, mut receiver) = tokio::sync::mpsc::channel(500);
     let mut execution = Box::pin(session.engine.wake_owned_child(&session.id, child, events));
+    type Answer<'a> = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<(String, String, bool)>>> + Send + 'a>,
+    >;
+    let mut pending_answer: Option<Answer<'_>> = None;
     loop {
         tokio::select! {
             biased;
             _ = jobs::wait_for_cancellation() => bail!("Owned child {child} task cancelled"),
-            Some(event) = receiver.recv() => {
+            answer = async { match pending_answer.as_mut() { Some(answer) => answer.await, None => std::future::pending().await } } => {
+                pending_answer = None;
+                if let Some((request_id, answer, permission)) = answer? {
+                    let delivered = session.engine.resume_with_answer(&request_id, answer).await;
+                    // A hook may atomically win after the host answer was read.
+                    if !permission { delivered?; }
+                }
+            },
+            Some(event) = receiver.recv(), if pending_answer.is_none() => {
                 if let Some(mut value) = crate::session::event_json(&event) {
                     value["child_session_id"] = json!(child);
                     service::emit_event(&value)?;
                 }
                 match event {
                     EngineEvent::ToolPermission { request_id, tool_name, input, .. } => {
+                        let mut closed = session.engine.permission_completion(&request_id).await;
+                        if *closed.borrow() { continue; }
                         let question = format!("Owned child {child}: allow {tool_name} {}? [y/N]", serde_json::to_string(&input)?);
-                        let answer = jobs::worker_answer(&worker.root, &session.id, &request_id, "permission", &question).await?.context("Worker approval channel missing")?;
-                        session.engine.resume_with_answer(&request_id, answer).await?;
+                        pending_answer = Some(Box::pin(async move {
+                            tokio::select! {
+                                biased;
+                                _ = closed.wait_for(|closed| *closed) => Ok(None),
+                                answer = jobs::worker_answer(&worker.root, &session.id, &request_id, "permission", &question) => {
+                                    Ok(Some((request_id.clone(), answer?.context("Worker approval channel missing")?, true)))
+                                }
+                            }
+                        }));
                     },
                     EngineEvent::AskUser { request_id, question, options, .. } => {
                         let question = format!("Owned child {child}: {question}\n{}", options.iter().enumerate().map(|(i, value)|format!("{}. {value}",i+1)).collect::<Vec<_>>().join("\n"));
-                        let answer = jobs::worker_answer(&worker.root, &session.id, &request_id, "question", &question).await?.context("Worker answer channel missing")?;
-                        let answer = answer.trim().parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| options.get(i)).cloned().unwrap_or(answer);
-                        session.engine.resume_with_answer(&request_id, answer).await?;
+                        pending_answer = Some(Box::pin(async move {
+                            let answer = jobs::worker_answer(&worker.root, &session.id, &request_id, "question", &question).await?.context("Worker answer channel missing")?;
+                            let answer = answer.trim().parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| options.get(i)).cloned().unwrap_or(answer);
+                            Ok(Some((request_id, answer, false)))
+                        }));
                     },
                     _ => {},
                 }
