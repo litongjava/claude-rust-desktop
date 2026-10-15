@@ -146,6 +146,7 @@ pub struct ToolLoopExecutor {
     skill_shell_active: bool,
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
+    allowed_directories: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,18 +181,6 @@ fn compact_tool_output(tool_name: &str, output: &str) -> String {
             if output.len() > 500 {
                 let safe_end = output.char_indices()
                     .take(500)
-                    .last()
-                    .map(|(idx, ch)| idx + ch.len_utf8())
-                    .unwrap_or(0);
-                format!("{}... (truncated, {} bytes total)", &output[..safe_end], output.len())
-            } else {
-                output.to_string()
-            }
-        }
-        "Read" => {
-            if output.len() > 2000 {
-                let safe_end = output.char_indices()
-                    .take(2000)
                     .last()
                     .map(|(idx, ch)| idx + ch.len_utf8())
                     .unwrap_or(0);
@@ -492,11 +481,17 @@ impl ToolLoopExecutor {
             skill_shell_active: false,
             pending_user_skill: None,
             manual_skill_active: false,
+            allowed_directories: Vec::new(),
         }
     }
 
     pub fn with_learning_tools(mut self, tools: Option<Arc<std::sync::Mutex<Vec<String>>>>) -> Self {
         self.learning_tools = tools;
+        self
+    }
+
+    pub(super) fn with_allowed_directories(mut self, directories: Vec<std::path::PathBuf>) -> Self {
+        self.allowed_directories = directories;
         self
     }
 
@@ -568,6 +563,12 @@ impl ToolLoopExecutor {
         }
         let cleaned = model_tool_output(tool_name, output);
         let output = cleaned.as_str();
+        // Read already selects the requested line range. This is the fresh
+        // result sent to the model, not a summary of old conversation history.
+        // Spilling it would also truncate any subsequent Read of the spill file.
+        if tool_name == "Read" {
+            return output.to_string();
+        }
         let preview = compact_tool_output(tool_name, output);
         if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
             return crate::performance::retain_tool_output(root, output, &preview);
@@ -665,6 +666,11 @@ impl ToolLoopExecutor {
     }
 
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        let directories = self.allowed_directories.clone();
+        crate::tools::path_scope::scope(directories, self.execute_scoped()).await
+    }
+
+    async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
         let conv_id = self.conv_id.clone().unwrap_or_default();
         tracing::info!(module = "ToolLoop", "[E1] execute ENTRY: conv_id={}, messages_count={}, provider={}", conv_id, self.messages.len(), self.provider.provider.id);
 

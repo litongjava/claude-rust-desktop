@@ -21,6 +21,7 @@ pub mod scheduled;
 mod content_compat;
 mod utf8;
 mod bash_process;
+pub(crate) mod path_scope;
 mod file_change;
 mod web;
 pub(crate) mod provider_search;
@@ -575,6 +576,7 @@ fn is_path_allowed(resolved_path: &Path, cwd: &str) -> bool {
             }
         }
     };
+    if path_scope::allows(&canonical) { return true; }
     if let Ok(cwd_canonical) = Path::new(cwd).canonicalize() {
         if canonical.starts_with(&cwd_canonical) { return true; }
     }

@@ -154,6 +154,182 @@ fn assert_no_secret(path: &Path) {
     }
 }
 
+async fn scope_respond(
+    State(requests): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> impl axum::response::IntoResponse {
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let calls = if last["role"] == "user" {
+        last["content"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    } else {
+        None
+    };
+    requests.lock().unwrap().push(body);
+    let (delta, finish) = if let Some(calls) = calls {
+        let calls: Vec<_> = calls.as_array().unwrap().iter().enumerate().map(|(i, call)| {
+            json!({"index":i,"id":format!("scope-{i}"),"type":"function","function":{"name":call["name"],"arguments":call["input"].to_string()}})
+        }).collect();
+        (json!({"tool_calls": calls}), "tool_calls")
+    } else {
+        (json!({"content":"scope complete"}), "stop")
+    };
+    (
+        [("content-type", "text/event-stream")],
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]})
+        ),
+    )
+}
+
+#[tokio::test]
+async fn added_directory_survives_worker_resume_without_granting_other_sessions() {
+    // Windows temp is inside AppData, an independently permitted root. Keep the
+    // fixture outside it so denial assertions actually exercise the allowlist.
+    let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let workspace = temp.path().join("workspace");
+    let allowed = temp.path().join("allowed");
+    let denied = temp.path().join("allowed-neighbor");
+    for path in [&workspace, &allowed, &denied] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(allowed.join("source.txt"), "permitted-source").unwrap();
+    std::fs::write(denied.join("source.txt"), "private-neighbor").unwrap();
+    let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let session = store
+        .create(&workspace, "fixture-one", "cli-runtime")
+        .unwrap();
+    let other = store
+        .create(&workspace, "fixture-one", "cli-runtime")
+        .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/v1/chat/completions", post(scope_respond))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let executable = temp.path().join(if cfg!(windows) {
+        "scope-worker.exe"
+    } else {
+        "scope-worker"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    let output = tokio::process::Command::new(&executable)
+        .current_dir(&workspace)
+        .args([
+            "--data-dir",
+            paths.data_dir.to_str().unwrap(),
+            "--resume",
+            &session,
+            "--add-dir",
+            allowed.to_str().unwrap(),
+            "--base-url",
+            &format!("{endpoint}/v1"),
+            "--api-format",
+            "openai",
+            "--api-key-env",
+            "CLAUDE_RUST_CHILD_API_KEY",
+            "--model",
+            "fixture-one",
+            "--permission-mode",
+            "bypass",
+            "--print",
+            "--",
+            "setup",
+        ])
+        .env("CLAUDE_RUST_CHILD_API_KEY", "fixture-secret-only-in-memory")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut cleanup = Cleanup(Vec::new());
+    for (id, granted) in [(&session, true), (&other, false)] {
+        let host = worker::ensure_worker(&paths.data_dir, &executable, id, &workspace)
+            .await
+            .unwrap();
+        cleanup.0.push(host.supervisor_pid.unwrap());
+        let calls = json!([
+            {"name":"Read","input":{"file_path":allowed.join("source.txt")}},
+            {"name":"Write","input":{"file_path":allowed.join(if granted {"written.txt"} else {"forbidden.txt"}),"content":"persisted"}},
+            {"name":"Read","input":{"file_path":denied.join("source.txt")}}
+        ]);
+        let job = submit(&host, &endpoint, &calls.to_string(), "fixture-one", 128).await;
+        assert_eq!(completed(&paths.data_dir, &job).await.status, "completed");
+        let observed = requests.lock().unwrap().last().unwrap().clone();
+        let results: Vec<_> = observed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), 3, "{observed}");
+        assert_eq!(
+            results[0]["content"]
+                .to_string()
+                .contains("permitted-source"),
+            granted,
+            "{results:?}"
+        );
+        assert!(
+            !results[2]["content"]
+                .to_string()
+                .contains("private-neighbor"),
+            "{results:?}"
+        );
+        if granted {
+            let before = requests.lock().unwrap().len();
+            let child_calls = json!([
+                {"name":"Read","input":{"file_path":allowed.join("source.txt")}},
+                {"name":"Read","input":{"file_path":denied.join("source.txt")}}
+            ]);
+            let delegate = json!([{"name":"Agent","input":{"prompt":child_calls.to_string(),"agent_type":"general"}}]);
+            let job = submit(&host, &endpoint, &delegate.to_string(), "fixture-one", 128).await;
+            assert_eq!(completed(&paths.data_dir, &job).await.status, "completed");
+            let requests = requests.lock().unwrap();
+            let child = requests[before..]
+                .iter()
+                .find(|request| {
+                    request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| m["role"] == "tool")
+                        .count()
+                        == 2
+                })
+                .expect("delegated agent must execute its own tool calls");
+            let results: Vec<_> = child["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .collect();
+            assert!(results[0]["content"]
+                .to_string()
+                .contains("permitted-source"));
+            assert!(!results[1]["content"]
+                .to_string()
+                .contains("private-neighbor"));
+        }
+        worker::shutdown(&paths.data_dir, id).await.unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(allowed.join("written.txt")).unwrap(),
+        "persisted"
+    );
+    assert!(!allowed.join("forbidden.txt").exists());
+    server.abort();
+}
+
 #[tokio::test]
 async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_crash_without_replay() {
     let temp = tempfile::tempdir().unwrap();

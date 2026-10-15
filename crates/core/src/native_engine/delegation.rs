@@ -182,6 +182,7 @@ impl ToolLoopExecutor {
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_search_config_path(self.search_config_path.clone().unwrap());
+        child.allowed_directories = self.allowed_directories.clone();
         child.delegation_depth = self.delegation_depth + 1;
         child.permission_manager = self.permission_manager.clone();
         if let Some(manager) = &child.permission_manager {

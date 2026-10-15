@@ -1,6 +1,59 @@
 use super::*;
 
 #[tokio::test]
+async fn fresh_read_retains_requested_source_range_beyond_spill_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = (1..=400)
+        .map(|line| format!("const line_{line} = '完整 source content beyond preview';\n"))
+        .collect::<String>();
+    std::fs::write(dir.path().join("source.ts"), &source).unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+    let mut executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1", "openai"),
+        vec![],
+        None,
+        128,
+        tx,
+        dir.path().to_string_lossy().into(),
+        ReasoningMode::Standard,
+    )
+    .with_search_config_path(dir.path().join("settings.json"));
+    let (_, output, failed) = executor
+        .execute_tool_call("Read", &json!({"file_path":"source.ts"}), "read-source")
+        .await;
+    assert!(!failed, "{output}");
+    assert!(output.len() > 16_000);
+    let retained = executor.retained_tool_output("Read", &output);
+    assert_eq!(retained, output);
+    assert!(retained.contains("line_400"));
+    assert!(!dir.path().join("tool-outputs").exists());
+
+    let (_, range, failed) = executor
+        .execute_tool_call(
+            "Read",
+            &json!({"file_path":"source.ts", "offset":350, "limit":51}),
+            "read-range",
+        )
+        .await;
+    assert!(!failed, "{range}");
+    assert_eq!(executor.retained_tool_output("Read", &range), range);
+    assert!(range.contains("line_400"));
+    assert!(!range.contains("line_349"));
+
+    let write = executor.retained_tool_output(
+        "Write",
+        &json!({
+            "success":true, "file_change":{"before":source,"after":"replacement"},
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&write).unwrap(),
+        json!({"success":true})
+    );
+}
+
+#[tokio::test]
 async fn immediate_terminal_answers_are_registered_before_events() {
     let dir = tempfile::tempdir().unwrap();
     for permission in [false, true] {

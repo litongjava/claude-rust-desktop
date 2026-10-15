@@ -401,6 +401,7 @@ impl QueryEngine {
             crate::project_instructions::load(&instructions_workspace)
         }).await??;
         request.system_prompt.get_or_insert_with(String::new).push_str(&instructions);
+        let allowed_directories = project.as_ref().map(|project| project.folders.iter().map(|folder| std::path::PathBuf::from(&folder.path)).collect()).unwrap_or_default();
         if let Some(project) = project {
             let folders = project.folders.iter().map(|f| f.path.as_str()).collect::<Vec<_>>();
             let context = format!("\nProject: {}\nProject source folders (the first is the working directory):\n{}\nProject instructions:\n{}", project.name, serde_json::to_string(&folders)?, project.instructions.unwrap_or_default());
@@ -502,6 +503,7 @@ impl QueryEngine {
             workspace_path.clone(),
             reasoning_mode.clone(),
         )
+        .with_allowed_directories(allowed_directories)
         .with_user_skill(pending_user_skill)
         .with_max_turns(request.max_turns)?
         .with_response_schema(request.response_schema)?
