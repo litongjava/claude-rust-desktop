@@ -160,6 +160,8 @@ pub struct ToolLoopExecutor {
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
     durable_user_input: bool,
+    message_inbox: Option<crate::services::session_messages::Target>,
+    message_deliveries: usize,
     allowed_directories: Vec<std::path::PathBuf>,
 }
 
@@ -515,6 +517,8 @@ impl ToolLoopExecutor {
             pending_user_skill: None,
             manual_skill_active: false,
             durable_user_input: false,
+            message_inbox: None,
+            message_deliveries: 0,
             allowed_directories: Vec::new(),
         }
     }
@@ -723,10 +727,27 @@ impl ToolLoopExecutor {
         }
     }
 
+    fn drain_peer_messages(&mut self) -> Result<Vec<String>> {
+        let messages = match self.message_inbox.as_ref() {
+            Some(inbox) => inbox.drain(32usize.saturating_sub(self.message_deliveries))?,
+            None => Vec::new(),
+        };
+        self.message_deliveries += messages.len();
+        Ok(messages)
+    }
+
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
+        // The OS lock is scoped to this future: cancellation/crash releases it.
+        let inbox_owner = match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+            (Some(root), Some(session)) => crate::services::session_messages::Consumer::attach(root, session)?,
+            _ => None,
+        };
+        self.message_inbox = inbox_owner.as_ref().map(|owner| owner.target.clone());
+        self.message_deliveries = 0;
+
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
                 let path = crate::services::plans::path(root, session)?;
@@ -918,7 +939,10 @@ impl ToolLoopExecutor {
             if !matches!(permission, PermissionResult::Granted) {
                 return (tool_input.clone(), "Team message access requires granted project tool permission".into(), true);
             }
-            let result = crate::tools::agent_messages::execute_for_session(tool_input.clone(), &self.workspace_cwd, self.conv_id.as_deref().unwrap_or("unknown"));
+            let result = match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+                (Some(root), Some(session)) => crate::services::session_messages::context(root).and_then(|context| crate::tools::agent_messages::execute_live(&context, session, tool_input.clone())),
+                _ => Err(anyhow::anyhow!("Session-local message routing is unavailable")),
+            };
             let failed = result.is_err();
             let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
             return (tool_input.clone(), output, failed);
@@ -1293,6 +1317,10 @@ impl ToolLoopExecutor {
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
 
         for iteration in 0..self.max_tool_iterations {
+            for content in self.drain_peer_messages()? {
+                conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) });
+            }
+
             if self.response_schema.is_some() { full_text.clear(); }
             let round_text_start = full_text.len();
             tracing::info!(module = "AnthropicLoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
@@ -1724,6 +1752,12 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
+                let incoming = if iteration + 1 < self.max_tool_iterations { self.drain_peer_messages()? } else { Vec::new() };
+                if !incoming.is_empty() {
+                    conversation_messages.push(AnthropicMessage { role: "assistant".into(), content: AnthropicContent::Blocks(assistant_blocks) });
+                    for content in incoming { conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) }); }
+                    continue;
+                }
                 if let Some(follow_up) = self.stop_hook(&full_text[round_text_start..]).await? {
                     anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
                     conversation_messages.push(AnthropicMessage { role: "assistant".into(), content: AnthropicContent::Blocks(assistant_blocks) });
@@ -1771,6 +1805,10 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
 
         for iteration in 0..self.max_tool_iterations {
+            for content in self.drain_peer_messages()? {
+                conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });
+            }
+
             if self.response_schema.is_some() { full_text.clear(); }
             let round_text_start = full_text.len();
             tracing::info!(module = "OpenAILoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
@@ -2192,6 +2230,12 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
+                let incoming = if iteration + 1 < self.max_tool_iterations { self.drain_peer_messages()? } else { Vec::new() };
+                if !incoming.is_empty() {
+                    conversation_messages.push(OpenAIMessage { role: "assistant".into(), content: assistant_content.unwrap_or(OpenAIContent::Text(String::new())), tool_calls: None, tool_call_id: None, reasoning_content: assistant_reasoning, provider_content: assistant_provider_content });
+                    for content in incoming { conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None }); }
+                    continue;
+                }
                 if let Some(follow_up) = self.stop_hook(&full_text[round_text_start..]).await? {
                     anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
                     conversation_messages.push(OpenAIMessage { role: "assistant".into(), content: assistant_content.unwrap_or(OpenAIContent::Text(String::new())), tool_calls: None, tool_call_id: None, reasoning_content: assistant_reasoning, provider_content: assistant_provider_content });

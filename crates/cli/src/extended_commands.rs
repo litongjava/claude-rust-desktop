@@ -114,8 +114,14 @@ pub async fn handle(
                 let request = match verb {
                     "" | "list" => {
                         ensure!(rest.trim().is_empty(), "Usage: /list-agents [list]");
-                        println!("{}", serde_json::to_string_pretty(&peers)?);
-                        eprintln!("Same-project sessions and recorded worker states; saved does not mean running. /list-agents message SESSION_ID TEXT queues local mail; /list-agents inbox reads it; /list-agents read MESSAGE_ID acknowledges it; /list-agents definitions lists agent templates.");
+                        let mut observed=peers.clone();
+                        for peer in &mut observed {
+                            let id=peer["id"].as_str().unwrap_or_default();
+                            let runtime=claude_core::services::session_worker::runtime_status(&paths.data_dir,id).await;
+                            peer["worker"]=serde_json::to_value(runtime)?;
+                        }
+                        println!("{}", serde_json::to_string_pretty(&observed)?);
+                        eprintln!("Trusted source-project sessions, including worktrees. receiver_active is an OS-locked model consumer; worker reports a bounded live probe. Saved alone does not mean running. /list-agents message SESSION_ID TEXT queues context; inbox/sent show delivery state, read MESSAGE_ID marks human read only. Idle recipients consume messages on their next explicit turn. /list-agents inbox legacy reads the old project mailbox.");
                         None
                     }
                     "message" => {
@@ -124,25 +130,40 @@ pub async fn handle(
                         ensure!(!content.trim().is_empty(), "Message must not be empty");
                         Some(serde_json::json!({"operation":"send","to":to,"content":content.trim()}))
                     }
+                    "inbox" if rest.trim()=="legacy" => {
+                        let result=claude_core::tools::agent_messages::execute_for_session(serde_json::json!({"operation":"receive"}),&session.workspace.to_string_lossy(),&session.id)?;
+                        println!("{}",serde_json::to_string_pretty(&result)?);
+                        eprintln!("Legacy repository mailbox; these rows are not automatically injected into live context.");
+                        None
+                    }
                     "inbox" => {
-                        ensure!(rest.trim().is_empty(), "Usage: /list-agents inbox");
-                        Some(serde_json::json!({"operation":"receive"}))
+                        ensure!(rest.trim().is_empty(), "Usage: /list-agents inbox [legacy]");
+                        Some(serde_json::json!({"operation":"receive","unread_only":false}))
+                    }
+                    "sent" => {
+                        ensure!(rest.trim().is_empty(), "Usage: /list-agents sent");
+                        Some(serde_json::json!({"operation":"sent"}))
+                    }
+                    "read" if rest.trim().starts_with("legacy ") => {
+                        let id=rest.trim().strip_prefix("legacy ").unwrap().trim();
+                        ensure!(!id.is_empty() && !id.contains(char::is_whitespace), "Usage: /list-agents read legacy MESSAGE_ID");
+                        let result=claude_core::tools::agent_messages::execute_for_session(serde_json::json!({"operation":"mark_read","message_id":id}),&session.workspace.to_string_lossy(),&session.id)?;
+                        println!("{}",serde_json::to_string_pretty(&result)?);
+                        None
                     }
                     "read" => {
                         ensure!(!rest.trim().is_empty() && !rest.trim().contains(char::is_whitespace), "Usage: /list-agents read MESSAGE_ID");
                         Some(serde_json::json!({"operation":"mark_read","message_id":rest.trim()}))
                     }
-                    _ => anyhow::bail!("Usage: /list-agents [list|definitions|message SESSION_ID TEXT|inbox|read MESSAGE_ID]"),
+                    _ => anyhow::bail!("Usage: /list-agents [list|definitions|message SESSION_ID TEXT|inbox [legacy]|sent|read MESSAGE_ID]"),
                 };
                 if let Some(request) = request {
-                    let result = claude_core::tools::agent_messages::execute_for_session(
-                        request,
-                        &session.workspace.to_string_lossy(),
-                        &session.id,
+                    let result = claude_core::tools::agent_messages::execute_live(
+                        &crate::services::context(paths)?, &session.id, request,
                     )?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                     if verb == "message" {
-                        eprintln!("Queued in the recipient's project mailbox; this does not interrupt or restart its active turn.");
+                        eprintln!("Queued durably. Active recipients receive it at the next safe model boundary; idle/offline recipients need their next explicit turn. context_committed means saved context, not proof of model processing. Check /list-agents sent.");
                     }
                 }
             }
@@ -153,30 +174,15 @@ pub async fn handle(
 }
 
 fn peer_sessions(
-    store: &claude_core::runtime::SessionStore,
+    _store: &claude_core::runtime::SessionStore,
     root: &Path,
-    workspace: &Path,
+    _workspace: &Path,
     current: &str,
 ) -> Result<Vec<Value>> {
-    let canonical = workspace.canonicalize()?;
-    let jobs = claude_core::services::background_sessions::list(root, None)?;
-    let rows = store
-        .db
-        .with_conn(conversation_repo::list_conversations)??;
-    let mut peers = Vec::new();
-    for row in rows {
-        if !row.workspace_path.as_deref().is_some_and(|path| {
-            Path::new(path)
-                .canonicalize()
-                .is_ok_and(|path| path == canonical)
-        }) {
-            continue;
-        }
-        let job = jobs
-            .iter()
-            .filter(|job| job.session_id == row.id)
-            .max_by_key(|job| job.started_ms);
-        peers.push(serde_json::json!({"id":row.id,"title":row.title,"current":row.id==current,"status":job.map(|j|j.status.as_str()).unwrap_or(if row.id==current {"attached"} else {"saved"}),"task_id":job.map(|j|&j.id),"parent_session_id":job.map(|j|&j.parent_session_id),"updated_at":row.updated_at}));
+    let context=claude_core::services::session_messages::context(root)?;
+    let mut peers=claude_core::services::session_messages::peers(&context,current)?;
+    for peer in &mut peers {
+        peer["status"]=serde_json::json!(if peer["id"]==current {"attached"} else if peer["receiver_active"]==true {"active_receiver"} else {"saved"});
     }
     Ok(peers)
 }

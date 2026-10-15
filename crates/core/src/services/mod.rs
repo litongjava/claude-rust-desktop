@@ -9,6 +9,7 @@ pub mod session_permission_mode;
 pub mod background_sessions;
 pub mod session_worker;
 pub mod session_parking;
+pub mod session_messages;
 pub mod batch;
 pub mod checkpoints;
 pub mod tool_hooks;

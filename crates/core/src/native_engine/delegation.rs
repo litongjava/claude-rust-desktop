@@ -155,11 +155,18 @@ impl ToolLoopExecutor {
             });
         }
         let sessions = SessionStore::new(context.db.clone());
-        let id = sessions.create(
-            std::path::Path::new(&self.workspace_cwd),
-            &self.provider.model.id,
-            &self.provider.provider.id,
-        )?;
+        let id = if let Some(parent) = self.conv_id.as_deref() {
+            // Preserve the parent's trusted source identity and managed worktree.
+            // Creating from actual cwd would incorrectly trust a worktree as a new project.
+            let child = sessions.clear(parent)?;
+            context.db.with_conn(|conn| conn.execute(
+                "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
+                rusqlite::params![child, self.provider.model.id, self.provider.provider.id],
+            ))??;
+            child
+        } else {
+            sessions.create(std::path::Path::new(&self.workspace_cwd), &self.provider.model.id, &self.provider.provider.id)?
+        };
         agents::bind(&context.db, &id, &definition)?;
         sessions.append(&id, "user", prompt)?;
         let mut state = ChildState {

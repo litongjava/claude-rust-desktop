@@ -525,8 +525,10 @@ pub fn collect_completed(session: &Session) -> Result<Vec<String>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WORKER_WARNING: AtomicBool = AtomicBool::new(false);
     static SHELL_WARNING: AtomicBool = AtomicBool::new(false);
+    static MESSAGE_WARNING: AtomicBool = AtomicBool::new(false);
     let mut notices = Vec::new();
     for (source, warning, result) in [
+        ("messages", &MESSAGE_WARNING, claude_core::services::session_messages::notices(&claude_core::services::ServiceContext { paths: session.paths.clone(), db: session.store.db.clone(), credentials: std::sync::Arc::new(claude_core::services::EnvironmentCredentials) },&session.id)),
         ("workers", &WORKER_WARNING, background_sessions::collect_completed(&session.store, &session.paths.data_dir, &session.id)),
         ("shells", &SHELL_WARNING, claude_core::tools::background_shell::collect_completed(&session.paths.data_dir, &session.id)),
     ] {

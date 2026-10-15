@@ -4,7 +4,27 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 pub(super) fn definition() -> super::ToolDefinition {
-    super::ToolDefinition {name:"SendMessage".into(),description:"Send or read persistent project-local agent messages. Operations: send, receive, pending_count, mark_read. Recipient labels are local routing names, not authenticated external identities. No network transmission.".into(),input_schema:json!({"type":"object","properties":{"operation":{"type":"string","enum":["send","receive","pending_count","mark_read"]},"to":{"type":"string"},"from":{"type":"string"},"content":{"type":"string"},"recipient":{"type":"string"},"unread_only":{"type":"boolean"},"message_id":{"type":"string"}},"required":["operation"]})}
+    super::ToolDefinition {name:"SendMessage".into(),description:"Send or read durable same-project session messages. Use a recipient session UUID from /list-agents. Active recipients consume queued context at their next safe model boundary; idle/offline recipients need an explicit next turn. context_committed means saved context, not proof the model processed it. Operations: peers, send, receive, sent, pending_count, mark_read. No external network transmission.".into(),input_schema:json!({"type":"object","properties":{"operation":{"type":"string","enum":["send","receive","pending_count","mark_read","sent","peers"]},"to":{"type":"string"},"from":{"type":"string"},"content":{"type":"string"},"recipient":{"type":"string"},"unread_only":{"type":"boolean"},"message_id":{"type":"string"}},"required":["operation"]})}
+}
+
+/// Live routing uses the private runtime DB; legacy cwd mail is explicitly separate.
+pub fn execute_live(context: &crate::services::ServiceContext, session: &str, input: Value) -> Result<Value> {
+    use crate::services::session_messages as live;
+    match input["operation"].as_str().context("operation is required")? {
+        "send" => {
+            let recipient=input["to"].as_str().context("to session UUID is required")?;
+            let content=input["content"].as_str().context("content is required")?;
+            let message=live::send(context,session,recipient,content)?;
+            let active=live::receiver_active(&context.paths.data_dir,recipient)?;
+            Ok(json!({"message":message,"state":"queued","receiver_active":active,"delivery":if active {"next_safe_model_boundary"} else {"queued_needs_resume"},"processed":false}))
+        },
+        "sent" => Ok(json!({"messages":live::sent(context,session)?})),
+        "peers" => Ok(json!({"sessions":live::peers(context,session)?})),
+        "receive" => Ok(json!({"messages":live::inbox(context,session,input["unread_only"].as_bool().unwrap_or(true))?})),
+        "pending_count" => Ok(json!({"pending_count":live::pending_count(context,session)?})),
+        "mark_read" => {let id=input["message_id"].as_str().context("message_id is required")?;live::mark_read(context,session,id)?;Ok(json!({"message_id":id,"read":true}))},
+        _ => bail!("Unknown live message operation"),
+    }
 }
 
 pub fn execute_for_session(mut input: Value, cwd: &str, session_id: &str) -> Result<Value> {
