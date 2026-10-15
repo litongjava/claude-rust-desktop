@@ -619,13 +619,16 @@ pub fn resolve_path(file_path: &str, cwd: &str) -> Result<String> {
 
 fn tool_read(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let file_path = input["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
-    let path = resolve_path(file_path, cwd)?;
-
-    if !Path::new(&path).exists() {
-        return Ok(serde_json::json!({ "content": format!("File not found: {}", path), "is_error": true }));
-    }
-
-    let content = fs::read_to_string(&path)?;
+    let resource = crate::skills::bundled_resources::read(Path::new(file_path));
+    let content = if let Some(bytes) = resource {
+        std::str::from_utf8(bytes)?.to_owned()
+    } else {
+        let path = resolve_path(file_path, cwd)?;
+        if !Path::new(&path).exists() {
+            return Ok(serde_json::json!({ "content": format!("File not found: {}", path), "is_error": true }));
+        }
+        fs::read_to_string(&path)?
+    };
     let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let offset = input["offset"].as_u64().unwrap_or(1) as usize;
     let limit = input["limit"].as_u64().unwrap_or(2000) as usize;

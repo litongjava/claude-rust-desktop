@@ -117,13 +117,17 @@ impl ToolLoopExecutor {
         Ok(json!({"team_id":team_id,"completed_tasks":results}))
     }
 
-    pub(super) async fn execute_delegated(&mut self, input: &Value) -> Result<Value> {
+    pub(super) async fn execute_delegated(&self, input: &Value) -> Result<Value> {
+        self.execute_delegated_typed(input, None, None).await
+    }
+
+    /// Workflow children inherit authority and may only narrow their tool set.
+    pub(super) async fn execute_delegated_typed(&self, input: &Value, schema: Option<Value>, tools: Option<Vec<String>>) -> Result<Value> {
         ensure!(self.delegation_depth < 2, "Delegation depth limit reached");
         let prompt = input["prompt"].as_str().context("prompt is required")?;
-        ensure!(
-            !prompt.trim().is_empty() && prompt.len() <= 64_000,
-            "Child prompt must contain 1–64000 bytes"
-        );
+        let max_prompt = if schema.is_some() { 1024 * 1024 } else { 64_000 };
+        ensure!(!prompt.trim().is_empty() && prompt.len() <= max_prompt,
+            "Child prompt must contain 1–{max_prompt} bytes");
         let root = self
             .search_config_path
             .as_deref()
@@ -142,6 +146,12 @@ impl ToolLoopExecutor {
                     .filter(|name| parent.contains(name))
                     .collect(),
                 None => parent.clone(),
+            });
+        }
+        if let Some(tools) = tools {
+            definition.tools = Some(match definition.tools {
+                Some(allowed) => tools.into_iter().filter(|name| allowed.contains(name)).collect(),
+                None => tools,
             });
         }
         let sessions = SessionStore::new(context.db.clone());
@@ -181,7 +191,10 @@ impl ToolLoopExecutor {
         .with_prompt_profile(self.prompt_profile)
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
+        .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(self.search_config_path.clone().unwrap());
+        let collect_web_evidence = schema.is_some();
+        child = child.with_response_schema(schema)?;
         child.allowed_directories = self.allowed_directories.clone();
         child.delegation_depth = self.delegation_depth + 1;
         child.durable_user_input = self.durable_user_input;
@@ -195,6 +208,8 @@ impl ToolLoopExecutor {
         }
         let assistant_id = uuid::Uuid::new_v4().to_string();
         let mut tool_index = 0;
+        let mut web_evidence = Vec::new();
+        let mut evidence_ids = std::collections::HashSet::new();
         let execution = Box::pin(child.execute());
         tokio::pin!(execution);
         let result = loop {
@@ -208,6 +223,9 @@ impl ToolLoopExecutor {
                         }
                         EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error }
                         | EngineEvent::PipelineToolResult { tool_use_id, tool_name, tool_input, output, is_error, .. } => {
+                            if collect_web_evidence && matches!(tool_name.as_str(), "WebSearch" | "WebFetch") && evidence_ids.insert(tool_use_id.clone()) {
+                                web_evidence.push(json!({"tool_use_id":tool_use_id,"name":tool_name,"input":tool_input,"output":serde_json::from_str::<Value>(&output).unwrap_or_else(|_|Value::String(output.clone())),"is_error":is_error}));
+                            }
                             let row = crate::db::message_repo::ToolCallRow { id: format!("{assistant_id}:{tool_use_id}"), message_id: assistant_id.clone(), name:tool_name, input:Some(tool_input.to_string()), output:Some(output), is_error, sort_order:tool_index };
                             let persisted = (|| -> Result<()> {
                                 context.db.with_conn(|conn| crate::db::message_repo::save_stream_tool_result(conn, &id, &assistant_id, "", &row))??;
@@ -255,7 +273,7 @@ impl ToolLoopExecutor {
                     "Child session {id} did not complete: {}",
                     reason.unwrap_or_default()
                 );
-                Ok(json!({"session_id":id,"status":"completed","result":text}))
+                Ok(json!({"session_id":id,"status":"completed","result":text,"web_evidence":web_evidence}))
             }
             Err(error) => {
                 state.value["status"] = json!("failed");

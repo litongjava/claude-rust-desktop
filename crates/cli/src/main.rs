@@ -25,6 +25,7 @@ mod session_commands;
 mod session_trust;
 mod status_commands;
 mod display_commands;
+mod doctor_commands;
 mod background_commands;
 mod batch_commands;
 mod rewind_commands;

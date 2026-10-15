@@ -1,5 +1,7 @@
 #[path = "delegation.rs"]
 mod delegation;
+#[path = "deep_research.rs"]
+mod deep_research;
 #[path = "skill_tool.rs"]
 mod skill_tool;
 #[path = "plan_tool.rs"]
@@ -143,6 +145,7 @@ pub struct ToolLoopExecutor {
     prompt_profile: PromptProfile,
     reasoning_mode: ReasoningMode,
     prefetch_engine: Option<Arc<PrefetchEngine>>,
+    bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     search_config_path: Option<std::path::PathBuf>,
     allowed_tools: Option<Vec<String>>,
     learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
@@ -167,6 +170,23 @@ struct PendingToolCall {
     name: String,
     input: Value,
     requires_user_interaction: bool,
+}
+
+/// A cancelled child must not leave an unreachable permission sender behind.
+struct PermissionWaiterGuard {
+    waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    request_id: String,
+}
+impl Drop for PermissionWaiterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = self.waiters.try_lock() {
+            waiters.remove(&self.request_id);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let waiters = self.waiters.clone();
+            let id = self.request_id.clone();
+            runtime.spawn(async move { waiters.lock().await.remove(&id); });
+        }
+    }
 }
 
 fn model_tool_output(tool_name: &str, output: &str) -> String {
@@ -479,6 +499,7 @@ impl ToolLoopExecutor {
             prompt_profile: PromptProfile::Desktop,
             reasoning_mode,
             prefetch_engine: None,
+            bundled_resources: Arc::default(),
             search_config_path: None,
             allowed_tools: None,
             learning_tools: None,
@@ -544,6 +565,7 @@ impl ToolLoopExecutor {
             let request_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
             self.answer_waiters.lock().await.insert(request_id.clone(), tx);
+            let _waiter_guard = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
             let _ = self.event_tx.send(EngineEvent::ToolPermission { request_id: request_id.clone(), tool_use_id: id.into(), tool_name: name.into(), input: input.clone() }).await;
             let answer = self.wait_for_user_answer(rx).await;
             self.answer_waiters.lock().await.remove(&request_id);
@@ -582,6 +604,11 @@ impl ToolLoopExecutor {
             return crate::performance::retain_tool_output(root, output, &preview);
         }
         output.to_string()
+    }
+
+    pub fn with_bundled_resources(mut self, resources: Arc<crate::skills::bundled_resources::Resources>) -> Self {
+        self.bundled_resources = resources;
+        self
     }
 
     pub fn with_search_config_path(mut self, path: std::path::PathBuf) -> Self {
@@ -633,6 +660,7 @@ impl ToolLoopExecutor {
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
         if self.search_config_path.is_some() && self.delegation_depth < 2 { tools.extend(delegation::definitions()); }
+        if self.search_config_path.is_some() && self.delegation_depth == 0 { tools.push(deep_research::definition()); }
         adapt_tools(tools, self.prompt_profile).into_iter().filter(|tool| self.allowed_tools.as_ref().is_none_or(|names| names.contains(&tool.name))).collect()
     }
 
@@ -681,6 +709,9 @@ impl ToolLoopExecutor {
     }
 
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        // A previous invocation may have been dropped while executing a manual
+        // skill. Explicit invocation authority never carries into the next turn.
+        self.manual_skill_active = false;
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
                 let path = crate::services::plans::path(root, session)?;
@@ -909,6 +940,10 @@ impl ToolLoopExecutor {
         let output_str;
         let is_error;
 
+        if tool_name == "Workflow" {
+            let result = Box::pin(self.execute_workflow(tool_input)).await;
+            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Workflow failed: {error:#}") }, result.is_err());
+        }
         if crate::tools::tasks::is_task(tool_name) {
             let result = async {
                 let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
@@ -976,6 +1011,7 @@ impl ToolLoopExecutor {
             waiters.insert(request_id.clone(), tx);
         }
 
+        let _waiter_guard = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
         let _ = self.event_tx.send(EngineEvent::AskUser {
             request_id: request_id.clone(),
             tool_use_id: tool_use_id.to_owned(),
@@ -1101,6 +1137,7 @@ impl ToolLoopExecutor {
             let mut waiters = self.answer_waiters.lock().await;
             waiters.insert(request_id.clone(), tx);
         }
+        let _waiter_guard = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
 
         let _ = self.event_tx.send(EngineEvent::ToolPermission {
             request_id: request_id.clone(),
@@ -1166,6 +1203,10 @@ impl ToolLoopExecutor {
         tool_input: &Value,
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
+        if tool_name == "Workflow" {
+            let result = Box::pin(self.execute_workflow(tool_input)).await;
+            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Workflow failed: {error:#}") }, result.is_err());
+        }
         if crate::tools::tasks::is_task(tool_name) {
             let result = async {
                 let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
@@ -1531,7 +1572,7 @@ impl ToolLoopExecutor {
                                 }).await;
 
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
+                                let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                                     || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                                     || self.is_plan_document_tool(&name, &input)
                                     || self.check_permission_requires_confirmation(&name, &input);
@@ -2028,7 +2069,7 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
+                    let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
                         || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                         || self.is_plan_document_tool(name, &input)
                         || self.check_permission_requires_confirmation(name, &input);

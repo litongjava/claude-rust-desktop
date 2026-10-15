@@ -106,6 +106,7 @@ pub struct ToolCallRecord {
 }
 
 pub struct QueryEngine {
+    bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
     db_manager: Arc<DbManager>,
     active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
@@ -136,6 +137,7 @@ impl QueryEngine {
         file_cache: Arc<FileCache>,
     ) -> Self {
         Self {
+            bundled_resources: Arc::default(),
             provider_manager,
             db_manager,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -369,8 +371,13 @@ impl QueryEngine {
         let mut pending_user_skill = None;
         if let Some((command, arguments)) = skill_invocation {
             let content = if let Some(skill) = discovered_skills.get(&command) {
-                let template = skill.render_template(&arguments, &conv_id)?;
-                let requires_execution = skill.context.as_deref() == Some("fork") || crate::skills::invocation::parse(&template)?.iter().any(|part| matches!(part, crate::skills::invocation::Segment::Shell(_)));
+                let embedded = skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
+                let requires_execution = if embedded {
+                    true
+                } else {
+                    let template = skill.render_template(&arguments, &conv_id)?;
+                    skill.context.as_deref() == Some("fork") || crate::skills::invocation::parse(&template)?.iter().any(|part| matches!(part, crate::skills::invocation::Segment::Shell(_)))
+                };
                 if requires_execution {
                     pending_user_skill = Some(serde_json::json!({"skill":command,"args":arguments}));
                     None
@@ -514,6 +521,7 @@ impl QueryEngine {
         .with_memex(crate::memory::MemExClient::with_path(
             self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir).join("memory.sqlite3"), None,
         ))
+        .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
         .with_answer_waiters(self.answer_waiters.clone())

@@ -138,6 +138,26 @@ pub async fn prepare_invocation(
     let Some(skill) = commands.get(name) else {
         return Ok(PreparedInvocation::NotHandled);
     };
+    if name == "code-review"
+        && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"))
+    {
+        return Ok(PreparedInvocation::Inline(
+            claude_core::skills::code_review::prepare(&session.workspace, arguments.trim()).await?,
+        ));
+    }
+    if name == "doctor" && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__")) {
+        let instructions = skill.render_template(arguments.trim(), &session.id)?;
+        let snapshot = crate::doctor_commands::snapshot(&session.workspace, &session.paths);
+        return Ok(PreparedInvocation::Inline(
+            claude_core::services::doctor::attach_snapshot(&instructions, &snapshot),
+        ));
+    }
+    if claude_core::skills::bundled_resources::supports(name)
+        && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"))
+    {
+        // The engine owns resources so they live in the worker that reads them.
+        return Ok(PreparedInvocation::NotHandled);
+    }
     let template = skill.render_template(arguments.trim(), &session.id)?;
     let segments = invocation::parse(&template)?;
     let fork = skill.context.as_deref() == Some("fork");

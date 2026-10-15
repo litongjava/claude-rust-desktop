@@ -1,4 +1,7 @@
 //! Model-invoked skills execute inside the existing event/permission loop.
+#[cfg(test)]
+#[path = "bundled_skill_tests.rs"]
+mod bundled_skill_tests;
 use super::{EngineEvent, ToolLoopExecutor};
 use crate::{
     runtime::RuntimePaths,
@@ -47,7 +50,7 @@ impl ToolLoopExecutor {
             Ok(None)
         } else {
             ensure!(
-                result["status"] == "completed",
+                result["status"] == "completed" || (result["execution"] == "workflow" && matches!(result["status"].as_str(), Some("partial" | "inconclusive"))),
                 "Skill child did not complete"
             );
             let text = result["result"]
@@ -94,6 +97,38 @@ impl ToolLoopExecutor {
             self.manual_skill_active || !skill.disable_model_invocation,
             "Skill /{name} is disabled for model invocation; it requires an explicit user command"
         );
+        if name == "code-review"
+            && skill.path.parent() == Some(Path::new("__embedded_cli_skills__"))
+        {
+            let instructions = crate::skills::code_review::prepare(
+                Path::new(&self.workspace_cwd), arguments,
+            ).await?;
+            return Ok(json!({"skill":name,"instructions":instructions,"execution":"inline","shell_context_already_collected":true}));
+        }
+        if name == "deep-research" && skill.path == Path::new("__embedded_cli_skills__").join("deep-research") {
+            ensure!(!arguments.trim().is_empty(), "Usage: /deep-research <specific research question>");
+            let workflow = json!({"name":"deep-research","args":arguments});
+            let (_, output, failed) = Box::pin(self.execute_tool_call("Workflow", &workflow, &uuid::Uuid::new_v4().to_string())).await;
+            ensure!(!failed, "Deep research failed: {output}");
+            return serde_json::from_str(&output).context("Invalid research result");
+        }
+        if name == "doctor"
+            && skill.path.parent() == Some(Path::new("__embedded_cli_skills__"))
+        {
+            let instructions = skill.render_template(arguments, self.conv_id.as_deref().unwrap_or("unknown"))?;
+            let snapshot = crate::services::doctor::inspect(
+                Path::new(&self.workspace_cwd), Some(&context.paths),
+            ).render();
+            return Ok(json!({"skill":name,"instructions":crate::services::doctor::attach_snapshot(&instructions, &snapshot),"execution":"inline","shell_context_already_collected":true}));
+        }
+        if crate::skills::bundled_resources::supports(name)
+            && skill.path.parent() == Some(Path::new("__embedded_cli_skills__"))
+        {
+            let instructions = self.bundled_resources.prepare(
+                name, arguments, Path::new(&self.workspace_cwd),
+            )?;
+            return Ok(json!({"skill":name,"instructions":instructions,"execution":"inline","shell_context_already_collected":true}));
+        }
         // user-invocable controls slash commands, not model-only skills.
         let mut selected = skill.clone();
         selected.user_invocable = true;
@@ -162,6 +197,73 @@ mod tests {
         native_engine::{engine_core::ReasoningMode, provider_manager::ResolvedProvider},
         permissions::rules::PermissionAction,
     };
+
+    #[tokio::test]
+    async fn embedded_review_manual_snapshot_and_model_restriction_preserve_custom_skills() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        std::fs::write(temp.path().join("review.txt"), "initial\n").unwrap();
+        for args in [
+            vec!["add", "--", "review.txt"],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        std::fs::write(temp.path().join("review.txt"), "core-review-snapshot\n").unwrap();
+        let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        let provider=ResolvedProvider {provider:serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),model:serde_json::from_value(json!({"id":"fixture","name":"fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap()};
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let mut executor = ToolLoopExecutor::new(
+            provider,
+            vec![],
+            None,
+            128,
+            tx,
+            temp.path().to_string_lossy().into_owned(),
+            ReasoningMode::Standard,
+        )
+        .with_search_config_path(paths.data_dir.join("config.json"));
+        let input = json!({"skill":"code-review","args":"high path review.txt"});
+        assert!(executor
+            .execute_skill_tool(&input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disabled for model invocation"));
+        executor.manual_skill_active = true;
+        let result = executor.execute_skill_tool(&input).await.unwrap();
+        assert_eq!(result["execution"], "inline");
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("Explicit target current file contents"));
+        assert!(instructions.contains("core-review-snapshot"));
+        let custom = temp.path().join(".claude/commands");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("code-review.md"), "CUSTOM_REVIEW $ARGUMENTS").unwrap();
+        executor.manual_skill_active = false;
+        let result = executor.execute_skill_tool(&input).await.unwrap();
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("CUSTOM_REVIEW high path review.txt"));
+        assert!(!instructions.contains("Explicit target current file contents"));
+    }
 
     #[tokio::test]
     async fn explicit_fork_skill_runs_one_isolated_child_and_no_parent_generation() {

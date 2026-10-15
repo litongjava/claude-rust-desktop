@@ -78,7 +78,34 @@ pub fn discover(workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
     let user = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
-    discover_from(user.as_deref(), workspace)
+    Ok(discover_available_from(user.as_deref(), workspace).0)
+}
+
+/// Tolerant runtime discovery. Invalid files never override valid definitions.
+/// Errors retain paths only: parser messages may contain credential values.
+pub fn discover_available_from(
+    user_config: Option<&Path>,
+    workspace: &Path,
+) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
+    let mut commands = super::bundled::commands(workspace);
+    let mut invalid = Vec::new();
+    for config in user_config
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(std::iter::once(workspace.join(".claude")))
+    {
+        let _ = scan_config_impl(&config, &mut commands, Some(&mut invalid));
+    }
+    for path in &invalid {
+        let safe: String = path
+            .to_string_lossy()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(240)
+            .collect();
+        tracing::warn!(path = %safe, category = "invalid_or_unreadable_skill", "Skipping invalid skill; run /doctor");
+    }
+    (commands, invalid)
 }
 
 /// Explicit roots allow fixture tests without reading or running personal skills.
@@ -214,6 +241,14 @@ pub fn discover_plugin(
 }
 
 fn scan_config(config: &Path, commands: &mut BTreeMap<String, SkillCommand>) -> Result<()> {
+    scan_config_impl(config, commands, None)
+}
+
+fn scan_config_impl(
+    config: &Path,
+    commands: &mut BTreeMap<String, SkillCommand>,
+    mut invalid: Option<&mut Vec<PathBuf>>,
+) -> Result<()> {
     // Skills win over legacy commands in the same scope.
     for (directory, skill_format) in [("commands", false), ("skills", true)] {
         let root = config.join(directory);
@@ -225,7 +260,16 @@ fn scan_config(config: &Path, commands: &mut BTreeMap<String, SkillCommand>) -> 
             .follow_links(false)
             .max_depth(16)
         {
-            let entry = entry.with_context(|| format!("Scanning {}", root.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if let Some(invalid) = invalid.as_mut() {
+                        invalid.push(error.path().unwrap_or(&root).to_path_buf());
+                        continue;
+                    }
+                    return Err(error).with_context(|| format!("Scanning {}", root.display()));
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -242,84 +286,99 @@ fn scan_config(config: &Path, commands: &mut BTreeMap<String, SkillCommand>) -> 
         }
         paths.sort();
         for path in paths {
-            ensure!(
-                std::fs::metadata(&path)?.len() <= 1024 * 1024,
-                "Skill file exceeds 1 MiB: {}",
-                path.display()
-            );
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("Reading UTF-8 skill {}", path.display()))?;
-            let (metadata, content) =
-                frontmatter(&text).with_context(|| format!("Parsing skill {}", path.display()))?;
-            if boolean(&metadata, "enabled", true)? == false {
-                continue;
-            }
-            let relative = path.strip_prefix(&root)?;
-            let stem = if skill_format {
-                relative
-                    .parent()
-                    .context("Skill must be in a named directory")?
-                    .to_path_buf()
-            } else {
-                relative.with_extension("")
-            };
-            let mut parts = stem
-                .iter()
-                .map(|v| v.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            // A plugin checkout inside a user skill directory has its own
-            // namespace and source root; structural `skills/` is not a command
-            // namespace. Ordinary nested skill collections retain their paths.
-            if skill_format {
-                if let Some(plugin_parts) = local_plugin_name(&root, &path)? {
-                    parts = plugin_parts;
+            let invalid_path = path.clone();
+            let parsed = (|| -> Result<()> {
+                ensure!(
+                    std::fs::metadata(&path)?.len() <= 1024 * 1024,
+                    "Skill file exceeds 1 MiB: {}",
+                    path.display()
+                );
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Reading UTF-8 skill {}", path.display()))?;
+                let (metadata, content) = frontmatter(&text)
+                    .with_context(|| format!("Parsing skill {}", path.display()))?;
+                if boolean(&metadata, "enabled", true)? == false {
+                    return Ok(());
+                }
+                let relative = path.strip_prefix(&root)?;
+                let stem = if skill_format {
+                    relative
+                        .parent()
+                        .context("Skill must be in a named directory")?
+                        .to_path_buf()
+                } else {
+                    relative.with_extension("")
+                };
+                let mut parts = stem
+                    .iter()
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                // A plugin checkout inside a user skill directory has its own
+                // namespace and source root; structural `skills/` is not a command
+                // namespace. Ordinary nested skill collections retain their paths.
+                if skill_format {
+                    if let Some(plugin_parts) = local_plugin_name(&root, &path)? {
+                        parts = plugin_parts;
+                    }
+                }
+                ensure!(
+                    !parts.is_empty(),
+                    "Skill must be in a named directory: {}",
+                    path.display()
+                );
+                if let Some(name) = metadata.get("name").and_then(Value::as_str) {
+                    *parts.last_mut().unwrap() = name.into();
+                }
+                let name = parts.join(":");
+                ensure!(
+                    name.chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')),
+                    "Invalid skill command name: {name}"
+                );
+                let command = SkillCommand {
+                    name: name.clone(),
+                    description: metadata
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Run local skill instructions")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    path,
+                    content,
+                    user_invocable: boolean(
+                        &metadata,
+                        "user-invocable",
+                        boolean(&metadata, "userInvocable", true)?,
+                    )?,
+                    disable_model_invocation: boolean(
+                        &metadata,
+                        "disable-model-invocation",
+                        false,
+                    )?,
+                    context: metadata
+                        .get("context")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    shell: metadata
+                        .get("shell")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    agent: metadata
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                };
+                commands.insert(name, command);
+                Ok(())
+            })();
+            if let Err(error) = parsed {
+                if let Some(invalid) = invalid.as_mut() {
+                    invalid.push(invalid_path);
+                } else {
+                    return Err(error);
                 }
             }
-            ensure!(
-                !parts.is_empty(),
-                "Skill must be in a named directory: {}",
-                path.display()
-            );
-            if let Some(name) = metadata.get("name").and_then(Value::as_str) {
-                *parts.last_mut().unwrap() = name.into();
-            }
-            let name = parts.join(":");
-            ensure!(
-                name.chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')),
-                "Invalid skill command name: {name}"
-            );
-            let command = SkillCommand {
-                name: name.clone(),
-                description: metadata
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Run local skill instructions")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                path,
-                content,
-                user_invocable: boolean(
-                    &metadata,
-                    "user-invocable",
-                    boolean(&metadata, "userInvocable", true)?,
-                )?,
-                disable_model_invocation: boolean(&metadata, "disable-model-invocation", false)?,
-                context: metadata
-                    .get("context")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                shell: metadata
-                    .get("shell")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                agent: metadata
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            };
-            commands.insert(name, command);
         }
     }
     Ok(())
@@ -400,7 +459,7 @@ fn boolean(metadata: &Value, key: &str, default: bool) -> Result<bool> {
         .unwrap_or(Ok(default))
 }
 
-fn frontmatter(text: &str) -> Result<(Value, String)> {
+pub(crate) fn frontmatter(text: &str) -> Result<(Value, String)> {
     let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     if !text.starts_with("---\n") {
         return Ok((serde_json::json!({}), text));
@@ -477,6 +536,20 @@ fn expand_arguments(content: &str, arguments: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tolerant_discovery_keeps_good_siblings_and_bundled_doctor() {
+        let root = tempfile::tempdir().unwrap();
+        let commands = root.path().join(".claude/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("good.md"), "Good instructions").unwrap();
+        std::fs::write(commands.join("doctor.md"), "---\nname: doctor\nenabled: NOT_A_BOOL_SECRET\n---\nInvalid replacement").unwrap();
+        let (available, invalid) = super::discover_available_from(None, root.path());
+        assert!(available["good"].content.contains("Good instructions"));
+        assert_eq!(available["doctor"].path.parent().unwrap(), std::path::Path::new("__embedded_cli_skills__"));
+        assert_eq!(invalid, vec![commands.join("doctor.md")]);
+        assert!(super::discover_from(None, root.path()).is_err());
+    }
+
     use super::*;
     #[test]
     fn fork_metadata_does_not_bypass_user_invocation_restrictions() {

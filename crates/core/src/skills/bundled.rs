@@ -1,4 +1,4 @@
-//! Native-tool workflows implemented for this Rust client, not verbatim source ports.
+//! Embedded workflow discovery; resource bundles are materialized on invocation.
 use super::discovery::SkillCommand;
 use std::{collections::BTreeMap, path::Path};
 
@@ -6,7 +6,7 @@ pub fn commands(workspace: &Path) -> BTreeMap<String, SkillCommand> {
     let definitions = [
         (
             "claude-api",
-            "Build and troubleshoot Claude API integrations",
+            "Build apps with the Claude API or Anthropic SDK. Use for anthropic / @anthropic-ai/sdk imports or explicit Claude API requests; not OpenAI or unrelated programming tasks.",
             include_str!("bundled/claude-api.md"),
         ),
         (
@@ -16,7 +16,7 @@ pub fn commands(workspace: &Path) -> BTreeMap<String, SkillCommand> {
         ),
         (
             "dataviz",
-            "Create and validate a visualization from actual data",
+            "Create charts and data visualizations, choose chart forms, and validate palettes, contrast and interaction using runnable reference assets.",
             include_str!("bundled/dataviz.md"),
         ),
         (
@@ -69,7 +69,7 @@ pub fn commands(workspace: &Path) -> BTreeMap<String, SkillCommand> {
                     path: Path::new("__embedded_cli_skills__").join(name),
                     content,
                     user_invocable: true,
-                    disable_model_invocation: true,
+                    disable_model_invocation: !super::bundled_resources::supports(name),
                     context: None,
                     shell: None,
                     agent: None,
@@ -100,7 +100,7 @@ mod tests {
                 .unwrap();
             assert!(rendered.contains("inspect my project"));
             assert!(!rendered.contains("__embedded_cli_skills__"));
-            assert!(command.disable_model_invocation);
+            assert_eq!(command.disable_model_invocation, !super::super::bundled_resources::supports(name));
         }
         assert!(commands["claude-api"].content.contains("Rust (HTTP API)"));
         assert!(!commands["doctor"].content.contains("Read-only local diagnostic snapshot:"));

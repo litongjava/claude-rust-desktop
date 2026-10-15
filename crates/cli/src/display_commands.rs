@@ -80,7 +80,7 @@ pub async fn handle(
         "/doctor" if argument.is_empty() || argument == "status" => {
             print!(
                 "{}",
-                claude_core::services::doctor::inspect(&session.workspace, Some(paths)).render()
+                crate::doctor_commands::snapshot(&session.workspace, paths)
             );
         }
         "/debug" => {

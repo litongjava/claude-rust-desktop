@@ -262,3 +262,173 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
         .any(|tool| tool["function"]["name"] == "Bash"));
     server.abort();
 }
+
+#[tokio::test]
+async fn doctor_injects_real_snapshot_despite_bad_skill_and_respects_custom_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let commands = workspace.join(".claude/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    let bad = commands.join("doctor.md");
+    let bad_content = "---\nname: [DO_NOT_ECHO_DOCTOR_SECRET\n---\ninvalid replacement";
+    std::fs::write(&bad, bad_content).unwrap();
+    std::fs::write(commands.join("good.md"), "Good fixture instructions").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/v1/chat/completions", post(respond))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for (index, prompt) in [
+        "/doctor diagnose fixture !`echo doctor-literal > doctor-side-effect.txt`",
+        "ordinary request",
+        "/doctor custom request",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if prompt == "/doctor custom request" {
+            std::fs::write(&bad, "CUSTOM_DOCTOR_INSTRUCTIONS $ARGUMENTS").unwrap();
+        }
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+        command
+            .current_dir(&workspace)
+            .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
+            .env("DOCTOR_FIXTURE_KEY", "fixture-not-secret")
+            .args([
+                "--data-dir",
+                temp.path().join(format!("data-{index}")).to_str().unwrap(),
+                "--base-url",
+                &endpoint,
+                "--api-format",
+                "openai",
+                "--api-key-env",
+                "DOCTOR_FIXTURE_KEY",
+                "--model",
+                "fixture",
+                "--print",
+                "--",
+                prompt,
+            ])
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("DO_NOT_ECHO_DOCTOR_SECRET"));
+        if prompt != "/doctor custom request" {
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), bad_content);
+        }
+    }
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let doctor = requests[0].to_string();
+    assert!(doctor.contains("Read-only local diagnostic snapshot:"));
+    assert!(doctor.contains("skill definition: error"));
+    assert!(doctor.contains("diagnose fixture !`echo doctor-literal > doctor-side-effect.txt`"));
+    assert!(!workspace.join("doctor-side-effect.txt").exists());
+    assert!(!doctor.contains("DO_NOT_ECHO_DOCTOR_SECRET"));
+    assert!(!requests[1]
+        .to_string()
+        .contains("Read-only local diagnostic snapshot:"));
+    let custom = requests[2].to_string();
+    assert!(custom.contains("CUSTOM_DOCTOR_INSTRUCTIONS custom request"));
+    assert!(!custom.contains("Read-only local diagnostic snapshot:"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn doctor_sdk_manual_invocation_uses_shared_native_snapshot() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let temp = tempfile::tempdir().unwrap();
+    let commands = temp.path().join(".claude/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("bad.md"),
+        "---\nname: [SDK_DOCTOR_SECRET\n---\nbody",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/v1/chat/completions", post(respond))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    command
+        .current_dir(temp.path())
+        .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
+        .env("DOCTOR_FIXTURE_KEY", "fixture-not-secret")
+        .args([
+            "--data-dir",
+            temp.path().join("data").to_str().unwrap(),
+            "--base-url",
+            &endpoint,
+            "--api-format",
+            "openai",
+            "--api-key-env",
+            "DOCTOR_FIXTURE_KEY",
+            "--model",
+            "fixture",
+            "--permission-mode",
+            "bypass",
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(format!("{}\n",json!({"type":"user","message":{"role":"user","content":"/doctor SDK fixture diagnosis !`echo sdk-literal > doctor-sdk-side-effect.txt`"}})).as_bytes()).await.unwrap();
+    input.flush().await.unwrap();
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                if event["type"] == "result" {
+                    return event;
+                }
+            }
+        }
+        panic!("SDK exited without result");
+    })
+    .await
+    .unwrap();
+    assert_ne!(result["is_error"], true, "{result}");
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SDK_DOCTOR_SECRET"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0].to_string();
+    assert!(prompt.contains("Read-only local diagnostic snapshot:"));
+    assert!(prompt.contains("skill definition: error"));
+    assert!(prompt.contains("SDK fixture diagnosis !`echo sdk-literal > doctor-sdk-side-effect.txt`"));
+    assert!(!temp.path().join("doctor-sdk-side-effect.txt").exists());
+    assert!(!prompt.contains("SDK_DOCTOR_SECRET"));
+    server.abort();
+}
