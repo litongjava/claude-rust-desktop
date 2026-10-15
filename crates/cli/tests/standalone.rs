@@ -495,6 +495,44 @@ async fn legacy_agent_import_preserves_allowlist_in_real_shared_engine() {
         "Read fixture",
     ]);
     let output = execute(cli).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["result"]
+        .as_str()
+        .unwrap()
+        .contains("READ_ALLOWED_SENTINEL"));
+    // Default reads need no approval; an explicit ask still applies to imported agents.
+    let id = result["session_id"].as_str().unwrap();
+    let paths = claude_core::runtime::RuntimePaths::new(data.clone()).unwrap();
+    let db = paths.open_database().unwrap();
+    let rules = std::collections::HashMap::from([(
+        "Read",
+        claude_core::permissions::rules::PermissionAction::Confirm,
+    )]);
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
+            [
+                format!("cli.permissions.{id}"),
+                serde_json::to_string(&rules).unwrap(),
+            ],
+        )
+    })
+    .unwrap()
+    .unwrap();
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args([
+        "--resume",
+        id,
+        "query",
+        "-p",
+        "Read fixture with explicit approval rule",
+    ]);
+    let output = execute(cli).await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Tool approval required"));
     let mut cli = query(&data, temp.path(), &url);
