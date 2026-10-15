@@ -1,4 +1,5 @@
 //! One terminal owner while a model turn runs. The idle editor is inactive.
+use super::change_view;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -26,6 +27,7 @@ pub enum Action {
 enum Update {
     Text(String),
     Notice(String),
+    Styled(Vec<change_view::Line>),
     Activity(String),
     Usage(Value),
     Question(String, oneshot::Sender<String>),
@@ -44,7 +46,8 @@ impl LiveTurn {
         bindings: crate::keybindings::Keybindings,
         history: Vec<String>,
     ) -> Option<Self> {
-        if crate::terminal::screen_reader() || !io::stdin().is_terminal()
+        if crate::terminal::screen_reader()
+            || !io::stdin().is_terminal()
             || !io::stdout().is_terminal()
             || !io::stderr().is_terminal()
             || std::env::var("TERM").as_deref() == Ok("dumb")
@@ -98,6 +101,9 @@ impl LiveTurn {
     }
     pub fn notice(&self, text: &str) {
         let _ = self.updates.send(Update::Notice(text.into()));
+    }
+    fn styled(&self, lines: Vec<change_view::Line>) {
+        let _ = self.updates.send(Update::Styled(lines));
     }
     pub fn activity(&self, text: &str) {
         let _ = self.updates.send(Update::Activity(text.into()));
@@ -203,6 +209,8 @@ struct State {
     answer: Option<oneshot::Sender<String>>,
     partial: String,
     usage: super::progress::ReportedUsage,
+    generated_characters: usize,
+    estimate_pending: bool,
     started: Instant,
     activity_started: Instant,
     bindings: crate::keybindings::Keybindings,
@@ -225,6 +233,8 @@ impl State {
             answer: None,
             partial: String::new(),
             usage: Default::default(),
+            generated_characters: 0,
+            estimate_pending: false,
             started: Instant::now(),
             activity_started: Instant::now(),
             bindings: Default::default(),
@@ -401,6 +411,14 @@ impl Frame {
             .summary()
             .map(|summary| format!(" \u{b7} {summary}"))
             .unwrap_or_default();
+        let usage = if state.estimate_pending && state.generated_characters > 0 {
+            format!(
+                " \u{b7} ~{} generated tokens (estimate)",
+                state.generated_characters.div_ceil(4)
+            )
+        } else {
+            usage
+        };
         let status = clip(
             &format!(
                 "* {} ({}s){usage}",
@@ -576,6 +594,10 @@ fn run(
         loop {
             match updates.try_recv() {
                 Ok(Update::Text(text)) => {
+                    state.generated_characters = state
+                        .generated_characters
+                        .saturating_add(text.chars().count());
+                    state.estimate_pending = true;
                     if state.activity.contains("thinking")
                         || state.activity == "Waiting for response"
                     {
@@ -599,6 +621,18 @@ fn run(
                     screen.log(&text)?;
                     dirty = true;
                 }
+                Ok(Update::Styled(lines)) => {
+                    if !state.partial.is_empty() {
+                        screen.log(&std::mem::take(&mut state.partial))?;
+                    }
+                    screen.clear()?;
+                    let width = terminal::size().unwrap_or((80, 24)).0.saturating_sub(1) as usize;
+                    let color = std::env::var_os("NO_COLOR").is_none();
+                    for line in lines {
+                        write(&format!("{}\r\n", change_view::render(&line, width, color)))?;
+                    }
+                    dirty = true;
+                }
                 Ok(Update::Activity(activity)) => {
                     if state.activity != activity {
                         state.activity_started = Instant::now();
@@ -608,6 +642,13 @@ fn run(
                 }
                 Ok(Update::Usage(value)) => {
                     state.usage.update(&value);
+                    if value["output_tokens"]
+                        .as_u64()
+                        .or_else(|| value["completion_tokens"].as_u64())
+                        .is_some_and(|value| value > 0)
+                    {
+                        state.estimate_pending = false;
+                    }
                     dirty = true;
                 }
                 Ok(Update::Detail(id, title, body)) => {
@@ -618,6 +659,10 @@ fn run(
                     dirty = true;
                 }
                 Ok(Update::Thinking(text)) => {
+                    state.generated_characters = state
+                        .generated_characters
+                        .saturating_add(text.chars().count());
+                    state.estimate_pending = true;
                     let remaining = 65536usize.saturating_sub(state.thinking.chars().count());
                     state.thinking.extend(text.chars().take(remaining));
                     if state.detail_entries.is_empty() {
@@ -653,7 +698,10 @@ fn run(
                     if std::env::var_os("NO_COLOR").is_some() {
                         write(&format!("{}\r\n", terminal_text(&footer)))?;
                     } else {
-                        write(&format!("\x1b[90m{}\x1b[0m\r\n", terminal_text(&footer)))?;
+                        write(&format!(
+                            "{}\r\n",
+                            change_view::render(&change_view::muted(&footer), usize::MAX, true)
+                        ))?;
                     }
                     return Ok(());
                 }
@@ -1009,9 +1057,28 @@ impl TurnDisplay {
                 &format!("{name} - {}", if failed { "error" } else { "completed" }),
                 &body,
             );
-            live.notice(&super::progress::tool_result_summary(
-                name, output, failed, elapsed,
-            ));
+            let change = matches!(name, "Write" | "Edit" | "MultiEdit")
+                .then(|| change_view::change(output, failed))
+                .flatten();
+            if let Some(lines) = change {
+                live.detail(
+                    id,
+                    &format!("{name} - completed"),
+                    &format!("{}\n\n{}", change_view::plain(&lines), body),
+                );
+                let mut preview = lines.iter().take(14).cloned().collect::<Vec<_>>();
+                if lines.len() > 14 {
+                    preview.push(change_view::success("More changes in details (Ctrl+O)"));
+                }
+                live.styled(preview);
+            } else {
+                let summary = super::progress::tool_result_summary(name, output, failed, elapsed);
+                if failed {
+                    live.notice(&summary);
+                } else {
+                    live.styled(vec![change_view::success(summary.trim())]);
+                }
+            }
             live.activity("Working");
         } else {
             self.fallback.tool_finished(id, name, output, failed);

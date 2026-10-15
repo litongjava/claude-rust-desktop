@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 pub mod macros;
 mod notebook;
-mod tasks;
+pub mod tasks;
 mod lsp;
 pub use lsp::{configure as configure_lsp_servers, shutdown_all as shutdown_lsp_servers, status as lsp_status};
 pub(crate) use lsp::passive_feedback as lsp_passive_feedback;
@@ -20,6 +20,8 @@ pub mod coordination;
 pub mod scheduled;
 mod content_compat;
 mod utf8;
+mod bash_process;
+mod file_change;
 mod web;
 pub(crate) mod provider_search;
 pub use provider_search::search as search_provider;
@@ -117,7 +119,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The shell command to execute" },
-                    "timeout": { "type": "number", "description": "Timeout in seconds (default: 120)" },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 3600, "description": "Timeout in seconds (default: 120); use 900-1800 for dependency installation or initial builds" },
                     "shell": { "type": "string", "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh (default: bash)" }
                 },
                 "required": ["command"]
@@ -632,11 +634,13 @@ fn tool_write(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> 
         fs::create_dir_all(parent)?;
     }
 
+    let before = file_change::capture(Path::new(&path));
     let bytes_written = utf8::write_utf8(Path::new(&path), content)?;
 
     Ok(serde_json::json!({
         "success": true,
         "content": format!("Successfully wrote to {}", path),
+        "file_change": file_change::completed(Path::new(&path),before),
         "bytes_written": bytes_written
     }))
 }
@@ -649,6 +653,7 @@ fn tool_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let path = resolve_path(file_path, cwd)?;
 
     let content = fs::read_to_string(&path)?;
+    let before = file_change::snapshot(&content);
 
     let (new_content, replacements) = if replace_all {
         let count = content.matches(old_string).count();
@@ -674,6 +679,7 @@ fn tool_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
 
     Ok(serde_json::json!({
         "success": true,
+        "file_change": file_change::completed(Path::new(&path),before),
         "content": format!("Successfully replaced {} occurrence(s) in {}", replacements, path),
         "replacements": replacements
     }))
@@ -685,6 +691,7 @@ fn tool_multi_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Va
     let path = resolve_path(file_path, cwd)?;
 
     let content = fs::read_to_string(&path)?;
+    let before = file_change::snapshot(&content);
     let mut new_content = content;
     let mut total_replacements = 0;
     let mut failed_edits: Vec<String> = Vec::new();
@@ -715,6 +722,7 @@ fn tool_multi_edit(input: serde_json::Value, cwd: &str) -> Result<serde_json::Va
 
     Ok(serde_json::json!({
         "success": true,
+        "file_change": file_change::completed(Path::new(&path),before),
         "content": format!("Successfully applied {} edits to {}", total_replacements, path),
         "replacements": total_replacements
     }))
@@ -913,7 +921,11 @@ async fn tool_computer_use_async(input: serde_json::Value) -> Result<serde_json:
 
 async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let command = input["command"].as_str().ok_or_else(|| anyhow!("command required"))?;
-    let timeout_secs = input["timeout"].as_u64().unwrap_or(default_bash_timeout_secs());
+    let timeout_secs = match input.get("timeout") {
+        Some(value) => value.as_u64().ok_or_else(|| anyhow!("Bash timeout must be an integer number of seconds"))?,
+        None => default_bash_timeout_secs(),
+    };
+    anyhow::ensure!((1..=3600).contains(&timeout_secs), "Bash timeout must be 1-3600 seconds");
     let shell_type = input["shell"].as_str().unwrap_or("bash");
 
     if is_dangerous_command(command) {
@@ -1025,37 +1037,7 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output()
-    ).await;
-
-    match output {
-        Ok(Ok(output)) => {
-            let stdout = limit_output(&String::from_utf8_lossy(&output.stdout));
-            let stderr = limit_output(&String::from_utf8_lossy(&output.stderr));
-            let exit_code = output.status.code().unwrap_or(-1);
-
-            Ok(serde_json::json!({
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-                "success": output.status.success(),
-                "shell": shell_type
-            }))
-        }
-        Ok(Err(e)) => Ok(serde_json::json!({
-            "error": format!("Command failed: {}", e),
-            "is_error": true,
-            "shell": shell_type
-        })),
-        Err(_) => Ok(serde_json::json!({
-            "error": format!("Command timed out after {} seconds", timeout_secs),
-            "is_error": true,
-            "timed_out": true,
-            "shell": shell_type
-        })),
-    }
+    bash_process::run(&mut cmd, std::time::Duration::from_secs(timeout_secs), shell_type).await
 }
 
 // Sync wrapper: delegates to tool_bash_async via block_on.

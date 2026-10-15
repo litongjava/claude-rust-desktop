@@ -239,6 +239,7 @@ impl ToolLoopExecutor {
                             | "failed"
                             | "cancelled"
                             | "max_iterations"
+                            | "max_tokens" | "length" | "incomplete"
                     )
                 );
                 if let Err(error) = sessions.append(&id, "assistant", &text) {

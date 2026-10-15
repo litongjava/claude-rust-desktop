@@ -145,15 +145,13 @@ async fn execute(
     if let Ok(value) = std::env::var("CLAUDE_RUST_WORKER_MODEL") {
         let model: claude_core::native_engine::provider_manager::ModelConfig =
             serde_json::from_str(&value)?;
-        ensure!(
-            model.id == selection.model,
-            "Worker model snapshot mismatch"
-        );
         let provider = selection
             .providers
             .iter_mut()
             .find(|provider| provider.id == selection.provider_id)
             .context("Worker provider missing")?;
+        let expected=claude_core::native_engine::provider_manager::resolve_model_selection(&provider.models,&selection.model).context("Worker selected model missing")?;
+        ensure!(model.id==expected.id,"Worker model snapshot mismatch");
         let target = provider
             .models
             .iter_mut()

@@ -69,7 +69,7 @@ async fn main() -> std::process::ExitCode {
         Ok(false) => {},
         Err(error) => { eprintln!("Session supervisor failed: {error:#}"); return std::process::ExitCode::FAILURE; },
     }
-    match persistent_worker::run_from_env().await {
+    match Box::pin(persistent_worker::run_from_env()).await {
         Ok(true) => return std::process::ExitCode::SUCCESS,
         Ok(false) => {},
         Err(error) => { eprintln!("Session host failed: {error:#}"); return std::process::ExitCode::FAILURE; },
@@ -78,7 +78,7 @@ async fn main() -> std::process::ExitCode {
     cli.normalize();
     terminal::configure_accessibility(cli.ax_screen_reader);
     debug_logging::install(cli.verbose);
-    if let Err(error) = run(&cli).await {
+    if let Err(error) = Box::pin(run(&cli)).await {
         if !worker_frontend::already_presented(&error) {
             if let Err(output_error) = output::report_startup_error(&cli, &error) {
                 eprintln!("Cannot write error result: {output_error}");
@@ -345,8 +345,19 @@ async fn run(cli: &Cli) -> Result<()> {
     startup_options::apply(cli, &mut session).await?;
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     let result = async {
-        if !single { eprintln!("Claude Rust {} — session {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.id); }
-        if !sdk_stream && !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
+        if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
+        if !sdk_stream && !prompt.trim().is_empty() {
+            if !single {
+                let display = display_commands::load(&session)?;
+                terminal::style::configure(&display.theme, &display.color);
+                terminal::prompt_display::write_submitted(
+                    &mut io::stderr(), "> ", &prompt,
+                    crossterm::terminal::size().map(|(cols, _)| cols.saturating_sub(1) as usize).unwrap_or(79),
+                    io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() && !terminal::screen_reader(), false,
+                )?;
+            }
+            session.turn(cli, &prompt, &mut input).await?;
+        }
         if sdk_stream {
             sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str())).await?;
         }

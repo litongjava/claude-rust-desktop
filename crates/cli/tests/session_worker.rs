@@ -115,16 +115,22 @@ async fn submit(
         "--".into(),
         prompt.into(),
     ];
+    let mut environment = vec![(
+        "CLAUDE_RUST_CHILD_API_KEY".into(),
+        "fixture-secret-only-in-memory".into(),
+    )];
+    if let Some(base) =
+        claude_core::native_engine::provider_manager::one_million_context_base(model)
+    {
+        environment.push(("CLAUDE_RUST_WORKER_MODEL".into(),json!({"id":base,"name":base,"enabled":true,"supports_vision":false,"supports_web_search":false,"context_window":1_000_000,"max_tokens":max_tokens}).to_string()));
+    }
     worker::call(
         host,
         &worker::Request::Submit {
             id: id.clone(),
             prompt: prompt.into(),
             arguments,
-            environment: vec![(
-                "CLAUDE_RUST_CHILD_API_KEY".into(),
-                "fixture-secret-only-in-memory".into(),
-            )],
+            environment,
         },
     )
     .await
@@ -191,7 +197,7 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     let mut cleanup = Cleanup(vec![host.supervisor_pid.unwrap()]);
     for (prompt, model, tokens) in [
         ("first turn", "fixture-one", 64),
-        ("second turn", "fixture-two", 96),
+        ("second turn", "fixture-two[1m]", 96),
     ] {
         let id = submit(&host, &endpoint, prompt, model, tokens).await;
         let job = completed(&paths.data_dir, &id).await;

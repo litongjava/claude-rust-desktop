@@ -104,3 +104,31 @@ pub fn muted_ansi() -> &'static str {
         "38;2;153;153;153"
     }
 }
+
+pub fn input_background() -> Color {
+    match THEME.load(Ordering::Relaxed) {
+        4 => Color::DarkGrey,
+        5 => Color::Grey,
+        1 | 3 => Color::Rgb {
+            r: 235,
+            g: 235,
+            b: 235,
+        },
+        _ => Color::Rgb {
+            r: 55,
+            g: 55,
+            b: 55,
+        },
+    }
+}
+pub fn input_foreground() -> Color {
+    if THEME.load(Ordering::Relaxed) % 2 == 1 {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+pub fn theme_variant() -> u8 {
+    THEME.load(Ordering::Relaxed)
+}

@@ -23,6 +23,10 @@ enum Mode {
     Text,
     Approval,
     Question,
+    Truncated,
+    TruncatedThinking,
+    TruncatedTool,
+    ReadThenTruncated,
     Tool,
     SchemaGood,
     SchemaBad,
@@ -53,7 +57,12 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         Mode::SchemaBad => r#"{"answer":"wrong"}"#.into(),
         _ => format!("reply-{count}"),
     };
-    let tool = matches!(state.mode, Mode::Tool)
+    let truncated = matches!(
+        state.mode,
+        Mode::Truncated | Mode::TruncatedTool | Mode::TruncatedThinking
+    ) || matches!(state.mode, Mode::ReadThenTruncated) && count > 1;
+    let tool = matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
+        || matches!(state.mode, Mode::ReadThenTruncated) && count == 1
         || matches!(state.mode, Mode::Approval | Mode::Question) && count % 2 == 1;
     let stream = if state.anthropic {
         let mut frames = vec![
@@ -70,10 +79,12 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                 ("read-1", "Read", json!({"file_path":"fixture.txt"}))
             };
             frames.extend([json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":args.to_string()}})]);
+        } else if matches!(state.mode, Mode::TruncatedThinking) {
+            frames.extend([json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"PARTIAL_THINKING"}})]);
         } else {
             frames.extend([json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})]);
         }
-        frames.extend([json!({"type":"content_block_stop","index":0}),json!({"type":"message_delta","delta":{"stop_reason":if tool {"tool_use"} else {"end_turn"}},"usage":{"output_tokens":4}}),json!({"type":"message_stop"})]);
+        frames.extend([json!({"type":"content_block_stop","index":0}),json!({"type":"message_delta","delta":{"stop_reason":if truncated {"max_tokens"} else if tool {"tool_use"} else {"end_turn"}},"usage":{"output_tokens":4}}),json!({"type":"message_stop"})]);
         frames
             .into_iter()
             .map(|frame| {
@@ -92,13 +103,15 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
             } else {
                 json!({"tool_calls":[{"index":0,"id":"read-1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"fixture.txt\"}"}}]})
             }
+        } else if matches!(state.mode, Mode::TruncatedThinking) {
+            json!({"reasoning_content":"PARTIAL_THINKING"})
         } else {
             json!({"content":text})
         };
         format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
             json!({"id":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
-            json!({"choices":[{"index":0,"delta":{},"finish_reason":if tool {"tool_calls"} else {"stop"}}]})
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":if truncated {"length"} else if tool {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":4}})
         )
     };
     ([("content-type", "text/event-stream")], stream).into_response()
@@ -156,7 +169,10 @@ impl Client {
                     .unwrap()
                     .expect("CLI ended before expected SDK frame");
                 let frame: Value = serde_json::from_str(&line).unwrap();
-                assert!(frame["type"]!="result" || kind=="result","Unexpected terminal result while waiting for {kind}: {frame}");
+                assert!(
+                    frame["type"] != "result" || kind == "result",
+                    "Unexpected terminal result while waiting for {kind}: {frame}"
+                );
                 if frame["type"] == kind {
                     return frame;
                 }
@@ -274,6 +290,157 @@ impl Client {
 
 fn user(text: &str) -> Value {
     json!({"type":"user","message":{"role":"user","content":text}})
+}
+
+#[tokio::test]
+async fn output_limit_is_incomplete_retains_partial_and_never_replays_tools() {
+    for anthropic in [false, true] {
+        for mode in [
+            Mode::Truncated,
+            Mode::TruncatedThinking,
+            Mode::TruncatedTool,
+            Mode::ReadThenTruncated,
+        ] {
+            let server = Server::start(anthropic, mode).await;
+            let root = tempfile::tempdir().unwrap();
+            let mut client = Client::start(root.path(), &server, &[]);
+            client.send(user("Do real work")).await;
+            let result = client.result().await;
+            assert_eq!(result["is_error"], true, "{result}");
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("output token limit"),
+                "{result}"
+            );
+            let (status, extra) = client.finish().await;
+            assert!(!status.success());
+            assert!(extra.is_empty());
+            let expected = if matches!(mode, Mode::ReadThenTruncated) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(server.fixture.requests.lock().unwrap().len(), expected);
+            let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+            let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+            let id = result["session_id"].as_str().unwrap();
+            let history = store
+                .model_history(
+                    id,
+                    &claude_core::native_engine::provider_manager::ApiFormat::OpenAI,
+                )
+                .unwrap();
+            let text = serde_json::to_string(&history).unwrap();
+            assert_eq!(
+                text.matches("SDK_READ_SENTINEL").count(),
+                if matches!(mode, Mode::ReadThenTruncated) {
+                    1
+                } else {
+                    0
+                }
+            );
+            if matches!(mode, Mode::TruncatedThinking) {
+                let retained = store
+                    .db
+                    .with_conn(|conn| {
+                        claude_core::db::message_repo::get_messages_by_conversation(conn, id)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert!(retained
+                    .iter()
+                    .any(|m| m.thinking.as_deref() == Some("PARTIAL_THINKING")));
+            } else if !matches!(mode, Mode::TruncatedTool) {
+                assert!(text.contains(&format!("reply-{expected}")), "{text}");
+            }
+            let snapshots = store
+                .db
+                .with_conn(|conn| -> anyhow::Result<Vec<Value>> {
+                    let messages =
+                        claude_core::db::message_repo::get_messages_by_conversation(conn, id)?;
+                    Ok(messages
+                        .iter()
+                        .filter(|m| m.role == "assistant")
+                        .map(|m| {
+                            claude_core::db::message_repo::get_request_snapshots(conn, &m.id)
+                                .unwrap()
+                        })
+                        .collect())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                snapshots.iter().any(|s| s
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["status"] == "incomplete")),
+                "{snapshots:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_million_suffix_is_selection_metadata_not_api_model() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::Text).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(
+            root.path(),
+            &server,
+            &["--model", "deepseek-v4.1-flash[1m]"],
+        );
+        client.send(user("Check suffix")).await;
+        let result = client.result().await;
+        assert_eq!(result["is_error"], false, "{result}");
+        client.send(json!({"type":"control_request","request_id":"model","request":{"subtype":"set_model","model":"deepseek-v4.1-flash[1m]"}})).await;
+        assert_eq!(
+            client.frame("control_response").await["response"]["subtype"],
+            "success"
+        );
+        client.send(user("Still selected")).await;
+        assert_eq!(client.result().await["is_error"], false);
+        assert!(client.finish().await.0.success());
+        assert!(server
+            .fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["model"] == "deepseek-v4.1-flash"));
+        let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        assert_eq!(
+            store
+                .resume(result["session_id"].as_str().unwrap())
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("deepseek-v4.1-flash[1m]")
+        );
+        store
+            .db
+            .with_conn(|conn| -> anyhow::Result<()> {
+                let messages = claude_core::db::message_repo::get_messages_by_conversation(
+                    conn,
+                    result["session_id"].as_str().unwrap(),
+                )?;
+                for message in messages.iter().filter(|m| m.role == "assistant") {
+                    let snapshots =
+                        claude_core::db::message_repo::get_request_snapshots(conn, &message.id)?;
+                    assert!(!snapshots.as_array().unwrap().is_empty());
+                    for snapshot in snapshots.as_array().unwrap() {
+                        assert_eq!(snapshot["contextWindow"], 1_000_000, "{snapshot}");
+                    }
+                }
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]

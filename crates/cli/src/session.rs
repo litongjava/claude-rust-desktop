@@ -53,7 +53,7 @@ impl Session {
         let providers=self.providers.lock().await;
         let (provider,model)=name.split_once("::").unwrap_or((&self.provider_id,name));
         let resolved=providers.resolve_selected(provider,model).context("SDK model is not configured")?;
-        let selection=Selection {providers:providers.list_providers().to_vec(),provider_id:resolved.provider.id,model:resolved.model.id};
+        let selection=Selection {providers:providers.list_providers().to_vec(),provider_id:resolved.provider.id,model:model.to_owned()};
         drop(providers);
         let paths=self.paths.clone();
         self.switch(&paths,selection).await
@@ -126,8 +126,9 @@ impl Session {
         if internal_worker {
             if let Ok(value) = std::env::var("CLAUDE_RUST_WORKER_MODEL") {
                 let model: claude_core::native_engine::provider_manager::ModelConfig = serde_json::from_str(&value)?;
-                anyhow::ensure!(model.id == selection.model, "Worker model snapshot does not match the selected model");
                 let provider = selection.providers.iter_mut().find(|provider|provider.id == selection.provider_id).context("Worker provider unavailable")?;
+                let expected=claude_core::native_engine::provider_manager::resolve_model_selection(&provider.models,&selection.model).context("Worker model unavailable")?;
+                anyhow::ensure!(model.id == expected.id, "Worker model snapshot does not match the selected model");
                 let existing = provider.models.iter_mut().find(|existing|existing.id == model.id).context("Worker model unavailable")?;
                 *existing = model;
             }
@@ -461,7 +462,7 @@ impl Session {
                     EngineEvent::MessageStop { full_text, stop_reason } => {
                         if cli.json_schema.is_some() { text = full_text.clone(); }
                         if text.is_empty() && !full_text.is_empty() { if cli.output_format == OutputFormat::Text { progress.before_text(&full_text); if !progress.is_live() { print!("{full_text}"); } } text = full_text; }
-                        if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning"].contains(&s)) {
+                        if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning", "max_tokens", "length", "incomplete"].contains(&s)) {
                             error.get_or_insert_with(|| format!("Turn stopped: {}", stop_reason.unwrap()));
                         }
                         completed = true; break;
@@ -685,6 +686,26 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
 #[cfg(test)]
 mod event_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn context_suffix_survives_session_switch_resume_and_worker_snapshot(){
+        use clap::Parser;
+        let dir=tempfile::tempdir().unwrap();let paths=RuntimePaths::new(dir.path().join("data")).unwrap();
+        let provider=serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"fixture-only","api_format":"openai","enabled":true,"models":[{"id":"flash","name":"Flash","enabled":true,"supports_vision":false,"supports_web_search":false,"context_window":128000}]})).unwrap();
+        let selection=Selection{providers:vec![provider],provider_id:"fixture".into(),model:"flash[1m]".into()};
+        let cli=Cli::parse_from(["claude-code","--print"]);
+        let mut session=Session::open(&cli,&paths,selection,None).await.unwrap();
+        assert_eq!(session.context_window().await,Some(1_000_000));assert_eq!(session.model,"flash[1m]");
+        let resolved=session.selected_provider().await.unwrap();
+        assert_eq!(resolved.model.id,"flash");
+        let env=crate::background_commands::worker_environment(false,&resolved).unwrap();
+        let snapshot:Value=serde_json::from_str(&env.iter().find(|(key,_)|key=="CLAUDE_RUST_WORKER_MODEL").unwrap().1).unwrap();
+        assert_eq!(snapshot["id"],"flash");assert_eq!(snapshot["context_window"],1_000_000);
+        let saved=session.id.clone();session.sdk_set_model("flash").await.unwrap();assert_eq!(session.context_window().await,Some(128000));
+        session.sdk_set_model("flash[1m]").await.unwrap();assert_eq!(session.model,"flash[1m]");
+        session.resume_saved(&paths,&saved).await.unwrap();assert_eq!(session.context_window().await,Some(1_000_000));
+        assert_eq!(session.store.resume(&saved).unwrap().model.as_deref(),Some("flash[1m]"));
+    }
 
     #[tokio::test]
     async fn mcp_starts_on_first_engine_turn_and_is_reused_by_sdk_turns() {

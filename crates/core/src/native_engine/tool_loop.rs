@@ -39,6 +39,10 @@ mod code_prompt_tests;
 mod tool_hooks_tests;
 
 #[cfg(test)]
+#[path = "builtin_failure_tests.rs"]
+mod builtin_failure_tests;
+
+#[cfg(test)]
 #[path = "turn_budget_tests.rs"]
 mod turn_budget_tests;
 
@@ -157,7 +161,20 @@ struct PendingToolCall {
     requires_user_interaction: bool,
 }
 
+fn model_tool_output(tool_name: &str, output: &str) -> String {
+    if matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
+        if let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(output) {
+            if fields.remove("file_change").is_some() {
+                return serde_json::to_string(&fields).unwrap_or_else(|_| output.to_owned());
+            }
+        }
+    }
+    output.to_owned()
+}
+
 fn compact_tool_output(tool_name: &str, output: &str) -> String {
+    let cleaned = model_tool_output(tool_name, output);
+    let output = cleaned.as_str();
     match tool_name {
         "Edit" | "Write" | "MultiEdit" | "smart_edit" => {
             if output.len() > 500 {
@@ -237,6 +254,9 @@ async fn execute_builtin_tool(
     if name != "WebSearch" {
         let file = if matches!(name, "Read" | "Edit" | "Write" | "MultiEdit") { input["file_path"].as_str().map(str::to_owned) } else { None };
         let mut result = crate::tools::execute_tool_async(name, input, cwd).await?;
+        if result["is_error"] == true || result["isError"] == true || result["success"] == false || result["exit_code"].as_i64().is_some_and(|code| code != 0) {
+            return Err(anyhow!(serde_json::to_string_pretty(&result)?));
+        }
         if let Some(file) = file {
             if let Some(feedback) = crate::tools::lsp_passive_feedback(cwd, &file).await {
                 if let Some(object) = result.as_object_mut() { object.insert("lsp_diagnostics".into(), feedback); }
@@ -546,6 +566,8 @@ impl ToolLoopExecutor {
         if let Some(tools) = &self.learning_tools {
             if let Ok(mut tools) = tools.lock() { if tools.len() < 256 { tools.push(tool_name.to_string()); } }
         }
+        let cleaned = model_tool_output(tool_name, output);
+        let output = cleaned.as_str();
         let preview = compact_tool_output(tool_name, output);
         if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
             return crate::performance::retain_tool_output(root, output, &preview);
@@ -697,7 +719,7 @@ impl ToolLoopExecutor {
         tracing::info!(module = "ToolLoop", "[E4.5] Model-specific token check...");
         let model_id = &self.provider.model.id;
         let safety_margin = 0.85; // Keep 15% buffer for response
-        let safe_limit = TokenCounter::get_safe_limit(model_id, safety_margin);
+        let safe_limit = self.provider.model.context_window.map(|n|(n as f64*safety_margin) as usize).unwrap_or_else(||TokenCounter::get_safe_limit(model_id, safety_margin));
         let estimated_tokens = TokenCounter::estimate(&self.messages);
 
         tracing::info!(module = "ToolLoop", "Model: {}, Estimated tokens: {}, Safe limit: {}", model_id, estimated_tokens, safe_limit);
@@ -744,7 +766,7 @@ impl ToolLoopExecutor {
 
         let loop_result = loop_result.and_then(|(text, stop_reason)| {
             if let Some(schema) = &self.response_schema {
-                if !matches!(stop_reason.as_deref(),Some("stream_error"|"error"|"interrupted"|"failed"|"cancelled"|"max_iterations")) {
+                if !matches!(stop_reason.as_deref(),Some("stream_error"|"error"|"interrupted"|"failed"|"cancelled"|"max_iterations"|"max_tokens"|"length"|"incomplete")) {
                     crate::structured_output::validate_result(schema,&text)?;
                 }
             }
@@ -754,7 +776,7 @@ impl ToolLoopExecutor {
             Ok((full_text, stop_reason)) => {
                 tracing::info!(module = "ToolLoop", "[E6] API loop COMPLETED, full_text_len={}", full_text.len());
                 // Persist before announcing completion so the next session can recall this turn.
-                if !matches!(stop_reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations")) {
+                if !matches!(stop_reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations" | "max_tokens" | "length" | "incomplete")) {
                     if let Some(ctx_mgr) = &self.context_manager {
                         ctx_mgr.after_response(&conv_id, &last_user_msg, full_text).await;
                     }
@@ -843,6 +865,15 @@ impl ToolLoopExecutor {
 
         let output_str;
         let is_error;
+
+        if crate::tools::tasks::is_task(tool_name) {
+            let result = (|| {
+                let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
+                let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
+                crate::tools::tasks::execute_for_session(tool_name, tool_input.clone(), root, session)
+            })();
+            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());
+        }
 
         if tool_name == "Skill" {
             let result = Box::pin(self.execute_skill_tool(tool_input)).await;
@@ -1083,6 +1114,15 @@ impl ToolLoopExecutor {
         tool_input: &Value,
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
+        if crate::tools::tasks::is_task(tool_name) {
+            let result = (|| {
+                let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
+                let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
+                crate::tools::tasks::execute_for_session(tool_name, tool_input.clone(), root, session)
+            })();
+            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());
+        }
+
         if tool_name == "Skill" {
             let result = Box::pin(self.execute_skill_tool(tool_input)).await;
             return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Skill failed: {error:#}") }, result.is_err());
@@ -1440,7 +1480,7 @@ impl ToolLoopExecutor {
 
                                 // Memory calls need this executor's configured client, not a generic stub.
                                 let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
-                                    || is_memory_tool(&name) || self.hooks.is_some()
+                                    || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                                     || self.check_permission_requires_confirmation(&name, &input);
 
                                 assistant_blocks.push(ContentBlock::ToolUse {
@@ -1591,14 +1631,6 @@ impl ToolLoopExecutor {
                 break;
             }
 
-            // Auto-resume when stopped due to max_tokens
-            if let Some(ref sr) = stop_reason {
-                if sr == "max_tokens" {
-                    tracing::info!(module = "AnthropicLoop", "Response truncated by max_tokens, auto-resuming...");
-                    let _ = self.event_tx.send(EngineEvent::Text("\n... [continuing] ...".to_string())).await;
-                    continue;
-                }
-            }
         }
 
         Ok((full_text, stop_reason))
@@ -1944,7 +1976,7 @@ impl ToolLoopExecutor {
 
                     // Memory calls need this executor's configured client, not a generic stub.
                     let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
-                        || is_memory_tool(&name) || self.hooks.is_some()
+                        || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                         || self.check_permission_requires_confirmation(name, &input);
 
                     assistant_tool_calls.push(crate::native_engine::openai_client::OpenAIToolCall {
@@ -2063,14 +2095,6 @@ impl ToolLoopExecutor {
                 break;
             }
 
-            // Auto-resume when stopped due to max_tokens
-            if let Some(ref sr) = stop_reason {
-                if sr == "max_tokens" || sr == "length" {
-                    tracing::info!(module = "OpenAILoop", "Response truncated by max_tokens, auto-resuming...");
-                    let _ = self.event_tx.send(EngineEvent::Text("\n... [continuing] ...".to_string())).await;
-                    continue;
-                }
-            }
         }
 
         Ok((full_text, stop_reason))

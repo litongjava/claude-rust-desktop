@@ -8,7 +8,7 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
-    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write};
@@ -366,25 +366,17 @@ impl Screen {
             queue!(out, MoveUp(self.cursor_row as u16))?;
         }
         queue!(out, Clear(ClearType::FromCursorDown))?;
-        if !text.is_empty() {
-            queue!(out, ResetColor)?;
-            write!(out, "\r\n")?;
-        }
-        if std::env::var_os("NO_COLOR").is_none() && !text.is_empty() {
-            queue!(
-                out,
-                SetBackgroundColor(Color::DarkGrey),
-                SetForegroundColor(Color::White)
-            )?;
-            write!(out, "{prompt}{}", text.replace('\n', "\r\n  "))?;
-            queue!(out, Clear(ClearType::UntilNewLine), ResetColor)?;
-            write!(out, "\r\n")?;
-        } else {
-            write!(out, "{prompt}{}\r\n", text.replace('\n', "\r\n  "))?;
-        }
-        if !text.is_empty() {
-            write!(out, "\r\n")?;
-        }
+        queue!(out, ResetColor)?;
+        crate::terminal::prompt_display::write_submitted(
+            &mut out,
+            prompt,
+            text,
+            terminal::size()
+                .map(|(cols, _)| cols.saturating_sub(1) as usize)
+                .unwrap_or(79),
+            std::env::var_os("NO_COLOR").is_none(),
+            true,
+        )?;
         out.flush()
     }
 }
@@ -516,10 +508,13 @@ impl PromptEditor {
                 cursor_col = cell;
             }
             let max_input = (rows as usize / 3).max(1);
+            let show_tip = items.is_empty() && search.is_none() && rows >= 12;
             let first = cursor_row.saturating_sub(max_input - 1);
             let input_height = input_lines.len().saturating_sub(first).min(max_input);
             let panel_budget = (rows as usize)
-                .saturating_sub(input_height + 5 + if items.is_empty() { 0 } else { 4 })
+                .saturating_sub(
+                    input_height + 5 + usize::from(show_tip) + if items.is_empty() { 0 } else { 4 },
+                )
                 .min(12);
             let panel = self.details.render(width, panel_budget);
             let panel_height = panel.lines.len();
@@ -533,11 +528,12 @@ impl PromptEditor {
                     .map(|s| (s.clone(), TextStyle::Plain)),
             );
             lines.push(("\u{2500}".repeat(width), TextStyle::Border));
-            let footer_rows = if self.details.entries.is_empty() {
-                1
-            } else {
-                2
-            };
+            let footer_rows = usize::from(show_tip)
+                + if self.details.entries.is_empty() {
+                    1
+                } else {
+                    2
+                };
             let available = (rows as usize)
                 .saturating_sub(lines.len() + footer_rows + 1)
                 .min(18);
@@ -592,6 +588,17 @@ impl PromptEditor {
                         "Ctrl+O details \u{00b7} Shift+drag selects terminal text",
                         width,
                     ),
+                    TextStyle::Muted,
+                ));
+            }
+            if show_tip {
+                let tips = [
+                    "Tip: Type / to browse available commands.",
+                    "Tip: Use /color and /rename to tell multiple sessions apart.",
+                    "Tip: Use /btw to ask a side question while Claude works.",
+                ];
+                lines.push((
+                    clipped(tips[self.history.len() % tips.len()], width),
                     TextStyle::Muted,
                 ));
             }

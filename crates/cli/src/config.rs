@@ -126,19 +126,23 @@ pub fn select(
     let selected_provider = qualified_provider.or(selected_provider);
     let model = if providers
         .iter()
-        .any(|p| p.models.iter().any(|m| m.id == raw_model))
+        .any(|p| p.enabled && selected_provider.is_none_or(|id|id==p.id) && p.models.iter().any(|m| m.enabled && m.id == raw_model))
     {
         raw_model.to_owned()
     } else {
-        ApiConfig::resolve_model_alias(raw_model)
+        if let Some(base)=claude_core::native_engine::provider_manager::one_million_context_base(raw_model){
+            let known=providers.iter().any(|p|p.enabled&&selected_provider.is_none_or(|id|id==p.id)&&p.models.iter().any(|m|m.enabled&&m.id==base));
+            format!("{}[1m]",if known {base.to_owned()}else{ApiConfig::resolve_model_alias(base)})
+        }else{ApiConfig::resolve_model_alias(raw_model)}
     };
+    let exact=providers.iter().any(|p|p.enabled&&selected_provider.is_none_or(|id|id==p.id)&&p.models.iter().any(|m|m.enabled&&m.id==model));
     let matching: Vec<usize> = providers
         .iter()
         .enumerate()
         .filter(|(_, p)| {
             p.enabled
                 && selected_provider.map_or(true, |id| p.id == id)
-                && p.models.iter().any(|m| m.enabled && m.id == model)
+                && if exact {p.models.iter().any(|m|m.enabled&&m.id==model)}else{claude_core::native_engine::provider_manager::resolve_model_selection(&p.models,&model).is_some()}
         })
         .map(|(i, _)| i)
         .collect();
@@ -193,7 +197,8 @@ pub fn select(
             selected_provider.is_none() || selected_provider == Some("cli-runtime"),
             "Selected provider does not contain enabled model {model}"
         );
-        let mut p = provider_from_config(&provider_template(&model));
+        let base=claude_core::native_engine::provider_manager::one_million_context_base(&model).unwrap_or(&model);
+        let mut p = provider_from_config(&provider_template(base));
         p.id = "cli-runtime".into();
         providers.push(p);
         providers.len() - 1
@@ -217,7 +222,7 @@ pub fn select(
     if let Some(limit) = cli.max_tokens {
         p.models
             .iter_mut()
-            .filter(|m| m.id == model)
+            .filter(|m| m.id == model || (!exact && Some(m.id.as_str())==claude_core::native_engine::provider_manager::one_million_context_base(&model)))
             .for_each(|m| m.max_tokens = Some(limit));
     }
     let provider_id = p.id.clone();

@@ -563,9 +563,9 @@ impl QueryEngine {
                 }
             };
 
-            let successful_turn = matches!(&exec_result, Ok((_, reason)) if !matches!(reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations")));
+            let successful_turn = matches!(&exec_result, Ok((_, reason)) if !matches!(reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations" | "max_tokens" | "length" | "incomplete")));
             if let Some(observation) = learning.as_mut() {
-                observation.complete(matches!(&exec_result, Ok((_, reason)) if !matches!(reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations"))));
+                observation.complete(successful_turn);
             }
             drop(learning);
             match exec_result {

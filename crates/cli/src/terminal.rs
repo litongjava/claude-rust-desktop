@@ -42,7 +42,9 @@ pub enum OutputFormat {
 
 pub mod input;
 pub mod progress;
+pub mod prompt_display;
 pub mod live;
+pub mod change_view;
 pub mod style;
 pub mod screen_mode;
 

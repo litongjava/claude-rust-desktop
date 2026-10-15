@@ -1,23 +1,80 @@
-//! Project-local durable task records. No background worker completion is fabricated.
-use anyhow::{bail, Context, Result};
+//! Session-scoped application-data task records. No background worker completion is fabricated.
+use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
+use std::path::Path;
 
 pub(super) fn definitions() -> Vec<super::ToolDefinition> {
     [
-        ("TaskCreate", "Create a durable project task.", json!({"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"}}), vec![]),
-        ("TaskGet", "Read a durable project task by ID.", json!({"id":{"type":"string"},"taskId":{"type":"string"}}),vec![]),
-        ("TaskList", "List durable project tasks.", json!({}),vec![]),
-        ("TaskUpdate", "Update a durable project task. Dependencies must exist and cannot form cycles.", json!({"id":{"type":"string"},"taskId":{"type":"string"},"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","running","completed","failed","cancelled","deleted"]},"output":{"type":"string"},"owner":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"},"addBlockedBy":{"type":"array","items":{"type":"string"}},"addBlocks":{"type":"array","items":{"type":"string"}}}),vec![]),
-        ("TodoWrite", "Replace the project's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
-        ("TodoRead", "Read the project's durable todo list.",json!({}),vec![]),
+        ("TaskCreate", "Create a durable session task.", json!({"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"}}), vec![]),
+        ("TaskGet", "Read a durable session task by ID.", json!({"id":{"type":"string"},"taskId":{"type":"string"}}),vec![]),
+        ("TaskList", "List durable session tasks.", json!({}),vec![]),
+        ("TaskUpdate", "Update a durable session task. Dependencies must exist and cannot form cycles.", json!({"id":{"type":"string"},"taskId":{"type":"string"},"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","running","completed","failed","cancelled","deleted"]},"output":{"type":"string"},"owner":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"},"addBlockedBy":{"type":"array","items":{"type":"string"}},"addBlocks":{"type":"array","items":{"type":"string"}}}),vec![]),
+        ("TodoWrite", "Replace the session's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
+        ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
         ("TaskOutput", "Read the saved output of a task record.",json!({"id":{"type":"string"}}),vec!["id"]),
         ("TaskStop", "Cancel a durable task record. This changes task metadata only and does not stop an executing worker; use host cancellation for running agents.",json!({"id":{"type":"string"}}),vec!["id"]),
         ("todo_write", "Manage durable todos using the legacy create/list/get/update/delete/complete/filter operations.",json!({"operation":{"type":"string","enum":["create","list","get","update","delete","complete","filter"]},"id":{"type":"string"},"content":{"type":"string"},"priority":{"type":"string","enum":["low","medium","high","urgent"]},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"tags":{"type":"array","items":{"type":"string"}},"filter_status":{"type":"string"},"filter_priority":{"type":"string"},"filter_tags":{"type":"array","items":{"type":"string"}}}),vec!["operation"]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).collect()
 }
 
-pub(super) fn execute(name: &str, mut input: Value, cwd: &str) -> Result<Value> {
+pub fn is_task(name: &str) -> bool {
+    matches!(
+        name,
+        "TaskCreate"
+            | "TaskGet"
+            | "TaskList"
+            | "TaskUpdate"
+            | "TaskOutput"
+            | "TaskStop"
+            | "TodoWrite"
+            | "TodoRead"
+            | "todo_write"
+    )
+}
+
+fn readonly(name: &str, input: &Value) -> bool {
+    matches!(name, "TaskGet" | "TaskList" | "TodoRead" | "TaskOutput")
+        || (name == "todo_write"
+            && matches!(input["operation"].as_str(), Some("list" | "filter" | "get")))
+}
+
+pub fn execute_for_session(name: &str, input: Value, root: &Path, session: &str) -> Result<Value> {
+    let session = uuid::Uuid::parse_str(session).context("Invalid task session ID")?;
+    execute_at(
+        name,
+        input,
+        &root.join("tasks").join(format!("{session}.sqlite3")),
+    )
+}
+
+pub fn read_legacy(name: &str, input: Value, cwd: &str) -> Result<Value> {
+    ensure!(readonly(name, &input), "Legacy project tasks are read-only");
+    let path = Path::new(cwd).canonicalize()?.join(".claude/tasks.sqlite3");
+    super::resolve_path(&path.to_string_lossy(), cwd)?;
+    execute_at(name, input, &path)
+}
+
+pub(super) fn execute(name: &str, input: Value, cwd: &str) -> Result<Value> {
+    let workspace = Path::new(cwd).canonicalize()?;
+    let hash = ring::digest::digest(
+        &ring::digest::SHA256,
+        workspace.to_string_lossy().as_bytes(),
+    );
+    let key = hash
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let root = crate::runtime::RuntimePaths::default_data_dir()?;
+    execute_at(
+        name,
+        input,
+        &root.join("tasks/projects").join(format!("{key}.sqlite3")),
+    )
+}
+
+fn execute_at(name: &str, mut input: Value, path: &Path) -> Result<Value> {
     if input.get("taskId").is_none() {
         if let Some(id) = input.get("id").cloned() {
             input["taskId"] = id;
@@ -30,16 +87,11 @@ pub(super) fn execute(name: &str, mut input: Value, cwd: &str) -> Result<Value> 
     }
     if name == "TaskStop" {
         input["status"] = json!("cancelled");
-        let task = execute("TaskUpdate", input, cwd)?;
+        let task = execute_at("TaskUpdate", input, path)?;
         return Ok(json!({"task":task,"record_cancelled":true,"worker_process_stopped":false}));
     }
-    let directory = std::path::Path::new(cwd).canonicalize()?.join(".claude");
-    // Apply the same path checks as file tools, including symlink resolution.
-    super::resolve_path(&directory.join("tasks.sqlite3").to_string_lossy(), cwd)?;
-    let readonly = matches!(name, "TaskGet" | "TaskList" | "TodoRead" | "TaskOutput")
-        || (name == "todo_write"
-            && matches!(input["operation"].as_str(), Some("list" | "filter" | "get")));
-    let path = directory.join("tasks.sqlite3");
+    let directory = path.parent().context("Task storage parent missing")?;
+    let readonly = readonly(name, &input);
     if readonly && !path.exists() {
         return match name {
             "TaskList" => Ok(json!({"tasks":[]})),
@@ -375,6 +427,41 @@ fn validate_todo(todo: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn execute(name: &str, input: Value, cwd: &str) -> Result<Value> {
+        execute_at(name, input, &Path::new(cwd).join("test-data/tasks.sqlite3"))
+    }
+
+    #[test]
+    fn sessions_are_isolated_and_legacy_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let project = temp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        let todos = json!({"todos":[{"content":"session a", "status":"pending"}]});
+        execute_for_session("TodoWrite", todos.clone(), &root, &a).unwrap();
+        assert_eq!(
+            execute_for_session("TodoRead", json!({}), &root, &a).unwrap(),
+            todos
+        );
+        assert_eq!(
+            execute_for_session("TodoRead", json!({}), &root, &b).unwrap()["todos"],
+            json!([])
+        );
+        assert!(!project.join(".claude").exists());
+        assert!(execute_for_session("TodoRead", json!({}), &root, "../escape").is_err());
+        let legacy = project.join(".claude/tasks.sqlite3");
+        execute_at("TodoWrite", todos.clone(), &legacy).unwrap();
+        let bytes = std::fs::read(&legacy).unwrap();
+        assert_eq!(
+            read_legacy("TodoRead", json!({}), project.to_str().unwrap()).unwrap(),
+            todos
+        );
+        assert!(read_legacy("TodoWrite", json!({"todos":[]}), project.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(legacy).unwrap(), bytes);
+    }
+
     #[test]
     fn legacy_task_and_todo_parameters_remain_usable() {
         let dir = tempfile::tempdir().unwrap();

@@ -8,6 +8,23 @@ use tokio::time::timeout;
 
 fn default_true() -> bool { true }
 
+/// Only the documented trailing context selector is special; arbitrary custom
+/// model IDs and other bracket suffixes remain opaque provider identifiers.
+pub fn one_million_context_base(id: &str) -> Option<&str> {
+    let end=id.len().checked_sub(4)?;
+    if !id.get(end..)?.eq_ignore_ascii_case("[1m]") {return None;}
+    let base=id[..end].trim_end();
+    (!base.is_empty()).then_some(base)
+}
+
+pub fn resolve_model_selection(models:&[ModelConfig],id:&str)->Option<ModelConfig>{
+    if let Some(model)=models.iter().find(|m|m.enabled&&m.id==id){return Some(model.clone());}
+    let base=one_million_context_base(id)?;
+    let mut model=models.iter().find(|m|m.enabled&&m.id==base)?.clone();
+    model.context_window=Some(1_000_000);
+    Some(model)
+}
+
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
@@ -206,8 +223,8 @@ impl ProviderManager {
 
     pub fn resolve_selected(&self, provider_id: &str, model_id: &str) -> Option<ResolvedProvider> {
         let provider = self.providers.iter().find(|p| p.id == provider_id && p.enabled)?;
-        let model = provider.models.iter().find(|m| m.id == model_id && m.enabled)?;
-        Some(ResolvedProvider { provider: provider.clone(), model: model.clone() })
+        let model = resolve_model_selection(&provider.models,model_id)?;
+        Some(ResolvedProvider { provider: provider.clone(), model })
     }
 
     fn resolve_provider_internal(&self, model_id: &str) -> Option<ResolvedProvider> {
@@ -265,6 +282,11 @@ impl ProviderManager {
             tracing::warn!(module = "ProviderManager", "No provider found for \"{}\"", model_id);
         }
 
+        if first_match.is_none() {
+            if let Some(base)=one_million_context_base(model_id) {
+                return self.resolve_provider_internal(base).map(|mut resolved|{resolved.model.context_window=Some(1_000_000);resolved});
+            }
+        }
         first_match
     }
 
@@ -333,7 +355,8 @@ impl ProviderManager {
 
     pub fn set_model_fast(&mut self, provider_id: &str, model_id: &str, enabled: bool) -> Result<()> {
         let provider = self.providers.iter_mut().find(|p| p.id == provider_id).ok_or_else(|| anyhow!("Provider not found"))?;
-        let model = provider.models.iter_mut().find(|m| m.id == model_id).ok_or_else(|| anyhow!("Model not found"))?;
+        let selected=resolve_model_selection(&provider.models,model_id).ok_or_else(||anyhow!("Model not found"))?;
+        let model = provider.models.iter_mut().find(|m| m.id == selected.id).ok_or_else(|| anyhow!("Model not found"))?;
         model.fast = enabled;
         // resolve_selected reads the live provider list; discard other cached resolutions.
         if let Ok(mut cache) = self.resolve_cache.try_lock() { cache.clear(); }
@@ -392,5 +415,24 @@ mod provider_selection_tests {
         manager.providers[1].enabled = false;
         assert!(manager.resolve_selected("b","same").is_none());
         assert_eq!(manager.resolve_provider_internal("same").unwrap().provider.id,"a");
+    }
+
+    #[test]
+    fn context_suffix_resolves_base_preserving_exact_custom_ids(){
+        let provider:Provider=serde_json::from_value(serde_json::json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"","api_format":"openai","enabled":true,"models":[{"id":"deepseek-v4.1-flash","name":"Flash","enabled":true,"supports_vision":false,"supports_web_search":false,"context_window":128000}]})).unwrap();
+        let mut manager=ProviderManager::in_memory(vec![provider],std::env::temp_dir().join("suffix-fixture.json"));
+        for selection in ["deepseek-v4.1-flash[1m]","deepseek-v4.1-flash[1M]"]{
+            let model=manager.resolve_selected("p",selection).unwrap().model;
+            assert_eq!(model.id,"deepseek-v4.1-flash");assert_eq!(model.context_window,Some(1_000_000));
+            assert_eq!(manager.resolve_provider_internal(&format!("p::{selection}")).unwrap().model.context_window,Some(1_000_000));
+        }
+        assert_eq!(manager.resolve_selected("p","deepseek-v4.1-flash").unwrap().model.context_window,Some(128000));
+        for opaque in ["deepseek-v4.1-flash[2m]","deepseek-v4.1-flash[thinking]","deepseek-v4.1-flash[1m]-custom","[1m]"]{assert!(manager.resolve_selected("p",opaque).is_none());}
+        let mut exact=manager.providers[0].models[0].clone();exact.id="deepseek-v4.1-flash[1m]".into();exact.context_window=Some(42);
+        manager.providers[0].models.push(exact);
+        let model=manager.resolve_selected("p","deepseek-v4.1-flash[1m]").unwrap().model;
+        assert_eq!(model.id,"deepseek-v4.1-flash[1m]");assert_eq!(model.context_window,Some(42));
+        manager.set_model_fast("p","deepseek-v4.1-flash[1M]",true).unwrap();
+        assert!(manager.resolve_selected("p","deepseek-v4.1-flash").unwrap().model.fast);
     }
 }

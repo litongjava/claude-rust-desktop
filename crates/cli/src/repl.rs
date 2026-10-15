@@ -29,6 +29,8 @@ pub fn tool_details(session: &Session) -> Result<Vec<(String, String)>> {
                     tool.input.as_deref().unwrap_or("{}"),
                     tool.output.as_deref().unwrap_or("")
                 );
+                let body=crate::terminal::change_view::details(&tool.name,tool.output.as_deref().unwrap_or(""),tool.is_error)
+                    .map(|diff|format!("{diff}\n\n{body}")).unwrap_or(body);
                 let mut shown: String = body.chars().take(65536).collect();
                 if shown.len() < body.len() {
                     shown

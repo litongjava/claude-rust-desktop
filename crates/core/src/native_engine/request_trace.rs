@@ -254,9 +254,12 @@ impl RequestTrace {
     }
 
     pub fn finish(mut self, status: &str, error: Option<&str>) -> Value {
-        let error = error.map(String::from).or(self.stream_error.take());
+        let mut error = error.map(String::from).or(self.stream_error.take());
         let status = if error.is_some() {
             "error"
+        } else if status == "completed" && matches!(self.finish_reason.as_deref(),Some("max_tokens"|"length")) {
+            error=Some(format!("Incomplete response: provider stopped at the output token limit ({}). Partial output was retained; send a follow-up to continue.",self.finish_reason.as_deref().unwrap()));
+            "incomplete"
         } else if status == "completed" && !self.response_finished && self.finish_reason.is_none() {
             "interrupted"
         } else {

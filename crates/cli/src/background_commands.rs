@@ -64,8 +64,14 @@ pub async fn handle(
             let mut parts = argument.split_whitespace();
             match parts.next().unwrap_or("list") {
                 "records" => {
-                    ensure!(parts.next().is_none(), "Usage: /tasks records");
-                    let records = claude_core::tools::execute_tool("TaskList", serde_json::json!({}), &session.workspace.to_string_lossy())?;
+                    let legacy = parts.next();
+                    ensure!((legacy.is_none() || legacy == Some("legacy")) && parts.next().is_none(), "Usage: /tasks records [legacy]");
+                    let read = |name| if legacy.is_some() {
+                        claude_core::tools::tasks::read_legacy(name, serde_json::json!({}), &session.workspace.to_string_lossy())
+                    } else {
+                        claude_core::tools::tasks::execute_for_session(name, serde_json::json!({}), &paths.data_dir, &session.id)
+                    };
+                    let records = serde_json::json!({"tasks":read("TaskList")?["tasks"],"todos":read("TodoRead")?["todos"],"legacy_read_only":legacy.is_some()});
                     println!("{}", serde_json::to_string_pretty(&records)?);
                 }
 
