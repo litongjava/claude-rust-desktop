@@ -9,6 +9,14 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 pub mod macros;
+mod notebook;
+mod tasks;
+mod lsp;
+mod worktrees;
+pub mod agent_messages;
+pub mod coordination;
+pub mod scheduled;
+mod content_compat;
 mod utf8;
 mod web;
 pub(crate) mod provider_search;
@@ -49,6 +57,12 @@ pub struct ToolDefinition {
 
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let mut defs = vec![
+        notebook::definition(),
+        lsp::definition(),
+        worktrees::definition(),
+        agent_messages::definition(),
+        scheduled::definition(),
+        ToolDefinition { name: "ToolSearch".into(), description: "Search the currently registered built-in tool names, descriptions and schemas. MCP tools are supplied separately by the host.".into(), input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
         ToolDefinition {
             name: "PluginRun".into(),
             description: "Execute an installed, enabled plugin command with OS user permissions. Requires execution approval.".into(),
@@ -361,6 +375,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         });
     }
 
+    defs.extend(tasks::definitions());
+    defs.extend(coordination::definitions());
+    defs.extend(content_compat::definitions());
+    let mut legacy_lsp=lsp::definition();
+    legacy_lsp.name="lsp".into();
+    legacy_lsp.input_schema["properties"]["action"]=serde_json::json!({"type":"string","enum":["symbols","references","diagnostics","definition","hover"]});
+    legacy_lsp.input_schema["required"]=serde_json::json!(["action","path"]);
+    defs.push(legacy_lsp);
     defs
 }
 
@@ -374,6 +396,13 @@ macro_rules! tool_dispatch {
      WebFetch => $webfetch:expr,
      WebSearch => $websearch:expr $(,)?) => {
         match $name {
+            "NotebookEdit" => notebook::execute($input, $cwd),
+            "SendMessage" => agent_messages::execute($input, $cwd),
+            "team" | "plan_mode" => coordination::execute($name, $input, $cwd),
+            "cron" => scheduled::execute($input, $cwd),
+            "Config" | "brief" | "SyntheticOutput" => content_compat::execute($name, &$input, $cwd),
+            "ToolSearch" => tool_search($input),
+            "TaskCreate" | "TaskGet" | "TaskList" | "TaskUpdate" | "TaskOutput" | "TaskStop" | "TodoWrite" | "TodoRead" | "todo_write" => tasks::execute($name, $input, $cwd),
             "Read" => tool_read($input, $cwd),
             "Write" => tool_write($input, $cwd),
             "Edit" => tool_edit($input, $cwd),
@@ -410,11 +439,19 @@ pub fn execute_tool(name: &str, input: serde_json::Value, cwd: &str) -> Result<s
 }
 
 pub async fn execute_tool_async(name: &str, input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
+    if name == "LSP" || name == "lsp" { return lsp::execute(input, cwd).await; }
+    if name == "worktree" { return worktrees::execute(input, cwd).await; }
     tool_dispatch!(name, input, cwd,
         Bash => tool_bash_async(input, cwd).await,
         WebFetch => tool_web_fetch_async(input).await,
         WebSearch => tool_web_search_async(input).await,
     )
+}
+
+fn tool_search(input: serde_json::Value) -> Result<serde_json::Value> {
+    let query = input["query"].as_str().ok_or_else(|| anyhow!("query is required"))?.to_lowercase();
+    let tools: Vec<_> = get_tool_definitions().into_iter().filter(|tool| tool.name.to_lowercase().contains(&query) || tool.description.to_lowercase().contains(&query)).collect();
+    Ok(serde_json::json!({"tools": tools}))
 }
 
 /// UTF-8 safe truncation: finds the last valid char boundary at or before `max_bytes`.

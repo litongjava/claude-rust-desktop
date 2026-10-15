@@ -17,7 +17,7 @@ use crate::native_engine::engine_core::ChatRequest;
 use crate::streaming::{StreamManager, SSE_IDLE_TIMEOUT_SECS, SSE_MAX_DURATION_SECS};
 use crate::config::ConfigManager;
 
-async fn chat_handler(
+pub(super) async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
@@ -199,6 +199,8 @@ async fn chat_handler(
     };
     tracing::info!(module = "Chat", "[7/7] Engine guard released, building SSE stream...");
 
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel(64);
+    let transport = sse_tx.clone();
     let db_for_stream = state.db_manager.clone();
     crate::metrics::ACTIVE_SSE_CONNECTIONS.inc();
     let stream = async_stream::stream! {
@@ -224,7 +226,15 @@ async fn chat_handler(
         let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
 
         loop {
-            let event = match rx.recv().await {
+            let next = tokio::select! {
+                biased;
+                _ = transport.closed() => {
+                    terminal_event = Some(serde_json::json!({"type":"message_stop","stop_reason":"cancelled","full_text":full_text,"error":"Response transport disconnected"}));
+                    break;
+                }
+                event = rx.recv() => event,
+            };
+            let event = match next {
                 Some(e) => e,
                 None => {
                     tracing::error!(module = "Chat", "Event channel closed unexpectedly for conv_id={}", conv_id);
@@ -411,6 +421,8 @@ async fn chat_handler(
             }
         }
 
+        // Closing this turn's receiver cancels its executor without addressing a newer turn.
+        drop(rx);
         tracing::info!(module = "Chat", "Stream ended for conv_id={}", conv_id);
 
         crate::metrics::ACTIVE_SSE_CONNECTIONS.dec();
@@ -495,9 +507,8 @@ async fn chat_handler(
         }
     };
 
-    // Keep collecting and persisting engine events if the WebView disconnects.
-    // The transport must not own the lifetime of the database writer.
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel(64);
+    // The collector observes transport closure, cancels only its executor, and
+    // finishes persisting the partial trajectory before this writer exits.
     tokio::spawn(async move {
         use futures::StreamExt;
         futures::pin_mut!(stream);

@@ -1,5 +1,8 @@
 pub mod engine;
+pub mod import;
+mod editing;
 pub mod open_design;
+mod legacy_builtin;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -66,6 +69,7 @@ pub struct SkillFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontmatterData {
+    pub enabled: Option<bool>,
     pub name: Option<String>,
     pub description: Option<String>,
     #[serde(rename = "whenToUse")]
@@ -84,6 +88,10 @@ pub struct SkillsManager {
 }
 
 impl SkillsManager {
+    pub fn with_path(skills_dir: PathBuf) -> Self {
+        Self { skills_dir }
+    }
+
     pub fn new() -> Self {
         let skills_dir = Self::get_skills_base_path();
         Self { skills_dir }
@@ -117,14 +125,17 @@ impl SkillsManager {
         }
 
         let bundled_skills_path = self.get_skills_path(&SkillSource::Bundled);
-        if bundled_skills_path.exists() {
-            skills.extend(self.scan_skills_dir(&bundled_skills_path, SkillSource::Bundled)?);
-        } else {
+        if !bundled_skills_path.exists() {
             self.install_bundled_skills()?;
-            if bundled_skills_path.exists() {
-                skills.extend(self.scan_skills_dir(&bundled_skills_path, SkillSource::Bundled)?);
-            }
         }
+        legacy_builtin::install(&bundled_skills_path)?;
+        skills.extend(self.scan_skills_dir(&bundled_skills_path, SkillSource::Bundled)?);
+
+        // Nested collections can be visited by both root and bundled scans.
+        let mut seen = std::collections::HashSet::new();
+        skills.reverse();
+        skills.retain(|skill| seen.insert(skill.id.clone()));
+        skills.reverse();
 
         Ok(skills)
     }
@@ -180,8 +191,8 @@ This skill provides utilities for:
 - `references/` - Schema definitions and documentation
 "#;
 
-        std::fs::write(bundled_path.join("skill-creator").join("SKILL.md"), skill_creator_md)?;
         std::fs::create_dir_all(bundled_path.join("skill-creator").join("agents"))?;
+        std::fs::write(bundled_path.join("skill-creator").join("SKILL.md"), skill_creator_md)?;
         std::fs::write(bundled_path.join("skill-creator").join("agents").join("analyzer.md"), "# Analyzer\n\nAnalyzes skill structure and quality.")?;
         std::fs::write(bundled_path.join("skill-creator").join("agents").join("grader.md"), "# Grader\n\nGrades skill performance.")?;
 
@@ -205,7 +216,8 @@ This skill provides utilities for:
             };
 
             let path = entry.path();
-            if path.is_file() && path.file_name().map(|n| n == "SKILL.md").unwrap_or(false) {
+            if entry.file_type().is_file() && path.file_name().map(|n| n == "SKILL.md").unwrap_or(false) {
+                editing::safe_existing(base_path, path)?;
                 if let Some(skill) = self.parse_skill_file(path, &source)? {
                     skills.push(skill);
                 }
@@ -264,7 +276,7 @@ This skill provides utilities for:
             description: frontmatter.description.unwrap_or_default(),
             content: Some(content),
             when_to_use: frontmatter.when_to_use,
-            enabled: true,
+            enabled: frontmatter.enabled.unwrap_or(true),
             source: source.clone(),
             loaded_from: source.as_str().to_string(),
             source_dir: skill_md_path
@@ -376,6 +388,7 @@ This skill provides utilities for:
 
     fn set_frontmatter_field(&self, frontmatter: &mut FrontmatterData, key: &str, value: &str) {
         match key {
+            "enabled" => frontmatter.enabled = value.parse().ok(),
             "name" => frontmatter.name = Some(value.to_string()),
             "description" => frontmatter.description = Some(value.replace('\n', " ").trim().to_string()),
             "when" | "whenToUse" | "when_to_use" => frontmatter.when_to_use = Some(value.to_string()),
@@ -440,20 +453,23 @@ This skill provides utilities for:
 
     pub fn get_skill_content(&self, skill_id: &str, file_path: &str) -> Result<String> {
         let skill_path = self.find_skill_path(skill_id)?;
-        let full_path = skill_path.join(file_path);
+        let full_path = editing::relative_file(&skill_path, file_path)?;
         let content = std::fs::read_to_string(&full_path)?;
         Ok(content)
     }
 
     pub fn create_skill(&self, name: &str, description: &str, content: &str) -> Result<Skill> {
+        editing::valid_name(name)?;
+        let skill_md = editing::document(name, description, content)?;
+        let frontmatter = self.parse_frontmatter(&skill_md);
+        anyhow::ensure!(skill_md.len() <= 2_000_000, "Skill exceeds 2 MB");
+        std::fs::create_dir_all(&self.skills_dir)?;
+        editing::safe_existing(&self.skills_dir, &self.skills_dir)?;
         let skill_dir = self.skills_dir.join(name);
-        std::fs::create_dir_all(&skill_dir)?;
-
-        let skill_md = format!(
-            "---\nname: {}\ndescription: {}\n---\n\n{}",
-            name, description, content
-        );
-        std::fs::write(skill_dir.join("SKILL.md"), &skill_md)?;
+        let staging = tempfile::tempdir_in(&self.skills_dir)?;
+        std::fs::write(staging.path().join("SKILL.md"), &skill_md)?;
+        anyhow::ensure!(!skill_dir.exists(), "Skill directory already exists");
+        std::fs::rename(staging.path(), &skill_dir)?;
 
         let skill = Skill {
             id: Self::generate_skill_id(&skill_dir.join("SKILL.md")),
@@ -461,7 +477,7 @@ This skill provides utilities for:
             description: description.to_string(),
             content: Some(skill_md),
             when_to_use: None,
-            enabled: true,
+            enabled: frontmatter.enabled.unwrap_or(true),
             source: SkillSource::User,
             loaded_from: "user".to_string(),
             source_dir: Some(skill_dir.to_string_lossy().to_string()),
@@ -486,40 +502,19 @@ This skill provides utilities for:
             anyhow::bail!("SKILL.md not found");
         }
 
-        let content = std::fs::read_to_string(&skill_md_path)?;
-
-        let mut new_content = content.clone();
-        if let Some(name) = updates.get("name").and_then(|v| v.as_str()) {
-            new_content = Self::update_yaml_field(&new_content, "name", name);
-        }
-        if let Some(description) = updates.get("description").and_then(|v| v.as_str()) {
-            new_content = Self::update_yaml_field(&new_content, "description", description);
-        }
-
-        std::fs::write(&skill_md_path, new_content)?;
-        Ok(())
-    }
-
-    fn update_yaml_field(content: &str, field: &str, value: &str) -> String {
-        let pattern = format!("^{}:", field);
-        if let Some(idx) = content.lines().position(|l| l.trim().starts_with(&pattern)) {
-            let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-            lines[idx] = format!("{}: {}", field, value);
-            lines.join("\n")
-        } else {
-            content.to_string()
-        }
+        editing::edit(&skill_md_path, &updates)
     }
 
     fn find_skill_path(&self, skill_id: &str) -> Result<PathBuf> {
         for entry in WalkDir::new(&self.skills_dir)
-            .max_depth(2)
+            .max_depth(4)
             .follow_links(false)
         {
             if let Ok(entry) = entry {
                 if entry.path().file_name().map(|n| n == "SKILL.md").unwrap_or(false) {
                     let id = Self::generate_skill_id(entry.path());
                     if id == skill_id {
+                        editing::safe_existing(&self.skills_dir, entry.path())?;
                         return Ok(entry.path().parent()
                             .ok_or_else(|| anyhow!("Skill path has no parent directory"))?
                             .to_path_buf());
@@ -589,10 +584,12 @@ This skill provides utilities for:
 
         if skill_md_path.exists() {
             let content = std::fs::read_to_string(&skill_md_path)?;
-            let updated = content.replace(
-                &format!("enabled: {}", !new_state),
-                &format!("enabled: {}", new_state)
-            );
+            let normalized=content.replace("\r\n","\n");
+            let updated=if let Some((header,body))=normalized.strip_prefix("---\n").and_then(|s|s.split_once("\n---")) {
+                let mut header:serde_yaml::Value=serde_yaml::from_str(header)?;
+                header.as_mapping_mut().ok_or_else(||anyhow!("Skill frontmatter must be a mapping"))?.insert(serde_yaml::Value::String("enabled".into()),serde_yaml::Value::Bool(new_state));
+                format!("---\n{}---{}",serde_yaml::to_string(&header)?,body)
+            } else { format!("---\nenabled: {new_state}\n---\n{content}") };
             std::fs::write(&skill_md_path, updated)?;
         }
 
@@ -827,6 +824,7 @@ impl Default for SkillsManager {
 impl Default for FrontmatterData {
     fn default() -> Self {
         FrontmatterData {
+            enabled: None,
             name: None,
             description: None,
             when_to_use: None,

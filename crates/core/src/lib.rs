@@ -47,3 +47,6 @@ pub mod app_studio;
 pub mod knowledge;
 pub mod runtime;
 pub mod services;
+
+pub mod learning;
+pub mod performance;

@@ -6,7 +6,7 @@ use crate::native_engine::tool_loop::{EngineEvent, ToolLoopExecutor};
 use crate::mcp::McpToolRegistry;
 use crate::permissions::{PermissionContext, PermissionManager, PermissionResult, audit::{AuditAction, AuditEntry}};
 use crate::prefetch::PrefetchEngine;
-use crate::skills::{SkillExecutionContext, SkillsManager};
+use crate::skills::SkillsManager;
 use crate::cache::FileCache;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -178,30 +178,16 @@ impl QueryEngine {
         self.permission_manager.check_permission(&context)
     }
 
-    pub async fn execute_skill(
-        &self,
-        skill_id: &str,
-        conversation_id: &str,
-        messages: Vec<Value>,
-        workspace_path: Option<String>,
-    ) -> Result<String> {
-        let skills_manager = self.skills_manager.as_ref()
-            .ok_or_else(|| anyhow!("Skills manager not configured"))?;
-
-        let manager = skills_manager.lock().await;
-
-        let context = SkillExecutionContext {
-            conversation_id: conversation_id.to_string(),
-            messages,
-            available_tools: crate::tools::get_tool_definitions(),
-            available_mcp_tools: Vec::new(),
-            current_input: "".to_string(),
-            workspace_path,
-            variables: std::collections::HashMap::new(),
-            mcp_server_manager: None,
+    /// Apply an enabled skill to the normal conversation executor and stream real results.
+    pub async fn execute_skill(&self, skill_id: &str, mut request: ChatRequest) -> Result<mpsc::Receiver<EngineEvent>> {
+        let manager = self.skills_manager.as_ref().context("Skills manager not configured")?;
+        let content = {
+            let manager = manager.lock().await;
+            let skill = manager.get_skill_by_id(skill_id).await?.filter(|s| s.enabled).context("Skill not found or disabled")?;
+            skill.content.context("Skill has no content")?
         };
-
-        manager.execute_skill(skill_id, "", Some(context)).await
+        request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSelected skill instructions:\n{content}\n"));
+        self.send_message(request).await
     }
 
     pub async fn confirm_tool_permission(&self, conversation_id: &str, tool_name: &str) {
@@ -333,9 +319,31 @@ impl QueryEngine {
 
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
     pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
+        let command = request.messages.iter().rev().find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str()).and_then(|text| text.trim_start().strip_prefix('/'))
+            .and_then(|text| text.split_whitespace().next()).map(str::to_string);
+        if let (Some(command), Some(manager)) = (command, &self.skills_manager) {
+            let skills = manager.lock().await.list_enabled_skills().await?;
+            let matches: Vec<_> = skills.into_iter().filter(|skill| skill.id == command || skill.name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-") == command).collect();
+            anyhow::ensure!(matches.len() <= 1, "Ambiguous skill command; use its full skill ID");
+            if let Some(content) = matches.into_iter().next().and_then(|skill| skill.content) {
+                request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSelected skill instructions:\n{content}\n"));
+            }
+        }
         let conv_id = request.conversation_id.clone();
         let plugin_root=self.provider_manager.lock().await.config_path().parent().context("Missing runtime directory")?.to_path_buf();
         let plugin_context=crate::services::ServiceContext{paths:crate::runtime::RuntimePaths::new(plugin_root)?,db:self.db_manager.clone(),credentials:Arc::new(crate::services::EnvironmentCredentials)};
+        if let Some(router) = plugin_context.setting::<crate::performance::RouterConfig>("performance.router")? {
+            // Route only a fresh plain-text turn; never switch models mid tool conversation.
+            if router.enabled && request.provider_id.is_none() && request.messages.len() == 1 && request.messages[0]["role"] == "user"
+                && request.messages[0]["content"].as_str().is_some_and(crate::performance::simple_turn) {
+                let manager = self.provider_manager.lock().await;
+                if manager.resolve_selected(&router.provider_id, &router.model_id).is_some() {
+                    request.provider_id = Some(router.provider_id);
+                    request.model = router.model_id;
+                } else { anyhow::bail!("Configured simple-turn routing target is unavailable"); }
+            }
+        }
         let plugins=crate::services::plugins::list(&plugin_context)?;
         if plugins.iter().any(|p|p.enabled) {
             request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable PluginRun commands: {}\n{}",serde_json::to_string(&plugins.iter().filter(|p|p.enabled).collect::<Vec<_>>())?,crate::services::plugins::prompt_hooks(&plugin_context)?));
@@ -448,6 +456,9 @@ impl QueryEngine {
 
         let search_config_path = self.provider_manager.lock().await.config_path()
             .parent().unwrap_or(std::path::Path::new(".")).join("config.json");
+        let learning = if plugin_context.setting::<bool>("learning.enabled")?.unwrap_or(false) {
+            Some(crate::learning::TurnObservation::new(plugin_context.clone(), conv_id.clone()))
+        } else { None };
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -457,6 +468,7 @@ impl QueryEngine {
             workspace_path.clone(),
             reasoning_mode.clone(),
         )
+        .with_learning_tools(learning.as_ref().map(|l| l.tools.clone()))
         .with_allowed_tools(agent.and_then(|d|d.tools))
         .with_prompt_profile(prompt_profile)
         .with_memex(crate::memory::MemExClient::with_path(
@@ -483,12 +495,15 @@ impl QueryEngine {
         tracing::info!(module = "EngineCore", "Spawning executor task for conv_id={}", conv_id_clone);
 
         let executor_handle = tokio::spawn(async move {
+            let mut learning = learning;
             tracing::info!(module = "EngineCore", "Executor task STARTED for {}", conv_id_clone);
 
             // 使用 catch_unwind 捕获 panic
-            let exec_result = std::panic::AssertUnwindSafe(executor.execute())
-                .catch_unwind()
-                .await;
+            let exec_result = tokio::select! {
+                biased;
+                result = std::panic::AssertUnwindSafe(executor.execute()).catch_unwind() => result,
+                _ = event_tx.closed() => Ok(Err(anyhow!("Response receiver disconnected; turn cancelled"))),
+            };
 
             let exec_result = match exec_result {
                 Ok(result) => result,
@@ -510,6 +525,11 @@ impl QueryEngine {
                 }
             };
 
+            let successful_turn = matches!(&exec_result, Ok((_, reason)) if !matches!(reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations")));
+            if let Some(observation) = learning.as_mut() {
+                observation.complete(matches!(&exec_result, Ok((_, reason)) if !matches!(reason.as_deref(), Some("stream_error" | "error" | "interrupted" | "failed" | "cancelled" | "max_iterations"))));
+            }
+            drop(learning);
             match exec_result {
                 Ok((full_text, _stop_reason)) => {
                     tracing::info!(module = "EngineCore", "Executor completed for {}, full_text_len={}", conv_id_clone, full_text.len());
@@ -544,6 +564,7 @@ impl QueryEngine {
             }
 
             let mut turns = active_turns_clone.lock().await;
+            if turns.get(&conv_id_clone).is_some_and(|turn| !turn.event_tx.same_channel(&event_tx)) { return; }
             if let Some(turn) = turns.get_mut(&conv_id_clone) {
                 turn.cancelled = true;
             }
@@ -551,12 +572,12 @@ impl QueryEngine {
 
             let mut states = conversation_states_clone.lock().await;
             if let Some(state) = states.get_mut(&conv_id_clone) {
-                state.status = ConversationStatus::Completed;
+                state.status = if successful_turn { ConversationStatus::Completed } else { ConversationStatus::Error };
                 state.last_activity = Utc::now().to_rfc3339();
                 let current_turn_count = state.turn_count;
                 state.turn_count += 1;
 
-                if current_turn_count == 0 {
+                if successful_turn && current_turn_count == 0 {
                     let title_conv_id = conv_id_clone.clone();
                     let title_model = state.model.clone();
                     let pm = provider_manager_title.clone();

@@ -3,8 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listProjects, type Project } from '../api/projects';
 
 interface Document { id:string; path:string; title:string; auto_update:boolean; update_count:number }
-interface Preview { id:string; document_id:string; original:string; proposed:string }
-interface Snapshot { documents:Document[]; previews:Preview[]; services:{name:string;state:string;error:string|null}[] }
+interface Preview { id:string; document_id:string; original:string; proposed:string; diff?:string }
+interface Snapshot { include_conversations?:boolean; documents:Document[]; previews:Preview[]; services:{name:string;state:string;error:string|null}[] }
 const button = 'rounded border border-claude-border p-2 text-sm disabled:opacity-40';
 const field = 'w-full rounded border border-claude-border bg-claude-bg p-2 text-sm';
 
@@ -48,11 +48,13 @@ export default function MagicDocsPanel() {
     <input aria-label="文档 Provider ID" className={field} value={provider} onChange={e=>setProvider(e.target.value)} placeholder="已保存的 Provider ID" />
     <input aria-label="文档模型" className={field} value={model} onChange={e=>setModel(e.target.value)} placeholder="模型 ID" />
     <textarea aria-label="文档更新背景" className={field} rows={4} value={context} onChange={e=>setContext(e.target.value)} placeholder="需要纳入文档的新信息" />
+    <label className="flex gap-2 text-sm"><input type="checkbox" disabled={busy||!project} checked={snapshot?.include_conversations ?? false} onChange={e=>void run({action:'context_config',enabled:e.target.checked},'项目会话来源设置已保存')} />允许自动更新时将此项目近期会话文本发送给所选模型</label>
     {snapshot?.documents.map(doc=><article key={doc.id} className="space-y-2 rounded border border-claude-border p-3">
       <p>{doc.title} · 已更新 {doc.update_count} 次</p><p className="break-all text-xs">{doc.path}</p>
       <button className={button} disabled={busy||!provider||!model} onClick={()=>void run({action:'update',id:doc.id,new_context:context,provider,model},'预览已生成，原文件未修改')}>生成更新预览</button>
       <label className="flex gap-2 text-sm"><input type="checkbox" disabled={busy} checked={doc.auto_update} onChange={e=>void run({action:'auto',id:doc.id,enabled:e.target.checked},'自动更新设置已保存')} />允许自动更新此文档</label>
       {snapshot.previews.filter(p=>p.document_id===doc.id).map(p=><div key={p.id} className="space-y-2">
+        {p.diff && <details open><summary>逐行差异</summary><pre className="max-h-80 overflow-auto whitespace-pre-wrap text-xs">{p.diff}</pre></details>}
         <div className="grid gap-3 md:grid-cols-2"><div><h4>原文</h4><pre className="max-h-80 overflow-auto whitespace-pre-wrap text-xs">{p.original}</pre></div><div><h4>修改后</h4><pre className="max-h-80 overflow-auto whitespace-pre-wrap text-xs">{p.proposed}</pre></div></div>
         <button className={button} disabled={busy} onClick={()=>void run({action:'apply',id:p.id},'已应用文档更新')}>确认应用此预览</button>
       </div>)}

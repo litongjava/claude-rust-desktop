@@ -26,6 +26,9 @@ pub struct Cli {
     pub model: Option<String>,
     #[arg(long, global = true)]
     pub provider: Option<String>,
+    /// Allow the explicitly configured lightweight-model router for a new conversation.
+    #[arg(long, conflicts_with_all=["provider", "model", "resume"])]
+    pub auto_route: bool,
     /// API endpoint for a temporary provider; never saved automatically.
     #[arg(long, env = "API_BASE_URL", global = true)]
     pub base_url: Option<String>,
@@ -78,6 +81,12 @@ pub enum PermissionModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    Learning { #[command(subcommand)] action: crate::migration::LearningCommands },
+    Performance { #[command(subcommand)] action: crate::migration::PerformanceCommands },
+    Project { #[command(subcommand)] action: crate::migration::ProjectCommands },
+    Cron { #[command(subcommand)] action: crate::migration::CronCommands },
+    Ssh { config: PathBuf, operation: PathBuf, #[arg(long)] yes: bool },
+    Remote { request: PathBuf, #[arg(long)] yes: bool },
     Help { #[arg(long)] topic:Option<String>, command:Vec<String> },
     /// Install and run versioned Node.js/Python plugin bundles.
     Plugin { #[command(subcommand)] action: PluginCommands },
@@ -192,6 +201,7 @@ pub enum MemoryCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum MagicCommands {
+    ContextConfig { project_id: String, #[arg(long)] enabled: bool },
     ImportLegacy {source:PathBuf,#[arg(long)] preview:bool},
     List,
     Check { file: PathBuf },
@@ -334,6 +344,7 @@ pub enum McpCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SkillsCommands {
+    ImportLegacy { source: PathBuf, #[arg(long)] preview: bool },
     List,
     Search {
         query: String,
@@ -357,6 +368,7 @@ pub enum SessionCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommands {
+    ImportLegacy { source: String, #[arg(long)] preview: bool },
     List,
     Install { source: String },
     Update { id: String, source: String },

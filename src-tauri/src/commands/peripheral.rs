@@ -75,9 +75,25 @@ pub async fn shutdown(app: &tauri::AppHandle) {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+    SkillImportLegacy { source: std::path::PathBuf, preview: bool },
+    Cron { project_id: String, operation: Value },
+    CronStart { project_id: String, provider: String, model: String },
+    CronStop,
+    LearningStatus,
+    LearningConfigure { enabled: bool },
+    LearningFeedback { id: String, rating: f64 },
+    LearningAccept { id: String },
+    PerformanceStatus,
+    PerformanceConfigure { config: claude_core::performance::RouterConfig },
+    ProjectTemplates,
+    ProjectScaffold { parent: std::path::PathBuf, name: String, template: String, template_file: Option<std::path::PathBuf>, #[serde(default)] variables: std::collections::HashMap<String,String>, #[serde(default)] git: bool, #[serde(default)] vscode: bool, preview: bool, #[serde(default)] allow_commands: bool },
+    NetworkCancel { id: String },
+    RemoteRequest { id: String, request: claude_core::services::remote_access::RemoteRequest, confirmed: bool },
+    SshOperation { id: String, config: claude_core::services::remote_access::SshConfig, operation: claude_core::services::remote_access::SshOperation, confirmed: bool },
     SessionImport {source:std::path::PathBuf,project_id:String,preview:bool},
     McpHosts,
     McpRestart {server:String,host:String},
+    PluginImportLegacy { source: String, preview: bool },
     Plugins,
     PluginSearch {registry:String,query:String},
     PluginInstall { source:String, update:Option<String> },
@@ -130,6 +146,7 @@ pub enum Request {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum MagicRequest {
+    ContextConfig { enabled: bool },
     ImportLegacy {source:std::path::PathBuf,preview:bool},
     List,
     Check { file: std::path::PathBuf },
@@ -149,6 +166,52 @@ pub async fn peripheral_command(
     async {
         let context=context(&app)?;
         match request {
+            Request::SkillImportLegacy {source,preview} => Ok(json!(claude_core::skills::import::import_legacy(&source,&context.paths.data_dir.join("skills"),preview)?)),
+            Request::Cron {project_id,operation} => {
+                let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");
+                let root=project.workspace_path.context("Project has no workspace")?;
+                claude_core::tools::scheduled::execute(operation,&root)
+            }
+            Request::CronStart {project_id,provider,model} => {
+                let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");
+                let root=project.workspace_path.context("Project has no workspace")?;
+                Generator::saved(&context.paths,&provider,&model)?;
+                let mut tasks=host.memory_tasks.lock().unwrap();
+                ensure!(tasks.get("cron").is_none_or(|t|t.is_finished()),"Cron host is still running");
+                let lease=lifecycle::Lease::acquire(&context,"cron")?;
+                tasks.insert("cron".into(),tokio::spawn(claude_core::services::scheduled_prompts::run_with_lease(context,root,provider,model,lease)));
+                Ok(json!({"started":true}))
+            }
+            Request::CronStop => {
+                lifecycle::stop(&context,"cron")?; lifecycle::wait_stopped(&context,"cron").await?;
+                let task=host.memory_tasks.lock().unwrap().remove("cron");
+                if let Some(task)=task {let _=task.await;}
+                Ok(json!({"stopped":true}))
+            }
+            Request::LearningStatus => {let mut value=json!(claude_core::learning::status(&context)?);value["enabled"]=json!(context.setting::<bool>("learning.enabled")?.unwrap_or(false));Ok(value)},
+            Request::LearningConfigure { enabled } => {context.save_setting("learning.enabled",&enabled)?;Ok(json!({"enabled":enabled}))},
+            Request::LearningFeedback { id, rating } => {claude_core::learning::feedback(&context,&id,rating)?;Ok(json!({"updated":id}))},
+            Request::LearningAccept { id } => Ok(json!(claude_core::learning::accept(&context,&id)?)),
+            Request::PerformanceStatus => Ok(json!(context.setting::<claude_core::performance::RouterConfig>("performance.router")?.unwrap_or_default())),
+            Request::PerformanceConfigure { config } => {claude_core::performance::configure_router(&context,&config)?;Ok(json!(config))},
+            Request::ProjectTemplates => Ok(json!(claude_core::services::project_templates::builtin_templates())),
+            Request::ProjectScaffold { parent,name,template,template_file,variables,git,vscode,preview,allow_commands } => {
+                use claude_core::services::project_templates as projects;
+                let template=if let Some(file)=template_file { projects::load_template(&file)? } else { projects::builtin_templates().into_iter().find(|t|t.name==template).context("Unknown project template")? };
+                let plan=projects::preview(&parent,&name,&template,&variables,git,vscode)?;
+                if preview {Ok(json!(plan))} else {Ok(json!({"created":projects::create(plan,allow_commands).await?}))}
+            }
+            Request::NetworkCancel { id } => { if let Some(sender)=host.voice_jobs.lock().unwrap().remove(&id) { let _=sender.send(true); } Ok(json!({"cancelled":id})) },
+            Request::RemoteRequest { id,request,confirmed } => {
+                ensure!(confirmed || matches!(request.method.to_ascii_uppercase().as_str(),"GET"|"HEAD"),"Confirm the mutating HTTP request first");
+                run_network(&host,id,async {Ok(json!(claude_core::services::remote_access::request(request).await?))}).await
+            }
+            Request::SshOperation { id,config,operation,confirmed } => {
+                ensure!(confirmed || matches!(operation,claude_core::services::remote_access::SshOperation::Check),"Confirm the SSH operation first");
+                run_network(&host,id,async {Ok(json!(claude_core::services::remote_access::ssh(&config,operation).await?))}).await
+            }
             Request::SessionImport {source,project_id,preview} => {
                 let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
                 ensure!(!project.is_archived,"Select an active project");let root=project.workspace_path.context("Project has no workspace")?;
@@ -158,6 +221,7 @@ pub async fn peripheral_command(
             Request::McpHosts => Ok(json!(claude_core::mcp::control::hosts(&context)?)),
             Request::McpRestart {server,host} => Ok(json!({"host":claude_core::mcp::control::restart(&context,&server,Some(&host)).await?})),
             Request::PluginSearch {registry,query} => Ok(json!(claude_core::services::plugins::search(&registry,&query).await?)),
+            Request::PluginImportLegacy {source,preview} => Ok(json!(claude_core::services::plugins::import_legacy(&context,std::path::Path::new(&source),preview)?)),
             Request::Plugins => Ok(json!(claude_core::services::plugins::list(&context)?)),
             Request::PluginInstall {source,update} => Ok(json!(claude_core::services::plugins::install(&context,&source,update.as_deref()).await?)),
             Request::PluginEnable {id,enabled} => {claude_core::services::plugins::enable(&context,&id,enabled)?;Ok(json!({"enabled":enabled}))},
@@ -193,8 +257,9 @@ pub async fn peripheral_command(
                 ensure!(!project.is_archived, "Select an active project");
                 let root = std::path::PathBuf::from(project.workspace_path.context("Project has no workspace")?);
                 match operation {
+                    MagicRequest::ContextConfig { enabled } => {claude_core::services::magic_context::configure(&context,&root,&project_id,enabled)?;Ok(json!({"include_conversations":enabled}))},
                     MagicRequest::ImportLegacy {source,preview}=>Ok(json!(docs::import_legacy(&context,&root,&source,preview)?)),
-                    MagicRequest::List => Ok(json!({"documents":docs::list(&context,&root)?, "previews":docs::previews(&context,&root)?, "services":lifecycle::status(&context)?})),
+                    MagicRequest::List => Ok(json!({"include_conversations":claude_core::services::magic_context::enabled(&context,&project_id)?,"documents":docs::list(&context,&root)?, "previews":docs::previews(&context,&root)?, "services":lifecycle::status(&context)?})),
                     MagicRequest::Check { file } => Ok(json!(docs::check(&context,&root,&file)?)),
                     MagicRequest::Update { id,new_context,provider,model } => {
                         let generator = Generator::saved(&context.paths,&provider,&model)?;
@@ -371,4 +436,17 @@ pub async fn voice_transcribe(
     .map_err(|e: anyhow::Error| e.to_string());
     host.voice_jobs.lock().unwrap().remove(&id);
     result
+}
+
+async fn run_network(host: &PeripheralHost, id: String, operation: impl std::future::Future<Output=anyhow::Result<Value>>) -> anyhow::Result<Value> {
+    let (sender, mut cancel) = watch::channel(false);
+    {
+        let mut jobs=host.voice_jobs.lock().unwrap();
+        ensure!(!jobs.contains_key(&id), "Operation ID is already active");
+        jobs.insert(id.clone(),sender);
+    }
+    struct Cleanup<'a> { host: &'a PeripheralHost, id: String }
+    impl Drop for Cleanup<'_> { fn drop(&mut self) { self.host.voice_jobs.lock().unwrap().remove(&self.id); } }
+    let _cleanup=Cleanup{host,id};
+    tokio::select! {result=operation=>result, _=cancel.changed()=>anyhow::bail!("Remote operation cancelled")}
 }

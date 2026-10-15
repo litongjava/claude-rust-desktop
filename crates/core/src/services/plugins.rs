@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod legacy;
+pub use legacy::import_legacy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginCommand {
@@ -19,6 +21,9 @@ pub struct PluginCommand {
     pub script: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Historical scripts receive string arguments as --key=value.
+    #[serde(default)]
+    pub legacy_arguments: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
@@ -262,6 +267,24 @@ pub async fn run(
         .commands
         .get(name)
         .context("Plugin command not registered")?;
+    bundle.validate()?;
+    let bytes = serde_json::to_vec(&input)?;
+    ensure!(bytes.len() <= 1_048_576, "Plugin input exceeds 1 MiB");
+    let mut legacy_args = Vec::new();
+    if command.legacy_arguments {
+        for (key, value) in input
+            .as_object()
+            .context("Legacy plugin input must be an object of strings")?
+        {
+            ensure!(valid_name(key), "Invalid legacy argument name");
+            legacy_args.push(format!(
+                "--{key}={}",
+                value
+                    .as_str()
+                    .context("Legacy plugin argument values must be strings")?
+            ));
+        }
+    }
     let directory = context.paths.data_dir.join("plugin-runs");
     std::fs::create_dir_all(&directory)?;
     let temporary = tempfile::tempdir_in(directory)?;
@@ -274,6 +297,7 @@ pub async fn run(
     process
         .arg(temporary.path().join(&command.script))
         .args(&command.args)
+        .args(legacy_args)
         .current_dir(std::fs::canonicalize(workspace)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -285,8 +309,11 @@ pub async fn run(
     let mut stdin = child.stdin.take().context("Plugin stdin unavailable")?;
     let stdout = child.stdout.take().context("Plugin stdout unavailable")?;
     let stderr = child.stderr.take().context("Plugin stderr unavailable")?;
-    let bytes = serde_json::to_vec(&input)?;
-    ensure!(bytes.len() <= 1_048_576, "Plugin input exceeds 1 MiB");
+    let bytes = if command.legacy_arguments {
+        Vec::new()
+    } else {
+        bytes
+    };
     let mut stdout = stdout.take(1_048_577);
     let mut stderr = stderr.take(1_048_577);
     let result = {

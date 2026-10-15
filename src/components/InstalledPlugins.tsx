@@ -21,6 +21,9 @@ export default function InstalledPlugins() {
     <button className={button} disabled={busy||!registry} onClick={()=>void run({action:'plugin_search',registry,query})}>搜索此目录</button>
     <input aria-label="插件包来源" className={field} value={source} onChange={e=>setSource(e.target.value)} placeholder="本地 JSON 路径或 HTTPS URL"/>
     <button className={button} disabled={busy||!source} onClick={()=>void run({action:'plugin_install',source,update:null})}>安装插件包</button>
+    <p>旧插件导入：在来源中填写包含 plugin.json 的本地目录。预览会说明执行参数转换；含未映射钩子、依赖或权限的插件需要先转换。</p>
+    <button className={button} disabled={busy||!source} onClick={()=>void run({action:'plugin_import_legacy',source,preview:true})}>预览旧插件</button>
+    <button className={button} disabled={busy||!source} onClick={()=>void run({action:'plugin_import_legacy',source,preview:false})}>确认导入旧插件</button>
     <select aria-label="插件运行项目" className={field} value={project} disabled={busy} onChange={e=>{setProject(e.target.value);setConfirmed(false);}}><option value="">选择已信任项目</option>{projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select>
     <textarea aria-label="插件 JSON 输入" className={field} value={input} onChange={e=>setInput(e.target.value)}/>
     <label><input type="checkbox" checked={confirmed} onChange={e=>setConfirmed(e.target.checked)}/>允许下次命令在所选项目中执行</label>

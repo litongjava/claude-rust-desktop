@@ -1,3 +1,6 @@
+#[path = "delegation.rs"]
+mod delegation;
+
 use crate::native_engine::anthropic_client::{AnthropicClient, AnthropicContent, AnthropicMessage, ContentBlock};
 use crate::native_engine::engine_core::ReasoningMode;
 use crate::native_engine::openai_client::{OpenAIClient, OpenAIContent, OpenAIMessage};
@@ -112,6 +115,8 @@ pub struct ToolLoopExecutor {
     prefetch_engine: Option<Arc<PrefetchEngine>>,
     search_config_path: Option<std::path::PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    delegation_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -404,7 +409,25 @@ impl ToolLoopExecutor {
             prefetch_engine: None,
             search_config_path: None,
             allowed_tools: None,
+            learning_tools: None,
+            delegation_depth: 0,
         }
+    }
+
+    pub fn with_learning_tools(mut self, tools: Option<Arc<std::sync::Mutex<Vec<String>>>>) -> Self {
+        self.learning_tools = tools;
+        self
+    }
+
+    fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
+        if let Some(tools) = &self.learning_tools {
+            if let Ok(mut tools) = tools.lock() { if tools.len() < 256 { tools.push(tool_name.to_string()); } }
+        }
+        let preview = compact_tool_output(tool_name, output);
+        if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
+            return crate::performance::retain_tool_output(root, output, &preview);
+        }
+        output.to_string()
     }
 
     pub fn with_search_config_path(mut self, path: std::path::PathBuf) -> Self {
@@ -451,7 +474,9 @@ impl ToolLoopExecutor {
     pub fn with_allowed_tools(mut self, tools: Option<Vec<String>>) -> Self { self.allowed_tools = tools; self }
 
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
-        adapt_tools(get_tool_definitions(), self.prompt_profile).into_iter().filter(|tool| self.allowed_tools.as_ref().is_none_or(|names| names.contains(&tool.name))).collect()
+        let mut tools = get_tool_definitions();
+        if self.search_config_path.is_some() && self.delegation_depth < 2 { tools.extend(delegation::definitions()); }
+        adapt_tools(tools, self.prompt_profile).into_iter().filter(|tool| self.allowed_tools.as_ref().is_none_or(|names| names.contains(&tool.name))).collect()
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -626,6 +651,37 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
         if self.allowed_tools.as_ref().is_some_and(|names| !names.iter().any(|name| name == tool_name)) { return (tool_input.clone(), "Tool is not allowed by this agent definition".into(), true); }
+        if tool_name == "team" && tool_input["operation"] == "run" {
+            let result = Box::pin(self.execute_team(tool_input)).await;
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
+            return (tool_input.clone(), output, failed);
+        }
+        if tool_name == "plan_mode" {
+            let result = crate::tools::execute_tool_async(tool_name, tool_input.clone(), &self.workspace_cwd).await;
+            if result.is_ok() && tool_input["operation"] == "enter" {
+                if let Some(manager) = &self.permission_manager { manager.set_mode(crate::permissions::PermissionMode::PlanMode); }
+            }
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
+            return (tool_input.clone(), output, failed);
+        }
+        if tool_name == "SendMessage" {
+            let permission = self.check_permission(tool_name, tool_input).await;
+            if !matches!(permission, PermissionResult::Granted) {
+                return (tool_input.clone(), "Team message access requires granted project tool permission".into(), true);
+            }
+            let result = crate::tools::agent_messages::execute_for_session(tool_input.clone(), &self.workspace_cwd, self.conv_id.as_deref().unwrap_or("unknown"));
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
+            return (tool_input.clone(), output, failed);
+        }
+        if matches!(tool_name, "Agent" | "Delegate" | "Worker") {
+            let result = Box::pin(self.execute_delegated(tool_input)).await;
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => format!("Delegation failed: {error}") };
+            return (tool_input.clone(), output, failed);
+        }
         if tool_name == "AskUserQuestion" {
             return self.execute_ask_user_question(tool_input).await;
         }
@@ -1232,7 +1288,7 @@ impl ToolLoopExecutor {
                                 let input = self.finalize_streaming_tool_args(&id);
 
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = name == "AskUserQuestion"
+                                let requires_user_interaction = matches!(name.as_str(), "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
                                     || is_memory_tool(&name)
                                     || self.check_permission_requires_confirmation(&name, &input);
 
@@ -1301,7 +1357,7 @@ impl ToolLoopExecutor {
                         output: output_str.clone(),
                         is_error,
                     }).await;
-                    let compacted = compact_tool_output(&tc.name, &output_str);
+                    let compacted = self.retained_tool_output(&tc.name, &output_str);
                     tool_results.push(AnthropicMessage {
                         role: "user".to_string(),
                         content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
@@ -1344,7 +1400,7 @@ impl ToolLoopExecutor {
                     let results = futures::future::join_all(futures).await;
 
                     for (tool_use_id, tool_name, _tool_input, output_str, is_error) in results {
-                        let compacted = compact_tool_output(&tool_name, &output_str);
+                        let compacted = self.retained_tool_output(&tool_name, &output_str);
                         tool_results.push(AnthropicMessage {
                             role: "user".to_string(),
                             content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
@@ -1729,7 +1785,7 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = name == "AskUserQuestion"
+                    let requires_user_interaction = matches!(name.as_str(), "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
                         || is_memory_tool(&name)
                         || self.check_permission_requires_confirmation(name, &input);
 
@@ -1765,7 +1821,7 @@ impl ToolLoopExecutor {
                         output: output_str.clone(),
                         is_error,
                     }).await;
-                    let compacted = compact_tool_output(&tc.name, &output_str);
+                    let compacted = self.retained_tool_output(&tc.name, &output_str);
                     tool_results.push(OpenAIMessage {
                         role: "tool".to_string(),
                         content: OpenAIContent::Text(compacted),
@@ -1807,7 +1863,7 @@ impl ToolLoopExecutor {
                     let results = futures::future::join_all(futures).await;
 
                     for (tool_use_id, tool_name, _tool_input, output_str, _is_error) in results {
-                        let compacted = compact_tool_output(&tool_name, &output_str);
+                        let compacted = self.retained_tool_output(&tool_name, &output_str);
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),

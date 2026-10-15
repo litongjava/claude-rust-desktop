@@ -121,36 +121,7 @@ pub struct FunctionCallDelta {
 }
 
 
-/// Retry with exponential backoff for transient errors (429, 5xx, connection).
-async fn retry_with_backoff<F, Fut, T>(mut f: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let max_retries = crate::config::OrchestrationConfig::max_retries();
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match f().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                let msg = format!("{:#}", e);
-                let retryable = msg.contains("429") || msg.contains("5")
-                    || msg.contains("500") || msg.contains("502")
-                    || msg.contains("503") || msg.contains("504")
-                    || msg.contains("connection") || msg.contains("timeout")
-                    || msg.contains("tls");
-                if !retryable || attempt > max_retries {
-                    return Err(e);
-                }
-                let base_ms = crate::config::OrchestrationConfig::retry_base_backoff_ms();
-                let delay = std::time::Duration::from_millis(base_ms * (1u64 << (attempt - 1)));
-                tracing::warn!("Retry {}/{} after {:?}: {}", attempt, max_retries, delay, msg);
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
+use crate::performance::{retry_with_backoff, checked_response};
 
 pub struct OpenAIClient {
     client: Client,
@@ -249,11 +220,7 @@ impl OpenAIClient {
                 .send()
                 .await?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                anyhow::bail!("OpenAI API error {}: {}", status, text);
-            }
+            let response = checked_response(response).await?;
 
             response.json().await.map_err(|e| anyhow::anyhow!("{:#}", e))
         }).await?;
@@ -322,11 +289,7 @@ impl OpenAIClient {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("OpenAI API error {}: {}", status, text);
-            }
+            let resp = checked_response(resp).await?;
             Ok(resp)
         }).await?;
 

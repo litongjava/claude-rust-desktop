@@ -26,6 +26,8 @@ pub struct Preview {
     pub document_id: String,
     pub original: String,
     pub proposed: String,
+    #[serde(default)]
+    pub diff: String,
 }
 
 fn scoped(root: &Path, path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -94,7 +96,7 @@ pub fn previews(context: &ServiceContext, root: &Path) -> Result<Vec<Preview>> {
     let root = std::fs::canonicalize(root)?;
     context.db.with_conn(|c| -> Result<_> {
         let mut stmt = c.prepare("SELECT p.id,p.document_id,p.original,p.proposed FROM magic_previews p JOIN magic_documents d ON d.id=p.document_id WHERE d.root=?1 ORDER BY p.created_at DESC")?;
-        let rows = stmt.query_map([root.to_string_lossy().as_ref()], |r| Ok(Preview {id:r.get(0)?,document_id:r.get(1)?,original:r.get(2)?,proposed:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map([root.to_string_lossy().as_ref()], |r| Ok(Preview {id:r.get(0)?,document_id:r.get(1)?,diff:diffy::create_patch(&r.get::<_,String>(2)?, &r.get::<_,String>(3)?).to_string(),original:r.get(2)?,proposed:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })?
 }
@@ -141,6 +143,7 @@ pub async fn update(
         let preview = Preview {
             id: uuid::Uuid::new_v4().to_string(),
             document_id: id.into(),
+            diff: diffy::create_patch(&original, &proposed).to_string(),
             original,
             proposed,
         };
@@ -274,12 +277,8 @@ pub async fn host(
             let memory = super::dream::client(&context);
             for document in list(&context, &root)?.into_iter().filter(|d| d.auto_update) {
                 let memories = memory.search(&document.title, Some(5)).await?;
-                if memories.is_empty() {
-                    continue;
-                }
-                let input = serde_json::to_string(
-                    &memories.iter().map(|m| &m.content).collect::<Vec<_>>(),
-                )?;
+                let memory_contents: Vec<String> = memories.into_iter().map(|m| m.content).collect();
+                let Some(input) = super::magic_context::collect(&context, &root, project_id.as_deref(), memory_contents.clone())? else { continue; };
                 let previous: Option<String> = context.db.with_conn(|c| {
                     c.query_row(
                         "SELECT input FROM magic_auto_inputs WHERE document_id=?1",
@@ -298,6 +297,7 @@ pub async fn host(
                         .db
                         .with_conn(|c| crate::db::project_repo::require_trusted(c, id))??;
                 }
+                if super::magic_context::collect(&context, &root, project_id.as_deref(), memory_contents)?.as_deref() != Some(&input) { continue; }
                 // Disabling a document during generation revokes automatic apply.
                 if list(&context, &root)?
                     .iter()

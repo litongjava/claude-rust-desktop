@@ -116,7 +116,7 @@ impl PermissionManager {
         matches!(
             tool_name,
             "Read" | "ListDir" | "Grep" | "WebFetch" | "WebSearch"
-                | "TodoRead" | "TodoWrite" | "SkillRead"
+                | "TodoRead" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "brief" | "SyntheticOutput"
         )
     }
 
@@ -124,19 +124,21 @@ impl PermissionManager {
         matches!(
             tool_name,
             "Write" | "Edit" | "SearchReplace" | "GlobReplace" | "Delete"
-                | "SkillCreate" | "SkillUpdate"
+                | "SkillCreate" | "SkillUpdate" | "NotebookEdit" | "TaskCreate" | "TaskUpdate" | "TaskStop" | "todo_write" | "TodoWrite" | "SendMessage" | "team" | "cron" | "Config"
         )
     }
 
     fn is_dangerous_tool(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "Bash" | "PluginRun" | "Delete" | "FileDelete" | "ProcessKill"
+            "Bash" | "PluginRun" | "LSP" | "lsp" | "worktree" | "Delete" | "FileDelete" | "ProcessKill"
         )
     }
 
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
         let mode = self.get_mode();
+        let read_only = Self::is_read_only_tool(&context.tool_name)
+            || (context.tool_name == "Config" && matches!(context.tool_input["operation"].as_str(), Some("get" | "list" | "merge" | "sources")));
 
         // Bypass permissions: all operations auto-approved
         if mode == PermissionMode::BypassPermissions {
@@ -149,23 +151,9 @@ impl PermissionManager {
             return PermissionResult::Granted;
         }
 
-        // Always allow check: if tool/action is in the always allow list, auto-approve
-        if let Some(ref checker) = *self.always_allow_checker.lock().unwrap_or_else(|e| e.into_inner()) {
-            let action = self.extract_action_from_context(context);
-            if checker(&context.tool_name, &action) {
-                tracing::info!(module = "Permission", "Always allow: {} ({}) auto-approved", context.tool_name, action);
-                self.audit_logger.log(
-                    AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
-                        .with_user_id(context.user_id.as_deref())
-                        .with_result("Always allow rule matched"),
-                );
-                return PermissionResult::Granted;
-            }
-        }
-
         // Plan mode: only read-only operations allowed
         if mode == PermissionMode::PlanMode {
-            if Self::is_read_only_tool(&context.tool_name) {
+            if read_only {
                 tracing::info!(module = "Permission", "Plan mode: {} auto-approved (read-only)", context.tool_name);
                 self.audit_logger.log(
                     AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
@@ -185,9 +173,23 @@ impl PermissionManager {
             }
         }
 
+        // Always allow check: if tool/action is in the always allow list, auto-approve
+        if let Some(ref checker) = *self.always_allow_checker.lock().unwrap_or_else(|e| e.into_inner()) {
+            let action = self.extract_action_from_context(context);
+            if checker(&context.tool_name, &action) {
+                tracing::info!(module = "Permission", "Always allow: {} ({}) auto-approved", context.tool_name, action);
+                self.audit_logger.log(
+                    AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
+                        .with_user_id(context.user_id.as_deref())
+                        .with_result("Always allow rule matched"),
+                );
+                return PermissionResult::Granted;
+            }
+        }
+
         // Accept edits mode: read and edit operations auto-approved, dangerous operations need confirmation
         if mode == PermissionMode::AcceptEdits {
-            if Self::is_read_only_tool(&context.tool_name) || Self::is_edit_tool(&context.tool_name) {
+            if read_only || Self::is_edit_tool(&context.tool_name) {
                 tracing::info!(module = "Permission", "Accept edits mode: {} auto-approved", context.tool_name);
                 self.audit_logger.log(
                     AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)

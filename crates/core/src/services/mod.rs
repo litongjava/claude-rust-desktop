@@ -134,3 +134,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(9);")?;
     Ok(())
 }
+
+pub mod project_templates;
+
+pub mod magic_context;
+
+pub mod remote_access;
+pub mod scheduled_prompts;

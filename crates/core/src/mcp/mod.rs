@@ -888,6 +888,30 @@ impl McpConnector {
 
         let result = response.result.ok_or_else(|| anyhow!("No result in read resource response"))?;
 
+        // MCP returns a contents array (including text or base64 blobs). Preserve
+        // every entry, while retaining the Desktop's flattened text convenience field.
+        if let Some(contents) = result.get("contents").and_then(|v| v.as_array()) {
+            let mut text = Vec::new();
+            for entry in contents {
+                if let Some(value) = entry.get("text").and_then(|v| v.as_str()) {
+                    text.push(value.to_owned());
+                } else if let Some(blob) = entry.get("blob").and_then(|v| v.as_str()) {
+                    text.push(format!("[base64] {blob}"));
+                } else {
+                    return Err(anyhow!("MCP resource entry contains neither text nor blob"));
+                }
+            }
+            return Ok(McpResourceContent {
+                uri: uri.to_owned(),
+                content: text.join("\n"),
+                content_type: contents.first().and_then(|v| v.get("mimeType")).and_then(|v| v.as_str()).unwrap_or("text/plain").to_owned(),
+                metadata: Some(serde_json::json!({"contents":contents})),
+            });
+        }
+        if result.get("content").and_then(|v| v.as_str()).is_none() {
+            return Err(anyhow!("MCP resource response has no contents"));
+        }
+
         let content = McpResourceContent {
             uri: result.get("uri").and_then(|u| u.as_str()).unwrap_or(uri).to_string(),
             content: result.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),

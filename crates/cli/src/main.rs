@@ -1,4 +1,5 @@
 mod args;
+mod migration;
 mod config;
 #[allow(dead_code)]
 mod legacy_api_config;
@@ -77,6 +78,12 @@ async fn run(cli: &Cli) -> Result<()> {
         Some(Commands::StressTest { concurrency, iterations, endpoint, allow_remote }) => {
             return tokio::select! {result=claude_core::services::diagnostics::stress(*concurrency,*iterations,endpoint.clone(),*allow_remote)=>services::print(&result?), _=tokio::signal::ctrl_c()=>anyhow::bail!("Diagnostics cancelled")};
         }
+        Some(Commands::Learning { action }) => return migration::learning(&paths, action).await,
+        Some(Commands::Performance { action }) => return migration::performance(&paths, action).await,
+        Some(Commands::Project { action }) => return migration::project(action).await,
+        Some(Commands::Cron { action }) => return migration::cron(&paths, &std::env::current_dir()?, action).await,
+        Some(Commands::Ssh { config, operation, yes }) => return tokio::select! { result=migration::ssh(config,operation,*yes)=>result, _=tokio::signal::ctrl_c()=>anyhow::bail!("SSH operation cancelled") },
+        Some(Commands::Remote { request, yes }) => return tokio::select! { result=migration::remote(request,*yes)=>result, _=tokio::signal::ctrl_c()=>anyhow::bail!("Remote operation cancelled") },
         Some(Commands::Agents { action }) => {
             let context = services::context(&paths)?;
             match action {
@@ -152,9 +159,13 @@ async fn run(cli: &Cli) -> Result<()> {
             return Ok(());
         }
         Some(Commands::Skills { action }) => {
-            let manager = SkillsManager::new();
+            if let SkillsCommands::ImportLegacy {source,preview} = action {
+                return services::print(&claude_core::skills::import::import_legacy(source,&paths.data_dir.join("skills"),*preview)?);
+            }
+            let manager = SkillsManager::with_path(paths.data_dir.join("skills"));
             let skills = manager.load_skills().await?;
             match action {
+                SkillsCommands::ImportLegacy {..} => unreachable!(),
                 SkillsCommands::List => {
                     println!("{}", serde_json::to_string_pretty(&skills)?);
                     return Ok(());
@@ -179,6 +190,7 @@ async fn run(cli: &Cli) -> Result<()> {
                         .context("Skill not found")?;
                     let content = manager.get_skill_content(&found.id, "SKILL.md")?;
                     if let SkillsCommands::Execute { args, .. } = action {
+                        ensure!(found.enabled, "Skill is disabled");
                         skill_prompt = Some(format!(
                             "Use this skill for the following task:\n\n{content}\n\nTask: {}",
                             args.join(" ")

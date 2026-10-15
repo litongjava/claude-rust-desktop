@@ -40,9 +40,10 @@ pub struct Session {
     pub id: String,
     pub store: SessionStore,
     pub engine: NativeEngine,
-    mcp: Arc<Mutex<McpServerManager>>,
+    mcp: Arc<McpServerManager>,
     model: String,
     provider_id: String,
+    auto_route: bool,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
 }
 
@@ -89,11 +90,11 @@ impl Session {
             selection.providers,
             paths.data_dir.join("providers.json"),
         )));
-        let mcp = Arc::new(Mutex::new(McpServerManager::new(
+        let mcp = Arc::new(McpServerManager::new(
             paths.data_dir.join("mcp-servers.json"),
-        )));
+        ));
         {
-            let manager = mcp.lock().await;
+            let manager = &mcp;
             manager.initialize().await?;
             for server in manager
                 .list_servers()
@@ -115,7 +116,7 @@ impl Session {
         )
         .with_mcp_registry(Arc::new(McpToolRegistry::new(mcp.clone())))
         .with_skills_manager(Arc::new(Mutex::new(
-            claude_core::skills::SkillsManager::new(),
+            claude_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
         )));
         Ok(Self {
             id,
@@ -124,13 +125,14 @@ impl Session {
             mcp,
             model: selection.model,
             provider_id: selection.provider_id,
+            auto_route: cli.auto_route,
             api_format,
         })
     }
 
     pub async fn close(&self) -> Result<()> {
         self.engine.cancel_turn(&self.id).await;
-        self.mcp.lock().await.shutdown_all().await
+        self.mcp.shutdown_all().await
     }
 
     pub async fn turn(
@@ -161,7 +163,7 @@ impl Session {
                     conversation_id: self.id.clone(),
                     messages: history,
                     model: self.model.clone(),
-                    provider_id: Some(self.provider_id.clone()),
+                    provider_id: if self.auto_route { None } else { Some(self.provider_id.clone()) },
                     effort: cli.effort.clone(),
                     system_prompt: Some(system),
                     max_tokens: cli.max_tokens,

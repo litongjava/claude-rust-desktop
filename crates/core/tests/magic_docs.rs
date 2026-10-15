@@ -34,6 +34,8 @@ async fn previews_are_persistent_scoped_and_apply_checks_permissions_and_changes
     let preview = docs::update(&context, &root, &document.id, "New facts.", &generator)
         .await
         .unwrap();
+    assert!(preview.diff.contains("-Original facts."));
+    assert!(preview.diff.contains("+Original facts. New facts."));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     let reopened = ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
     assert_eq!(docs::previews(&reopened, &root).unwrap()[0].id, preview.id);

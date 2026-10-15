@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tools::{get_tool_definitions, execute_tool_async, ToolDefinition};
+use crate::tools::{get_tool_definitions, ToolDefinition};
 use crate::mcp::{McpServerManager, McpTool};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -226,55 +226,10 @@ impl SkillExecutionEngine {
     }
 
     async fn execute_tool_call(
-        tool_name: &str,
-        args: &JsonValue,
-        context: &SkillExecutionContext,
+        _tool_name: &str, _args: &JsonValue, _context: &SkillExecutionContext,
         _context_vars: &mut HashMap<String, String>,
     ) -> Result<ToolExecutionResult> {
-        let cwd = context.workspace_path.as_deref().unwrap_or(".");
-        
-        let is_mcp_tool = context.available_mcp_tools.iter()
-            .any(|t| t.name == tool_name);
-        
-        let result = if is_mcp_tool {
-            Self::execute_mcp_tool_call(tool_name, args, context).await
-        } else {
-            execute_tool_async(tool_name, args.clone(), cwd).await
-        };
-        
-        match result {
-            Ok(output) => Ok(ToolExecutionResult {
-                tool_name: tool_name.to_string(),
-                input: args.clone(),
-                output,
-                error: None,
-            }),
-            Err(e) => Ok(ToolExecutionResult {
-                tool_name: tool_name.to_string(),
-                input: args.clone(),
-                output: JsonValue::Null,
-                error: Some(e.to_string()),
-            }),
-        }
-    }
-    
-    async fn execute_mcp_tool_call(
-        tool_name: &str,
-        args: &JsonValue,
-        context: &SkillExecutionContext,
-    ) -> Result<JsonValue> {
-        let manager = context.mcp_server_manager.clone()
-            .ok_or_else(|| anyhow!("MCP server manager not available"))?;
-        
-        let mcp_tool = context.available_mcp_tools.iter()
-            .find(|t| t.name == tool_name)
-            .ok_or_else(|| anyhow!("MCP tool not found: {}", tool_name))?;
-        
-        let server_name = &mcp_tool.server_name;
-        
-        let response = manager.call_tool(server_name, tool_name, args.clone()).await?;
-        
-        Ok(response)
+        anyhow::bail!("Skill tool execution requires NativeEngine::execute_skill so normal permissions and cancellation apply")
     }
 
     fn generate_summary(

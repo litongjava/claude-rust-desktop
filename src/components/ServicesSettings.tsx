@@ -1,3 +1,7 @@
+import LearningPanel from './LearningPanel';
+import ProjectRemotePanel from './ProjectRemotePanel';
+import ScheduledPromptsPanel from './ScheduledPromptsPanel';
+import SkillImportPanel from './SkillImportPanel';
 import React, { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import MagicDocsPanel from './MagicDocsPanel';
@@ -29,6 +33,10 @@ async function configure(action: string, config: Record<string, unknown>, value:
 }
 
 export default function ServicesSettings() {
+  const [showLearning,setShowLearning]=useState(false);
+  const [showProjectTools,setShowProjectTools]=useState(false);
+  const [showSchedules,setShowSchedules]=useState(false);
+  const [showSkillImport,setShowSkillImport]=useState(false);
   const [showTeamContext,setShowTeamContext]=useState(false);
   const [showImport,setShowImport]=useState(false);
   const [showPlugins,setShowPlugins]=useState(false);
@@ -63,6 +71,14 @@ export default function ServicesSettings() {
     {error && <p role="alert" className="text-red-500 whitespace-pre-wrap">{error}</p>}{message && <p role="status">{message}</p>}
     <button className={buttonStyle} onClick={() => setShowDocs(!showDocs)}>Magic Docs 文档维护</button>
     {showDocs && <MagicDocsPanel />}
+    <button className={buttonStyle} onClick={()=>setShowLearning(!showLearning)}>学习与性能</button>
+    {showLearning&&<LearningPanel />}
+    <button className={buttonStyle} onClick={()=>setShowProjectTools(!showProjectTools)}>项目模板与远程操作</button>
+    {showProjectTools&&<ProjectRemotePanel />}
+    <button className={buttonStyle} onClick={()=>setShowSchedules(!showSchedules)}>定时提示词</button>
+    {showSchedules&&<ScheduledPromptsPanel />}
+    <button className={buttonStyle} onClick={()=>setShowSkillImport(!showSkillImport)}>导入旧技能目录</button>
+    {showSkillImport&&<SkillImportPanel />}
     <PeripheralDiagnostics />
     <button className={buttonStyle} onClick={()=>setShowPlugins(!showPlugins)}>插件安装与运行</button>
     {showPlugins&&<InstalledPlugins />}

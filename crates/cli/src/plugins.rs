@@ -4,6 +4,9 @@ use claude_core::{runtime::RuntimePaths, services::plugins};
 pub async fn run(paths: &RuntimePaths, action: &PluginCommands) -> Result<()> {
     let context = services::context(paths)?;
     match action {
+        PluginCommands::ImportLegacy { source, preview } => services::print(
+            &plugins::import_legacy(&context, std::path::Path::new(source), *preview)?,
+        ),
         PluginCommands::List => services::print(&plugins::list(&context)?),
         PluginCommands::Install { source } => {
             services::print(&plugins::install(&context, source, None).await?)

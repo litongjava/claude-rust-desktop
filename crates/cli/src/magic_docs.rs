@@ -12,6 +12,10 @@ pub async fn run(cli: &Cli, paths: &RuntimePaths, action: &MagicCommands) -> Res
     let context = crate::services::context(paths)?;
     let root = std::env::current_dir()?;
     match action {
+        MagicCommands::ContextConfig { project_id, enabled } => {
+            claude_core::services::magic_context::configure(&context, &root, project_id, *enabled)?;
+            print(&serde_json::json!({"include_conversations":enabled}))
+        }
         MagicCommands::ImportLegacy { source, preview } => {
             print(&docs::import_legacy(&context, &root, source, *preview)?)
         }
