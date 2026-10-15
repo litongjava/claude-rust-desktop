@@ -1238,8 +1238,8 @@ export function reconnectStream(
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
             }
-            if (parsed.type === 'tool_permission' && onSystem) {
-              onSystem('tool_permission', '', parsed);
+            if ((parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') && onSystem) {
+              onSystem(parsed.type, '', parsed);
             }
             if (parsed.type === 'request_snapshot' && onSystem) onSystem('request_snapshot', '', parsed);
             if (parsed.type === 'message_start' && onSystem) {
@@ -2375,9 +2375,9 @@ export async function sendMessage(
           }
 
           // Handle tool permission request from engine
-          if (parsed.type === 'tool_permission') {
+          if (parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') {
             if (onSystem) {
-              try { onSystem('tool_permission', '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
+              try { onSystem(parsed.type, '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
             }
             continue;
           }

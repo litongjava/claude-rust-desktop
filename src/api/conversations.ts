@@ -581,8 +581,8 @@ export async function reconnectStream(
               fullText = ''; thinkingText = '';
               onSystem?.('context_reset', '', parsed);
             }
-            if (parsed.type === 'tool_permission' && onSystem) {
-              onSystem('tool_permission', '', parsed);
+            if ((parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') && onSystem) {
+              onSystem(parsed.type, '', parsed);
             }
             if (parsed.type === 'request_snapshot' && onSystem) onSystem('request_snapshot', '', parsed);
             if (parsed.type === 'message_start' && onSystem) {

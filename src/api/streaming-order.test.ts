@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { sendMessage as sendDesktopMessage } from '../api';
+import { sendMessage as sendDesktopMessage, reconnectStream as reconnectDesktop } from '../api';
+import { reconnectStream as reconnectModular } from './conversations';
 import { sendMessage as sendModularMessage } from './chat';
 
 vi.mock('./client', () => ({
@@ -12,6 +13,18 @@ vi.mock('./client', () => ({
 afterEach(() => vi.unstubAllGlobals());
 
 describe.each([['desktop', sendDesktopMessage], ['modular', sendModularMessage]] as const)('%s streaming text', (_name, sendMessage) => {
+  it('forwards request-scoped permission completion before stream termination', async () => {
+    const permission = { type: 'tool_permission', request_id: 'approval', tool_use_id: 'write', tool_name: 'Write', input: {} };
+    const resolved = { type: 'tool_permission_resolved', request_id: 'approval', tool_use_id: 'write', conversation_id: 'test' };
+    const body = [permission, resolved, { type: 'message_stop' }].map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body)));
+    const system = vi.fn(), error = vi.fn(), done = vi.fn();
+    await sendMessage('test', 'hello', null, vi.fn(), done, error, undefined, system);
+    expect(error).not.toHaveBeenCalled();
+    expect(system.mock.calls.filter(call => call[0].startsWith('tool_permission')))
+      .toEqual([['tool_permission', '', permission], ['tool_permission_resolved', '', resolved]]);
+    expect(done).toHaveBeenCalled();
+  });
   it('forwards HTTP 400 with its original response body', async () => {
     const body = '{"detail":"The model is not supported."}';
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 400 })));
@@ -61,5 +74,17 @@ describe.each([['desktop', sendDesktopMessage], ['modular', sendModularMessage]]
     expect(error).not.toHaveBeenCalled();
     expect(done).toHaveBeenCalledWith('前言。结束。');
     expect(draft).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Report', preview: '# 内容', done: true }));
+  });
+});
+
+
+describe.each([['desktop', reconnectDesktop], ['modular', reconnectModular]] as const)('%s permission reconnect', (_name, reconnect) => {
+  it('forwards an already resolved request instead of reopening its approval', async () => {
+    const resolved = { type: 'tool_permission_resolved', request_id: 'previous', conversation_id: 'test' };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(`data: ${JSON.stringify(resolved)}\n\ndata: {"type":"message_stop"}\n\n`)));
+    const system = vi.fn(), error = vi.fn();
+    reconnect('test', vi.fn(), vi.fn(), error, undefined, system);
+    await vi.waitFor(() => expect(system).toHaveBeenCalledWith('tool_permission_resolved', '', resolved));
+    expect(error).not.toHaveBeenCalled();
   });
 });

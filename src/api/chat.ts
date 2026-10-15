@@ -953,9 +953,9 @@ export async function sendMessage(
               continue;
             }
 
-            if (parsed.type === 'tool_permission') {
+            if (parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') {
               if (onSystem) {
-                try { onSystem('tool_permission', '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
+                try { onSystem(parsed.type, '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
               }
               continue;
             }

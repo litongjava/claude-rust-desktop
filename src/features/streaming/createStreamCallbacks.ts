@@ -283,6 +283,12 @@ export function createStreamCallbacks(ctx: StreamContext) {
   const onSystemEvents = (event: string, message: string, data: any) => {
     if (!isStreamSessionActive(conversationId, streamRequestId)) return;
     if (event === 'request_snapshot') { onRequestSnapshot(data); return; }
+    if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string') {
+      if (data.conversation_id && data.conversation_id !== conversationId) return;
+      setToolPermissionDialog((current: any) => current?.request_id === data.request_id ? null : current);
+      setPermissionApproval((current: any) => current?.id === data.request_id ? null : current);
+      return;
+    }
 
     if (event === 'metadata' && data?.user_message_id) {
       setMessages(prev => {
@@ -575,6 +581,12 @@ export function createStreamCallbacks(ctx: StreamContext) {
   const onSystemEventsLight = (event: string, message: string, data: any) => {
     if (!isStreamSessionActive(conversationId, streamRequestId)) return;
     if (event === 'request_snapshot') { onRequestSnapshot(data); return; }
+    if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string') {
+      if (data.conversation_id && data.conversation_id !== conversationId) return;
+      setToolPermissionDialog((current: any) => current?.request_id === data.request_id ? null : current);
+      setPermissionApproval((current: any) => current?.id === data.request_id ? null : current);
+      return;
+    }
     if (event === 'metadata' && data?.user_message_id) {
       setMessagesFor(conversationId, prev => {
         const newMsgs = [...prev];

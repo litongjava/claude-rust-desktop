@@ -225,6 +225,7 @@ pub(super) async fn chat_handler(
             conn.query_row("SELECT COALESCE(MAX(request_number), 0) FROM model_requests WHERE conversation_id = ?1", rusqlite::params![conv_number], |row| row.get::<_, i64>(0))
         })).await.ok().and_then(Result::ok).and_then(Result::ok).unwrap_or(0);
         let mut terminal_event = None;
+        let mut permission_watches = super::permission_watch::PermissionWatches::default();
         let mut full_text = String::new();
         let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
 
@@ -234,6 +235,10 @@ pub(super) async fn chat_handler(
                 _ = transport.closed() => {
                     terminal_event = Some(serde_json::json!({"type":"message_stop","stop_reason":"cancelled","full_text":full_text,"error":"Response transport disconnected"}));
                     break;
+                }
+                resolved = permission_watches.next(&conv_id), if !permission_watches.is_empty() => {
+                    yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+                    continue;
                 }
                 event = rx.recv() => event,
             };
@@ -400,6 +405,14 @@ pub(super) async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input } => {
+                    let closed = match native_engine.lock().await.as_ref() {
+                        Some(engine) => engine.permission_completion(&request_id).await,
+                        None => tokio::sync::watch::channel(true).1,
+                    };
+                    if !permission_watches.register(&request_id, &tool_use_id, closed) {
+                        yield Ok::<Event, Infallible>(Event::default().data(super::permission_watch::resolved(&conv_id, &request_id, &tool_use_id).to_string()));
+                        continue;
+                    }
                     Some(serde_json::json!({
                         "type": "tool_permission",
                         "request_id": request_id,
@@ -466,6 +479,9 @@ pub(super) async fn chat_handler(
             }
         }
 
+        for resolved in permission_watches.finish(&conv_id) {
+            yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+        }
         // Save assistant message to SQLite after stream ends
         if !full_text.is_empty() || !request_snapshots.is_empty() || !collected_tool_calls.is_empty() {
             let db = db_clone;

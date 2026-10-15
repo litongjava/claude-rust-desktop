@@ -2,6 +2,7 @@ use super::AppState;
 
 pub mod system;
 pub mod chat;
+mod permission_watch;
 pub mod conversations;
 pub mod tools;
 pub mod projects;

@@ -715,6 +715,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 if (event === 'ask_user' && data) {
                   setAskUserDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, questions: data.questions || [], answers: {} });
                 }
+                if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string' && (!data.conversation_id || data.conversation_id === convId)) {
+                  setToolPermissionDialog(current => current?.request_id === data.request_id ? null : current);
+                  setPermissionApproval(current => current?.id === data.request_id ? null : current);
+                }
                 if (event === 'tool_permission' && data) {
                   setToolPermissionDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, tool_name: data.tool_name, input: data.input });
                   setPermissionApproval({

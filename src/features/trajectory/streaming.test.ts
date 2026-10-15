@@ -19,7 +19,7 @@ function harness() {
     setLoading: vi.fn(), setCompactStatus: vi.fn(), setContextInfo: vi.fn(), setTokenUsage: vi.fn(), setActiveTasks: vi.fn(),
     setAskUserDialog: vi.fn(), setToolPermissionDialog: vi.fn(), setPermissionApproval: vi.fn(), setPlanMode: vi.fn(), setConversationTitle: vi.fn(),
   };
-  return { callbacks: createStreamCallbacks(ctx), message: () => messages[messages.length - 1] };
+  return { callbacks: createStreamCallbacks(ctx), context: ctx, message: () => messages[messages.length - 1] };
 }
 describe('stream process recording', () => {
   it('persists a 400 card without replacing partial output or tool history', () => {
@@ -118,5 +118,32 @@ describe('stream process recording', () => {
     expect(message().processSteps.at(-1).text).toContain('Error: connection lost');
     expect(message().content).toContain('Before.');
     expect(message().processEndedAt).toBeGreaterThan(0);
+  });
+});
+
+
+describe('native permission completion', () => {
+  it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s dismisses only the completed permission request', callback => {
+    const { callbacks, context } = harness();
+    const stale = { request_id: 'old', tool_use_id: 'tool-a' };
+    const newer = { request_id: 'new', tool_use_id: 'tool-b' };
+    callbacks[callback]('tool_permission_resolved', '', { conversation_id: 'test', request_id: 'old' });
+    const closeDialog = context.setToolPermissionDialog.mock.lastCall[0];
+    const closeApproval = context.setPermissionApproval.mock.lastCall[0];
+    expect(closeDialog(stale)).toBeNull();
+    expect(closeDialog(newer)).toBe(newer);
+    expect(closeDialog(null)).toBeNull();
+    expect(closeApproval({ id: 'old' })).toBeNull();
+    const otherApproval = { id: 'new' };
+    expect(closeApproval(otherApproval)).toBe(otherApproval);
+    expect(context.setAskUserDialog).not.toHaveBeenCalled();
+  });
+
+  it.each(['onSystemEvents', 'onSystemEventsLight'] as const)('%s ignores completion from another conversation or malformed request', callback => {
+    const { callbacks, context } = harness();
+    callbacks[callback]('tool_permission_resolved', '', { conversation_id: 'other', request_id: 'old' });
+    callbacks[callback]('tool_permission_resolved', '', { conversation_id: 'test' });
+    expect(context.setToolPermissionDialog).not.toHaveBeenCalled();
+    expect(context.setPermissionApproval).not.toHaveBeenCalled();
   });
 });
