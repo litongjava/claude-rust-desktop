@@ -1,5 +1,7 @@
 //! Per-run SDK initialization. Validate and gather metadata before publishing overrides.
 use crate::{args::Cli, session::Session};
+#[path = "sdk_agents.rs"]
+mod agents;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 
@@ -27,9 +29,23 @@ impl State {
     ) -> Result<Value> {
         ensure!(!self.initialized, "Already initialized");
         let overrides = validate(cli, request)?;
-        let response = metadata(session).await?;
+        let catalog = agents::prepare(session, request.get("agents")).await?;
+        let mut response = metadata(session).await?;
+        let entries = response["agents"]
+            .as_array_mut()
+            .expect("metadata agents array");
+        for agent in catalog.iter() {
+            entries.retain(|entry| entry["name"] != agent.definition.id);
+            let mut entry =
+                json!({"name":agent.definition.id,"description":agent.definition.description});
+            if let Some(provider) = &agent.provider {
+                entry["model"] = json!(provider.model.id);
+            }
+            entries.push(entry);
+        }
         // Nothing above mutates the running session, including a failed metadata read.
         session.sdk_overrides = overrides;
+        session.engine.set_runtime_agents(&session.id, catalog);
         self.initialized = true;
         Ok(response)
     }
@@ -61,7 +77,8 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
                     .context("Invalid initialize.jsonSchema")?;
                 schema = Some(value.clone());
             }
-            "hooks" | "agents" => ensure!(
+            "agents" => ensure!(value.is_object(), "initialize.agents must be an object"),
+            "hooks" => ensure!(
                 value.as_object().is_some_and(|v| v.is_empty()),
                 "initialize.{key} is not supported; only an empty object is accepted"
             ),
@@ -191,7 +208,7 @@ mod tests {
             json!({"jsonSchema":{"$ref":"https://invalid/schema"}}),
             json!({"unknown":false}),
             json!({"hooks":{"PreToolUse":[]}}),
-            json!({"agents":{"custom":{}}}),
+            json!({"agents":[]}),
             json!({"sdkMcpServers":["host"]}),
             json!({"promptSuggestions":true}),
         ] {

@@ -21,6 +21,7 @@ use tokio::{
 #[derive(Clone, Copy)]
 enum Mode {
     Text,
+    RuntimeAgent,
     Approval,
     Question,
     Plan,
@@ -62,7 +63,8 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         state.mode,
         Mode::Truncated | Mode::TruncatedTool | Mode::TruncatedThinking
     ) || matches!(state.mode, Mode::ReadThenTruncated) && count > 1;
-    let tool = matches!(state.mode, Mode::Plan) && count == 1
+    let tool = matches!(state.mode, Mode::RuntimeAgent) && count <= 2
+        || matches!(state.mode, Mode::Plan) && count == 1
         || matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
         || matches!(state.mode, Mode::ReadThenTruncated) && count == 1
         || matches!(state.mode, Mode::Approval | Mode::Question) && count % 2 == 1;
@@ -71,7 +73,21 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
             json!({"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","content":[],"model":"fixture","usage":{"input_tokens":10,"output_tokens":0}}}),
         ];
         if tool {
-            let (id, name, args) = if matches!(state.mode, Mode::Question) {
+            let (id, name, args) = if matches!(state.mode, Mode::RuntimeAgent) {
+                if count == 1 {
+                    (
+                        "agent-1",
+                        "Agent",
+                        json!({"agent_type":"sdk-child","prompt":"Complete the child task"}),
+                    )
+                } else {
+                    (
+                        "write-1",
+                        "Write",
+                        json!({"file_path":"child.txt","content":"CHILD_WRITE"}),
+                    )
+                }
+            } else if matches!(state.mode, Mode::Question) {
                 (
                     "question-1",
                     "AskUserQuestion",
@@ -110,7 +126,20 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
             .collect::<String>()
     } else {
         let delta = if tool {
-            if matches!(state.mode, Mode::Question) {
+            if matches!(state.mode, Mode::RuntimeAgent) {
+                let (name, args) = if count == 1 {
+                    (
+                        "Agent",
+                        json!({"agent_type":"sdk-child","prompt":"Complete the child task"}),
+                    )
+                } else {
+                    (
+                        "Write",
+                        json!({"file_path":"child.txt","content":"CHILD_WRITE"}),
+                    )
+                };
+                json!({"tool_calls":[{"index":0,"id":if count==1 {"agent-1"}else{"write-1"},"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+            } else if matches!(state.mode, Mode::Question) {
                 json!({"tool_calls":[{"index":0,"id":"question-1","type":"function","function":{"name":"AskUserQuestion","arguments":json!({"question":"Which language?","description":"Choose the implementation language","multiSelect":true,"options":[{"label":"Rust","description":"Memory safety"},{"label":"Go","description":"Fast compilation"}]}).to_string()}}]})
             } else if matches!(state.mode, Mode::Plan) {
                 json!({"tool_calls":[{"index":0,"id":"plan-1","type":"function","function":{"name":"ExitPlanMode","arguments":json!({"plan":"APPROVED_PLAN_SENTINEL"}).to_string()}}]})
@@ -985,7 +1014,10 @@ async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_fail
         .unwrap();
         let mut client = Client::start(root.path(), &server, &["--permission-mode", "dontAsk"]);
         client.send(json!({"type":"control_request","request_id":"auto","request":{"subtype":"set_permission_mode","mode":"auto"}})).await;
-        assert_eq!(client.frame("control_response").await["response"]["subtype"], "success");
+        assert_eq!(
+            client.frame("control_response").await["response"]["subtype"],
+            "success"
+        );
         client.send(json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Write approval.txt with the requested content"},{"type":"text","text":"SDK_AUTHORITY_TEXT: only edit that requested file"}]}})).await;
         loop {
             let line = tokio::time::timeout(Duration::from_secs(20), client.output.next_line())
@@ -1430,5 +1462,213 @@ async fn sdk_unknown_and_completed_permission_ids_cannot_execute_pending_tools()
             "updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await;
         assert!(!client.finish().await.0.success());
         assert!(!root.path().join("approval.txt").exists());
+    }
+}
+
+#[tokio::test]
+async fn sdk_initialize_agents_execute_with_bounded_tools_and_run_local_catalog() {
+    for anthropic in [false, true] {
+        for case in [
+            "allow",
+            "disallow",
+            "inherit-deny",
+            "parent",
+            "plan",
+            "turn-limit",
+        ] {
+            let disallow = matches!(case, "disallow" | "inherit-deny");
+            let parent_limited = case == "parent";
+            let server = Server::start(anthropic, Mode::RuntimeAgent).await;
+            let root = tempfile::tempdir().unwrap();
+            let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+            let context = claude_core::services::ServiceContext::open(
+                paths.clone(),
+                Arc::new(claude_core::services::EnvironmentCredentials),
+            )
+            .unwrap();
+            let mut config = claude_core::config::AppConfig::default();
+            config.providers.push(serde_json::from_value(json!({"id":"sdk-fixture","name":"SDK fixture provider","provider_type":if anthropic {"anthropic"}else{"openai"},"base_url":server.url,"enabled":true,"is_default":false,"settings":{},"supports_web_search":false,"models":[{"id":"fixture-model","name":"Fixture primary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true},{"id":"fixture-second","name":"Fixture secondary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true}]})).unwrap());
+            std::fs::write(
+                paths.data_dir.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let parent_session = if parent_limited {
+                let definition: claude_core::services::agents::Definition = serde_json::from_value(json!({"id":"limited-parent","description":"Read-only parent","system_prompt":"Parent scope","tools":["Agent","Read"]})).unwrap();
+                claude_core::services::agents::install(&context, definition.clone()).unwrap();
+                let id = claude_core::runtime::SessionStore::new(context.db.clone())
+                    .create(root.path(), "fixture-model", "sdk-fixture")
+                    .unwrap();
+                claude_core::services::agents::bind(&context.db, &id, &definition).unwrap();
+                Some(id)
+            } else {
+                None
+            };
+            let extra: &[&str] = if parent_limited {
+                &["--resume", parent_session.as_deref().unwrap()]
+            } else if case == "plan" {
+                &["--permission-mode", "plan"]
+            } else {
+                &[]
+            };
+            let mut client = Client::start(root.path(), &server, extra);
+            let mut definition = json!({"description":"SDK_CHILD_DESCRIPTION","prompt":"SDK_CHILD_PROMPT_SENTINEL",
+                "tools":["Read","Write"],"disallowedTools":if disallow {vec!["Write"]}else{vec![]},"model":if disallow {"inherit"}else{"fixture-second"},"maxTurns":if case == "turn-limit" {1}else{3}});
+            if case == "inherit-deny" {
+                definition.as_object_mut().unwrap().remove("tools");
+            }
+            if case == "allow" {
+                definition["model"] = json!("sdk-fixture::fixture-second");
+            }
+            client
+                .send(initialize_request(
+                    "init",
+                    json!({"agents":{"sdk-child":definition}}),
+                ))
+                .await;
+            let initialized = client.frame("control_response").await;
+            assert_eq!(
+                initialized["response"]["subtype"], "success",
+                "{initialized}"
+            );
+            assert!(initialized["response"]["response"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["name"] == "sdk-child"));
+            client.send(user("Delegate the task to sdk-child")).await;
+            let result = client.result().await;
+            assert_eq!(result["is_error"], false, "{result}");
+            assert_eq!(
+                root.path().join("child.txt").exists(),
+                matches!(case, "allow" | "turn-limit")
+            );
+            let requests = server.fixture.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                if case == "turn-limit" { 3 } else { 4 },
+                "{case}"
+            );
+            assert!(requests[0]["tools"]
+                .to_string()
+                .contains("SDK_CHILD_DESCRIPTION"));
+            let child = &requests[1];
+            assert!(
+                child.to_string().contains("SDK_CHILD_PROMPT_SENTINEL"),
+                "{child}"
+            );
+            let names = child["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| {
+                    if anthropic {
+                        tool["name"].as_str().unwrap()
+                    } else {
+                        tool["function"]["name"].as_str().unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"Read"));
+            assert_eq!(names.contains(&"Write"), !disallow && !parent_limited);
+            assert_eq!(
+                child["model"],
+                if disallow {
+                    "fixture-model"
+                } else {
+                    "fixture-second"
+                }
+            );
+            assert_eq!(names.contains(&"Bash"), case == "inherit-deny");
+            drop(requests);
+            assert!(client.finish().await.0.success());
+            let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+            let context = claude_core::services::ServiceContext::open(
+                paths,
+                Arc::new(claude_core::services::EnvironmentCredentials),
+            )
+            .unwrap();
+            assert!(!claude_core::services::agents::list(&context)
+                .unwrap()
+                .iter()
+                .any(|agent| agent.id == "sdk-child"));
+            let bindings: Vec<String> = context.db.with_conn(|conn| {
+                conn.prepare("SELECT definition FROM session_agents WHERE definition LIKE '%sdk-runtime-boundary%'")?
+                    .query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()
+            }).unwrap().unwrap();
+            assert_eq!(bindings.len(), 1);
+            let binding: Value = serde_json::from_str(&bindings[0]).unwrap();
+            assert!(!bindings[0].contains("SDK_CHILD_PROMPT_SENTINEL"));
+            assert_eq!(
+                binding["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool == "Write"),
+                !disallow && !parent_limited
+            );
+            let fresh = Server::start(anthropic, Mode::RuntimeAgent).await;
+            let mut client = Client::start(root.path(), &fresh, &[]);
+            client.send(initialize_request("fresh", json!({}))).await;
+            let response = client.frame("control_response").await;
+            assert!(!response["response"]["response"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["name"] == "sdk-child"));
+            client.send(user("Try the previous run agent")).await;
+            client.result().await;
+            assert!(fresh.fixture.requests.lock().unwrap()[1]
+                .to_string()
+                .contains("Unknown agent type"));
+            assert!(!fresh
+                .fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.to_string().contains("SDK_CHILD_PROMPT_SENTINEL")));
+            client.finish().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publication() {
+    for bad in [
+        json!({"description":"bad","prompt":"bad","model":"unknown-model"}),
+        json!({"description":"bad","prompt":"bad","tools":"Write"}),
+        json!({"description":"bad","prompt":"bad","permissionMode":"bypassPermissions"}),
+        json!({"description":"bad","prompt":"bad","maxTurns":0}),
+        json!({"description":"bad","prompt":"bad","mcpServers":["host"]}),
+        json!({"description":"bad","prompt":"bad","skills":["custom"]}),
+        json!({"description":"bad","prompt":"bad","background":true}),
+        json!({"description":"bad","prompt":"bad","memory":"project"}),
+        json!({"description":"bad","prompt":"bad","effort":"high"}),
+        json!({"description":"bad","prompt":"bad","initialPrompt":"initial"}),
+        json!({"description":"bad","prompt":"bad","criticalSystemReminder_EXPERIMENTAL":"reminder"}),
+    ] {
+        let server = Server::start(false, Mode::Text).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(
+            root.path(),
+            &server,
+            &["--system-prompt", "ORIGINAL_SYSTEM"],
+        );
+        client.send(initialize_request("invalid",json!({"systemPrompt":"MUST_NOT_APPLY","agents":{
+            "a-valid-first":{"description":"MUST_NOT_REGISTER","prompt":"MUST_NOT_APPLY"}, "z-invalid-second":bad}}))).await;
+        let result = client.frame("control_response").await;
+        assert_eq!(result["response"]["subtype"], "error", "{result}");
+        client.send(initialize_request("retry", json!({}))).await;
+        let result = client.frame("control_response").await;
+        assert_eq!(result["response"]["subtype"], "success", "{result}");
+        assert!(!result.to_string().contains("MUST_NOT_REGISTER"));
+        client.send(user("Check current system")).await;
+        client.result().await;
+        let requests = server.fixture.requests.lock().unwrap();
+        assert!(requests[0].to_string().contains("ORIGINAL_SYSTEM"));
+        assert!(!requests[0].to_string().contains("MUST_NOT_APPLY"));
+        drop(requests);
+        assert!(client.finish().await.0.success());
     }
 }

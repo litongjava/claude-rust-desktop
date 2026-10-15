@@ -16,7 +16,7 @@ use std::{
 pub(crate) type OwnedChildren = Arc<Mutex<HashMap<String, OwnedChild>>>;
 pub(crate) struct OwnedChild {
     executor: Box<ToolLoopExecutor>,
-    pub(super) parent: String,
+    pub(in crate::native_engine) parent: String,
     policy: Value,
     binding: Value,
     retained: Instant,
@@ -428,8 +428,46 @@ impl ToolLoopExecutor {
             RuntimePaths::new(root.to_path_buf())?,
             Arc::new(EnvironmentCredentials),
         )?;
-        let mut definition =
-            agents::resolve(&context, input["agent_type"].as_str().unwrap_or("general"))?;
+        let agent_type = input["agent_type"].as_str().unwrap_or("general");
+        let runtime = self
+            .runtime_agents
+            .iter()
+            .find(|agent| agent.definition.id == agent_type)
+            .cloned();
+        let mut definition = match &runtime {
+            Some(agent) => agent.definition.clone(),
+            None => agents::resolve(&context, agent_type)?,
+        };
+        let provider = runtime
+            .as_ref()
+            .and_then(|agent| agent.provider.clone())
+            .unwrap_or_else(|| self.provider.clone());
+        if let Some(agent) = &runtime {
+            if !agent.disallowed_tools.is_empty() {
+                let available = match definition.tools.take() {
+                    Some(tools) => tools,
+                    None => {
+                        let mut tools = self
+                            .tool_definitions()
+                            .into_iter()
+                            .map(|tool| tool.name)
+                            .collect::<Vec<_>>();
+                        if let Some(registry) = &self.mcp_registry {
+                            tools.extend(
+                                registry.get_all_tools().await?.into_iter().map(|tool| tool.name),
+                            );
+                        }
+                        tools
+                    }
+                };
+                definition.tools = Some(
+                    available
+                        .into_iter()
+                        .filter(|tool| !agent.disallowed_tools.contains(tool))
+                        .collect(),
+                );
+            }
+        }
         if let Some(parent) = &self.allowed_tools {
             definition.tools = Some(match definition.tools {
                 Some(child) => child
@@ -473,18 +511,34 @@ impl ToolLoopExecutor {
             context.db.with_conn(|conn| {
                 conn.execute(
                     "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
-                    rusqlite::params![child, self.provider.model.id, self.provider.provider.id],
+                    rusqlite::params![child, provider.model.id, provider.provider.id],
                 )
             })??;
             child
         } else {
             sessions.create(
                 std::path::Path::new(&self.workspace_cwd),
-                &self.provider.model.id,
-                &self.provider.provider.id,
+                &provider.model.id,
+                &provider.provider.id,
             )?
         };
-        agents::bind(&context.db, &id, &definition)?;
+        if runtime.is_some() {
+            // Preserve the effective tool boundary on a later standalone child resume,
+            // without making the SDK prompt/definition available after this run.
+            agents::bind(
+                &context.db,
+                &id,
+                &agents::Definition {
+                    id: "sdk-runtime-boundary".into(),
+                    description: "Inherited tool restrictions from an SDK child".into(),
+                    system_prompt: "This session retains the tool restrictions of its original SDK child task.".into(),
+                    tools: definition.tools.clone(),
+                    legacy: None,
+                },
+            )?;
+        } else {
+            agents::bind(&context.db, &id, &definition)?;
+        }
         sessions.append(&id, "user", prompt)?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         let system = format!(
@@ -494,15 +548,19 @@ impl ToolLoopExecutor {
             id,
             self.conv_id.as_deref().unwrap_or("")
         );
+        let child_max_tokens = self
+            .max_tokens
+            .min(provider.model.max_tokens.unwrap_or(self.max_tokens));
         let mut child = ToolLoopExecutor::new(
-            self.provider.clone(),
+            provider,
             vec![json!({"role":"user","content":prompt})],
             Some(system),
-            self.max_tokens,
+            child_max_tokens,
             events,
             self.workspace_cwd.clone(),
             self.reasoning_mode.clone(),
         )
+        .with_runtime_agents(self.runtime_agents.clone())
         .with_allowed_tools(definition.tools)
         .with_prompt_profile(self.prompt_profile)
         .with_conv_id(id.clone())
@@ -545,7 +603,12 @@ impl ToolLoopExecutor {
                 tracing::warn!("SubagentStart hook: {warning}");
             }
         }
-        child.max_tool_iterations = self.max_tool_iterations;
+        child.max_tool_iterations = runtime
+            .as_ref()
+            .and_then(|agent| agent.max_turns)
+            .map_or(self.max_tool_iterations, |limit| {
+                self.max_tool_iterations.min(limit as usize)
+            });
         child.mcp_registry = self.mcp_registry.clone();
         if let Some(memory) = &self.memex_client {
             child = child.with_memex(memory.clone());

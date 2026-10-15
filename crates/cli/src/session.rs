@@ -77,6 +77,17 @@ impl Session {
         models
     }
 
+    pub(crate) async fn sdk_resolve_model(
+        &self,
+        name: &str,
+    ) -> Result<claude_core::native_engine::provider_manager::ResolvedProvider> {
+        let providers = self.providers.lock().await;
+        let (provider, model) = name.split_once("::").unwrap_or((&self.provider_id, name));
+        providers
+            .resolve_selected(provider, model)
+            .context("SDK agent model is not configured")
+    }
+
     pub(crate) async fn sdk_set_model(&mut self, name: &str) -> Result<()> {
         let providers=self.providers.lock().await;
         let (provider,model)=name.split_once("::").unwrap_or((&self.provider_id,name));

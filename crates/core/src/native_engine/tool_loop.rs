@@ -157,6 +157,7 @@ pub struct ToolLoopExecutor {
     permission_mailbox: crate::native_engine::permission_response::Mailbox,
     permission_interrupted: Option<String>,
     approved_call: Option<(String, Value, String)>,
+    runtime_agents: super::runtime_agents::Catalog,
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
     context_manager: Option<ContextManager>,
@@ -523,6 +524,7 @@ impl ToolLoopExecutor {
             permission_mailbox: Default::default(),
             permission_interrupted: None,
             approved_call: None,
+            runtime_agents: Default::default(),
             permission_manager: None,
             memex_client: None,
             context_manager: None,
@@ -709,9 +711,28 @@ impl ToolLoopExecutor {
 
     pub fn with_allowed_tools(mut self, tools: Option<Vec<String>>) -> Self { self.allowed_tools = tools; self }
 
+    pub(crate) fn with_runtime_agents(mut self, agents: super::runtime_agents::Catalog) -> Self {
+        self.runtime_agents = agents;
+        self
+    }
+
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
-        if self.search_config_path.is_some() && self.delegation_depth < 2 { tools.extend(delegation::definitions()); }
+        if self.search_config_path.is_some() && self.delegation_depth < 2 {
+            let mut definitions = delegation::definitions();
+            if !self.runtime_agents.is_empty() {
+                let catalog = self
+                    .runtime_agents
+                    .iter()
+                    .map(|agent| format!("{}: {}", agent.definition.id, agent.definition.description))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                for definition in &mut definitions {
+                    definition.description.push_str(&format!(" Run-local agents: {catalog}"));
+                }
+            }
+            tools.extend(definitions);
+        }
         if self.search_config_path.is_some() && self.delegation_depth == 0 { tools.push(deep_research::definition()); }
         adapt_tools(tools, self.prompt_profile).into_iter().filter(|tool| self.allowed_tools.as_ref().is_none_or(|names| names.contains(&tool.name))).collect()
     }

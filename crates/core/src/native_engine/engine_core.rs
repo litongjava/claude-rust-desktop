@@ -107,6 +107,7 @@ pub struct ToolCallRecord {
 
 pub struct QueryEngine {
     owned_children: super::tool_loop::delegation::OwnedChildren,
+    runtime_agents: std::sync::RwLock<HashMap<String, super::runtime_agents::Catalog>>,
     auto_manual_interactive: std::sync::atomic::AtomicBool,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
@@ -143,6 +144,7 @@ impl QueryEngine {
             auto_manual_interactive: std::sync::atomic::AtomicBool::new(false),
             bundled_resources: Arc::default(),
             owned_children: Default::default(),
+            runtime_agents: Default::default(),
             provider_manager,
             db_manager,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -521,6 +523,14 @@ impl QueryEngine {
             reasoning_mode.clone(),
         )
         .with_owned_children(self.owned_children.clone())
+        .with_runtime_agents(
+            self.runtime_agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&conv_id)
+                .cloned()
+                .unwrap_or_default(),
+        )
         .with_allowed_directories(allowed_directories)
         .with_user_skill(pending_user_skill)
         .with_max_turns(request.max_turns)?
@@ -813,6 +823,25 @@ impl QueryEngine {
             state.status = ConversationStatus::Idle;
             state.last_activity = Utc::now().to_rfc3339();
         }
+    }
+
+    pub fn set_runtime_agents(&self, session: &str, agents: super::runtime_agents::Catalog) {
+        self.runtime_agents
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_owned(), agents);
+    }
+
+    pub fn clear_runtime_agents(&self, session: &str) {
+        self.runtime_agents
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+        // Retained executors must not keep a run-local catalog usable after SDK exit.
+        self.owned_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, child| child.parent != session);
     }
 
     pub async fn resume_with_permission(&self, request_id: &str, response: super::permission_response::PermissionResponse) -> Result<()> {

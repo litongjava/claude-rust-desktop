@@ -367,6 +367,7 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
     }
     session.sdk_content = None;
     session.sdk_overrides = Default::default();
+    session.engine.clear_runtime_agents(&session.id);
     result
 }
 
@@ -382,6 +383,7 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
     });
     session.sdk_permissions = Some(permissions.clone());
     session.sdk_overrides = Default::default();
+    session.engine.clear_runtime_agents(&session.id);
     let mut initialization = crate::sdk_initialization::State::default();
     let mut frames = crate::sdk_input::stdin();
     let mut queue = VecDeque::<UserMessage>::new();
