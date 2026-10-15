@@ -128,11 +128,12 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
     if job.session_id != session.id {
         display.notice("Follow-up prompts are queued to your current session after this view closes; they do not steer the attached child. /btw uses your current session context.");
     }
-    let proposal_frontend = if display.live.is_some() && job.session_id == session.id {
+    let main_execution = is_main_execution(&session.paths.data_dir, &job, &session.id)?;
+    let proposal_frontend = if display.live.is_some() && main_execution {
         Some(claude_core::services::goal_proposals::Frontend::acquire(session.store.db.clone(), &session.id)?)
     } else { None };
     present(session, &job, input, &mut display, false, proposal_frontend.as_ref()).await?;
-    let kickoff = if job.session_id == session.id && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session)? } else { None };
+    let kickoff = if main_execution && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session)? } else { None };
     drop(proposal_frontend);
     if let Some(kickoff) = kickoff { Box::pin(turn(cli, session, &kickoff, input)).await?; }
     Ok(())
@@ -143,6 +144,18 @@ fn authorize_attachment(job: &jobs::Job, session: &str) -> Result<()> {
         job.parent_session_id == session || job.session_id == session,
         "Task belongs to another session"
     );
+    Ok(())
+}
+
+fn is_main_execution(root: &std::path::Path, job: &jobs::Job, session: &str) -> Result<bool> {
+    Ok(job.session_id == session && claude_core::services::session_worker::job_execution_session(root, job)? == session)
+}
+
+pub(crate) fn cancel_job(session: &Session, id: &str) -> Result<()> {
+    let job = jobs::cancel(&session.paths.data_dir, id)?;
+    if is_main_execution(&session.paths.data_dir, &job, &session.id)? {
+        claude_core::services::goal_proposals::discard(&session.store.db, &session.id)?;
+    }
     Ok(())
 }
 
@@ -394,7 +407,7 @@ async fn observe(
                     },
                     Some(Action::Cancel) | None => {
                         if jobs::get(root, id)?.status == "completed" { return Ok(false); }
-                        if !cancelled { jobs::cancel(root, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
+                        if !cancelled { cancel_job(session, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
                     },
                     Some(Action::SideQuestion(question)) => {
                         if side.is_none() { side=Some(Box::pin(async move { crate::background_commands::side_question(session, &question).await })); }
@@ -423,7 +436,7 @@ async fn observe(
                 match answer { Ok(answer)=>display.notice(&format!("Side answer:\n{answer}")), Err(error)=>display.notice(&format!("Side question failed: {error:#}")) }
             },
             _ = tokio::signal::ctrl_c() => {
-                if !cancelled { jobs::cancel(root, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
+                if !cancelled { cancel_job(session, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
             },
         }
     }
@@ -710,6 +723,57 @@ fn result_text(event: &Value, streamed: bool) -> Option<&str> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[tokio::test]
+    async fn idle_child_attachment_never_consumes_parent_goal_and_main_cancel_revokes_it() {
+        use clap::Parser;
+        use claude_core::services::{goal_proposals, session_goals};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = claude_core::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let child = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let cli = Cli::try_parse_from(["claude-code"]).unwrap();
+        let mut provider = claude_core::runtime::provider_from_config(&crate::config::provider_template("fixture"));
+        provider.id = "fixture".into();
+        let session = Session::open(&cli, &paths, crate::config::Selection {
+            providers: vec![provider], model: "fixture".into(), provider_id: "fixture".into(),
+        }, Some(&parent)).await.unwrap();
+        let frontend = goal_proposals::Frontend::acquire(session.store.db.clone(), &parent).unwrap();
+        goal_proposals::propose(&session.store.db, &parent, &paths.data_dir, &session.workspace, &session.permissions,
+            &serde_json::json!({"condition":"Verify requested changes"})).unwrap();
+        let proposal = frontend.poll().unwrap().unwrap();
+        frontend.decide(&proposal.id, true, &paths.data_dir, &session.workspace, &session.permissions).unwrap();
+        drop(frontend);
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = paths.data_dir.join("background-tasks").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut job = jobs::Job { id: id.clone(), foreground: false, parent_session_id: parent.clone(), session_id: parent.clone(),
+            title: "idle child".into(), status: "completed".into(), supervisor_pid: None, child_pid: None,
+            started_ms: 1, heartbeat_ms: 2, finished_ms: Some(2), exit_code: Some(0), error: None };
+        std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+        std::fs::write(directory.join("owned-child.json"), serde_json::to_vec(&child).unwrap()).unwrap();
+        std::fs::write(directory.join("output.jsonl"), "").unwrap();
+        assert!(!is_main_execution(&paths.data_dir, &job, &parent).unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(3), attach(&cli, &session, &id, &mut None)).await.unwrap().unwrap();
+        assert!(session_goals::active(&session.store.db, &parent).unwrap().is_none());
+        // Cancelling an idle child also leaves the parent's separate approval intact.
+        job.status = "running".into(); job.finished_ms = None; job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
+        std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+        cancel_job(&session, &id).unwrap();
+        assert!(goal_proposals::activate(&session.store.db, &parent, &paths.data_dir, &session.workspace, &session.permissions).unwrap().is_some());
+        session_goals::clear(&session.store.db, &parent).unwrap();
+        let frontend = goal_proposals::Frontend::acquire(session.store.db.clone(), &parent).unwrap();
+        goal_proposals::propose(&session.store.db, &parent, &paths.data_dir, &session.workspace, &session.permissions,
+            &serde_json::json!({"condition":"Do remaining verification"})).unwrap();
+        let proposal = frontend.poll().unwrap().unwrap();
+        frontend.decide(&proposal.id, true, &paths.data_dir, &session.workspace, &session.permissions).unwrap();
+        std::fs::remove_file(directory.join("owned-child.json")).unwrap();
+        assert!(is_main_execution(&paths.data_dir, &job, &parent).unwrap());
+        cancel_job(&session, &id).unwrap();
+        assert!(goal_proposals::activate(&session.store.db, &parent, &paths.data_dir, &session.workspace, &session.permissions).unwrap().is_none());
+        assert!(session_goals::active(&session.store.db, &parent).unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn attachment_checks_owner_and_reads_completed_job_without_resubmission() {
         use clap::Parser;

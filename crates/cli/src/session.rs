@@ -511,6 +511,7 @@ impl Session {
                 Ok(Some(followup)) => next = followup,
                 Ok(None) => break,
                 Err(error) => {
+                    claude_core::services::goal_proposals::discard(&self.store.db, &self.id)?;
                     if let Some(goal) = goal {
                         if crate::session_commands::retryable_goal_error(&error, std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_some()) {
                             if let Some(retry) = claude_core::services::session_goals::arm_retry(&self.store.db, &self.id, &goal.id, &error.to_string())? {

@@ -225,7 +225,7 @@ pub async fn handle(
                             == session.id,
                         "Task belongs to another session"
                     );
-                    background_sessions::cancel(&paths.data_dir, id)?;
+                    crate::worker_frontend::cancel_job(session, id)?;
                     eprintln!("Cancellation requested for {id}; /tasks shows the confirmed terminal state.");
                 }
                 _ => anyhow::bail!(

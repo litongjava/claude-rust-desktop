@@ -22,6 +22,8 @@ pub struct Proposal {
     revision: u64,
     frontend: String,
     pub approved: bool,
+    #[serde(default)]
+    source_job: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Presence {
@@ -193,6 +195,10 @@ impl Frontend {
             };
             if approved {
                 ensure!(
+                    source_job_allows_activation(root, &self.session, proposal),
+                    "The proposing task was cancelled or failed"
+                );
+                ensure!(
                     policy == Some(permissions.policy_snapshot()),
                     "ProposeGoal tool policy changed"
                 );
@@ -246,6 +252,12 @@ fn guard(
     permissions: &PermissionManager,
     _condition: &str,
 ) -> Result<bool> {
+    if let Some(directory) = super::background_sessions::worker_directory(root, session)? {
+        ensure!(
+            !directory.join("cancel").exists(),
+            "The proposing task was cancelled"
+        );
+    }
     crate::native_engine::workspace::conversation_project(conn, session)?;
     let mode: Option<String> = conn
         .query_row(
@@ -403,11 +415,37 @@ pub fn propose(
             revision: super::session_goals::revision_conn(conn, session)?,
             frontend: frontend.id.clone(),
             approved: false,
+            source_job: super::background_sessions::worker_directory(root, session)?.and_then(
+                |directory| {
+                    directory
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                },
+            ),
         };
         state.pending = Some(proposal);
         Ok(
             json!({"condition":condition,"askUser":true,"content":"Shown the goal proposal for approval. Continue working; do not wait for the decision. Until a kickoff message confirms activation, the existing goal remains unchanged. Do not ask about a declined proposal or re-propose it."}),
         )
+    })
+}
+
+// Persist the originating job so a killed/detached worker cannot leave consent
+// for a later unrelated turn to consume. Successful detached work remains valid.
+fn source_job_allows_activation(root: &Path, session: &str, proposal: &Proposal) -> bool {
+    let Some(id) = &proposal.source_job else {
+        return true;
+    };
+    super::background_sessions::get(root, id).is_ok_and(|job| {
+        job.session_id == session
+            && super::session_worker::job_execution_session(root, &job)
+                .is_ok_and(|target| target == session)
+            && matches!(job.status.as_str(), "starting" | "running" | "completed")
+            && !root
+                .join("background-tasks")
+                .join(id)
+                .join("cancel")
+                .exists()
     })
 }
 
@@ -436,9 +474,10 @@ pub fn activate(
         else {
             return Ok(None);
         };
-        if !policy
-            .as_ref()
-            .is_ok_and(|snapshot| *snapshot == permissions.policy_snapshot())
+        if !source_job_allows_activation(root, session, proposal)
+            || !policy
+                .as_ref()
+                .is_ok_and(|snapshot| *snapshot == permissions.policy_snapshot())
             || guard(
                 conn,
                 session,
@@ -538,6 +577,67 @@ mod tests {
             permission_authority::history(&self.db, &self.session, 65536).unwrap()
         }
     }
+    #[test]
+    fn failed_or_cancelled_origin_revokes_approved_goals_but_detach_preserves_them() {
+        for status in [
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "unresponsive",
+            "cancel-requested",
+        ] {
+            let f = Fixture::new();
+            let frontend = Frontend::acquire(f.db.clone(), &f.session).unwrap();
+            f.propose("Verify requested changes", true).unwrap();
+            let proposal = frontend.poll().unwrap().unwrap();
+            f.decide(&frontend, &proposal.id, true).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let directory = f.root.path().join("background-tasks").join(&id);
+            std::fs::create_dir_all(&directory).unwrap();
+            let job = super::super::background_sessions::Job {
+                id: id.clone(),
+                foreground: true,
+                parent_session_id: f.session.clone(),
+                session_id: f.session.clone(),
+                title: "proposal origin".into(),
+                status: if status == "cancel-requested" {
+                    "running"
+                } else {
+                    status
+                }
+                .into(),
+                supervisor_pid: None,
+                child_pid: None,
+                started_ms: now() as u64,
+                heartbeat_ms: now() as u64,
+                finished_ms: (status != "running" && status != "cancel-requested")
+                    .then_some(now() as u64),
+                exit_code: None,
+                error: None,
+            };
+            std::fs::write(
+                directory.join("state.json"),
+                serde_json::to_vec(&job).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(directory.join("detached"), b"detached").unwrap();
+            if status == "cancel-requested" {
+                std::fs::write(directory.join("cancel"), b"cancel").unwrap();
+            }
+            update(&f.db, &f.session, |_, state| {
+                state.pending.as_mut().unwrap().source_job = Some(id);
+                Ok(())
+            })
+            .unwrap();
+            drop(frontend); // A disappearing host does not itself revoke valid consent.
+            let allowed = matches!(status, "running" | "completed");
+            assert_eq!(f.activate().unwrap().is_some(), allowed, "{status}");
+            assert_eq!(f.authority().len(), usize::from(allowed), "{status}");
+            assert!(f.activate().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn approval_is_nonblocking_and_authority_is_created_only_once_at_activation() {
         let f = Fixture::new();
