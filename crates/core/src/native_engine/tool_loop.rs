@@ -34,6 +34,13 @@ mod code_prompt_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
+    /// Delegated task state without exposing the child's private model output.
+    AgentProgress {
+        session_id: String,
+        agent_type: String,
+        status: String,
+        tool_name: Option<String>,
+    },
     RequestSnapshot(Value),
     Text(String),
     Thinking(String),

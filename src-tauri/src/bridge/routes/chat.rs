@@ -403,6 +403,15 @@ pub(super) async fn chat_handler(
                         "total_count": total_count,
                     }))
                 }
+                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+                    Some(serde_json::json!({
+                        "type": "agent_progress",
+                        "session_id": session_id,
+                        "agent_type": agent_type,
+                        "status": status,
+                        "tool_name": tool_name,
+                    }))
+                }
                 crate::native_engine::tool_loop::EngineEvent::BudgetWarning { message, usage, limit } => {
                     Some(serde_json::json!({
                         "type": "budget_warning",

@@ -1,3 +1,4 @@
+mod command_catalog;
 mod interactive_config;
 mod args;
 mod migration;
@@ -13,6 +14,11 @@ mod help;
 mod voice;
 #[allow(dead_code)]
 mod terminal;
+mod repl;
+mod output;
+mod compaction;
+mod skill_commands;
+mod extended_commands;
 
 use anyhow::{bail, ensure, Context, Result};
 use args::{Cli, Commands, McpCommands, OutputFormat, SessionCommands, SkillsCommands};
@@ -40,6 +46,9 @@ async fn main() -> std::process::ExitCode {
         .with_ansi(io::stderr().is_terminal())
         .init();
     if let Err(error) = run(&cli).await {
+        if let Err(output_error) = output::report_startup_error(&cli, &error) {
+            eprintln!("Cannot write error result: {output_error}");
+        }
         eprintln!("Error: {error:#}");
         std::process::ExitCode::FAILURE
     } else {
@@ -126,8 +135,12 @@ async fn run(cli: &Cli) -> Result<()> {
         Some(Commands::Config { action }) => return config::run(&paths, action),
         Some(Commands::Mcp { action }) => return mcp(&paths, action).await,
         Some(Commands::Sessions { action }) => {
+            if let SessionCommands::Compact { id, instructions } = action {
+                return compaction::run(cli, &paths, id, instructions).await;
+            }
             let db = paths.open_database()?;
             let value = match action {
+                SessionCommands::Compact { .. } => unreachable!(),
                 SessionCommands::ImportLegacy {source,preview} => serde_json::to_value(claude_core::services::session_import::import(&services::context(&paths)?,source,&std::env::current_dir()?,*preview)?)?,
                 SessionCommands::List => serde_json::to_value(
                     db.with_conn(claude_core::db::conversation_repo::list_conversations)??,
@@ -207,7 +220,9 @@ async fn run(cli: &Cli) -> Result<()> {
     }
     let explicit_repl = matches!(cli.command, Some(Commands::Repl { .. }));
     let single = cli.print
+        || cli.print_short
         || cli.no_interactive
+        || cli.no_interactive_short
         || matches!(cli.command, Some(Commands::Query { .. }))
         || skill_prompt.is_some()
         || !io::stdin().is_terminal();
@@ -241,6 +256,9 @@ async fn run(cli: &Cli) -> Result<()> {
     );
     let resumed = if let Some(id) = &cli.resume {
         Some(SessionStore::new(paths.open_database()?).resume(id)?)
+    } else if cli.continue_session {
+        Some(SessionStore::new(paths.open_database()?).latest(&std::env::current_dir()?)?
+            .context("No resumable Code session in this directory")?)
     } else {
         None
     };
@@ -278,35 +296,108 @@ async fn run(cli: &Cli) -> Result<()> {
         },
         Err(error) => return Err(error),
     };
-    let mut session = session::Session::open(cli, &paths, selection).await?;
+    let mut session = session::Session::open(cli, &paths, selection, resumed.as_ref().map(|s| s.id.as_str())).await?;
     let result = async {
         if !single { eprintln!("Claude Rust {} — session {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.id); }
         if !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
         if single { return Ok(()); }
+        let mut skills = skill_commands::load(&paths).await?;
+        input.as_mut().unwrap().set_commands(skill_commands::catalog(&skills));
+        let mut composer = terminal::prompt::Composer::default();
         loop {
-            eprint!("\n> "); io::stderr().flush()?;
+            let mut catalog = skill_commands::catalog(&skills);
+            if let Some((_, description)) = catalog.iter_mut().find(|(name, _)| name == "/model") {
+                *description = format!("Set the AI model (currently {} · {})", session.model, session.provider_id);
+            }
+            input.as_mut().unwrap().set_commands(catalog);
+            input.as_mut().unwrap().set_details(repl::tool_details(&session)?);
+            let prompt = if composer.is_pending() { "... " } else { "\n> " };
             let line = tokio::select! {
-                line = input.as_mut().expect("interactive reader").recv() => match line { Some(line) => line, None => break },
-                _ = tokio::signal::ctrl_c() => break,
+                line = input.as_mut().expect("interactive reader").read_prompt(prompt) => match line {
+                    Ok(Some(line)) => line,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        if composer.is_pending() {
+                            composer.cancel();
+                            eprintln!("Prompt discarded.");
+                            continue;
+                        }
+                        break;
+                    },
+                    Err(error) => return Err(error.into()),
+                    Ok(None) => {
+                        if composer.is_pending() { eprintln!("Unfinished prompt discarded."); }
+                        break;
+                    }
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    if composer.is_pending() {
+                        composer.cancel();
+                        eprintln!("Prompt discarded.");
+                        continue;
+                    }
+                    break;
+                },
             };
+            let line = match composer.push(line) {
+                terminal::prompt::Input::Pending => continue,
+                terminal::prompt::Input::Cancelled => { eprintln!("Prompt discarded."); continue; },
+                terminal::prompt::Input::Prompt(prompt) => {
+                    if !prompt.trim().is_empty() {
+                        if let Err(error) = session.turn(cli, &prompt, &mut input).await { eprintln!("Error: {error:#}"); }
+                    }
+                    continue;
+                },
+                terminal::prompt::Input::Command(line) => line,
+            };
+            if line.trim() == "/reload-skills" {
+                match skill_commands::load(&paths).await {
+                    Ok(updated) => {
+                        skills = updated;
+                        input.as_mut().unwrap().set_commands(skill_commands::catalog(&skills));
+                        eprintln!("Loaded {} skill commands.", skills.len());
+                    },
+                    Err(error) => eprintln!("Cannot reload skills: {error:#}"),
+                }
+                continue;
+            }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
+                Ok(true) => continue,
+                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Ok(false) => {},
+            }
+            match repl::handle(&line, &paths, &mut session).await {
                 Ok(true) => continue,
                 Err(error) => { eprintln!("Error: {error:#}"); continue; },
                 Ok(false) => {},
             }
             match line.trim() {
                 "" => continue,
-                "/exit" | "exit" | "quit" | ".exit" | ":q" => break,
-                "/help" | "help" | ".help" | ":h" => eprintln!("/exit  /status  /history  /tools\n/provider [ID|add|edit ID]  /model [ID]  /test\nSwitches preserve history; /test makes an isolated text request. Resume with --resume ID."),
+                "/exit" | "/quit" | "exit" | "quit" | ".exit" | ":q" => break,
+                "/" | "/help" | "help" | ".help" | ":h" => {
+                    eprintln!("{}", command_catalog::help());
+                    for (name, description) in &skills { eprintln!("  {name:<24} {description}"); }
+                },
                 "/status" | "status" | ".status" => { eprintln!("Session: {}\nProject: {}\nData: {}", session.id, std::env::current_dir()?.display(), paths.data_dir.display()); interactive_config::status(&session); },
                 "/history" | "history" | ".history" => println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
                 "/tools" | "tools" | ".tools" => for tool in claude_core::tools::get_tool_definitions() { eprintln!("{}: {}", tool.name, tool.description); },
-                line => if let Err(error) = session.turn(cli, line, &mut input).await { eprintln!("Error: {error:#}"); },
+                command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {
+                    if let Err(error) = session.turn(cli, &line, &mut input).await { eprintln!("Error: {error:#}"); }
+                },
+                command if command.starts_with('/') => eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
+                _ => if let Err(error) = session.turn(cli, &line, &mut input).await { eprintln!("Error: {error:#}"); },
             }
         }
         Ok(())
     }.await;
     let shutdown = session.close().await;
+    // A completed single turn already wrote its terminal result. Shutdown may
+    // still fail, but stdout must not acquire a second result record.
+    if single && cli.output_format != OutputFormat::Text && result.is_ok() {
+        if let Err(error) = shutdown {
+            return Err(output::ReportedError(format!("Session shutdown failed: {error:#}")).into());
+        }
+        return result;
+    }
     result.and(shutdown)
 }
 

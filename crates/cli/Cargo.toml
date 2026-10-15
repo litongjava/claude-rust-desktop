@@ -20,6 +20,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 dirs = "5"
+rustyline = { version = "15", default-features = false }
+crossterm = "0.28"
+unicode-width = "0.2"
 cpal = "0.15"
 axum = "0.8"
 

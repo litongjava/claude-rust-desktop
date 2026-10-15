@@ -32,49 +32,112 @@ pub enum OutputFormat {
     Markdown,
 }
 
-pub mod input {
-    use std::io::{self, BufRead, Write};
+pub mod input;
+pub mod progress;
 
-    pub struct InputReader {
-        reader: io::BufReader<io::Stdin>,
+/// Assemble prompts without creating another stdin reader. Explicit multiline
+/// mode treats slash commands as literal text until /end or /cancel.
+pub mod prompt {
+    #[derive(Debug, PartialEq)]
+    pub enum Input {
+        Pending,
+        Cancelled,
+        Command(String),
+        Prompt(String),
     }
 
-    impl Default for InputReader {
-        fn default() -> Self {
-            Self::new()
+    #[derive(Default)]
+    pub struct Composer {
+        lines: Vec<String>,
+        multiline: bool,
+    }
+
+    impl Composer {
+        pub fn is_pending(&self) -> bool {
+            self.multiline || !self.lines.is_empty()
+        }
+
+        pub fn cancel(&mut self) {
+            self.lines.clear();
+            self.multiline = false;
+        }
+
+        pub fn push(&mut self, line: String) -> Input {
+            if self.is_pending() && line.trim() == "/cancel" {
+                self.cancel();
+                return Input::Cancelled;
+            }
+            if self.multiline {
+                if line.trim() == "/end" {
+                    self.multiline = false;
+                    return Input::Prompt(std::mem::take(&mut self.lines).join("\n"));
+                }
+                self.lines.push(line);
+                return Input::Pending;
+            }
+            if !self.is_pending() && line.trim() == "/multiline" {
+                self.multiline = true;
+                return Input::Pending;
+            }
+            // An odd number of trailing backslashes continues the prompt;
+            // pairs remain literal so Windows paths can be entered unchanged.
+            let trailing = line.chars().rev().take_while(|c| *c == '\\').count();
+            if trailing % 2 == 1 {
+                self.lines.push(line[..line.len() - 1].to_owned());
+                return Input::Pending;
+            }
+            if !self.lines.is_empty() {
+                self.lines.push(line);
+                return Input::Prompt(std::mem::take(&mut self.lines).join("\n"));
+            }
+            Input::Command(line)
         }
     }
 
-    impl InputReader {
-        pub fn new() -> Self {
-            Self {
-                reader: io::BufReader::new(io::stdin()),
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn multiline_preserves_whitespace_and_literal_commands() {
+            let mut composer = Composer::default();
+            assert_eq!(composer.push("/multiline".into()), Input::Pending);
+            for line in ["  code  ", "", "/exit"] {
+                assert_eq!(composer.push(line.into()), Input::Pending);
             }
+            assert_eq!(
+                composer.push("/end".into()),
+                Input::Prompt("  code  \n\n/exit".into())
+            );
+            assert!(!composer.is_pending());
         }
 
-        pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
-            print!("{}", prompt);
-            io::stdout().flush()?;
-            let mut line = String::new();
-            if self.reader.read_line(&mut line)? == 0 {
-                return Ok(None);
-            }
-            Ok(Some(line.trim_end().to_string()))
+        #[test]
+        fn continuation_and_cancellation_reset_state() {
+            let mut composer = Composer::default();
+            assert_eq!(composer.push("first\\".into()), Input::Pending);
+            assert_eq!(
+                composer.push("second".into()),
+                Input::Prompt("first\nsecond".into())
+            );
+            assert_eq!(composer.push("discard\\".into()), Input::Pending);
+            assert_eq!(composer.push("/cancel".into()), Input::Cancelled);
+            assert_eq!(
+                composer.push("hello".into()),
+                Input::Command("hello".into())
+            );
+            composer.push("/multiline".into());
+            composer.cancel();
+            assert!(!composer.is_pending());
         }
 
-        pub fn read_multiline(&mut self, terminator: &str) -> io::Result<String> {
-            let mut input = String::new();
-            loop {
-                let mut line = String::new();
-                if self.reader.read_line(&mut line)? == 0 {
-                    break;
-                }
-                if line.trim_end() == terminator {
-                    break;
-                }
-                input.push_str(&line);
-            }
-            Ok(input)
+        #[test]
+        fn double_backslash_is_literal() {
+            let mut composer = Composer::default();
+            assert_eq!(
+                composer.push("path\\\\".into()),
+                Input::Command("path\\\\".into())
+            );
         }
     }
 }

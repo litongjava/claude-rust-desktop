@@ -20,6 +20,7 @@ struct ChildState {
     context: ServiceContext,
     key: String,
     value: Value,
+    event_tx: tokio::sync::mpsc::Sender<EngineEvent>,
 }
 
 struct TeamTaskGuard {
@@ -41,10 +42,21 @@ impl Drop for TeamTaskGuard {
         }
     }
 }
+impl ChildState {
+    fn progress(&self, status: &str, tool_name: Option<String>) -> EngineEvent {
+        EngineEvent::AgentProgress {
+            session_id: self.value["session_id"].as_str().unwrap_or_default().into(),
+            agent_type: self.value["agent_type"].as_str().unwrap_or_default().into(),
+            status: status.into(),
+            tool_name,
+        }
+    }
+}
 impl Drop for ChildState {
     fn drop(&mut self) {
         if self.value["status"] == "running" {
             self.value["status"] = json!("cancelled");
+            let _ = self.event_tx.try_send(self.progress("cancelled", None));
         }
         self.value["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
         if self.context.save_setting(&self.key, &self.value).is_err() {
@@ -143,9 +155,11 @@ impl ToolLoopExecutor {
         let mut state = ChildState {
             context: context.clone(),
             key: format!("delegation.{id}"),
+            event_tx: self.event_tx.clone(),
             value: json!({"session_id":id,"parent_session_id":self.conv_id,"agent_type":definition.id,"status":"running","started_at":chrono::Utc::now().to_rfc3339()}),
         };
         context.save_setting(&state.key, &state.value)?;
+        let _ = self.event_tx.send(state.progress("started", None)).await;
         let (events, mut receiver) = tokio::sync::mpsc::channel(500);
         let system = format!(
             "{}\nChild task role:\n{}\nChild session ID: {}\nParent session ID: {}",
@@ -183,12 +197,25 @@ impl ToolLoopExecutor {
                 biased;
                 Some(event) = receiver.recv() => {
                     match event {
-                        event @ (EngineEvent::AskUser {..} | EngineEvent::ToolPermission {..} | EngineEvent::Usage(_)) => { let _ = self.event_tx.send(event).await; }
+                        event @ (EngineEvent::AskUser {..} | EngineEvent::ToolPermission {..} | EngineEvent::Usage(_) | EngineEvent::AgentProgress {..}) => { let _ = self.event_tx.send(event).await; }
+                        EngineEvent::ToolUseStart { tool_name, .. } => {
+                            let _ = self.event_tx.send(state.progress("running", Some(tool_name))).await;
+                        }
                         EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error }
                         | EngineEvent::PipelineToolResult { tool_use_id, tool_name, tool_input, output, is_error, .. } => {
                             let row = crate::db::message_repo::ToolCallRow { id: format!("{assistant_id}:{tool_use_id}"), message_id: assistant_id.clone(), name:tool_name, input:Some(tool_input.to_string()), output:Some(output), is_error, sort_order:tool_index };
-                            context.db.with_conn(|conn| crate::db::message_repo::save_stream_tool_result(conn, &id, &assistant_id, "", &row))??;
+                            let persisted = (|| -> Result<()> {
+                                context.db.with_conn(|conn| crate::db::message_repo::save_stream_tool_result(conn, &id, &assistant_id, "", &row))??;
+                                Ok(())
+                            })();
+                            if let Err(error) = persisted {
+                                state.value["status"] = json!("failed");
+                                let _ = self.event_tx.send(state.progress("failed", None)).await;
+                                return Err(error);
+                            }
                             tool_index += 1;
+                            let status = if is_error { "tool_failed" } else { "tool_completed" };
+                            let _ = self.event_tx.send(state.progress(status, Some(row.name.clone()))).await;
                         }
                         _ => {}
                     }
@@ -209,8 +236,14 @@ impl ToolLoopExecutor {
                             | "max_iterations"
                     )
                 );
-                state.value["status"] = json!(if failed { "failed" } else { "completed" });
-                sessions.append(&id, "assistant", &text)?;
+                if let Err(error) = sessions.append(&id, "assistant", &text) {
+                    state.value["status"] = json!("failed");
+                    let _ = self.event_tx.send(state.progress("failed", None)).await;
+                    return Err(error.into());
+                }
+                let status = if failed { "failed" } else { "completed" };
+                state.value["status"] = json!(status);
+                let _ = self.event_tx.send(state.progress(status, None)).await;
                 ensure!(
                     !failed,
                     "Child session {id} did not complete: {}",
@@ -220,6 +253,7 @@ impl ToolLoopExecutor {
             }
             Err(error) => {
                 state.value["status"] = json!("failed");
+                let _ = self.event_tx.send(state.progress("failed", None)).await;
                 Err(error)
             }
         }

@@ -27,6 +27,11 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
     if state.fail {
         return (StatusCode::BAD_REQUEST, "fixture failure").into_response();
     }
+    if body["stream"] != true {
+        return Json(json!({"id":"summary", "object":"chat.completion", "created":0,
+            "model":"fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":"SUMMARY_SENTINEL: preserve task and run tests"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}})).into_response();
+    }
     let last = body["messages"].as_array().unwrap().last().unwrap();
     let (delta, finish) = if let Some(tool) =
         state.tool.as_deref().filter(|_| last["role"] != "tool")
@@ -497,5 +502,118 @@ async fn legacy_agent_import_preserves_allowlist_in_real_shared_engine() {
     let output = execute(cli).await;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("READ_ALLOWED_SENTINEL"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn continue_fork_and_prompt_file_use_shared_session_without_changing_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let (url, fixture, task) = server(None, false).await;
+    let mut first = query(&data, temp.path(), &url);
+    first.args(["query", "-p", "original"]);
+    let first = execute(first).await;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let prompt_file = temp.path().join("system.txt");
+    std::fs::write(&prompt_file, "SYSTEM_FILE_SENTINEL 中文").unwrap();
+    let mut next = query(&data, temp.path(), &url);
+    next.args([
+        "--continue",
+        "--fork-session",
+        "--system-prompt-file",
+        prompt_file.to_str().unwrap(),
+        "--append-system-prompt",
+        "APPEND_SENTINEL",
+        "query",
+        "-p",
+        "follow up",
+    ]);
+    let next = execute(next).await;
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next: Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_ne!(first["session_id"], next["session_id"]);
+    {
+        let requests = fixture.requests.lock().unwrap();
+        let body = requests.last().unwrap().to_string();
+        assert!(body.contains("SYSTEM_FILE_SENTINEL"));
+        assert!(body.contains("APPEND_SENTINEL"));
+        assert!(body.contains("original"));
+        assert!(body.contains("follow up"));
+    }
+    let paths = claude_core::runtime::RuntimePaths::new(data).unwrap();
+    let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+    assert_eq!(
+        store
+            .history(first["session_id"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .history(next["session_id"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        4
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn compact_command_generates_summary_and_resume_uses_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let (url, fixture, task) = server(None, false).await;
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args(["query", "-p", "ORIGINAL_SENTINEL"]);
+    let first = execute(cli).await;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let id = first["session_id"].as_str().unwrap();
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args([
+        "sessions",
+        "compact",
+        id,
+        "--instructions",
+        "Preserve pending tests",
+    ]);
+    let compacted = execute(cli).await;
+    assert!(
+        compacted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compacted.stderr)
+    );
+    let compacted: Value = serde_json::from_slice(&compacted.stdout).unwrap();
+    assert_eq!(compacted["summarized_messages"], 2);
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args(["--resume", id, "query", "-p", "Continue after summary"]);
+    let resumed = execute(cli).await;
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].to_string().contains("ORIGINAL_SENTINEL"));
+    assert!(requests[2].to_string().contains("SUMMARY_SENTINEL"));
+    assert!(!requests[2].to_string().contains("ORIGINAL_SENTINEL"));
+    let paths = claude_core::runtime::RuntimePaths::new(data).unwrap();
+    let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+    assert_eq!(store.history(id).unwrap().len(), 5);
     task.abort();
 }

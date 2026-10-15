@@ -4,14 +4,12 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use claude_core::{config::ConfigManager, runtime::RuntimePaths};
 use serde_json::json;
-use std::io::{self, Write};
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::terminal::input::TerminalInput;
 
-async fn ask(input: &mut UnboundedReceiver<String>, prompt: &str) -> Result<String> {
-    eprint!("{prompt}: ");
-    io::stderr().flush()?;
+async fn ask(input: &mut TerminalInput, prompt: &str) -> Result<String> {
+    let prompt = format!("{prompt}: ");
     let line = tokio::select! {
-        line = input.recv() => line.context("Input closed")?,
+        line = input.read_answer(&prompt) => line?.context("Input closed")?,
         _ = tokio::signal::ctrl_c() => bail!("Cancelled"),
     };
     ensure!(line.trim() != "/cancel", "Cancelled");
@@ -20,7 +18,7 @@ async fn ask(input: &mut UnboundedReceiver<String>, prompt: &str) -> Result<Stri
 
 pub async fn wizard(
     paths: &RuntimePaths,
-    input: &mut UnboundedReceiver<String>,
+    input: &mut TerminalInput,
     edit: Option<&str>,
 ) -> Result<()> {
     paths.read_config()?;
@@ -143,7 +141,7 @@ pub fn status(session: &Session) {
 
 pub async fn setup(
     paths: &RuntimePaths,
-    input: &mut UnboundedReceiver<String>,
+    input: &mut TerminalInput,
 ) -> Result<config::Selection> {
     loop {
         for p in paths.read_config()?.providers.iter().filter(|p| p.enabled) {
@@ -180,7 +178,7 @@ pub async fn handle(
     line: &str,
     paths: &RuntimePaths,
     session: &mut Session,
-    input: &mut UnboundedReceiver<String>,
+    input: &mut TerminalInput,
 ) -> Result<bool> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or_default();
@@ -303,12 +301,12 @@ pub async fn handle(
 mod tests {
     use super::*;
 
-    fn answers(lines: &[&str]) -> UnboundedReceiver<String> {
+    fn answers(lines: &[&str]) -> TerminalInput {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         for line in lines {
             tx.send((*line).into()).unwrap();
         }
-        rx
+        rx.into()
     }
 
     #[tokio::test]
@@ -388,9 +386,14 @@ mod tests {
             manager.add_provider(p).unwrap();
         }
         let cli = Cli::parse_from(["claude-code"]);
-        let mut session = Session::open(&cli, &paths, select(&paths, "one", "model-a").unwrap())
-            .await
-            .unwrap();
+        let mut session = Session::open(
+            &cli,
+            &paths,
+            select(&paths, "one", "model-a").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
         session
             .store
             .append(&session.id, "user", "private-history-marker")

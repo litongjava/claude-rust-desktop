@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub provider: Option<String>,
     /// Allow the explicitly configured lightweight-model router for a new conversation.
-    #[arg(long, conflicts_with_all=["provider", "model", "resume"])]
+    #[arg(long, conflicts_with_all=["provider", "model", "resume", "continue_session"])]
     pub auto_route: bool,
     /// API endpoint for a temporary provider; never saved automatically.
     #[arg(long, env = "API_BASE_URL", global = true)]
@@ -40,24 +40,60 @@ pub struct Cli {
     /// Run once, stream the answer to stdout, then exit.
     #[arg(long, global = true)]
     pub print: bool,
-    #[arg(short = 'n', long, global = true)]
+    /// Run once (short form of --print, before any subcommand).
+    #[arg(short = 'p')]
+    pub print_short: bool,
+    #[arg(long, global = true)]
     pub no_interactive: bool,
+    /// Non-interactive mode (short form, before any subcommand).
+    #[arg(short = 'n')]
+    pub no_interactive_short: bool,
     #[arg(long, value_enum, default_value = "text", global = true)]
     pub output_format: OutputFormat,
     #[arg(long, value_enum, default_value = "ask", global = true)]
     pub permission_mode: PermissionModeArg,
-    #[arg(long, global = true)]
+    #[arg(short = 'r', long, global = true)]
     pub resume: Option<String>,
+    /// Continue the most recently updated conversation in this project.
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    pub continue_session: bool,
+    /// Copy the resumed conversation into a new session before continuing.
+    #[arg(long, global = true)]
+    pub fork_session: bool,
     #[arg(long, value_parser = ["off", "low", "high", "max"], global = true)]
     pub effort: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..), global = true)]
     pub max_tokens: Option<u32>,
     #[arg(long, global = true)]
     pub system_prompt: Option<String>,
+    /// Read a UTF-8 system prompt from a file.
+    #[arg(long, global = true, conflicts_with = "system_prompt")]
+    pub system_prompt_file: Option<PathBuf>,
+    /// Append instructions to the supplied system prompt.
+    #[arg(long, global = true)]
+    pub append_system_prompt: Option<String>,
     #[arg(short, long, global = true)]
     pub verbose: bool,
     #[arg(long)]
     pub info: bool,
+}
+
+impl Cli {
+    pub fn system_prompt_text(&self) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let mut prompt = match &self.system_prompt_file {
+            Some(path) => std::fs::read_to_string(path)
+                .with_context(|| format!("Cannot read UTF-8 system prompt: {}", path.display()))?,
+            None => self.system_prompt.clone().unwrap_or_default(),
+        };
+        if let Some(append) = &self.append_system_prompt {
+            if !prompt.is_empty() && !append.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(append);
+        }
+        Ok(prompt)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -364,6 +400,8 @@ pub enum SessionCommands {
     ImportLegacy {source:PathBuf,#[arg(long)] preview:bool},
     List,
     Show { id: String },
+    /// Summarize a saved conversation while preserving its original transcript.
+    Compact { id: String, #[arg(long, default_value = "")] instructions: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -378,4 +416,81 @@ pub enum PluginCommands {
     Remove { id: String },
     /// Execute with the current user's permissions in the selected project.
     Run { id: String, command: String, #[arg(long,default_value="null")] input: String, #[arg(long)] yes: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_sources_compose_and_reject_ambiguous_input() {
+        let cli = Cli::try_parse_from([
+            "claude-code",
+            "--system-prompt",
+            "Base",
+            "--append-system-prompt",
+            "Extra",
+        ])
+        .unwrap();
+        assert_eq!(cli.system_prompt_text().unwrap(), "Base\n\nExtra");
+        assert!(Cli::try_parse_from([
+            "claude-code",
+            "--system-prompt",
+            "Base",
+            "--system-prompt-file",
+            "prompt.txt",
+        ])
+        .is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.txt");
+        std::fs::write(&path, "中文 instructions").unwrap();
+        let cli = Cli::try_parse_from([
+            "claude-code",
+            "--system-prompt-file",
+            path.to_str().unwrap(),
+            "--append-system-prompt",
+            "Extra",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.system_prompt_text().unwrap(),
+            "中文 instructions\n\nExtra"
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(cli.system_prompt_text().is_err());
+        std::fs::remove_file(path).unwrap();
+        assert!(cli.system_prompt_text().is_err());
+    }
+
+    #[test]
+    fn continuation_is_exclusive_with_explicit_resume_and_auto_route() {
+        assert!(
+            Cli::try_parse_from(["claude-code", "-c"])
+                .unwrap()
+                .continue_session
+        );
+        assert!(Cli::try_parse_from(["claude-code", "-c", "--resume", "id"]).is_err());
+        assert!(Cli::try_parse_from(["claude-code", "-c", "--auto-route"]).is_err());
+    }
+
+    #[test]
+    fn root_short_flags_do_not_shadow_subcommand_flags() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        assert!(
+            Cli::try_parse_from(["claude-code", "-p", "hello"])
+                .unwrap()
+                .print_short
+        );
+        assert!(
+            matches!(Cli::try_parse_from(["claude-code", "query", "-p", "hello"]).unwrap().command,
+            Some(Commands::Query { prompt: Some(value) }) if value == "hello")
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["claude-code", "stress-test", "-c", "2"])
+                .unwrap()
+                .command,
+            Some(Commands::StressTest { concurrency: 2, .. })
+        ));
+    }
 }

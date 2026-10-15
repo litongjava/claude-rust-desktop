@@ -183,8 +183,23 @@ async fn run_case(cancel: bool, team: bool) {
         return;
     }
     let mut delegated = None;
+    let mut progress = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         while let Some(event) = events.recv().await {
+            if let claude_core::native_engine::tool_loop::EngineEvent::AgentProgress {
+                session_id,
+                agent_type,
+                status,
+                tool_name,
+            } = &event
+            {
+                progress.push((
+                    session_id.clone(),
+                    agent_type.clone(),
+                    status.clone(),
+                    tool_name.clone(),
+                ));
+            }
             if let claude_core::native_engine::tool_loop::EngineEvent::ToolUseDone {
                 tool_name,
                 output,
@@ -209,6 +224,21 @@ async fn run_case(cancel: bool, team: bool) {
     };
     let child_id = delegated["session_id"].as_str().unwrap().to_owned();
     assert_ne!(id, child_id);
+    assert!(progress
+        .iter()
+        .all(|(session, agent, _, _)| session == &child_id && agent == "general"));
+    assert_eq!(progress.first().unwrap().2, "started");
+    assert_eq!(progress.last().unwrap().2, "completed");
+    assert!(progress
+        .iter()
+        .any(|(_, _, status, tool)| status == "running" && tool.as_deref() == Some("Read")));
+    assert!(progress
+        .iter()
+        .any(|(_, _, status, tool)| status == "tool_completed" && tool.as_deref() == Some("Read")));
+    assert!(progress
+        .iter()
+        .any(|(_, _, status, tool)| status == "tool_failed" && tool.as_deref() == Some("Write")));
+
     assert!(!dir.path().join("forbidden.txt").exists());
     let definition = agents::for_session(&context.db, &child_id)
         .unwrap()

@@ -22,6 +22,19 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
         source.workspace_path.as_deref(), source.project_id.as_deref(), source.research_mode, false, false,
         &now, &now, messages.len() as i64)?;
     set_workspace_mode(&transaction, &new_id, &source.workspace_mode)?;
+    // Preserve the bound agent's prompt and tool restrictions for both CLI and
+    // Desktop branches. Older databases may not have the agent-service schema.
+    let has_agents: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_agents')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_agents {
+        transaction.execute(
+            "INSERT INTO session_agents (conversation_id, definition) SELECT ?1, definition FROM session_agents WHERE conversation_id = ?2",
+            params![new_id, source_id],
+        )?;
+    }
     transaction.execute("INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2", rusqlite::params![new_id, source_id])?;
     for message in messages {
         let new_message_id = uuid::Uuid::new_v4().to_string();

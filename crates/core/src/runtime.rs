@@ -223,11 +223,92 @@ impl SessionStore {
         })?
     }
 
+    /// Latest usable Code session in this exact directory, shared with Desktop.
+    /// Archived sessions and unavailable/untrusted projects are not candidates.
+    pub fn latest(&self, workspace: &Path) -> Result<Option<conversation_repo::ConversationRow>> {
+        let workspace =
+            std::fs::canonicalize(workspace).context("Project directory is unavailable")?;
+        ensure!(workspace.is_dir(), "Project path must be a directory");
+        self.db.with_conn(|conn| -> Result<_> {
+            let mut sessions = conversation_repo::list_conversations(conn)?;
+            sessions.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            for session in sessions {
+                if session.archived || session.workspace_mode != "code" {
+                    continue;
+                }
+                // Resolve the same project/worktree as the engine, rather than a
+                // stale conversation workspace_path or the caller's override.
+                let Ok((path, _)) = crate::native_engine::workspace::resolve_workspace(
+                    conn,
+                    &workspace,
+                    &session.id,
+                    None,
+                ) else {
+                    continue;
+                };
+                if std::fs::canonicalize(path).ok().as_ref() == Some(&workspace) {
+                    return Ok(Some(session));
+                }
+            }
+            Ok(None)
+        })?
+    }
+
+    /// Fork using Desktop's branching implementation, including tools and attachments.
+    pub fn fork(&self, id: &str) -> Result<String> {
+        self.resume(id)?;
+        self.db
+            .with_conn(|conn| conversation_repo::branch_conversation(conn, id, None, None))?
+    }
+
+    /// Start an empty session in the same project without deleting the original.
+    /// Copy bindings atomically so agent restrictions and worktrees survive clear.
+    pub fn clear(&self, id: &str) -> Result<String> {
+        self.resume(id)?;
+        self.db.with_conn(|conn| -> Result<String> {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let source = conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conversation_repo::insert_conversation(
+                &tx, &new_id, Some("CLI session"), source.model.as_deref(),
+                source.provider.as_deref(), source.workspace_path.as_deref(),
+                source.project_id.as_deref(), source.research_mode, false, false,
+                &now, &now, 0,
+            )?;
+            conversation_repo::set_workspace_mode(&tx, &new_id, &source.workspace_mode)?;
+            tx.execute(
+                "INSERT INTO session_agents (conversation_id, definition) SELECT ?1, definition FROM session_agents WHERE conversation_id = ?2",
+                rusqlite::params![new_id, id],
+            )?;
+            tx.execute(
+                "INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2",
+                rusqlite::params![new_id, id],
+            )?;
+            tx.commit()?;
+            Ok(new_id)
+        })?
+    }
+
+    pub fn workspace(&self, id: &str, workspaces_root: &Path) -> Result<PathBuf> {
+        self.resume(id)?;
+        self.db.with_conn(|conn| {
+            crate::native_engine::workspace::resolve_workspace(conn, workspaces_root, id, None)
+                .map(|(path, _)| path)
+        })?
+    }
+
     /// Rebuild protocol-valid tool history from the shared SQLite tool rows.
     pub fn model_history(&self, id: &str, format: &ApiFormat) -> Result<Vec<Value>> {
         self.db.with_conn(|conn| -> Result<_> {
             let mut history = Vec::new();
-            for message in message_repo::get_messages_by_conversation(conn, id)? {
+            let messages = message_repo::get_messages_by_conversation(conn, id)?;
+            let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
+            for message in messages.into_iter().skip(start) {
                 let calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
                 if message.role == "assistant" && !calls.is_empty() {
                     match format {

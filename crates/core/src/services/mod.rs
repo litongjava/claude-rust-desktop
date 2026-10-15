@@ -1,5 +1,6 @@
 //! Peripheral services shared by CLI and Desktop. Hosts supply credentials/devices.
 pub mod lifecycle;
+pub mod compaction;
 pub mod team;
 pub mod team_server;
 pub mod voice;

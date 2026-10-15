@@ -161,7 +161,17 @@ pub async fn run(
     config.validate()?;
     context.credentials.get(&config.credential)?;
     let resumed = if send {
-        if let Some(id) = &cli.resume {
+        let resume_id = if cli.continue_session {
+            Some(
+                claude_core::runtime::SessionStore::new(paths.open_database()?)
+                    .latest(&std::env::current_dir()?)?
+                    .context("No resumable Code session in this directory")?
+                    .id,
+            )
+        } else {
+            cli.resume.clone()
+        };
+        if let Some(id) = &resume_id {
             let db = paths.open_database()?;
             let resumed = claude_core::runtime::SessionStore::new(db.clone()).resume(id)?;
             let (workspace, _) = db.with_conn(|c| {
@@ -198,6 +208,7 @@ pub async fn run(
                     resumed.as_ref().and_then(|s| s.model.as_deref()),
                     resumed.as_ref().and_then(|s| s.provider.as_deref()),
                 )?,
+                resumed.as_ref().map(|s| s.id.as_str()),
             )
             .await?,
         )

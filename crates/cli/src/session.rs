@@ -19,21 +19,13 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
+use crate::terminal::input::TerminalInput;
 
 /// One stdin reader for the entire REPL, also used for tool questions. A detached
 /// OS thread avoids Tokio's uncancellable stdin read blocking runtime shutdown.
-pub fn terminal_input() -> mpsc::UnboundedReceiver<String> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let mut input = crate::terminal::input::InputReader::new();
-        while let Ok(Some(line)) = input.read_line("") {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    rx
+pub fn terminal_input() -> TerminalInput {
+    TerminalInput::new()
 }
 
 pub struct Session {
@@ -44,18 +36,30 @@ pub struct Session {
     pub(crate) model: String,
     pub(crate) provider_id: String,
     pub(crate) auto_route: bool,
+    permission_mode: PermissionModeArg,
     providers: Arc<Mutex<ProviderManager>>,
+    workspace: std::path::PathBuf,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
 }
 
 impl Session {
-    pub async fn open(cli: &Cli, paths: &RuntimePaths, selection: Selection) -> Result<Self> {
+    pub async fn open(
+        cli: &Cli,
+        paths: &RuntimePaths,
+        selection: Selection,
+        resumed_id: Option<&str>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !cli.fork_session || resumed_id.is_some(),
+            "--fork-session requires --resume or --continue"
+        );
+        cli.system_prompt_text()?;
         claude_core::config::OrchestrationConfig::init_global()?;
         let db = paths.open_database()?;
         let store = SessionStore::new(db.clone());
-        let id = if let Some(id) = &cli.resume {
+        let id = if let Some(id) = resumed_id {
             store.resume(id)?;
-            id.clone()
+            id.to_owned()
         } else {
             store.create(
                 &std::env::current_dir()?,
@@ -63,6 +67,12 @@ impl Session {
                 &selection.provider_id,
             ).context("Creating CLI session")?
         };
+        let id = if cli.fork_session {
+            store.fork(&id)?
+        } else {
+            id
+        };
+        let workspace = store.workspace(&id, &paths.data_dir.join("workspaces"))?;
         store.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE conversations SET model = ?1, provider = ?2 WHERE id = ?3",
@@ -127,7 +137,9 @@ impl Session {
             model: selection.model,
             provider_id: selection.provider_id,
             providers,
+            workspace,
             auto_route: cli.auto_route,
+            permission_mode: cli.permission_mode,
             api_format,
         })
     }
@@ -162,6 +174,64 @@ impl Session {
         Ok(())
     }
 
+    pub fn clear(&mut self) -> Result<String> {
+        let id = self.store.clear(&self.id)?;
+        self.id = id.clone();
+        Ok(id)
+    }
+
+    /// Validate the project and provider before replacing the current session.
+    pub async fn resume_saved(&mut self, paths: &RuntimePaths, id: &str) -> Result<()> {
+        let saved = self.store.resume(id)?;
+        let workspace = self.store.workspace(id, &paths.data_dir.join("workspaces"))?;
+        let model = saved.model.context("Saved session has no model")?;
+        let provider_id = saved.provider.context("Saved session has no provider")?;
+        let resolved = self.providers.lock().await.resolve_selected(&provider_id, &model)
+            .context("Saved provider/model is unavailable; current session retained")?;
+        self.workspace = workspace;
+        self.api_format = resolved.provider.api_format;
+        self.model = model;
+        self.provider_id = provider_id;
+        self.auto_route = false;
+        self.id = id.to_owned();
+        Ok(())
+    }
+
+    pub async fn branch_saved(&mut self, paths: &RuntimePaths, title: &str) -> Result<String> {
+        anyhow::ensure!(title.chars().count() <= 200, "Session titles must be at most 200 characters");
+        let id = self.store.fork(&self.id)?;
+        if !title.is_empty() {
+            self.store.db.with_conn(|conn| {
+                claude_core::db::conversation_repo::update_conversation_title(conn, &id, title)
+            })??;
+        }
+        self.resume_saved(paths, &id).await?;
+        Ok(id)
+    }
+
+    pub fn permission_mode(&self) -> &'static str {
+        match self.permission_mode {
+            PermissionModeArg::Ask => "ask",
+            PermissionModeArg::AcceptEdits => "accept-edits",
+            PermissionModeArg::Plan => "plan",
+            PermissionModeArg::Bypass => "bypass",
+        }
+    }
+
+    pub async fn set_permission_mode(&mut self, value: &str) -> Result<()> {
+        use clap::ValueEnum;
+        let mode = PermissionModeArg::from_str(value, false)
+            .map_err(|_| anyhow::anyhow!("Unknown permission mode '{value}'; use ask, accept-edits, plan, or bypass"))?;
+        self.engine.set_permission_mode(match mode {
+            PermissionModeArg::Ask => PermissionMode::AskPermissions,
+            PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
+            PermissionModeArg::Plan => PermissionMode::PlanMode,
+            PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
+        }).await;
+        self.permission_mode = mode;
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<()> {
         self.engine.cancel_turn(&self.id).await;
         self.mcp.shutdown_all().await
@@ -171,23 +241,18 @@ impl Session {
         &self,
         cli: &Cli,
         prompt: &str,
-        input: &mut Option<mpsc::UnboundedReceiver<String>>,
+        input: &mut Option<TerminalInput>,
     ) -> Result<()> {
         let mut history = self.store.model_history(&self.id, &self.api_format)?;
         history.push(json!({"role":"user","content":prompt}));
-        let mut system = cli.system_prompt.clone().unwrap_or_default();
+        let mut system = cli.system_prompt_text()?;
         system.push_str("\nThe user is working in the standalone Claude Rust terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
-        let cwd = std::env::current_dir()?;
-        for name in ["AGENTS.md", "CLAUDE.md"] {
-            let path = cwd.join(name);
-            if path.is_file() {
-                system.push_str(&format!(
-                    "\nProject instructions ({name}):\n{}",
-                    std::fs::read_to_string(path)?
-                ));
-            }
-        }
+        let cwd = &self.workspace;
         self.store.append(&self.id, "user", prompt).context("Persisting CLI user message")?;
+        let mut progress = crate::terminal::progress::TurnProgress::new(
+            input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short,
+        );
+        progress.set_permission_mode(self.permission_mode());
         let mut events = self
             .engine
             .send_message_with_history(
@@ -213,56 +278,74 @@ impl Session {
         let mut completed = false;
         let mut snapshots = Vec::<Value>::new();
         let mut tools = Vec::<message_repo::ToolCallRow>::new();
+        let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let turn_result: Result<()> = async {
             loop {
                 let event = tokio::select! {
                     event = events.recv() => event.context("Engine stream closed before completion")?,
                     _ = tokio::signal::ctrl_c() => bail!("Interrupted"),
+                    _ = refresh.tick() => { progress.tick(); continue; },
                 };
                 if cli.output_format == OutputFormat::StreamJson {
                     if let Some(value) = event_json(&event) { emit_json(&value)?; }
                 }
                 match event {
-                    EngineEvent::Text(delta) => { text.push_str(&delta); if cli.output_format == OutputFormat::Text { print!("{delta}"); io::stdout().flush()?; } },
-                    EngineEvent::Thinking(delta) if cli.verbose => eprint!("{delta}"),
-                    EngineEvent::Usage(value) => { if let Some(fields) = value.as_object() { for (key, value) in fields { usage[key] = value.clone(); } } },
-                    EngineEvent::Error(message) => { error = Some(message); },
+                    EngineEvent::Text(delta) => { text.push_str(&delta); if cli.output_format == OutputFormat::Text { progress.before_text(&delta); print!("{delta}"); io::stdout().flush()?; } },
+                    EngineEvent::Thinking(delta) => {
+                        if cli.verbose { progress.before_text(&delta); eprint!("{delta}"); }
+                        else { progress.thinking(); }
+                    },
+                    EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
+                    EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => progress.agent_progress(&session_id, &agent_type, &status, tool_name.as_deref()),
+                    EngineEvent::Usage(value) => { progress.reported_usage(&value); if let Some(fields) = value.as_object() { for (key, value) in fields { usage[key] = value.clone(); } } },
+                    EngineEvent::Error(message) => { progress.clear(); error = Some(message); },
                     EngineEvent::MessageStop { full_text, stop_reason } => {
-                        if text.is_empty() && !full_text.is_empty() { if cli.output_format == OutputFormat::Text { print!("{full_text}"); } text = full_text; }
+                        if text.is_empty() && !full_text.is_empty() { if cli.output_format == OutputFormat::Text { progress.before_text(&full_text); print!("{full_text}"); } text = full_text; }
                         if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning"].contains(&s)) {
                             error.get_or_insert_with(|| format!("Turn stopped: {}", stop_reason.unwrap()));
                         }
                         completed = true; break;
                     },
                     EngineEvent::ToolPermission { request_id, tool_name, input: tool_input, .. } => {
+                        progress.clear();
                         let reader = input.as_mut().context("Tool approval required in non-interactive mode; choose --permission-mode explicitly")?;
                         eprintln!("\nAllow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?);
                         let answer = read_answer(reader).await?;
                         let answer = if ["y", "yes", "是", "允许"].contains(&answer.trim().to_lowercase().as_str()) { "yes" } else { "no" };
                         self.engine.resume_with_answer(&request_id, answer.into()).await?;
+                        progress.set_activity("Working");
                     },
                     EngineEvent::AskUser { request_id, question, options } => {
+                        progress.clear();
                         let reader = input.as_mut().context("User input required in non-interactive mode; resume this session interactively")?;
                         eprintln!("\n{question}");
                         for (i, option) in options.iter().enumerate() { eprintln!("{}. {option}", i + 1); }
                         let answer = read_answer(reader).await?;
                         let answer = answer.trim().parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| options.get(i)).cloned().unwrap_or(answer);
                         self.engine.resume_with_answer(&request_id, answer).await?;
+                        progress.set_activity("Composing");
                     },
-                    EngineEvent::ToolUseStart { tool_name, .. } if cli.verbose => eprintln!("\n[{tool_name}]"),
+                    EngineEvent::ToolUseStart { tool_use_id, tool_name, tool_input, .. } => {
+                        progress.clear();
+                        if cli.verbose { eprintln!("\n[{tool_name}]"); }
+                        progress.tool_started(&tool_use_id, &tool_name, &tool_input);
+                    },
                     EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error }
                     | EngineEvent::PipelineToolResult { tool_use_id, tool_name, tool_input, output, is_error, .. } => {
+                        progress.tool_finished(&tool_use_id, &tool_name, &output, is_error);
                         tools.push(message_repo::ToolCallRow { id: tool_use_id, message_id: String::new(), name: tool_name, input: Some(tool_input.to_string()), output: Some(output), is_error, sort_order: tools.len() as i64 });
                     },
                     EngineEvent::RequestSnapshot(snapshot) => {
                         if let Some(old) = snapshots.iter_mut().find(|s| s["id"] == snapshot["id"]) { *old = snapshot; } else { snapshots.push(snapshot); }
                     },
-                    EngineEvent::BudgetWarning { message, .. } => eprintln!("{message}"),
+                    EngineEvent::BudgetWarning { message, .. } => { progress.clear(); eprintln!("{message}"); },
                     _ => {},
                 }
             }
             Ok(())
         }.await;
+        progress.clear();
         // Cancel and join before persisting, including Ctrl+C and closed stdin.
         self.engine.cancel_turn(&self.id).await;
         if let Err(failure) = turn_result {
@@ -291,20 +374,24 @@ impl Session {
             })??;
         }
         match cli.output_format {
-            OutputFormat::Text => println!(),
+            OutputFormat::Text => { println!(); io::stdout().flush()?; },
             _ => emit_json(
                 &json!({"type":"result","session_id":self.id,"result":text,"is_error":error.is_some(),"error":error,"usage":usage}),
             )?,
         }
+        progress.finish(error.as_deref());
         if let Some(error) = error {
+            if cli.output_format != OutputFormat::Text {
+                return Err(crate::output::ReportedError(format!("{error} (session {})", self.id)).into());
+            }
             bail!("{error} (session {})", self.id);
         }
         Ok(())
     }
 }
 
-async fn read_answer(reader: &mut mpsc::UnboundedReceiver<String>) -> Result<String> {
-    tokio::select! { answer = reader.recv() => answer.context("Input closed"), _ = tokio::signal::ctrl_c() => bail!("Interrupted") }
+async fn read_answer(reader: &mut TerminalInput) -> Result<String> {
+    tokio::select! { answer = reader.read_answer("") => answer?.context("Input closed"), _ = tokio::signal::ctrl_c() => bail!("Interrupted") }
 }
 
 fn emit_json(value: &Value) -> Result<()> {
@@ -321,6 +408,7 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
         EngineEvent::Thinking(delta) => json!({"type":"thinking","delta":delta}),
         EngineEvent::Usage(usage) => json!({"type":"usage","usage":usage}),
         EngineEvent::MessageStart { model } => json!({"type":"message_start","model":model}),
+        EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => json!({"type":"agent_progress","session_id":session_id,"agent_type":agent_type,"status":status,"tool_name":tool_name}),
         EngineEvent::Error(error) => json!({"type":"error","error":error}),
         EngineEvent::ToolUseStart {
             tool_use_id,
@@ -359,4 +447,23 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
         } => json!({"type":"permission","request_id":request_id,"name":tool_name,"input":input}),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn agent_progress_json_preserves_real_session_status() {
+        let value = event_json(&EngineEvent::AgentProgress {
+            session_id: "child-42".into(),
+            agent_type: "reviewer".into(),
+            status: "tool_failed".into(),
+            tool_name: Some("Read".into()),
+        }).unwrap();
+        assert_eq!(value, json!({
+            "type": "agent_progress", "session_id": "child-42",
+            "agent_type": "reviewer", "status": "tool_failed", "tool_name": "Read"
+        }));
+    }
 }

@@ -26,6 +26,7 @@ pub mod cost_tracker;
 pub mod native_engine;
 pub mod upload;
 pub mod project;
+pub mod project_instructions;
 pub mod ask_user;
 pub mod document;
 pub mod sandbox;

@@ -234,7 +234,8 @@ impl QueryEngine {
 
                 let model = conv.as_ref().and_then(|c| c.model.as_deref()).unwrap_or("");
 
-                let messages_json: Vec<Value> = messages.into_iter().map(|msg| {
+                let start = messages.iter().rposition(|msg| msg.is_compact_boundary).unwrap_or(0);
+                let messages_json: Vec<Value> = messages.into_iter().skip(start).map(|msg| {
                     serde_json::json!({
                         "role": msg.role,
                         "content": msg.content,
@@ -319,6 +320,7 @@ impl QueryEngine {
 
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
     pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
+        crate::services::compaction::apply_boundary(&self.db_manager, &request.conversation_id, &mut request.messages)?;
         let command = request.messages.iter().rev().find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str()).and_then(|text| text.trim_start().strip_prefix('/'))
             .and_then(|text| text.split_whitespace().next()).map(str::to_string);
@@ -367,6 +369,11 @@ impl QueryEngine {
         let workspace_path = workspace.to_string_lossy().into_owned();
         request.workspace_path = Some(workspace_path.clone());
         request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWorking directory: {workspace_path}\n"));
+        let instructions_workspace = workspace.clone();
+        let instructions = tokio::task::spawn_blocking(move || {
+            crate::project_instructions::load(&instructions_workspace)
+        }).await??;
+        request.system_prompt.get_or_insert_with(String::new).push_str(&instructions);
         if let Some(project) = project {
             let folders = project.folders.iter().map(|f| f.path.as_str()).collect::<Vec<_>>();
             let context = format!("\nProject: {}\nProject source folders (the first is the working directory):\n{}\nProject instructions:\n{}", project.name, serde_json::to_string(&folders)?, project.instructions.unwrap_or_default());
