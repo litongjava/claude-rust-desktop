@@ -69,6 +69,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         worktrees::definition(),
         agent_messages::definition(),
         scheduled::definition(),
+        crate::services::goal_proposals::definition(),
         ToolDefinition { name: "ToolSearch".into(), description: "Search the currently registered built-in tool names, descriptions and schemas. MCP tools are supplied separately by the host.".into(), input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
         ToolDefinition {
             name: "PluginRun".into(),

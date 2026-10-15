@@ -501,6 +501,10 @@ impl Session {
                 if (input.is_none() || cli.output_format != OutputFormat::Text) && std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
                     return Ok::<Option<String>,anyhow::Error>(None);
                 }
+                if let Some(kickoff) = claude_core::services::goal_proposals::activate(&self.store.db, &self.id, &self.paths.data_dir, &self.workspace, &self.permissions)? {
+                    crate::session_commands::goal_notice("Approved session goal is now active.");
+                    return Ok::<Option<String>,anyhow::Error>(Some(kickoff));
+                }
                 Box::pin(crate::session_commands::goal_check(self)).await
             }.await;
             match result {
@@ -580,6 +584,9 @@ impl Session {
         let interactive_display = input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short && !crate::display_commands::load(self)?.focus;
         self.engine.set_auto_manual_interactive(input.is_some());
         self.engine.set_permission_host_available(input.is_some() || self.sdk_permissions.is_some() || std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_some());
+        // A host flag and a live, session-owned frontend lease are both required.
+        // SDK/Desktop engines never enable this local terminal tool.
+        self.engine.set_local_goal_frontend(claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_some());
         let request = self
             .engine
             .send_message_with_history(
@@ -642,6 +649,7 @@ impl Session {
                                 }
                             },
                             crate::terminal::live::Action::Cancel => bail!("Interrupted"),
+                            crate::terminal::live::Action::GoalDecision { .. } => progress.notice("Goal proposals require the attached session frontend."),
                             crate::terminal::live::Action::Detach => progress.notice("This turn is not owned by a background worker."),
                             crate::terminal::live::Action::Submit(prompt) => {
                                 if let Some(message) = crate::session_commands::live_goal_command(self, &prompt)? { progress.notice(&message); }
@@ -874,7 +882,7 @@ impl Session {
                     crate::terminal::live::Action::SideQuestion(question)=>reader.queue_prompt(format!("/btw {question}")),
                     crate::terminal::live::Action::Draft(draft)=>reader.restore_draft(draft),
                     crate::terminal::live::Action::CyclePermission => { self.cycle_permission_mode().await?; },
-                    crate::terminal::live::Action::Cancel|crate::terminal::live::Action::Detach=>{},
+                    crate::terminal::live::Action::Cancel|crate::terminal::live::Action::Detach|crate::terminal::live::Action::GoalDecision { .. }=>{},
                 }
             }
         }
@@ -903,6 +911,7 @@ async fn turn_answer(session: &Session, progress: &mut crate::terminal::live::Tu
                     },
                     Some(crate::terminal::live::Action::Cancel)|None=>bail!("Interrupted"),
                     Some(crate::terminal::live::Action::Detach)=>progress.notice("Answer the pending question before detaching."),
+                    Some(crate::terminal::live::Action::GoalDecision { .. })=>progress.notice("Answer the pending question first."),
                     Some(crate::terminal::live::Action::Submit(prompt))=>if let Some(reader)=input.as_mut(){reader.queue_prompt(prompt);},
                     Some(crate::terminal::live::Action::SideQuestion(question))=>if let Some(reader)=input.as_mut(){reader.queue_prompt(format!("/btw {question}"));},
                     Some(crate::terminal::live::Action::Draft(draft))=>if let Some(reader)=input.as_ref(){reader.restore_draft(draft);},

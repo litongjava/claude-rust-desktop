@@ -18,6 +18,19 @@ pub async fn turn(
     prompt: &str,
     input: &mut Option<TerminalInput>,
 ) -> Result<()> {
+    let mut next = prompt.to_owned();
+    loop {
+        let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input)).await? else { return Ok(()) };
+        next = kickoff;
+    }
+}
+
+async fn single_turn(
+    cli: &Cli,
+    session: &Session,
+    prompt: &str,
+    input: &mut Option<TerminalInput>,
+) -> Result<Option<String>> {
     let root = &session.paths.data_dir;
     ensure!(!jobs::list(root, Some(&session.id))?.iter().any(|job| job.session_id == session.id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")),
         "This session already has an active worker. Use /tasks attach ID, /tasks cancel ID, or /clear to work in a new session; the current prompt was not submitted.");
@@ -47,6 +60,9 @@ pub async fn turn(
         &root.join("keybindings.json"),
         history,
     )?.with_workspace(&session.workspace);
+    let proposal_frontend = if display.live.is_some() {
+        Some(claude_core::services::goal_proposals::Frontend::acquire(session.store.db.clone(), &session.id)?)
+    } else { None };
     let job = if std::env::var("CLAUDE_RUST_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
         jobs::spawn_foreground(
             root,
@@ -85,11 +101,18 @@ pub async fn turn(
             }
         }
     };
-    present(session, &job, input, &mut display, true).await
+    present(session, &job, input, &mut display, true, proposal_frontend.as_ref()).await?;
+    if jobs::get(root, &job.id)?.status == "completed" { activate_goal_proposal(session) } else { Ok(None) }
+}
+
+fn activate_goal_proposal(session: &Session) -> Result<Option<String>> {
+    let kickoff = claude_core::services::goal_proposals::activate(&session.store.db, &session.id, &session.paths.data_dir, &session.workspace, &session.permissions)?;
+    if kickoff.is_some() { crate::session_commands::goal_notice("Approved session goal is now active."); }
+    Ok(kickoff)
 }
 
 /// Attach to durable events only: never submit or recreate a worker request.
-pub async fn attach(session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
+pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
     let job = jobs::get(&session.paths.data_dir, id)?;
     authorize_attachment(&job, &session.id)?;
     let workspace = session.store.workspace(&job.session_id, &session.paths.data_dir.join("workspaces"))?;
@@ -105,7 +128,14 @@ pub async fn attach(session: &Session, id: &str, input: &mut Option<TerminalInpu
     if job.session_id != session.id {
         display.notice("Follow-up prompts are queued to your current session after this view closes; they do not steer the attached child. /btw uses your current session context.");
     }
-    present(session, &job, input, &mut display, false).await
+    let proposal_frontend = if display.live.is_some() && job.session_id == session.id {
+        Some(claude_core::services::goal_proposals::Frontend::acquire(session.store.db.clone(), &session.id)?)
+    } else { None };
+    present(session, &job, input, &mut display, false, proposal_frontend.as_ref()).await?;
+    let kickoff = if job.session_id == session.id && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session)? } else { None };
+    drop(proposal_frontend);
+    if let Some(kickoff) = kickoff { Box::pin(turn(cli, session, &kickoff, input)).await?; }
+    Ok(())
 }
 
 fn authorize_attachment(job: &jobs::Job, session: &str) -> Result<()> {
@@ -122,10 +152,11 @@ async fn present(
     input: &mut Option<TerminalInput>,
     display: &mut TurnDisplay,
     sync_plan_mode: bool,
+    proposal_frontend: Option<&claude_core::services::goal_proposals::Frontend>,
 ) -> Result<()> {
     authorize_attachment(job, &session.id)?;
     let root = &session.paths.data_dir;
-    let result = observe(session, &job.id, &job.parent_session_id, input, display, sync_plan_mode).await;
+    let result = observe(session, &job.id, &job.parent_session_id, input, display, sync_plan_mode, proposal_frontend).await;
     let still_running = result.is_err()
         && jobs::get(root, &job.id)
             .is_ok_and(|job| matches!(job.status.as_str(), "starting" | "running"));
@@ -198,6 +229,7 @@ async fn observe(
     input: &mut Option<TerminalInput>,
     display: &mut TurnDisplay,
     sync_plan_mode: bool,
+    proposal_frontend: Option<&claude_core::services::goal_proposals::Frontend>,
 ) -> Result<bool> {
     let root = &session.paths.data_dir;
     let initial_job = jobs::get(root, id)?;
@@ -221,9 +253,16 @@ async fn observe(
     let mut notified = std::time::Instant::now();
     let mut notification_error = None;
     let mut final_mode_synced = false;
+    let mut shown_proposal = None::<String>;
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                let proposal = proposal_frontend.map(|frontend| frontend.poll()).transpose()?.flatten();
+                let has_proposal = proposal.is_some();
+                if shown_proposal.as_deref() != proposal.as_ref().map(|p| p.id.as_str()) {
+                    shown_proposal = proposal.as_ref().map(|p| p.id.clone());
+                    if let Some(live) = &display.live { live.goal_proposal(proposal.map(|p| (p.id, p.condition))); }
+                }
                 let (job, next, events) = jobs::events_since(root, id, owner, cursor)?;
                 let drained = cursor == next;
                 cursor = next;
@@ -277,8 +316,8 @@ async fn observe(
                 if drained && !matches!(job.status.as_str(), "starting"|"running") {
                     if job.session_id == owner && matches!(job.status.as_str(),"completed"|"failed"|"cancelled") {jobs::acknowledge_foreground(root,id,owner)?;}
                     ensure!(job.status == "completed", "Worker {}: {}{}", id, job.status, job.error.map(|error|format!(" - {error}")).unwrap_or_default());
-                    if side.is_none() { return Ok(false); }
-                    display.set_activity("Main task complete - finishing side question");
+                    if side.is_none() && !has_proposal { return Ok(false); }
+                    display.set_activity(if has_proposal { "Task complete · goal proposal awaiting your choice" } else { "Main task complete - finishing side question" });
                 }
                 if notified.elapsed() >= std::time::Duration::from_secs(1) {
                     match crate::background_commands::collect_completed(session) {
@@ -316,6 +355,16 @@ async fn observe(
             },
             action = display.action() => {
                 match action {
+                    Some(Action::GoalDecision { id, approved }) => {
+                        if let Some(frontend) = proposal_frontend {
+                            match frontend.decide(&id, approved, root, &session.workspace, &session.permissions) {
+                                Ok(true) => display.notice(if approved { "Goal approved. It will start after the current turn finishes." } else { "Goal proposal declined. Current work continues." }),
+                                Ok(false) => display.notice("That goal proposal is no longer current."),
+                                Err(error) => display.notice(&format!("Goal proposal not approved: {error:#}")),
+                            }
+                            shown_proposal = None;
+                        }
+                    },
                     Some(Action::CyclePermission) => {
                         let change = async {
                             let job = jobs::get(root, id)?;
@@ -344,6 +393,7 @@ async fn observe(
                         return Ok(true);
                     },
                     Some(Action::Cancel) | None => {
+                        if jobs::get(root, id)?.status == "completed" { return Ok(false); }
                         if !cancelled { jobs::cancel(root, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
                     },
                     Some(Action::SideQuestion(question)) => {
@@ -361,6 +411,7 @@ async fn observe(
                                     cancelled = true;
                                 }
                                 restore(input, Action::Submit(prompt));
+                                if jobs::get(root, id)?.status == "completed" { return Ok(false); }
                             }
                         } else { restore(input, Action::Submit(prompt)); }
                     },
@@ -718,7 +769,7 @@ mod failure_tests {
             let before = session.store.history(session_id).unwrap();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                attach(&session, &id, &mut None),
+                attach(&cli, &session, &id, &mut None),
             )
             .await
             .unwrap()
@@ -782,7 +833,7 @@ mod failure_tests {
         )
         .unwrap();
         std::fs::write(directory.join("output.jsonl"), "broken-json\n").unwrap();
-        let error = attach(&session, &id, &mut None).await.unwrap_err();
+        let error = attach(&cli, &session, &id, &mut None).await.unwrap_err();
         assert!(error.to_string().contains("worker continues"));
         assert_eq!(jobs::get(&paths.data_dir, &id).unwrap().status, "running");
         assert!(!directory.join("cancel").exists());

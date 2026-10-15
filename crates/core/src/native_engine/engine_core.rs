@@ -113,6 +113,7 @@ pub struct QueryEngine {
     runtime_agents: std::sync::RwLock<HashMap<String, super::runtime_agents::Catalog>>,
     auto_manual_interactive: std::sync::atomic::AtomicBool,
     permission_host_available: std::sync::atomic::AtomicBool,
+    local_goal_frontend: std::sync::atomic::AtomicBool,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
     db_manager: Arc<DbManager>,
@@ -147,6 +148,7 @@ impl QueryEngine {
         Self {
             auto_manual_interactive: std::sync::atomic::AtomicBool::new(false),
             permission_host_available: std::sync::atomic::AtomicBool::new(true),
+            local_goal_frontend: std::sync::atomic::AtomicBool::new(false),
             bundled_resources: Arc::default(),
             owned_children: Default::default(),
             runtime_agents: Default::default(),
@@ -187,6 +189,9 @@ impl QueryEngine {
 
     pub fn set_auto_manual_interactive(&self, interactive: bool) {
         self.auto_manual_interactive.store(interactive, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn set_local_goal_frontend(&self, enabled: bool) {
+        self.local_goal_frontend.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn check_tool_permission(
@@ -560,6 +565,7 @@ impl QueryEngine {
         .with_permission_manager(self.permission_manager.clone())
         .with_auto_manual_interactive(self.auto_manual_interactive.load(std::sync::atomic::Ordering::Relaxed))
         .with_permission_host(self.permission_host_available.load(std::sync::atomic::Ordering::Relaxed))
+        .with_local_goal_frontend(self.local_goal_frontend.load(std::sync::atomic::Ordering::Relaxed))
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(self.file_cache.clone(), workspace_path.clone())));
 
         if let Some(ref registry) = self.mcp_registry {

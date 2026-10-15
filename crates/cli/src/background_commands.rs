@@ -178,7 +178,7 @@ pub async fn handle(
                 "attach" => {
                     let id = parts.next().ok_or_else(|| anyhow::anyhow!("Usage: /tasks attach ID"))?;
                     ensure!(parts.next().is_none(), "Usage: /tasks attach ID");
-                    crate::worker_frontend::attach(session, id, input).await?;
+                    crate::worker_frontend::attach(cli, session, id, input).await?;
                 }
                 "show" | "logs" => {
                     let id = parts

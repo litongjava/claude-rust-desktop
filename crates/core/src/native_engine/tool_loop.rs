@@ -64,6 +64,9 @@ mod turn_budget_tests;
 #[cfg(test)]
 #[path = "durable_input_tests.rs"]
 mod durable_input_tests;
+#[cfg(test)]
+#[path = "goal_proposal_tests.rs"]
+mod goal_proposal_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -141,6 +144,7 @@ pub struct ToolLoopExecutor {
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
+    local_goal_frontend: bool,
     auto_history: Vec<Value>,
     messages: Vec<Value>,
     system_prompt: Option<String>,
@@ -511,6 +515,7 @@ impl ToolLoopExecutor {
         Self {
             auto_manual_interactive: false,
             permission_host_available: true,
+            local_goal_frontend: false,
             auto_history: messages.clone(),
             provider,
             messages,
@@ -599,6 +604,7 @@ impl ToolLoopExecutor {
         for warning in outcome.warnings { tracing::warn!("{event:?} hook: {warning}"); }
         if outcome.prevent_continuation {
             if let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) {
+                crate::services::goal_proposals::discard(db, id)?;
                 if let Some(goal) = crate::services::session_goals::active(db, id)? {
                     crate::services::session_goals::pause(db, id, &goal.id, "Stop hook prevented continuation")?;
                 }
@@ -763,6 +769,7 @@ impl ToolLoopExecutor {
 
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
+        if !self.goal_proposals_available() { tools.retain(|tool| tool.name != "ProposeGoal"); }
         if self.search_config_path.is_some() && self.delegation_depth < 2 {
             let mut definitions = delegation::definitions();
             if !self.runtime_agents.is_empty() {
@@ -789,6 +796,18 @@ impl ToolLoopExecutor {
 
     pub fn with_permission_host(mut self, available: bool) -> Self {
         self.permission_host_available = available;
+        self
+    }
+
+    fn goal_proposals_available(&self) -> bool {
+        if !self.local_goal_frontend || self.delegation_depth != 0 || self.subagent_hook_context.is_some() { return false; }
+        match (&self.goal_db, &self.conv_id, &self.permission_manager, self.search_config_path.as_deref().and_then(std::path::Path::parent)) {
+            (Some(db), Some(session), Some(permissions), Some(root)) => crate::services::goal_proposals::available(db, session, root, std::path::Path::new(&self.workspace_cwd), permissions),
+            _ => false,
+        }
+    }
+    pub fn with_local_goal_frontend(mut self, enabled: bool) -> Self {
+        self.local_goal_frontend = enabled;
         self
     }
 
@@ -1144,6 +1163,14 @@ impl ToolLoopExecutor {
         }
         if tool_name == "AskUserQuestion" {
             return self.execute_ask_user_question(tool_input, _tool_use_id).await;
+        }
+        if tool_name == "ProposeGoal" {
+            let result = (|| -> Result<Value> {
+                anyhow::ensure!(self.goal_proposals_available(), "ProposeGoal is only available in an attached local main session outside plan mode");
+                crate::services::goal_proposals::propose(self.goal_db.as_ref().unwrap(), self.conv_id.as_deref().unwrap(), self.search_config_path.as_deref().unwrap().parent().unwrap(), std::path::Path::new(&self.workspace_cwd), self.permission_manager.as_ref().unwrap(), tool_input)
+            })();
+            let failed = result.is_err();
+            return (tool_input.clone(), match result { Ok(value) => value.to_string(), Err(error) => error.to_string() }, failed);
         }
 
         if matches!(tool_name, "memory_search" | "memory_ingest") {
@@ -1695,7 +1722,7 @@ impl ToolLoopExecutor {
                                 }).await;
 
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
+                                let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || matches!(name.as_str(), "AskUserQuestion" | "ProposeGoal")
                                     || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                                     || self.is_plan_document_tool(&name, &input)
                                     || self.check_permission_requires_confirmation(&name, &input);
@@ -2225,7 +2252,7 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || name == "AskUserQuestion"
+                    let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || matches!(name.as_str(), "AskUserQuestion" | "ProposeGoal")
                         || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
                         || self.is_plan_document_tool(name, &input)
                         || self.check_permission_requires_confirmation(name, &input);

@@ -18,6 +18,7 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use unicode_width::UnicodeWidthChar;
 
 pub enum Action {
+    GoalDecision { id: String, approved: bool },
     CyclePermission,
     Submit(String),
     SideQuestion(String),
@@ -26,6 +27,7 @@ pub enum Action {
     Draft(String),
 }
 enum Update {
+    GoalProposal(Option<(String, String)>),
     PermissionMode(String),
     Text(String),
     Notice(String),
@@ -43,6 +45,9 @@ pub struct LiveTurn {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl LiveTurn {
+    pub fn goal_proposal(&self, proposal: Option<(String, String)>) {
+        let _ = self.updates.send(Update::GoalProposal(proposal));
+    }
     pub fn start(
         mode: &str,
         bindings: crate::keybindings::Keybindings,
@@ -214,6 +219,7 @@ impl Draft {
     }
 }
 struct State {
+    goal_proposal: Option<(String, String)>,
     mode: String,
     activity: String,
     draft: Draft,
@@ -239,6 +245,7 @@ struct State {
 impl State {
     fn new(mode: String) -> Self {
         Self {
+            goal_proposal: None,
             mode,
             activity: "Waiting for response".into(),
             draft: Draft::default(),
@@ -307,6 +314,11 @@ impl State {
         // This is a mode-control event, never a queued prompt or an answer.
         let _ = actions.send(Action::CyclePermission);
     }
+    fn decide_goal(&mut self, approved: bool, actions: &async_mpsc::UnboundedSender<Action>) {
+        if let Some((id, _)) = self.goal_proposal.take() {
+            let _ = actions.send(Action::GoalDecision { id, approved });
+        }
+    }
 
     fn question(&mut self, reply: oneshot::Sender<String>) {
         self.dismiss_closed_question();
@@ -350,7 +362,7 @@ impl State {
             let _ = actions.send(Action::Submit(text));
             return None;
         }
-        if text.trim().starts_with('/') {
+        if text.trim().starts_with('/') && !(self.goal_proposal.is_some() && self.activity.starts_with("Task complete")) {
             return Some("While working, use /btw QUESTION or type a prompt to queue; other commands are available after completion.".into());
         }
         let _ = actions.send(Action::Submit(text.clone()));
@@ -537,7 +549,10 @@ impl Frame {
                 status
             ),
             clip(
-                "  Tip: /btw asks a side question while the main task continues.",
+                if state.goal_proposal.is_some() {
+                    if state.answer.is_some() { "  Goal proposal pending; finish the current question first." }
+                    else { "  Proposed goal: Ctrl+Y approve · Ctrl+N decline. Work continues while you decide." }
+                } else { "  Tip: /btw asks a side question while the main task continues." },
                 width,
             ),
             rule.clone(),
@@ -659,6 +674,15 @@ fn run(
         let mut dirty = false;
         loop {
             match updates.try_recv() {
+                Ok(Update::GoalProposal(proposal)) => {
+                    if let Some((id, condition)) = &proposal {
+                        if state.goal_proposal.as_ref().is_none_or(|old| old.0 != *id) {
+                            screen.log(&format!("Proposed session goal:\n{}\nCtrl+Y approves this condition; Ctrl+N declines. The current task continues.", terminal_text(condition)))?;
+                        }
+                    }
+                    state.goal_proposal = proposal;
+                    dirty = true;
+                },
                 Ok(Update::PermissionMode(mode)) => { state.mode = mode; dirty = true; },
                 Ok(Update::Text(text)) => {
                     state.generated_characters = state
@@ -793,7 +817,9 @@ fn run(
                     if !(control && key.code == KeyCode::Char('r')) {
                         state.search_query = None;
                     }
-                    if control && key.code == KeyCode::Char('b') {
+                    if control && matches!(key.code, KeyCode::Char('y' | 'n')) && state.goal_proposal.is_some() && state.answer.is_none() {
+                        state.decide_goal(key.code == KeyCode::Char('y'), &actions);
+                    } else if control && key.code == KeyCode::Char('b') {
                         let _ = actions.send(Action::Detach);
                     } else if control && key.code == KeyCode::Char('o') {
                         state.details.toggle();
@@ -1169,6 +1195,33 @@ mod tests {
         state.draft.insert("/goal start a different task");
         assert!(state.submit(&send).is_some());
         assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn goal_decision_is_separate_from_prompts_and_preserves_the_draft() {
+        let mut state = State::new("ask".into());
+        let (send, mut receive) = async_mpsc::unbounded_channel();
+        state.draft.insert("my unfinished next prompt");
+        state.goal_proposal = Some(("proposal-id".into(), "Run tests".into()));
+        state.decide_goal(true, &send);
+        assert!(matches!(receive.try_recv().unwrap(), Action::GoalDecision { id, approved: true } if id == "proposal-id"));
+        assert_eq!(state.draft.take(), "my unfinished next prompt");
+        state.decide_goal(false, &send);
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn unanswered_goal_does_not_block_commands_after_the_model_finishes() {
+        let mut state = State::new("ask".into());
+        let (send, mut receive) = async_mpsc::unbounded_channel();
+        state.goal_proposal = Some(("proposal-id".into(), "Run tests".into()));
+        state.draft.insert("/model");
+        state.submit(&send);
+        assert!(receive.try_recv().is_err());
+        state.activity = "Task complete · goal proposal awaiting your choice".into();
+        state.draft.insert("/model");
+        state.submit(&send);
+        assert!(matches!(receive.try_recv().unwrap(), Action::Submit(command) if command == "/model"));
     }
 }
 

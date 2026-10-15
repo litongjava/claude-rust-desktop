@@ -328,7 +328,7 @@ impl PermissionManager {
         matches!(
             tool_name,
             "Read" | "ListDir" | "Grep" | "Glob" | "WebFetch" | "WebSearch" | "memory_search"
-                | "TodoRead" | "Skill" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode" | "brief" | "SyntheticOutput"
+                | "TodoRead" | "Skill" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "ProposeGoal" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode" | "brief" | "SyntheticOutput"
         )
     }
 
