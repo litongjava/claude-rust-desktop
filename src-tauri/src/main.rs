@@ -651,6 +651,7 @@ fn main() {
             commands::mcp_start_server,
             commands::mcp_stop_server,
             commands::mcp_restart_server,
+            commands::mcp_import_legacy,
             commands::mcp_add_server,
             commands::mcp_update_server,
             commands::mcp_remove_server,

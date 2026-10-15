@@ -290,8 +290,12 @@ async fn run(cli: &Cli) -> Result<()> {
 async fn mcp(paths: &RuntimePaths, action: &McpCommands) -> Result<()> {
     std::fs::create_dir_all(&paths.data_dir)?;
     let manager = McpServerManager::new(paths.data_dir.join("mcp-servers.json"));
+    if let McpCommands::ImportLegacy { source, preview } = action {
+        return services::print(&manager.import_legacy(source, *preview).await?);
+    }
     manager.initialize().await?;
     match action {
+        McpCommands::ImportLegacy { .. } => unreachable!(),
         McpCommands::Hosts => services::print(&claude_core::mcp::control::hosts(&services::context(paths)?)?)?,
         McpCommands::Restart {name,host} => {
             let owner=claude_core::mcp::control::restart(&services::context(paths)?,name,host.as_deref()).await?;
@@ -318,6 +322,7 @@ async fn mcp(paths: &RuntimePaths, action: &McpCommands) -> Result<()> {
                     command: command.clone(),
                     args: args.clone(),
                     env: HashMap::new(),
+                    cwd: None,
                     enabled: true,
                 })
                 .await?;

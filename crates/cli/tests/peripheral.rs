@@ -255,3 +255,27 @@ async fn plugins_diagnostics_and_topic_help_are_standalone() {
     assert!(output(dir.path(),&["help","mcp"]).await.status.success());
     assert!(!output(dir.path(),&["mcp","restart","missing"]).await.status.success());
 }
+
+#[tokio::test]
+async fn legacy_mcp_import_is_standalone_and_preserves_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("old.json");
+    let bytes = json!({"mcp_servers":[{"name":"legacy-fixture","command":"node","args":["fixture.cjs"],"env":{"FIXTURE_SECRET":"not-a-real-credential"},"cwd":dir.path(),"auto_start":false,"status":"Running","capabilities":[]}]}).to_string();
+    std::fs::write(&source, &bytes).unwrap();
+    let input = source.to_str().unwrap();
+    assert_eq!(
+        run(dir.path(), &["mcp", "import-legacy", input, "--preview"]).await["imported"],
+        json!(["legacy-fixture"])
+    );
+    assert!(!dir.path().join("mcp-servers.json").exists());
+    run(dir.path(), &["mcp", "import-legacy", input]).await;
+    assert_eq!(
+        run(dir.path(), &["mcp", "import-legacy", input]).await["skipped"],
+        json!(["legacy-fixture"])
+    );
+    let list = run(dir.path(), &["mcp", "list"]).await;
+    assert_eq!(list[0]["cwd"], json!(dir.path()));
+    assert_eq!(list[0]["running"], false);
+    assert!(!list.to_string().contains("not-a-real-credential"));
+    assert_eq!(std::fs::read_to_string(source).unwrap(), bytes);
+}

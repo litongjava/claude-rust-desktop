@@ -302,6 +302,12 @@ pub enum ConfigCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum McpCommands {
+    /// Import old settings.json MCP definitions without starting processes.
+    ImportLegacy {
+        source: PathBuf,
+        #[arg(long)]
+        preview: bool,
+    },
     Hosts,
     Restart { name:String, #[arg(long)] host:Option<String> },
     List,

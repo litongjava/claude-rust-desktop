@@ -43,6 +43,7 @@ async fn restart_reaches_existing_process_and_acknowledges_real_restart() {
                 boots.to_string_lossy().into(),
             ],
             env: Default::default(),
+            cwd: None,
             enabled: true,
         })
         .await

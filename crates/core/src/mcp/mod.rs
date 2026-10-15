@@ -7,18 +7,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 
+pub mod composio;
 pub mod control;
 pub mod tool_executor;
-pub mod composio;
+pub mod transfer;
 pub use tool_executor::McpToolRegistry;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub id: String,
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
     pub enabled: bool,
 }
 
@@ -60,6 +63,8 @@ pub struct McpServerStatus {
     pub command: String,
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
     pub enabled: bool,
     pub running: bool,
     pub pid: Option<u32>,
@@ -89,6 +94,7 @@ impl std::fmt::Debug for McpServerState {
 pub struct McpServerManager {
     servers: Arc<RwLock<HashMap<String, McpServerState>>>,
     config_path: PathBuf,
+    revision: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     control: std::sync::Mutex<Option<control::Host>>,
     lifecycle_lock: Arc<Mutex<()>>,
 }
@@ -98,6 +104,7 @@ impl McpServerManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             config_path,
+            revision: Arc::new(std::sync::Mutex::new(None)),
             control: std::sync::Mutex::new(None),
             lifecycle_lock: Arc::new(Mutex::new(())),
         }
@@ -111,8 +118,14 @@ impl McpServerManager {
         }
         let mut control=self.control.lock().unwrap();
         if control.is_none() {
-            let worker=Self {servers:self.servers.clone(),config_path:self.config_path.clone(),control:std::sync::Mutex::new(None),lifecycle_lock:self.lifecycle_lock.clone()};
-            *control=Some(control::Host::start(worker)?);
+            let worker = Self {
+                servers: self.servers.clone(),
+                config_path: self.config_path.clone(),
+                revision: self.revision.clone(),
+                control: std::sync::Mutex::new(None),
+                lifecycle_lock: self.lifecycle_lock.clone(),
+            };
+            *control = Some(control::Host::start(worker)?);
         }
         Ok(())
     }
@@ -120,6 +133,7 @@ impl McpServerManager {
     async fn load_config(&self) -> Result<()> {
         let content = tokio::fs::read_to_string(&self.config_path).await?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
+        *self.revision.lock().unwrap() = Some(content.as_bytes().to_vec());
 
         if let Some(servers) = config.get("mcpServers").and_then(|s| s.as_object()) {
             for (id, value) in servers {
@@ -145,13 +159,17 @@ impl McpServerManager {
                         .and_then(|e| e.as_object())
                         .map(|obj| {
                             obj.iter()
-                                .filter_map(|(k, v)| {
-                                    v.as_str().map(|s| (k.clone(), s.to_string()))
-                                })
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    enabled: value.get("enabled")
+                    cwd: value
+                        .get("cwd")
+                        .filter(|v| !v.is_null())
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()?,
+                    enabled: value
+                        .get("enabled")
                         .and_then(|e| e.as_bool())
                         .unwrap_or(true),
                 };
@@ -161,7 +179,12 @@ impl McpServerManager {
                     name: server_config.name.clone(),
                     command: server_config.command.clone(),
                     args: server_config.args.clone(),
-                    env: if server_config.env.is_empty() { None } else { Some(server_config.env.clone()) },
+                    env: if server_config.env.is_empty() {
+                        None
+                    } else {
+                        Some(server_config.env.clone())
+                    },
+                    cwd: server_config.cwd.clone(),
                     enabled: server_config.enabled,
                     running: false,
                     pid: None,
@@ -196,6 +219,7 @@ impl McpServerManager {
                     ".".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
             McpServerConfig {
@@ -207,6 +231,7 @@ impl McpServerManager {
                     "@anthropic/mcp-server-git".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
             McpServerConfig {
@@ -218,6 +243,7 @@ impl McpServerManager {
                     "@anthropic/mcp-server-brave-search".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
             McpServerConfig {
@@ -230,6 +256,7 @@ impl McpServerManager {
                     ".".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
             McpServerConfig {
@@ -241,6 +268,7 @@ impl McpServerManager {
                     "@modelcontextprotocol/server-github".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
             McpServerConfig {
@@ -252,6 +280,7 @@ impl McpServerManager {
                     "@modelcontextprotocol/server-slack".to_string(),
                 ],
                 env: HashMap::new(),
+                cwd: None,
                 enabled: false,
             },
         ];
@@ -263,7 +292,12 @@ impl McpServerManager {
                 name: server.name.clone(),
                 command: server.command.clone(),
                 args: server.args.clone(),
-                env: if server.env.is_empty() { None } else { Some(server.env.clone()) },
+                env: if server.env.is_empty() {
+                    None
+                } else {
+                    Some(server.env.clone())
+                },
+                cwd: server.cwd.clone(),
                 enabled: server.enabled,
                 running: false,
                 pid: None,
@@ -288,27 +322,11 @@ impl McpServerManager {
 
     async fn save_config(&self) -> Result<()> {
         let servers_map = self.servers.read().await;
-        let mut mcp_servers = serde_json::Map::new();
-
-        for (id, state) in servers_map.iter() {
-            let mut server_obj = serde_json::Map::new();
-            server_obj.insert("name".to_string(), serde_json::json!(state.config.name));
-            server_obj.insert("command".to_string(), serde_json::json!(state.config.command));
-            server_obj.insert("args".to_string(), serde_json::json!(state.config.args));
-            server_obj.insert("env".to_string(), serde_json::json!(state.config.env));
-            server_obj.insert("enabled".to_string(), serde_json::json!(state.config.enabled));
-            mcp_servers.insert(id.clone(), serde_json::json!(server_obj));
-        }
-
-        let config = serde_json::json!({
-            "mcpServers": mcp_servers
-        });
-
-        if let Some(parent) = self.config_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        tokio::fs::write(&self.config_path, serde_json::to_string_pretty(&config)?).await?;
+        let configs = servers_map
+            .iter()
+            .map(|(id, state)| (id.clone(), state.config.clone()))
+            .collect();
+        transfer::persist(&self.config_path, &self.revision, &configs, false)?;
         Ok(())
     }
 
@@ -318,7 +336,12 @@ impl McpServerManager {
             name: config.name.clone(),
             command: config.command.clone(),
             args: config.args.clone(),
-            env: if config.env.is_empty() { None } else { Some(config.env.clone()) },
+            env: if config.env.is_empty() {
+                None
+            } else {
+                Some(config.env.clone())
+            },
+            cwd: config.cwd.clone(),
             enabled: config.enabled,
             running: false,
             pid: None,
@@ -334,20 +357,46 @@ impl McpServerManager {
             status,
         };
 
-        self.servers.write().await.insert(state.config.id.clone(), state);
-        self.save_config().await?;
+        let mut servers = self.servers.write().await;
+        anyhow::ensure!(
+            !servers.contains_key(&state.config.id),
+            "MCP server already exists"
+        );
+        let mut configs: HashMap<_, _> = servers
+            .iter()
+            .map(|(id, s)| (id.clone(), s.config.clone()))
+            .collect();
+        configs.insert(state.config.id.clone(), state.config.clone());
+        transfer::persist(&self.config_path, &self.revision, &configs, false)?;
+        servers.insert(state.config.id.clone(), state);
         Ok(())
     }
 
     pub async fn update_server(&self, id: &str, config: McpServerConfig) -> Result<()> {
+        let _guard = self.lifecycle_lock.lock().await;
         let mut servers = self.servers.write().await;
+        anyhow::ensure!(
+            config.id == id && servers.contains_key(id),
+            "MCP server ID mismatch or not found"
+        );
+        let mut configs: HashMap<_, _> = servers
+            .iter()
+            .map(|(id, s)| (id.clone(), s.config.clone()))
+            .collect();
+        configs.insert(id.to_string(), config.clone());
+        transfer::persist(&self.config_path, &self.revision, &configs, false)?;
         if let Some(state) = servers.get_mut(id) {
             let was_running = state.status.running;
             state.config = config;
             state.status.name = state.config.name.clone();
             state.status.command = state.config.command.clone();
             state.status.args = state.config.args.clone();
-            state.status.env = if state.config.env.is_empty() { None } else { Some(state.config.env.clone()) };
+            state.status.env = if state.config.env.is_empty() {
+                None
+            } else {
+                Some(state.config.env.clone())
+            };
+            state.status.cwd = state.config.cwd.clone();
             state.status.enabled = state.config.enabled;
 
             if was_running {
@@ -362,15 +411,24 @@ impl McpServerManager {
             return Err(anyhow!("Server not found: {}", id));
         }
 
-        drop(servers);
-        self.save_config().await?;
         Ok(())
     }
 
     pub async fn remove_server(&self, id: &str) -> Result<()> {
-        self.stop_server(id).await?;
-        self.servers.write().await.remove(id);
-        self.save_config().await?;
+        let _guard = self.lifecycle_lock.lock().await;
+        let mut servers = self.servers.write().await;
+        anyhow::ensure!(servers.contains_key(id), "MCP server not found");
+        let configs = servers
+            .iter()
+            .filter(|(key, _)| key.as_str() != id)
+            .map(|(id, s)| (id.clone(), s.config.clone()))
+            .collect();
+        transfer::persist(&self.config_path, &self.revision, &configs, false)?;
+        if let Some(state) = servers.remove(id) {
+            if let Some(connector) = state.connector {
+                let _ = connector.lock().await.stop().await;
+            }
+        }
         Ok(())
     }
 
@@ -576,35 +634,28 @@ impl McpServerManager {
     }
 
     pub async fn toggle_server(&self, id: &str) -> Result<()> {
-        let enabled = {
-            let servers = self.servers.read().await;
-            if let Some(state) = servers.get(id) {
-                state.config.enabled
-            } else {
-                return Err(anyhow!("Server not found: {}", id));
-            }
-        };
-
-        let mut servers = self.servers.write().await;
-        if let Some(state) = servers.get_mut(id) {
-            state.config.enabled = !enabled;
-            state.status.enabled = !enabled;
-        }
-
-        self.save_config().await?;
-        Ok(())
+        self.change_server_enabled(id, None).await
     }
 
     pub async fn set_server_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        let mut servers = self.servers.write().await;
-        if let Some(state) = servers.get_mut(id) {
-            state.config.enabled = enabled;
-            state.status.enabled = enabled;
-        } else {
-            return Err(anyhow!("Server not found: {}", id));
-        }
+        self.change_server_enabled(id, Some(enabled)).await
+    }
 
-        self.save_config().await?;
+    async fn change_server_enabled(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let mut servers = self.servers.write().await;
+        let state = servers
+            .get(id)
+            .ok_or_else(|| anyhow!("Server not found: {}", id))?;
+        let enabled = enabled.unwrap_or(!state.config.enabled);
+        let mut configs: HashMap<_, _> = servers
+            .iter()
+            .map(|(id, s)| (id.clone(), s.config.clone()))
+            .collect();
+        configs.get_mut(id).unwrap().enabled = enabled;
+        transfer::persist(&self.config_path, &self.revision, &configs, false)?;
+        let state = servers.get_mut(id).unwrap();
+        state.config.enabled = enabled;
+        state.status.enabled = enabled;
         Ok(())
     }
 }
@@ -695,6 +746,9 @@ impl McpConnector {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
+        if let Some(cwd) = &self.config.cwd {
+            cmd.current_dir(cwd);
+        }
         let mut child = cmd.spawn()?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to take stdin"))?;

@@ -446,6 +446,23 @@ pub async fn mcp_restart_server(
 }
 
 #[tauri::command]
+pub async fn mcp_import_legacy(
+    app_handle: tauri::AppHandle,
+    source: String,
+    preview: bool,
+) -> Result<claude_core::mcp::transfer::Report, String> {
+    let mcp_state =
+        app_handle.state::<Arc<Mutex<Option<Arc<Mutex<crate::mcp::McpServerManager>>>>>>();
+    let guard = mcp_state.lock().await;
+    let manager = guard.as_ref().ok_or("MCP manager not initialized")?;
+    let manager = manager.lock().await;
+    manager
+        .import_legacy(std::path::Path::new(&source), preview)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn mcp_add_server(
     app_handle: tauri::AppHandle,
     config: McpServerConfig,
