@@ -4,6 +4,7 @@ mod config;
 mod legacy_api_config;
 mod session;
 mod services;
+mod memory;
 mod voice;
 #[allow(dead_code)]
 mod terminal;
@@ -64,6 +65,7 @@ async fn run(cli: &Cli) -> Result<()> {
     }
     let mut skill_prompt = None;
     match &cli.command {
+        Some(Commands::Memory { action }) => return memory::run(&paths, action).await,
         Some(Commands::VoiceConfig { endpoint, model, credential, language }) => {
             let context = services::context(&paths)?;
             let config = claude_core::services::voice::VoiceConfig {

@@ -77,6 +77,11 @@ pub enum PermissionModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Manage personal memory shared with Desktop.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCommands,
+    },
     /// Capture real microphone audio or transcribe a recording with the configured backend.
     Voice {
         #[arg(long)]
@@ -139,6 +144,17 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommands {
+    Status,
+    /// Clear personal memory only. Requires explicit confirmation.
+    Clear { #[arg(long)] yes: bool },
+    /// Export all local memories; never overwrite an existing file.
+    Export { output: PathBuf },
+    /// Import a versioned archive or an old MemoryEntry JSON array.
+    Import { input: PathBuf, #[arg(long)] preview: bool },
 }
 
 #[derive(Debug, Subcommand)]

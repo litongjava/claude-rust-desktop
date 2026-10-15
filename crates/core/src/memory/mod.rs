@@ -8,6 +8,8 @@
 
 mod caveman_rtk;
 mod local;
+mod transfer;
+pub use transfer::{MemoryArchive, MemoryImportReport};
 pub use caveman_rtk::{CavemanRTKStats, CavemanRTKSystem, RTKConfig, TokenImportance};
 
 use anyhow::{anyhow, Result};

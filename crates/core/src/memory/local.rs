@@ -8,7 +8,7 @@ use std::{collections::{HashMap, HashSet}, path::PathBuf};
 pub(super) struct LocalMemory { pub path: PathBuf }
 
 impl LocalMemory {
-    fn open(&self) -> Result<Connection> {
+    pub(super) fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() { std::fs::create_dir_all(parent)?; }
         let conn = Connection::open(&self.path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;

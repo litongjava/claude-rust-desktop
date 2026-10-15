@@ -34,6 +34,27 @@ async fn run(path: &Path, args: &[&str]) -> Value {
     );
     serde_json::from_slice(&result.stdout).unwrap()
 }
+
+#[tokio::test]
+async fn personal_memory_transfer_is_standalone_and_clear_requires_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("legacy.json");
+    let export = dir.path().join("export.json");
+    let bytes = serde_json::to_vec(&json!([{"id":"legacy", "memory_type":"Preference", "content":"Prefer Chinese", "timestamp":"2026-10-15T00:00:00Z", "importance":0.7, "tags":[], "metadata":{}}])).unwrap();
+    std::fs::write(&source, &bytes).unwrap();
+    let input = source.to_str().unwrap();
+    assert_eq!(run(dir.path(), &["memory","import",input,"--preview"]).await["imported"], 1);
+    assert_eq!(run(dir.path(), &["memory","status"]).await["total_memories"], 0);
+    assert_eq!(run(dir.path(), &["memory","import",input]).await["imported"], 1);
+    assert_eq!(run(dir.path(), &["memory","import",input]).await["skipped"], 1);
+    assert_eq!(run(dir.path(), &["memory","export",export.to_str().unwrap()]).await["exported"], 1);
+    assert!(!output(dir.path(), &["memory","export",export.to_str().unwrap()]).await.status.success());
+    assert!(!output(dir.path(), &["memory","clear"]).await.status.success());
+    run(dir.path(), &["memory","clear","--yes"]).await;
+    run(dir.path(), &["memory","import",export.to_str().unwrap()]).await;
+    assert_eq!(run(dir.path(), &["memory","status"]).await["total_memories"], 1);
+    assert_eq!(std::fs::read(source).unwrap(), bytes);
+}
 async fn start_server(path: &Path) -> (String, Child) {
     let mut child = cli(path)
         .args(["team-sync", "serve"])

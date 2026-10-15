@@ -196,3 +196,15 @@ git diff --check
 - 新凭据先保存到独立安全存储名称；认证/配置失败会清理该项，保持原有效凭据。CLI 使用环境凭据，不读取 Desktop 安全存储；共享配置中的 credential 名称可通过 status 查看，也可在 CLI 重新 auth 选择自己的环境变量。
 
 验证日志保存在 `artifacts/validation/`。该批提交只覆盖本节 P0/P1 实施，**不是 P2–P4 或整份清单完成声明**。
+
+## 10. 2026-10-15 P2 个人记忆传输增量
+
+个人记忆 status/clear/export/import 已接入共享 MemEx 存储、独立 CLI 与桌面长期记忆面板。实现：`crates/core/src/memory/transfer.rs`、`crates/cli/src/memory.rs`、`src-tauri/src/bridge/routes/memory.rs`、`src/components/MemoryPanel.tsx`。
+
+- 支持旧 MemoryEntry 数组与 version=1 归档；保留 ID、时间，其他旧字段完整保存在 legacy_source 中。
+- 预览事务回滚；正式导入前备份整个 memory.sqlite3，再取得写锁校验和原子导入。同 ID 全字段一致跳过，ID 或内容冲突整批回滚。
+- 导出全部条目，不受搜索分页或 enabled 影响；CLI 禁止覆盖。导入/导出仅支持 local，远端明确报错。
+- CLI 清空须 --yes，仅影响当前配置后端个人记忆。桌面提供 JSON 粘贴、预览、确认导入及下载。
+- 验证通过：核心 memory_transfer 2 项、独立 CLI 进程 1 项、前端 6 项、TypeScript、CLI/Desktop cargo check、git diff --check。
+
+仍未完成：dream/auto-dream、Magic Docs、agent 映射及 P3/P4；本次不勾选整个 P2，未做本批真实 GUI 验收或重新打包。详细用法见用户指定文档目录 `D:/code/project/project-harven/claude-code-cli-doc/memory-transfer-20261015.md`。后续浏览器验收使用指定 deepseek-browser-use，展示过程，截图放文档目录 assets。

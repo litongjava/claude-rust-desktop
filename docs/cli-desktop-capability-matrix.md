@@ -13,13 +13,13 @@
 | `team-sync status/auth/sync/list/create/delete` | `services/team.rs`、`team_server.rs`；CLI `services.rs` | 设置 → 服务与团队（含更新、冲突与旧数据导入） | 已迁入自部署真实 HTTP 协议；两个 CLI 客户端/独立服务进程验证；生产部署与 GUI 手工验收待完成，不提供伪造官方 OAuth |
 | `services status/start/stop/team-sync/voice` | `services/lifecycle.rs`，跨进程 SQLite 租约；CLI 前台宿主，voice 显示后端配置 | 设置 → 服务与团队；宿主句柄由 Tauri 持有，退出中止并等待 | **team-sync 链路完成**；voice 是配置状态，不是后台录音宿主 |
 | `services auto-dream/magic-docs/plugins/agents` | 尚未注册这些启动能力 | 尚无对应真实宿主控制 | 仍待实施；不展示不可运行的服务为成功 |
-| `memory status/clear/export/import/dream/auto-dream` | 已有 `memory/{mod,local}.rs` 与模型自动检索/摄入；CLI 管理命令待接 | MemoryPanel 支持增添、搜索、清空与配置 | 部分等价覆盖；旧个人 JSON 导入、导出、整理、调度/租约仍待 P2 |
+| `memory status/clear/export/import/dream/auto-dream` | 已有 `memory/{mod,local}.rs` 与模型自动检索/摄入；CLI status/clear/export/import 已接入 | MemoryPanel 支持增添、搜索、清空、配置及导入预览/确认/导出 | 部分等价覆盖；旧个人 JSON 导入/导出已实现并有核心、CLI、前端测试；整理、调度/租约仍待 P2 |
 | `magic-docs list/check/update/clear` | 尚未迁入；旧标记与解析可参考 `services/magic_docs.rs` | 追踪/差异/确认应用/自动更新界面尚缺 | 仍待 P2，必须接现有 NativeEngine 与项目权限 |
 | `agent --agent-type --prompt` | 已有 `multiagent/`、`orchestration/`、`agent_bus/` | AgentPanel、AgentExecutionView | 类型/别名/自定义定义及 CLI 映射待 P2；不能创建第二套工具循环 |
 | `plugin list/install/remove/update/search/enable/disable` | 尚未实现正式插件安装/执行生命周期 | PluginsPage 仍是静态分类搜索 | 仍待 P3；本地 manifest/加载/撤销/回滚先行 |
 | `stress-test -c/-i` | 旧 `services/stress_tests.rs` 未迁入 | 诊断入口与结果尚缺 | 仍待 P3；默认可控本地端点，付费端点显式选择 |
 | `update`、`help --topic` | Clap 标准帮助已可用，专题帮助/真实版本检查尚缺 | 有 `src-tauri/src/updater.rs` 可继续核查 | 仍待 P3；标准帮助只列实际注册命令 |
-| 历史数据 | provider/模型/token 上限；团队 JSON 原子导入、预览、备份、去重与源载荷记录 | 团队导入面板 / 设置 | 旧 session/个人 memory/MCP/plugin/Magic Docs 的全量导入仍待实施；旧伪 token 不导入 |
+| 历史数据 | provider/模型/token 上限；团队 JSON 原子导入、预览、备份、去重与源载荷记录 | 团队导入面板 / 设置 | 个人 memory JSON 已接入；旧 session/MCP/plugin/Magic Docs 的全量导入仍待实施；旧伪 token 不导入 |
 
 ## 扩展能力审计边界
 

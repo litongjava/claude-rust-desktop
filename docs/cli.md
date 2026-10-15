@@ -84,7 +84,7 @@ REPL 支持 `/help`、`/status`、`/history`、`/tools`、`/exit`；Ctrl+C 取�
 
 旧仓库完整的自有 Rust 源码和测试保存在 `legacy/claude-code-cli`，不参与发布构建。活跃 CLI 保留 `query -p`、`repl -p`、`rust`（REPL 别名）、`--model`、`--verbose`、`--no-interactive`、`--info`、配置、MCP、技能和项目初始化入口，改用共享引擎；根级项目路径短参数现在为 `-C`，长参数 `--path` 保留。
 
-`voice`、`team-sync` 和团队同步宿主已接入共享核心，详见下文。`services` 当前只运行 `team-sync`，其他旧服务不会显示为可启动。`magic-docs`、`plugin`、`agent`、`stress-test`、旧 JSON memory 管理及原 GUI/Web/WASM 的独有能力仍待迁移。旧配置导入目前迁移 provider、模型与 token 上限；旧团队记忆支持显式导入，旧个人 memory/session、插件和 MCP 数据不会自动转换。完整映射见 [能力矩阵](cli-desktop-capability-matrix.md)。
+`voice`、`team-sync` 和团队同步宿主已接入共享核心，详见下文。`services` 当前只运行 `team-sync`，其他旧服务不会显示为可启动。`magic-docs`、`plugin`、`agent`、`stress-test`、memory dream/auto-dream 及原 GUI/Web/WASM 的独有能力仍待迁移。旧配置导入目前迁移 provider、模型与 token 上限；旧团队记忆支持显式导入，旧个人 memory 支持显式 JSON 导入；session、插件和 MCP 数据不会自动转换。完整映射见 [能力矩阵](cli-desktop-capability-matrix.md)。
 
 ## 语音
 
@@ -150,3 +150,15 @@ cargo test -p claude-desktop-tauri --lib --tests
 ```
 
 CLI 集成测试使用临时数据目录和本机模拟模型服务，实际启动可执行文件，覆盖流式输出、工具读写、权限中断、会话恢复、失败退出和旧配置只读导入，不使用真实 API 密钥。
+
+## 个人记忆传输
+
+`memory status` 查询当前后端。`memory clear --yes` 清空该后端个人记忆，保留会话与团队数据。
+
+```powershell
+claude-code memory import D:\backup\legacy-memory.json --preview
+claude-code memory import D:\backup\legacy-memory.json
+claude-code memory export D:\backup\personal-memory.json
+```
+
+导入/导出要求 local 后端，支持旧 MemoryEntry 数组和新版本化归档。导入前备份完整 SQLite，报告返回路径；重复导入跳过，冲突整批回滚。导出路径必须不存在。桌面长期记忆面板提供对应预览、确认与下载。dream/auto-dream 尚未实现。
