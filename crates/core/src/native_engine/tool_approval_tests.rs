@@ -347,7 +347,7 @@ async fn permission_request_headless_validates_decisions_and_cleans_waiters() {
         assert_eq!(failed, case != "allow", "{case}: {result}");
         assert_eq!(
             executor.ensure_permission_continuation().is_err(),
-            case == "interrupt"
+            matches!(case, "interrupt" | "wrong-event" | "no-decision")
         );
         assert!(!root.path().join("original.txt").exists());
         assert_eq!(

@@ -131,6 +131,17 @@ impl ToolLoopExecutor {
         input: &Value,
         id: &str,
     ) -> Result<Value> {
+        // Hook execution holds a substantial async state machine. Keep it out
+        // of every enclosing tool/model-loop future on Windows debug stacks.
+        Box::pin(self.request_tool_approval_inner(tool, input, id)).await
+    }
+
+    async fn request_tool_approval_inner(
+        &self,
+        tool: &str,
+        input: &Value,
+        id: &str,
+    ) -> Result<Value> {
         let reviewed_policy = self
             .permission_manager
             .as_ref()
@@ -229,7 +240,9 @@ impl ToolLoopExecutor {
                         if let Some(decision) = decision {
                             let _ = crate::native_engine::permission_response::respond(&self.permission_mailbox, &request_id, decision).await;
                         } else if !self.permission_host_available {
-                            return Err(anyhow!("Tool approval required but no approval host or PermissionRequest hook decision is available"));
+                            let reason = "Tool approval required but no approval host or PermissionRequest hook decision is available";
+                            *self.permission_interrupted.lock().unwrap_or_else(|error| error.into_inner()) = Some(reason.into());
+                            return Err(anyhow!(reason));
                         }
                     },
                     answer = &mut text_rx, if !text_done => {
