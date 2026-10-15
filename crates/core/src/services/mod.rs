@@ -8,6 +8,7 @@ pub mod permission_authority;
 pub mod session_workspace;
 pub mod session_trust;
 pub mod session_permission_mode;
+pub mod session_goals;
 pub mod background_sessions;
 pub mod session_worker;
 pub mod session_parking;

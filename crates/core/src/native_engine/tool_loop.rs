@@ -174,6 +174,8 @@ pub struct ToolLoopExecutor {
     subagent_hook_context: Option<(String, String)>,
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
+    stop_hook_blocks: u64,
+    goal_db: Option<Arc<crate::db::DbManager>>,
     skill_shell_active: bool,
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
@@ -541,6 +543,8 @@ impl ToolLoopExecutor {
             subagent_hook_context: None,
             hooks: None,
             stop_hook_active: false,
+            stop_hook_blocks: 0,
+            goal_db: None,
             skill_shell_active: false,
             pending_user_skill: None,
             manual_skill_active: false,
@@ -573,6 +577,11 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
+        self.goal_db = Some(db);
+        self
+    }
+
     async fn stop_hook(&mut self, text: &str) -> Result<Option<String>> {
         use crate::services::tool_hooks::HookEvent;
         let Some(hooks) = &self.hooks else { return Ok(None); };
@@ -584,9 +593,25 @@ impl ToolLoopExecutor {
         } else { (HookEvent::Stop, self.conv_id.as_deref().unwrap_or("unknown")) };
         let outcome = hooks.run(event, session, payload).await?;
         for warning in outcome.warnings { tracing::warn!("{event:?} hook: {warning}"); }
-        if outcome.prevent_continuation { return Ok(None); }
+        if outcome.prevent_continuation {
+            if let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) {
+                if let Some(goal) = crate::services::session_goals::active(db, id)? {
+                    crate::services::session_goals::pause(db, id, &goal.id, "Stop hook prevented continuation")?;
+                }
+            }
+            return Ok(None);
+        }
         if outcome.blocked {
-            anyhow::ensure!(!self.stop_hook_active, "{event:?} hook blocked again after its continuation: {}", outcome.reason);
+            self.stop_hook_blocks = self.stop_hook_blocks.saturating_add(1);
+            let cap = crate::services::session_goals::stop_cap();
+            let shared = match (&self.goal_db, &self.conv_id) {
+                (Some(db), Some(id)) => crate::services::session_goals::block(db, id, None, cap)?,
+                _ => None,
+            };
+            if !shared.unwrap_or_else(|| crate::services::session_goals::within_stop_cap(self.stop_hook_blocks, cap)) {
+                tracing::warn!("{event:?} consecutive block cap reached; send a message to continue");
+                return Ok(None);
+            }
             self.stop_hook_active = true;
             return Ok(Some(format!("The configured {event:?} hook requires follow-up before finishing: {}", outcome.reason)));
         }

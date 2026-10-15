@@ -537,6 +537,7 @@ impl QueryEngine {
         .with_response_schema(request.response_schema)?
         .with_learning_tools(learning.as_ref().map(|l| l.tools.clone()))
         .with_hooks(hooks)
+        .with_goal_state(self.db_manager.clone())
         .with_allowed_tools(agent.and_then(|d|d.tools))
         .with_prompt_profile(prompt_profile)
         .with_memex(crate::memory::MemExClient::with_path(

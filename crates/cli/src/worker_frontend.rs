@@ -310,6 +310,20 @@ async fn observe(
                         if side.is_none() { side=Some(Box::pin(async move { crate::background_commands::side_question(session, &question).await })); }
                         else { display.notice("A side question is already running."); }
                     },
+                    Some(Action::Submit(prompt)) => {
+                        if jobs::get(root, id)?.session_id == session.id {
+                            if let Some(message) = crate::session_commands::live_goal_command(session, &prompt)? {
+                                display.notice(&message);
+                            } else {
+                                if let Some(goal) = claude_core::services::session_goals::active(&session.store.db, &session.id)?.filter(|g|g.state == "waiting") {
+                                    claude_core::services::session_goals::pause(&session.store.db, &session.id, &goal.id, "New user input interrupted the retry delay")?;
+                                    jobs::cancel(root, id)?;
+                                    cancelled = true;
+                                }
+                                restore(input, Action::Submit(prompt));
+                            }
+                        } else { restore(input, Action::Submit(prompt)); }
+                    },
                     Some(action) => restore(input, action),
                 }
             },

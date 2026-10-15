@@ -82,15 +82,48 @@ async fn modified_input_is_executed_and_post_context_reaches_tool_result() {
 }
 
 #[tokio::test]
-async fn stop_hook_can_continue_only_once() {
+async fn stop_hook_obeys_shared_default_consecutive_block_cap() {
     let root = tempfile::tempdir().unwrap();
     write_hook(root.path(), "Stop", "exit 2");
     let mut executor = executor(root.path());
-    assert!(executor.stop_hook("done").await.unwrap().is_some());
-    assert!(executor
-        .stop_hook("still done")
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("blocked again"));
+    for _ in 0..8 { assert!(executor.stop_hook("done").await.unwrap().is_some()); }
+    assert!(executor.stop_hook("still done").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn ordinary_stop_hooks_and_goal_checks_consume_one_session_budget() {
+    use crate::services::session_goals as goals;
+    let root = tempfile::tempdir().unwrap();
+    write_hook(root.path(), "Stop", "exit 2");
+    let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
+    db.init().unwrap();
+    let goal = goals::set(&db, "parent", "Finish the task").unwrap();
+    for _ in 0..3 { assert_eq!(goals::block(&db,"parent",Some(&goal.id),8).unwrap(),Some(true)); }
+    let mut parent = executor(root.path()).with_conv_id("parent".into()).with_goal_state(db.clone());
+    for _ in 0..5 { assert!(parent.stop_hook("done").await.unwrap().is_some()); }
+    assert!(parent.stop_hook("done").await.unwrap().is_none());
+    assert_eq!(goals::active(&db,"parent").unwrap().unwrap().state,"paused");
+    let mut child = executor(root.path()).with_conv_id("child".into()).with_goal_state(db.clone());
+    assert!(child.stop_hook("child done").await.unwrap().is_some());
+    assert_eq!(goals::active(&db,"parent").unwrap().unwrap().stop_blocks,9);
+}
+
+#[tokio::test]
+async fn stop_hook_prevent_continuation_pauses_goal_before_outer_evaluation() {
+    use crate::services::session_goals as goals;
+    let root = tempfile::tempdir().unwrap();
+    let output = r#"{"continue":false,"stopReason":"User hook stopped work"}"#;
+    let command = if cfg!(windows) {
+        format!("[Console]::Out.Write('{output}')")
+    } else {
+        format!("printf '%s' '{output}'")
+    };
+    write_hook(root.path(), "Stop", &command);
+    let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
+    db.init().unwrap();
+    let goal = goals::set(&db, "parent", "Keep working").unwrap();
+    let mut parent = executor(root.path()).with_conv_id("parent".into()).with_goal_state(db.clone());
+    assert!(parent.stop_hook("done").await.unwrap().is_none());
+    assert_eq!(goals::active(&db, "parent").unwrap().unwrap().state, "paused");
+    assert!(!goals::verdict(&db, "parent", &goal.id, "continue", "late check").unwrap());
 }

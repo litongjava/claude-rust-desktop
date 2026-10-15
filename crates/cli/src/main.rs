@@ -497,6 +497,18 @@ async fn run(cli: &Cli) -> Result<()> {
                 Err(error) => { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } continue; },
                 Ok(background_commands::Outcome::NotHandled) => {},
             }
+            if command == "/goal" {
+                match session_commands::handle(command, argument, &paths, &mut session).await {
+                    Ok(_) if !argument.trim().is_empty() && !session_commands::is_goal_clear(argument) => {
+                        if let Err(error) = session.turn(cli, argument.trim(), &mut input).await {
+                            if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); }
+                        }
+                    },
+                    Err(error) => eprintln!("Error: {error:#}"),
+                    _ => {},
+                }
+                continue;
+            }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
                 Ok(true) => continue,
                 Err(error) => { eprintln!("Error: {error:#}"); continue; },

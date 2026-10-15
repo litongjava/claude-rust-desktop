@@ -336,6 +336,11 @@ impl State {
             let _ = actions.send(Action::Detach);
             return Some("Detaching from the active worker; its request continues.".into());
         }
+        let (command, argument) = text.trim().split_once(char::is_whitespace).unwrap_or((text.trim(), ""));
+        if command == "/goal" && (argument.trim().is_empty() || crate::session_commands::is_goal_clear(argument)) {
+            let _ = actions.send(Action::Submit(text));
+            return None;
+        }
         if text.trim().starts_with('/') {
             return Some("While working, use /btw QUESTION or type a prompt to queue; other commands are available after completion.".into());
         }
@@ -1115,6 +1120,19 @@ mod tests {
         assert!(matches!(receive.try_recv().unwrap(), Action::Submit(_)));
         state.draft.insert("/permissions bypass");
         state.submit(&send);
+        assert!(receive.try_recv().is_err());
+    }
+    #[test]
+    fn live_goal_controls_reach_owner_without_accepting_other_slash_commands() {
+        let mut state = State::new("ask".into());
+        let (send, mut receive) = async_mpsc::unbounded_channel();
+        for prompt in ["/goal", "/goal clear", "/goal STOP", "/goal off"] {
+            state.draft.insert(prompt);
+            assert!(state.submit(&send).is_none());
+            assert!(matches!(receive.try_recv().unwrap(), Action::Submit(text) if text == prompt));
+        }
+        state.draft.insert("/goal start a different task");
+        assert!(state.submit(&send).is_some());
         assert!(receive.try_recv().is_err());
     }
 }

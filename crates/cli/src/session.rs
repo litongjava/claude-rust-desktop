@@ -477,30 +477,59 @@ impl Session {
                 return crate::skill_commands::finish_background(cli, self, job, input).await;
             },
         };
+        crate::session_commands::migrate_goal(self)?;
+        claude_core::services::session_goals::begin_input(&self.store.db, &self.id)?;
         if !crate::terminal::screen_reader() && input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short
             && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
             && std::env::var("TERM").as_deref() != Ok("dumb") && !crate::display_commands::load(self)?.focus {
             return crate::worker_frontend::turn(cli, self, prompt, input).await;
         }
         let mut next = prompt.to_owned();
-        for attempt in 0..=3 {
-            self.run_turn(cli, &next, input).await?;
-            // Structured output has one result per submitted query; autonomous
-            // continuation is restricted to the interactive text frontend.
-            if (input.is_none() || cli.output_format != OutputFormat::Text) && std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
-                break;
+        loop {
+            let goal = claude_core::services::session_goals::active(&self.store.db, &self.id)?;
+            if let (Some(goal), Some(limit)) = (&goal, cli.max_turns) {
+                if goal.model_requests.saturating_sub(goal.run_start_requests) >= u64::from(limit) {
+                    claude_core::services::session_goals::pause(&self.store.db, &self.id, &goal.id, "Maximum turns reached")?;
+                    crate::session_commands::goal_notice("Goal paused: maximum turns reached. Send a message to continue.");
+                    break;
+                }
             }
-            let followup = tokio::select! {
-                result = crate::session_commands::goal_check(self) => result?,
-                _ = tokio::signal::ctrl_c() => bail!("Goal check cancelled"),
-            };
-            let Some(followup) = followup else { break };
-            if attempt == 3 {
-                eprintln!("Goal remains active. Automatic continuation limit reached; use /goal status to review.");
-                break;
+            let result = async {
+                self.run_turn(cli, &next, input).await?;
+                if (input.is_none() || cli.output_format != OutputFormat::Text) && std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
+                    return Ok::<Option<String>,anyhow::Error>(None);
+                }
+                crate::session_commands::goal_check(self).await
+            }.await;
+            match result {
+                Ok(Some(followup)) => next = followup,
+                Ok(None) => break,
+                Err(error) => {
+                    if let Some(goal) = goal {
+                        if crate::session_commands::retryable_goal_error(&error, std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_some()) {
+                            if let Some(retry) = claude_core::services::session_goals::arm_retry(&self.store.db, &self.id, &goal.id, &error.to_string())? {
+                                let seconds = (retry.retry_after_ms.unwrap_or_default() - chrono::Utc::now().timestamp_millis()).max(0) / 1000;
+                                crate::session_commands::goal_notice(&format!("Goal still active: transient connection failure. Retrying in {seconds}s ({}/3). Send a message to retry now, or /goal clear to stop.", retry.retry_attempts));
+                                match crate::session_commands::wait_goal_retry(self, &goal.id).await {
+                                    Ok(true) => {
+                                        next = format!("Resume unfinished work toward the explicitly authorized goal: {}. Review existing progress first and do not repeat completed operations. Stay within existing permissions.", goal.condition);
+                                        continue;
+                                    },
+                                    Ok(false) => break,
+                                    Err(cancelled) => {
+                                        claude_core::services::session_goals::pause(&self.store.db, &self.id, &goal.id, &cancelled.to_string())?;
+                                        return Err(cancelled);
+                                    }
+                                }
+                            }
+                        }
+                        if claude_core::services::session_goals::pause(&self.store.db, &self.id, &goal.id, &error.to_string())? {
+                            crate::session_commands::goal_notice("Goal paused. Send a message to continue, or /goal clear to remove it.");
+                        }
+                    }
+                    return Err(error);
+                }
             }
-            eprintln!("Continuing toward the session goal ({}/3). Ctrl+C interrupts.", attempt + 1);
-            next = followup;
         }
         Ok(())
     }
@@ -511,6 +540,7 @@ impl Session {
         prompt: &str,
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
+        let turn_goal = claude_core::services::session_goals::active(&self.store.db, &self.id)?;
         if let Err(error) = crate::ide_commands::restore(self).await {
             eprintln!("IDE connection unavailable: {error:#}");
             self.ide.disconnect().await;
@@ -558,7 +588,7 @@ impl Session {
                     effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
                     system_prompt: Some(system),
                     max_tokens: cli.max_tokens,
-                    max_turns: cli.max_turns,
+                    max_turns: cli.max_turns.map(|limit| turn_goal.as_ref().map_or(limit, |g| limit.saturating_sub(g.model_requests.saturating_sub(g.run_start_requests).min(u64::from(u32::MAX)) as u32).max(1))),
                     response_schema,
                     workspace_path: Some(cwd.to_string_lossy().into_owned()),
                     temperature: None,
@@ -582,6 +612,7 @@ impl Session {
         let mut error = None;
         let mut completed = false;
         let mut snapshots = Vec::<Value>::new();
+        let mut goal_requests = crate::session_commands::GoalRequests::default();
         let mut observed_plan_boundary = claude_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
         let mut tools = Vec::<message_repo::ToolCallRow>::new();
         let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -609,7 +640,10 @@ impl Session {
                             },
                             crate::terminal::live::Action::Cancel => bail!("Interrupted"),
                             crate::terminal::live::Action::Detach => progress.notice("This turn is not owned by a background worker."),
-                            crate::terminal::live::Action::Submit(prompt) => if let Some(reader)=input.as_mut() { reader.queue_prompt(prompt); },
+                            crate::terminal::live::Action::Submit(prompt) => {
+                                if let Some(message) = crate::session_commands::live_goal_command(self, &prompt)? { progress.notice(&message); }
+                                else if let Some(reader)=input.as_mut() { reader.queue_prompt(prompt); }
+                            },
                             crate::terminal::live::Action::Draft(draft) => if let Some(reader)=input.as_ref() { reader.restore_draft(draft); },
                             crate::terminal::live::Action::SideQuestion(question) => {
                                 if side_request.is_some() { progress.notice("A side question is already running; wait for its answer before sending another."); }
@@ -720,6 +754,7 @@ impl Session {
                         if let Some(position) = position { tools[position] = row; } else { tools.push(row); }
                     },
                     EngineEvent::RequestSnapshot(snapshot) => {
+                        goal_requests.observe(&snapshot);
                         if let Some(old) = snapshots.iter_mut().find(|s| s["id"] == snapshot["id"]) { *old = snapshot; } else { snapshots.push(snapshot); }
                     },
                     EngineEvent::BudgetWarning { message, .. } => { progress.notice(&message); },
@@ -774,6 +809,10 @@ impl Session {
                 message_repo::save_request_snapshots(conn, &message_id, &json!(snapshots))?;
                 Ok(())
             })??;
+        }
+        if let Some(goal) = turn_goal {
+            let (tokens, requests, unreported) = goal_requests.usage();
+            claude_core::services::session_goals::record_turn(&self.store.db, &self.id, &goal.id, tokens, requests, unreported)?;
         }
         match cli.output_format {
             OutputFormat::Text => { if !progress.is_live() { println!(); io::stdout().flush()?; } },
