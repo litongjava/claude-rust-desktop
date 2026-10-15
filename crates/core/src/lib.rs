@@ -51,3 +51,4 @@ pub mod services;
 
 pub mod learning;
 pub mod performance;
+pub mod structured_output;

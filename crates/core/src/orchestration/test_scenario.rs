@@ -14,7 +14,7 @@ fn create_mock_provider() -> ResolvedProvider {
             name: "Claude 3 Sonnet".to_string(),
             enabled: true,
             max_tokens: Some(8192),
-            supports_vision: false, context_window: None, supports_text: true, api: None, effort: None,
+            supports_vision: false, context_window: None, supports_text: true, api: None, effort: None, fast: false,
             supports_web_search: false,
         }],
         enabled: true,
@@ -28,7 +28,7 @@ fn create_mock_provider() -> ResolvedProvider {
             name: "Claude 3 Sonnet".to_string(),
             enabled: true,
             max_tokens: Some(8192),
-            supports_vision: false, context_window: None, supports_text: true, api: None, effort: None,
+            supports_vision: false, context_window: None, supports_text: true, api: None, effort: None, fast: false,
             supports_web_search: false,
         },
     }

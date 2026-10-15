@@ -1,10 +1,10 @@
 //! Interactive provider management. Credentials remain environment references.
+use crate::terminal::input::TerminalInput;
 use crate::{args::Cli, config, session::Session};
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use claude_core::{config::ConfigManager, runtime::RuntimePaths};
 use serde_json::json;
-use crate::terminal::input::TerminalInput;
 
 async fn ask(input: &mut TerminalInput, prompt: &str) -> Result<String> {
     let prompt = format!("{prompt}: ");
@@ -139,10 +139,7 @@ pub fn status(session: &Session) {
     );
 }
 
-pub async fn setup(
-    paths: &RuntimePaths,
-    input: &mut TerminalInput,
-) -> Result<config::Selection> {
+pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<config::Selection> {
     loop {
         for p in paths.read_config()?.providers.iter().filter(|p| p.enabled) {
             eprintln!(
@@ -182,6 +179,16 @@ pub async fn handle(
 ) -> Result<bool> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or_default();
+    if command == "/config" {
+        return settings_menu(
+            line.strip_prefix("/config").unwrap().trim(),
+            paths,
+            session,
+            input,
+        )
+        .await
+        .map(|()| true);
+    }
     if !["/provider", "/model", "/test"].contains(&command) {
         return Ok(false);
     }
@@ -400,7 +407,28 @@ mod tests {
             .unwrap();
         let before = serde_json::to_value(session.store.history(&session.id).unwrap()).unwrap();
         let id = session.id.clone();
+        let mut menu_input = answers(&["theme", "light", "done"]);
+        handle("/config", &paths, &mut session, &mut menu_input)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::display_commands::load(&session).unwrap().theme,
+            "light"
+        );
         let mut input = answers(&[]);
+        handle("/config permissions plan", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        assert_eq!(session.permission_mode(), "plan");
+        assert!(handle(
+            "/config invalid-setting value",
+            &paths,
+            &mut session,
+            &mut input
+        )
+        .await
+        .is_err());
+        assert_eq!(session.permission_mode(), "plan");
         handle("/provider two", &paths, &mut session, &mut input)
             .await
             .unwrap();
@@ -436,5 +464,82 @@ mod tests {
         assert_eq!(resumed.provider.as_deref(), Some("two"));
         session.close().await.unwrap();
         server.abort();
+    }
+}
+
+async fn settings_menu(
+    argument: &str,
+    paths: &RuntimePaths,
+    session: &mut Session,
+    input: &mut TerminalInput,
+) -> Result<()> {
+    let mut direct = if argument.is_empty() {
+        None
+    } else {
+        Some(argument.to_owned())
+    };
+    loop {
+        let interactive = direct.is_none();
+        let choice = if let Some(argument) = direct.take() {
+            argument
+        } else {
+            let display = crate::display_commands::load(session)?;
+            eprintln!("Settings | {}\nProvider: {} | Model: {}\nPermissions: {} | Theme: {} | Color: {} | Focus: {} | Renderer: {}\nprovider | model | permissions | theme | color | focus | output-style | statusline | tui | effort | autocompact\nChoose a setting, or enter done to return.", paths.data_dir.display(), session.provider_id, session.model, session.permission_mode(), display.theme, display.color, display.focus, display.tui);
+            ask(input, "Setting").await?
+        };
+        if matches!(choice.as_str(), "" | "done" | "exit") {
+            return Ok(());
+        }
+        let (setting, value) = choice
+            .split_once(char::is_whitespace)
+            .unwrap_or((&choice, ""));
+        ensure!(
+            [
+                "provider",
+                "model",
+                "permissions",
+                "theme",
+                "color",
+                "focus",
+                "output-style",
+                "statusline",
+                "tui",
+                "effort",
+                "autocompact"
+            ]
+            .contains(&setting),
+            "Unknown setting"
+        );
+        let value = if value.trim().is_empty() && !matches!(setting, "provider" | "model") {
+            ask(
+                input,
+                &format!("{setting} value (blank uses command default)"),
+            )
+            .await?
+        } else {
+            value.trim().to_owned()
+        };
+        if matches!(setting, "provider" | "model") {
+            Box::pin(handle(
+                &format!("/{setting} {value}"),
+                paths,
+                session,
+                input,
+            ))
+            .await?;
+        } else if setting == "permissions" {
+            if value.is_empty() {
+                eprintln!("Permission mode: {}", session.permission_mode());
+            } else {
+                session.set_permission_mode(&value).await?;
+            }
+        } else if matches!(setting, "effort" | "autocompact") {
+            crate::session_commands::handle(&format!("/{setting}"), &value, paths, session).await?;
+        } else {
+            crate::display_commands::handle(&format!("/{setting}"), &value, paths, session).await?;
+        }
+        if !interactive {
+            return Ok(());
+        }
     }
 }

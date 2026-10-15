@@ -51,6 +51,17 @@ pub async fn stream(
     tools: Vec<ToolDefinition>,
     max_tokens: u32,
 ) -> Result<ProviderStream> {
+    stream_with_schema(provider, messages, system, tools, max_tokens, None).await
+}
+
+pub async fn stream_with_schema(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+) -> Result<ProviderStream> {
     let (entry, model) = metadata(provider)?;
     let protocol = provider
         .model
@@ -228,6 +239,14 @@ pub async fn stream(
     };
     let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
     let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
+    if let Some(schema) = response_schema {
+        match api {
+            "openai-completions" => body["response_format"] = serde_json::json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}}),
+            "openai-responses" => body["text"]["format"] = serde_json::json!({"type":"json_schema","name":"structured_response","strict":true,"schema":schema}),
+            "anthropic-messages" => body["output_config"]["format"] = serde_json::json!({"type":"json_schema","schema":schema}),
+            _ => bail!("Strict JSON Schema output is not implemented for provider protocol '{protocol}'"),
+        }
+    }
     if protocol == "openai-codex-responses" {
         body.as_object_mut().unwrap().remove("max_output_tokens");
     }
@@ -278,6 +297,12 @@ pub async fn stream(
         } else {
             None
         };
+    if api == "anthropic-messages" {
+        crate::services::anthropic_auth::apply_fast(&mut body, provider.model.fast, &provider.model.id, &provider.provider.base_url)?;
+    } else {
+        anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&key), "Anthropic OAuth credentials require the Anthropic messages API");
+        anyhow::ensure!(!provider.model.fast, "Fast mode requires the Anthropic messages API");
+    }
     let encoded_body = serde_json::to_string(&body)?;
     let account = if protocol == "openai-codex-responses" {
         Some(codex_account(&key)?)
@@ -309,7 +334,9 @@ pub async fn stream(
         match api {
             "anthropic-messages" => {
                 request = request.header("anthropic-version", "2023-06-01");
-                if entry["id"] == "github-copilot" || key.starts_with("sk-ant-oat") {
+                if crate::services::anthropic_auth::is_oauth_marker(&key) || provider.model.fast {
+                    request = crate::services::anthropic_auth::authorize(request, &key, &provider.provider.base_url, provider.model.fast).await?;
+                } else if entry["id"] == "github-copilot" || key.starts_with("sk-ant-oat") {
                     request = request.bearer_auth(&key);
                 } else if entry["id"] != "cloudflare-ai-gateway" {
                     request = request.header("x-api-key", &key);

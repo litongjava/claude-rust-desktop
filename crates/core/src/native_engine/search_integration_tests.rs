@@ -69,7 +69,7 @@ async fn search_failure_still_records_provider_usage() {
     }));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
     let (tx, mut rx) = mpsc::channel(8);
-    assert!(execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &provider, &tx, None).await.is_err());
+    assert!(execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &provider, &tx, None, false).await.is_err());
     let mut final_snapshot = None;
     while let Ok(event) = rx.try_recv() {
         if let EngineEvent::RequestSnapshot(snapshot) = event { final_snapshot = Some(snapshot); }
@@ -85,7 +85,7 @@ async fn deepseek_search_requires_separate_settings_instead_of_chat_credentials(
     let mut provider = search_provider("http://127.0.0.1:1", "deepseek-v4.1-flash");
     provider.provider.web_search_strategy = None;
     let (tx, mut rx) = mpsc::channel(8);
-    let error = execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &provider, &tx, None)
+    let error = execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &provider, &tx, None, false)
         .await.unwrap_err().to_string();
     assert!(error.contains("DeepSeek") && error.contains("API Key"));
     assert!(error.contains("联网搜索"));
@@ -118,7 +118,7 @@ async fn deepseek_search_reads_independent_endpoint_model_and_new_key_on_each_ca
         let mut config = crate::config::AppConfig::default();
         config.deepseek_search = serde_json::from_value(json!({"base_url":base,"model":model,"api_key":key})).unwrap();
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let value = execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &chat, &tx, Some(&config_path)).await.unwrap();
+        let value = execute_builtin_tool("WebSearch", json!({"query":"Rust"}), ".", &chat, &tx, Some(&config_path), false).await.unwrap();
         assert_eq!(value["provider_id"], "deepseek-search");
         assert_eq!(value["model"], model);
     }

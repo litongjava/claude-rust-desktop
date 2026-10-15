@@ -166,6 +166,8 @@ pub(super) async fn chat_handler(
             engine.sync_providers(providers_to_sync).await;
 
             let chat_req = crate::native_engine::engine_core::ChatRequest {
+                max_turns: None,
+                response_schema: None,
                 provider_id: req.provider_id.clone(), effort: req.effort.clone(),
                 conversation_id: conv_id.clone(),
                 messages: messages.clone(),
@@ -368,7 +370,7 @@ pub(super) async fn chat_handler(
                         "usage": usage,
                     }))
                 }
-                crate::native_engine::tool_loop::EngineEvent::AskUser { request_id, question, options } => {
+                crate::native_engine::tool_loop::EngineEvent::AskUser { request_id, question, options, .. } => {
                     let options_json: Vec<serde_json::Value> = options.iter()
                         .map(|o| serde_json::json!({"label": o, "description": ""}))
                         .collect();

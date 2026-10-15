@@ -1,3 +1,5 @@
+mod persistent_worker;
+mod worker_frontend;
 mod command_catalog;
 mod interactive_config;
 mod args;
@@ -19,6 +21,22 @@ mod output;
 mod compaction;
 mod skill_commands;
 mod extended_commands;
+mod session_commands;
+mod display_commands;
+mod background_commands;
+mod batch_commands;
+mod rewind_commands;
+mod keybindings;
+mod permission_commands;
+mod sdk_input;
+mod sdk;
+mod account_commands;
+mod design_commands;
+mod ide_commands;
+mod startup_options;
+mod debug_logging;
+mod resource_commands;
+mod feedback_commands;
 
 use anyhow::{bail, ensure, Context, Result};
 use args::{Cli, Commands, McpCommands, OutputFormat, SessionCommands, SkillsCommands};
@@ -36,20 +54,37 @@ use std::{
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(if cli.verbose { "info" } else { "error" })
-    });
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(io::stderr)
-        .with_ansi(io::stderr().is_terminal())
-        .init();
+    match claude_core::services::batch::run_worker_from_env() {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {},
+        Err(error) => { eprintln!("Batch worker failed: {error:#}"); return std::process::ExitCode::FAILURE; },
+    }
+    match claude_core::services::background_sessions::run_worker_from_env() {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {},
+        Err(error) => { eprintln!("Background worker failed: {error:#}"); return std::process::ExitCode::FAILURE; },
+    }
+    match claude_core::services::session_worker::run_supervisor_from_env() {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {},
+        Err(error) => { eprintln!("Session supervisor failed: {error:#}"); return std::process::ExitCode::FAILURE; },
+    }
+    match persistent_worker::run_from_env().await {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {},
+        Err(error) => { eprintln!("Session host failed: {error:#}"); return std::process::ExitCode::FAILURE; },
+    }
+    let mut cli = Cli::parse();
+    cli.normalize();
+    terminal::configure_accessibility(cli.ax_screen_reader);
+    debug_logging::install(cli.verbose);
     if let Err(error) = run(&cli).await {
-        if let Err(output_error) = output::report_startup_error(&cli, &error) {
-            eprintln!("Cannot write error result: {output_error}");
+        if !worker_frontend::already_presented(&error) {
+            if let Err(output_error) = output::report_startup_error(&cli, &error) {
+                eprintln!("Cannot write error result: {output_error}");
+            }
+            eprintln!("Error: {error:#}");
         }
-        eprintln!("Error: {error:#}");
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
@@ -66,6 +101,7 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
 
 async fn run(cli: &Cli) -> Result<()> {
     if let Some(Commands::Help {topic,command})=&cli.command {return help::show(topic.as_deref(),command); }
+    cli.response_schema()?;
     let data_dir = match &cli.data_dir {
         Some(path) => path.clone(),
         None => RuntimePaths::default_data_dir()?,
@@ -74,12 +110,17 @@ async fn run(cli: &Cli) -> Result<()> {
     if let Some(path) = &cli.path {
         std::env::set_current_dir(path).context("Cannot open project directory")?;
     }
+    if cli.debug.is_some() || cli.debug_file.is_some() {
+        let log = cli.debug_file.clone().unwrap_or_else(||paths.data_dir.join(format!("debug-{}.log",uuid::Uuid::new_v4())));
+        debug_logging::configure_filtered(log, cli.debug.as_deref().unwrap_or(""))?;
+    }
     if cli.info {
         println!("claude-code {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
         return Ok(());
     }
     let mut skill_prompt = None;
     match &cli.command {
+        Some(Commands::Auth { action }) => return account_commands::run(&paths, action).await,
         Some(Commands::Plugin { action }) => return plugins::run(&paths,action).await,
         Some(Commands::Update { url }) => {
             let update = claude_core::services::updates::check(url,env!("CARGO_PKG_VERSION")).await?;
@@ -219,7 +260,10 @@ async fn run(cli: &Cli) -> Result<()> {
         _ => {}
     }
     let explicit_repl = matches!(cli.command, Some(Commands::Repl { .. }));
-    let single = cli.print
+    let sdk_stream = cli.input_format == args::InputFormat::StreamJson;
+    ensure!(!cli.replay_user_messages || sdk_stream, "--replay-user-messages requires --input-format stream-json");
+    ensure!(!sdk_stream || cli.output_format == OutputFormat::StreamJson, "--input-format stream-json requires --output-format stream-json");
+    let single = sdk_stream || cli.print
         || cli.print_short
         || cli.no_interactive
         || cli.no_interactive_short
@@ -240,7 +284,7 @@ async fn run(cli: &Cli) -> Result<()> {
             _ => cli.prompt.clone(),
         })
         .unwrap_or_default();
-    if !io::stdin().is_terminal() {
+    if !sdk_stream && !io::stdin().is_terminal() {
         let mut piped = String::new();
         io::stdin().read_to_string(&mut piped)?;
         if !piped.trim().is_empty() {
@@ -251,7 +295,7 @@ async fn run(cli: &Cli) -> Result<()> {
         }
     }
     ensure!(
-        !single || !prompt.trim().is_empty(),
+        sdk_stream || !single || !prompt.trim().is_empty(),
         "A prompt or piped stdin is required"
     );
     let resumed = if let Some(id) = &cli.resume {
@@ -296,61 +340,99 @@ async fn run(cli: &Cli) -> Result<()> {
         },
         Err(error) => return Err(error),
     };
+    startup_options::validate(cli, &std::env::current_dir()?)?;
     let mut session = session::Session::open(cli, &paths, selection, resumed.as_ref().map(|s| s.id.as_str())).await?;
+    startup_options::apply(cli, &mut session).await?;
+    let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     let result = async {
         if !single { eprintln!("Claude Rust {} — session {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.id); }
-        if !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
+        if !sdk_stream && !prompt.trim().is_empty() { session.turn(cli, &prompt, &mut input).await?; }
+        if sdk_stream {
+            sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str())).await?;
+        }
         if single { return Ok(()); }
-        let mut skills = skill_commands::load(&paths).await?;
+        let mut skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
         input.as_mut().unwrap().set_commands(skill_commands::catalog(&skills));
         let mut composer = terminal::prompt::Composer::default();
-        loop {
+        let mut background_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+        background_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        'repl: loop {
+            for notice in background_commands::collect_completed(&session)? { eprintln!("{notice}"); }
+            skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
+            if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
+                eprintln!("Keybindings: {error:#}");
+            }
+            let display = display_commands::load(&session)?;
+            if screen_mode.set(&display.tui)? {
+                for row in session.store.history(&session.id)? {
+                    let content: String = row["content"].as_str().unwrap_or("").chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+                    eprintln!("\n{}\n{content}", row["role"].as_str().unwrap_or("message"));
+                }
+            }
+            terminal::style::configure(&display.theme, &display.color);
             let mut catalog = skill_commands::catalog(&skills);
             if let Some((_, description)) = catalog.iter_mut().find(|(name, _)| name == "/model") {
                 *description = format!("Set the AI model (currently {} · {})", session.model, session.provider_id);
             }
             input.as_mut().unwrap().set_commands(catalog);
-            input.as_mut().unwrap().set_details(repl::tool_details(&session)?);
+            if display.diff_panel && !display.focus {
+                match claude_core::services::worktree_diff::snapshot(&session.workspace, display.diff_staged).await {
+                    Ok(diff) => input.as_mut().unwrap().set_panel(vec![(if display.diff_staged { "Staged diff" } else { "Uncommitted changes (untracked files listed by name)" }.into(), diff)], true),
+                    Err(error) => { eprintln!("Diff: {error:#}"); input.as_mut().unwrap().set_details(vec![]); },
+                }
+            } else {
+                input.as_mut().unwrap().set_details(if display.focus { vec![] } else { repl::tool_details(&session)? });
+            }
+            match display_commands::statusline(&session, &display).await {
+                Ok(Some(line)) => eprintln!("{line}"),
+                Ok(None) => {},
+                Err(error) => eprintln!("Status line: {error:#}"),
+            }
             let prompt = if composer.is_pending() { "... " } else { "\n> " };
-            let line = tokio::select! {
-                line = input.as_mut().expect("interactive reader").read_prompt(prompt) => match line {
+            let line = 'read: loop { tokio::select! {
+                line = input.as_mut().expect("interactive reader").read_prompt(prompt) => break 'read match line {
                     Ok(Some(line)) => line,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                         if composer.is_pending() {
                             composer.cancel();
                             eprintln!("Prompt discarded.");
-                            continue;
+                            continue 'repl;
                         }
-                        break;
+                        break 'repl;
                     },
                     Err(error) => return Err(error.into()),
                     Ok(None) => {
                         if composer.is_pending() { eprintln!("Unfinished prompt discarded."); }
-                        break;
+                        break 'repl;
+                    }
+                },
+                _ = background_refresh.tick() => {
+                    for notice in background_commands::collect_completed(&session)? {
+                        input.as_ref().expect("interactive reader").notice(notice);
                     }
                 },
                 _ = tokio::signal::ctrl_c() => {
                     if composer.is_pending() {
                         composer.cancel();
                         eprintln!("Prompt discarded.");
-                        continue;
+                        continue 'repl;
                     }
-                    break;
+                    break 'repl;
                 },
-            };
+            } };
             let line = match composer.push(line) {
                 terminal::prompt::Input::Pending => continue,
                 terminal::prompt::Input::Cancelled => { eprintln!("Prompt discarded."); continue; },
                 terminal::prompt::Input::Prompt(prompt) => {
                     if !prompt.trim().is_empty() {
-                        if let Err(error) = session.turn(cli, &prompt, &mut input).await { eprintln!("Error: {error:#}"); }
+                        if let Err(error) = session.turn(cli, &prompt, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } }
                     }
                     continue;
                 },
                 terminal::prompt::Input::Command(line) => line,
             };
             if line.trim() == "/reload-skills" {
-                match skill_commands::load(&paths).await {
+                match skill_commands::load_for_workspace(&paths, &session.workspace).await {
                     Ok(updated) => {
                         skills = updated;
                         input.as_mut().unwrap().set_commands(skill_commands::catalog(&skills));
@@ -359,6 +441,22 @@ async fn run(cli: &Cli) -> Result<()> {
                     Err(error) => eprintln!("Cannot reload skills: {error:#}"),
                 }
                 continue;
+            }
+            let (command, argument) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
+            match design_commands::handle(cli, command, argument, &paths, &mut session).await {
+                Ok(true) => continue,
+                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Ok(false) => {},
+            }
+            match batch_commands::handle(cli, command, argument, &paths, &mut session).await {
+                Ok(true) => continue,
+                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Ok(false) => {},
+            }
+            match background_commands::handle(cli, command, argument, &paths, &mut session).await {
+                Ok(true) => continue,
+                Err(error) => { eprintln!("Error: {error:#}"); continue; },
+                Ok(false) => {},
             }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
                 Ok(true) => continue,
@@ -377,14 +475,14 @@ async fn run(cli: &Cli) -> Result<()> {
                     eprintln!("{}", command_catalog::help());
                     for (name, description) in &skills { eprintln!("  {name:<24} {description}"); }
                 },
-                "/status" | "status" | ".status" => { eprintln!("Session: {}\nProject: {}\nData: {}", session.id, std::env::current_dir()?.display(), paths.data_dir.display()); interactive_config::status(&session); },
+                "/status" | "status" | ".status" => { eprintln!("Session: {}\nProject: {}\nData: {}", session.id, session.workspace.display(), paths.data_dir.display()); interactive_config::status(&session); },
                 "/history" | "history" | ".history" => println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
                 "/tools" | "tools" | ".tools" => for tool in claude_core::tools::get_tool_definitions() { eprintln!("{}: {}", tool.name, tool.description); },
                 command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {
-                    if let Err(error) = session.turn(cli, &line, &mut input).await { eprintln!("Error: {error:#}"); }
+                    if let Err(error) = session.turn(cli, &line, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } }
                 },
                 command if command.starts_with('/') => eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
-                _ => if let Err(error) = session.turn(cli, &line, &mut input).await { eprintln!("Error: {error:#}"); },
+                _ => if let Err(error) = session.turn(cli, &line, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } },
             }
         }
         Ok(())

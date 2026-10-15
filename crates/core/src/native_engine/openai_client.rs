@@ -125,6 +125,7 @@ use crate::performance::{retry_with_backoff, checked_response};
 
 pub struct OpenAIClient {
     client: Client,
+    response_schema: Option<Value>,
 }
 
 impl OpenAIClient {
@@ -133,7 +134,12 @@ impl OpenAIClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client }
+        Self { client, response_schema: None }
+    }
+
+    pub fn with_response_schema(mut self, schema: Option<Value>) -> Self {
+        self.response_schema = schema;
+        self
     }
 
     pub async fn send_message(
@@ -144,8 +150,9 @@ impl OpenAIClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<OpenAIResponse> {
+        anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            let mut stream = super::provider_runtime::stream(provider, messages, system_prompt, tools, max_tokens).await?;
+            let mut stream = super::provider_runtime::stream_with_schema(provider, messages, system_prompt, tools, max_tokens, self.response_schema.as_ref()).await?;
             let mut text = String::new();
             let mut thinking = String::new();
             let mut calls = std::collections::BTreeMap::<usize, Value>::new();
@@ -219,6 +226,9 @@ impl OpenAIClient {
         }
 
         apply_effort(&mut body, provider.model.effort.as_deref(), &provider.provider.base_url);
+        if let Some(schema) = &self.response_schema {
+            body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}});
+        }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
         let data: OpenAIResponse = retry_with_backoff(|| async {
             let response = self.client
@@ -245,8 +255,9 @@ impl OpenAIClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            return super::provider_runtime::stream(provider, messages, system_prompt, tools, max_tokens).await;
+            return super::provider_runtime::stream_with_schema(provider, messages, system_prompt, tools, max_tokens, self.response_schema.as_ref()).await;
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -288,6 +299,9 @@ impl OpenAIClient {
         }
 
         apply_effort(&mut body, provider.model.effort.as_deref(), &provider.provider.base_url);
+        if let Some(schema) = &self.response_schema {
+            body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}});
+        }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
         let response = retry_with_backoff(|| async {
             let resp = self.client

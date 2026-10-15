@@ -15,6 +15,7 @@ pub struct McpToolDefinition {
 
 pub struct McpToolRegistry {
     manager: Arc<McpServerManager>,
+    ide: Option<Arc<crate::services::ide::IdeClient>>,
     #[allow(dead_code)]
     active_connectors: Arc<Mutex<HashMap<String, Arc<Mutex<McpConnector>>>>>,
 }
@@ -23,8 +24,14 @@ impl McpToolRegistry {
     pub fn new(manager: Arc<McpServerManager>) -> Self {
         Self {
             manager,
+            ide: None,
             active_connectors: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_ide(mut self, ide: Arc<crate::services::ide::IdeClient>) -> Self {
+        self.ide = Some(ide);
+        self
     }
 
     pub async fn get_all_tools(&self) -> Result<Vec<McpToolDefinition>> {
@@ -68,6 +75,7 @@ impl McpToolRegistry {
             }
         }
 
+        if let Some(ide) = &self.ide { all_tools.extend(ide.tools().await); }
         Ok(all_tools)
     }
 
@@ -76,6 +84,9 @@ impl McpToolRegistry {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        if name.starts_with("mcp__ide__") {
+            return self.ide.as_ref().ok_or_else(||anyhow::anyhow!("IDE is not connected"))?.call_tool(name, arguments).await;
+        }
         let manager = &self.manager;
         let servers = manager.list_servers_full().await;
 
@@ -131,6 +142,7 @@ impl McpToolRegistry {
     }
 
     pub async fn is_mcp_tool(&self, name: &str) -> bool {
+        if name.starts_with("mcp__ide__") { return true; }
         if matches!(name, "ListMcpResources" | "ReadMcpResource") {
             return true;
         }

@@ -76,6 +76,7 @@ impl DeepSeekSearchConfig {
             supports_text: true,
             api: Some("anthropic-messages".into()),
             effort: None,
+            fast: false,
         };
         Ok(ResolvedProvider {
             provider: Provider {

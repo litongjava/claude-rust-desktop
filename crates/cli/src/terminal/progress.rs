@@ -34,6 +34,7 @@ pub struct TurnProgress {
 impl TurnProgress {
     pub fn new(interactive_text: bool) -> Self {
         let enabled = interactive_text
+            && !crate::terminal::screen_reader()
             && io::stdin().is_terminal()
             && io::stdout().is_terminal()
             && io::stderr().is_terminal()
@@ -195,12 +196,12 @@ impl TurnProgress {
         let status = styled(
             &clipped(&status, width.saturating_sub(1)),
             self.color,
-            "38;5;209",
+            crate::terminal::style::activity(),
         );
         let tip = styled(
             &clipped(&format!("  └ {tip}"), width.saturating_sub(1)),
             self.color,
-            "90",
+            crate::terminal::style::muted_ansi(),
         );
         let mut lines = activity_frame(
             status,
@@ -343,13 +344,13 @@ fn activity_frame(
 }
 
 #[derive(Default)]
-struct ReportedUsage {
+pub(crate) struct ReportedUsage {
     input: Option<u64>,
     output: Option<u64>,
 }
 
 impl ReportedUsage {
-    fn update(&mut self, value: &Value) {
+    pub(crate) fn update(&mut self, value: &Value) {
         // Anthropic sends partial usage updates; OpenAI sends prompt/completion.
         // Child sessions also forward usage without a request ID, so summing
         // these events would double-count or conflate independent requests.
@@ -367,7 +368,7 @@ impl ReportedUsage {
         }
     }
 
-    fn summary(&self) -> Option<String> {
+    pub(crate) fn summary(&self) -> Option<String> {
         if self.input.is_none() && self.output.is_none() {
             return None;
         }
@@ -392,7 +393,7 @@ fn single_line(text: &str) -> String {
         .join(" ")
 }
 
-fn tool_preview(name: &str, input: &Value) -> String {
+pub(crate) fn tool_preview(name: &str, input: &Value) -> String {
     let name = single_line(name);
     let preview = if name == "Bash" {
         input["command"].as_str().map(|command| {
@@ -426,7 +427,7 @@ fn tool_preview(name: &str, input: &Value) -> String {
     }
 }
 
-fn tool_result_summary(
+pub(crate) fn tool_result_summary(
     name: &str,
     output: &str,
     failed: bool,

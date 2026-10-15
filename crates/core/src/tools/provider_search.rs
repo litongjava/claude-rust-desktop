@@ -113,7 +113,7 @@ fn endpoint(provider: &ResolvedProvider) -> Result<(Strategy, reqwest::Url)> {
 fn credentials(provider: &ResolvedProvider) -> Result<(String, bool)> {
     let configured = provider.provider.api_key.trim();
     if !configured.is_empty() {
-        if configured.starts_with("sk-ant-oat") {
+        if configured.starts_with("sk-ant-oat") || crate::services::anthropic_auth::is_oauth_marker(configured) {
             bail!("Native WebSearch currently requires an API key; Claude subscription OAuth credentials are not supported by this adapter.");
         }
         return Ok((configured.into(), false));
@@ -436,6 +436,7 @@ mod tests {
                 supports_text: true,
                 api: None,
                 effort: None,
+                fast: false,
             },
         }
     }

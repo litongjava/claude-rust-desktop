@@ -1,6 +1,16 @@
 //! Peripheral services shared by CLI and Desktop. Hosts supply credentials/devices.
 pub mod lifecycle;
 pub mod compaction;
+pub mod session_workspace;
+pub mod background_sessions;
+pub mod session_worker;
+pub mod batch;
+pub mod checkpoints;
+pub mod tool_hooks;
+pub mod anthropic_auth;
+pub mod design;
+pub mod ide;
+pub mod usage;
 pub mod team;
 pub mod team_server;
 pub mod voice;
@@ -10,6 +20,11 @@ pub mod magic_docs;
 pub mod agents;
 pub mod agent_import;
 pub mod diagnostics;
+pub mod doctor;
+pub mod cli_resources;
+pub mod feedback;
+pub mod statusline;
+pub mod worktree_diff;
 pub mod updates;
 pub mod plugins;
 pub mod session_import;

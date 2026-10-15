@@ -17,6 +17,10 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[path = "runtime_user_content.rs"]
+mod user_content;
+pub use user_content::normalize_user_content;
+
 #[derive(Clone, Debug)]
 pub struct RuntimePaths {
     pub data_dir: PathBuf,
@@ -101,6 +105,7 @@ pub fn provider_from_config(p: &ProviderConfig) -> Provider {
                 supports_vision: m.supports_vision,
                 api: m.api.clone(),
                 effort: None,
+                fast: false,
                 supports_web_search: false,
             })
             .collect(),
@@ -132,20 +137,44 @@ pub struct SessionStore {
     pub db: Arc<DbManager>,
 }
 
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn explicit_session_id_is_durable_and_never_overwrites_existing_history() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(store.create_with_id(root.path(),"model","provider",&id).unwrap(),id);
+        store.append(&id,"user","Keep this conversation").unwrap();
+        assert!(store.create_with_id(root.path(),"other","provider",&id).is_err());
+        assert!(store.create_with_id(root.path(),"model","provider","invalid").is_err());
+        assert_eq!(store.resume(&id).unwrap().model.as_deref(),Some("model"));
+        assert_eq!(store.history(&id).unwrap()[0]["content"],"Keep this conversation");
+    }
+}
+
 impl SessionStore {
     pub fn new(db: Arc<DbManager>) -> Self {
         Self { db }
     }
 
     pub fn create(&self, workspace: &Path, model: &str, provider: &str) -> Result<String> {
+        self.create_with_id(workspace, model, provider, &uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Create a fresh conversation; existing IDs remain untouched.
+    pub fn create_with_id(&self, workspace: &Path, model: &str, provider: &str, id: &str) -> Result<String> {
+        let id = uuid::Uuid::parse_str(id).context("Session ID must be a UUID")?.to_string();
         let workspace =
             std::fs::canonicalize(workspace).context("Project directory is unavailable")?;
         ensure!(workspace.is_dir(), "Project path must be a directory");
         let path = workspace.to_string_lossy().into_owned();
-        let id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
             // Acquire the writer before reading project state, avoiding a stale WAL snapshot upgrade.
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1)", [&id], |row| row.get::<_,bool>(0))?, "Session ID already exists; use --resume to continue it");
             let project = project_repo::list_projects(&tx)?.into_iter().find(|p| {
                 !p.is_archived
                     && p.workspace_path
@@ -325,13 +354,25 @@ impl SessionStore {
                         }
                     }
                 }
-                if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
+                use rusqlite::OptionalExtension;
+                let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
+                if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
+                else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
             }
             Ok(history)
         })?
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {
+        self.append_with_content(id,role,text,None)
+    }
+
+    pub fn append_user_content(&self,id:&str,text:&str,content:&Value)->Result<String>{
+        let content=normalize_user_content(content)?;
+        self.append_with_content(id,"user",text,Some(&content))
+    }
+
+    fn append_with_content(&self,id:&str,role:&str,text:&str,content:Option<&Value>)->Result<String>{
         let message_id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
             // Message ordering is a read/modify/write operation shared by CLI and Desktop hosts.
@@ -354,6 +395,7 @@ impl SessionStore {
                 order,
             )?;
             conversation_repo::increment_message_count(&tx, id)?;
+            if let Some(content)=content {tx.execute("INSERT INTO message_user_content (message_id,content_json) VALUES (?1,?2)",rusqlite::params![message_id,serde_json::to_string(content)?])?;}
             conversation_repo::update_conversation_timestamp(&tx, id, &now)?;
             tx.commit()?;
             Ok(())

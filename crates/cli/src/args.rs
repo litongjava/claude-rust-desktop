@@ -50,8 +50,23 @@ pub struct Cli {
     pub no_interactive_short: bool,
     #[arg(long, value_enum, default_value = "text", global = true)]
     pub output_format: OutputFormat,
+    /// Read plain text or newline-delimited SDK user messages from stdin.
+    #[arg(long, value_enum, default_value = "text", global = true)]
+    pub input_format: InputFormat,
+    /// Echo accepted SDK user envelopes, including their UUIDs.
+    #[arg(long, global = true)]
+    pub replay_user_messages: bool,
+    /// Maximum model/tool-loop iterations for each submitted user message.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), global = true)]
+    pub max_turns: Option<u32>,
+    /// Require a provider-enforced JSON result matching this JSON Schema string.
+    #[arg(long, global = true)]
+    pub json_schema: Option<String>,
     #[arg(long, value_enum, default_value = "ask", global = true)]
     pub permission_mode: PermissionModeArg,
+    /// Bypass interactive permission prompts; explicit deny rules still apply.
+    #[arg(long, global = true, conflicts_with = "permission_mode")]
+    pub dangerously_skip_permissions: bool,
     #[arg(short = 'r', long, global = true)]
     pub resume: Option<String>,
     /// Continue the most recently updated conversation in this project.
@@ -60,7 +75,31 @@ pub struct Cli {
     /// Copy the resumed conversation into a new session before continuing.
     #[arg(long, global = true)]
     pub fork_session: bool,
-    #[arg(long, value_parser = ["off", "low", "high", "max"], global = true)]
+    /// UUID for a new conversation; existing IDs must be resumed explicitly.
+    #[arg(long, conflicts_with_all=["resume", "continue_session", "fork_session"], value_parser=parse_session_id)]
+    pub session_id: Option<String>,
+    /// Create an isolated managed Git worktree; omit NAME to generate one.
+    #[arg(short='w',long,num_args=0..=1,default_missing_value="",conflicts_with_all=["resume","continue_session","fork_session"])]
+    pub worktree: Option<String>,
+    /// Human-readable title saved with this conversation.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Additional trusted working directory. May be repeated.
+    #[arg(long)]
+    pub add_dir: Vec<PathBuf>,
+    /// Connect automatically when exactly one editor extension matches the workspace.
+    #[arg(long)]
+    pub ide: bool,
+    /// Flat terminal output without borders, animation, mouse capture or fullscreen.
+    #[arg(long)]
+    pub ax_screen_reader: bool,
+    /// Enable diagnostics; optionally select categories (api,hooks,mcp,lsp,skills,permissions,cli).
+    #[arg(short='d',long,num_args=0..=1,default_missing_value="")]
+    pub debug: Option<String>,
+    /// Append redacted diagnostics to this UTF-8 log file.
+    #[arg(long)]
+    pub debug_file: Option<PathBuf>,
+    #[arg(long, value_parser = ["off", "low", "medium", "high", "xhigh", "max"], global = true)]
     pub effort: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..), global = true)]
     pub max_tokens: Option<u32>,
@@ -72,13 +111,34 @@ pub struct Cli {
     /// Append instructions to the supplied system prompt.
     #[arg(long, global = true)]
     pub append_system_prompt: Option<String>,
+    /// Append UTF-8 instructions from a file after the supplied system prompt.
+    #[arg(long, global = true, conflicts_with = "append_system_prompt")]
+    pub append_system_prompt_file: Option<PathBuf>,
     #[arg(short, long, global = true)]
     pub verbose: bool,
     #[arg(long)]
     pub info: bool,
 }
 
+fn parse_session_id(value: &str) -> Result<String, String> {
+    uuid::Uuid::parse_str(value).map(|id|id.to_string()).map_err(|_|"Session ID must be a UUID".into())
+}
+
 impl Cli {
+    pub fn normalize(&mut self) {
+        if self.dangerously_skip_permissions {
+            self.permission_mode = PermissionModeArg::Bypass;
+        }
+    }
+    pub fn response_schema(&self) -> anyhow::Result<Option<serde_json::Value>> {
+        use anyhow::Context;
+        self.json_schema.as_ref().map(|text| {
+            let schema = serde_json::from_str(text).context("--json-schema must be a valid JSON Schema string")?;
+            claude_core::structured_output::validate_schema(&schema)?;
+            Ok(schema)
+        }).transpose()
+    }
+
     pub fn system_prompt_text(&self) -> anyhow::Result<String> {
         use anyhow::Context;
         let mut prompt = match &self.system_prompt_file {
@@ -92,6 +152,12 @@ impl Cli {
             }
             prompt.push_str(append);
         }
+        if let Some(path) = &self.append_system_prompt_file {
+            let append = std::fs::read_to_string(path)
+                .with_context(|| format!("Cannot read UTF-8 appended system prompt: {}", path.display()))?;
+            if !prompt.is_empty() && !append.is_empty() { prompt.push_str("\n\n"); }
+            prompt.push_str(&append);
+        }
         Ok(prompt)
     }
 }
@@ -103,20 +169,30 @@ pub enum OutputFormat {
     StreamJson,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InputFormat {
+    Text,
+    StreamJson,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ApiFormatArg {
     Anthropic,
     Openai,
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum PermissionModeArg {
+    #[value(alias = "default")]
     Ask,
+    #[value(alias = "acceptEdits")]
     AcceptEdits,
     Plan,
+    #[value(alias = "bypassPermissions")]
     Bypass,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Manage this application's Anthropic account without provider setup.
+    Auth { #[command(subcommand)] action: AuthCommands },
     Learning { #[command(subcommand)] action: crate::migration::LearningCommands },
     Performance { #[command(subcommand)] action: crate::migration::PerformanceCommands },
     Project { #[command(subcommand)] action: crate::migration::ProjectCommands },
@@ -211,6 +287,13 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommands {
+    Login,
+    Logout,
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -421,6 +504,30 @@ pub enum PluginCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_permission_flags_are_explicit_and_unambiguous() {
+        let mut cli = Cli::try_parse_from(["claude-code", "--dangerously-skip-permissions"]).unwrap();
+        cli.normalize();
+        assert!(matches!(cli.permission_mode, PermissionModeArg::Bypass));
+        assert!(Cli::try_parse_from(["claude-code", "--dangerously-skip-permissions", "--permission-mode", "plan"]).is_err());
+        assert!(matches!(Cli::try_parse_from(["claude-code", "--permission-mode", "acceptEdits"]).unwrap().permission_mode, PermissionModeArg::AcceptEdits));
+        assert!(matches!(Cli::try_parse_from(["claude-code", "--permission-mode", "bypassPermissions"]).unwrap().permission_mode, PermissionModeArg::Bypass));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.md");
+        std::fs::write(&path, "UTF-8 中文").unwrap();
+        let cli = Cli::try_parse_from(["claude-code", "--system-prompt", "Base", "--append-system-prompt-file", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cli.system_prompt_text().unwrap(), "Base\n\nUTF-8 中文");
+    }
+    #[test]
+    fn sdk_input_and_turn_budget_preserve_short_print_prompt() {
+        let cli = Cli::try_parse_from(["claude-code", "-p", "initial", "--input-format", "stream-json", "--max-turns", "2"]).unwrap();
+        assert_eq!(cli.prompt.as_deref(), Some("initial"));
+        assert!(cli.print_short);
+        assert_eq!(cli.input_format, InputFormat::StreamJson);
+        assert_eq!(cli.max_turns, Some(2));
+        assert!(Cli::try_parse_from(["claude-code", "--max-turns", "0"]).is_err());
+        assert!(Cli::try_parse_from(["claude-code", "--input-format", "invalid"]).is_err());
+    }
 
     #[test]
     fn prompt_sources_compose_and_reject_ambiguous_input() {

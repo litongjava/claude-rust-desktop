@@ -5,6 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+static SCREEN_READER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn configure_accessibility(enabled: bool) {
+    SCREEN_READER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn screen_reader() -> bool {
+    SCREEN_READER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
     pub verbose: bool,
@@ -34,6 +42,9 @@ pub enum OutputFormat {
 
 pub mod input;
 pub mod progress;
+pub mod live;
+pub mod style;
+pub mod screen_mode;
 
 /// Assemble prompts without creating another stdin reader. Explicit multiline
 /// mode treats slash commands as literal text until /end or /cancel.

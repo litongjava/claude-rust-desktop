@@ -2135,7 +2135,7 @@ async fn workflow_execute(
             enabled: m.enabled,
             max_tokens: m.max_tokens,
             supports_vision: m.supports_vision,
-                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None,
+                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None, fast: false,
             supports_web_search: false,
         }).collect(),
         enabled: provider_config.enabled,
@@ -2148,7 +2148,7 @@ async fn workflow_execute(
         enabled: model_config.enabled,
         max_tokens: model_config.max_tokens,
         supports_vision: model_config.supports_vision,
-        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None,
+        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None, fast: false,
         supports_web_search: false,
     };
 
@@ -2223,7 +2223,7 @@ async fn workflow_execute_stream(
             enabled: m.enabled,
             max_tokens: m.max_tokens,
             supports_vision: m.supports_vision,
-                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None,
+                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None, fast: false,
             supports_web_search: false,
         }).collect(),
         enabled: provider_config.enabled,
@@ -2236,7 +2236,7 @@ async fn workflow_execute_stream(
         enabled: model_config.enabled,
         max_tokens: model_config.max_tokens,
         supports_vision: model_config.supports_vision,
-        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None,
+        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None, fast: false,
         supports_web_search: false,
     };
 

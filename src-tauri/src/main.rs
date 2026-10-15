@@ -257,6 +257,8 @@ fn main() {
 
                         // Build chat request with user's message
                         let chat_req = crate::native_engine::engine_core::ChatRequest {
+                            max_turns: None,
+                            response_schema: None,
                 provider_id: None, effort: None,
                             conversation_id: cid.clone(),
                             messages: vec![serde_json::json!({

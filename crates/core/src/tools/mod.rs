@@ -12,6 +12,8 @@ pub mod macros;
 mod notebook;
 mod tasks;
 mod lsp;
+pub use lsp::{configure as configure_lsp_servers, shutdown_all as shutdown_lsp_servers, status as lsp_status};
+pub(crate) use lsp::passive_feedback as lsp_passive_feedback;
 mod worktrees;
 pub mod agent_messages;
 pub mod coordination;
@@ -57,6 +59,7 @@ pub struct ToolDefinition {
 
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let mut defs = vec![
+        ToolDefinition { name: "Skill".into(), description: "Invoke an available skill by name with optional args. Inline skills return instructions to follow; context:fork skills execute in an isolated child conversation and return its actual result. Dynamic shell context uses normal execution permissions and can request approval. Do not read a skill file to bypass this execution path.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"type":"string"},"args":{"type":"string"}},"required":["skill"],"additionalProperties":false}) },
         notebook::definition(),
         lsp::definition(),
         worktrees::definition(),

@@ -252,7 +252,12 @@ async fn plugins_diagnostics_and_topic_help_are_standalone() {
     run(dir.path(),&["plugin","enable","fixture"]).await;
     assert_eq!(run(dir.path(),&["stress-test","-c","2","-i","2"]).await["succeeded"],4);
     assert!(output(dir.path(),&["help","--topic","plugins"]).await.status.success());
-    assert!(output(dir.path(),&["help","mcp"]).await.status.success());
+    let help = output(dir.path(), &["help", "mcp"]).await;
+    assert!(help.status.success(), "{}", String::from_utf8_lossy(&help.stderr));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("mcp"));
+    let unknown = output(dir.path(), &["help", "unknown-command"]).await;
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("Unknown command"));
     assert!(!output(dir.path(),&["mcp","restart","missing"]).await.status.success());
 }
 

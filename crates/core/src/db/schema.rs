@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS message_trajectory (
     requests_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS message_user_content (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    content_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_requests (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,

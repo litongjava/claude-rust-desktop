@@ -57,6 +57,11 @@ pub struct ChatRequest {
     pub effort: Option<String>,
     pub system_prompt: Option<String>,
     pub max_tokens: Option<u32>,
+    /// Per-request model/tool-loop budget. None keeps the configured default.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub response_schema: Option<Value>,
     pub workspace_path: Option<String>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -321,17 +326,9 @@ impl QueryEngine {
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
     pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
         crate::services::compaction::apply_boundary(&self.db_manager, &request.conversation_id, &mut request.messages)?;
-        let command = request.messages.iter().rev().find(|m| m["role"] == "user")
+        let skill_invocation = request.messages.iter().rev().find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str()).and_then(|text| text.trim_start().strip_prefix('/'))
-            .and_then(|text| text.split_whitespace().next()).map(str::to_string);
-        if let (Some(command), Some(manager)) = (command, &self.skills_manager) {
-            let skills = manager.lock().await.list_enabled_skills().await?;
-            let matches: Vec<_> = skills.into_iter().filter(|skill| skill.id == command || skill.name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-") == command).collect();
-            anyhow::ensure!(matches.len() <= 1, "Ambiguous skill command; use its full skill ID");
-            if let Some(content) = matches.into_iter().next().and_then(|skill| skill.content) {
-                request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSelected skill instructions:\n{content}\n"));
-            }
-        }
+            .map(|text| { let mut parts = text.splitn(2, char::is_whitespace); (parts.next().unwrap_or("").to_owned(), parts.next().unwrap_or("").trim().to_owned()) });
         let conv_id = request.conversation_id.clone();
         let plugin_root=self.provider_manager.lock().await.config_path().parent().context("Missing runtime directory")?.to_path_buf();
         let plugin_context=crate::services::ServiceContext{paths:crate::runtime::RuntimePaths::new(plugin_root)?,db:self.db_manager.clone(),credentials:Arc::new(crate::services::EnvironmentCredentials)};
@@ -367,6 +364,36 @@ impl QueryEngine {
             request.system_prompt.as_deref(), &request.model, prompt_profile,
         ));
         let workspace_path = workspace.to_string_lossy().into_owned();
+        let mut discovered_skills = crate::services::plugins::skill_commands(&plugin_context)?;
+        discovered_skills.extend(crate::skills::discovery::discover(&workspace)?);
+        let mut pending_user_skill = None;
+        if let Some((command, arguments)) = skill_invocation {
+            let content = if let Some(skill) = discovered_skills.get(&command) {
+                let template = skill.render_template(&arguments, &conv_id)?;
+                let requires_execution = skill.context.as_deref() == Some("fork") || crate::skills::invocation::parse(&template)?.iter().any(|part| matches!(part, crate::skills::invocation::Segment::Shell(_)));
+                if requires_execution {
+                    pending_user_skill = Some(serde_json::json!({"skill":command,"args":arguments}));
+                    None
+                } else { Some(skill.render(&arguments, &conv_id)?) }
+            } else if let Some(manager) = &self.skills_manager {
+                let skills = manager.lock().await.list_enabled_skills().await?;
+                let matches: Vec<_> = skills.into_iter().filter(|skill| skill.id == command || skill.name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-") == command).collect();
+                anyhow::ensure!(matches.len() <= 1, "Ambiguous skill command; use its full skill ID");
+                matches.into_iter().next().and_then(|skill| skill.content).map(|content| format!("{content}\n\nUser arguments: {arguments}"))
+            } else { None };
+            // Hosts reject unknown slash commands; ordinary Desktop or multiline
+            // messages may legitimately begin with a literal filesystem path.
+            if let Some(content) = content { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSelected skill instructions:\n{content}\n")); }
+        }
+        let available_skills = discovered_skills.values().filter(|skill| skill.model_invocable()).map(|skill| serde_json::json!({"name":skill.name,"description":skill.description,"context":skill.context})).collect::<Vec<_>>();
+        if !available_skills.is_empty() { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool. {}\n", serde_json::to_string(&available_skills)?)); }
+        crate::tools::configure_lsp_servers(&workspace_path, crate::services::plugins::language_servers(&plugin_context)?)?;
+        let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(&plugin_context, &workspace)?;
+        let prompt = request.messages.iter().rev().find(|m| m["role"] == "user").map(|m| m["content"].clone()).unwrap_or(Value::Null);
+        let hook_result = hooks.run(crate::services::tool_hooks::HookEvent::UserPromptSubmit, &conv_id, serde_json::json!({"prompt":prompt})).await?;
+        anyhow::ensure!(!hook_result.blocked, "UserPromptSubmit hook blocked request: {}", hook_result.reason);
+        for context in hook_result.additional_context { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nUserPromptSubmit hook context: {context}\n")); }
+        for warning in hook_result.warnings { tracing::warn!("UserPromptSubmit hook: {warning}"); }
         request.workspace_path = Some(workspace_path.clone());
         request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWorking directory: {workspace_path}\n"));
         let instructions_workspace = workspace.clone();
@@ -449,7 +476,7 @@ impl QueryEngine {
         tracing::info!(module = "EngineCore", "Conversation state updated");
 
         if let Some(effort) = request.effort.as_deref() {
-            if !["off", "low", "high", "max"].contains(&effort) { anyhow::bail!("Invalid effort"); }
+            if !["off", "low", "medium", "high", "xhigh", "max"].contains(&effort) { anyhow::bail!("Invalid effort"); }
         }
         provider.model.effort = request.effort.clone();
         validate_model_input(&provider.model, &request.messages)?;
@@ -475,7 +502,11 @@ impl QueryEngine {
             workspace_path.clone(),
             reasoning_mode.clone(),
         )
+        .with_user_skill(pending_user_skill)
+        .with_max_turns(request.max_turns)?
+        .with_response_schema(request.response_schema)?
         .with_learning_tools(learning.as_ref().map(|l| l.tools.clone()))
+        .with_hooks(hooks)
         .with_allowed_tools(agent.and_then(|d|d.tools))
         .with_prompt_profile(prompt_profile)
         .with_memex(crate::memory::MemExClient::with_path(

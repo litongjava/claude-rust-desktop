@@ -11,7 +11,7 @@ async fn immediate_terminal_answers_are_registered_before_events() {
             if permission {
                 executor.execute_ask_user_confirmation("Write", &json!({"file_path":"approved.txt","content":"approved"}), "call", "approve").await
             } else {
-                executor.execute_ask_user_question(&json!({"question":"Which option?","options":[]})).await
+                executor.execute_ask_user_question(&json!({"question":"Which option?","options":[]}), "question-fixture").await
             }
         });
         let event = rx.recv().await.unwrap();

@@ -120,15 +120,30 @@ use crate::performance::{retry_with_backoff, checked_response};
 
 pub struct AnthropicClient {
     client: Client,
+    response_schema: Option<Value>,
 }
 
 impl AnthropicClient {
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client }
+        Self { client, response_schema: None }
+    }
+
+    pub fn with_response_schema(mut self, schema: Option<Value>) -> Self {
+        self.response_schema = schema;
+        self
+    }
+
+    fn apply_options(&self, body: &mut Value, provider: &ResolvedProvider) -> Result<()> {
+        crate::services::anthropic_auth::apply_fast(body, provider.model.fast, &provider.model.id, &provider.provider.base_url)?;
+        if let Some(schema) = &self.response_schema {
+            body["output_config"]["format"] = json!({"type":"json_schema","schema":schema});
+        }
+        Ok(())
     }
 
     pub async fn send_message(
@@ -167,16 +182,16 @@ impl AnthropicClient {
             body["tools"] = json!(tool_defs);
         }
 
+        if let Some(effort) = provider.model.effort.as_deref() { apply_effort(&mut body, effort, &provider.model.id, max_tokens)?; }
+        self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
         let data: AnthropicResponse = retry_with_backoff(|| async {
-            let response = self.client
+            let request = self.client
                 .post(&url)
-                .header("x-api-key", &provider.provider.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            let response = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?.send().await?;
 
             let response = checked_response(response).await?;
 
@@ -223,16 +238,16 @@ impl AnthropicClient {
             body["tools"] = json!(tool_defs);
         }
 
+        if let Some(effort) = provider.model.effort.as_deref() { apply_effort(&mut body, effort, &provider.model.id, max_tokens)?; }
+        self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
         let response = retry_with_backoff(|| async {
-            let resp = self.client
+            let request = self.client
                 .post(&url)
-                .header("x-api-key", &provider.provider.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            let resp = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?.send().await?;
 
             let resp = checked_response(resp).await?;
             Ok(resp)
@@ -297,16 +312,15 @@ impl AnthropicClient {
             body["thinking"] = json!({"type":"enabled", "budget_tokens": 10000u32.min(max_tokens.saturating_sub(1))});
         }
 
+        self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
         let response = retry_with_backoff(|| async {
-            let resp = self.client
+            let request = self.client
                 .post(&url)
-                .header("x-api-key", &provider.provider.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            let resp = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?.send().await?;
 
             let resp = checked_response(resp).await?;
             Ok(resp)
@@ -341,7 +355,7 @@ pub fn apply_effort(body: &mut Value, effort: &str, model: &str, max_tokens: u32
         body["output_config"] = json!({"effort": if effort == "max" && model.contains("sonnet") { "high" } else { effort }});
     } else {
         if max_tokens <= 1024 { anyhow::bail!("Thinking requires max output tokens greater than 1024"); }
-        let budget = match effort { "low" => 2048, "high" => 10000, "max" => 32000, _ => anyhow::bail!("Invalid effort") };
+        let budget = match effort { "low" => 2048, "medium" => 5000, "high" => 10000, "xhigh" => 16000, "max" => 32000, _ => anyhow::bail!("Invalid effort") };
         body["thinking"] = json!({"type":"enabled", "budget_tokens": budget.min(max_tokens - 1)});
     }
     Ok(())

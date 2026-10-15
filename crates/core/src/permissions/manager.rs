@@ -48,10 +48,19 @@ pub struct PermissionManager {
     audit_logger: AuditLoggerRef,
     confirmations: Mutex<HashMap<String, bool>>,
     mode: Mutex<PermissionMode>,
+    session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
     always_allow_checker: Mutex<Option<AlwaysAllowCheckerFn>>,
 }
 
 impl PermissionManager {
+    pub fn set_session_rules(&self, conversation: &str, rules: HashMap<String, PermissionAction>) {
+        self.session_rules.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation.to_owned(), rules);
+    }
+    pub(crate) fn inherit_session_rules(&self, parent: &str, child: &str) {
+        let mut sessions = self.session_rules.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rules) = sessions.get(parent).cloned() { sessions.insert(child.to_owned(), rules); }
+    }
+
     pub fn new(audit_logger: AuditLoggerRef) -> Self {
         let mut manager = Self {
             ruleset: Mutex::new(PermissionRuleset::new()),
@@ -59,6 +68,7 @@ impl PermissionManager {
             audit_logger,
             confirmations: Mutex::new(HashMap::new()),
             mode: Mutex::new(PermissionMode::default()),
+            session_rules: Mutex::new(HashMap::new()),
             always_allow_checker: Mutex::new(None),
         };
         manager.load_default_rules();
@@ -115,8 +125,8 @@ impl PermissionManager {
     fn is_read_only_tool(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "Read" | "ListDir" | "Grep" | "WebFetch" | "WebSearch"
-                | "TodoRead" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "brief" | "SyntheticOutput"
+            "Read" | "ListDir" | "Grep" | "Glob" | "WebFetch" | "WebSearch"
+                | "TodoRead" | "Skill" | "SkillRead" | "TaskGet" | "TaskList" | "TaskOutput" | "ToolSearch" | "plan_mode" | "brief" | "SyntheticOutput"
         )
     }
 
@@ -136,6 +146,18 @@ impl PermissionManager {
     }
 
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
+        let explicit = self.session_rules.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&context.conversation_id).and_then(|rules| rules.get(&context.tool_name)).cloned();
+        if explicit == Some(PermissionAction::Deny) {
+            return PermissionResult::Denied("Explicit session tool deny rule".into());
+        }
+        if self.get_mode() != PermissionMode::PlanMode {
+            match explicit {
+                Some(PermissionAction::Allow) => return PermissionResult::Granted,
+                Some(PermissionAction::Confirm) => return self.request_confirmation(context),
+                _ => {},
+            }
+        }
         let mode = self.get_mode();
         let read_only = Self::is_read_only_tool(&context.tool_name)
             || (context.tool_name == "Config" && matches!(context.tool_input["operation"].as_str(), Some("get" | "list" | "merge" | "sources")));
@@ -355,3 +377,24 @@ impl PermissionChecker for PermissionManager {
 }
 
 pub type PermissionManagerRef = Arc<PermissionManager>;
+
+#[cfg(test)]
+mod session_rule_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_denies_survive_bypass_and_allow_cannot_override_plan() {
+        let manager = PermissionManager::new(Arc::new(super::super::AuditLogger::new(16)));
+        let context = PermissionContext { tool_name: "Write".into(), tool_input: serde_json::json!({"path":"test"}), conversation_id: "one".into(), user_id: None, workspace_path: None };
+        manager.set_session_rules("one", HashMap::from([("Write".into(), PermissionAction::Deny)]));
+        manager.set_mode(PermissionMode::BypassPermissions);
+        assert!(matches!(manager.check_permission(&context), PermissionResult::Denied(_)));
+        let other = PermissionContext { conversation_id: "two".into(), ..context.clone() };
+        assert_eq!(manager.check_permission(&other), PermissionResult::Granted);
+        manager.set_session_rules("one", HashMap::from([("Write".into(), PermissionAction::Allow)]));
+        manager.set_mode(PermissionMode::PlanMode);
+        assert!(matches!(manager.check_permission(&context), PermissionResult::Denied(_)));
+        manager.set_mode(PermissionMode::AskPermissions);
+        assert_eq!(manager.check_permission(&context), PermissionResult::Granted);
+    }
+}

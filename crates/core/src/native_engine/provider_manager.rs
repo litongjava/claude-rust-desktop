@@ -50,6 +50,8 @@ pub struct ModelConfig {
     pub api: Option<String>,
     #[serde(skip)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +329,15 @@ impl ProviderManager {
 
     pub fn list_providers(&self) -> &[Provider] {
         &self.providers
+    }
+
+    pub fn set_model_fast(&mut self, provider_id: &str, model_id: &str, enabled: bool) -> Result<()> {
+        let provider = self.providers.iter_mut().find(|p| p.id == provider_id).ok_or_else(|| anyhow!("Provider not found"))?;
+        let model = provider.models.iter_mut().find(|m| m.id == model_id).ok_or_else(|| anyhow!("Model not found"))?;
+        model.fast = enabled;
+        // resolve_selected reads the live provider list; discard other cached resolutions.
+        if let Ok(mut cache) = self.resolve_cache.try_lock() { cache.clear(); }
+        Ok(())
     }
 
     pub fn update_provider(&mut self, id: &str, provider: Provider) {

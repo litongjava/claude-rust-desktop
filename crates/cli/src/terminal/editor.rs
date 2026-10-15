@@ -15,15 +15,21 @@ use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
 pub struct PromptEditor {
+    notices: Option<std::sync::mpsc::Receiver<String>>,
     history: Vec<String>,
+    pending_draft: String,
     commands: Vec<(String, String)>,
     details: DetailsPanel,
+    keybindings: crate::keybindings::Keybindings,
 }
 impl Default for PromptEditor {
     fn default() -> Self {
         Self {
+            notices: None,
             history: Vec::new(),
+            pending_draft: String::new(),
             details: DetailsPanel::default(),
+            keybindings: crate::keybindings::Keybindings::default(),
             commands: crate::command_catalog::COMMANDS
                 .iter()
                 .map(|(n, d)| (n.to_string(), d.to_string()))
@@ -127,36 +133,37 @@ fn clipped(text: &str, width: usize) -> String {
         .collect()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TextStyle {
+pub(crate) enum TextStyle {
+    Border,
     Plain,
     Muted,
     Selected,
 }
-type DisplayLine = (String, TextStyle);
+pub(crate) type DisplayLine = (String, TextStyle);
 
 #[derive(Clone, Copy, Debug)]
-struct HitTarget {
-    row: usize,
+pub(crate) struct HitTarget {
+    pub(crate) row: usize,
     start: usize,
     end: usize,
 }
 impl HitTarget {
-    fn contains(self, row: usize, column: usize) -> bool {
+    pub(crate) fn contains(self, row: usize, column: usize) -> bool {
         row == self.row && column >= self.start && column < self.end
     }
 }
 #[derive(Default)]
-struct DetailsPanel {
+pub(crate) struct DetailsPanel {
     entries: Vec<(String, String)>,
-    expanded: bool,
+    pub(crate) expanded: bool,
     scroll: usize,
     cached_width: usize,
     wrapped: Vec<String>,
 }
-struct PanelFrame {
-    lines: Vec<DisplayLine>,
-    toggle: Option<HitTarget>,
-    viewport: usize,
+pub(crate) struct PanelFrame {
+    pub(crate) lines: Vec<DisplayLine>,
+    pub(crate) toggle: Option<HitTarget>,
+    pub(crate) viewport: usize,
 }
 /// Display untrusted tool output as text, never terminal escape instructions.
 fn wrap_detail(text: &str, width: usize) -> Vec<String> {
@@ -192,12 +199,18 @@ fn wrap_detail(text: &str, width: usize) -> Vec<String> {
     lines
 }
 impl DetailsPanel {
-    fn toggle(&mut self) {
+    pub(crate) fn update_entries(&mut self, entries: Vec<(String, String)>) {
+        self.entries = entries;
+        self.cached_width = 0;
+        self.wrapped.clear();
+    }
+
+    pub(crate) fn toggle(&mut self) {
         if !self.entries.is_empty() {
             self.expanded = !self.expanded;
         }
     }
-    fn scroll_by(&mut self, amount: isize, viewport: usize) {
+    pub(crate) fn scroll_by(&mut self, amount: isize, viewport: usize) {
         if self.expanded {
             self.scroll = self
                 .scroll
@@ -205,7 +218,7 @@ impl DetailsPanel {
                 .min(self.wrapped.len().saturating_sub(viewport.max(1)));
         }
     }
-    fn render(&mut self, width: usize, budget: usize) -> PanelFrame {
+    pub(crate) fn render(&mut self, width: usize, budget: usize) -> PanelFrame {
         let mut frame = PanelFrame {
             lines: Vec::new(),
             toggle: None,
@@ -215,7 +228,7 @@ impl DetailsPanel {
             return frame;
         }
         if !self.expanded || budget < 3 {
-            let prefix = format!("{} tools \u{00b7} ", self.entries.len());
+            let prefix = format!("{} entries \u{00b7} ", self.entries.len());
             let label = clipped(&format!("{prefix}Show more (Ctrl+O)"), width);
             frame.toggle = Some(HitTarget {
                 row: 0,
@@ -241,7 +254,7 @@ impl DetailsPanel {
         frame.lines.push((
             clipped(
                 &format!(
-                    "Tool details \u{00b7} {} tools \u{00b7} lines {}-{} / {}",
+                    "Details \u{00b7} {} entries \u{00b7} lines {}-{} / {}",
                     self.entries.len(),
                     self.scroll + 1,
                     (self.scroll + frame.viewport).min(self.wrapped.len()),
@@ -316,13 +329,17 @@ impl Screen {
             if let Some((text, style)) = next {
                 if std::env::var_os("NO_COLOR").is_none() {
                     match style {
+                        TextStyle::Border => {
+                            queue!(frame, SetForegroundColor(crate::terminal::style::border()))?
+                        }
                         TextStyle::Plain => queue!(frame, ResetColor)?,
                         TextStyle::Muted => {
-                            queue!(frame, SetForegroundColor(Color::AnsiValue(248)))?
+                            queue!(frame, SetForegroundColor(crate::terminal::style::muted()))?
                         }
-                        TextStyle::Selected => {
-                            queue!(frame, SetForegroundColor(Color::AnsiValue(147)))?
-                        }
+                        TextStyle::Selected => queue!(
+                            frame,
+                            SetForegroundColor(crate::terminal::style::selected())
+                        )?,
                     }
                 }
                 write!(frame, "{text}")?;
@@ -349,6 +366,10 @@ impl Screen {
             queue!(out, MoveUp(self.cursor_row as u16))?;
         }
         queue!(out, Clear(ClearType::FromCursorDown))?;
+        if !text.is_empty() {
+            queue!(out, ResetColor)?;
+            write!(out, "\r\n")?;
+        }
         if std::env::var_os("NO_COLOR").is_none() && !text.is_empty() {
             queue!(
                 out,
@@ -360,6 +381,9 @@ impl Screen {
             write!(out, "\r\n")?;
         } else {
             write!(out, "{prompt}{}\r\n", text.replace('\n', "\r\n  "))?;
+        }
+        if !text.is_empty() {
+            write!(out, "\r\n")?;
         }
         out.flush()
     }
@@ -392,9 +416,23 @@ fn read_editor_event() -> io::Result<Event> {
 }
 
 impl PromptEditor {
+    pub fn set_notices(&mut self, notices: std::sync::mpsc::Receiver<String>) {
+        self.notices = Some(notices);
+    }
+    pub fn set_keybindings(&mut self, bindings: crate::keybindings::Keybindings) {
+        self.keybindings = bindings;
+    }
+    pub fn set_draft(&mut self, draft: String) {
+        self.pending_draft = draft;
+    }
     pub fn set_commands(&mut self, commands: Vec<(String, String)>) {
         self.commands = commands;
     }
+    pub fn set_panel(&mut self, details: Vec<(String, String)>, expanded: bool) {
+        self.set_details(details);
+        self.details.expanded = expanded;
+    }
+
     pub fn set_details(&mut self, details: Vec<(String, String)>) {
         self.details = DetailsPanel {
             entries: details,
@@ -409,6 +447,8 @@ impl PromptEditor {
             execute!(io::stderr(), EnableMouseCapture)?;
         }
         let mut buffer = Buffer::default();
+        buffer.set(&std::mem::take(&mut self.pending_draft));
+        let mut keybinding_pending = crate::keybindings::Pending::default();
         let mut screen = Screen::default();
         let mut selected = 0usize;
         let mut history_pos = self.history.len();
@@ -417,6 +457,18 @@ impl PromptEditor {
         let mut search: Option<String> = None;
         let mut search_pos = self.history.len();
         loop {
+            if let Some(notices) = &self.notices {
+                while let Ok(notice) = notices.try_recv() {
+                    screen.finish("", "")?;
+                    let safe: String = notice
+                        .chars()
+                        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                        .collect();
+                    write!(io::stderr(), "{}\r\n", safe.replace('\n', "\r\n"))?;
+                    io::stderr().flush()?;
+                    screen = Screen::default();
+                }
+            }
             let (cols, rows) = terminal::size()?;
             let width = cols.saturating_sub(1).max(4) as usize;
             let text = buffer.text();
@@ -472,7 +524,7 @@ impl PromptEditor {
             let panel = self.details.render(width, panel_budget);
             let panel_height = panel.lines.len();
             let mut lines = panel.lines;
-            lines.push(("\u{2500}".repeat(width), TextStyle::Muted));
+            lines.push(("\u{2500}".repeat(width), TextStyle::Border));
             lines.extend(
                 input_lines
                     .iter()
@@ -480,7 +532,7 @@ impl PromptEditor {
                     .take(max_input)
                     .map(|s| (s.clone(), TextStyle::Plain)),
             );
-            lines.push(("\u{2500}".repeat(width), TextStyle::Muted));
+            lines.push(("\u{2500}".repeat(width), TextStyle::Border));
             let footer_rows = if self.details.entries.is_empty() {
                 1
             } else {
@@ -544,6 +596,9 @@ impl PromptEditor {
                 ));
             }
             screen.draw(&lines, panel_height + cursor_row - first + 1, cursor_col)?;
+            if !event::poll(std::time::Duration::from_millis(100))? {
+                continue;
+            }
             match read_editor_event()? {
                 Event::Resize(_, new_rows) => {
                     // Dimensions changed: every row needs repainting. Clamp the
@@ -582,7 +637,15 @@ impl PromptEditor {
                     menu_hidden = false;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let key = match self.keybindings.resolve(key, &mut keybinding_pending) {
+                        crate::keybindings::Resolution::Key(key) => key,
+                        crate::keybindings::Resolution::Consumed => continue,
+                    };
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if control && key.code == KeyCode::Char('l') {
+                        screen.invalidated = true;
+                        continue;
+                    }
                     if control && key.code == KeyCode::Char('c') {
                         screen.finish("", &prompt)?;
                         return Err(io::Error::new(

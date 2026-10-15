@@ -206,6 +206,8 @@ async fn shared_engine_routes_opt_in_and_preserves_explicit_provider() {
         let conversation_id = sessions.create(dir.path(), "primary", "local").unwrap();
         let mut events = engine
             .send_message(ChatRequest {
+                max_turns: None,
+                response_schema: None,
                 conversation_id,
                 messages: vec![json!({"role":"user","content":prompt})],
                 model: "primary".into(),

@@ -22,14 +22,23 @@ pub fn show(topic: Option<&str>, commands: &[String]) -> Result<()> {
         println!("{content}");
         return Ok(());
     }
-    let mut command = crate::args::Cli::command();
-    for name in commands {
-        command = command
-            .find_subcommand(name)
-            .with_context(|| format!("Unknown command {name}"))?
-            .clone();
-    }
-    command.print_long_help()?;
-    println!();
-    Ok(())
+    // The full Clap tree is large. Building it inside the management future can
+    // exhaust Windows' small main-thread stack; keep this synchronous work on
+    // a separately bounded stack, without changing command parsing or errors.
+    let commands = commands.to_vec();
+    std::thread::Builder::new()
+        .name("cli-help".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || -> Result<()> {
+            let mut command = crate::args::Cli::command();
+            for name in &commands {
+                command = command.find_subcommand(name)
+                    .with_context(|| format!("Unknown command {name}"))?.clone();
+            }
+            command.print_long_help()?;
+            println!();
+            Ok(())
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("Help rendering thread failed"))?
 }

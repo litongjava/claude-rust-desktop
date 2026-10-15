@@ -126,6 +126,8 @@ async fn run_case(cancel: bool, team: bool) {
     .unwrap();
     let mut events = engine
         .send_message(ChatRequest {
+            max_turns: None,
+            response_schema: None,
             conversation_id: id.clone(),
             messages: vec![json!({"role":"user","content":"Delegate inspection"})],
             model: "fixture".into(),

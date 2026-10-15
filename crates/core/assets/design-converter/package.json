@@ -1,0 +1,12 @@
+﻿{
+  "name": "claude-rust-design-converter",
+  "version": "2.1.295",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "esbuild": "0.25.12",
+    "ts-morph": "27.0.2",
+    "@types/react": "19.2.14",
+    "playwright": "1.58.2"
+  }
+}

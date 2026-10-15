@@ -75,37 +75,61 @@ pub async fn handle(
             session.set_permission_mode("plan").await?;
             eprintln!("Plan mode enabled. Use /permissions ask to leave plan mode.");
         }
-        "/config" => {
-            ensure!(argument.is_empty(), "Usage: /config");
-            eprintln!("Data directory: {}\nProvider: {}\nModel: {}\nPermission mode: {}\nChange settings using /provider, /model, and /permissions.", paths.data_dir.display(), session.provider_id, session.model, session.permission_mode());
-        }
         "/terminal-setup" => {
             ensure!(argument.is_empty(), "Usage: /terminal-setup");
             use std::io::IsTerminal;
             eprintln!("Interactive input: {}\nInteractive output: {}\nTab: complete commands; arrow keys: edit/history.\nMultiline: /multiline followed by /end, or a trailing backslash.\nClipboard: /copy [N]. Mouse selection and automatic copy are controlled by your terminal.", std::io::stdin().is_terminal(), std::io::stdout().is_terminal());
         }
-        "/tasks" => {
-            ensure!(argument.is_empty(), "Usage: /tasks");
-            let workspace = session
-                .store
-                .workspace(&session.id, &paths.data_dir.join("workspaces"))?;
-            let tasks = claude_core::tools::execute_tool(
-                "TaskList",
-                serde_json::json!({}),
-                &workspace.to_string_lossy(),
-            )?;
-            eprintln!("Durable project task records (not a list of running processes):");
-            println!("{}", serde_json::to_string_pretty(&tasks)?);
-            let children = delegated_states(&session.store, &session.id)?;
-            eprintln!("Recorded child sessions for {} (delegation waits for completion; saved states may be stale after a crash):", session.id);
-            println!("{}", serde_json::to_string_pretty(&children)?);
-        }
         "/list-agents" => {
-            ensure!(argument.is_empty(), "Usage: /list-agents");
-            let context = crate::services::context(paths)?;
-            eprintln!("Available agent definitions (not running tasks):");
-            for agent in claude_core::services::agents::list(&context)? {
-                println!("{}: {}", agent.id, agent.description);
+            if argument == "definitions" {
+                let context = crate::services::context(paths)?;
+                for agent in claude_core::services::agents::list(&context)? {
+                    println!("{}: {}", agent.id, agent.description);
+                }
+            } else {
+                let peers = peer_sessions(
+                    &session.store,
+                    &paths.data_dir,
+                    &session.workspace,
+                    &session.id,
+                )?;
+                let (verb, rest) = argument
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((argument, ""));
+                let request = match verb {
+                    "" | "list" => {
+                        ensure!(rest.trim().is_empty(), "Usage: /list-agents [list]");
+                        println!("{}", serde_json::to_string_pretty(&peers)?);
+                        eprintln!("Same-project sessions and recorded worker states; saved does not mean running. /list-agents message SESSION_ID TEXT queues local mail; /list-agents inbox reads it; /list-agents read MESSAGE_ID acknowledges it; /list-agents definitions lists agent templates.");
+                        None
+                    }
+                    "message" => {
+                        let (to, content) = rest.trim().split_once(char::is_whitespace).context("Usage: /list-agents message SESSION_ID TEXT")?;
+                        ensure!(peers.iter().any(|peer| peer["id"] == to), "Recipient must be a listed session in this project");
+                        ensure!(!content.trim().is_empty(), "Message must not be empty");
+                        Some(serde_json::json!({"operation":"send","to":to,"content":content.trim()}))
+                    }
+                    "inbox" => {
+                        ensure!(rest.trim().is_empty(), "Usage: /list-agents inbox");
+                        Some(serde_json::json!({"operation":"receive"}))
+                    }
+                    "read" => {
+                        ensure!(!rest.trim().is_empty() && !rest.trim().contains(char::is_whitespace), "Usage: /list-agents read MESSAGE_ID");
+                        Some(serde_json::json!({"operation":"mark_read","message_id":rest.trim()}))
+                    }
+                    _ => anyhow::bail!("Usage: /list-agents [list|definitions|message SESSION_ID TEXT|inbox|read MESSAGE_ID]"),
+                };
+                if let Some(request) = request {
+                    let result = claude_core::tools::agent_messages::execute_for_session(
+                        request,
+                        &session.workspace.to_string_lossy(),
+                        &session.id,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    if verb == "message" {
+                        eprintln!("Queued in the recipient's project mailbox; this does not interrupt or restart its active turn.");
+                    }
+                }
             }
         }
         _ => return Ok(false),
@@ -113,25 +137,33 @@ pub async fn handle(
     Ok(true)
 }
 
-fn delegated_states(
+fn peer_sessions(
     store: &claude_core::runtime::SessionStore,
-    parent: &str,
+    root: &Path,
+    workspace: &Path,
+    current: &str,
 ) -> Result<Vec<Value>> {
-    store.db.with_conn(|conn| -> Result<Vec<Value>> {
-        let mut statement = conn.prepare(
-            "SELECT value FROM peripheral_settings WHERE key LIKE 'delegation.%' ORDER BY key",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut children = Vec::new();
-        for row in rows {
-            let value: Value =
-                serde_json::from_str(&row?).context("Reading saved delegation state")?;
-            if value["parent_session_id"].as_str() == Some(parent) {
-                children.push(value);
-            }
+    let canonical = workspace.canonicalize()?;
+    let jobs = claude_core::services::background_sessions::list(root, None)?;
+    let rows = store
+        .db
+        .with_conn(conversation_repo::list_conversations)??;
+    let mut peers = Vec::new();
+    for row in rows {
+        if !row.workspace_path.as_deref().is_some_and(|path| {
+            Path::new(path)
+                .canonicalize()
+                .is_ok_and(|path| path == canonical)
+        }) {
+            continue;
         }
-        Ok(children)
-    })?
+        let job = jobs
+            .iter()
+            .filter(|job| job.session_id == row.id)
+            .max_by_key(|job| job.started_ms);
+        peers.push(serde_json::json!({"id":row.id,"title":row.title,"current":row.id==current,"status":job.map(|j|j.status.as_str()).unwrap_or(if row.id==current {"attached"} else {"saved"}),"task_id":job.map(|j|&j.id),"parent_session_id":job.map(|j|&j.parent_session_id),"updated_at":row.updated_at}));
+    }
+    Ok(peers)
 }
 
 fn response(history: &[Value], number: usize) -> Result<&str> {
@@ -223,35 +255,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn task_view_scopes_children_to_parent_and_preserves_recorded_states() {
+    fn peer_list_scopes_projects_and_mailboxes_do_not_spoof_identity() {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
-        let context = crate::services::context(&paths).unwrap();
-        let store = claude_core::runtime::SessionStore::new(context.db.clone());
-        context.save_setting("delegation.child-a", &json!({"parent_session_id":"parent-a","session_id":"child-a","status":"completed"})).unwrap();
-        context
-            .save_setting(
-                "delegation.child-b",
-                &json!({"parent_session_id":"parent-b","session_id":"child-b","status":"running"}),
-            )
-            .unwrap();
-        context
-            .save_setting("other-setting", &json!({"parent_session_id":"parent-a"}))
-            .unwrap();
-        let children = delegated_states(&store, "parent-a").unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0]["session_id"], "child-a");
-        assert_eq!(children[0]["status"], "completed");
-        assert!(delegated_states(&store, "missing-parent")
-            .unwrap()
-            .is_empty());
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let project = dir.path().join("project");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let parent = store.create(&project, "test", "cli-runtime").unwrap();
+        let child = store.create(&project, "test", "cli-runtime").unwrap();
+        store.create(&other, "test", "cli-runtime").unwrap();
+        let peers = peer_sessions(&store, &paths.data_dir, &project, &parent).unwrap();
+        assert_eq!(peers.len(), 2);
         assert_eq!(
-            context
-                .setting::<Value>("delegation.child-b")
-                .unwrap()
-                .unwrap()["status"],
-            "running"
+            peers.iter().find(|p| p["id"] == parent).unwrap()["status"],
+            "attached"
         );
+        assert_eq!(
+            peers.iter().find(|p| p["id"] == child).unwrap()["status"],
+            "saved"
+        );
+        let sent = claude_core::tools::agent_messages::execute_for_session(
+            json!({"operation":"send","to":child,"from":"spoof","content":"check"}),
+            project.to_str().unwrap(),
+            &parent,
+        )
+        .unwrap();
+        assert_eq!(sent["from"], parent);
+        let inbox = claude_core::tools::agent_messages::execute_for_session(
+            json!({"operation":"receive"}),
+            project.to_str().unwrap(),
+            &child,
+        )
+        .unwrap();
+        assert_eq!(inbox["messages"][0]["id"], sent["id"]);
     }
 
     #[test]

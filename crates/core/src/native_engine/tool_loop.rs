@@ -1,5 +1,7 @@
 #[path = "delegation.rs"]
 mod delegation;
+#[path = "skill_tool.rs"]
+mod skill_tool;
 
 use crate::native_engine::anthropic_client::{AnthropicClient, AnthropicContent, AnthropicMessage, ContentBlock};
 use crate::native_engine::engine_core::ReasoningMode;
@@ -31,6 +33,14 @@ mod search_integration_tests;
 #[cfg(test)]
 #[path = "code_prompt_tests.rs"]
 mod code_prompt_tests;
+
+#[cfg(test)]
+#[path = "tool_hooks_tests.rs"]
+mod tool_hooks_tests;
+
+#[cfg(test)]
+#[path = "turn_budget_tests.rs"]
+mod turn_budget_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -75,6 +85,8 @@ pub enum EngineEvent {
     Usage(Value),
     AskUser {
         request_id: String,
+        tool_use_id: String,
+        tool_input: Value,
         question: String,
         options: Vec<String>,
     },
@@ -106,6 +118,7 @@ pub struct ToolLoopExecutor {
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: usize,
+    response_schema: Option<Value>,
     event_tx: mpsc::Sender<EngineEvent>,
     anthropic_client: AnthropicClient,
     openai_client: OpenAIClient,
@@ -124,6 +137,11 @@ pub struct ToolLoopExecutor {
     allowed_tools: Option<Vec<String>>,
     learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     delegation_depth: usize,
+    hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
+    stop_hook_active: bool,
+    skill_shell_active: bool,
+    pending_user_skill: Option<Value>,
+    manual_skill_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +220,13 @@ async fn execute_builtin_tool(
     provider: &ResolvedProvider,
     event_tx: &mpsc::Sender<EngineEvent>,
     search_config_path: Option<&std::path::Path>,
+    skill_shell_active: bool,
 ) -> Result<Value> {
+    if name == "Bash" && skill_shell_active {
+        let input = crate::skills::invocation::shell_input(input["command"].as_str().ok_or_else(||anyhow!("Skill shell command missing"))?, input["shell"].as_str())?;
+        let permit = crate::skills::invocation::authorize(input, PermissionResult::Granted, false)?;
+        return Ok(json!({"stdout":crate::skills::invocation::execute(permit,std::path::Path::new(cwd)).await?,"success":true,"exit_code":0}));
+    }
     if name == "PluginRun" {
         let root=search_config_path.and_then(|p|p.parent()).ok_or_else(||anyhow!("Plugin storage is unavailable"))?;
         let context=crate::services::ServiceContext::open(crate::runtime::RuntimePaths::new(root.to_path_buf())?,std::sync::Arc::new(crate::services::EnvironmentCredentials))?;
@@ -211,7 +235,15 @@ async fn execute_builtin_tool(
         return crate::services::plugins::run(&context,id,command,input["input"].clone(),std::path::Path::new(cwd)).await;
     }
     if name != "WebSearch" {
-        return crate::tools::execute_tool_async(name, input, cwd).await;
+        let file = if matches!(name, "Read" | "Edit" | "Write" | "MultiEdit") { input["file_path"].as_str().map(str::to_owned) } else { None };
+        let mut result = crate::tools::execute_tool_async(name, input, cwd).await?;
+        if let Some(file) = file {
+            if let Some(feedback) = crate::tools::lsp_passive_feedback(cwd, &file).await {
+                if let Some(object) = result.as_object_mut() { object.insert("lsp_diagnostics".into(), feedback); }
+                else { result = json!({"result":result,"lsp_diagnostics":feedback}); }
+            }
+        }
+        return Ok(result);
     }
     if crate::tools::provider_search::uses_public_search(provider) {
         return crate::tools::execute_public_web_search(input).await;
@@ -349,14 +381,14 @@ async fn execute_tool_standalone(
                 Err(e) => (format!("Error: {}", e), true),
             }
         } else {
-            let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref()).await;
+            let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref(), false).await;
             match &result {
                 Ok(val) => (serde_json::to_string_pretty(val).unwrap_or_default(), false),
                 Err(e) => (format!("Error: {}", e), true),
             }
         }
     } else {
-        let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref()).await;
+        let result = execute_builtin_tool(&tool_name, tool_input.clone(), &workspace_cwd, &provider, &event_tx, search_config_path.as_deref(), false).await;
         match &result {
             Ok(val) => (serde_json::to_string_pretty(val).unwrap_or_default(), false),
             Err(e) => (format!("Error: {}", e), true),
@@ -385,6 +417,22 @@ async fn execute_tool_standalone(
 }
 
 impl ToolLoopExecutor {
+    pub fn with_response_schema(mut self, schema: Option<Value>) -> Result<Self> {
+        if let Some(schema) = &schema { crate::structured_output::validate_schema(schema)?; }
+        self.openai_client = self.openai_client.with_response_schema(schema.clone());
+        self.anthropic_client = self.anthropic_client.with_response_schema(schema.clone());
+        self.response_schema = schema;
+        Ok(self)
+    }
+
+    pub fn with_max_turns(mut self, max_turns: Option<u32>) -> Result<Self> {
+        if let Some(max_turns) = max_turns {
+            anyhow::ensure!(max_turns > 0, "max_turns must be greater than zero");
+            self.max_tool_iterations = max_turns as usize;
+        }
+        Ok(self)
+    }
+
     pub fn new(
         provider: ResolvedProvider,
         messages: Vec<Value>,
@@ -400,6 +448,7 @@ impl ToolLoopExecutor {
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
+            response_schema: None,
             event_tx,
             anthropic_client: AnthropicClient::new(),
             openai_client: OpenAIClient::new(),
@@ -418,12 +467,79 @@ impl ToolLoopExecutor {
             allowed_tools: None,
             learning_tools: None,
             delegation_depth: 0,
+            hooks: None,
+            stop_hook_active: false,
+            skill_shell_active: false,
+            pending_user_skill: None,
+            manual_skill_active: false,
         }
     }
 
     pub fn with_learning_tools(mut self, tools: Option<Arc<std::sync::Mutex<Vec<String>>>>) -> Self {
         self.learning_tools = tools;
         self
+    }
+
+    pub(super) fn with_user_skill(mut self, skill: Option<Value>) -> Self {
+        self.pending_user_skill = skill;
+        self
+    }
+
+    pub fn with_hooks(mut self, hooks: crate::services::tool_hooks::HookRunner) -> Self {
+        if !hooks.list().is_empty() { self.hooks = Some(Arc::new(hooks)); }
+        self
+    }
+
+    async fn stop_hook(&mut self, text: &str) -> Result<Option<String>> {
+        use crate::services::tool_hooks::HookEvent;
+        let Some(hooks) = &self.hooks else { return Ok(None); };
+        let outcome = hooks.run(HookEvent::Stop, self.conv_id.as_deref().unwrap_or("unknown"), json!({"stop_hook_active":self.stop_hook_active,"last_assistant_message":text})).await?;
+        for warning in outcome.warnings { tracing::warn!("Stop hook: {warning}"); }
+        if outcome.prevent_continuation { return Ok(None); }
+        if outcome.blocked {
+            anyhow::ensure!(!self.stop_hook_active, "Stop hook blocked again after its continuation: {}", outcome.reason);
+            self.stop_hook_active = true;
+            return Ok(Some(format!("The configured Stop hook requires follow-up before finishing: {}", outcome.reason)));
+        }
+        Ok(None)
+    }
+
+    async fn execute_tool_call(&mut self, name: &str, input: &Value, id: &str) -> (Value, String, bool) {
+        use crate::services::tool_hooks::HookEvent;
+        let Some(hooks) = self.hooks.clone() else { return self.execute_tool_call_inner(name, input, id).await; };
+        let session = self.conv_id.clone().unwrap_or_else(|| "unknown".into());
+        let pre = match hooks.run(HookEvent::PreToolUse, &session, json!({"tool_name":name,"tool_input":input,"tool_use_id":id})).await {
+            Ok(outcome) => outcome,
+            Err(error) => return (input.clone(), format!("PreToolUse hook failed; tool not executed: {error:#}"), true),
+        };
+        if pre.blocked { return (input.clone(), format!("PreToolUse hook blocked tool: {}", pre.reason), true); }
+        let input = pre.updated_input.unwrap_or_else(|| input.clone());
+        if pre.ask_permission {
+            if let PermissionResult::Denied(reason) = self.check_permission(name, &input).await {
+                return (input, format!("Permission denied: {reason}"), true);
+            }
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let (tx, rx) = oneshot::channel();
+            self.answer_waiters.lock().await.insert(request_id.clone(), tx);
+            let _ = self.event_tx.send(EngineEvent::ToolPermission { request_id: request_id.clone(), tool_use_id: id.into(), tool_name: name.into(), input: input.clone() }).await;
+            let answer = timeout(Duration::from_secs(300), rx).await;
+            self.answer_waiters.lock().await.remove(&request_id);
+            let approved = answer.ok().and_then(|r| r.ok()).is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "yes"|"allow"|"ok"|"approved"|"always_allow"|"允许"|"是"|"确认"));
+            if !approved { return (input, "Hook requested permission; operation was not approved".into(), true); }
+        }
+        // Updated arguments pass through the complete normal permission path.
+        let (actual, mut output, mut failed) = self.execute_tool_call_inner(name, &input, id).await;
+        for context in pre.additional_context { output.push_str(&format!("\nPreToolUse context: {context}")); }
+        for warning in pre.warnings { tracing::warn!("PreToolUse hook: {warning}"); }
+        match hooks.run(HookEvent::PostToolUse, &session, json!({"tool_name":name,"tool_input":actual,"tool_use_id":id,"tool_response":output,"is_error":failed})).await {
+            Ok(post) => {
+                for context in post.additional_context { output.push_str(&format!("\nPostToolUse context: {context}")); }
+                for warning in post.warnings { tracing::warn!("PostToolUse hook: {warning}"); }
+                if post.blocked { output.push_str(&format!("\nPostToolUse hook requires attention: {}", post.reason)); failed = true; }
+            }
+            Err(error) => { output.push_str(&format!("\nPostToolUse hook failed: {error:#}")); failed = true; }
+        }
+        (actual, output, failed)
     }
 
     fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
@@ -610,7 +726,11 @@ impl ToolLoopExecutor {
 
         tracing::info!(module = "ToolLoop", "[E6] API format: {:?}", self.provider.provider.api_format);
 
-        let loop_result = match self.provider.provider.api_format {
+        let user_skill = self.prepare_user_skill().await;
+        let loop_result = match user_skill {
+            Err(error) => Err(error),
+            Ok(Some(text)) => Ok((text, Some("end_turn".into()))),
+            Ok(None) => match self.provider.provider.api_format {
             ApiFormat::Anthropic => {
                 tracing::info!(module = "ToolLoop", "[E6.1] Starting Anthropic loop...");
                 self.execute_anthropic_loop().await
@@ -619,8 +739,17 @@ impl ToolLoopExecutor {
                 tracing::info!(module = "ToolLoop", "[E6.2] Starting OpenAI loop...");
                 self.execute_openai_loop().await
             }
+            },
         };
 
+        let loop_result = loop_result.and_then(|(text, stop_reason)| {
+            if let Some(schema) = &self.response_schema {
+                if !matches!(stop_reason.as_deref(),Some("stream_error"|"error"|"interrupted"|"failed"|"cancelled"|"max_iterations")) {
+                    crate::structured_output::validate_result(schema,&text)?;
+                }
+            }
+            Ok((text,stop_reason))
+        });
         match &loop_result {
             Ok((full_text, stop_reason)) => {
                 tracing::info!(module = "ToolLoop", "[E6] API loop COMPLETED, full_text_len={}", full_text.len());
@@ -651,7 +780,7 @@ impl ToolLoopExecutor {
         loop_result
     }
 
-    async fn execute_tool_call(
+    async fn execute_tool_call_inner(
         &mut self,
         tool_name: &str,
         tool_input: &Value,
@@ -690,7 +819,7 @@ impl ToolLoopExecutor {
             return (tool_input.clone(), output, failed);
         }
         if tool_name == "AskUserQuestion" {
-            return self.execute_ask_user_question(tool_input).await;
+            return self.execute_ask_user_question(tool_input, _tool_use_id).await;
         }
 
         // Route memory_search and memory_ingest directly to MemEx backend
@@ -715,6 +844,11 @@ impl ToolLoopExecutor {
         let output_str;
         let is_error;
 
+        if tool_name == "Skill" {
+            let result = Box::pin(self.execute_skill_tool(tool_input)).await;
+            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Skill failed: {error:#}") }, result.is_err());
+        }
+
         if let Some(ref registry) = self.mcp_registry {
             if registry.is_mcp_tool(tool_name).await {
                 let result = registry.execute_tool(tool_name, tool_input.clone()).await;
@@ -730,7 +864,7 @@ impl ToolLoopExecutor {
                 };
             } else {
                 let cwd = self.get_workspace_cwd().to_string();
-                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
+                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
                 output_str = match &result {
                     Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                     Err(e) => format!("Error: {}", e),
@@ -739,7 +873,7 @@ impl ToolLoopExecutor {
             }
         } else {
             let cwd = self.get_workspace_cwd().to_string();
-            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
+            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
             output_str = match &result {
                 Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                 Err(e) => format!("Error: {}", e),
@@ -750,7 +884,7 @@ impl ToolLoopExecutor {
         (tool_input.clone(), output_str, is_error)
     }
 
-    async fn execute_ask_user_question(&mut self, tool_input: &Value) -> (Value, String, bool) {
+    async fn execute_ask_user_question(&mut self, tool_input: &Value, tool_use_id: &str) -> (Value, String, bool) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let question = tool_input["question"].as_str().unwrap_or("").to_string();
         let options: Vec<String> = tool_input["options"]
@@ -770,6 +904,8 @@ impl ToolLoopExecutor {
 
         let _ = self.event_tx.send(EngineEvent::AskUser {
             request_id: request_id.clone(),
+            tool_use_id: tool_use_id.to_owned(),
+            tool_input: tool_input.clone(),
             question: question.clone(),
             options: options.clone(),
         }).await;
@@ -947,6 +1083,10 @@ impl ToolLoopExecutor {
         tool_input: &Value,
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
+        if tool_name == "Skill" {
+            let result = Box::pin(self.execute_skill_tool(tool_input)).await;
+            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Skill failed: {error:#}") }, result.is_err());
+        }
         let output_str;
         let is_error;
 
@@ -960,7 +1100,7 @@ impl ToolLoopExecutor {
                 is_error = result.is_err();
             } else {
                 let cwd = self.get_workspace_cwd().to_string();
-                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
+                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
                 output_str = match &result {
                     Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                     Err(e) => format!("Error: {}", e),
@@ -969,7 +1109,7 @@ impl ToolLoopExecutor {
             }
         } else {
             let cwd = self.get_workspace_cwd().to_string();
-            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref()).await;
+            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
             output_str = match &result {
                 Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
                 Err(e) => format!("Error: {}", e),
@@ -1005,6 +1145,7 @@ impl ToolLoopExecutor {
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
 
         for iteration in 0..self.max_tool_iterations {
+            if self.response_schema.is_some() { full_text.clear(); }
             tracing::info!(module = "AnthropicLoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
             tracing::info!(module = "AnthropicLoop", "API key length={}", api_key_len);
 
@@ -1236,12 +1377,8 @@ impl ToolLoopExecutor {
                                     current_tool_use_id = Some(id.clone());
                                     current_tool_name = Some(name.clone());
 
-                                    let _ = self.event_tx.send(EngineEvent::ToolUseStart {
-                                        tool_use_id: id,
-                                        tool_name: name,
-                                        tool_input: json!({}),
-                                        text_before: full_text.clone(),
-                                    }).await;
+                                    // Announce only after the complete arguments arrive. Consumers
+                                    // use this event to capture pre-edit file contents/checkpoints.
                                 }
                                 _ => {}
                             }
@@ -1294,9 +1431,16 @@ impl ToolLoopExecutor {
                                 let name = current_tool_name.clone().unwrap_or_default();
                                 let input = self.finalize_streaming_tool_args(&id);
 
+                                let _ = self.event_tx.send(EngineEvent::ToolUseStart {
+                                    tool_use_id: id.clone(),
+                                    tool_name: name.clone(),
+                                    tool_input: input.clone(),
+                                    text_before: full_text.clone(),
+                                }).await;
+
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = matches!(name.as_str(), "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
-                                    || is_memory_tool(&name)
+                                let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
+                                    || is_memory_tool(&name) || self.hooks.is_some()
                                     || self.check_permission_requires_confirmation(&name, &input);
 
                                 assistant_blocks.push(ContentBlock::ToolUse {
@@ -1356,11 +1500,11 @@ impl ToolLoopExecutor {
                     .partition::<Vec<_>, _>(|tc| tc.requires_user_interaction);
 
                 for tc in &serial_calls {
-                    let (.., output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
-                        tool_input: tc.input.clone(),
+                        tool_input: actual_input,
                         output: output_str.clone(),
                         is_error,
                     }).await;
@@ -1428,6 +1572,12 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
+                if let Some(follow_up) = self.stop_hook(&full_text).await? {
+                    anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
+                    conversation_messages.push(AnthropicMessage { role: "assistant".into(), content: AnthropicContent::Blocks(assistant_blocks) });
+                    conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(follow_up) });
+                    continue;
+                }
                 break;
             }
 
@@ -1477,6 +1627,7 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
 
         for iteration in 0..self.max_tool_iterations {
+            if self.response_schema.is_some() { full_text.clear(); }
             tracing::info!(module = "OpenAILoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
             tracing::info!(module = "OpenAILoop", "API key length={}", api_key_len);
 
@@ -1792,8 +1943,8 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = matches!(name.as_str(), "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
-                        || is_memory_tool(&name)
+                    let requires_user_interaction = matches!(name.as_str(), "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode") || name == "AskUserQuestion"
+                        || is_memory_tool(&name) || self.hooks.is_some()
                         || self.check_permission_requires_confirmation(name, &input);
 
                     assistant_tool_calls.push(crate::native_engine::openai_client::OpenAIToolCall {
@@ -1820,11 +1971,11 @@ impl ToolLoopExecutor {
                     .partition::<Vec<_>, _>(|tc| tc.requires_user_interaction);
 
                 for tc in &serial_calls {
-                    let (.., output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
-                        tool_input: tc.input.clone(),
+                        tool_input: actual_input,
                         output: output_str.clone(),
                         is_error,
                     }).await;
@@ -1893,6 +2044,12 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
+                if let Some(follow_up) = self.stop_hook(&full_text).await? {
+                    anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
+                    conversation_messages.push(OpenAIMessage { role: "assistant".into(), content: assistant_content.unwrap_or(OpenAIContent::Text(String::new())), tool_calls: None, tool_call_id: None, reasoning_content: assistant_reasoning, provider_content: assistant_provider_content });
+                    conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(follow_up), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });
+                    continue;
+                }
                 break;
             }
 

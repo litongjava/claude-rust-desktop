@@ -184,6 +184,11 @@ impl ToolLoopExecutor {
         .with_search_config_path(self.search_config_path.clone().unwrap());
         child.delegation_depth = self.delegation_depth + 1;
         child.permission_manager = self.permission_manager.clone();
+        if let Some(manager) = &child.permission_manager {
+            manager.inherit_session_rules(self.conv_id.as_deref().unwrap_or_default(), &id);
+        }
+        child.hooks = self.hooks.clone();
+        child.max_tool_iterations = self.max_tool_iterations;
         child.mcp_registry = self.mcp_registry.clone();
         if let Some(memory) = &self.memex_client {
             child = child.with_memex(memory.clone());

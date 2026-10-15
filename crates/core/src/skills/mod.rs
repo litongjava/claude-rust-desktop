@@ -1,4 +1,7 @@
 pub mod engine;
+pub mod discovery;
+pub mod bundled;
+pub mod invocation;
 pub mod import;
 mod editing;
 pub mod open_design;

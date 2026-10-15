@@ -114,6 +114,84 @@ pub fn prepare(
     branch: Option<&str>,
     use_worktree: bool,
 ) -> Result<PreparedWorkspace> {
+    prepare_internal(source, branch, use_worktree, None)
+}
+
+/// CLI names share Desktop persistence and trusted-workspace resolution.
+pub fn prepare_named(source: &Path, name: Option<&str>) -> Result<PreparedWorkspace> {
+    validate_named(source, name)?;
+    prepare_internal(source, None, true, name)
+}
+
+pub fn validate_named(source: &Path, name: Option<&str>) -> Result<()> {
+    if let Some(name) = name {
+        validate_name(name)?;
+    }
+    ensure!(
+        branches(source)?.is_repository,
+        "--worktree requires a Git repository"
+    );
+    git(source, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if let Some(name) = name {
+        let common = PathBuf::from(git(
+            source,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?);
+        ensure!(
+            !common.join("desktop-worktrees").join(name).exists(),
+            "Worktree already exists; resume its session"
+        );
+        ensure!(
+            !command(
+                source,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/worktree/{name}")
+                ]
+            )?
+            .status
+            .success(),
+            "Worktree branch already exists; choose another name"
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= 64,
+        "Worktree name must contain 1..64 ASCII characters"
+    );
+    ensure!(name.split('/').all(|part| !part.is_empty() && part!="." && part!=".." && part.bytes().all(|ch|ch.is_ascii_alphanumeric() || b"._-".contains(&ch))),"Worktree name must contain letters, digits, dots, underscores or dashes in non-empty slash-separated segments");
+    ensure!(
+        !name
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with('.') || part.ends_with(".lock"))
+            && !name.contains(".."),
+        "Worktree name is not a valid Git branch name"
+    );
+    #[cfg(windows)]
+    ensure!(
+        !name.split('/').any(|part| {
+            let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                || (stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        }),
+        "Worktree name contains a Windows reserved device name"
+    );
+    Ok(())
+}
+
+fn prepare_internal(
+    source: &Path,
+    branch: Option<&str>,
+    use_worktree: bool,
+    requested_name: Option<&str>,
+) -> Result<PreparedWorkspace> {
     if branch.is_none() && !use_worktree {
         return Ok(PreparedWorkspace {
             path: source.to_path_buf(),
@@ -165,9 +243,28 @@ pub fn prepare(
     )?);
     // Keep generated worktrees outside the source tree so they do not appear as untracked files.
     let id = uuid::Uuid::new_v4().to_string();
-    let path = common.join("desktop-worktrees").join(&id);
+    let path = common
+        .join("desktop-worktrees")
+        .join(requested_name.unwrap_or(&id));
+    ensure!(
+        !path.exists(),
+        "Worktree already exists; resume its session instead of overwriting it"
+    );
+    // Resolve every existing ancestor to prevent configured junctions/symlinks
+    // from redirecting managed worktree creation outside Git's common directory.
+    let common_root = common.canonicalize()?;
+    let mut ancestor = path.parent().context("Invalid worktree path")?;
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().context("Invalid worktree ancestor")?;
+    }
+    ensure!(
+        ancestor.canonicalize()?.starts_with(&common_root),
+        "Managed worktree parent escapes Git common directory"
+    );
     std::fs::create_dir_all(path.parent().context("Invalid worktree path")?)?;
-    let name = format!("session/{id}");
+    let name = requested_name
+        .map(|name| format!("worktree/{name}"))
+        .unwrap_or_else(|| format!("session/{id}"));
     git(
         &repo,
         &[

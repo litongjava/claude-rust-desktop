@@ -1,5 +1,5 @@
 //! Local REPL commands use the same stores as Desktop and never call a model.
-use crate::{args::McpCommands, session::Session};
+use crate::session::Session;
 use anyhow::{ensure, Result};
 use claude_core::{
     db::conversation_repo,
@@ -14,7 +14,9 @@ pub fn tool_details(session: &Session) -> Result<Vec<(String, String)>> {
             return Ok(Vec::new());
         };
         let tools = claude_core::db::message_repo::get_tool_calls_for_message(conn, &message.id)?;
-        Ok(tools
+        let mut entries = Vec::new();
+        if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.is_empty()) { entries.push(("Thinking".into(), thinking.chars().take(65536).collect())); }
+        entries.extend(tools
             .into_iter()
             .map(|tool| {
                 let title = format!(
@@ -34,13 +36,32 @@ pub fn tool_details(session: &Session) -> Result<Vec<(String, String)>> {
                 }
                 (title, shown)
             })
-            .collect())
+            );
+        Ok(entries)
     })?
 }
 
 pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
     let line = line.trim();
     let (command, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    if crate::feedback_commands::handle(command, argument, session).await? {
+        return Ok(true);
+    }
+    if crate::resource_commands::handle(command, argument, paths).await? {
+        return Ok(true);
+    }
+    if crate::account_commands::handle(command, argument, paths, session).await? {
+        return Ok(true);
+    }
+    if crate::rewind_commands::handle(command, argument, paths, session).await? {
+        return Ok(true);
+    }
+    if crate::display_commands::handle(command, argument, paths, session).await? {
+        return Ok(true);
+    }
+    if crate::session_commands::handle(command, argument, paths, session).await? {
+        return Ok(true);
+    }
     match command {
         "/compact" => {
             let report = tokio::select! {
@@ -77,10 +98,7 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
             eprintln!("Saved messages: {}\nActive messages: {}\nActive message text: {bytes} UTF-8 bytes\nCompacted: {}\nCounts exclude system instructions and tool payloads; this is not a token estimate.", rows.len(), rows.len() - start, rows.iter().any(|row| row.is_compact_boundary));
         }
         "/permissions" => {
-            if !argument.trim().is_empty() {
-                session.set_permission_mode(argument.trim()).await?;
-            }
-            eprintln!("Permission mode: {}", session.permission_mode());
+            crate::permission_commands::handle(argument, session).await?;
         }
         "/rename" => {
             let title = argument.trim();
@@ -104,8 +122,12 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
             );
         }
         "/mcp" => {
-            ensure!(argument.trim().is_empty(), "Usage: /mcp");
-            crate::mcp(paths, &McpCommands::List).await?;
+            use clap::Parser;
+            let mut words = crate::display_commands::split_arguments(argument)?;
+            if words.is_empty() { words.push("list".into()); }
+            let parsed = crate::args::Cli::try_parse_from(["claude-code".into(), "mcp".into()].into_iter().chain(words))?;
+            let Some(crate::args::Commands::Mcp { action }) = parsed.command else { unreachable!() };
+            crate::mcp(paths, &action).await?;
         }
         "/end" | "/cancel" => eprintln!("No unfinished prompt. Use /multiline to compose one."),
         _ => return crate::extended_commands::handle(command, argument, paths, session).await,

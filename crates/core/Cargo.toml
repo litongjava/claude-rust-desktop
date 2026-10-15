@@ -7,6 +7,7 @@ description = "Shared model, tool, session and persistence engine for CLI and De
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = { version = "0.33", default-features = false }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls", "blocking"], default-features = false }
 axum = { version = "0.8", features = ["macros", "multipart"] }
@@ -37,7 +38,7 @@ r2d2_sqlite = "0.24"
 enigo = "0.2"
 base64 = "0.22"
 ring = "0.17"
-windows = { version = "0.58", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows = { version = "0.58", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_System_Memory"] }
 cron = "0.12"
 diffy = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -47,6 +48,7 @@ scraper = "0.24"
 
 tempfile = "3"
 semver = "1"
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

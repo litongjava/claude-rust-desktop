@@ -12,6 +12,9 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod legacy;
+mod official;
+mod materialized;
+pub use materialized::{skill_commands, command_hooks, sync_mcp};
 pub use legacy::import_legacy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,8 +36,22 @@ pub struct Bundle {
     /// Declarative system-prompt hook, loaded only while enabled.
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default, rename = "lspServers")]
+    pub lsp_servers: BTreeMap<String, Value>,
     pub commands: BTreeMap<String, PluginCommand>,
     pub files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub binary_files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub executable_files: Vec<String>,
+    #[serde(default)]
+    pub skill_paths: Vec<String>,
+    #[serde(default)]
+    pub command_paths: Vec<String>,
+    #[serde(default)]
+    pub lifecycle_hooks: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, Value>,
 }
 #[derive(Debug, Serialize)]
 pub struct Installed {
@@ -44,6 +61,7 @@ pub struct Installed {
     pub enabled: bool,
     pub source: String,
     pub commands: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -61,22 +79,35 @@ fn safe_path(path: &str) -> bool {
 }
 impl Bundle {
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.lsp_servers.len() <= 32, "Too many plugin language servers");
+        for (name, config) in &self.lsp_servers {
+            ensure!(valid_name(name) && config.is_object(), "Invalid language server configuration");
+            ensure!(config["command"].as_str().is_some_and(|s| !s.trim().is_empty()), "Language server command is required");
+            ensure!(config["extensionToLanguage"].as_object().is_some_and(|m| !m.is_empty()), "Language server extension mapping is required");
+        }
         ensure!(valid_name(&self.id), "Invalid plugin ID");
         semver::Version::parse(&self.version)?;
         ensure!(
             self.system_prompt.len() <= 16_000
-                && self.files.len() <= 100
+                && self.files.len() + self.binary_files.len() <= 1000
                 && self.commands.len() <= 30,
             "Plugin limits exceeded"
         );
         ensure!(
-            self.files.iter().all(|(name, _)| safe_path(name)),
+            self.files.keys().chain(self.binary_files.keys()).all(|name| safe_path(name)),
             "Plugin path escapes package"
         );
         ensure!(
-            self.files.values().map(String::len).sum::<usize>() <= 5_000_000,
-            "Plugin files exceed 5 MB"
+            self.files.values().chain(self.binary_files.values()).map(String::len).sum::<usize>() <= 35_000_000,
+            "Plugin files exceed package size limit"
         );
+        ensure!(self.executable_files.iter().all(|path| safe_path(path) && (self.files.contains_key(path) || self.binary_files.contains_key(path))), "Invalid executable plugin path");
+        ensure!(self.skill_paths.iter().chain(&self.command_paths).all(|path| safe_path(path)), "Plugin feature path escapes package");
+        ensure!(self.mcp_servers.len() <= 32, "Too many plugin MCP servers");
+        for (name, config) in &self.mcp_servers {
+            ensure!(valid_name(name) && config.is_object() && config["command"].as_str().is_some_and(|v| !v.is_empty()), "Invalid stdio MCP server");
+            ensure!(config.get("url").is_none() && config.get("type").and_then(Value::as_str).is_none_or(|v| v == "stdio"), "Only stdio plugin MCP servers are supported");
+        }
         for (name, command) in &self.commands {
             ensure!(
                 command.args.len() <= 64 && command.args.iter().all(|a| a.len() <= 4096),
@@ -92,6 +123,22 @@ impl Bundle {
         }
         Ok(())
     }
+}
+
+/// Read active plugin language servers without starting processes or exposing
+/// credentials in the CLI's plugin list. The LSP manager starts them on demand.
+pub fn language_servers(context: &ServiceContext) -> Result<Vec<Value>> {
+    let mut servers = Vec::new();
+    for item in list(context)?.into_iter().filter(|item| item.enabled) {
+        let bundle = enabled_bundle(context, &item.id)?;
+        let root = materialized::materialize(context, &bundle)?;
+        for (name, mut config) in bundle.lsp_servers {
+            official::replace_plugin_root(&mut config, &root.to_string_lossy().replace('\\', "/"));
+            config["name"] = Value::String(format!("{}:{name}", item.id));
+            servers.push(config);
+        }
+    }
+    Ok(servers)
 }
 async fn source_bytes(source: &str) -> Result<Vec<u8>> {
     let bytes = if source.starts_with("https://") || source.starts_with("http://") {
@@ -124,6 +171,9 @@ async fn source_bytes(source: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 pub async fn source(source: &str) -> Result<Bundle> {
+    if Path::new(source).is_dir() {
+        return official::load(Path::new(source));
+    }
     let bundle: Bundle = serde_json::from_slice(&source_bytes(source).await?)?;
     bundle.validate()?;
     Ok(bundle)
@@ -134,6 +184,7 @@ pub async fn install(
     update: Option<&str>,
 ) -> Result<Installed> {
     let bundle = source(from).await?;
+    materialized::materialize(context, &bundle)?;
     if let Some(id) = update {
         ensure!(
             bundle.id == id,
@@ -194,6 +245,14 @@ pub fn list(context: &ServiceContext) -> Result<Vec<Installed>> {
         rows.map(|r| {
             let (raw, enabled, source) = r?;
             let b: Bundle = serde_json::from_str(&raw)?;
+            let capabilities = [
+                (!b.lsp_servers.is_empty(), "lsp"),
+                (!b.skill_paths.is_empty(), "skills"),
+                (!b.command_paths.is_empty(), "slash_commands"),
+                (!b.lifecycle_hooks.is_empty(), "command_hooks"),
+                (!b.mcp_servers.is_empty(), "stdio_mcp"),
+                (!b.commands.is_empty(), "script_commands"),
+            ].into_iter().filter_map(|(enabled, name)| enabled.then(|| name.to_string())).collect();
             Ok(Installed {
                 id: b.id,
                 version: b.version,
@@ -201,6 +260,7 @@ pub fn list(context: &ServiceContext) -> Result<Vec<Installed>> {
                 enabled,
                 source,
                 commands: b.commands.keys().cloned().collect(),
+                capabilities,
             })
         })
         .collect()

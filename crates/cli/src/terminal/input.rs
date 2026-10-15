@@ -6,11 +6,14 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use tokio::sync::{mpsc, oneshot};
 
 #[path = "editor.rs"]
-mod editor;
+pub(crate) mod editor;
 
 enum Message {
     Commands(Vec<(String, String)>),
     Details(Vec<(String, String)>),
+    Panel(Vec<(String, String)>, bool),
+    Draft(String),
+    Keybindings(crate::keybindings::Keybindings),
     Read(Request),
 }
 
@@ -21,20 +24,24 @@ struct Request {
 }
 
 pub struct TerminalInput {
+    notices: std::sync::mpsc::Sender<String>,
     requests: std::sync::mpsc::Sender<Message>,
     pending: Option<oneshot::Receiver<io::Result<Option<String>>>>,
     fixture: Option<mpsc::UnboundedReceiver<String>>,
+    queued: std::collections::VecDeque<String>,
 }
 
 impl TerminalInput {
     pub fn new() -> Self {
         let (requests, rx) = std::sync::mpsc::channel::<Message>();
+        let (notices, notice_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let terminal = io::stdin().is_terminal()
+            let terminal = !crate::terminal::screen_reader() && io::stdin().is_terminal()
                 && io::stdout().is_terminal()
                 && io::stderr().is_terminal()
                 && std::env::var("TERM").as_deref() != Ok("dumb");
             let mut editor = editor::PromptEditor::default();
+            editor.set_notices(notice_rx);
             let mut plain = io::BufReader::new(io::stdin());
             for message in rx {
                 let request = match message {
@@ -42,8 +49,20 @@ impl TerminalInput {
                         editor.set_commands(commands);
                         continue;
                     }
+                    Message::Draft(draft) => {
+                        editor.set_draft(draft);
+                        continue;
+                    }
+                    Message::Panel(details, expanded) => {
+                        editor.set_panel(details, expanded);
+                        continue;
+                    }
                     Message::Details(details) => {
                         editor.set_details(details);
+                        continue;
+                    }
+                    Message::Keybindings(bindings) => {
+                        editor.set_keybindings(bindings);
                         continue;
                     }
                     Message::Read(request) => request,
@@ -68,22 +87,50 @@ impl TerminalInput {
             }
         });
         Self {
+            notices,
             requests,
             pending: None,
             fixture: None,
+            queued: Default::default(),
         }
+    }
+
+    pub fn notice(&self, text: String) {
+        let _ = self.notices.send(text);
     }
 
     pub fn set_commands(&self, commands: Vec<(String, String)>) {
         let _ = self.requests.send(Message::Commands(commands));
     }
 
+    /// Reload before the next prompt. Invalid files leave the prior valid
+    /// configuration intact and return an error for the caller to display.
+    pub fn set_keybindings(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let bindings = crate::keybindings::load(path)?;
+        self.requests
+            .send(Message::Keybindings(bindings))
+            .map_err(|_| anyhow::anyhow!("Terminal input closed"))
+    }
+
     /// Set the last turn's tool titles and full display bodies before reading.
+    pub fn set_panel(&self, details: Vec<(String, String)>, expanded: bool) {
+        let _ = self.requests.send(Message::Panel(details, expanded));
+    }
+
     pub fn set_details(&self, details: Vec<(String, String)>) {
         let _ = self.requests.send(Message::Details(details));
     }
 
+    pub fn queue_prompt(&mut self, prompt: String) {
+        self.queued.push_back(prompt);
+    }
+    pub fn restore_draft(&self, draft: String) {
+        let _ = self.requests.send(Message::Draft(draft));
+    }
     pub async fn read_prompt(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        if let Some(queued) = self.queued.pop_front() {
+            return Ok(Some(queued));
+        }
         self.read(prompt, true).await
     }
 
@@ -129,9 +176,11 @@ impl From<mpsc::UnboundedReceiver<String>> for TerminalInput {
     fn from(fixture: mpsc::UnboundedReceiver<String>) -> Self {
         let (requests, _) = std::sync::mpsc::channel();
         Self {
+            notices: std::sync::mpsc::channel().0,
             requests,
             pending: None,
             fixture: Some(fixture),
+            queued: Default::default(),
         }
     }
 }
