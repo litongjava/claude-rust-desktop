@@ -62,12 +62,15 @@ impl From<PermissionMode> for String {
 
 pub type AlwaysAllowCheckerFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeSnapshot { pub mode: PermissionMode, revision: u64 }
+
 pub struct PermissionManager {
     ruleset: Mutex<PermissionRuleset>,
     tool_permissions: Mutex<HashMap<String, ToolPermission>>,
     audit_logger: AuditLoggerRef,
     confirmations: Mutex<HashMap<String, bool>>,
-    mode: Mutex<PermissionMode>,
+    mode: Mutex<ModeSnapshot>,
     session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
     runtime_rules: Mutex<HashMap<String, Vec<HashMap<String, PermissionAction>>>>,
     always_allow_checker: Mutex<Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>>,
@@ -123,7 +126,7 @@ impl PermissionManager {
             ),
             audit_logger: self.audit_logger.clone(),
             confirmations: Mutex::new(HashMap::new()),
-            mode: Mutex::new(self.get_mode()),
+            mode: Mutex::new(ModeSnapshot { mode: self.get_mode(), revision: 0 }),
             session_rules: Mutex::new(HashMap::from([(child.to_owned(), rules)])),
             runtime_rules: Mutex::new(HashMap::from([(
                 child.to_owned(),
@@ -149,7 +152,7 @@ impl PermissionManager {
             tool_permissions: Mutex::new(HashMap::new()),
             audit_logger,
             confirmations: Mutex::new(HashMap::new()),
-            mode: Mutex::new(PermissionMode::default()),
+            mode: Mutex::new(ModeSnapshot { mode: PermissionMode::default(), revision: 0 }),
             session_rules: Mutex::new(HashMap::new()),
             runtime_rules: Mutex::new(HashMap::new()),
             always_allow_checker: Mutex::new(None),
@@ -164,12 +167,35 @@ impl PermissionManager {
 
     pub fn set_mode(&self, mode: PermissionMode) {
         let mut m = self.mode.lock().unwrap_or_else(|e| e.into_inner());
-        *m = mode;
+        if m.mode != mode { m.mode = mode; m.revision = m.revision.wrapping_add(1); }
         tracing::info!(module = "Permission", "Mode changed to: {}", mode.as_str());
     }
 
     pub fn get_mode(&self) -> PermissionMode {
+        self.mode.lock().unwrap_or_else(|e| e.into_inner()).mode
+    }
+
+    pub fn mode_snapshot(&self) -> ModeSnapshot {
         *self.mode.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Caller must acquire any DB lock BEFORE entering this method. The closure
+    /// may commit an existing transaction but must not acquire DB/permission locks.
+    /// Failed commits leave mode unchanged; intervening mode changes reject approval.
+    pub fn commit_mode_transition<T>(&self, expected: ModeSnapshot, next: PermissionMode, commit: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut current = self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(*current == expected, "Permission mode changed during review; request approval again");
+        let result = commit()?;
+        current.mode = next;
+        current.revision = current.revision.wrapping_add(1);
+        Ok(result)
+    }
+    /// Explicit host selection; same DB-before-mode lock order as plan approval.
+    pub fn commit_mode_update<T>(&self, next: PermissionMode, commit: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut current = self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        let result = commit()?;
+        if current.mode != next { current.mode = next; current.revision = current.revision.wrapping_add(1); }
+        Ok(result)
     }
 
     pub fn add_rule(&self, rule: PermissionRule) {
