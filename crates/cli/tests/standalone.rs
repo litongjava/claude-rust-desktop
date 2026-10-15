@@ -390,3 +390,93 @@ async fn empty_stdin_and_malformed_config_fail_without_overwriting() {
         "not json"
     );
 }
+
+#[tokio::test]
+async fn legacy_agent_import_preserves_allowlist_in_real_shared_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let source = temp.path().join("old-agent.json");
+    let raw = json!({"agent_type":"Custom","name":"Old Reviewer","description":"Read only","when_to_use":"Review","tools":["file_read"],"model":"old-model","system_prompt":"LEGACY_SENTINEL","source":"user","base_dir":"unused-old-path"}).to_string();
+    std::fs::write(&source, &raw).unwrap();
+    let mut cli = command(&data, temp.path());
+    cli.args([
+        "agents",
+        "import-legacy",
+        source.to_str().unwrap(),
+        "--id",
+        "LegacyReader",
+        "--preview",
+    ]);
+    let preview = execute(cli).await;
+    assert!(preview.status.success());
+    let mut cli = command(&data, temp.path());
+    cli.args(["agents", "list"]);
+    assert!(!String::from_utf8_lossy(&execute(cli).await.stdout).contains("LegacyReader"));
+    for _ in 0..2 {
+        let mut cli = command(&data, temp.path());
+        cli.args([
+            "agents",
+            "import-legacy",
+            source.to_str().unwrap(),
+            "--id",
+            "LegacyReader",
+        ]);
+        assert!(execute(cli).await.status.success());
+    }
+    let (url, fixture, task) = server(Some("Write"), false).await;
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args([
+        "--permission-mode",
+        "bypass",
+        "agent",
+        "--agent-type",
+        "LegacyReader",
+        "--prompt",
+        "Review",
+    ]);
+    let output = execute(cli).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!temp.path().join("created.txt").exists());
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests[0]["model"], "fixture-model");
+    assert!(requests[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("LEGACY_SENTINEL"));
+    assert!(!requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["function"]["name"] == "Write"));
+    assert!(requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("not allowed")));
+    assert_eq!(std::fs::read_to_string(source).unwrap(), raw);
+    drop(requests);
+    task.abort();
+    std::fs::write(temp.path().join("fixture.txt"), "READ_ALLOWED_SENTINEL").unwrap();
+    let (url, _, task) = server(Some("Read"), false).await;
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args([
+        "agent",
+        "--agent-type",
+        "LegacyReader",
+        "--prompt",
+        "Read fixture",
+    ]);
+    let output = execute(cli).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Tool approval required"));
+    let mut cli = query(&data, temp.path(), &url);
+    cli.args(["--permission-mode", "accept-edits", "agent", "--agent-type", "LegacyReader", "--prompt", "Read fixture"]);
+    let output = execute(cli).await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("READ_ALLOWED_SENTINEL"));
+    task.abort();
+}

@@ -7,6 +7,7 @@ pub mod generation;
 pub mod dream;
 pub mod magic_docs;
 pub mod agents;
+pub mod agent_import;
 pub mod diagnostics;
 pub mod updates;
 pub mod plugins;

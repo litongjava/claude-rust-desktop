@@ -86,6 +86,7 @@ pub enum Request {
     PluginRun { id:String, command:String, input:Value, project_id:String, confirmed:bool },
     Diagnostics { concurrency:usize, iterations:usize },
     UpdateCheck { url:String },
+    AgentImportLegacy { source: std::path::PathBuf, id: String, preview: bool },
     Agents,
     AgentImport { definition: claude_core::services::agents::Definition },
     AgentCreate { project_id:String, agent_type:String, provider:String, model:String },
@@ -170,6 +171,7 @@ pub async fn peripheral_command(
             },
             Request::Diagnostics {concurrency,iterations} => Ok(json!(claude_core::services::diagnostics::stress(concurrency,iterations,None,false).await?)),
             Request::UpdateCheck {url} => {let update=claude_core::services::updates::check(&url,env!("CARGO_PKG_VERSION")).await?;Ok(json!({"up_to_date":update.is_none(),"update":update}))}
+            Request::AgentImportLegacy { source, id, preview } => Ok(json!(claude_core::services::agent_import::import(&context, &source, &id, preview)?)),
             Request::Agents => Ok(json!(claude_core::services::agents::list(&context)?)),
             Request::AgentImport { definition } => {claude_core::services::agents::install(&context,definition)?;Ok(json!({"imported":true}))}
             Request::AgentCreate { project_id,agent_type,provider,model } => {

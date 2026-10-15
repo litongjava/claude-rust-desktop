@@ -5,7 +5,8 @@ use anyhow::{ensure, Context, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Definition {
     #[serde(alias = "name")]
     pub id: String,
@@ -13,6 +14,8 @@ pub struct Definition {
     pub system_prompt: String,
     /// None uses the host's tools and permissions; a list is a strict additional limit.
     pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<super::agent_import::LegacyDefinition>,
 }
 pub fn canonical(id: &str) -> &str {
     match id {
@@ -30,7 +33,7 @@ pub fn builtins() -> Vec<Definition> {
         ("verify","Verify the requested behavior with relevant tests and evidence. Report failures and limitations accurately.",false),
         ("general","Complete the requested task using the shared tools, respecting project instructions and host permissions.",false),
     ].into_iter().map(|(id,prompt,read_only)| Definition {
-        id:id.into(), description:prompt.into(), system_prompt:prompt.into(),
+        id:id.into(), description:prompt.into(), system_prompt:prompt.into(), legacy:None,
         tools:read_only.then(|| ["Read","ListDir","Grep","WebFetch","WebSearch","memory_search","AskUserQuestion"].into_iter().map(String::from).collect()),
     }).collect()
 }
@@ -68,21 +71,29 @@ pub fn list(context: &ServiceContext) -> Result<Vec<Definition>> {
     Ok(definitions)
 }
 pub fn resolve(context: &ServiceContext, id: &str) -> Result<Definition> {
+    let definitions = list(context)?;
+    if let Some(definition) = definitions.iter().find(|d| d.id == id) {
+        return Ok(definition.clone());
+    }
     let id = id.to_lowercase();
-    list(context)?
+    definitions
         .into_iter()
         .find(|d| d.id == canonical(&id))
         .context("Unknown agent type; use agents list")
 }
-pub fn install(context: &ServiceContext, definition: Definition) -> Result<()> {
+pub fn validate_custom(definition: &Definition) -> Result<()> {
     definition.validate()?;
+    let normalized = definition.id.to_lowercase();
     ensure!(
-        canonical(&definition.id) == definition.id
-            && !builtins().iter().any(|d| d.id == definition.id),
+        canonical(&normalized) == normalized && !builtins().iter().any(|d| d.id == normalized),
         "Cannot replace a built-in agent or alias"
     );
+    Ok(())
+}
+pub fn install(context: &ServiceContext, definition: Definition) -> Result<()> {
+    validate_custom(&definition)?;
     context.db.with_conn(|c| -> Result<()> {
-        let tx = c.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
         let raw: Option<String> = tx.query_row("SELECT value FROM peripheral_settings WHERE key='agent-definitions'",[],|r|r.get(0)).optional()?;
         let mut definitions: Vec<Definition> = raw.map(|v|serde_json::from_str(&v)).transpose()?.unwrap_or_default();
         definitions.retain(|d|d.id!=definition.id); definitions.push(definition);

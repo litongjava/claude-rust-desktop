@@ -1,3 +1,4 @@
+import AgentLegacyImport from './AgentLegacyImport';
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listProjects, type Project } from '../api/projects';
@@ -34,6 +35,7 @@ export default function AgentLauncher({ onOpen }: { onOpen:()=>void }) {
       window.dispatchEvent(new CustomEvent('navigateToConversation',{detail:{id:result.id}}));
       onOpen();
     })}>打开 Agent 会话</button>
+    <AgentLegacyImport onImported={async () => setDefinitions(await command<Definition[]>({action:'agents'}))} />
     <details><summary className="text-sm">导入自定义 Agent</summary>
       <p className="text-xs">JSON 字段：id、description、system_prompt、tools。tools 为允许的工具名数组，null 表示沿用宿主工具与权限。</p>
       <textarea aria-label="自定义 Agent JSON" rows={4} className={field} value={custom} onChange={e=>setCustom(e.target.value)} />

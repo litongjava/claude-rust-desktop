@@ -209,9 +209,19 @@ pub enum MagicCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommands {
+    /// Preview or import one historical AgentDefinition under an explicit custom ID.
+    ImportLegacy {
+        source: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        preview: bool,
+    },
     List,
     /// Load a custom JSON definition; source is not modified.
-    Import { source:PathBuf },
+    Import {
+        source: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]

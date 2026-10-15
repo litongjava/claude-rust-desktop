@@ -80,6 +80,7 @@ async fn run(cli: &Cli) -> Result<()> {
         Some(Commands::Agents { action }) => {
             let context = services::context(&paths)?;
             match action {
+                args::AgentCommands::ImportLegacy { source, id, preview } => return services::print(&claude_core::services::agent_import::import(&context, source, id, *preview)?),
                 args::AgentCommands::List => return services::print(&claude_core::services::agents::list(&context)?),
                 args::AgentCommands::Import { source } => {
                     let definition = serde_json::from_slice(&std::fs::read(source)?)?;
