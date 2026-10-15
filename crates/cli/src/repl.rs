@@ -67,13 +67,15 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
     }
     match command {
         "/compact" => {
+            let context = crate::services::context(paths)?;
             let report = tokio::select! {
-                report = claude_core::services::compaction::compact(
-                    &session.engine, &session.store.db, &session.id,
-                    &session.provider_id, &session.model, argument.trim(),
+                report = claude_core::services::compaction::compact_with_hooks(
+                    &session.engine, &context, &session.workspace, &session.id,
+                    &session.provider_id, &session.model, argument.trim(), "manual",
                 ) => report?,
-                _ = tokio::signal::ctrl_c() => anyhow::bail!("Compaction cancelled; original history retained"),
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("Compaction interrupted; check /history for a completed summary. Original transcript retained"),
             };
+            for warning in &report.warnings { eprintln!("Hook: {warning}"); }
             eprintln!(
                 "Summarized {} messages. Original transcript remains in /history.",
                 report.summarized_messages

@@ -145,12 +145,24 @@ impl Session {
             let definition = claude_core::services::agents::resolve(&crate::services::context(paths)?, agent_type)?;
             claude_core::services::agents::bind(&store.db, &id, &definition)?;
         }
-        permissions.set_mode(match cli.permission_mode {
+        let selected_mode = match cli.permission_mode {
             PermissionModeArg::Ask => PermissionMode::AskPermissions,
             PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
             PermissionModeArg::Plan => PermissionMode::PlanMode,
             PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
-        });
+        };
+        let explicit_mode = cli.permission_mode_explicit || cli.dangerously_skip_permissions || !matches!(cli.permission_mode, PermissionModeArg::Ask);
+        let active_job = if internal_worker { None } else { claude_core::services::background_sessions::list(&paths.data_dir, None)?.into_iter().find(|job|job.session_id == id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) };
+        if let Some(job) = &active_job {
+            anyhow::ensure!(!explicit_mode, "This session has active background work; resume without an explicit permission mode and use /tasks attach {} to change its mode", job.id);
+        }
+        let selected_mode = if explicit_mode {
+            selected_mode
+        } else {
+            claude_core::services::session_permission_mode::load(&store.db, &id)?.filter(|mode| *mode != PermissionMode::BypassPermissions).unwrap_or(selected_mode)
+        };
+        if active_job.is_some() { permissions.set_mode(selected_mode); }
+        else { claude_core::services::session_permission_mode::set(&store.db, &id, &permissions, selected_mode)?; }
         let api_format = selection
             .providers
             .iter()
@@ -301,6 +313,7 @@ impl Session {
         let resolved = self.providers.lock().await.resolve_selected(&provider_id, &model)
             .context("Saved provider/model is unavailable; current session retained")?;
         let lifecycle_owned = self.lifecycle_owned;
+        let saved_mode = claude_core::services::session_permission_mode::load(&self.store.db, id)?.filter(|mode| *mode != PermissionMode::BypassPermissions).unwrap_or(PermissionMode::AskPermissions);
         self.end_hooks("other").await;
         self.workspace = workspace;
         self.api_format = resolved.provider.api_format;
@@ -308,6 +321,7 @@ impl Session {
         self.provider_id = provider_id;
         self.auto_route = false;
         self.id = id.to_owned();
+        claude_core::services::session_permission_mode::set(&self.store.db, &self.id, &self.permissions, saved_mode)?;
         if lifecycle_owned { self.start_hooks("resume").await?; }
         Ok(())
     }
@@ -334,16 +348,35 @@ impl Session {
         }
     }
 
-    pub async fn set_permission_mode(&mut self, value: &str) -> Result<()> {
+    pub fn next_permission_mode(&self) -> &'static str {
+        match self.permission_mode() {
+            "ask" => "accept-edits",
+            "accept-edits" => "plan",
+            _ => "ask", // Bypass is explicit opt-in and can only be exited here.
+        }
+    }
+
+    pub async fn cycle_permission_mode(&self) -> Result<&'static str> {
+        self.set_permission_mode(self.next_permission_mode())
+            .await?;
+        Ok(self.permission_mode())
+    }
+
+    pub async fn set_permission_mode(&self, value: &str) -> Result<()> {
         use clap::ValueEnum;
+        if claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_none() {
+            if let Some(job) = claude_core::services::background_sessions::list(&self.paths.data_dir, None)?.into_iter().find(|job|job.session_id == self.id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) {
+                anyhow::bail!("This session has active background work; use /tasks attach {} to change its permission mode", job.id);
+            }
+        }
         let mode = PermissionModeArg::from_str(value, false)
             .map_err(|_| anyhow::anyhow!("Unknown permission mode '{value}'; use ask, accept-edits, plan, or bypass"))?;
-        self.engine.set_permission_mode(match mode {
+        claude_core::services::session_permission_mode::set(&self.store.db, &self.id, &self.permissions, match mode {
             PermissionModeArg::Ask => PermissionMode::AskPermissions,
             PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
             PermissionModeArg::Plan => PermissionMode::PlanMode,
             PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
-        }).await;
+        })?;
         Ok(())
     }
 
@@ -488,6 +521,12 @@ impl Session {
                     },
                     action = progress.action() => {
                         match action.context("Live terminal input closed")? {
+                            crate::terminal::live::Action::CyclePermission => {
+                                match self.cycle_permission_mode().await {
+                                    Ok(mode) => progress.set_permission_mode(mode),
+                                    Err(error) => progress.notice(&format!("Permission mode: {error:#}")),
+                                }
+                            },
                             crate::terminal::live::Action::Cancel => bail!("Interrupted"),
                             crate::terminal::live::Action::Detach => progress.notice("This turn is not owned by a background worker."),
                             crate::terminal::live::Action::Submit(prompt) => if let Some(reader)=input.as_mut() { reader.queue_prompt(prompt); },
@@ -536,7 +575,7 @@ impl Session {
                         } else { format!("Allow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?) };
                         let answer = if let Some(sdk)=&self.sdk_permissions { sdk.ask(&request_id,&tool_use_id,&tool_name,&tool_input).await? } else if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { answer } else {
                             anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
-                            turn_answer(&mut progress, input, question).await?
+                            turn_answer(self, &mut progress, input, question).await?
                         };
                         let answer = if ["y", "yes", "是", "允许"].contains(&answer.trim().to_lowercase().as_str()) { "yes" } else { "no" };
                         self.engine.resume_with_answer(&request_id, answer.into()).await?;
@@ -552,7 +591,7 @@ impl Session {
                         }
                         let mut prompt = question;
                         for (index, option) in options.iter().enumerate() { prompt.push_str(&format!("\n{}. {option}", index+1)); }
-                        let answer = if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "question", &prompt).await? { answer } else { turn_answer(&mut progress, input, prompt).await? };
+                        let answer = if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "question", &prompt).await? { answer } else { turn_answer(self, &mut progress, input, prompt).await? };
                         let answer = answer.trim().parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| options.get(i)).cloned().unwrap_or(answer);
                         self.engine.resume_with_answer(&request_id, answer).await?;
                         progress.set_activity("Composing");
@@ -571,6 +610,9 @@ impl Session {
                                 progress.notice(&format!("Cannot checkpoint this tool's file: {error:#}"));
                             }
                         }
+                        if matches!(tool_name.as_str(), "EnterPlanMode" | "ExitPlanMode" | "plan_mode") {
+                            progress.set_permission_mode(self.permission_mode());
+                        }
                         progress.tool_finished(&tool_use_id, &tool_name, &output, is_error);
                         tools.push(message_repo::ToolCallRow { id: tool_use_id, message_id: String::new(), name: tool_name, input: Some(tool_input.to_string()), output: Some(output), is_error, sort_order: tools.len() as i64 });
                     },
@@ -586,6 +628,11 @@ impl Session {
         progress.clear();
         // Cancel and join before persisting, including Ctrl+C and closed stdin.
         self.engine.cancel_turn(&self.id).await;
+        if claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_none() {
+            if let Err(error) = self.set_permission_mode(self.permission_mode()).await {
+                progress.notice(&format!("Could not save permission mode: {error:#}"));
+            }
+        }
         if let Some(capture) = checkpoint {
             if let Err(error) = claude_core::services::checkpoints::finish(capture) {
                 progress.notice(&format!("Could not save code checkpoint: {error:#}"));
@@ -634,6 +681,9 @@ impl Session {
                             break;
                         },
                         action = progress.action() => match action {
+                            Some(crate::terminal::live::Action::CyclePermission) => {
+                                match self.cycle_permission_mode().await { Ok(mode)=>progress.set_permission_mode(mode),Err(error)=>progress.notice(&format!("Permission mode: {error:#}")) }
+                            },
                             Some(crate::terminal::live::Action::Cancel)|None => { progress.notice("Side question cancelled."); break; },
                             Some(crate::terminal::live::Action::Submit(prompt)) => if let Some(reader)=input.as_mut() { reader.queue_prompt(prompt); },
                             Some(_) => progress.notice("Finishing the current side question; another can be sent from the next prompt."),
@@ -649,6 +699,7 @@ impl Session {
                     crate::terminal::live::Action::Submit(prompt)=>reader.queue_prompt(prompt),
                     crate::terminal::live::Action::SideQuestion(question)=>reader.queue_prompt(format!("/btw {question}")),
                     crate::terminal::live::Action::Draft(draft)=>reader.restore_draft(draft),
+                    crate::terminal::live::Action::CyclePermission => { self.cycle_permission_mode().await?; },
                     crate::terminal::live::Action::Cancel|crate::terminal::live::Action::Detach=>{},
                 }
             }
@@ -663,13 +714,19 @@ impl Session {
     }
 }
 
-async fn turn_answer(progress: &mut crate::terminal::live::TurnDisplay, input: &mut Option<TerminalInput>, question: String) -> Result<String> {
+async fn turn_answer(session: &Session, progress: &mut crate::terminal::live::TurnDisplay, input: &mut Option<TerminalInput>, question: String) -> Result<String> {
     if let Some(live)=progress.live.as_ref() {
         let mut answer=live.question(question);
         loop {
             tokio::select! {
                 response=&mut answer=>return response.context("Terminal answer cancelled"),
                 action=progress.action()=>match action {
+                    Some(crate::terminal::live::Action::CyclePermission) => {
+                        match session.cycle_permission_mode().await {
+                            Ok(mode) => progress.set_permission_mode(mode),
+                            Err(error) => progress.notice(&format!("Permission mode: {error:#}")),
+                        }
+                    },
                     Some(crate::terminal::live::Action::Cancel)|None=>bail!("Interrupted"),
                     Some(crate::terminal::live::Action::Detach)=>progress.notice("Answer the pending question before detaching."),
                     Some(crate::terminal::live::Action::Submit(prompt))=>if let Some(reader)=input.as_mut(){reader.queue_prompt(prompt);},
@@ -750,6 +807,31 @@ fn event_json(event: &EngineEvent) -> Option<Value> {
 #[cfg(test)]
 mod event_tests {
     use super::*;
+    #[tokio::test]
+    async fn persisted_permission_mode_restores_unless_explicit_cli_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let selection = || Selection {
+            providers: vec![serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap()],
+            provider_id:"fixture".into(), model:"fixture".into(),
+        };
+        let cli = Cli::try_parse_with_mode_source(["claude-code"]).unwrap();
+        let first = Session::open(&cli, &paths, selection(), None).await.unwrap();
+        first.set_permission_mode("plan").await.unwrap();
+        let saved = first.id.clone();
+        first.close().await.unwrap();
+        let resumed = Session::open(&cli, &paths, selection(), Some(&saved)).await.unwrap();
+        assert_eq!(resumed.permission_mode(), "plan");
+        resumed.close().await.unwrap();
+        let explicit = Cli::try_parse_with_mode_source(["claude-code", "--permission-mode", "ask"]).unwrap();
+        let overridden = Session::open(&explicit, &paths, selection(), Some(&saved)).await.unwrap();
+        assert_eq!(overridden.permission_mode(), "ask");
+        overridden.set_permission_mode("bypass").await.unwrap();
+        overridden.close().await.unwrap();
+        let safe_resume = Session::open(&cli, &paths, selection(), Some(&saved)).await.unwrap();
+        assert_eq!(safe_resume.permission_mode(), "ask");
+        safe_resume.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn plan_command_displays_saved_document_without_leaving_plan_mode() {

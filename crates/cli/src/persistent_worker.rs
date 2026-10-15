@@ -4,7 +4,6 @@ use crate::{
     session::Session,
 };
 use anyhow::{ensure, Context, Result};
-use clap::Parser;
 use claude_core::{
     runtime::RuntimePaths,
     services::{
@@ -20,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+type ModeTarget = Arc<std::sync::Mutex<Option<(String, Arc<claude_core::permissions::PermissionManager>, Arc<claude_core::db::DbManager>)>>>;
 
 pub async fn run_from_env() -> Result<bool> {
     let Some(value) = std::env::var_os(service::HOST_ENV) else {
@@ -34,6 +34,7 @@ pub async fn run_from_env() -> Result<bool> {
     );
     let mut listener = service::Listener::bind(&worker)?;
     let session = Arc::new(tokio::sync::Mutex::new(None::<Session>));
+    let mode_target: ModeTarget = Arc::new(std::sync::Mutex::new(None));
     let active = Arc::new(AtomicBool::new(false));
     let fatal = Arc::new(AtomicBool::new(false));
     let mut idle = Instant::now();
@@ -68,6 +69,16 @@ pub async fn run_from_env() -> Result<bool> {
                 }
                 match request {
                     Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
+                    Request::SetPermissionMode { job_id, mode } => {
+                        let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
+                        let reply = match result { Ok(()) => Reply::ok(Some(job_id)), Err(error) => Reply::error(error) };
+                        let _ = service::reply(stream, &reply).await;
+                    },
+                    Request::GetPermissionMode { job_id } => {
+                        let result = current_live_mode(&worker, &mode_target, &job_id);
+                        let reply = match result { Ok(mode) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_mode=Some(mode); reply }, Err(error)=>Reply::error(error) };
+                        let _ = service::reply(stream, &reply).await;
+                    },
                     Request::Shutdown=>{
                         if active.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker has an active turn; cancel or detach it explicitly")).await;}
                         else if claude_core::tools::background_shell::has_active() {let _=service::reply(stream,&Reply::error("Session worker owns running background shell tasks; stop them explicitly before shutdown")).await;}
@@ -81,10 +92,11 @@ pub async fn run_from_env() -> Result<bool> {
                         if let Err(error)=service::begin_job(&worker,&id,&prompt) {
                             active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
                         }
-                        let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();
+                        let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();
                         tokio::spawn(async move {
-                            let task_worker=worker.clone();let task_id=turn_id.clone();
-                            let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions).await}).await;
+                            let task_worker=worker.clone();let task_id=turn_id.clone();let task_mode_target=mode_target.clone();
+                            let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target).await}).await;
+                            *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = None;
                             let error=match result {Ok(result)=>result.err().map(|error|format!("{error:#}")),Err(error)=>{fatal.store(true,Ordering::Release);Some(format!("Session turn panicked: {error}"))}};
                             if let Some(error)=&error {let _=service::emit_event(&serde_json::json!({"type":"error","error":error}));}
                             if service::finish_job(&worker,&turn_id,error).await.is_err() {fatal.store(true,Ordering::Release);}
@@ -112,6 +124,7 @@ async fn execute(
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     sessions: Arc<tokio::sync::Mutex<Option<Session>>>,
+    mode_target: ModeTarget,
 ) -> Result<()> {
     let dir = worker.root.join("background-tasks").join(id);
     service::set_event_sink(Some(dir.join("output.jsonl")));
@@ -136,7 +149,7 @@ async fn execute(
         );
         std::env::set_var(name, value);
     }
-    let mut cli = Cli::try_parse_from(std::iter::once("claude-code".to_owned()).chain(arguments))?;
+    let mut cli = Cli::try_parse_with_mode_source(std::iter::once("claude-code".to_owned()).chain(arguments))?;
     cli.normalize();
     ensure!(
         cli.resume.as_deref() == Some(worker.session_id.as_str()) && cli.command.is_none(),
@@ -179,11 +192,37 @@ async fn execute(
         *current = Some(Session::open(&cli, &paths, selection, Some(&worker.session_id)).await?);
     }
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
-    current
+    let session = current.as_ref().unwrap();
+    *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = Some((id.into(), session.permissions.clone(), session.store.db.clone()));
+    let result = current
         .as_ref()
         .unwrap()
         .turn(&cli, &prompt, &mut None)
-        .await
+        .await;
+    let _mode_guard = mode_target.lock().unwrap_or_else(|e|e.into_inner());
+    claude_core::services::session_permission_mode::set(&session.store.db, &session.id, &session.permissions, session.permissions.get_mode())?;
+    result
+}
+
+fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &str) -> Result<()> {
+    ensure!(matches!(mode, "ask" | "accept-edits" | "plan"), "Live switching cannot enable bypass permissions");
+    let target = target.lock().unwrap_or_else(|e|e.into_inner());
+    let (active_job, manager, db) = target.as_ref().context("Session worker has no active initialized turn")?;
+    ensure!(active_job == job_id, "Permission change targets a different job");
+    let job = jobs::get(&worker.root, job_id)?;
+    ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Permission change targets an inactive session job");
+    claude_core::services::session_permission_mode::set(db, &worker.session_id, manager, claude_core::services::session_permission_mode::parse(mode)?)?;
+    let _ = service::emit_event(&serde_json::json!({"type":"permission_mode","mode":mode}));
+    Ok(())
+}
+
+fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<String> {
+    let target = target.lock().unwrap_or_else(|e|e.into_inner());
+    let (active_job, manager, _) = target.as_ref().context("Session worker has no active initialized turn")?;
+    ensure!(active_job == job_id, "Mode query targets a different job");
+    let job = jobs::get(&worker.root, job_id)?;
+    ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Mode query targets an inactive session job");
+    Ok(claude_core::services::session_permission_mode::name(manager.get_mode()).into())
 }
 
 fn should_expire(turn: bool, shell: bool, fatal: bool, idle: Duration) -> bool {

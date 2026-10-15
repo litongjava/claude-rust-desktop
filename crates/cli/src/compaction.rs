@@ -12,6 +12,8 @@ pub async fn run(cli: &Cli, paths: &RuntimePaths, id: &str, instructions: &str) 
     let db = paths.open_database()?;
     let store = SessionStore::new(db.clone());
     let session = store.resume(id)?;
+    let workspace = store.workspace(id, &paths.data_dir.join("workspaces"))?;
+    let context = crate::services::context(paths)?;
     let selected = config::select(
         cli,
         paths,
@@ -29,7 +31,42 @@ pub async fn run(cli: &Cli, paths: &RuntimePaths, id: &str, instructions: &str) 
         Arc::new(FileCache::new()),
     );
     tokio::select! {
-        result = claude_core::services::compaction::compact(&engine, &db, id, &selected.provider_id, &selected.model, instructions) => crate::services::print(&result?),
-        _ = tokio::signal::ctrl_c() => anyhow::bail!("Compaction cancelled; original history retained"),
+        result = claude_core::services::compaction::compact_with_hooks(&engine, &context, &workspace, id, &selected.provider_id, &selected.model, instructions, "manual") => crate::services::print(&result?),
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("Compaction interrupted; check /history for a completed summary. Original transcript retained"),
+    }
+}
+
+/// Persist notices for detached workers so an attaching frontend can replay them.
+pub(crate) fn notice(message: &str) {
+    let event = serde_json::json!({"type":"notice", "message":message});
+    if !matches!(
+        claude_core::services::session_worker::emit_event(&event),
+        Ok(true)
+    ) {
+        eprintln!("{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compaction_notices_are_retained_in_the_worker_event_log() {
+        use claude_core::services::session_worker::set_event_sink;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(&path, "").unwrap();
+        set_event_sink(Some(path.clone()));
+        super::notice("Auto-compacting conversation");
+        super::notice("Hook: expected failure");
+        set_event_sink(None);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "notice");
+        assert_eq!(events[0]["message"], "Auto-compacting conversation");
+        assert_eq!(events[1]["message"], "Hook: expected failure");
     }
 }

@@ -182,6 +182,7 @@ async fn present(
 fn restore(input: &mut Option<TerminalInput>, action: Action) {
     if let Some(input) = input {
         match action {
+            Action::CyclePermission => input.queue_permission_cycle(),
             Action::Draft(draft) => input.restore_draft(draft),
             Action::Submit(prompt) => input.queue_prompt(prompt),
             Action::SideQuestion(question) => input.queue_prompt(format!("/btw {question}")),
@@ -199,6 +200,8 @@ async fn observe(
     sync_plan_mode: bool,
 ) -> Result<bool> {
     let root = &session.paths.data_dir;
+    let initial_job = jobs::get(root, id)?;
+    let sync_mode = may_sync_permission_mode(&session.id, &initial_job.session_id, &initial_job.status, sync_plan_mode);
     let mut cursor = 0;
     let mut streamed = false;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -211,14 +214,23 @@ async fn observe(
     let mut cancelled = false;
     let mut notified = std::time::Instant::now();
     let mut notification_error = None;
+    let mut final_mode_synced = false;
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 let (job, next, events) = jobs::events_since(root, id, owner, cursor)?;
                 let drained = cursor == next;
                 cursor = next;
+                let finished_mode = job.finished_ms.is_some() && matches!(job.status.as_str(), "completed" | "failed" | "cancelled");
+                let refresh_mode = sync_mode && job.session_id == session.id
+                    && (events.iter().any(permission_event) || (finished_mode && !final_mode_synced));
+                if refresh_mode {
+                    match refresh_permission_mode(session, &job).await {
+                        Ok(mode) => { display.set_permission_mode(mode); final_mode_synced = finished_mode; },
+                        Err(error) => display.notice(&format!("Could not refresh permission mode; keeping last confirmed mode: {error:#}")),
+                    }
+                }
                 for event in events {
-                    sync_plan_event(&session.permissions, &event, sync_plan_mode && job.session_id == session.id);
                     if event["type"] == "text" { streamed = true; }
                     if event["type"] == "result" {
                         if let Some(text)=result_text(&event,streamed) {display.before_text(text);}
@@ -269,6 +281,20 @@ async fn observe(
             },
             action = display.action() => {
                 match action {
+                    Some(Action::CyclePermission) => {
+                        let change = async {
+                            let job = jobs::get(root, id)?;
+                            ensure!(job.session_id == session.id, "Permission cycling applies to your current session; attach that session directly to change its mode");
+                            let mode = session.next_permission_mode();
+                            claude_core::services::session_worker::set_permission_mode(root, &session.id, id, mode).await?;
+                            session.permissions.set_mode(claude_core::services::session_permission_mode::parse(mode)?);
+                            Ok::<_, anyhow::Error>(mode)
+                        }.await;
+                        match change {
+                            Ok(mode) => display.set_permission_mode(mode),
+                            Err(error) => display.notice(&format!("Permission mode unchanged: {error:#}")),
+                        }
+                    },
                     Some(Action::Detach) => {
                         jobs::detach(root, id, owner)?;
                         display.notice(&format!("Task {id} continues in the background without restarting its request. Use /tasks attach {id} to return."));
@@ -298,29 +324,67 @@ async fn observe(
     }
 }
 
-fn sync_plan_event(manager: &claude_core::permissions::PermissionManager, event: &Value, current_foreground_turn: bool) {
-    // Attach replays a durable log, possibly from before a later /permissions
-    // command. Historical display must never restore obsolete authorization.
-    if current_foreground_turn {
-        if let Some(mode) = plan_event_mode(event) { manager.set_mode(mode); }
-    }
+fn may_sync_permission_mode(
+    current: &str,
+    job_session: &str,
+    initial_status: &str,
+    foreground: bool,
+) -> bool {
+    current == job_session
+        && (foreground || matches!(initial_status, "starting" | "running" | "unresponsive"))
 }
 
 #[test]
-fn plan_history_replay_never_changes_current_permissions() {
-    use claude_core::permissions::PermissionMode;
-    use serde_json::json;
-    let manager = claude_core::runtime::default_permissions();
-    for initial in [PermissionMode::BypassPermissions, PermissionMode::PlanMode, PermissionMode::AskPermissions] {
-        manager.set_mode(initial);
-        for (name, output) in [("EnterPlanMode", r#"{"mode":"plan"}"#), ("ExitPlanMode", r#"{"approved":true,"mode":"ask"}"#)] {
-            let event = json!({"type":"tool_result","name":name,"output":output,"is_error":false});
-            sync_plan_event(&manager, &event, false);
-            assert_eq!(manager.get_mode(), initial);
-        }
-    }
-    sync_plan_event(&manager, &json!({"type":"tool_result","name":"EnterPlanMode","output":r#"{"mode":"plan"}"#,"is_error":false}), true);
-    assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+fn historical_attachment_does_not_refresh_permissions_but_live_attachment_can() {
+    assert!(!may_sync_permission_mode(
+        "session",
+        "session",
+        "completed",
+        false
+    ));
+    assert!(!may_sync_permission_mode(
+        "session", "session", "failed", false
+    ));
+    assert!(!may_sync_permission_mode(
+        "session", "child", "running", false
+    ));
+    assert!(may_sync_permission_mode(
+        "session", "session", "running", false
+    ));
+    assert!(may_sync_permission_mode(
+        "session",
+        "session",
+        "completed",
+        true
+    ));
+    let event = serde_json::json!({"type":"tool_result","name":"EnterPlanMode","output":r#"{"mode":"plan"}"#,"is_error":false});
+    assert!(permission_event(&event)); // Trigger a fresh worker query, never apply this old payload.
+}
+
+fn permission_event(event: &Value) -> bool {
+    event["type"] == "permission_mode" || plan_event_mode(event).is_some()
+}
+
+async fn refresh_permission_mode(session: &Session, job: &jobs::Job) -> Result<&'static str> {
+    use claude_core::services::{session_permission_mode, session_worker};
+    ensure!(
+        job.session_id == session.id,
+        "Permission mode belongs to another session"
+    );
+    // Historical ToolResult data is only a refresh trigger. It must never
+    // overwrite a later mode acknowledged by the live worker.
+    let mode = if job.finished_ms.is_some()
+        && matches!(job.status.as_str(), "completed" | "failed" | "cancelled")
+    {
+        session_permission_mode::load(&session.store.db, &session.id)?
+            .ok_or_else(|| anyhow::anyhow!("Final permission mode unavailable"))?
+    } else {
+        let mode =
+            session_worker::permission_mode(&session.paths.data_dir, &session.id, &job.id).await?;
+        session_permission_mode::parse(&mode)?
+    };
+    session.permissions.set_mode(mode);
+    Ok(session.permission_mode())
 }
 
 fn plan_event_mode(event: &Value) -> Option<claude_core::permissions::PermissionMode> {
@@ -367,6 +431,7 @@ fn plan_worker_events_only_apply_successful_transitions() {
 fn render(display: &mut TurnDisplay, event: &Value) {
     let text = |name: &str| event[name].as_str().unwrap_or("");
     match text("type") {
+        "notice" => display.notice(text("message")),
         "text" => display.before_text(text("delta")),
         "thinking" => {
             display.record_thinking(text("delta"));

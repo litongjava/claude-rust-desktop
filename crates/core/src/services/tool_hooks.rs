@@ -26,6 +26,8 @@ pub enum HookEvent {
     WorktreeRemove,
     SessionStart,
     SessionEnd,
+    PreCompact,
+    PostCompact,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -38,6 +40,8 @@ impl HookEvent {
             Self::WorktreeRemove => "WorktreeRemove",
             Self::SessionStart => "SessionStart",
             Self::SessionEnd => "SessionEnd",
+            Self::PreCompact => "PreCompact",
+            Self::PostCompact => "PostCompact",
         }
     }
 }
@@ -146,6 +150,8 @@ impl HookRunner {
                     "WorktreeRemove" => HookEvent::WorktreeRemove,
                     "SessionStart" => HookEvent::SessionStart,
                     "SessionEnd" => HookEvent::SessionEnd,
+                    "PreCompact" => HookEvent::PreCompact,
+                    "PostCompact" => HookEvent::PostCompact,
                     _ => continue,
                 };
                 for group in groups {
@@ -234,10 +240,14 @@ impl HookRunner {
         input.insert("session_id".into(), json!(session_id));
         input.insert("cwd".into(), json!(self.workspace));
         input.insert("hook_event_name".into(), json!(event.name()));
-        let lifecycle = matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd);
+        let lifecycle = matches!(
+            event,
+            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact
+        );
         let match_key = match event {
             HookEvent::SessionStart => "source",
             HookEvent::SessionEnd => "reason",
+            HookEvent::PreCompact | HookEvent::PostCompact => "trigger",
             _ => "tool_name",
         };
         let name = input
@@ -312,6 +322,15 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
     }
     let output = stdout.trim();
     if output.is_empty() {
+        return Ok(result);
+    }
+    // Compact hooks consume successful stdout as text, never as permission decisions.
+    if event == HookEvent::PreCompact {
+        result.additional_context.push(output.into());
+        return Ok(result);
+    }
+    if event == HookEvent::PostCompact {
+        result.warnings.push(output.into());
         return Ok(result);
     }
     if !output.starts_with('{') {

@@ -66,7 +66,7 @@ pub fn effective_effort(session: &Session, fallback: Option<&str>) -> Result<Opt
 /// Copy only behavioral settings, retaining independent state after branching.
 pub fn copy_settings(db: &DbManager, from: &str, to: &str) -> Result<()> {
     save(db, to, &load(db, from)?)?;
-    for prefix in ["cli.display", "cli.permissions", "cli.ide"] {
+    for prefix in ["cli.display", "cli.permissions", "cli.permission-mode", "cli.ide"] {
         db.with_conn(|conn| conn.execute(
             "INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [format!("{prefix}.{to}"), format!("{prefix}.{from}")],
@@ -341,10 +341,16 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Res
     if active.len() < 2 || estimated < window as usize * percent as usize / 100 {
         return Ok(());
     }
-    eprintln!("Auto-compacting conversation (estimated {estimated} tokens, threshold {percent}%)…");
+    crate::compaction::notice(&format!(
+        "Auto-compacting conversation (estimated {estimated} tokens, threshold {percent}%)…"
+    ));
+    let context = crate::services::context(&session.paths)?;
     tokio::select! {
-        result = claude_core::services::compaction::compact(&session.engine, &session.store.db, &session.id, &session.provider_id, &session.model, "") => { result?; },
-        _ = tokio::signal::ctrl_c() => anyhow::bail!("Autocompact cancelled; original history retained"),
+        result = claude_core::services::compaction::compact_with_hooks(&session.engine, &context, &session.workspace, &session.id, &session.provider_id, &session.model, "", "auto") => {
+            for warning in result?.warnings { crate::compaction::notice(&format!("Hook: {warning}")); }
+        },
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("Autocompact interrupted; check /history for a completed summary. Original transcript retained"),
+        _ = claude_core::services::background_sessions::wait_for_cancellation() => anyhow::bail!("Autocompact task cancelled; check /history for a completed summary. Original transcript retained"),
     }
     Ok(())
 }

@@ -40,6 +40,7 @@ pub enum Resolution {
 pub fn supported_actions() -> &'static [&'static str] {
     &[
         "chat:submit",
+        "chat:cycleMode",
         "chat:newline",
         "chat:cancel",
         "app:interrupt",
@@ -64,11 +65,20 @@ fn event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
 
+pub fn is_cycle_permission(key: KeyEvent) -> bool {
+    (key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 fn action(name: &str) -> Result<KeyEvent> {
     use KeyCode::*;
     let none = KeyModifiers::NONE;
     let ctrl = KeyModifiers::CONTROL;
     Ok(match name {
+        "chat:cycleMode" => event(Tab, KeyModifiers::SHIFT),
         "chat:submit" => event(Enter, none),
         "chat:newline" => event(Enter, KeyModifiers::ALT),
         "chat:cancel" | "app:interrupt" => event(Char('c'), ctrl),
@@ -283,7 +293,7 @@ pub fn ensure_file(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let template = json!({"$schema":"https://www.schemastore.org/claude-code-keybindings.json","bindings":[{"context":"Global","bindings":{"ctrl+o":"app:toggleTranscript","ctrl+r":"history:search"}},{"context":"Chat","bindings":{"enter":"chat:submit","alt+enter":"chat:newline","up":"history:previous","down":"history:next"}}]});
+    let template = json!({"$schema":"https://www.schemastore.org/claude-code-keybindings.json","bindings":[{"context":"Global","bindings":{"ctrl+o":"app:toggleTranscript","ctrl+r":"history:search"}},{"context":"Chat","bindings":{"enter":"chat:submit","shift+tab":"chat:cycleMode","alt+enter":"chat:newline","up":"history:previous","down":"history:next"}}]});
     writeln!(file, "{}", serde_json::to_string_pretty(&template)?)?;
     Ok(())
 }
@@ -291,6 +301,19 @@ pub fn ensure_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permission_cycle_normalizes_backtab_and_supports_remap_and_disable() {
+        assert!(is_cycle_permission(event(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert!(is_cycle_permission(event(KeyCode::Tab, KeyModifiers::SHIFT)));
+        assert!(!is_cycle_permission(event(KeyCode::Tab, KeyModifiers::NONE)));
+        let bindings = Keybindings::parse(r#"{"bindings":[{"context":"Chat","bindings":{"shift+tab":null,"f2":"chat:cycleMode"}}]}"#).unwrap();
+        for key in [event(KeyCode::BackTab, KeyModifiers::NONE), event(KeyCode::Tab, KeyModifiers::SHIFT)] {
+            assert_eq!(bindings.resolve(key, &mut Pending::default()), Resolution::Consumed);
+        }
+        let Resolution::Key(key) = bindings.resolve(event(KeyCode::F(2), KeyModifiers::NONE), &mut Pending::default()) else { panic!("cycle shortcut not mapped") };
+        assert!(is_cycle_permission(key));
+    }
+
     #[test]
     fn context_override_null_and_chords_work() {
         let bindings=Keybindings::parse(r#"{"bindings":[{"context":"Global","bindings":{"ctrl+j":"chat:newline","ctrl+o":null}},{"context":"Chat","bindings":{"ctrl+j":"chat:submit","ctrl+x ctrl+k":"input:lineEnd"}}]}"#).unwrap();

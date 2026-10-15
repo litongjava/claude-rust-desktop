@@ -18,6 +18,8 @@ pub struct PromptEditor {
     notices: Option<std::sync::mpsc::Receiver<String>>,
     history: Vec<String>,
     pending_draft: String,
+    pending_cursor: Option<usize>,
+    permission_mode: String,
     commands: Vec<(String, String)>,
     details: DetailsPanel,
     keybindings: crate::keybindings::Keybindings,
@@ -28,6 +30,8 @@ impl Default for PromptEditor {
             notices: None,
             history: Vec::new(),
             pending_draft: String::new(),
+            pending_cursor: None,
+            permission_mode: "ask".into(),
             details: DetailsPanel::default(),
             keybindings: crate::keybindings::Keybindings::default(),
             commands: crate::command_catalog::COMMANDS
@@ -205,6 +209,19 @@ impl DetailsPanel {
         self.wrapped.clear();
     }
 
+    /// Append streamed detail without cloning unrelated tool output. Wrapping
+    /// remains lazy and happens at most once when the next expanded frame draws.
+    pub(crate) fn append_body(&mut self, index: usize, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some((_, body)) = self.entries.get_mut(index) {
+            body.push_str(text);
+            self.cached_width = 0;
+            self.wrapped.clear();
+        }
+    }
+
     pub(crate) fn toggle(&mut self) {
         if !self.entries.is_empty() {
             self.expanded = !self.expanded;
@@ -358,6 +375,16 @@ impl Screen {
         self.invalidated = false;
         Ok(())
     }
+    fn suspend(&mut self) -> io::Result<()> {
+        let mut out = io::stderr();
+        queue!(out, MoveToColumn(0))?;
+        if self.cursor_row > 0 {
+            queue!(out, MoveUp(self.cursor_row as u16))?;
+        }
+        queue!(out, Clear(ClearType::FromCursorDown), ResetColor)?;
+        out.flush()
+    }
+
     fn finish(&mut self, text: &str, prompt: &str) -> io::Result<()> {
         // Clear menu and borders, retaining just submitted input in scrollback.
         let mut out = io::stderr();
@@ -408,6 +435,24 @@ fn read_editor_event() -> io::Result<Event> {
 }
 
 impl PromptEditor {
+    pub fn set_permission_mode(&mut self, mode: String) {
+        self.permission_mode = mode;
+    }
+
+    fn preserve_cycle_draft(&mut self, buffer: &Buffer) {
+        self.pending_draft = buffer.chars.iter().collect();
+        self.pending_cursor = Some(buffer.cursor);
+    }
+
+    fn resume_buffer(&mut self) -> Buffer {
+        let mut buffer = Buffer::default();
+        buffer.set(&std::mem::take(&mut self.pending_draft));
+        if let Some(cursor) = self.pending_cursor.take() {
+            buffer.cursor = cursor.min(buffer.chars.len());
+        }
+        buffer
+    }
+
     pub fn set_notices(&mut self, notices: std::sync::mpsc::Receiver<String>) {
         self.notices = Some(notices);
     }
@@ -416,6 +461,7 @@ impl PromptEditor {
     }
     pub fn set_draft(&mut self, draft: String) {
         self.pending_draft = draft;
+        self.pending_cursor = None;
     }
     pub fn set_commands(&mut self, commands: Vec<(String, String)>) {
         self.commands = commands;
@@ -431,15 +477,14 @@ impl PromptEditor {
             ..Default::default()
         };
     }
-    pub fn readline(&mut self, prompt: &str) -> io::Result<Option<String>> {
+    pub fn readline(&mut self, prompt: &str) -> io::Result<Option<super::PromptEvent>> {
         terminal::enable_raw_mode()?;
         let _raw = RawMode;
         execute!(io::stderr(), EnableBracketedPaste)?;
         if !self.details.entries.is_empty() {
             execute!(io::stderr(), EnableMouseCapture)?;
         }
-        let mut buffer = Buffer::default();
-        buffer.set(&std::mem::take(&mut self.pending_draft));
+        let mut buffer = self.resume_buffer();
         let mut keybinding_pending = crate::keybindings::Pending::default();
         let mut screen = Screen::default();
         let mut selected = 0usize;
@@ -579,7 +624,10 @@ impl PromptEditor {
                     items.len()
                 )
             } else {
-                "Enter send · Alt+Enter newline · Ctrl+R history".into()
+                format!(
+                    "{} mode (Shift+Tab to cycle) - Enter send - Alt+Enter newline",
+                    self.permission_mode
+                )
             };
             lines.push((clipped(&footer, width), TextStyle::Muted));
             if !self.details.entries.is_empty() {
@@ -648,6 +696,11 @@ impl PromptEditor {
                         crate::keybindings::Resolution::Key(key) => key,
                         crate::keybindings::Resolution::Consumed => continue,
                     };
+                    if crate::keybindings::is_cycle_permission(key) {
+                        self.preserve_cycle_draft(&buffer);
+                        screen.suspend()?;
+                        return Ok(Some(super::PromptEvent::CyclePermission));
+                    }
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
                     if control && key.code == KeyCode::Char('l') {
                         screen.invalidated = true;
@@ -736,7 +789,7 @@ impl PromptEditor {
                             if !text.trim().is_empty() && self.history.last() != Some(&text) {
                                 self.history.push(text.clone());
                             }
-                            return Ok(Some(text));
+                            return Ok(Some(super::PromptEvent::Line(text)));
                         }
                         KeyCode::Esc => menu_hidden = true,
                         KeyCode::Up if !items.is_empty() => {
@@ -809,6 +862,51 @@ impl PromptEditor {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn permission_cycle_preserves_multiline_unicode_draft_cursor_and_history() {
+        let mut editor = PromptEditor::default();
+        editor.history.push("previous".into());
+        let mut buffer = Buffer::default();
+        buffer.set("hello \u{4e2d}\u{6587}\nworld");
+        buffer.cursor = 3;
+        editor.preserve_cycle_draft(&buffer);
+        editor.set_permission_mode("plan".into());
+        let restored = editor.resume_buffer();
+        assert_eq!(restored.chars, buffer.chars);
+        assert_eq!(restored.cursor, 3);
+        assert_eq!(editor.history, vec!["previous"]);
+        assert!(editor.pending_draft.is_empty());
+    }
+
+    #[test]
+    fn streaming_detail_appends_preserve_other_allocations_and_defer_wrapping() {
+        let mut panel = super::DetailsPanel::default();
+        panel.update_entries(vec![
+            ("Read".into(), "tool output".repeat(4096)),
+            ("Thinking".into(), String::new()),
+        ]);
+        let tool_pointer = panel.entries[0].1.as_ptr();
+        let mut expected = String::new();
+        for _ in 0..3000 {
+            panel.append_body(1, "中文🦀\n");
+            expected.push_str("中文🦀\n");
+            assert_eq!(panel.entries[0].1.as_ptr(), tool_pointer);
+            assert!(panel.wrapped.is_empty());
+        }
+        assert_eq!(panel.entries[1].1, expected);
+        panel.toggle();
+        panel.render(80, 12);
+        assert_eq!(panel.cached_width, 80);
+        let cached_lines = panel.wrapped.len();
+        panel.append_body(1, "");
+        assert_eq!(panel.cached_width, 80);
+        assert_eq!(panel.wrapped.len(), cached_lines);
+        panel.append_body(1, "latest");
+        panel.render(80, 12);
+        assert!(panel.wrapped.iter().any(|line| line == "latest"));
+        assert_eq!(panel.entries[0].1.as_ptr(), tool_pointer);
+    }
+
     use super::*;
     fn frame_lines() -> Vec<DisplayLine> {
         vec![

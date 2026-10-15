@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::json;
 use std::{path::Path, time::Duration};
 
-fn key(session: &str) -> String {
+pub(crate) fn key(session: &str) -> String {
     format!("session-start-context:{session}")
 }
 
@@ -40,6 +40,19 @@ pub async fn start(
     );
     // Clear previous activation's context before running commands, including failures.
     context.save_setting(&key(session), &"")?;
+    let (text, warnings) = collect(context, workspace, session, source, model).await?;
+    context.save_setting(&key(session), &text)?;
+    Ok(warnings)
+}
+
+/// Collect context without changing persistence; compaction commits it with its boundary.
+pub(crate) async fn collect(
+    context: &ServiceContext,
+    workspace: &Path,
+    session: &str,
+    source: &str,
+    model: &str,
+) -> Result<(String, Vec<String>)> {
     let outcome = HookRunner::load_with_plugins(context, workspace)?
         .run(
             HookEvent::SessionStart,
@@ -47,9 +60,7 @@ pub async fn start(
             json!({"source":source,"model":model}),
         )
         .await?;
-    let text = outcome.additional_context.join("\n");
-    context.save_setting(&key(session), &text)?;
-    Ok(outcome.warnings)
+    Ok((outcome.additional_context.join("\n"), outcome.warnings))
 }
 
 pub fn end_timeout() -> Duration {

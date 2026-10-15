@@ -36,6 +36,8 @@ pub struct Worker {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    SetPermissionMode { job_id: String, mode: String },
+    GetPermissionMode { job_id: String },
     Submit {
         id: String,
         prompt: String,
@@ -49,6 +51,8 @@ pub struct Reply {
     pub ok: bool,
     pub job_id: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 impl Reply {
     pub fn ok(id: Option<String>) -> Self {
@@ -56,6 +60,7 @@ impl Reply {
             ok: true,
             job_id: id,
             error: None,
+            permission_mode: None,
         }
     }
     pub fn error(error: impl ToString) -> Self {
@@ -63,6 +68,7 @@ impl Reply {
             ok: false,
             job_id: None,
             error: Some(error.to_string()),
+            permission_mode: None,
         }
     }
 }
@@ -473,6 +479,22 @@ pub async fn shutdown(root: &Path, session: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub async fn set_permission_mode(root: &Path, session: &str, job_id: &str, mode: &str) -> Result<()> {
+    ensure!(matches!(mode, "ask" | "accept-edits" | "plan"), "Live mode switching supports ask, accept-edits and plan; bypass requires explicit configuration");
+    let worker = current(root, session)?.context("Session has no persistent worker")?;
+    let job = jobs::get(root, job_id)?;
+    ensure!(job.session_id == session && job.finished_ms.is_none(), "Mode change must target the active job in this session");
+    call(&worker, &Request::SetPermissionMode { job_id: job_id.into(), mode: mode.into() }).await?;
+    Ok(())
+}
+
+pub async fn permission_mode(root: &Path, session: &str, job_id: &str) -> Result<String> {
+    let worker = current(root, session)?.context("Session has no persistent worker")?;
+    let job = jobs::get(root, job_id)?;
+    ensure!(job.session_id == session, "Mode query targets another session");
+    call(&worker, &Request::GetPermissionMode { job_id: job_id.into() }).await?.permission_mode.context("Worker did not return its permission mode")
 }
 
 pub fn run_supervisor_from_env() -> Result<bool> {

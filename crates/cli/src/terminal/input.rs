@@ -8,7 +8,14 @@ use tokio::sync::{mpsc, oneshot};
 #[path = "editor.rs"]
 pub(crate) mod editor;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptEvent {
+    Line(String),
+    CyclePermission,
+}
+
 enum Message {
+    PermissionMode(String),
     Commands(Vec<(String, String)>),
     Details(Vec<(String, String)>),
     Panel(Vec<(String, String)>, bool),
@@ -20,15 +27,15 @@ enum Message {
 struct Request {
     prompt: String,
     repl: bool,
-    response: oneshot::Sender<io::Result<Option<String>>>,
+    response: oneshot::Sender<io::Result<Option<PromptEvent>>>,
 }
 
 pub struct TerminalInput {
     notices: std::sync::mpsc::Sender<String>,
     requests: std::sync::mpsc::Sender<Message>,
-    pending: Option<oneshot::Receiver<io::Result<Option<String>>>>,
+    pending: Option<oneshot::Receiver<io::Result<Option<PromptEvent>>>>,
     fixture: Option<mpsc::UnboundedReceiver<String>>,
-    queued: std::collections::VecDeque<String>,
+    queued: std::collections::VecDeque<PromptEvent>,
 }
 
 impl TerminalInput {
@@ -36,7 +43,8 @@ impl TerminalInput {
         let (requests, rx) = std::sync::mpsc::channel::<Message>();
         let (notices, notice_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let terminal = !crate::terminal::screen_reader() && io::stdin().is_terminal()
+            let terminal = !crate::terminal::screen_reader()
+                && io::stdin().is_terminal()
                 && io::stdout().is_terminal()
                 && io::stderr().is_terminal()
                 && std::env::var("TERM").as_deref() != Ok("dumb");
@@ -45,6 +53,10 @@ impl TerminalInput {
             let mut plain = io::BufReader::new(io::stdin());
             for message in rx {
                 let request = match message {
+                    Message::PermissionMode(mode) => {
+                        editor.set_permission_mode(mode);
+                        continue;
+                    }
                     Message::Commands(commands) => {
                         editor.set_commands(commands);
                         continue;
@@ -76,12 +88,14 @@ impl TerminalInput {
                     } else {
                         // Answers have no access to prompt history or completion.
                         match Editor::<(), DefaultHistory>::new() {
-                            Ok(mut answer) => map_readline(answer.readline(&request.prompt)),
+                            Ok(mut answer) => map_readline(answer.readline(&request.prompt))
+                                .map(|value| value.map(PromptEvent::Line)),
                             Err(error) => Err(io::Error::other(error.to_string())),
                         }
                     }
                 } else {
                     read_plain(&mut plain, &request.prompt)
+                        .map(|value| value.map(PromptEvent::Line))
                 };
                 let _ = request.response.send(result);
             }
@@ -121,13 +135,21 @@ impl TerminalInput {
         let _ = self.requests.send(Message::Details(details));
     }
 
+    pub fn queue_permission_cycle(&mut self) {
+        self.queued.push_back(PromptEvent::CyclePermission);
+    }
+
     pub fn queue_prompt(&mut self, prompt: String) {
-        self.queued.push_back(prompt);
+        self.queued.push_back(PromptEvent::Line(prompt));
     }
     pub fn restore_draft(&self, draft: String) {
         let _ = self.requests.send(Message::Draft(draft));
     }
-    pub async fn read_prompt(&mut self, prompt: &str) -> io::Result<Option<String>> {
+    pub fn set_permission_mode(&self, mode: &str) {
+        let _ = self.requests.send(Message::PermissionMode(mode.into()));
+    }
+
+    pub async fn read_prompt(&mut self, prompt: &str) -> io::Result<Option<PromptEvent>> {
         if let Some(queued) = self.queued.pop_front() {
             return Ok(Some(queued));
         }
@@ -135,7 +157,13 @@ impl TerminalInput {
     }
 
     pub async fn read_answer(&mut self, prompt: &str) -> io::Result<Option<String>> {
-        self.read(prompt, false).await
+        match self.read(prompt, false).await? {
+            Some(PromptEvent::Line(line)) => Ok(Some(line)),
+            None => Ok(None),
+            Some(PromptEvent::CyclePermission) => Err(io::Error::other(
+                "Permission cycle is not a question answer",
+            )),
+        }
     }
 
     // Compatibility for voice consumers; errors/interruption terminate input.
@@ -143,9 +171,9 @@ impl TerminalInput {
         self.read_answer("").await.ok().flatten()
     }
 
-    async fn read(&mut self, prompt: &str, repl: bool) -> io::Result<Option<String>> {
+    async fn read(&mut self, prompt: &str, repl: bool) -> io::Result<Option<PromptEvent>> {
         if let Some(fixture) = self.fixture.as_mut() {
-            return Ok(fixture.recv().await);
+            return Ok(fixture.recv().await.map(PromptEvent::Line));
         }
         if self.pending.is_none() {
             let (response, receive) = oneshot::channel();

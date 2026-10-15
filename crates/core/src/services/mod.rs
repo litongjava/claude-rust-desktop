@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod plans;
 pub mod session_workspace;
 pub mod session_trust;
+pub mod session_permission_mode;
 pub mod background_sessions;
 pub mod session_worker;
 pub mod batch;

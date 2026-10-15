@@ -18,6 +18,7 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use unicode_width::UnicodeWidthChar;
 
 pub enum Action {
+    CyclePermission,
     Submit(String),
     SideQuestion(String),
     Cancel,
@@ -25,6 +26,7 @@ pub enum Action {
     Draft(String),
 }
 enum Update {
+    PermissionMode(String),
     Text(String),
     Notice(String),
     Styled(Vec<change_view::Line>),
@@ -104,6 +106,9 @@ impl LiveTurn {
     }
     fn styled(&self, lines: Vec<change_view::Line>) {
         let _ = self.updates.send(Update::Styled(lines));
+    }
+    pub fn permission_mode(&self, mode: &str) {
+        let _ = self.updates.send(Update::PermissionMode(mode.into()));
     }
     pub fn activity(&self, text: &str) {
         let _ = self.updates.send(Update::Activity(text.into()));
@@ -217,7 +222,8 @@ struct State {
     key_pending: crate::keybindings::Pending,
     details: super::input::editor::DetailsPanel,
     detail_entries: Vec<(String, String, String)>,
-    thinking: String,
+    thinking_characters: usize,
+    thinking_entry: Option<usize>,
     history: Vec<String>,
     history_index: usize,
     history_draft: String,
@@ -241,7 +247,8 @@ impl State {
             key_pending: Default::default(),
             details: Default::default(),
             detail_entries: Vec::new(),
-            thinking: String::new(),
+            thinking_characters: 0,
+            thinking_entry: None,
             history: Vec::new(),
             history_index: 0,
             history_draft: String::new(),
@@ -261,6 +268,39 @@ impl State {
                 .collect(),
         );
     }
+    fn append_thinking(&mut self, text: &str) {
+        let characters = text.chars().count();
+        self.generated_characters = self.generated_characters.saturating_add(characters);
+        self.estimate_pending = true;
+        let index = match self.thinking_entry {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .detail_entries
+                    .iter()
+                    .position(|entry| entry.0 == "thinking")
+                    .unwrap_or(self.detail_entries.len());
+                self.detail("thinking".into(), "Thinking".into(), String::new());
+                self.thinking_entry = Some(index);
+                index
+            }
+        };
+        let remaining = 65536usize.saturating_sub(self.thinking_characters);
+        let end = text
+            .char_indices()
+            .nth(remaining)
+            .map_or(text.len(), |(byte, _)| byte);
+        let appended = &text[..end];
+        self.thinking_characters += characters.min(remaining);
+        self.detail_entries[index].2.push_str(appended);
+        self.details.append_body(index, appended);
+    }
+
+    fn cycle_permission(&self, actions: &async_mpsc::UnboundedSender<Action>) {
+        // This is a mode-control event, never a queued prompt or an answer.
+        let _ = actions.send(Action::CyclePermission);
+    }
+
     fn question(&mut self, reply: oneshot::Sender<String>) {
         self.saved_draft = Some(std::mem::take(&mut self.draft));
         self.answer = Some(reply);
@@ -432,10 +472,10 @@ impl Frame {
             width,
         );
         let mode = if state.answer.is_some() {
-            "Answer requested · Enter submits · Ctrl+C interrupts".to_owned()
+            format!("{} mode (Shift+Tab to cycle) - Answer requested - Enter submits", state.mode)
         } else {
             format!(
-                "{} · Enter queues · /btw question /background detach · Esc interrupts",
+                "{} mode (Shift+Tab to cycle) · Enter queues · /btw question /background detach · Esc interrupts",
                 state.mode
             )
         };
@@ -593,6 +633,7 @@ fn run(
         let mut dirty = false;
         loop {
             match updates.try_recv() {
+                Ok(Update::PermissionMode(mode)) => { state.mode = mode; dirty = true; },
                 Ok(Update::Text(text)) => {
                     state.generated_characters = state
                         .generated_characters
@@ -659,16 +700,10 @@ fn run(
                     dirty = true;
                 }
                 Ok(Update::Thinking(text)) => {
-                    state.generated_characters = state
-                        .generated_characters
-                        .saturating_add(text.chars().count());
-                    state.estimate_pending = true;
-                    let remaining = 65536usize.saturating_sub(state.thinking.chars().count());
-                    state.thinking.extend(text.chars().take(remaining));
                     if state.detail_entries.is_empty() {
                         execute!(io::stderr(), EnableMouseCapture)?;
                     }
-                    state.detail("thinking".into(), "Thinking".into(), state.thinking.clone());
+                    state.append_thinking(&text);
                     dirty = true;
                 }
                 Ok(Update::Question(text, reply)) => {
@@ -716,6 +751,10 @@ fn run(
                         crate::keybindings::Resolution::Key(key) => key,
                         crate::keybindings::Resolution::Consumed => continue,
                     };
+                    if crate::keybindings::is_cycle_permission(key) {
+                        state.cycle_permission(&actions);
+                        continue;
+                    }
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
                     if !(control && key.code == KeyCode::Char('r')) {
                         state.search_query = None;
@@ -881,6 +920,103 @@ fn run(
 mod tests {
     use super::*;
     #[test]
+    fn permission_cycle_preserves_pending_answer_and_queued_draft() {
+        let mut state = State::new("ask".into());
+        state.draft.insert("queued draft");
+        let (reply, mut received) = oneshot::channel();
+        state.question(reply);
+        state.draft.insert("unfinished answer");
+        let (actions, mut events) = async_mpsc::unbounded_channel();
+        state.cycle_permission(&actions);
+        assert!(matches!(events.try_recv().unwrap(), Action::CyclePermission));
+        assert!(received.try_recv().is_err());
+        assert!(state.answer.is_some());
+        state.submit(&actions);
+        assert_eq!(received.try_recv().unwrap(), "unfinished answer");
+        assert_eq!(state.draft.take(), "queued draft");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn long_thinking_stream_keeps_exact_unicode_prefix_and_all_usage_characters() {
+        let mut state = State::new("ask".into());
+        state.draft.insert("未提交 draft");
+        state.detail(
+            "tool-first".into(),
+            "Read".into(),
+            "unchanged tool output".into(),
+        );
+        let delta = "中🦀e\u{301}\n0123456789";
+        let mut complete = String::new();
+        for index in 0..6000 {
+            state.append_thinking(delta);
+            complete.push_str(delta);
+            if index == 2000 {
+                state.detail("tool-second".into(), "Bash".into(), "second output".into());
+            }
+        }
+        assert_eq!(state.generated_characters, complete.chars().count());
+        assert_eq!(state.thinking_characters, 65536);
+        assert!(state.estimate_pending);
+        assert_eq!(state.detail_entries.len(), 3);
+        assert_eq!(state.detail_entries[0].2, "unchanged tool output");
+        assert_eq!(state.detail_entries[2].2, "second output");
+        let expected = complete.chars().take(65536).collect::<String>();
+        assert_eq!(
+            state.detail_entries[state.thinking_entry.unwrap()].2,
+            expected
+        );
+        // A later non-thinking update rebuilds the panel from canonical detail
+        // storage, so the prefix must remain exact there too.
+        state.detail(
+            "tool-first".into(),
+            "Read completed".into(),
+            "updated output".into(),
+        );
+        state.details.toggle();
+        let panel = state.details.render(100, 12);
+        assert!(panel
+            .lines
+            .iter()
+            .any(|(line, _)| line.contains("中🦀e\u{301}")));
+        assert_eq!(state.draft.take(), "未提交 draft");
+    }
+
+    #[test]
+    fn streamed_thinking_refreshes_open_details_without_resetting_disclosure() {
+        let mut state = State::new("ask".into());
+        state.append_thinking("first ");
+        state.details.toggle();
+        assert!(state
+            .details
+            .render(60, 8)
+            .lines
+            .iter()
+            .any(|(line, _)| line == "first "));
+        state.append_thinking("second 中文");
+        assert!(state.details.expanded);
+        assert!(state
+            .details
+            .render(60, 8)
+            .lines
+            .iter()
+            .any(|(line, _)| line == "first second 中文"));
+        assert_eq!(
+            state.generated_characters,
+            "first second 中文".chars().count()
+        );
+        state.details.toggle();
+        state.append_thinking(" 🦀");
+        state.details.toggle();
+        assert!(state
+            .details
+            .render(60, 8)
+            .lines
+            .iter()
+            .any(|(line, _)| line == "first second 中文 🦀"));
+    }
+
+    #[test]
     fn wrapped_rows_preserve_unicode_bytes_and_combining_marks() {
         let text = "ab\u{4e2d}e\u{301}xyz";
         let rows = visual_lines(text, 4);
@@ -998,6 +1134,10 @@ impl TurnDisplay {
         self.workspace = Some(workspace.to_owned());
         self.fallback.set_workspace(workspace);
         self
+    }
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        if let Some(live) = &self.live { live.permission_mode(mode); }
+        self.fallback.set_permission_mode(mode);
     }
     pub fn set_activity(&mut self, text: &str) {
         if let Some(live) = &self.live {

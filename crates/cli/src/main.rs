@@ -41,7 +41,6 @@ mod feedback_commands;
 
 use anyhow::{bail, ensure, Context, Result};
 use args::{Cli, Commands, McpCommands, OutputFormat, SessionCommands, SkillsCommands};
-use clap::Parser;
 use claude_core::{
     mcp::{McpServerConfig, McpServerManager},
     runtime::{RuntimePaths, SessionStore},
@@ -75,7 +74,7 @@ async fn main() -> std::process::ExitCode {
         Ok(false) => {},
         Err(error) => { eprintln!("Session host failed: {error:#}"); return std::process::ExitCode::FAILURE; },
     }
-    let mut cli = Cli::parse();
+    let mut cli = Cli::parse_with_mode_source();
     cli.normalize();
     terminal::configure_accessibility(cli.ax_screen_reader);
     debug_logging::install(cli.verbose);
@@ -410,10 +409,15 @@ async fn run(cli: &Cli) -> Result<()> {
                 Ok(None) => {},
                 Err(error) => eprintln!("Status line: {error:#}"),
             }
+            input.as_ref().expect("interactive reader").set_permission_mode(session.permission_mode());
             let prompt = if composer.is_pending() { "... " } else { "\n> " };
             let line = 'read: loop { tokio::select! {
                 line = input.as_mut().expect("interactive reader").read_prompt(prompt) => break 'read match line {
-                    Ok(Some(line)) => line,
+                    Ok(Some(terminal::input::PromptEvent::Line(line))) => line,
+                    Ok(Some(terminal::input::PromptEvent::CyclePermission)) => {
+                        if let Err(error) = session.cycle_permission_mode().await { eprintln!("Permission mode: {error:#}"); }
+                        continue 'repl;
+                    },
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                         if composer.is_pending() {
                             composer.cancel();

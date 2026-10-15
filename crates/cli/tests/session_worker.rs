@@ -12,6 +12,47 @@ use std::{
 };
 
 struct Cleanup(Vec<u32>);
+
+#[tokio::test]
+async fn live_mode_change_applies_to_tool_after_inflight_model_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let session = store.create(&workspace, "fixture", "cli-runtime").unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route("/v1/chat/completions", post({
+        let started=started.clone(); let release=release.clone(); let calls=calls.clone();
+        move || { let started=started.clone(); let release=release.clone(); let calls=calls.clone(); async move {
+            let first = calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst)==0;
+            let (delta, reason) = if first {
+                started.notify_one(); release.notified().await;
+                (json!({"tool_calls":[{"index":0,"id":"mode-write","type":"function","function":{"name":"Write","arguments":"{\"path\":\"must-not-exist.txt\",\"content\":\"blocked\"}"}}]}), "tool_calls")
+            } else { (json!({"content":"finished"}), "stop") };
+            ([("content-type","text/event-stream")], format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]})))
+        }}
+    }));
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint=format!("http://{}",listener.local_addr().unwrap());
+    let server=tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
+    let executable=temp.path().join(if cfg!(windows){"live-mode.exe"}else{"live-mode"});
+    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"),&executable).unwrap();
+    let host=worker::ensure_worker(&paths.data_dir,&executable,&session,&workspace).await.unwrap();
+    let _cleanup=Cleanup(vec![host.supervisor_pid.unwrap()]);
+    let id=submit(&host,&endpoint,"check mode","fixture",128).await;
+    tokio::time::timeout(Duration::from_secs(10),started.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2),worker::set_permission_mode(&paths.data_dir,&session,&id,"plan")).await.unwrap().unwrap();
+    release.notify_one();
+    assert_eq!(completed(&paths.data_dir,&id).await.status,"completed");
+    assert!(!workspace.join("must-not-exist.txt").exists());
+    let (_,_,events)=jobs::events_since(&paths.data_dir,&id,&session,0).unwrap();
+    assert!(events.iter().any(|event|event["type"]=="tool_result" && event["id"]=="mode-write" && event["is_error"]==true));
+    worker::shutdown(&paths.data_dir,&session).await.unwrap();
+    server.abort();
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for pid in &self.0 {
@@ -412,8 +453,17 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     })
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker::set_permission_mode(&paths.data_dir, &session, &slow, "plan")).await.unwrap().unwrap();
+    assert_eq!(claude_core::services::session_permission_mode::load(&store.db, &session).unwrap(), Some(claude_core::permissions::PermissionMode::PlanMode));
+    assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "plan");
+    worker::set_permission_mode(&paths.data_dir, &session, &slow, "accept-edits").await.unwrap();
+    // Query after an older mode event has been queued must return live authority.
+    assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "accept-edits");
+    assert!(worker::set_permission_mode(&paths.data_dir, &session, &slow, "bypass").await.is_err());
+    assert!(worker::call(&host, &worker::Request::SetPermissionMode { job_id: uuid::Uuid::new_v4().to_string(), mode:"ask".into() }).await.is_err());
     jobs::cancel(&paths.data_dir, &slow).unwrap();
     assert_eq!(completed(&paths.data_dir, &slow).await.status, "cancelled");
+    assert!(worker::set_permission_mode(&paths.data_dir, &session, &slow, "ask").await.is_err());
     let next = submit(&host, &endpoint, "after cancellation", "fixture-two", 96).await;
     assert_eq!(completed(&paths.data_dir, &next).await.status, "completed");
     let observed = worker::read_worker(&worker::directory(&host)).unwrap();

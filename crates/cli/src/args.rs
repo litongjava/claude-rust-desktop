@@ -64,6 +64,8 @@ pub struct Cli {
     pub json_schema: Option<String>,
     #[arg(long, value_enum, default_value = "ask", global = true)]
     pub permission_mode: PermissionModeArg,
+    #[arg(skip)]
+    pub permission_mode_explicit: bool,
     /// Bypass interactive permission prompts; explicit deny rules still apply.
     #[arg(long, global = true, conflicts_with = "permission_mode")]
     pub dangerously_skip_permissions: bool,
@@ -125,6 +127,17 @@ fn parse_session_id(value: &str) -> Result<String, String> {
 }
 
 impl Cli {
+    pub fn try_parse_with_mode_source<I, T>(args: I) -> Result<Self, clap::Error>
+    where I: IntoIterator<Item=T>, T: Into<std::ffi::OsString> + Clone {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command().try_get_matches_from(args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        cli.permission_mode_explicit = matches.value_source("permission_mode") == Some(clap::parser::ValueSource::CommandLine);
+        Ok(cli)
+    }
+    pub fn parse_with_mode_source() -> Self {
+        Self::try_parse_with_mode_source(std::env::args_os()).unwrap_or_else(|error|error.exit())
+    }
     pub fn normalize(&mut self) {
         if self.dangerously_skip_permissions {
             self.permission_mode = PermissionModeArg::Bypass;
@@ -513,6 +526,11 @@ pub enum PluginCommands {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn permission_mode_tracks_explicit_ask_without_confusing_default() {
+        assert!(!super::Cli::try_parse_with_mode_source(["claude-code"]).unwrap().permission_mode_explicit);
+        assert!(super::Cli::try_parse_with_mode_source(["claude-code", "--permission-mode", "ask"]).unwrap().permission_mode_explicit);
+    }
     use super::*;
     #[test]
     fn original_permission_flags_are_explicit_and_unambiguous() {
