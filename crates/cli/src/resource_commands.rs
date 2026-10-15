@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use claude_core::{runtime::RuntimePaths, services::cli_resources};
 use std::collections::BTreeSet;
 
-const LESSONS: &[(&str, &str, &str)] = &[
+pub(crate) const LESSONS: &[(&str, &str, &str)] = &[
     ("context", "Explore a codebase", "Ask a question about a file by including its relative path. Use /context to inspect active history and /compact to summarize a long conversation."),
     ("modes", "Choose permissions", "Use /plan for read-only planning, /permissions ask for approval before tools, or /permissions accept-edits for routine edits. Explicit deny rules remain in force in every mode."),
     ("rewind", "Restore a checkpoint", "After an editing turn, run /rewind list, then /rewind preview ID. /rewind code ID restores recorded file edits; /rewind conversation ID branches the conversation."),

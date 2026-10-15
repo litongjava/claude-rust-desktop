@@ -8,7 +8,7 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
-    style::{ResetColor, SetForegroundColor},
+    style::{Attribute, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write};
@@ -126,7 +126,7 @@ fn menu_page(heights: &[usize], selected: usize, budget: usize) -> (usize, usize
     (start, heights.len())
 }
 
-fn clipped(text: &str, width: usize) -> String {
+pub(crate) fn clipped(text: &str, width: usize) -> String {
     let mut used = 0;
     text.chars()
         .filter(|c| !c.is_control())
@@ -138,6 +138,8 @@ fn clipped(text: &str, width: usize) -> String {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextStyle {
+    Accent,
+    Success,
     Border,
     Plain,
     Muted,
@@ -308,14 +310,21 @@ impl DetailsPanel {
 }
 
 #[derive(Default)]
-struct Screen {
+pub(crate) struct Screen {
     cursor_row: usize,
     height: usize,
     previous: Vec<DisplayLine>,
     invalidated: bool,
 }
 impl Screen {
-    fn draw(&mut self, lines: &[DisplayLine], row: usize, col: usize) -> io::Result<()> {
+    pub(crate) fn resized(&mut self, rows: u16) -> io::Result<()> {
+        let (_, cursor_y) = position()?;
+        self.cursor_row = self.cursor_row.min(cursor_y as usize);
+        self.height = self.height.min(rows.max(1) as usize);
+        self.invalidated = true;
+        Ok(())
+    }
+    pub(crate) fn draw(&mut self, lines: &[DisplayLine], row: usize, col: usize) -> io::Result<()> {
         self.draw_to(&mut io::stderr().lock(), lines, row, col)
     }
 
@@ -351,6 +360,14 @@ impl Screen {
             if let Some((text, style)) = next {
                 if std::env::var_os("NO_COLOR").is_none() {
                     match style {
+                        TextStyle::Accent => queue!(
+                            frame,
+                            SetAttribute(Attribute::Bold),
+                            SetForegroundColor(crate::terminal::style::accent())
+                        )?,
+                        TextStyle::Success => {
+                            queue!(frame, SetForegroundColor(crate::terminal::style::success()))?
+                        }
                         TextStyle::Border => {
                             queue!(frame, SetForegroundColor(crate::terminal::style::border()))?
                         }
@@ -368,6 +385,9 @@ impl Screen {
             }
             // Overwrite first, then erase only the old trailing cells. Clearing
             // the whole line before writing causes visible flashes on Windows.
+            if matches!(next, Some((_, TextStyle::Accent))) {
+                queue!(frame, SetAttribute(Attribute::Reset))?;
+            }
             queue!(frame, ResetColor, Clear(ClearType::UntilNewLine))?;
         }
         move_screen_row(&mut frame, &mut current_row, row)?;
@@ -380,7 +400,7 @@ impl Screen {
         self.invalidated = false;
         Ok(())
     }
-    fn suspend(&mut self) -> io::Result<()> {
+    pub(crate) fn suspend(&mut self) -> io::Result<()> {
         let mut out = io::stderr();
         queue!(out, MoveToColumn(0))?;
         if self.cursor_row > 0 {
@@ -422,9 +442,13 @@ fn move_screen_row(out: &mut impl Write, current: &mut usize, target: usize) -> 
     Ok(())
 }
 
-fn read_editor_event(reader: &mut crate::terminal::paste_input::Reader) -> io::Result<Option<Event>> {
+fn read_editor_event(
+    reader: &mut crate::terminal::paste_input::Reader,
+) -> io::Result<Option<Event>> {
     loop {
-        let Some(event) = reader.next(std::time::Duration::from_millis(100))? else {return Ok(None);};
+        let Some(event) = reader.next(std::time::Duration::from_millis(100))? else {
+            return Ok(None);
+        };
         if let Event::Mouse(mouse) = &event {
             if !matches!(
                 mouse.kind,
@@ -657,7 +681,9 @@ impl PromptEditor {
                 ));
             }
             screen.draw(&lines, panel_height + cursor_row - first + 1, cursor_col)?;
-            let Some(event) = read_editor_event(&mut input_reader)? else {continue;};
+            let Some(event) = read_editor_event(&mut input_reader)? else {
+                continue;
+            };
             match event {
                 Event::Resize(_, new_rows) => {
                     // Dimensions changed: every row needs repainting. Clamp the

@@ -15,6 +15,11 @@ pub enum PromptEvent {
 }
 
 enum Message {
+    Powerup(
+        claude_core::runtime::RuntimePaths,
+        String,
+        oneshot::Sender<anyhow::Result<()>>,
+    ),
     PermissionMode(String),
     Commands(Vec<(String, String)>),
     Details(Vec<(String, String)>),
@@ -53,6 +58,12 @@ impl TerminalInput {
             let mut plain = io::BufReader::new(io::stdin());
             for message in rx {
                 let request = match message {
+                    Message::Powerup(paths, argument, response) => {
+                        if !response.is_closed() {
+                            let _ = response.send(crate::powerup::run(&paths, &argument));
+                        }
+                        continue;
+                    }
                     Message::PermissionMode(mode) => {
                         editor.set_permission_mode(mode);
                         continue;
@@ -111,6 +122,22 @@ impl TerminalInput {
 
     pub fn notice(&self, text: String) {
         let _ = self.notices.send(text);
+    }
+
+    /// The existing input thread owns modal keys as well as ordinary prompts.
+    pub async fn powerup(
+        &mut self,
+        paths: claude_core::runtime::RuntimePaths,
+        argument: String,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.pending.is_none(), "A prompt is still reading input");
+        let (response, receive) = oneshot::channel();
+        self.requests
+            .send(Message::Powerup(paths, argument, response))
+            .map_err(|_| anyhow::anyhow!("Terminal input closed"))?;
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("Terminal reader stopped"))?
     }
 
     pub fn set_commands(&self, commands: Vec<(String, String)>) {

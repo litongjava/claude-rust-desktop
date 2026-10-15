@@ -97,6 +97,40 @@ pub fn activity() -> &'static str {
     }
 }
 
+pub fn accent() -> Color {
+    match THEME.load(Ordering::Relaxed) {
+        1 => Color::Rgb {
+            r: 166,
+            g: 74,
+            b: 44,
+        },
+        2 | 3 => Color::Cyan,
+        4 | 5 => Color::Yellow,
+        _ => Color::Rgb {
+            r: 215,
+            g: 119,
+            b: 87,
+        },
+    }
+}
+
+pub fn success() -> Color {
+    match THEME.load(Ordering::Relaxed) {
+        1 => Color::Rgb {
+            r: 22,
+            g: 128,
+            b: 35,
+        },
+        2 | 3 => Color::Blue,
+        4 | 5 => Color::Green,
+        _ => Color::Rgb {
+            r: 78,
+            g: 186,
+            b: 101,
+        },
+    }
+}
+
 pub fn muted_ansi() -> &'static str {
     if THEME.load(Ordering::Relaxed) % 2 == 1 {
         "38;2;102;102;102"

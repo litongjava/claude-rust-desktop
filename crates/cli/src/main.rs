@@ -42,6 +42,7 @@ mod ide_commands;
 mod startup_options;
 mod debug_logging;
 mod resource_commands;
+mod powerup;
 mod feedback_commands;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -474,6 +475,12 @@ async fn run(cli: &Cli) -> Result<()> {
                 continue;
             }
             let (command, argument) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
+            if command == "/powerup" && powerup::interactive_topic(argument).is_some() && powerup::available() {
+                if let Err(error) = input.as_mut().unwrap().powerup(paths.clone(), argument.to_owned()).await {
+                    eprintln!("Power-ups: {error:#}");
+                }
+                continue;
+            }
             match design_commands::handle(cli, command, argument, &paths, &mut session).await {
                 Ok(true) => continue,
                 Err(error) => { eprintln!("Error: {error:#}"); continue; },
