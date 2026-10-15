@@ -832,3 +832,41 @@ async fn structured_results_are_enforced_and_provider_rejection_is_not_softened(
         }
     }
 }
+
+#[tokio::test]
+async fn dont_ask_control_denies_write_without_sdk_permission_request() {
+    let server = Server::start(false, Mode::Approval).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = Client::start(root.path(), &server, &["--permission-mode", "dontAsk"]);
+    client.send(json!({"type":"control_request","request_id":"invalid","request":{"subtype":"set_permission_mode","mode":"auto"}})).await;
+    assert_eq!(
+        client.frame("control_response").await["response"]["subtype"],
+        "error"
+    );
+    client.send(user("Write a file without approval")).await;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(20), client.output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_ne!(
+            frame["type"], "control_request",
+            "dontAsk must never request SDK approval"
+        );
+        if frame["type"] == "result" {
+            break;
+        }
+    }
+    assert!(!root.path().join("approval.txt").exists());
+    client.send(json!({"type":"control_request","request_id":"mode","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}})).await;
+    assert_eq!(
+        client.frame("control_response").await["response"]["subtype"],
+        "success"
+    );
+    client.send(user("Write with approval from mode")).await;
+    assert_eq!(client.result().await["is_error"], false);
+    assert!(root.path().join("approval.txt").exists());
+    assert!(client.finish().await.0.success());
+}

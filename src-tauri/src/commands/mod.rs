@@ -1323,7 +1323,7 @@ pub async fn set_permission_mode(
     let permission_state = app_handle.state::<Arc<Mutex<Option<Arc<crate::permissions::PermissionManager>>>>>();
     let permission_guard = permission_state.lock().await;
     if let Some(perm_mgr) = permission_guard.as_ref() {
-        let mode_enum = PermissionMode::from_str(&mode);
+        let mode_enum = PermissionMode::parse(&mode).map_err(|error| error.to_string())?;
         perm_mgr.set_mode(mode_enum);
         Ok(())
     } else {

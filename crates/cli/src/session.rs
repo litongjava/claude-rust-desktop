@@ -159,6 +159,7 @@ impl Session {
             PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
             PermissionModeArg::Plan => PermissionMode::PlanMode,
             PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
+            PermissionModeArg::DontAsk => PermissionMode::DontAsk,
         };
         let explicit_mode = cli.permission_mode_explicit || cli.dangerously_skip_permissions || !matches!(cli.permission_mode, PermissionModeArg::Ask);
         let active_job = if internal_worker { None } else { claude_core::services::background_sessions::list(&paths.data_dir, None)?.into_iter().find(|job|job.session_id == id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) };
@@ -354,6 +355,7 @@ impl Session {
             PermissionMode::AcceptEdits => "accept-edits",
             PermissionMode::PlanMode => "plan",
             PermissionMode::BypassPermissions => "bypass",
+            PermissionMode::DontAsk => "dont-ask",
         }
     }
 
@@ -372,20 +374,13 @@ impl Session {
     }
 
     pub async fn set_permission_mode(&self, value: &str) -> Result<()> {
-        use clap::ValueEnum;
         if claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_none() {
             if let Some(job) = claude_core::services::background_sessions::list(&self.paths.data_dir, None)?.into_iter().find(|job|job.session_id == self.id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) {
                 anyhow::bail!("This session has active background work; use /tasks attach {} to change its permission mode", job.id);
             }
         }
-        let mode = PermissionModeArg::from_str(value, false)
-            .map_err(|_| anyhow::anyhow!("Unknown permission mode '{value}'; use ask, accept-edits, plan, or bypass"))?;
-        claude_core::services::session_permission_mode::set(&self.store.db, &self.id, &self.permissions, match mode {
-            PermissionModeArg::Ask => PermissionMode::AskPermissions,
-            PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
-            PermissionModeArg::Plan => PermissionMode::PlanMode,
-            PermissionModeArg::Bypass => PermissionMode::BypassPermissions,
-        })?;
+        let mode = claude_core::services::session_permission_mode::parse(value)?;
+        claude_core::services::session_permission_mode::set(&self.store.db, &self.id, &self.permissions, mode)?;
         Ok(())
     }
 
@@ -919,7 +914,15 @@ mod event_tests {
         first.close().await.unwrap();
         let resumed = Session::open(&cli, &paths, selection(), Some(&saved)).await.unwrap();
         assert_eq!(resumed.permission_mode(), "plan");
+        resumed.set_permission_mode("dontAsk").await.unwrap();
+        assert!(resumed.set_permission_mode("auto").await.is_err());
+        assert_eq!(resumed.permission_mode(), "dont-ask");
         resumed.close().await.unwrap();
+        let restored = Session::open(&cli, &paths, selection(), Some(&saved)).await.unwrap();
+        assert_eq!(restored.permission_mode(), "dont-ask");
+        restored.cycle_permission_mode().await.unwrap();
+        assert_eq!(restored.permission_mode(), "ask");
+        restored.close().await.unwrap();
         let explicit = Cli::try_parse_with_mode_source(["claude-code", "--permission-mode", "ask"]).unwrap();
         let overridden = Session::open(&explicit, &paths, selection(), Some(&saved)).await.unwrap();
         assert_eq!(overridden.permission_mode(), "ask");

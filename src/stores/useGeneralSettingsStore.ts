@@ -4,7 +4,7 @@ import { useUIStore } from './useUIStore';
 import type { WorkspaceMode } from './useWorkspaceModeStore';
 
 export type WorkDetails = 'compact' | 'standard' | 'detailed' | 'verbose';
-export type PermissionMode = 'ask_permissions' | 'accept_edits' | 'plan_mode' | 'bypass_permissions';
+export type PermissionMode = 'ask_permissions' | 'accept_edits' | 'plan_mode' | 'bypass_permissions' | 'dont_ask';
 export type HomeModelMode = Exclude<WorkspaceMode, 'code'>;
 export interface ModeModel { providerId: string; modelId: string }
 export interface GeneralSettings {
@@ -23,7 +23,7 @@ export interface GeneralSettings {
   defaultModelByMode: Record<HomeModelMode, ModeModel | null>;
 }
 
-const permissions = ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_permissions'];
+const permissions = ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_permissions', 'dont_ask'];
 const sendKeys = ['enter', 'ctrl_enter', 'cmd_enter', 'alt_enter'];
 const newlineKeys = [...sendKeys, 'shift_enter'];
 const defaults: GeneralSettings = {
@@ -40,7 +40,7 @@ export function normalizeGeneralSettings(value: unknown): GeneralSettings {
   // Upgrade the previous default once; subsequent explicit 14px choices remain valid.
   const fontSize = !v.typographyVersion && v.fontSize === 14 ? defaults.fontSize : v.fontSize;
   return {
-    defaultPermissionMode: permissions.includes(v.defaultPermissionMode || '') ? v.defaultPermissionMode! : defaults.defaultPermissionMode,
+    defaultPermissionMode: permissions.includes(v.defaultPermissionMode || '') ? v.defaultPermissionMode! : v.defaultPermissionMode == null ? defaults.defaultPermissionMode : 'ask_permissions',
     theme: ['light', 'dark', 'system'].includes(v.theme || '') ? v.theme! : defaults.theme,
     fontSize: typeof fontSize === 'number' && Number.isFinite(fontSize) ? Math.min(32, Math.max(10, Math.round(fontSize))) : defaults.fontSize,
     typographyVersion: 1,

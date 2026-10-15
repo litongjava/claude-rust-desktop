@@ -381,13 +381,7 @@ async fn conversation_warm_handler(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Only log permission mode changes, don't spam for every request
     if let Some(ref pm_str) = req.permission_mode {
-        let perm_mode = match pm_str.as_str() {
-            "ask_permissions" => PermissionMode::AskPermissions,
-            "accept_edits" => PermissionMode::AcceptEdits,
-            "plan_mode" => PermissionMode::PlanMode,
-            "bypass_permissions" => PermissionMode::BypassPermissions,
-            _ => PermissionMode::AskPermissions,
-        };
+        let perm_mode = PermissionMode::parse(pm_str).map_err(|_| StatusCode::BAD_REQUEST)?;
         if let Some(engine) = state.native_engine.lock().await.as_ref() {
             engine.set_permission_mode(perm_mode).await;
             // Only log once per mode change, not for every conversation

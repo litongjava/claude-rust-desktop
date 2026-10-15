@@ -155,3 +155,118 @@ async fn child_start_context_and_stop_continuation_are_isolated_from_parent_stop
     assert!(!temp.path().join("wrong-parent-stop").exists());
     server.abort();
 }
+
+#[tokio::test]
+async fn dont_ask_executes_reads_denies_side_effects_and_never_creates_waiters() {
+    use crate::permissions::{rules::PermissionAction, PermissionMode};
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("fixture.txt"), "REAL_READ_SENTINEL").unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let manager = crate::runtime::default_permissions();
+    manager.set_mode(PermissionMode::DontAsk);
+    let mut executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1"),
+        vec![],
+        None,
+        128,
+        tx,
+        temp.path().to_string_lossy().into_owned(),
+        ReasoningMode::Standard,
+    )
+    .with_conv_id("dont-ask-fixture".into())
+    .with_permission_manager(manager.clone());
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "Read",
+            &json!({"file_path":temp.path().join("fixture.txt")}),
+            "read",
+        )
+        .await;
+    assert!(!failed, "{output}");
+    assert!(output.contains("REAL_READ_SENTINEL"));
+    let args = json!({"file_path":temp.path().join("denied.txt"),"content":"DENIED"});
+    let (_, output, failed) = executor
+        .execute_tool_call("Write", &args, "write-denied")
+        .await;
+    assert!(failed, "{output}");
+    assert!(!temp.path().join("denied.txt").exists());
+    manager.set_session_rules(
+        "dont-ask-fixture",
+        HashMap::from([
+            ("Write".into(), PermissionAction::Allow),
+            ("Read".into(), PermissionAction::Confirm),
+        ]),
+    );
+    let (_, output, failed) = executor
+        .execute_tool_call("Write", &args, "write-allowed")
+        .await;
+    assert!(!failed, "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("denied.txt")).unwrap(),
+        "DENIED"
+    );
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "Read",
+            &json!({"file_path":temp.path().join("fixture.txt")}),
+            "explicit-ask",
+        )
+        .await;
+    assert!(failed, "{output}");
+    assert!(executor.answer_waiters.lock().await.is_empty());
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(event, EngineEvent::ToolPermission { .. }));
+    }
+}
+
+#[tokio::test]
+async fn dont_ask_hook_ask_denies_preapproved_write_without_waiter() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output =
+        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#;
+    let hooks = load_hooks(
+        temp.path(),
+        json!({"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[hook(&format!("[Console]::Out.Write('{output}')"),&format!("printf '%s' '{output}'"))]}]}}),
+    );
+    let (tx, mut rx) = mpsc::channel(32);
+    let manager = crate::runtime::default_permissions();
+    manager.set_mode(crate::permissions::PermissionMode::DontAsk);
+    manager.set_session_rules(
+        "hook-ask",
+        HashMap::from([(
+            "Write".into(),
+            crate::permissions::rules::PermissionAction::Allow,
+        )]),
+    );
+    let mut executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1"),
+        vec![],
+        None,
+        128,
+        tx,
+        temp.path().to_string_lossy().into_owned(),
+        ReasoningMode::Standard,
+    )
+    .with_conv_id("hook-ask".into())
+    .with_permission_manager(manager)
+    .with_hooks(hooks);
+    let (_, output, failed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute_tool_call(
+            "Write",
+            &json!({"file_path":"blocked.txt","content":"blocked"}),
+            "hook-write",
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(failed, "{output}");
+    assert!(output.contains("hook requested permission"), "{output}");
+    assert!(!temp.path().join("blocked.txt").exists());
+    assert!(executor.answer_waiters.lock().await.is_empty());
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(event, EngineEvent::ToolPermission { .. }));
+    }
+}

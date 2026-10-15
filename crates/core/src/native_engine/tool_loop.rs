@@ -574,6 +574,9 @@ impl ToolLoopExecutor {
         if pre.blocked { return (input.clone(), format!("PreToolUse hook blocked tool: {}", pre.reason), true); }
         let input = pre.updated_input.unwrap_or_else(|| input.clone());
         if pre.ask_permission {
+            if self.permission_manager.as_ref().is_some_and(|manager| manager.get_mode() == crate::permissions::PermissionMode::DontAsk) {
+                return (input, "dontAsk mode: hook requested permission; tool was not executed".into(), true);
+            }
             if let PermissionResult::Denied(reason) = self.check_permission(name, &input).await {
                 return (input, format!("Permission denied: {reason}"), true);
             }

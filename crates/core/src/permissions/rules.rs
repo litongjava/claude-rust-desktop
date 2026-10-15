@@ -97,54 +97,8 @@ impl PermissionRuleset {
     }
 }
 
-pub fn get_default_rules() -> PermissionRuleset {
-    let mut ruleset = PermissionRuleset::new();
-    
-    ruleset.add_rule(
-        PermissionRule::new(
-            "system:deny-dangerous",
-            PermissionAction::Confirm,
-            PermissionScope::Global,
-            PermissionLevel::Execute,
-        )
-        .with_description("Require confirmation for dangerous operations")
-        .with_priority(100),
-    );
-
-    ruleset.add_rule(
-        PermissionRule::new(
-            "system:allow-read",
-            PermissionAction::Allow,
-            PermissionScope::Global,
-            PermissionLevel::Read,
-        )
-        .with_description("Allow read operations by default")
-        .with_priority(50),
-    );
-
-    ruleset.add_rule(
-        PermissionRule::new(
-            "system:allow-write-workspace",
-            PermissionAction::Allow,
-            PermissionScope::Workspace,
-            PermissionLevel::Write,
-        )
-        .with_description("Allow write operations within workspace")
-        .with_priority(40),
-    );
-
-    ruleset.add_rule(
-        PermissionRule::new(
-            "system:deny-execute-external",
-            PermissionAction::Confirm,
-            PermissionScope::Global,
-            PermissionLevel::Execute,
-        )
-        .with_description("Require confirmation for external command execution")
-        .with_priority(60),
-    );
-
-    ruleset
-}
+// Default operation policy is evaluated by PermissionManager. This ruleset
+// represents explicit overrides; a global Confirm rule would incorrectly match
+// ordinary reads before their default read-only allowance.
 
 pub const DANGEROUS_TOOLS: &[&str] = &["bash", "command", "computer_use", "file_write", "file_delete", "FileDelete", "ProcessKill", "LSP", "lsp", "worktree"];

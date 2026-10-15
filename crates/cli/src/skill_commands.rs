@@ -212,9 +212,11 @@ pub async fn prepare_invocation(
                     )
                     .await;
                 if pre.ask_permission && decision == PermissionResult::Granted {
-                    decision = PermissionResult::RequiresConfirmation(
-                        "Hook requests shell approval".into(),
-                    );
+                    decision = if session.permissions.get_mode() == claude_core::permissions::PermissionMode::DontAsk {
+                        PermissionResult::Denied("dontAsk mode: hook requested shell approval".into())
+                    } else {
+                        PermissionResult::RequiresConfirmation("Hook requests shell approval".into())
+                    };
                 }
                 let confirmed = if matches!(decision, PermissionResult::RequiresConfirmation(_)) {
                     let question = format!(
@@ -438,6 +440,46 @@ pub fn catalog(skills: &BTreeMap<String, String>) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dont_ask_skill_shell_hook_rejects_before_prompt_or_execution() {
+        use crate::{args::Cli, config::Selection, session::Session};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        let selection=Selection{providers:vec![serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap()],provider_id:"fixture".into(),model:"fixture".into()};
+        let cli = Cli::try_parse_with_mode_source([
+            "claude-code",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--permission-mode",
+            "dontAsk",
+        ])
+        .unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let session_id = store.create(temp.path(), "fixture", "fixture").unwrap();
+        let session = Session::open(&cli, &paths, selection, Some(&session_id)).await.unwrap();
+        let skill_dir = temp.path().join(".claude/skills/permission-fixture");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"),"---\nname: permission-fixture\ndescription: fixture\n---\n!`echo should-not-run > forbidden.txt`\n").unwrap();
+        let output =
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#;
+        let command = if cfg!(windows) {
+            format!("[Console]::Out.Write('{output}')")
+        } else {
+            format!("printf '%s' '{output}'")
+        };
+        std::fs::write(temp.path().join(".claude/settings.json"),serde_json::json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","shell":if cfg!(windows){"powershell"}else{"sh"},"command":command}]}]}}).to_string()).unwrap();
+        session
+            .permissions
+            .set_always_allow_checker(Box::new(|_, _| true));
+        let result = prepare_invocation(&cli, &session, "/permission-fixture", &mut None).await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("hook ask must be denied"),
+        };
+        assert!(error.contains("dontAsk"), "{error}");
+        assert!(!temp.path().join("forbidden.txt").exists());
+        session.close().await.unwrap();
+    }
     #[test]
     fn skill_child_has_empty_history_and_independent_permissions_without_parent_goal() {
         let temp = tempfile::tempdir().unwrap();

@@ -74,3 +74,9 @@ it('uses per-mode usage defaults and preserves explicit false for Code after con
   await initializeGeneralSettings();
   expect(useGeneralSettingsStore.getState().showUsageByMode).toEqual({ ...defaults, chat: true, code: false });
 });
+
+it('retains dontAsk and falls back to ask for malformed explicit permission modes', () => {
+  expect(normalizeGeneralSettings({ defaultPermissionMode: 'dont_ask' }).defaultPermissionMode).toBe('dont_ask');
+  expect(normalizeGeneralSettings({ defaultPermissionMode: 'auto' }).defaultPermissionMode).toBe('ask_permissions');
+  expect(normalizeGeneralSettings({}).defaultPermissionMode).toBe('accept_edits');
+});

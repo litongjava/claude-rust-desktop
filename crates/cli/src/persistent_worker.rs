@@ -200,6 +200,7 @@ async fn execute(
                 PermissionModeArg::AcceptEdits => "accept-edits",
                 PermissionModeArg::Plan => "plan",
                 PermissionModeArg::Bypass => "bypass",
+                PermissionModeArg::DontAsk => "dont-ask",
             })
             .await?;
     } else {
@@ -220,7 +221,7 @@ async fn execute(
 }
 
 fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &str) -> Result<()> {
-    ensure!(matches!(mode, "ask" | "accept-edits" | "plan"), "Live switching cannot enable bypass permissions");
+    ensure!(matches!(claude_core::services::session_permission_mode::parse(mode)?, claude_core::permissions::PermissionMode::AskPermissions | claude_core::permissions::PermissionMode::AcceptEdits | claude_core::permissions::PermissionMode::PlanMode | claude_core::permissions::PermissionMode::DontAsk), "Live switching cannot enable bypass permissions");
     let target = target.lock().unwrap_or_else(|e|e.into_inner());
     let (active_job, manager, db) = target.as_ref().context("Session worker has no active initialized turn")?;
     ensure!(active_job == job_id, "Permission change targets a different job");

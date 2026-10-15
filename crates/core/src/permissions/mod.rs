@@ -1,3 +1,5 @@
+pub mod decision;
+pub use decision::{DecisionOrigin, PermissionDecision};
 pub mod manager;
 pub mod rules;
 pub mod patterns;

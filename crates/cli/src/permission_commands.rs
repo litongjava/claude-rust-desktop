@@ -35,7 +35,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
     let mut rules = load(session)?;
     match words.as_slice() {
         [] | ["list"] => {},
-        [mode @ ("ask" | "accept-edits" | "plan" | "bypass")] => session.set_permission_mode(mode).await?,
+        [mode] if claude_core::permissions::PermissionMode::parse(mode).is_ok() => session.set_permission_mode(mode).await?,
         [action @ ("allow" | "deny" | "ask" | "remove"), tool] => {
             claude_core::permissions::patterns::validate(tool)?;
             match *action {
@@ -48,7 +48,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
             let value = serde_json::to_string(&rules)?;
             session.store.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("cli.permissions.{}",session.id),value]))??;
         }
-        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|allow RULE|deny RULE|ask RULE|remove RULE]. Examples: allow Bash(git status *), deny Read(.env), ask Edit(src/**). Enter rules without outer shell quotes."),
+        _ => anyhow::bail!("Usage: /permissions [list|ask|accept-edits|plan|bypass|dont-ask|allow RULE|deny RULE|ask RULE|remove RULE]. Examples: allow Bash(git status *), deny Read(.env), ask Edit(src/**). Enter rules without outer shell quotes."),
     }
     session
         .permissions

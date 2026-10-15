@@ -145,7 +145,9 @@ const initialState = {
   webSearchToast: null as string | null,
   permissionMode: (() => {
     try {
-      return localStorage.getItem('permission_mode') || 'accept_edits';
+      const saved = localStorage.getItem('permission_mode');
+      if (saved == null) return 'accept_edits';
+      return ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_permissions', 'dont_ask'].includes(saved) ? saved : 'ask_permissions';
     } catch { return 'accept_edits'; }
   })() as string,
   reasoningMode: localStorage.getItem('model_effort') || 'off',

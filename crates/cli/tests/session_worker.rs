@@ -496,6 +496,11 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     worker::set_permission_mode(&paths.data_dir, &session, &slow, "accept-edits").await.unwrap();
     // Query after an older mode event has been queued must return live authority.
     assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "accept-edits");
+    worker::set_permission_mode(&paths.data_dir, &session, &slow, "dontAsk").await.unwrap();
+    assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "dont-ask");
+    assert_eq!(claude_core::services::session_permission_mode::load(&store.db, &session).unwrap(), Some(claude_core::permissions::PermissionMode::DontAsk));
+    assert!(worker::set_permission_mode(&paths.data_dir, &session, &slow, "auto").await.is_err());
+    assert_eq!(worker::permission_mode(&paths.data_dir, &session, &slow).await.unwrap(), "dont-ask");
     assert!(worker::set_permission_mode(&paths.data_dir, &session, &slow, "bypass").await.is_err());
     assert!(worker::call(&host, &worker::Request::SetPermissionMode { job_id: uuid::Uuid::new_v4().to_string(), mode:"ask".into() }).await.is_err());
     jobs::cancel(&paths.data_dir, &slow).unwrap();

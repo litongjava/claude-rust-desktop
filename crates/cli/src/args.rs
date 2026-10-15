@@ -193,13 +193,16 @@ pub enum ApiFormatArg {
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum PermissionModeArg {
-    #[value(alias = "default")]
+    #[value(alias = "default", alias = "ask_permissions", alias = "ask_permission")]
     Ask,
-    #[value(alias = "acceptEdits")]
+    #[value(alias = "acceptEdits", alias = "accept_edits", alias = "edits")]
     AcceptEdits,
+    #[value(alias = "plan_mode")]
     Plan,
-    #[value(alias = "bypassPermissions")]
+    #[value(alias = "bypassPermissions", alias = "bypass_permissions", alias = "always_allow", alias = "alwaysallow", alias = "zh")]
     Bypass,
+    #[value(alias = "dontAsk", alias = "dont_ask")]
+    DontAsk,
 }
 
 #[derive(Debug, Subcommand)]

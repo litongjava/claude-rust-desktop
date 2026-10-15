@@ -3,16 +3,10 @@ use crate::{
     db::DbManager,
     permissions::{PermissionManager, PermissionMode},
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use rusqlite::OptionalExtension;
 pub fn parse(value: &str) -> Result<PermissionMode> {
-    Ok(match value {
-        "ask" | "default" => PermissionMode::AskPermissions,
-        "accept-edits" | "acceptEdits" => PermissionMode::AcceptEdits,
-        "plan" => PermissionMode::PlanMode,
-        "bypass" | "bypassPermissions" => PermissionMode::BypassPermissions,
-        _ => bail!("Unknown permission mode: {value}"),
-    })
+    PermissionMode::parse(value)
 }
 pub fn name(mode: PermissionMode) -> &'static str {
     match mode {
@@ -20,6 +14,7 @@ pub fn name(mode: PermissionMode) -> &'static str {
         PermissionMode::AcceptEdits => "accept-edits",
         PermissionMode::PlanMode => "plan",
         PermissionMode::BypassPermissions => "bypass",
+        PermissionMode::DontAsk => "dont-ask",
     }
 }
 pub fn load(db: &DbManager, session: &str) -> Result<Option<PermissionMode>> {

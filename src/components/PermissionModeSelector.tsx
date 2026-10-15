@@ -5,7 +5,7 @@ import { useI18n } from '../hooks/useI18n';
 import { Shield, ShieldCheck, ShieldOff, Eye } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
-type PermissionMode = 'ask_permissions' | 'accept_edits' | 'plan_mode' | 'bypass_permissions';
+import type { PermissionMode } from '../stores/useGeneralSettingsStore';
 
 interface PermissionModeOption {
   value: PermissionMode;
@@ -21,8 +21,8 @@ const MODE_OPTIONS: PermissionModeOption[] = [
     value: 'ask_permissions',
     label: 'Ask permissions',
     labelZh: '询问权限',
-    description: 'All tool calls require user confirmation',
-    descriptionZh: '所有工具调用都需要用户确认',
+    description: 'Allow reads; confirm actions without prior permission',
+    descriptionZh: '允许读取，未预先授权的操作需要确认',
     icon: <Shield size={14} />,
   },
   {
@@ -42,11 +42,19 @@ const MODE_OPTIONS: PermissionModeOption[] = [
     icon: <Eye size={14} />,
   },
   {
+    value: 'dont_ask',
+    label: "Don't ask",
+    labelZh: '不询问权限',
+    description: 'Allow pre-approved actions; deny actions that need permission',
+    descriptionZh: '允许已授权操作，拒绝需要询问权限的操作',
+    icon: <Shield size={14} />,
+  },
+  {
     value: 'bypass_permissions',
     label: 'Bypass permissions',
     labelZh: '全托管模式',
-    description: 'All operations auto-approved, no confirmation needed',
-    descriptionZh: '所有操作自动通过，无需任何确认',
+    description: 'Approve unconfigured actions; explicit deny and ask rules still apply',
+    descriptionZh: '自动允许未配置的操作；仍遵循明确的拒绝和询问规则',
     icon: <ShieldOff size={14} />,
   },
 ];
@@ -70,7 +78,7 @@ export default function PermissionModeSelector({ className = '', value, onChange
   const menuRef = useRef<HTMLDivElement>(null);
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({});
 
-  const currentMode = MODE_OPTIONS.find((m) => m.value === permissionMode) || MODE_OPTIONS[1];
+  const currentMode = MODE_OPTIONS.find((m) => m.value === permissionMode) || MODE_OPTIONS[0];
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -158,6 +166,7 @@ export default function PermissionModeSelector({ className = '', value, onChange
     switch (mode) {
       case 'ask_permissions': return 'bg-claude-textSecondary/20 text-claude-textSecondary';
       case 'accept_edits': return 'bg-green-500/20 text-green-500';
+      case 'dont_ask': return 'bg-claude-textSecondary/20 text-claude-textSecondary';
       case 'plan_mode': return 'bg-blue-500/20 text-blue-500';
       case 'bypass_permissions': return 'bg-orange-500/20 text-orange-500';
       default: return 'bg-claude-textSecondary/20 text-claude-textSecondary';
