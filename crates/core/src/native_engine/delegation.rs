@@ -257,6 +257,7 @@ impl ToolLoopExecutor {
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
         entry.executor.permission_mailbox = self.permission_mailbox.clone();
+        entry.executor.permission_host_available = self.permission_host_available;
         entry.executor.message_inbox = None;
         entry.executor.stop_hook_active = false;
         if let Some(manager) = &entry.executor.permission_manager {
@@ -349,6 +350,7 @@ impl ToolLoopExecutor {
         tools: Option<Vec<String>>,
         preapproved: bool,
     ) -> Result<Value> {
+        let mut approved_input = None;
         if !preapproved {
             use crate::permissions::PermissionResult;
             let invocation_id = uuid::Uuid::new_v4().to_string();
@@ -357,54 +359,12 @@ impl ToolLoopExecutor {
                     anyhow::bail!("Delegation permission denied: {reason}")
                 }
                 PermissionResult::RequiresConfirmation(_) => {
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    self.answer_waiters
-                        .lock()
-                        .await
-                        .insert(request_id.clone(), tx);
-                    let _guard = super::PermissionWaiterGuard {
-                        waiters: self.answer_waiters.clone(),
-                        request_id: request_id.clone(),
-                    };
-                    self.event_tx
-                        .send(EngineEvent::ToolPermission {
-                            request_id: request_id.clone(),
-                            tool_use_id: invocation_id.clone(),
-                            tool_name: "Agent".into(),
-                            input: input.clone(),
-                        })
-                        .await
-                        .context("Delegation approval host disconnected")?;
-                    let answer = self
-                        .wait_for_user_answer(rx)
-                        .await
-                        .context("Delegation approval timed out")??;
-                    ensure!(
-                        ["yes", "y", "allow", "approved", "always_allow"]
-                            .contains(&answer.trim().to_lowercase().as_str()),
-                        "Delegation not approved"
-                    );
-                    if let Some(manager) = &self.permission_manager {
-                        let context = crate::permissions::PermissionContext {
-                            tool_name: "Agent".into(),
-                            tool_input: input.clone(),
-                            conversation_id: self.conv_id.clone().unwrap_or_default(),
-                            user_id: None,
-                            workspace_path: Some(self.workspace_cwd.clone()),
-                        };
-                        ensure!(
-                            !matches!(
-                                manager.check_permission(&context),
-                                PermissionResult::Denied(_)
-                            ),
-                            "Delegation policy denied the action after approval"
-                        );
-                    }
+                    approved_input = Some(self.request_tool_approval("Agent", input, &invocation_id).await?);
                 }
                 PermissionResult::Granted => {}
             }
         }
+        let input = approved_input.as_ref().unwrap_or(input);
         if let Some(id) = input["resume"].as_str() {
             return Box::pin(self.resume_owned_child(id, input["prompt"].as_str(), false)).await;
         }
@@ -566,6 +526,7 @@ impl ToolLoopExecutor {
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())
+        .with_permission_host(self.permission_host_available)
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(self.search_config_path.clone().unwrap());
         child = child.with_response_schema(schema)?;

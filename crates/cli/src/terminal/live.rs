@@ -309,8 +309,17 @@ impl State {
     }
 
     fn question(&mut self, reply: oneshot::Sender<String>) {
+        self.dismiss_closed_question();
         self.saved_draft = Some(std::mem::take(&mut self.draft));
         self.answer = Some(reply);
+    }
+    fn dismiss_closed_question(&mut self) -> bool {
+        if self.answer.as_ref().is_some_and(oneshot::Sender::is_closed) {
+            self.answer = None;
+            self.draft = self.saved_draft.take().unwrap_or_default();
+            return true;
+        }
+        false
     }
     fn submit(&mut self, actions: &async_mpsc::UnboundedSender<Action>) -> Option<String> {
         let text = self.draft.take();
@@ -761,7 +770,15 @@ fn run(
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         }
+        dirty |= state.dismiss_closed_question();
         if let Some(event) = input_reader.next(Duration::from_millis(25))? {
+            // Cancellation may arrive while waiting for a key. Never submit a
+            // dismissed approval draft as a newly queued user prompt.
+            if state.dismiss_closed_question() {
+                flush_wrapped(state, screen)?;
+                screen.draw(state)?;
+                continue;
+            }
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let key = match state.bindings.resolve(key, &mut state.key_pending) {
@@ -1104,6 +1121,24 @@ mod tests {
         assert_eq!(received.try_recv().unwrap(), "yes");
         assert_eq!(state.draft.take(), "queued draft");
         assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn cancelled_question_discards_answer_and_restores_original_draft() {
+        let mut state = State::new("ask".into());
+        state.draft.insert("original draft");
+        let (reply, receive) = oneshot::channel();
+        state.question(reply);
+        state.draft.insert("late yes");
+        drop(receive);
+        assert!(state.dismiss_closed_question());
+        assert_eq!(state.draft.take(), "original draft");
+        assert!(state.answer.is_none());
+        assert!(!state.dismiss_closed_question());
+        let (reply, mut receive) = oneshot::channel();
+        state.question(reply);
+        state.draft.insert("fresh no");
+        state.submit(&async_mpsc::unbounded_channel().0);
+        assert_eq!(receive.try_recv().unwrap(), "fresh no");
     }
     #[test]
     fn side_questions_and_queued_prompts_are_distinct() {

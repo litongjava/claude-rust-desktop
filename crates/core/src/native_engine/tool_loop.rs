@@ -140,6 +140,7 @@ pub enum EngineEvent {
 pub struct ToolLoopExecutor {
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
+    permission_host_available: bool,
     auto_history: Vec<Value>,
     messages: Vec<Value>,
     system_prompt: Option<String>,
@@ -155,8 +156,8 @@ pub struct ToolLoopExecutor {
     conv_id: Option<String>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     permission_mailbox: crate::native_engine::permission_response::Mailbox,
-    permission_interrupted: Option<String>,
-    approved_call: Option<(String, Value, String)>,
+    permission_interrupted: std::sync::Mutex<Option<String>>,
+    approved_call: Option<tool_approval::ExactApproval>,
     runtime_agents: super::runtime_agents::Catalog,
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
@@ -508,6 +509,7 @@ impl ToolLoopExecutor {
     ) -> Self {
         Self {
             auto_manual_interactive: false,
+            permission_host_available: true,
             auto_history: messages.clone(),
             provider,
             messages,
@@ -524,7 +526,7 @@ impl ToolLoopExecutor {
             conv_id: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
             permission_mailbox: Default::default(),
-            permission_interrupted: None,
+            permission_interrupted: std::sync::Mutex::new(None),
             approved_call: None,
             runtime_agents: Default::default(),
             permission_manager: None,
@@ -644,7 +646,23 @@ impl ToolLoopExecutor {
                 Ok(actual) => actual,
                 Err(error) => return (input, format!("Hook requested permission: {error:#}"), true),
             };
-            self.approved_call = Some((name.into(), input.clone(), id.into()));
+            self.approved_call = Some(tool_approval::ExactApproval { tool:name.into(), input:input.clone(), id:id.into(), pre_tool_hook:false });
+        }
+        if pre.allow_permission && !pre.ask_permission && !matches!(name, "AskUserQuestion" | "AskUser" | "EnterPlanMode" | "ExitPlanMode" | "plan_mode") {
+            let can_replace_prompt = self.permission_manager.as_ref().is_none_or(|manager| {
+                let decision = manager.evaluate_permission(&crate::permissions::PermissionContext {
+                    tool_name: name.into(), tool_input: input.clone(), conversation_id: self.conv_id.clone().unwrap_or_default(),
+                    user_id: None, workspace_path: Some(self.workspace_cwd.clone()),
+                });
+                decision.origin == crate::permissions::DecisionOrigin::DefaultPrompt
+                    || matches!(decision.result, PermissionResult::Granted)
+            });
+            if can_replace_prompt {
+                if let Err(error) = self.validate_approved_input_for(name, &input, true).await {
+                    return (input, format!("PreToolUse allow rejected: {error:#}"), true);
+                }
+                self.approved_call = Some(tool_approval::ExactApproval { tool:name.into(), input:input.clone(), id:id.into(), pre_tool_hook:true });
+            }
         }
         // Updated arguments pass through the complete normal permission path.
         let (actual, mut output, mut failed) = Box::pin(self.execute_tool_call_inner(name, &input, id)).await;
@@ -767,6 +785,11 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub fn with_permission_host(mut self, available: bool) -> Self {
+        self.permission_host_available = available;
+        self
+    }
+
     pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
         self.auto_manual_interactive = interactive;
         self
@@ -782,8 +805,8 @@ impl ToolLoopExecutor {
     }
 
     async fn check_permission(&self, tool_name: &str, tool_input: &Value, tool_use_id: &str) -> PermissionResult {
-        if self.approved_call.as_ref().is_some_and(|(name, input, id)| name == tool_name && input == tool_input && id == tool_use_id) {
-            return self.permission_hard_denial(tool_name, tool_input).map(PermissionResult::Denied).unwrap_or(PermissionResult::Granted);
+        if let Some(approval) = self.approved_call.as_ref().filter(|approval| approval.tool == tool_name && approval.input == *tool_input && approval.id == tool_use_id) {
+            return self.permission_hard_denial_for(tool_name, tool_input, approval.pre_tool_hook).map(PermissionResult::Denied).unwrap_or(PermissionResult::Granted);
         }
         if let Some(ref pm) = self.permission_manager {
             let conv_id = self.conv_id.clone().unwrap_or_default();
@@ -860,7 +883,7 @@ impl ToolLoopExecutor {
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
-        self.permission_interrupted = None;
+        *self.permission_interrupted.lock().unwrap_or_else(|error| error.into_inner()) = None;
         self.approved_call = None;
         if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
             self.messages = vec![json!({"role":"user","content":content})];

@@ -25,6 +25,7 @@ mod permission_updates;
 #[derive(Default)]
 pub struct Permissions {
     pending: Mutex<HashMap<String, (Value, Option<String>, oneshot::Sender<Result<Reply>>)>>,
+    cancelled: Mutex<VecDeque<String>>,
     closed: AtomicBool,
     updates: Option<Arc<permission_updates::Updates>>,
 }
@@ -125,6 +126,16 @@ impl Permissions {
         crate::session::emit_json(&frame)?;
         rx.await.context("SDK permission channel closed")?
     }
+    pub async fn cancel_one(&self, id: &str) {
+        let mut pending = self.pending.lock().await;
+        if let Some((_, _, tx)) = pending.remove(id) {
+            let mut cancelled = self.cancelled.lock().await;
+            cancelled.push_back(id.into());
+            while cancelled.len() > 256 { cancelled.pop_front(); }
+            let _ = tx.send(Err(anyhow::anyhow!("SDK permission resolved by another source")));
+            let _ = crate::session::emit_json(&json!({"type":"control_cancel_request","request_id":id}));
+        }
+    }
     pub async fn cancel(&self) {
         for (id, (_, _, tx)) in self.pending.lock().await.drain() {
             let _ = tx.send(Err(anyhow::anyhow!("SDK turn interrupted")));
@@ -139,6 +150,10 @@ impl Permissions {
             .as_str()
             .context("Missing response request_id")?;
         let Some((input, question, tx)) = self.pending.lock().await.remove(id) else {
+            // The host may have sent its answer before receiving our cancel
+            // frame. Its prepared policy patch must be discarded, not treated
+            // as a fatal protocol error that interrupts the winning tool.
+            if self.cancelled.lock().await.iter().any(|cancelled| cancelled == id) { return Ok(()); }
             bail!("Unknown or completed SDK permission request: {id}")
         };
         let answer = (|| -> Result<Reply> {

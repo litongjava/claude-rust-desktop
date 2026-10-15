@@ -1,6 +1,13 @@
 use super::*;
 use crate::native_engine::permission_response::{Pending, PermissionResponse};
 
+pub(super) struct ExactApproval {
+    pub tool: String,
+    pub input: Value,
+    pub id: String,
+    pub pre_tool_hook: bool,
+}
+
 impl ToolLoopExecutor {
     pub(crate) fn with_permission_mailbox(
         mut self,
@@ -11,6 +18,15 @@ impl ToolLoopExecutor {
     }
 
     pub(super) fn permission_hard_denial(&self, tool: &str, input: &Value) -> Option<String> {
+        self.permission_hard_denial_for(tool, input, false)
+    }
+
+    pub(super) fn permission_hard_denial_for(
+        &self,
+        tool: &str,
+        input: &Value,
+        pre_tool_hook: bool,
+    ) -> Option<String> {
         if self
             .allowed_tools
             .as_ref()
@@ -29,7 +45,13 @@ impl ToolLoopExecutor {
         let result = if self.is_plan_document_tool(tool, input) {
             manager.check_plan_document_permission(&context)
         } else {
-            manager.check_permission(&context)
+            let decision = manager.evaluate_permission(&context);
+            if pre_tool_hook && decision.origin == crate::permissions::DecisionOrigin::DefaultPrompt
+            {
+                PermissionResult::Granted
+            } else {
+                decision.result
+            }
         };
         match result {
             PermissionResult::Denied(reason) => Some(reason),
@@ -38,13 +60,26 @@ impl ToolLoopExecutor {
     }
 
     pub(super) fn ensure_permission_continuation(&self) -> Result<()> {
-        if let Some(reason) = &self.permission_interrupted {
+        if let Some(reason) = &*self
+            .permission_interrupted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
             anyhow::bail!("Tool permission interrupted the turn: {reason}");
         }
         Ok(())
     }
 
-    async fn validate_approved_input(&self, tool: &str, input: &Value) -> Result<()> {
+    pub(super) async fn validate_approved_input(&self, tool: &str, input: &Value) -> Result<()> {
+        self.validate_approved_input_for(tool, input, false).await
+    }
+
+    pub(super) async fn validate_approved_input_for(
+        &self,
+        tool: &str,
+        input: &Value,
+        pre_tool_hook: bool,
+    ) -> Result<()> {
         anyhow::ensure!(input.is_object(), "Approved tool input must be an object");
         let mut schema = self
             .tool_definitions()
@@ -84,24 +119,28 @@ impl ToolLoopExecutor {
                 validate_workspace_path(path, &self.workspace_cwd, &self.allowed_directories)?;
             }
         }
-        if let Some(reason) = self.permission_hard_denial(tool, input) {
+        if let Some(reason) = self.permission_hard_denial_for(tool, input, pre_tool_hook) {
             anyhow::bail!("Permission denied for approved input: {reason}");
         }
         Ok(())
     }
 
     pub(super) async fn request_tool_approval(
-        &mut self,
+        &self,
         tool: &str,
         input: &Value,
         id: &str,
     ) -> Result<Value> {
+        let reviewed_policy = self
+            .permission_manager
+            .as_ref()
+            .map(|manager| manager.policy_snapshot());
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (typed_tx, typed_rx) = oneshot::channel();
-        self.permission_mailbox
-            .lock()
-            .await
-            .insert(request_id.clone(), typed_tx);
+        let mut typed_rx = crate::native_engine::permission_response::register(
+            &self.permission_mailbox,
+            &request_id,
+        )
+        .await;
         let _typed = Pending {
             mailbox: self.permission_mailbox.clone(),
             request_id: request_id.clone(),
@@ -116,36 +155,88 @@ impl ToolLoopExecutor {
             waiters: self.answer_waiters.clone(),
             request_id: request_id.clone(),
         };
-        self.event_tx
-            .send(EngineEvent::ToolPermission {
-                request_id,
-                tool_use_id: id.into(),
-                tool_name: tool.into(),
-                input: input.clone(),
-            })
-            .await
-            .map_err(|_| anyhow!("Approval host disconnected"))?;
+        if self.permission_host_available {
+            self.event_tx
+                .send(EngineEvent::ToolPermission {
+                    request_id: request_id.clone(),
+                    tool_use_id: id.into(),
+                    tool_name: tool.into(),
+                    input: input.clone(),
+                })
+                .await
+                .map_err(|_| anyhow!("Approval host disconnected"))?;
+        }
+        let hooks = self.hooks.clone();
+        let session = self.conv_id.clone().unwrap_or_default();
+        let manager = self.permission_manager.clone();
+        let hook = async {
+            let Some(hooks) = hooks else {
+                return None;
+            };
+            use crate::services::tool_hooks::{HookEvent, HookPermissionResponse};
+            let outcome = match hooks.run(HookEvent::PermissionRequest, &session,
+                json!({"tool_name":tool,"tool_input":input,"tool_use_id":id,"permission_suggestions":[]})).await {
+                Ok(outcome) => outcome,
+                Err(error) => { tracing::warn!("PermissionRequest hook failed: {error:#}"); return None; }
+            };
+            for warning in outcome.warnings {
+                tracing::warn!("PermissionRequest hook: {warning}");
+            }
+            match outcome.permission_response? {
+                HookPermissionResponse::Deny { message, interrupt } => {
+                    Some(PermissionResponse::Deny { message, interrupt })
+                }
+                HookPermissionResponse::Allow {
+                    updated_input,
+                    updated_permissions,
+                } => {
+                    let commit = match updated_permissions {
+                        None => None,
+                        Some(value) => {
+                            let Some(manager) = manager else {
+                                return None;
+                            };
+                            let updates = Arc::new(
+                                crate::services::permission_updates::Updates::new(manager, session),
+                            );
+                            match updates.prepare(&value) {
+                                Ok(commit) => Some(commit),
+                                Err(error) => {
+                                    tracing::warn!("PermissionRequest update rejected: {error:#}");
+                                    return None;
+                                }
+                            }
+                        }
+                    };
+                    Some(PermissionResponse::Allow {
+                        updated_input,
+                        commit,
+                    })
+                }
+            }
+        };
         let response = async {
-            tokio::select! {
-                response = typed_rx => response.map_err(|_| anyhow!("Tool approval cancelled")),
-                answer = text_rx => {
-                    let answer = answer.map_err(|_| anyhow!("Tool approval cancelled"))?;
-                    if matches!(answer.trim().to_lowercase().as_str(), "yes"|"y"|"allow"|"ok"|"continue"|"proceed"|"approved"|"always_allow"|"是"|"允许"|"确认"|"继续"|"同意"|"好的"|"可以") {
-                        let commit: Option<crate::native_engine::permission_response::Commit> = if answer.trim().eq_ignore_ascii_case("always_allow") {
-                            self.permission_manager.clone().map(|manager| {
-                                let tool = tool.to_owned();
-                                Box::new(move || {
-                                    manager.set_tool_permission(&tool, crate::permissions::ToolPermission {
-                                        tool_name: tool.clone(), allowed: true, requires_confirmation: false,
-                                        scope: crate::permissions::PermissionScope::Global,
-                                        level: crate::permissions::PermissionLevel::Execute,
-                                    });
-                                    Ok(())
-                                }) as crate::native_engine::permission_response::Commit
-                            })
-                        } else { None };
-                        Ok(PermissionResponse::Allow { updated_input: None, commit })
-                    } else { Ok(PermissionResponse::Deny { message: "User denied the operation".into(), interrupt: false }) }
+            tokio::pin!(hook);
+            let mut text_rx = text_rx;
+            let mut hook_done = false;
+            let mut text_done = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    response = &mut typed_rx => break response.map_err(|_| anyhow!("Tool approval cancelled")),
+                    decision = &mut hook, if !hook_done => {
+                        hook_done = true;
+                        if let Some(decision) = decision {
+                            let _ = crate::native_engine::permission_response::respond(&self.permission_mailbox, &request_id, decision).await;
+                        } else if !self.permission_host_available {
+                            return Err(anyhow!("Tool approval required but no approval host or PermissionRequest hook decision is available"));
+                        }
+                    },
+                    answer = &mut text_rx, if !text_done => {
+                        text_done = true;
+                        let answer = answer.map_err(|_| anyhow!("Tool approval cancelled"))?;
+                        let _ = crate::native_engine::permission_response::respond(&self.permission_mailbox, &request_id, PermissionResponse::Text(answer)).await;
+                    }
                 }
             }
         };
@@ -156,10 +247,68 @@ impl ToolLoopExecutor {
                 .await
                 .map_err(|_| anyhow!("Tool approval timed out"))??
         };
+        let response = if let PermissionResponse::Text(answer) = response {
+            if matches!(
+                answer.trim().to_lowercase().as_str(),
+                "yes"
+                    | "y"
+                    | "allow"
+                    | "ok"
+                    | "continue"
+                    | "proceed"
+                    | "approved"
+                    | "always_allow"
+                    | "是"
+                    | "允许"
+                    | "确认"
+                    | "继续"
+                    | "同意"
+                    | "好的"
+                    | "可以"
+            ) {
+                let commit: Option<crate::native_engine::permission_response::Commit> =
+                    if answer.trim().eq_ignore_ascii_case("always_allow") {
+                        self.permission_manager.clone().map(|manager| {
+                            let tool = tool.to_owned();
+                            Box::new(move || {
+                                manager.set_tool_permission(
+                                    &tool,
+                                    crate::permissions::ToolPermission {
+                                        tool_name: tool.clone(),
+                                        allowed: true,
+                                        requires_confirmation: false,
+                                        scope: crate::permissions::PermissionScope::Global,
+                                        level: crate::permissions::PermissionLevel::Execute,
+                                    },
+                                );
+                                Ok(())
+                            })
+                                as crate::native_engine::permission_response::Commit
+                        })
+                    } else {
+                        None
+                    };
+                PermissionResponse::Allow {
+                    updated_input: None,
+                    commit,
+                }
+            } else {
+                PermissionResponse::Deny {
+                    message: "User denied the operation".into(),
+                    interrupt: false,
+                }
+            }
+        } else {
+            response
+        };
         match response {
+            PermissionResponse::Text(_) => unreachable!("text answer normalized"),
             PermissionResponse::Deny { message, interrupt } => {
                 if interrupt {
-                    self.permission_interrupted = Some(message.clone());
+                    *self
+                        .permission_interrupted
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(message.clone());
                 }
                 anyhow::bail!("{message}");
             }
@@ -176,6 +325,13 @@ impl ToolLoopExecutor {
                     anyhow::ensure!(actual == *input, "Plan transitions require their original reviewed input and dedicated plan choice");
                 }
                 self.validate_approved_input(tool, &actual).await?;
+                anyhow::ensure!(
+                    self.permission_manager
+                        .as_ref()
+                        .map(|manager| manager.policy_snapshot())
+                        == reviewed_policy,
+                    "Permission policy changed during review; request approval again"
+                );
                 if let Some(commit) = commit {
                     commit()?;
                 }
@@ -205,7 +361,12 @@ impl ToolLoopExecutor {
                 )
             }
         };
-        self.approved_call = Some((tool.into(), actual.clone(), id.into()));
+        self.approved_call = Some(ExactApproval {
+            tool: tool.into(),
+            input: actual.clone(),
+            id: id.into(),
+            pre_tool_hook: false,
+        });
         let result = Box::pin(self.execute_tool_call_inner(tool, &actual, id)).await;
         self.approved_call = None;
         result

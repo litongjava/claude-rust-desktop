@@ -109,6 +109,7 @@ pub struct QueryEngine {
     owned_children: super::tool_loop::delegation::OwnedChildren,
     runtime_agents: std::sync::RwLock<HashMap<String, super::runtime_agents::Catalog>>,
     auto_manual_interactive: std::sync::atomic::AtomicBool,
+    permission_host_available: std::sync::atomic::AtomicBool,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
     db_manager: Arc<DbManager>,
@@ -142,6 +143,7 @@ impl QueryEngine {
     ) -> Self {
         Self {
             auto_manual_interactive: std::sync::atomic::AtomicBool::new(false),
+            permission_host_available: std::sync::atomic::AtomicBool::new(true),
             bundled_resources: Arc::default(),
             owned_children: Default::default(),
             runtime_agents: Default::default(),
@@ -174,6 +176,10 @@ impl QueryEngine {
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.cost_tracker = Some(tracker);
         self
+    }
+
+    pub fn set_permission_host_available(&self, available: bool) {
+        self.permission_host_available.store(available, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_auto_manual_interactive(&self, interactive: bool) {
@@ -550,6 +556,7 @@ impl QueryEngine {
         .with_permission_mailbox(self.permission_mailbox.clone())
         .with_permission_manager(self.permission_manager.clone())
         .with_auto_manual_interactive(self.auto_manual_interactive.load(std::sync::atomic::Ordering::Relaxed))
+        .with_permission_host(self.permission_host_available.load(std::sync::atomic::Ordering::Relaxed))
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(self.file_cache.clone(), workspace_path.clone())));
 
         if let Some(ref registry) = self.mcp_registry {
@@ -849,7 +856,15 @@ impl QueryEngine {
         super::permission_response::respond(&self.permission_mailbox, request_id, response).await
     }
 
+    pub async fn permission_completion(&self, request_id: &str) -> tokio::sync::watch::Receiver<bool> {
+        super::permission_response::completion(&self.permission_mailbox, request_id).await
+    }
+
     pub async fn resume_with_answer(&self, conv_id: &str, answer: String) -> Result<()> {
+        if self.permission_mailbox.lock().await.contains_key(conv_id) {
+            return super::permission_response::respond(&self.permission_mailbox, conv_id,
+                super::permission_response::PermissionResponse::Text(answer)).await;
+        }
         let mut waiters = self.answer_waiters.lock().await;
         if let Some(tx) = waiters.remove(conv_id) {
             tx.send(answer).map_err(|_| anyhow!("Failed to send answer: receiver already dropped"))?;

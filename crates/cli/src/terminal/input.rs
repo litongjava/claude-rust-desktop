@@ -1,8 +1,13 @@
 //! Request-driven terminal input: one OS reader, idle until a consumer asks.
 //! History is session-local and restricted to explicit REPL reads. Answers to
 //! permission and provider questions never enter completion or history.
-use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+#[cfg(test)]
+use rustyline::error::ReadlineError;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[path = "editor.rs"]
@@ -30,15 +35,22 @@ enum Message {
 }
 
 struct Request {
+    cancelled: Arc<AtomicBool>,
     prompt: String,
     repl: bool,
     response: oneshot::Sender<io::Result<Option<PromptEvent>>>,
 }
 
+struct PendingRead {
+    receive: oneshot::Receiver<io::Result<Option<PromptEvent>>>,
+    cancelled: Arc<AtomicBool>,
+    repl: bool,
+}
+
 pub struct TerminalInput {
     notices: std::sync::mpsc::Sender<String>,
     requests: std::sync::mpsc::Sender<Message>,
-    pending: Option<oneshot::Receiver<io::Result<Option<PromptEvent>>>>,
+    pending: Option<PendingRead>,
     fixture: Option<mpsc::UnboundedReceiver<String>>,
     queued: std::collections::VecDeque<PromptEvent>,
 }
@@ -93,17 +105,11 @@ impl TerminalInput {
                 if request.response.is_closed() {
                     continue;
                 }
-                let result = if terminal {
-                    if request.repl {
-                        editor.readline(&request.prompt)
-                    } else {
-                        // Answers have no access to prompt history or completion.
-                        match Editor::<(), DefaultHistory>::new() {
-                            Ok(mut answer) => map_readline(answer.readline(&request.prompt))
-                                .map(|value| value.map(PromptEvent::Line)),
-                            Err(error) => Err(io::Error::other(error.to_string())),
-                        }
-                    }
+                let result = if !request.repl {
+                    super::answer_input::read(&mut plain, &request.prompt, &request.cancelled)
+                        .map(|value| value.map(PromptEvent::Line))
+                } else if terminal {
+                    editor.readline(&request.prompt)
                 } else {
                     read_plain(&mut plain, &request.prompt)
                         .map(|value| value.map(PromptEvent::Line))
@@ -183,6 +189,21 @@ impl TerminalInput {
         self.read(prompt, true).await
     }
 
+    /// Dismiss only the outstanding answer generation and wait until the sole OS
+    /// reader acknowledges it. A new prompt can never inherit its response.
+    pub async fn dismiss_answer(&mut self) -> io::Result<()> {
+        if self.pending.as_ref().is_some_and(|pending| pending.repl) {
+            return Err(io::Error::other(
+                "Cannot dismiss an ordinary prompt as an approval",
+            ));
+        }
+        if let Some(mut pending) = self.pending.take() {
+            pending.cancelled.store(true, Ordering::Release);
+            let _ = (&mut pending.receive).await;
+        }
+        Ok(())
+    }
+
     pub async fn read_answer(&mut self, prompt: &str) -> io::Result<Option<String>> {
         match self.read(prompt, false).await? {
             Some(PromptEvent::Line(line)) => Ok(Some(line)),
@@ -204,18 +225,24 @@ impl TerminalInput {
         }
         if self.pending.is_none() {
             let (response, receive) = oneshot::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
             self.requests
                 .send(Message::Read(Request {
+                    cancelled: cancelled.clone(),
                     prompt: prompt.into(),
                     repl,
                     response,
                 }))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Terminal input closed"))?;
-            self.pending = Some(receive);
+            self.pending = Some(PendingRead {
+                receive,
+                cancelled,
+                repl,
+            });
         }
         // Keep the outstanding response in the handle across select! cancellation.
         // There is never a second reader racing for stdin or losing its next line.
-        let result = self.pending.as_mut().unwrap().await;
+        let result = (&mut self.pending.as_mut().unwrap().receive).await;
         self.pending = None;
         result.unwrap_or_else(|_| {
             Err(io::Error::new(
@@ -240,6 +267,7 @@ impl From<mpsc::UnboundedReceiver<String>> for TerminalInput {
     }
 }
 
+#[cfg(test)]
 fn map_readline(result: rustyline::Result<String>) -> io::Result<Option<String>> {
     match result {
         Ok(line) => Ok(Some(line)),
@@ -265,6 +293,117 @@ fn read_plain(reader: &mut impl BufRead, prompt: &str) -> io::Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn piped_answer_reader_cancels_without_stealing_the_next_line() {
+        const FIXTURE: &str = "CLAUDE_TEST_PIPE_ANSWER_READER";
+        if std::env::var_os(FIXTURE).is_some() {
+            let mut reader = io::BufReader::new(io::stdin());
+            let flag = Arc::new(AtomicBool::new(false));
+            let cancelled = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                cancelled.store(true, Ordering::Release);
+            });
+            assert_eq!(
+                super::super::answer_input::read(&mut reader, "", &flag)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+            println!("CANCEL_ACK");
+            io::stdout().flush().unwrap();
+            assert_eq!(
+                super::super::answer_input::read(&mut reader, "", &AtomicBool::new(false))
+                    .unwrap()
+                    .as_deref(),
+                Some("FRESH_RESPONSE")
+            );
+            return;
+        }
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","terminal::input::tests::piped_answer_reader_cancels_without_stealing_the_next_line","--nocapture"])
+            .env(FIXTURE,"1").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        stdin.write_all(b"STALE_ANSWER").await.unwrap();
+        stdin.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if stdout
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("child ended before cancellation ACK")
+                    .contains("CANCEL_ACK")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        stdin.write_all(b"FRESH_RESPONSE\n").await.unwrap();
+        drop(stdin);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissed_answer_waits_for_reader_ack_and_cannot_answer_next_prompt() {
+        let (requests, receive) = std::sync::mpsc::channel();
+        let (notices, _) = std::sync::mpsc::channel();
+        let mut input = TerminalInput {
+            requests,
+            notices,
+            pending: None,
+            fixture: None,
+            queued: Default::default(),
+        };
+        let reader = std::thread::spawn(move || {
+            let Message::Read(first) = receive.recv().unwrap() else {
+                panic!()
+            };
+            while !first.cancelled.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Even an answer already typed in the losing generation is discarded.
+            first
+                .response
+                .send(Ok(Some(PromptEvent::Line("stale yes".into()))))
+                .unwrap();
+            let Message::Read(second) = receive.recv().unwrap() else {
+                panic!()
+            };
+            assert!(!second.cancelled.load(Ordering::Acquire));
+            second
+                .response
+                .send(Ok(Some(PromptEvent::Line("fresh no".into()))))
+                .unwrap();
+        });
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            input.read_answer("First?")
+        )
+        .await
+        .is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(2), input.dismiss_answer())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            input.read_answer("Second?").await.unwrap().as_deref(),
+            Some("fresh no")
+        );
+        reader.join().unwrap();
+    }
     #[test]
     fn piped_input_preserves_unicode_spaces_and_eof() {
         let mut input = io::Cursor::new("  中文  \r\n\nlast");

@@ -467,9 +467,13 @@ pub fn answer_question(
     )?;
     response.flush()?;
     response
-        .persist_noclobber(path)
+        .persist_noclobber(&path)
         .map_err(|error| error.error)
         .context("This question already has an answer or the response could not be published")?;
+    if !pending_question(root, id, parent)?.is_some_and(|question| question.request_id == request) {
+        let _ = fs::remove_file(path);
+        anyhow::bail!("Question was resolved before the answer was published");
+    }
     Ok(())
 }
 
@@ -531,7 +535,50 @@ pub async fn worker_answer(
         .map(Some)
 }
 
+struct PendingAnswerCleanup {
+    dir: PathBuf,
+    request: String,
+}
+
+#[cfg(test)]
+mod answer_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_worker_question_is_removed_without_removing_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.path().to_path_buf();
+        let request = id.clone();
+        let task = tokio::spawn(async move { wait_for_answer(&path, &request, "permission", "Allow?").await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.path().join("pending-question.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!dir.path().join("pending-question.json").exists());
+        let guard = PendingAnswerCleanup { dir:dir.path().into(), request:id.clone() };
+        save(&dir.path().join("pending-question.json"), &PendingQuestion {request_id:"next".into(),question:"Next?".into(),kind:"permission".into()}).unwrap();
+        fs::write(response_path(dir.path(), &id).unwrap(), b"late").unwrap();
+        drop(guard);
+        let pending: PendingQuestion = serde_json::from_slice(&fs::read(dir.path().join("pending-question.json")).unwrap()).unwrap();
+        assert_eq!(pending.request_id, "next");
+        assert!(!response_path(dir.path(), &id).unwrap().exists());
+    }
+}
+impl Drop for PendingAnswerCleanup {
+    fn drop(&mut self) {
+        let pending = self.dir.join("pending-question.json");
+        if fs::read(&pending).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value["request_id"] == self.request) {
+            let _ = fs::remove_file(pending);
+        }
+        if let Ok(response) = response_path(&self.dir, &self.request) { let _ = fs::remove_file(response); }
+    }
+}
+
 async fn wait_for_answer(dir: &Path, request: &str, kind: &str, question: &str) -> Result<String> {
+    let _cleanup = PendingAnswerCleanup { dir: dir.to_path_buf(), request: request.into() };
     save(
         &dir.join("pending-question.json"),
         &PendingQuestion {
@@ -556,9 +603,12 @@ async fn wait_for_answer(dir: &Path, request: &str, kind: &str, question: &str) 
                     .as_str()
                     .context("Invalid background answer")?
                     .to_owned();
-                // Remove pending first so no frontend can reserve the old question.
-                fs::remove_file(dir.join("pending-question.json"))?;
-                fs::remove_file(response_path(dir, request)?)?;
+                // The request-bound guard removes only this generation. An older
+                // waiter must never remove a newly published question.
+                let pending: PendingQuestion = serde_json::from_slice(
+                    &fs::read(dir.join("pending-question.json"))?,
+                )?;
+                ensure!(pending.request_id == request, "Background question was superseded");
                 return Ok(answer);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

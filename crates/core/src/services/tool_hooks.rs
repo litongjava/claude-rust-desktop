@@ -22,6 +22,7 @@ pub enum HookEvent {
     PostToolUse,
     PostToolUseFailure,
     PermissionDenied,
+    PermissionRequest,
     SubagentStart,
     SubagentStop,
     UserPromptSubmit,
@@ -40,6 +41,7 @@ impl HookEvent {
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
             Self::PermissionDenied => "PermissionDenied",
+            Self::PermissionRequest => "PermissionRequest",
             Self::SubagentStart => "SubagentStart",
             Self::SubagentStop => "SubagentStop",
             Self::UserPromptSubmit => "UserPromptSubmit",
@@ -66,6 +68,8 @@ pub struct ActiveHook {
 
 #[derive(Debug, Default)]
 pub struct HookOutcome {
+    pub allow_permission: bool,
+    pub permission_response: Option<HookPermissionResponse>,
     pub blocked: bool,
     pub reason: String,
     pub additional_context: Vec<String>,
@@ -76,6 +80,12 @@ pub struct HookOutcome {
     pub prevent_continuation: bool,
     /// PermissionDenied advice, never an execution grant.
     pub retry: bool,
+}
+
+#[derive(Debug)]
+pub enum HookPermissionResponse {
+    Allow { updated_input: Option<Value>, updated_permissions: Option<Value> },
+    Deny { message: String, interrupt: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +166,7 @@ impl HookRunner {
                     "PostToolUse" => HookEvent::PostToolUse,
                     "PostToolUseFailure" => HookEvent::PostToolUseFailure,
                     "PermissionDenied" => HookEvent::PermissionDenied,
+                    "PermissionRequest" => HookEvent::PermissionRequest,
                     "SubagentStart" => HookEvent::SubagentStart,
                     "SubagentStop" => HookEvent::SubagentStop,
                     "UserPromptSubmit" => HookEvent::UserPromptSubmit,
@@ -270,9 +281,37 @@ impl HookRunner {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        if event == HookEvent::PermissionRequest {
+            use futures::{stream::FuturesUnordered, StreamExt};
+            let mut pending = FuturesUnordered::new();
+            for hook in self.hooks.iter().filter(|hook| hook.event == event) {
+                if !matches_tool(&hook.matcher, &name)? { continue; }
+                let input = Value::Object(input.clone());
+                pending.push(async move {
+                    let (code, stdout, stderr) = execute(hook, &self.workspace, &input).await?;
+                    parse_output(event, code, &stdout, &stderr)
+                });
+            }
+            let mut result = HookOutcome::default();
+            while let Some(outcome) = pending.next().await {
+                match outcome {
+                    Ok(outcome) => {
+                        result.warnings.extend(outcome.warnings);
+                        if outcome.blocked { result.warnings.push(outcome.reason); }
+                        if outcome.permission_response.is_some() {
+                            result.permission_response = outcome.permission_response;
+                            // Dropping the losing futures kills their actual subprocesses.
+                            return Ok(result);
+                        }
+                    }
+                    Err(error) => result.warnings.push(format!("PermissionRequest hook failed: {error:#}")),
+                }
+            }
+            return Ok(result);
+        }
         let mut result = HookOutcome::default();
         for hook in self.hooks.iter().filter(|h| h.event == event) {
-            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::SubagentStop))
+            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PermissionRequest | HookEvent::PostToolUse | HookEvent::SubagentStop))
                 && !matches_tool(&hook.matcher, &name)?
             {
                 continue;
@@ -295,6 +334,11 @@ impl HookRunner {
             result.additional_context.extend(outcome.additional_context);
             result.warnings.extend(outcome.warnings);
             result.ask_permission |= outcome.ask_permission;
+            result.allow_permission |= outcome.allow_permission;
+            if outcome.permission_response.is_some() {
+                result.permission_response = outcome.permission_response;
+                return Ok(result);
+            }
             result.prevent_continuation |= outcome.prevent_continuation;
             result.retry |= outcome.retry;
             if let Some(updated) = outcome.updated_input {
@@ -356,6 +400,30 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     let output: Value = serde_json::from_str(output).context("Hook returned invalid JSON")?;
+    if event == HookEvent::PermissionRequest {
+        if let Some(message) = string_field(&output, "systemMessage")? { result.warnings.push(message.into()); }
+        if let Some(specific) = output.get("hookSpecificOutput") {
+            ensure!(specific.is_object(), "hookSpecificOutput must be an object");
+            ensure!(string_field(specific, "hookEventName")? == Some(event.name()), "Hook returned an incorrect hookEventName");
+            if let Some(decision) = specific.get("decision") {
+                ensure!(decision.is_object(), "PermissionRequest decision must be an object");
+                result.permission_response = Some(match string_field(decision, "behavior")? {
+                    Some("allow") => {
+                        let updated_input = decision.get("updatedInput").map(|value| {
+                            ensure!(value.is_object(), "Hook updatedInput must be an object"); Ok(value.clone())
+                        }).transpose()?;
+                        HookPermissionResponse::Allow { updated_input, updated_permissions: decision.get("updatedPermissions").cloned() }
+                    }
+                    Some("deny") => HookPermissionResponse::Deny {
+                        message: string_field(decision, "message")?.unwrap_or("Permission denied by hook").into(),
+                        interrupt: decision.get("interrupt").map(|value| value.as_bool().context("Hook interrupt must be boolean")).transpose()?.unwrap_or(false),
+                    },
+                    _ => bail!("Invalid PermissionRequest behavior"),
+                });
+            }
+        }
+        return Ok(result);
+    }
     if event == HookEvent::PermissionDenied {
         if let Some(message) = string_field(&output, "systemMessage")? { result.warnings.push(message.into()); }
         if let Some(specific) = output.get("hookSpecificOutput") {
@@ -410,7 +478,7 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
                             .into();
                     }
                     "ask" => result.ask_permission = true,
-                    "allow" => {} // Never override the engine's normal permissions.
+                    "allow" => result.allow_permission = true,
                     _ => bail!("Invalid hook permissionDecision"),
                 }
             }
@@ -604,6 +672,34 @@ impl Drop for ProcessTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_request_requires_typed_event_and_valid_decision() {
+        for output in [
+            json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","decision":{"behavior":"allow"}}}),
+            json!({"hookSpecificOutput":{"decision":{"behavior":"allow"}}}),
+            json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":[]}}}),
+            json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","interrupt":"true"}}}),
+        ] { assert!(parse_output(HookEvent::PermissionRequest,0,&output.to_string(),"").is_err()); }
+        let allow = json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{}}}});
+        assert!(matches!(parse_output(HookEvent::PermissionRequest,0,&allow.to_string(),"").unwrap().permission_response,Some(HookPermissionResponse::Allow {..})));
+        for exit in [1,2] {assert!(parse_output(HookEvent::PermissionRequest,exit,&allow.to_string(),"failure").unwrap().permission_response.is_none());}
+    }
+
+    #[tokio::test]
+    async fn permission_request_hooks_race_each_other_and_ignore_invalid_peers() {
+        let root = tempfile::tempdir().unwrap();
+        let allow = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+        let commands = if cfg!(windows) {
+            vec!["[IO.File]::WriteAllText('slow-started','yes'); Start-Sleep -Seconds 30".into(), "[Console]::Out.Write('{invalid')".into(), format!("while (-not [IO.File]::Exists('slow-started')) {{Start-Sleep -Milliseconds 20}}; [Console]::Out.Write('{allow}')")]
+        } else {
+            vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
+        };
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into())}).collect()};
+        let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
+        assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
+        assert!(root.path().join("slow-started").exists());
+    }
 
     #[test]
     fn matcher_and_output_decisions_are_validated() {

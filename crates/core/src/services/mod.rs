@@ -171,3 +171,5 @@ pub mod remote_access;
 pub mod scheduled_prompts;
 
 pub mod context_usage;
+
+pub mod permission_updates;

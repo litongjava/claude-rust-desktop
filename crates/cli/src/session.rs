@@ -577,6 +577,7 @@ impl Session {
         };
         let interactive_display = input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short && !crate::display_commands::load(self)?.focus;
         self.engine.set_auto_manual_interactive(input.is_some());
+        self.engine.set_permission_host_available(input.is_some() || self.sdk_permissions.is_some() || std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_some());
         let request = self
             .engine
             .send_message_with_history(
@@ -698,18 +699,39 @@ impl Session {
                             format!("Review plan\n{}\n\n{}\n\nApprove this plan and leave plan mode? Implementation will use ask permissions. [y/N]",
                                 tool_input["planFilePath"].as_str().unwrap_or(""), tool_input["plan"].as_str().unwrap_or(""))
                         } else { format!("Allow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?) };
+                        let mut completion = self.engine.permission_completion(&request_id).await;
+                        if *completion.borrow() { continue; }
                         if let Some(sdk) = &self.sdk_permissions {
-                            let decision = sdk.ask(&request_id, &tool_use_id, &tool_name, &tool_input).await?;
-                            self.engine.resume_with_permission(&request_id, decision).await?;
+                            let decision = tokio::select! {
+                                biased;
+                                _ = completion.changed() => None,
+                                decision = sdk.ask(&request_id, &tool_use_id, &tool_name, &tool_input) => Some(decision?),
+                            };
+                            if let Some(decision) = decision {
+                                let _ = self.engine.resume_with_permission(&request_id, decision).await;
+                            } else { sdk.cancel_one(&request_id).await; }
                             progress.set_activity("Working");
                             continue;
                         }
-                        let answer = if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { answer } else {
-                            anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
-                            turn_answer(self, &mut progress, input, question).await?
+                        let answer = {
+                            let answering = async {
+                                if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { Ok(answer) } else {
+                                    anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
+                                    turn_answer(self, &mut progress, input, question).await
+                                }
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = completion.changed() => None,
+                                answer = answering => Some(answer?),
+                            }
                         };
-                        let answer = if ["y", "yes", "是", "允许"].contains(&answer.trim().to_lowercase().as_str()) { "yes" } else { "no" };
-                        self.engine.resume_with_answer(&request_id, answer.into()).await?;
+                        if let Some(answer) = answer {
+                            let answer = if ["y", "yes", "\u{662f}", "\u{5141}\u{8bb8}"].contains(&answer.trim().to_lowercase().as_str()) { "yes" } else { "no" };
+                            let _ = self.engine.resume_with_answer(&request_id, answer.into()).await;
+                        } else if let Some(reader) = input.as_mut() {
+                            reader.dismiss_answer().await?;
+                        }
                         progress.set_activity("Working");
                     },
                     EngineEvent::AskUser { request_id, tool_use_id, tool_input, question, options } => {

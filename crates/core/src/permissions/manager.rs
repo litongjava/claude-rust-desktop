@@ -114,6 +114,22 @@ impl PermissionManager {
             .unwrap_or_else(|e| e.into_inner())
             .insert(conversation.to_owned(), rules);
     }
+    /// Validate or atomically publish a session patch against the latest runtime rules.
+    pub(crate) fn update_runtime_rules(
+        &self, conversation: &str, publish: bool,
+        update: impl FnOnce(&mut Vec<HashMap<String, PermissionAction>>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut revision = self.policy_revision.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runtime = self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = runtime.get(conversation).cloned().unwrap_or_else(|| vec![HashMap::new(); 3]);
+        next.resize_with(3, HashMap::new);
+        update(&mut next)?;
+        if publish {
+            runtime.insert(conversation.into(), next);
+            *revision = revision.wrapping_add(1);
+        }
+        Ok(())
+    }
     pub fn clear_runtime_rules(&self, conversation: &str) {
         let mut revision = self.policy_revision.lock().unwrap_or_else(|e| e.into_inner());
         *revision = revision.wrapping_add(1);

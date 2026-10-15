@@ -208,6 +208,7 @@ async fn observe(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut answered = std::collections::HashSet::new();
     let mut pending: Option<(String, tokio::sync::oneshot::Receiver<String>)> = None;
+    let mut plain_pending: Option<(String, String)> = None;
     let mut side: Option<
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>,
     > = None;
@@ -238,14 +239,25 @@ async fn observe(
                     }
                     render(display, &event);
                 }
-                if pending.is_none() {
-                    if let Some(question) = jobs::pending_question(root, id, owner)?.filter(|question| !answered.contains(&question.request_id)) {
+                let question = jobs::pending_question(root, id, owner)?;
+                let current = question.as_ref().map(|question| question.request_id.as_str());
+                if pending.as_ref().is_some_and(|(request, _)| Some(request.as_str()) != current) {
+                    // Closing this receiver tells the live renderer to discard
+                    // only its answer draft and restore the queued prompt draft.
+                    pending = None;
+                    display.set_activity("Working");
+                }
+                if plain_pending.as_ref().is_some_and(|(request, _)| Some(request.as_str()) != current) {
+                    plain_pending = None;
+                    if let Some(reader) = input.as_mut() { reader.dismiss_answer().await?; }
+                    display.set_activity("Working");
+                }
+                if pending.is_none() && plain_pending.is_none() {
+                    if let Some(question) = question.filter(|question| !answered.contains(&question.request_id)) {
                         if let Some(live) = &display.live {
                             pending = Some((question.request_id, live.question(question.question)));
-                        } else if let Some(reader) = input.as_mut() {
-                            if let Some(answer) = reader.read_answer(&question.question).await? {
-                                jobs::answer_question(root, id, owner, &question.request_id, &answer)?;
-                            }
+                        } else if input.is_some() {
+                            plain_pending = Some((question.request_id, question.question));
                         }
                     }
                 }
@@ -275,7 +287,17 @@ async fn observe(
             },
             answer = async { match pending.as_mut() { Some((_, answer)) => answer.await, None => std::future::pending().await } } => {
                 let (request, _) = pending.take().unwrap();
-                jobs::answer_question(root, id, owner, &request, &answer?)?;
+                answer_if_current(root, id, owner, &request, &answer?)?;
+                answered.insert(request);
+                display.set_activity("Working");
+            },
+            answer = async {
+                if let (Some((_, question)), Some(reader)) = (plain_pending.as_ref(), input.as_mut()) {
+                    reader.read_answer(question).await
+                } else { std::future::pending().await }
+            } => {
+                let (request, _) = plain_pending.take().unwrap();
+                if let Some(answer) = answer? { answer_if_current(root, id, owner, &request, &answer)?; }
                 answered.insert(request);
                 display.set_activity("Working");
             },
@@ -336,6 +358,18 @@ async fn observe(
             },
         }
     }
+}
+
+fn answer_if_current(root: &std::path::Path, id: &str, owner: &str, request: &str, answer: &str) -> Result<()> {
+    if jobs::pending_question(root, id, owner)?.is_some_and(|question| question.request_id == request) {
+        if let Err(error) = jobs::answer_question(root, id, owner, request, answer) {
+            // The hook can claim between the read and atomic answer reservation.
+            if jobs::pending_question(root, id, owner)?.is_some_and(|question| question.request_id == request) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn may_sync_permission_mode(

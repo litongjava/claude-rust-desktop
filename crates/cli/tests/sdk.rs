@@ -18,6 +18,65 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+fn permission_hook_settings(root: &Path, case: &str) {
+    let response = if case == "no-decision" {json!({})} else {json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{"file_path":"hook.txt","content":"HOOK_WINNER"},"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})};
+    let seconds = if case == "host" {3} else {1};
+    let command = if cfg!(windows) {
+        format!("$v=[Console]::In.ReadToEnd() | ConvertFrom-Json; if ($v.tool_use_id -ne 'write-1' -or $v.tool_name -ne 'Write') {{exit 7}}; [IO.File]::WriteAllText('hook-started','yes'); Start-Sleep -Seconds {seconds}; [IO.File]::WriteAllText('hook-finished','yes'); [Console]::Out.Write('{}')", response.to_string().replace('\'', "''"))
+    } else { format!("read input; printf yes > hook-started; sleep {seconds}; printf yes > hook-finished; printf '%s' '{}'", response.to_string().replace('\'', "'\\''")) };
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(root.join("data/settings.json"), json!({"hooks":{"PermissionRequest":[{"matcher":"Write","hooks":[{"type":"command","shell":if cfg!(windows) {"powershell"} else {"sh"},"command":command}]}]}}).to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn permission_request_hooks_race_sdk_and_cancel_only_the_losing_request() {
+    for anthropic in [false, true] {
+        for winner in ["hook", "host", "no-decision"] {
+            let root = tempfile::tempdir().unwrap();
+            permission_hook_settings(root.path(), winner);
+            let server = Server::start(anthropic, Mode::Approval).await;
+            let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+            client.send(user("Write the fixture file")).await;
+            let request = client.frame("control_request").await;
+            assert_eq!(request["request"]["tool_use_id"], "write-1");
+            assert!(!root.path().join("hook-finished").exists(), "hook must not delay SDK prompt publication");
+            if winner == "hook" {
+                let cancel = client.frame("control_cancel_request").await;
+                assert_eq!(cancel["request_id"], request["request_id"]);
+                // A late host response carries a conflicting persistent patch. It must lose.
+                client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":request["request_id"],"response":{"behavior":"allow","updatedInput":{"file_path":"late.txt","content":"LATE"},"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"deny","rules":[{"toolName":"Write"}]}]}}})).await;
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let marker = if winner=="host" {"hook-started"} else {"hook-finished"};
+                    while !root.path().join(marker).exists() {tokio::time::sleep(Duration::from_millis(10)).await;}
+                }).await.unwrap();
+                client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":request["request_id"],"response":{"behavior":"allow","updatedInput":{"file_path":"host.txt","content":"HOST_WINNER"}}}})).await;
+            }
+            let result = client.result().await;
+            assert_eq!(result["is_error"], false, "{anthropic} {winner}: {result}");
+            assert_eq!(root.path().join("hook.txt").exists(), winner=="hook");
+            assert_eq!(root.path().join("host.txt").exists(), winner!="hook");
+            assert!(!root.path().join("approval.txt").exists());
+            assert!(!root.path().join("late.txt").exists());
+            // The winning hook's session patch survives; losing hooks cannot install it.
+            client.send(user("Write again")).await;
+            if winner != "hook" {
+                let next = client.frame("control_request").await;
+                assert_ne!(next["request_id"], request["request_id"]);
+                client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":next["request_id"],"response":{"behavior":"deny"}}})).await;
+            }
+            let next = client.result().await;
+            assert_eq!(next["is_error"], false, "{next}");
+            assert_eq!(root.path().join("approval.txt").exists(), winner=="hook");
+            client.finish().await;
+            if winner == "host" {
+                tokio::time::sleep(Duration::from_millis(3200)).await;
+                assert!(!root.path().join("hook-finished").exists(), "losing hook child must be killed");
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Text,
