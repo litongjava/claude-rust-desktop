@@ -32,19 +32,56 @@ pub struct Goal {
 struct State {
     active: Option<Goal>,
     last: Option<Goal>,
+    #[serde(default)]
+    revision: u64,
 }
 
 fn modify<T>(db: &DbManager, session: &str, f: impl FnOnce(&mut State) -> T) -> Result<T> {
+    modify_with_conn(db, session, |_, state| Ok(f(state)))
+}
+
+fn modify_with_conn<T>(
+    db: &DbManager,
+    session: &str,
+    f: impl FnOnce(&rusqlite::Connection, &mut State) -> Result<T>,
+) -> Result<T> {
     db.with_conn(|conn| -> Result<T> {
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let key = format!("session.goal.{session}");
-        let json: Option<String> = tx.query_row("SELECT value FROM peripheral_settings WHERE key=?1", [&key], |r| r.get(0)).optional()?;
-        let mut state: State = json.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
-        let result = f(&mut state);
-        tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&key, &serde_json::to_string(&state)?])?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let result = modify_conn(&tx, session, f)?;
         tx.commit()?;
         Ok(result)
     })?
+}
+
+fn read_conn(conn: &rusqlite::Connection, session: &str) -> Result<State> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT value FROM peripheral_settings WHERE key=?1",
+            [format!("session.goal.{session}")],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(json
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn modify_conn<T>(
+    conn: &rusqlite::Connection,
+    session: &str,
+    f: impl FnOnce(&rusqlite::Connection, &mut State) -> Result<T>,
+) -> Result<T> {
+    let mut state = read_conn(conn, session)?;
+    let result = f(conn, &mut state)?;
+    conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("session.goal.{session}"), serde_json::to_string(&state)?])?;
+    Ok(result)
+}
+
+/// Explicit goal replacement/cancellation revision, for transactional proposal CAS.
+pub fn revision_conn(conn: &rusqlite::Connection, session: &str) -> Result<u64> {
+    Ok(read_conn(conn, session)?.revision)
 }
 
 pub fn active(db: &DbManager, session: &str) -> Result<Option<Goal>> {
@@ -70,12 +107,54 @@ pub fn status(db: &DbManager, session: &str) -> Result<Option<Goal>> {
 }
 
 pub fn set(db: &DbManager, session: &str, condition: &str) -> Result<Goal> {
+    let goal = new_goal(condition)?;
+    modify(db, session, |s| replace(s, &goal))?;
+    Ok(goal)
+}
+
+/// The caller must hold an immediate transaction and validate the proposal's
+/// approval/revision before calling. This function does not grant authority.
+pub fn set_conn(conn: &rusqlite::Connection, session: &str, condition: &str) -> Result<Goal> {
+    let goal = new_goal(condition)?;
+    modify_conn(conn, session, |_, s| {
+        replace(s, &goal);
+        Ok(())
+    })?;
+    Ok(goal)
+}
+
+pub fn set_from_user(
+    db: &DbManager,
+    session: &str,
+    condition: &str,
+    raw_input: &str,
+) -> Result<Goal> {
+    let goal = new_goal(condition)?;
+    modify_with_conn(db, session, |conn, state| {
+        super::permission_authority::record_conn(
+            conn,
+            session,
+            super::permission_authority::Source::User,
+            &serde_json::json!(raw_input),
+        )?;
+        replace(state, &goal);
+        Ok(())
+    })?;
+    Ok(goal)
+}
+
+fn replace(state: &mut State, goal: &Goal) {
+    state.revision = state.revision.saturating_add(1);
+    state.active = Some(goal.clone());
+}
+
+fn new_goal(condition: &str) -> Result<Goal> {
     let condition = condition.trim();
     ensure!(
         !condition.is_empty() && condition.encode_utf16().count() <= 4000,
         "Goal must contain 1 to 4000 UTF-16 code units"
     );
-    let goal = Goal {
+    Ok(Goal {
         id: uuid::Uuid::new_v4().to_string(),
         condition: condition.into(),
         state: "active".into(),
@@ -90,13 +169,30 @@ pub fn set(db: &DbManager, session: &str, condition: &str) -> Result<Goal> {
         stop_blocks: 0,
         retry_attempts: 0,
         retry_after_ms: None,
-    };
-    modify(db, session, |s| s.active = Some(goal.clone()))?;
-    Ok(goal)
+    })
 }
 
 pub fn clear(db: &DbManager, session: &str) -> Result<bool> {
-    modify(db, session, |s| s.active.take().is_some())
+    modify(db, session, |s| {
+        s.revision = s.revision.saturating_add(1);
+        s.active.take().is_some()
+    })
+}
+
+/// Host-only boundary for an explicit human cancellation. Persist revocation
+/// with the state change so automatic permission review cannot retain only
+/// the earlier goal after cancellation. Internal cleanup must use `clear`.
+pub fn clear_from_user(db: &DbManager, session: &str, raw_input: &str) -> Result<bool> {
+    modify_with_conn(db, session, |conn, state| {
+        super::permission_authority::record_conn(
+            conn,
+            session,
+            super::permission_authority::Source::User,
+            &serde_json::json!(raw_input),
+        )?;
+        state.revision = state.revision.saturating_add(1);
+        Ok(state.active.take().is_some())
+    })
 }
 
 /// Only a real user input resets the shared Stop-hook continuation budget.
@@ -253,6 +349,81 @@ mod tests {
         let b = set(&db, "s", "second").unwrap();
         assert!(!verdict(&db, "s", &a.id, "achieved", "late").unwrap());
         assert_eq!(active(&db, "s").unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn explicit_clear_records_revocation_atomically_and_internal_cleanup_has_no_authority() {
+        use super::super::permission_authority::{history, record_user};
+        use serde_json::json;
+        let (root, db) = db();
+        let db = std::sync::Arc::new(db);
+        let session = crate::runtime::SessionStore::new(db.clone())
+            .create(root.path(), "fixture", "fixture")
+            .unwrap();
+        let goal = set(&db, &session, "Run the tests").unwrap();
+        assert!(history(&db, &session, 8192).unwrap().is_empty());
+        record_user(&db, &session, &json!("/goal Run the tests")).unwrap();
+        db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_goal_revocation BEFORE INSERT ON session_permission_authority BEGIN SELECT RAISE(ABORT,'fixture failure'); END;"))
+            .unwrap().unwrap();
+        assert!(clear_from_user(&db, &session, "/goal clear").is_err());
+        assert!(set_from_user(&db, &session, "replacement", "/goal replacement").is_err());
+        assert_eq!(active(&db, &session).unwrap().unwrap().id, goal.id);
+        assert_eq!(
+            db.with_conn(|conn| revision_conn(conn, &session))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(history(&db, &session, 8192).unwrap().len(), 1);
+        db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_goal_revocation"))
+            .unwrap()
+            .unwrap();
+        assert!(clear_from_user(&db, &session, "/goal CLEAR").unwrap());
+        assert!(active(&db, &session).unwrap().is_none());
+        let expected = vec![
+            json!({"role":"user","content":"/goal Run the tests"}),
+            json!({"role":"user","content":"/goal CLEAR"}),
+        ];
+        assert_eq!(history(&db, &session, 8192).unwrap(), expected);
+        set(&db, &session, "internal restoration").unwrap();
+        clear(&db, &session).unwrap();
+        assert_eq!(history(&db, &session, 8192).unwrap(), expected);
+        // A cancellation still expresses current user intent if a concurrent
+        // evaluator already completed the active goal.
+        assert!(!clear_from_user(&db, &session, "/goal stop").unwrap());
+        assert_eq!(history(&db, &session, 8192).unwrap().len(), 3);
+        assert_eq!(
+            db.with_conn(|conn| revision_conn(conn, &session))
+                .unwrap()
+                .unwrap(),
+            5
+        );
+        set_from_user(&db, &session, "Run tests only", "/goal Run tests only").unwrap();
+        assert_eq!(
+            history(&db, &session, 8192).unwrap().last().unwrap()["content"],
+            "/goal Run tests only"
+        );
+    }
+
+    #[test]
+    fn proposal_revision_changes_only_on_explicit_set_or_clear_and_rolls_back() {
+        let (_root, db) = db();
+        let goal = set(&db, "s", "first").unwrap();
+        record_turn(&db, "s", &goal.id, 7, 1, 0).unwrap();
+        verdict(&db, "s", &goal.id, "continue", "still working").unwrap();
+        begin_input(&db, "s").unwrap();
+        db.with_conn(|conn| -> Result<()> {
+            assert_eq!(revision_conn(conn, "s")?, 1);
+            let tx = conn.unchecked_transaction()?;
+            set_conn(&tx, "s", "approved proposal")?;
+            assert_eq!(revision_conn(&tx, "s")?, 2);
+            tx.rollback()?;
+            assert_eq!(revision_conn(conn, "s")?, 1);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(active(&db, "s").unwrap().unwrap().condition, "first");
     }
     #[test]
     fn shared_budget_exceeds_three_then_pauses_and_resumes_without_affecting_children() {

@@ -208,7 +208,11 @@ pub async fn handle(
             use claude_core::services::session_goals as goals;
             migrate_goal(session)?;
             if is_goal_clear(argument) {
-                if goals::clear(&session.store.db, &session.id)? {
+                if goals::clear_from_user(
+                    &session.store.db,
+                    &session.id,
+                    &format!("{command} {argument}"),
+                )? {
                     eprintln!("Goal cleared. The current turn may finish; automatic goal continuation is disabled.");
                 } else {
                     eprintln!("No goal set");
@@ -216,7 +220,12 @@ pub async fn handle(
                 return Ok(true);
             } else if !argument.is_empty() {
                 ensure_goal_allowed(session)?;
-                goals::set(&session.store.db, &session.id, argument)?;
+                goals::set_from_user(
+                    &session.store.db,
+                    &session.id,
+                    argument,
+                    &format!("{command} {argument}"),
+                )?;
             }
             eprintln!("{}", goal_status(session)?);
         }
@@ -263,7 +272,11 @@ pub fn live_goal_command(session: &Session, prompt: &str) -> Result<Option<Strin
         return Ok(None);
     }
     if is_goal_clear(argument) {
-        claude_core::services::session_goals::clear(&session.store.db, &session.id)?;
+        claude_core::services::session_goals::clear_from_user(
+            &session.store.db,
+            &session.id,
+            prompt,
+        )?;
         return Ok(Some(
             "Goal cleared. Current work may finish; goal continuation is disabled.".into(),
         ));
