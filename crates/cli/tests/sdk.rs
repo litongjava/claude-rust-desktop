@@ -23,6 +23,7 @@ enum Mode {
     Text,
     Approval,
     Question,
+    Plan,
     Truncated,
     TruncatedThinking,
     TruncatedTool,
@@ -61,7 +62,8 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         state.mode,
         Mode::Truncated | Mode::TruncatedTool | Mode::TruncatedThinking
     ) || matches!(state.mode, Mode::ReadThenTruncated) && count > 1;
-    let tool = matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
+    let tool = matches!(state.mode, Mode::Plan) && count == 1
+        || matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
         || matches!(state.mode, Mode::ReadThenTruncated) && count == 1
         || matches!(state.mode, Mode::Approval | Mode::Question) && count % 2 == 1;
     let stream = if state.anthropic {
@@ -75,6 +77,8 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                     "AskUserQuestion",
                     json!({"question":"Which language?","description":"Choose the implementation language","multiSelect":true,"options":[{"label":"Rust","description":"Memory safety"},{"label":"Go","description":"Fast compilation"}]}),
                 )
+            } else if matches!(state.mode, Mode::Plan) {
+                ("plan-1", "ExitPlanMode", json!({"plan":"APPROVED_PLAN_SENTINEL"}))
             } else {
                 ("read-1", "Read", json!({"file_path":"fixture.txt"}))
             };
@@ -98,6 +102,8 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         let delta = if tool {
             if matches!(state.mode, Mode::Question) {
                 json!({"tool_calls":[{"index":0,"id":"question-1","type":"function","function":{"name":"AskUserQuestion","arguments":json!({"question":"Which language?","description":"Choose the implementation language","multiSelect":true,"options":[{"label":"Rust","description":"Memory safety"},{"label":"Go","description":"Fast compilation"}]}).to_string()}}]})
+            } else if matches!(state.mode, Mode::Plan) {
+                json!({"tool_calls":[{"index":0,"id":"plan-1","type":"function","function":{"name":"ExitPlanMode","arguments":json!({"plan":"APPROVED_PLAN_SENTINEL"}).to_string()}}]})
             } else if matches!(state.mode, Mode::Approval) {
                 json!({"tool_calls":[{"index":0,"id":"write-1","type":"function","function":{"name":"Write","arguments":json!({"file_path":"approval.txt","content":"ACTUAL_APPROVED_WRITE"}).to_string()}}]})
             } else {
@@ -869,4 +875,37 @@ async fn dont_ask_control_denies_write_without_sdk_permission_request() {
     assert_eq!(client.result().await["is_error"], false);
     assert!(root.path().join("approval.txt").exists());
     assert!(client.finish().await.0.success());
+}
+
+#[tokio::test]
+async fn sdk_plan_clear_boundary_survives_actual_cli_process() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::Plan).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(root.path(), &server, &["--permission-mode", "plan"]);
+        client.send(user("OLD_HISTORY_SENTINEL")).await;
+        let request = client.frame("control_request").await;
+        let mut updated = request["request"]["input"].clone();
+        let question = updated["questions"][0]["question"].as_str().unwrap().to_owned();
+        let choice = updated["questions"][0]["options"][0]["label"].as_str().unwrap().to_owned();
+        assert_eq!(choice, claude_core::services::plan_approval::OPTIONS[0]);
+        updated["answers"] = json!({question: choice});
+        client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":request["request_id"],"response":{"behavior":"allow","updatedInput":updated}}})).await;
+        let result = client.result().await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert!(client.finish().await.0.success());
+        let requests = server.fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let resumed = requests[1]["messages"].to_string();
+        assert!(resumed.contains("APPROVED_PLAN_SENTINEL"));
+        assert!(!resumed.contains("OLD_HISTORY_SENTINEL"));
+        let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let session = result["session_id"].as_str().unwrap();
+        assert!(claude_core::services::plan_approval::latest_boundary(&store.db, session).unwrap().is_some());
+        let history = store.model_history(session, &claude_core::native_engine::provider_manager::ApiFormat::OpenAI).unwrap();
+        let history = serde_json::to_string(&history).unwrap();
+        assert!(history.contains("APPROVED_PLAN_SENTINEL"));
+        assert!(!history.contains("OLD_HISTORY_SENTINEL"));
+    }
 }

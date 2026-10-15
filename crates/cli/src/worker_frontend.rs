@@ -431,6 +431,7 @@ fn plan_event_mode(event: &Value) -> Option<claude_core::permissions::Permission
         "ExitPlanMode" | "plan_mode" if output["approved"] == true && output["mode"] == "ask" => {
             Some(PermissionMode::AskPermissions)
         }
+        "ExitPlanMode" | "plan_mode" if output["approved"] == true && output["mode"] == "accept_edits" => Some(PermissionMode::AcceptEdits),
         _ => None,
     }
 }

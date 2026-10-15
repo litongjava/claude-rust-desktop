@@ -59,6 +59,8 @@ mod durable_input_tests;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
+    /// A durable plan boundary; hosts must finish the old assistant segment before it.
+    ContextReset { session_id: String, boundary_id: String },
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
         session_id: String,
@@ -162,6 +164,7 @@ pub struct ToolLoopExecutor {
     durable_user_input: bool,
     message_inbox: Option<crate::services::session_messages::Target>,
     message_deliveries: usize,
+    pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
 }
 
@@ -519,6 +522,7 @@ impl ToolLoopExecutor {
             durable_user_input: false,
             message_inbox: None,
             message_deliveries: 0,
+            pending_plan_reset: None,
             allowed_directories: Vec::new(),
         }
     }
@@ -564,6 +568,9 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_tool_call(&mut self, name: &str, input: &Value, id: &str) -> (Value, String, bool) {
+        if self.pending_plan_reset.is_some() {
+            return (input.clone(), "Tool skipped: the user cleared planning context. Request it again from the approved implementation context.".into(), true);
+        }
         use crate::services::tool_hooks::HookEvent;
         let Some(hooks) = self.hooks.clone() else { return Box::pin(self.execute_tool_call_inner(name, input, id)).await; };
         let session = self.conv_id.clone().unwrap_or_else(|| "unknown".into());
@@ -743,6 +750,11 @@ impl ToolLoopExecutor {
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
+        if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
+            self.messages = vec![json!({"role":"user","content":content})];
+            self.stop_hook_active = false;
+            let _ = self.event_tx.send(EngineEvent::ContextReset { session_id: self.conv_id.clone().unwrap_or_default(), boundary_id }).await;
+        }
         // The OS lock is scoped to this future: cancellation/crash releases it.
         let inbox_owner = match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
             (Some(root), Some(session)) => crate::services::session_messages::Consumer::attach(root, session)?,
@@ -754,7 +766,7 @@ impl ToolLoopExecutor {
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
                 let path = crate::services::plans::path(root, session)?;
-                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nThe only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit; all other file changes remain prohibited.\n", path.display()));
+                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWhile planning mode is active, the only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit; all other file changes remain prohibited until the user approves leaving plan mode.\n", path.display()));
             }
         }
 
@@ -1677,6 +1689,9 @@ impl ToolLoopExecutor {
             }
             if has_tool_use && !pending_tool_calls.is_empty() {
                 let mut tool_results: Vec<AnthropicMessage> = Vec::new();
+                if pending_tool_calls.iter().any(|t| matches!(t.name.as_str(), "ExitPlanMode" | "plan_mode")) {
+                    for call in &mut pending_tool_calls { call.requires_user_interaction = true; }
+                }
 
                 let (serial_calls, parallel_calls): (Vec<_>, Vec<_>) = pending_tool_calls
                     .into_iter()
@@ -1753,6 +1768,14 @@ impl ToolLoopExecutor {
 
                 for tool_result_msg in tool_results {
                     conversation_messages.push(tool_result_msg);
+                }
+                if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
+                    self.messages = vec![json!({"role":"user","content":content})];
+                    conversation_messages = vec![AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) }];
+                    full_text.clear();
+                    self.messages.clear();
+                    self.stop_hook_active = false;
+                    let _ = self.event_tx.send(EngineEvent::ContextReset { session_id: self.conv_id.clone().unwrap_or_default(), boundary_id }).await;
                 }
             } else {
                 let incoming = if iteration + 1 < self.max_tool_iterations { self.drain_peer_messages()? } else { Vec::new() };
@@ -2154,6 +2177,9 @@ impl ToolLoopExecutor {
                 }
 
                 let mut tool_results: Vec<OpenAIMessage> = Vec::new();
+                if pending_tool_calls.iter().any(|t| matches!(t.name.as_str(), "ExitPlanMode" | "plan_mode")) {
+                    for call in &mut pending_tool_calls { call.requires_user_interaction = true; }
+                }
 
                 let (serial_calls, parallel_calls): (Vec<_>, Vec<_>) = pending_tool_calls
                     .into_iter()
@@ -2231,6 +2257,14 @@ impl ToolLoopExecutor {
 
                 for tool_result_msg in tool_results {
                     conversation_messages.push(tool_result_msg);
+                }
+                if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
+                    self.messages = vec![json!({"role":"user","content":content})];
+                    conversation_messages = vec![OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None }];
+                    full_text.clear();
+                    self.messages.clear();
+                    self.stop_hook_active = false;
+                    let _ = self.event_tx.send(EngineEvent::ContextReset { session_id: self.conv_id.clone().unwrap_or_default(), boundary_id }).await;
                 }
             } else {
                 let incoming = if iteration + 1 < self.max_tool_iterations { self.drain_peer_messages()? } else { Vec::new() };

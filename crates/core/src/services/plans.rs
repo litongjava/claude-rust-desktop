@@ -339,7 +339,7 @@ pub fn definitions() -> Vec<crate::tools::ToolDefinition> {
         },
         crate::tools::ToolDefinition {
             name: "ExitPlanMode".into(),
-            description: "Read the current session plan file (or save supplied Markdown) and ask the user to approve leaving plan mode. Supply plan text, or omit it to review the existing session plan. Approval switches to ask permissions; it never grants blanket Bash/write access. Rejection keeps planning mode active.".into(),
+            description: "Read the current session plan file (or save supplied Markdown) and ask the user to approve leaving plan mode. Supply plan text, or omit it to review the existing session plan. The user chooses clear context plus accept-edits, keep context plus accept-edits, manual approval, or further planning. Existing deny/confirmation rules remain enforced; no bypass or auto mode is granted.".into(),
             input_schema: json!({"type":"object","properties":{"plan":{"type":"string","description":"Complete Markdown implementation and verification plan"}},"additionalProperties":false}),
         },
     ]

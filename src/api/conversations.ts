@@ -577,6 +577,10 @@ export async function reconnectStream(
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
             }
+            if (parsed.type === 'context_reset') {
+              fullText = ''; thinkingText = '';
+              onSystem?.('context_reset', '', parsed);
+            }
             if (parsed.type === 'tool_permission' && onSystem) {
               onSystem('tool_permission', '', parsed);
             }

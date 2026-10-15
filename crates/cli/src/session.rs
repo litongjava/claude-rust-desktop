@@ -507,6 +507,7 @@ impl Session {
         let mut error = None;
         let mut completed = false;
         let mut snapshots = Vec::<Value>::new();
+        let mut observed_plan_boundary = claude_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
         let mut tools = Vec::<message_repo::ToolCallRow>::new();
         let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -565,6 +566,12 @@ impl Session {
                         else { progress.thinking(); }
                     },
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
+                    EngineEvent::ContextReset { session_id, boundary_id } if session_id == self.id => {
+                        claude_core::services::plan_approval::archive_segment(&self.store.db, &self.id, &boundary_id, None, &text, &thinking_text, &tools, &snapshots)?;
+                        text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
+                        observed_plan_boundary = Some(boundary_id);
+                        progress.notice("Planning context cleared. The approved plan starts a fresh context in this session; prior messages remain archived.");
+                    },
                     EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => progress.agent_progress(&session_id, &agent_type, &status, tool_name.as_deref()),
                     EngineEvent::Usage(value) => { progress.reported_usage(&value); if let Some(fields) = value.as_object() { for (key, value) in fields { usage[key] = value.clone(); } } },
                     EngineEvent::Error(message) => { progress.clear(); error = Some(message); },
@@ -643,6 +650,14 @@ impl Session {
         progress.clear();
         // Cancel and join before persisting, including Ctrl+C and closed stdin.
         self.engine.cancel_turn(&self.id).await;
+        // Cancellation may happen after the atomic boundary commit but before its event.
+        let latest_boundary = claude_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
+        if latest_boundary != observed_plan_boundary {
+            if let Some(boundary) = latest_boundary {
+                claude_core::services::plan_approval::archive_segment(&self.store.db, &self.id, &boundary, None, &text, &thinking_text, &tools, &snapshots)?;
+                text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
+            }
+        }
         if claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_none() {
             if let Err(error) = self.set_permission_mode(self.permission_mode()).await {
                 progress.notice(&format!("Could not save permission mode: {error:#}"));
@@ -803,6 +818,7 @@ fn duplicate_tool_result(event: &EngineEvent, tools: &[message_repo::ToolCallRow
 
 fn event_json(event: &EngineEvent) -> Option<Value> {
     Some(match event {
+        EngineEvent::ContextReset { session_id, boundary_id } => json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id}),
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
         EngineEvent::Thinking(delta) => json!({"type":"thinking","delta":delta}),
         EngineEvent::Usage(usage) => json!({"type":"usage","usage":usage}),

@@ -1,6 +1,9 @@
 use super::*;
 use crate::{permissions::PermissionMode, services::plans};
 use anyhow::Context;
+#[cfg(test)]
+#[path = "plan_approval_tests.rs"]
+mod approval_tests;
 
 impl ToolLoopExecutor {
     pub(super) fn is_plan_document_tool(&self, tool: &str, input: &Value) -> bool {
@@ -33,6 +36,7 @@ impl ToolLoopExecutor {
                     let request = uuid::Uuid::new_v4().to_string();
                     let (tx, rx) = oneshot::channel();
                     self.answer_waiters.lock().await.insert(request.clone(), tx);
+                    let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request.clone() };
                     if self.event_tx.send(EngineEvent::ToolPermission {request_id:request.clone(),tool_use_id:id.into(),tool_name:tool.into(),input:input.clone()}).await.is_err() {
                         self.answer_waiters.lock().await.remove(&request);
                         anyhow::bail!("Approval host disconnected");
@@ -94,6 +98,7 @@ impl ToolLoopExecutor {
                 let request = uuid::Uuid::new_v4().to_string();
                 let (tx, rx) = oneshot::channel();
                 self.answer_waiters.lock().await.insert(request.clone(), tx);
+                let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request.clone() };
                 if self
                     .event_tx
                     .send(EngineEvent::ToolPermission {
@@ -184,19 +189,24 @@ impl ToolLoopExecutor {
         let plan = plans::read(&root, &session)?
             .filter(|plan| !plan.trim().is_empty())
             .ok_or_else(|| anyhow!("No plan written yet; write the session plan file, then call ExitPlanMode (or supply plan text)"))?;
+        let expected_mode = manager.mode_snapshot();
+        anyhow::ensure!(expected_mode.mode == PermissionMode::PlanMode, "Planning mode changed before approval");
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.answer_waiters
             .lock()
             .await
             .insert(request_id.clone(), tx);
+        let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
+        let question = format!("Review plan\n{}\n\n{plan}\n\nChoose 1?4, or feedback: <changes>. Clear context preserves this session and its archived transcript.", path.display());
         let sent = self
             .event_tx
-            .send(EngineEvent::ToolPermission {
+            .send(EngineEvent::AskUser {
                 request_id: request_id.clone(),
                 tool_use_id: id.into(),
-                tool_name: "ExitPlanMode".into(),
-                input: json!({"plan":plan,"planFilePath":path,"permissionMode":"ask"}),
+                tool_input: json!({"plan":plan,"planFilePath":path,"planApproval":true,"question":format!("Review plan\n{}\n\n{plan}\n\nChoose 1–4, or feedback: <changes>. Clear context preserves this session and its archived transcript.", path.display()),"options":crate::services::plan_approval::OPTIONS.iter().map(|label| json!({"label":label})).collect::<Vec<_>>(),"multiSelect":false}),
+                question: format!("Review plan\n{}\n\n{plan}\n\nChoose 1–4, or feedback: <changes>. Clear context preserves this session and its archived transcript.", path.display()),
+                options: crate::services::plan_approval::OPTIONS.iter().map(|s|s.to_string()).collect(),
             })
             .await;
         if sent.is_err() {
@@ -205,16 +215,9 @@ impl ToolLoopExecutor {
         }
         let answer = self.wait_for_user_answer(rx).await;
         self.answer_waiters.lock().await.remove(&request_id);
-        let approved = answer
-            .ok()
-            .and_then(|answer| answer.ok())
-            .is_some_and(|answer| {
-                matches!(
-                    answer.trim().to_lowercase().as_str(),
-                    "yes" | "y" | "allow" | "approved" | "允许" | "是"
-                )
-            });
-        anyhow::ensure!(approved, "Plan was not approved; planning mode retained");
+        let answer = answer.context("Plan approval cancelled; planning mode retained")??;
+        use crate::services::plan_approval::{self, Choice};
+        let choice = plan_approval::parse(&answer)?;
         anyhow::ensure!(
             plans::read(&root, &session)?.as_deref() == Some(plan.as_str()),
             "Plan changed during review; request approval again"
@@ -223,17 +226,26 @@ impl ToolLoopExecutor {
             manager.get_mode() == PermissionMode::PlanMode,
             "Permission mode changed during review; approval was not applied"
         );
-        if tool_name == "plan_mode" {
-            crate::tools::coordination::execute(
-                "plan_mode",
-                json!({"operation":"exit"}),
-                &self.workspace_cwd,
-            )?;
+        if let Choice::Revise(feedback) = choice {
+            return Ok(json!({"approved":false,"mode":"plan","feedback":feedback,"message":"Keep planning. Apply the user's feedback before requesting approval again."}));
         }
-        manager.set_mode(PermissionMode::AskPermissions);
+        let clear = choice == Choice::ClearEdits;
+        let context = crate::services::session_messages::context(&root)?;
+        if clear {
+            let message = format!("Implement the following approved plan:\n\n{plan}\n\nPrior conversation context has been cleared. Its transcript remains archived locally in session {session}. Existing permission rules remain in force.");
+            let boundary = plan_approval::commit_approved_boundary(&context, &session, &message, &manager, expected_mode)?;
+            self.pending_plan_reset = Some((boundary, message));
+        }
+        let mode = if choice == Choice::Manual { PermissionMode::AskPermissions } else { PermissionMode::AcceptEdits };
+        if !clear { plan_approval::commit_approved_mode(&context, &session, &manager, expected_mode, mode)?; }
+        // The old project-wide plan record is a compatibility mirror, never the
+        // authority for permission changes. Update only after approval commits.
+        let legacy_warning = if tool_name == "plan_mode" {
+            crate::tools::coordination::execute("plan_mode",json!({"operation":"exit"}),&self.workspace_cwd).err().map(|e|format!("Legacy plan state could not be updated: {e:#}"))
+        } else { None };
         Ok(
-            json!({"approved":true,"mode":"ask","planFilePath":path,"plan":plan,
-            "message":"Plan approved. Implementation may proceed under normal ask permissions."}),
+            json!({"approved":true,"mode":if mode == PermissionMode::AskPermissions {"ask"} else {"accept_edits"},"clearContext":clear,"planFilePath":path,"plan":plan,
+            "warning":legacy_warning,"message":"Plan approved under the selected permission mode. Existing deny and confirmation rules remain in force."}),
         )
     }
 }
@@ -446,17 +458,16 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let EngineEvent::ToolPermission {
+            let EngineEvent::AskUser {
                 request_id,
                 tool_use_id,
-                tool_name,
-                input,
+                tool_input: input,
+                ..
             } = event
             else {
                 panic!("Expected plan approval");
             };
             assert_eq!(tool_use_id, "exit");
-            assert_eq!(tool_name, "ExitPlanMode");
             assert!(input["plan"].as_str().unwrap().contains("修复"));
             assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
             if answer == Some("changed") {
@@ -483,15 +494,15 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 failed,
-                !matches!(answer, Some("yes" | "legacy")),
+                !matches!(answer, Some("yes" | "legacy" | "no")),
                 "{output}"
             );
             assert_eq!(
                 manager.get_mode(),
-                if failed {
-                    PermissionMode::PlanMode
-                } else {
+                if matches!(answer, Some("yes" | "legacy")) {
                     PermissionMode::AskPermissions
+                } else {
+                    PermissionMode::PlanMode
                 }
             );
             assert!(waiters.lock().await.is_empty());
@@ -590,8 +601,8 @@ mod tests {
                     .execute_tool_call("ExitPlanMode", &json!({}), "exit")
                     .await
             });
-            let EngineEvent::ToolPermission {
-                request_id, input, ..
+            let EngineEvent::AskUser {
+                request_id, tool_input: input, ..
             } = timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap()
@@ -612,13 +623,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(failed, answer != Some("yes"), "{out}");
+            assert_eq!(failed, answer.is_none(), "{out}");
             assert_eq!(
                 manager.get_mode(),
-                if failed {
-                    PermissionMode::PlanMode
-                } else {
+                if answer == Some("yes") {
                     PermissionMode::AskPermissions
+                } else {
+                    PermissionMode::PlanMode
                 }
             );
             assert!(waiters.lock().await.is_empty());
@@ -770,13 +781,11 @@ mod tests {
                     let mut approvals = 0;
                     while let Some(event) = events.recv().await {
                         match event {
-                            EngineEvent::ToolPermission {
+                            EngineEvent::AskUser {
                                 request_id,
-                                tool_name,
-                                input,
+                                tool_input: input,
                                 ..
                             } => {
-                                assert_eq!(tool_name, "ExitPlanMode");
                                 assert_eq!(input["plan"], "# Stream plan\nRun regression tests");
                                 approvals += 1;
                                 waiters
@@ -811,7 +820,7 @@ mod tests {
                 for (name, output, failed) in &results[..3] {
                     assert!(!failed, "{format} {name}: {output}");
                 }
-                assert_eq!(results[3].2, answer != "yes");
+                assert!(!results[3].2);
                 assert_eq!(
                     manager.get_mode(),
                     if answer == "yes" {

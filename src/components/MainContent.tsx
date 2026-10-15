@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { planModeFromTool, approvedPermissionModeFromTool } from '../features/streaming/planMode';
 import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, Loader2, Smartphone, Terminal, Monitor } from 'lucide-react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconWebSearch } from './Icons';
@@ -707,6 +708,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 });
               },
               (event, message, data) => {
+                if (event === 'context_reset' && data?.boundary_id) {
+                  setMessagesFor(convId, prev => prev.some(item => item.id === data.boundary_id) ? prev : [...prev, { id: data.boundary_id, role: 'user', content: data.content, is_compact_boundary: true }, { id: data.assistant_id, role: 'assistant', content: '' }]);
+                  setPlanMode(false);
+                }
                 if (event === 'ask_user' && data) {
                   setAskUserDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, questions: data.questions || [], answers: {} });
                 }
@@ -743,8 +748,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 }
               },
               (toolEvent) => {
-                if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
-                if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+                const planMode = planModeFromTool(toolEvent);
+                if (planMode !== null) setPlanMode(planMode);
+                const approvedMode = approvedPermissionModeFromTool(toolEvent);
+                if (approvedMode) useChatStore.getState().setPermissionMode(approvedMode);
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];

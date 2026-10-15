@@ -230,7 +230,7 @@ impl ToolLoopExecutor {
         if let Some(memory) = &self.memex_client {
             child = child.with_memex(memory.clone());
         }
-        let assistant_id = uuid::Uuid::new_v4().to_string();
+        let mut assistant_id = uuid::Uuid::new_v4().to_string();
         let mut tool_index = 0;
         let mut web_evidence = Vec::new();
         let mut evidence_ids = std::collections::HashSet::new();
@@ -241,6 +241,10 @@ impl ToolLoopExecutor {
                 biased;
                 Some(event) = receiver.recv() => {
                     match event {
+                        EngineEvent::ContextReset { .. } => {
+                            assistant_id = uuid::Uuid::new_v4().to_string();
+                            tool_index = 0;
+                        }
                         event @ (EngineEvent::AskUser {..} | EngineEvent::ToolPermission {..} | EngineEvent::Usage(_) | EngineEvent::AgentProgress {..}) => { let _ = self.event_tx.send(event).await; }
                         EngineEvent::ToolUseStart { tool_name, .. } => {
                             let _ = self.event_tx.send(state.progress("running", Some(tool_name))).await;

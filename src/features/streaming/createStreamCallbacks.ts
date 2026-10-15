@@ -1,4 +1,6 @@
+import { useChatStore } from '../../stores/useChatStore';
 import { getConversation, getContextSize, getAttachmentUrl } from '../../api';
+import { planModeFromTool, approvedPermissionModeFromTool } from './planMode';
 import { persistMessages } from '../../api/conversations';
 import { compactConversation } from '../../api';
 import { useTabStore } from '../../stores/useTabStore';
@@ -333,6 +335,15 @@ export function createStreamCallbacks(ctx: StreamContext) {
       }
     }
     if (event === 'context_size' && data) setContextInfo({ tokens: data.tokens, limit: data.limit });
+    if (event === 'context_reset' && data?.boundary_id) {
+      setMessagesFor(conversationId, prev => {
+        if (prev.some(message => message.id === data.boundary_id)) return prev;
+        const next = [...prev, { id: data.boundary_id, role: 'user', content: data.content, is_compact_boundary: true }, { id: data.assistant_id, role: 'assistant', content: '' }];
+        messagesBufferRef.current.set(conversationId, next);
+        return next;
+      });
+      setPlanMode(false);
+    }
     if (event === 'tool_text_offset' && data?.offset != null) {
       setMessages(prev => {
         const newMsgs = [...prev];
@@ -495,8 +506,10 @@ export function createStreamCallbacks(ctx: StreamContext) {
         content: toolEvent.content, is_error: toolEvent.is_error, status: toolEvent.is_error ? 'error' : 'done',
       });
     }
-    if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
-    if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+    const planMode = planModeFromTool(toolEvent);
+    if (planMode !== null) setPlanMode(planMode);
+                const approvedMode = approvedPermissionModeFromTool(toolEvent);
+                if (approvedMode) useChatStore.getState().setPermissionMode(approvedMode);
 
     setMessagesFor(conversationId, prev => {
       const newMsgs = [...prev];

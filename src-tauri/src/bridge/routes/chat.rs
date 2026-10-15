@@ -216,7 +216,8 @@ pub(super) async fn chat_handler(
             }
         };
 
-        let assistant_id = uuid::Uuid::new_v4().to_string();
+        let mut assistant_id = uuid::Uuid::new_v4().to_string();
+        let mut observed_plan_boundary = claude_core::services::plan_approval::latest_boundary(&db_clone, &conv_id).unwrap_or(None);
         let mut request_snapshots = Vec::<serde_json::Value>::new();
         let db_number = db_clone.clone();
         let conv_number = conv_id.clone();
@@ -256,6 +257,20 @@ pub(super) async fn chat_handler(
                 }
             };
             let event_data = match event {
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id } => {
+                    if session_id == conv_id {
+                        let rows = collected_tool_calls.iter().enumerate().map(|(i,(id,name,input,output,is_error))| crate::db::message_repo::ToolCallRow { id:id.clone(),message_id:assistant_id.clone(),name:name.clone(),input:Some(input.clone()),output:output.clone(),is_error:*is_error,sort_order:i as i64 }).collect::<Vec<_>>();
+                        if let Err(error) = claude_core::services::plan_approval::archive_segment(&db_clone, &conv_id, &boundary_id, Some(&assistant_id), &full_text, "", &rows, &request_snapshots) {
+                            terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot archive planning context: {error:#}")}));
+                            break;
+                        }
+                        assistant_id = uuid::Uuid::new_v4().to_string();
+                        full_text.clear(); collected_tool_calls.clear(); request_snapshots.clear();
+                        observed_plan_boundary = Some(boundary_id.clone());
+                    }
+                    let content = db_clone.with_conn(|conn| crate::db::message_repo::get_message(conn, &boundary_id)).ok().and_then(Result::ok).flatten().map(|m|m.content).unwrap_or_default();
+                    Some(serde_json::json!({"type":"context_reset","boundary_id":boundary_id,"content":content,"assistant_id":assistant_id}))
+                }
                 crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(mut snapshot) => {
                     if let Some(existing) = request_snapshots.iter_mut().find(|entry| entry["id"] == snapshot["id"]) {
                         snapshot["number"] = existing["number"].clone();
@@ -460,14 +475,16 @@ pub(super) async fn chat_handler(
             let snapshots_save = serde_json::json!(request_snapshots);
             let saved = tokio::task::spawn_blocking(move || {
                 db.with_conn(|conn| {
+                    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+                    let conn = &*tx;
                     tracing::info!(module = "BridgeDB", "Saving assistant message for conv_id={}", conv_id_save);
                     let msg_id = assistant_id;
                     let now = chrono::Utc::now().to_rfc3339();
-                    let sort_order = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
-                        .unwrap_or_default()
-                        .len() as i64;
+                    let (sort_order, archive) = claude_core::services::plan_approval::final_response_order(conn, &conv_id_save, observed_plan_boundary.as_deref())?;
                     tracing::info!(module = "BridgeDB", "Inserting assistant message: id={}, content_len={}, sort_order={}", msg_id, assistant_text.len(), sort_order);
-                    let insert_result = if crate::db::message_repo::get_message(conn, &msg_id)?.is_some() {
+                    let insert_result = if let Some(message) = crate::db::message_repo::get_message(conn, &msg_id)? {
+                        anyhow::ensure!(message.conversation_id == conv_id_save && message.role == "assistant", "Response session identity changed");
+                        if archive { conn.execute("UPDATE messages SET sort_order=?2 WHERE id=?1",rusqlite::params![msg_id,sort_order])?; }
                         crate::db::message_repo::update_message_content(conn, &msg_id, &assistant_text)
                     } else {
                         crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order)
@@ -504,6 +521,7 @@ pub(super) async fn chat_handler(
                         rusqlite::params![total_msgs, &now, &conv_id_save],
                     );
 
+                    tx.commit()?;
                     Ok::<(), anyhow::Error>(())
                 })
             }).await;

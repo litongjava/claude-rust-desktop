@@ -162,6 +162,7 @@ async fn h5_chat_handler(
         while let Some(event) = rx.recv().await {
             let event_data = match event {
                 crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(_) => None,
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { .. } => { full_text.clear(); None },
                 crate::native_engine::tool_loop::EngineEvent::MessageStart { model } => {
                     Some(serde_json::json!({
                         "type": "message_start",

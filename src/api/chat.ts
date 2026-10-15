@@ -938,9 +938,18 @@ export async function sendMessage(
             }
 
             if (parsed.type === 'ask_user') {
+              // handled below
               if (onSystem) {
                 try { onSystem('ask_user', '', parsed); } catch (err) { console.error('[API] onSystem ask_user callback error:', err); }
               }
+              continue;
+            }
+
+            if (parsed.type === 'context_reset') {
+              flushPending();
+              fullText = ''; thinkingText = ''; pendingTextDelta = ''; pendingThinkingDelta = '';
+              inlineArtifactBuffer = ''; activeInlineArtifact = null;
+              onSystem?.('context_reset', '', parsed);
               continue;
             }
 
