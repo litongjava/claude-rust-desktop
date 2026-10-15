@@ -241,14 +241,14 @@ pub async fn prepare_invocation(
                 let permit = invocation::authorize(input.clone(), decision, confirmed)?;
                 eprintln!("Running skill /{name} shell expansion...");
                 let result = invocation::execute(permit, &session.workspace).await;
-                let output = result
-                    .as_ref()
-                    .map(String::as_str)
-                    .unwrap_or("Skill shell failed");
-                let post = hooks.run(HookEvent::PostToolUse, &session.id, serde_json::json!({"tool_name":"Bash","tool_input":input,"tool_use_id":request_id,"tool_response":output,"is_error":result.is_err()})).await?;
+                let (event, payload) = match &result {
+                    Ok(output) => (HookEvent::PostToolUse, serde_json::json!({"tool_name":"Bash","tool_input":input,"tool_use_id":request_id,"tool_response":output})),
+                    Err(error) => (HookEvent::PostToolUseFailure, serde_json::json!({"tool_name":"Bash","tool_input":input,"tool_use_id":request_id,"error":format!("{error:#}"),"is_interrupt":false})),
+                };
+                let post = hooks.run(event, &session.id, payload).await?;
                 ensure!(
                     !post.blocked,
-                    "Skill shell blocked by PostToolUse hook: {}",
+                    "Skill shell blocked by {event:?} hook: {}",
                     post.reason
                 );
                 expanded.push_str(
