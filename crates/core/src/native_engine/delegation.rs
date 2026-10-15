@@ -201,6 +201,18 @@ impl ToolLoopExecutor {
         child.permission_manager = self.permission_manager.as_ref().map(|manager|
             Arc::new(manager.fork_session(self.conv_id.as_deref().unwrap_or_default(), &id)));
         child.hooks = self.hooks.clone();
+        let hook_session = self.subagent_hook_context.as_ref().map(|(parent, _)| parent.clone())
+            .or_else(|| self.conv_id.clone()).unwrap_or_else(|| "unknown".into());
+        child.subagent_hook_context = Some((hook_session.clone(), definition.id.clone()));
+        if let Some(hooks) = &child.hooks {
+            use crate::services::tool_hooks::HookEvent;
+            let start = hooks.run(HookEvent::SubagentStart, &hook_session,
+                json!({"agent_id":id,"agent_type":definition.id})).await?;
+            for context in start.additional_context {
+                child.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSubagentStart context:\n{context}"));
+            }
+            for warning in start.warnings { tracing::warn!("SubagentStart hook: {warning}"); }
+        }
         child.max_tool_iterations = self.max_tool_iterations;
         child.mcp_registry = self.mcp_registry.clone();
         if let Some(memory) = &self.memex_client {

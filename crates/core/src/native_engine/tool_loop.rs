@@ -2,6 +2,9 @@
 mod delegation;
 #[path = "deep_research.rs"]
 mod deep_research;
+#[cfg(test)]
+#[path = "hook_lifecycle_tests.rs"]
+mod hook_lifecycle_tests;
 #[path = "skill_tool.rs"]
 mod skill_tool;
 #[path = "plan_tool.rs"]
@@ -150,6 +153,7 @@ pub struct ToolLoopExecutor {
     allowed_tools: Option<Vec<String>>,
     learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     delegation_depth: usize,
+    subagent_hook_context: Option<(String, String)>,
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
     skill_shell_active: bool,
@@ -504,6 +508,7 @@ impl ToolLoopExecutor {
             allowed_tools: None,
             learning_tools: None,
             delegation_depth: 0,
+            subagent_hook_context: None,
             hooks: None,
             stop_hook_active: false,
             skill_shell_active: false,
@@ -537,13 +542,19 @@ impl ToolLoopExecutor {
     async fn stop_hook(&mut self, text: &str) -> Result<Option<String>> {
         use crate::services::tool_hooks::HookEvent;
         let Some(hooks) = &self.hooks else { return Ok(None); };
-        let outcome = hooks.run(HookEvent::Stop, self.conv_id.as_deref().unwrap_or("unknown"), json!({"stop_hook_active":self.stop_hook_active,"last_assistant_message":text})).await?;
-        for warning in outcome.warnings { tracing::warn!("Stop hook: {warning}"); }
+        let mut payload = json!({"stop_hook_active":self.stop_hook_active,"last_assistant_message":text});
+        let (event, session) = if let Some((parent, agent_type)) = &self.subagent_hook_context {
+            payload["agent_id"] = json!(self.conv_id);
+            payload["agent_type"] = json!(agent_type);
+            (HookEvent::SubagentStop, parent.as_str())
+        } else { (HookEvent::Stop, self.conv_id.as_deref().unwrap_or("unknown")) };
+        let outcome = hooks.run(event, session, payload).await?;
+        for warning in outcome.warnings { tracing::warn!("{event:?} hook: {warning}"); }
         if outcome.prevent_continuation { return Ok(None); }
         if outcome.blocked {
-            anyhow::ensure!(!self.stop_hook_active, "Stop hook blocked again after its continuation: {}", outcome.reason);
+            anyhow::ensure!(!self.stop_hook_active, "{event:?} hook blocked again after its continuation: {}", outcome.reason);
             self.stop_hook_active = true;
-            return Ok(Some(format!("The configured Stop hook requires follow-up before finishing: {}", outcome.reason)));
+            return Ok(Some(format!("The configured {event:?} hook requires follow-up before finishing: {}", outcome.reason)));
         }
         Ok(None)
     }
@@ -576,13 +587,17 @@ impl ToolLoopExecutor {
         let (actual, mut output, mut failed) = Box::pin(self.execute_tool_call_inner(name, &input, id)).await;
         for context in pre.additional_context { output.push_str(&format!("\nPreToolUse context: {context}")); }
         for warning in pre.warnings { tracing::warn!("PreToolUse hook: {warning}"); }
-        match hooks.run(HookEvent::PostToolUse, &session, json!({"tool_name":name,"tool_input":actual,"tool_use_id":id,"tool_response":output,"is_error":failed})).await {
+        let event = if failed { HookEvent::PostToolUseFailure } else { HookEvent::PostToolUse };
+        let mut payload = json!({"tool_name":name,"tool_input":actual,"tool_use_id":id});
+        if failed { payload["error"] = json!(output); payload["is_interrupt"] = json!(false); }
+        else { payload["tool_response"] = json!(output); }
+        match hooks.run(event, &session, payload).await {
             Ok(post) => {
-                for context in post.additional_context { output.push_str(&format!("\nPostToolUse context: {context}")); }
-                for warning in post.warnings { tracing::warn!("PostToolUse hook: {warning}"); }
-                if post.blocked { output.push_str(&format!("\nPostToolUse hook requires attention: {}", post.reason)); failed = true; }
+                for context in post.additional_context { output.push_str(&format!("\n{event:?} context: {context}")); }
+                for warning in post.warnings { tracing::warn!("{event:?} hook: {warning}"); }
+                if post.blocked { output.push_str(&format!("\n{event:?} hook requires attention: {}", post.reason)); failed = true; }
             }
-            Err(error) => { output.push_str(&format!("\nPostToolUse hook failed: {error:#}")); failed = true; }
+            Err(error) => { output.push_str(&format!("\n{event:?} hook failed: {error:#}")); failed = true; }
         }
         (actual, output, failed)
     }
@@ -1279,6 +1294,7 @@ impl ToolLoopExecutor {
 
         for iteration in 0..self.max_tool_iterations {
             if self.response_schema.is_some() { full_text.clear(); }
+            let round_text_start = full_text.len();
             tracing::info!(module = "AnthropicLoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
             tracing::info!(module = "AnthropicLoop", "API key length={}", api_key_len);
 
@@ -1708,7 +1724,7 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
-                if let Some(follow_up) = self.stop_hook(&full_text).await? {
+                if let Some(follow_up) = self.stop_hook(&full_text[round_text_start..]).await? {
                     anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
                     conversation_messages.push(AnthropicMessage { role: "assistant".into(), content: AnthropicContent::Blocks(assistant_blocks) });
                     conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(follow_up) });
@@ -1756,6 +1772,7 @@ impl ToolLoopExecutor {
 
         for iteration in 0..self.max_tool_iterations {
             if self.response_schema.is_some() { full_text.clear(); }
+            let round_text_start = full_text.len();
             tracing::info!(module = "OpenAILoop", "Iteration {}/{} starting, base_url={}, model={}", iteration+1, self.max_tool_iterations, base_url, model_id);
             tracing::info!(module = "OpenAILoop", "API key length={}", api_key_len);
 
@@ -2175,7 +2192,7 @@ impl ToolLoopExecutor {
                     conversation_messages.push(tool_result_msg);
                 }
             } else {
-                if let Some(follow_up) = self.stop_hook(&full_text).await? {
+                if let Some(follow_up) = self.stop_hook(&full_text[round_text_start..]).await? {
                     anyhow::ensure!(iteration + 1 < self.max_tool_iterations, "Stop hook requested continuation after the tool iteration limit");
                     conversation_messages.push(OpenAIMessage { role: "assistant".into(), content: assistant_content.unwrap_or(OpenAIContent::Text(String::new())), tool_calls: None, tool_call_id: None, reasoning_content: assistant_reasoning, provider_content: assistant_provider_content });
                     conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(follow_up), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });

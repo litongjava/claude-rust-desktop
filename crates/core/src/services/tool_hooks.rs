@@ -20,6 +20,9 @@ const OUTPUT_LIMIT: u64 = 1024 * 1024;
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    PostToolUseFailure,
+    SubagentStart,
+    SubagentStop,
     UserPromptSubmit,
     Stop,
     WorktreeCreate,
@@ -34,6 +37,9 @@ impl HookEvent {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::Stop => "Stop",
             Self::WorktreeCreate => "WorktreeCreate",
@@ -144,6 +150,9 @@ impl HookRunner {
                 let event = match name.as_str() {
                     "PreToolUse" => HookEvent::PreToolUse,
                     "PostToolUse" => HookEvent::PostToolUse,
+                    "PostToolUseFailure" => HookEvent::PostToolUseFailure,
+                    "SubagentStart" => HookEvent::SubagentStart,
+                    "SubagentStop" => HookEvent::SubagentStop,
                     "UserPromptSubmit" => HookEvent::UserPromptSubmit,
                     "Stop" => HookEvent::Stop,
                     "WorktreeCreate" => HookEvent::WorktreeCreate,
@@ -242,12 +251,13 @@ impl HookRunner {
         input.insert("hook_event_name".into(), json!(event.name()));
         let lifecycle = matches!(
             event,
-            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact
+            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact | HookEvent::SubagentStart | HookEvent::PostToolUseFailure
         );
         let match_key = match event {
             HookEvent::SessionStart => "source",
             HookEvent::SessionEnd => "reason",
             HookEvent::PreCompact | HookEvent::PostCompact => "trigger",
+            HookEvent::SubagentStart | HookEvent::SubagentStop => "agent_type",
             _ => "tool_name",
         };
         let name = input
@@ -257,7 +267,7 @@ impl HookRunner {
             .to_owned();
         let mut result = HookOutcome::default();
         for hook in self.hooks.iter().filter(|h| h.event == event) {
-            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse))
+            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::SubagentStop))
                 && !matches_tool(&hook.matcher, &name)?
             {
                 continue;
@@ -334,7 +344,7 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     if !output.starts_with('{') {
-        if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart) {
+        if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart | HookEvent::SubagentStart) {
             result.additional_context.push(output.into());
         }
         return Ok(result);
