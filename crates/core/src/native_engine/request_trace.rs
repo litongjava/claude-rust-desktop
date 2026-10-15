@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Instant};
 
 pub struct RequestTrace {
+    context_capture: Option<super::request_context::ContextCapture>,
     snapshot: Value,
     clock: Instant,
     first_content_ms: Option<u64>,
@@ -22,6 +23,7 @@ impl RequestTrace {
         snapshot["status"] = json!("running");
         snapshot["responseBlocks"] = json!([]);
         Self {
+            context_capture: None,
             snapshot,
             clock: Instant::now(),
             first_content_ms: None,
@@ -37,8 +39,18 @@ impl RequestTrace {
         }
     }
 
+    pub fn capture_context(&mut self, sender: tokio::sync::mpsc::Sender<super::tool_loop::EngineEvent>) -> super::request_context::ContextCapture {
+        let capture = super::request_context::ContextCapture { event: Some((sender, self.started())), ..Default::default() };
+        self.context_capture = Some(capture.clone());
+        capture
+    }
+
     pub fn started(&self) -> Value {
-        self.snapshot.clone()
+        let mut snapshot = self.snapshot.clone();
+        if let Some(usage) = self.context_capture.as_ref().and_then(|c| c.snapshot()) {
+            snapshot["contextUsage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+        }
+        snapshot
     }
 
     pub fn mark_completed(&mut self) {
@@ -326,7 +338,7 @@ impl RequestTrace {
             .as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
-        self.snapshot
+        self.started()
     }
 }
 

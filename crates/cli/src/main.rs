@@ -1,3 +1,4 @@
+mod context_commands;
 mod persistent_worker;
 mod worker_frontend;
 mod command_catalog;

@@ -1399,14 +1399,16 @@ impl ToolLoopExecutor {
                 "source": "native_engine"
             }));
             let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.started())).await;
+            let context_capture = request_trace.capture_context(self.event_tx.clone());
             let stream = self.anthropic_client
-                .send_message_stream_with_thinking(
+                .send_message_stream_with_thinking_observed(
                     &self.provider,
                     conversation_messages.clone(),
                     self.system_prompt.as_deref(),
                     tools.clone(),
                     self.max_tokens,
                     enable_thinking,
+                    Some(&context_capture),
                 )
                 .await;
 
@@ -1877,13 +1879,15 @@ impl ToolLoopExecutor {
                 "source": "native_engine"
             }));
             let _ = self.event_tx.send(EngineEvent::RequestSnapshot(request_trace.started())).await;
+            let context_capture = request_trace.capture_context(self.event_tx.clone());
             let stream = self.openai_client
-                .send_message_stream(
+                .send_message_stream_observed(
                     &self.provider,
                     conversation_messages.clone(),
                     self.system_prompt.as_deref(),
                     tools.clone(),
                     self.max_tokens,
+                    Some(&context_capture),
                 )
                 .await;
 

@@ -115,42 +115,7 @@ pub async fn handle(
         }
         "/context" => {
             ensure!(argument.is_empty(), "Usage: /context");
-            let provider = session.selected_provider().await?;
-            let history = session
-                .store
-                .model_history(&session.id, &provider.provider.api_format)?;
-            let tokens =
-                claude_core::native_engine::token_counter::TokenCounter::estimate(&history) as u64;
-            eprintln!(
-                "{} · {} active messages · approximately {tokens} history tokens",
-                session.model,
-                history.len()
-            );
-            if let Some(window) = provider.model.context_window {
-                let cells =
-                    (tokens.saturating_mul(50).div_ceil(window.max(1) as u64)).min(50) as usize;
-                use std::io::IsTerminal;
-                let color =
-                    !crate::terminal::screen_reader() && std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-                if color {
-                    eprint!("\x1b[{}m", crate::terminal::style::activity());
-                }
-                eprint!("{}", "█".repeat(cells));
-                if color {
-                    eprint!("\x1b[{}m", crate::terminal::style::muted_ansi());
-                }
-                eprint!("{}", "░".repeat(50 - cells));
-                if color {
-                    eprint!("\x1b[0m");
-                }
-                eprintln!(
-                    "  {:.1}% of {window}",
-                    tokens as f64 * 100.0 / window.max(1) as f64
-                );
-            } else {
-                eprintln!("Model context window is not configured.");
-            }
-            eprintln!("Estimated history only; excludes system instructions, tool schemas, and output reserve. /usage shows provider-reported request counts.");
+            crate::context_commands::show(session)?;
         }
         "/keybindings" => {
             ensure!(argument.is_empty(), "Usage: /keybindings");

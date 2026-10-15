@@ -255,9 +255,21 @@ impl OpenAIClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        self.send_message_stream_observed(provider, messages, system_prompt, tools, max_tokens, None).await
+    }
+
+    pub async fn send_message_stream_observed(
+        &self,
+        provider: &ResolvedProvider,
+        messages: Vec<OpenAIMessage>,
+        system_prompt: Option<&str>,
+        tools: Vec<ToolDefinition>,
+        max_tokens: u32,
+        context_capture: Option<&super::request_context::ContextCapture>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            return super::provider_runtime::stream_with_schema(provider, messages, system_prompt, tools, max_tokens, self.response_schema.as_ref()).await;
+            return super::provider_runtime::stream_with_schema_observed(provider, messages, system_prompt, tools, max_tokens, self.response_schema.as_ref(), context_capture).await;
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -303,6 +315,7 @@ impl OpenAIClient {
             body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}});
         }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
+        if let Some(capture) = context_capture { capture.record("openai-completions", &body, provider.model.context_window, max_tokens).await; }
         let response = retry_with_backoff(|| async {
             let resp = self.client
                 .post(&url)

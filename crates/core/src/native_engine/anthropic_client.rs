@@ -277,6 +277,19 @@ impl AnthropicClient {
         max_tokens: u32,
         enable_thinking: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        self.send_message_stream_with_thinking_observed(provider, messages, system_prompt, tools, max_tokens, enable_thinking, None).await
+    }
+
+    pub async fn send_message_stream_with_thinking_observed(
+        &self,
+        provider: &ResolvedProvider,
+        messages: Vec<AnthropicMessage>,
+        system_prompt: Option<&str>,
+        tools: Vec<ToolDefinition>,
+        max_tokens: u32,
+        enable_thinking: bool,
+        context_capture: Option<&super::request_context::ContextCapture>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
             format!("{}/messages", base_url)
@@ -320,7 +333,9 @@ impl AnthropicClient {
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .json(&body);
-            let resp = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?.send().await?;
+            let request = crate::services::anthropic_auth::authorize(request, &provider.provider.api_key, base_url, provider.model.fast).await?;
+            if let Some(capture) = context_capture { capture.record("anthropic-messages", &body, provider.model.context_window, max_tokens).await; }
+            let resp = request.send().await?;
 
             let resp = checked_response(resp).await?;
             Ok(resp)

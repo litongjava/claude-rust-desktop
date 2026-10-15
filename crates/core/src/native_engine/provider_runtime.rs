@@ -62,6 +62,18 @@ pub async fn stream_with_schema(
     max_tokens: u32,
     response_schema: Option<&Value>,
 ) -> Result<ProviderStream> {
+    stream_with_schema_observed(provider, messages, system, tools, max_tokens, response_schema, None).await
+}
+
+pub async fn stream_with_schema_observed(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    context_capture: Option<&super::request_context::ContextCapture>,
+) -> Result<ProviderStream> {
     let (entry, model) = metadata(provider)?;
     let protocol = provider
         .model
@@ -369,6 +381,7 @@ pub async fn stream_with_schema(
         if entry["id"] == "cloudflare-ai-gateway" {
             request = request.header("cf-aig-authorization", format!("Bearer {key}"));
         }
+        if let Some(capture) = context_capture { capture.record(api, &body, provider.model.context_window, max_tokens).await; }
         checked_response(request.send().await?).await
     })
     .await?;
