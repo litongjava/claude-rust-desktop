@@ -82,6 +82,7 @@ enum Mode {
     Text,
     RuntimeAgent,
     Approval,
+    DelayedApproval,
     Question,
     Plan,
     Truncated,
@@ -106,6 +107,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         requests.push(body);
         requests.len()
     };
+    if matches!(state.mode, Mode::DelayedApproval) && count == 1 { tokio::time::sleep(Duration::from_secs(2)).await; }
     if matches!(state.mode, Mode::SchemaRejected) {
         return (
             StatusCode::BAD_REQUEST,
@@ -126,7 +128,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         || matches!(state.mode, Mode::Plan) && count == 1
         || matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
         || matches!(state.mode, Mode::ReadThenTruncated) && count == 1
-        || matches!(state.mode, Mode::Approval | Mode::Question) && count % 2 == 1;
+        || matches!(state.mode, Mode::Approval | Mode::DelayedApproval | Mode::Question) && count % 2 == 1;
     let stream = if state.anthropic {
         let mut frames = vec![
             json!({"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","content":[],"model":"fixture","usage":{"input_tokens":10,"output_tokens":0}}}),
@@ -158,7 +160,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                     "ExitPlanMode",
                     json!({"plan":"APPROVED_PLAN_SENTINEL"}),
                 )
-            } else if matches!(state.mode, Mode::Approval) {
+            } else if matches!(state.mode, Mode::Approval | Mode::DelayedApproval) {
                 (
                     "write-1",
                     "Write",
@@ -202,7 +204,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                 json!({"tool_calls":[{"index":0,"id":"question-1","type":"function","function":{"name":"AskUserQuestion","arguments":json!({"question":"Which language?","description":"Choose the implementation language","multiSelect":true,"options":[{"label":"Rust","description":"Memory safety"},{"label":"Go","description":"Fast compilation"}]}).to_string()}}]})
             } else if matches!(state.mode, Mode::Plan) {
                 json!({"tool_calls":[{"index":0,"id":"plan-1","type":"function","function":{"name":"ExitPlanMode","arguments":json!({"plan":"APPROVED_PLAN_SENTINEL"}).to_string()}}]})
-            } else if matches!(state.mode, Mode::Approval) {
+            } else if matches!(state.mode, Mode::Approval | Mode::DelayedApproval) {
                 json!({"tool_calls":[{"index":0,"id":"write-1","type":"function","function":{"name":"Write","arguments":json!({"file_path":"approval.txt","content":"ACTUAL_APPROVED_WRITE"}).to_string()}}]})
             } else {
                 json!({"tool_calls":[{"index":0,"id":"read-1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"fixture.txt\"}"}}]})
@@ -788,7 +790,7 @@ async fn sdk_eof_during_approval_and_unsupported_initialization_fail_explicitly(
     let server = Server::start(false, Mode::Approval).await;
     let root = tempfile::tempdir().unwrap();
     let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
-    client.send(json!({"type":"control_request","request_id":"unsupported","request":{"subtype":"initialize","hooks":{"PreToolUse":[{"hookCallbackIds":["callback"]}]}}})).await;
+    client.send(json!({"type":"control_request","request_id":"unsupported","request":{"subtype":"initialize","hooks":{"WorktreeCreate":[{"hookCallbackIds":["callback"]}]}}})).await;
     let response = client.frame("control_response").await;
     assert_eq!(response["response"]["subtype"], "error");
     assert!(response["response"]["error"]
@@ -1295,7 +1297,7 @@ async fn sdk_initialize_validation_is_atomic_and_does_not_consume_initialization
             json!({"systemPrompt":"INVALID_MARKER","jsonSchema":{"type":42}}),
             json!({"systemPrompt":"INVALID_MARKER","unknown":null}),
             json!({"systemPrompt":17}),
-            json!({"systemPrompt":"INVALID_MARKER","hooks":{"PreToolUse":[{"hookCallbackIds":["callback"]}]}}),
+            json!({"systemPrompt":"INVALID_MARKER","hooks":{"WorktreeCreate":[{"hookCallbackIds":["callback"]}]}}),
             json!({"jsonSchema":{"$ref":"https://example.invalid/schema"}}),
         ].into_iter().enumerate() {
             client.send(initialize_request(&format!("bad-{index}"),fields)).await;
@@ -1731,3 +1733,6 @@ async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publicatio
         assert!(client.finish().await.0.success());
     }
 }
+
+#[path = "sdk/hook_callbacks.rs"]
+mod hook_callbacks;

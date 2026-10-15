@@ -17,6 +17,10 @@ pub struct Overrides {
 }
 
 impl State {
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
     pub fn start_user_turn(&mut self) {
         self.initialized = true;
     }
@@ -29,6 +33,11 @@ impl State {
     ) -> Result<Value> {
         ensure!(!self.initialized, "Already initialized");
         let overrides = validate(cli, request)?;
+        let callbacks = request
+            .get("hooks")
+            .map(claude_core::services::hook_callbacks::validate)
+            .transpose()?
+            .unwrap_or_default();
         let catalog = agents::prepare(session, request.get("agents")).await?;
         let mut response = metadata(session).await?;
         let entries = response["agents"]
@@ -44,6 +53,11 @@ impl State {
             entries.push(entry);
         }
         // Nothing above mutates the running session, including a failed metadata read.
+        session
+            .sdk_hooks
+            .as_mut()
+            .context("SDK hook transport unavailable")?
+            .install(&session.id, callbacks);
         session.sdk_overrides = overrides;
         session.engine.set_runtime_agents(&session.id, catalog);
         self.initialized = true;
@@ -78,10 +92,9 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
                 schema = Some(value.clone());
             }
             "agents" => ensure!(value.is_object(), "initialize.agents must be an object"),
-            "hooks" => ensure!(
-                value.as_object().is_some_and(|v| v.is_empty()),
-                "initialize.{key} is not supported; only an empty object is accepted"
-            ),
+            "hooks" => {
+                claude_core::services::hook_callbacks::validate(value)?;
+            }
             "sdkMcpServers" => ensure!(
                 value.as_array().is_some_and(Vec::is_empty),
                 "initialize.sdkMcpServers is not supported; only an empty array is accepted"
@@ -207,7 +220,7 @@ mod tests {
             json!({"jsonSchema":{"type":42}}),
             json!({"jsonSchema":{"$ref":"https://invalid/schema"}}),
             json!({"unknown":false}),
-            json!({"hooks":{"PreToolUse":[]}}),
+            json!({"hooks":{"PreToolUse":[{"hookCallbackIds":[""]}]}}),
             json!({"agents":[]}),
             json!({"sdkMcpServers":["host"]}),
             json!({"promptSuggestions":true}),

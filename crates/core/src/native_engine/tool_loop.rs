@@ -582,7 +582,7 @@ impl ToolLoopExecutor {
     }
 
     pub fn with_hooks(mut self, hooks: crate::services::tool_hooks::HookRunner) -> Self {
-        if !hooks.list().is_empty() { self.hooks = Some(Arc::new(hooks)); }
+        if hooks.has_hooks() { self.hooks = Some(Arc::new(hooks)); }
         self
     }
 

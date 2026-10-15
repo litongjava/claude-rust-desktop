@@ -36,6 +36,8 @@ mod permission_commands;
 mod sdk_input;
 mod sdk;
 mod sdk_initialization;
+mod sdk_hooks;
+mod sdk_control;
 mod account_commands;
 mod design_commands;
 mod ide_commands;
@@ -360,7 +362,7 @@ async fn run(cli: &Cli) -> Result<()> {
     startup_options::apply(cli, &mut session).await?;
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     let result = async {
-        session.start_hooks(if resumed.is_some() { "resume" } else { "startup" }).await?;
+        if !sdk_stream { session.start_hooks(if resumed.is_some() { "resume" } else { "startup" }).await?; }
         if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
         if !sdk_stream && !prompt.trim().is_empty() {
             if !single {
@@ -375,7 +377,7 @@ async fn run(cli: &Cli) -> Result<()> {
             session.turn(cli, &prompt, &mut input).await?;
         }
         if sdk_stream {
-            Box::pin(sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str()))).await?;
+            Box::pin(sdk::run(cli,&mut session,(!prompt.trim().is_empty()).then_some(prompt.as_str()),if resumed.is_some() { "resume" } else { "startup" })).await?;
         }
         if single { return Ok(()); }
         let mut skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;

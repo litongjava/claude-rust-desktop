@@ -107,9 +107,12 @@ fn default_timeout() -> u64 {
     60
 }
 
+#[derive(Default)]
 pub struct HookRunner {
     workspace: PathBuf,
     hooks: Vec<ActiveHook>,
+    callbacks: Option<std::sync::Weak<super::hook_callbacks::Registration>>,
+    disabled: bool,
 }
 
 impl HookRunner {
@@ -224,11 +227,39 @@ impl HookRunner {
         Ok(Self {
             workspace: workspace.to_path_buf(),
             hooks,
+            disabled,
+            callbacks: None,
         })
     }
 
     pub fn list(&self) -> &[ActiveHook] {
         &self.hooks
+    }
+
+    pub fn with_session_callbacks(mut self, session: &str) -> Self {
+        self.callbacks = super::hook_callbacks::lookup(session);
+        self
+    }
+    pub fn has_hooks(&self) -> bool {
+        !self.disabled
+            && (!self.hooks.is_empty()
+                || self
+                    .callbacks
+                    .as_ref()
+                    .and_then(|callbacks| callbacks.upgrade())
+                    .is_some_and(|callbacks| callbacks.has_callbacks()))
+    }
+    fn callbacks(
+        &self,
+        session: &str,
+    ) -> Option<std::sync::Arc<super::hook_callbacks::Registration>> {
+        if self.disabled {
+            return None;
+        }
+        self.callbacks
+            .clone()
+            .or_else(|| super::hook_callbacks::lookup(session))
+            .and_then(|callbacks| callbacks.upgrade())
     }
 
     /// Worktree hooks return a filesystem path, not tool-permission JSON.
@@ -252,12 +283,25 @@ impl HookRunner {
         Ok(path)
     }
 
-    pub async fn run(
+    pub fn run<'a>(
+        &'a self,
+        event: HookEvent,
+        session_id: &'a str,
+        payload: Value,
+    ) -> futures::future::BoxFuture<'a, Result<HookOutcome>> {
+        // Keep command/callback state out of the enclosing engine and CLI futures.
+        Box::pin(self.run_inner(event, session_id, payload))
+    }
+
+    async fn run_inner(
         &self,
         event: HookEvent,
         session_id: &str,
         payload: Value,
     ) -> Result<HookOutcome> {
+        if self.disabled {
+            return Ok(HookOutcome::default());
+        }
         let mut input = payload
             .as_object()
             .cloned()
@@ -267,7 +311,13 @@ impl HookRunner {
         input.insert("hook_event_name".into(), json!(event.name()));
         let lifecycle = matches!(
             event,
-            HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::PreCompact | HookEvent::PostCompact | HookEvent::SubagentStart | HookEvent::PostToolUseFailure | HookEvent::PermissionDenied
+            HookEvent::SessionStart
+                | HookEvent::SessionEnd
+                | HookEvent::PreCompact
+                | HookEvent::PostCompact
+                | HookEvent::SubagentStart
+                | HookEvent::PostToolUseFailure
+                | HookEvent::PermissionDenied
         );
         let match_key = match event {
             HookEvent::SessionStart => "source",
@@ -283,50 +333,142 @@ impl HookRunner {
             .to_owned();
         if event == HookEvent::PermissionRequest {
             use futures::{stream::FuturesUnordered, StreamExt};
-            let mut pending = FuturesUnordered::new();
+            let mut pending: FuturesUnordered<futures::future::BoxFuture<'_, Result<HookOutcome>>> =
+                FuturesUnordered::new();
             for hook in self.hooks.iter().filter(|hook| hook.event == event) {
-                if !matches_tool(&hook.matcher, &name)? { continue; }
+                if !matches_tool(&hook.matcher, &name)? {
+                    continue;
+                }
                 let input = Value::Object(input.clone());
-                pending.push(async move {
+                pending.push(Box::pin(async move {
                     let (code, stdout, stderr) = execute(hook, &self.workspace, &input).await?;
                     parse_output(event, code, &stdout, &stderr)
-                });
+                }));
+            }
+            if let Some(callbacks) = self.callbacks(session_id) {
+                for callback in callbacks.matching(event, &name) {
+                    let callbacks = callbacks.clone();
+                    let input = Value::Object(input.clone());
+                    pending.push(Box::pin(async move {
+                        parse_json_output(event, callbacks.invoke(&callback, input).await?)
+                    }));
+                }
             }
             let mut result = HookOutcome::default();
             while let Some(outcome) = pending.next().await {
                 match outcome {
                     Ok(outcome) => {
                         result.warnings.extend(outcome.warnings);
-                        if outcome.blocked { result.warnings.push(outcome.reason); }
+                        if outcome.blocked {
+                            result.warnings.push(outcome.reason);
+                        }
                         if outcome.permission_response.is_some() {
                             result.permission_response = outcome.permission_response;
                             // Dropping the losing futures kills their actual subprocesses.
                             return Ok(result);
                         }
                     }
-                    Err(error) => result.warnings.push(format!("PermissionRequest hook failed: {error:#}")),
+                    Err(error) => result
+                        .warnings
+                        .push(format!("PermissionRequest hook failed: {error:#}")),
                 }
             }
             return Ok(result);
         }
+        use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+        let mut pending: FuturesUnordered<BoxFuture<'_, (bool, Result<HookOutcome>)>> =
+            FuturesUnordered::new();
+        let command_input = input.clone();
+        let command_name = name.clone();
+        pending.push(Box::pin(async move {
+            (
+                false,
+                async {
+                    let mut input = command_input;
+                    let name = command_name;
+                    let mut result = HookOutcome::default();
+                    for hook in self.hooks.iter().filter(|h| h.event == event) {
+                        if (lifecycle
+                            || matches!(
+                                event,
+                                HookEvent::PreToolUse
+                                    | HookEvent::PermissionRequest
+                                    | HookEvent::PostToolUse
+                                    | HookEvent::SubagentStop
+                            ))
+                            && !matches_tool(&hook.matcher, &name)?
+                        {
+                            continue;
+                        }
+                        let outcome = async {
+                            let output =
+                                execute(hook, &self.workspace, &Value::Object(input.clone()))
+                                    .await?;
+                            parse_output(event, output.0, &output.1, &output.2)
+                        }
+                        .await;
+                        let outcome = match outcome {
+                            Ok(outcome) => outcome,
+                            Err(error) if lifecycle => {
+                                result
+                                    .warnings
+                                    .push(format!("{} hook: {error:#}", event.name()));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        result.additional_context.extend(outcome.additional_context);
+                        result.warnings.extend(outcome.warnings);
+                        result.ask_permission |= outcome.ask_permission;
+                        result.allow_permission |= outcome.allow_permission;
+                        if outcome.permission_response.is_some() {
+                            result.permission_response = outcome.permission_response;
+                            return Ok(result);
+                        }
+                        result.prevent_continuation |= outcome.prevent_continuation;
+                        result.retry |= outcome.retry;
+                        if let Some(updated) = outcome.updated_input {
+                            input.insert("tool_input".into(), updated.clone());
+                            result.updated_input = Some(updated);
+                        }
+                        if outcome.blocked && lifecycle {
+                            result.warnings.push(outcome.reason);
+                            continue;
+                        }
+                        if outcome.blocked {
+                            result.blocked = true;
+                            result.reason = outcome.reason;
+                            break;
+                        }
+                    }
+                    Ok(result)
+                }
+                .await,
+            )
+        }));
+        if let Some(callbacks) = self.callbacks(session_id) {
+            for callback in callbacks.matching(event, &name) {
+                let callbacks = callbacks.clone();
+                let input = Value::Object(input.clone());
+                pending.push(Box::pin(async move {
+                    (
+                        true,
+                        async {
+                            parse_json_output(event, callbacks.invoke(&callback, input).await?)
+                        }
+                        .await,
+                    )
+                }));
+            }
+        }
         let mut result = HookOutcome::default();
-        for hook in self.hooks.iter().filter(|h| h.event == event) {
-            if (lifecycle || matches!(event, HookEvent::PreToolUse | HookEvent::PermissionRequest | HookEvent::PostToolUse | HookEvent::SubagentStop))
-                && !matches_tool(&hook.matcher, &name)?
-            {
-                continue;
-            }
-            let outcome = async {
-                let output = execute(hook, &self.workspace, &Value::Object(input.clone())).await?;
-                parse_output(event, output.0, &output.1, &output.2)
-            }
-            .await;
+        while let Some((callback, outcome)) = pending.next().await {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
-                Err(error) if lifecycle => {
+                Err(error) if callback => {
                     result
                         .warnings
-                        .push(format!("{} hook: {error:#}", event.name()));
+                        .push(format!("{} callback failed: {error:#}", event.name()));
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -335,24 +477,18 @@ impl HookRunner {
             result.warnings.extend(outcome.warnings);
             result.ask_permission |= outcome.ask_permission;
             result.allow_permission |= outcome.allow_permission;
-            if outcome.permission_response.is_some() {
-                result.permission_response = outcome.permission_response;
-                return Ok(result);
-            }
             result.prevent_continuation |= outcome.prevent_continuation;
             result.retry |= outcome.retry;
-            if let Some(updated) = outcome.updated_input {
-                input.insert("tool_input".into(), updated.clone());
-                result.updated_input = Some(updated);
-            }
-            if outcome.blocked && lifecycle {
-                result.warnings.push(outcome.reason);
-                continue;
+            if outcome.updated_input.is_some() {
+                result.updated_input = outcome.updated_input;
             }
             if outcome.blocked {
-                result.blocked = true;
-                result.reason = outcome.reason;
-                break;
+                if lifecycle {
+                    result.warnings.push(outcome.reason);
+                } else {
+                    result.blocked = true;
+                    result.reason = outcome.reason;
+                }
             }
         }
         Ok(result)
@@ -400,6 +536,12 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     let output: Value = serde_json::from_str(output).context("Hook returned invalid JSON")?;
+    parse_json_output(event, output)
+}
+
+fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
+    ensure!(output.is_object(), "Hook output must be an object");
+    let mut result = HookOutcome::default();
     if event == HookEvent::PermissionRequest {
         if let Some(message) = string_field(&output, "systemMessage")? { result.warnings.push(message.into()); }
         if let Some(specific) = output.get("hookSpecificOutput") {
@@ -695,7 +837,7 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into())}).collect()};
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into())}).collect(),..Default::default()};
         let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
         assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
         assert!(root.path().join("slow-started").exists());
@@ -777,6 +919,7 @@ mod tests {
         let runner = HookRunner {
             workspace: root.path().into(),
             hooks: vec![hook],
+            ..Default::default()
         };
         let output = runner
             .run(HookEvent::PreToolUse, "test", json!({"tool_name":"Read"}))

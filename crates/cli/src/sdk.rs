@@ -131,9 +131,15 @@ impl Permissions {
         if let Some((_, _, tx)) = pending.remove(id) {
             let mut cancelled = self.cancelled.lock().await;
             cancelled.push_back(id.into());
-            while cancelled.len() > 256 { cancelled.pop_front(); }
-            let _ = tx.send(Err(anyhow::anyhow!("SDK permission resolved by another source")));
-            let _ = crate::session::emit_json(&json!({"type":"control_cancel_request","request_id":id}));
+            while cancelled.len() > 256 {
+                cancelled.pop_front();
+            }
+            let _ = tx.send(Err(anyhow::anyhow!(
+                "SDK permission resolved by another source"
+            )));
+            let _ = crate::session::emit_json(
+                &json!({"type":"control_cancel_request","request_id":id}),
+            );
         }
     }
     pub async fn cancel(&self) {
@@ -153,7 +159,15 @@ impl Permissions {
             // The host may have sent its answer before receiving our cancel
             // frame. Its prepared policy patch must be discarded, not treated
             // as a fatal protocol error that interrupts the winning tool.
-            if self.cancelled.lock().await.iter().any(|cancelled| cancelled == id) { return Ok(()); }
+            if self
+                .cancelled
+                .lock()
+                .await
+                .iter()
+                .any(|cancelled| cancelled == id)
+            {
+                return Ok(());
+            }
             bail!("Unknown or completed SDK permission request: {id}")
         };
         let answer = (|| -> Result<Reply> {
@@ -371,14 +385,36 @@ async fn idle_control(
     .await;
     response(&frame["request_id"], result)
 }
-pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
-    let result = run_inner(cli, session, initial).await;
+pub async fn run(
+    cli: &Cli,
+    session: &mut Session,
+    initial: Option<&str>,
+    source: &str,
+) -> Result<()> {
+    let runtime = crate::sdk_hooks::Runtime::default();
+    // Declared before run_inner: dropping run first closes its event receiver,
+    // then this guard revokes callbacks. The engine prioritizes receiver closure.
+    let cleanup = runtime.cleanup();
+    session.sdk_hooks = Some(runtime);
+    let result = Box::pin(run_inner(cli, session, initial, source)).await;
+    if result.is_err() {
+        session.engine.cancel_turn(&session.id).await;
+    }
+    if let Some(runtime) = &session.sdk_hooks {
+        runtime.broker.close();
+    }
+    session
+        .end_hooks(if result.is_ok() {
+            "prompt_input_exit"
+        } else {
+            "other"
+        })
+        .await;
+    session.sdk_hooks.take();
+    drop(cleanup);
     if let Some(permissions) = session.sdk_permissions.take() {
         permissions.closed.store(true, Ordering::SeqCst);
         permissions.cancel().await;
-    }
-    if result.is_err() {
-        session.engine.cancel_turn(&session.id).await;
     }
     session.sdk_content = None;
     session.sdk_overrides = Default::default();
@@ -386,7 +422,18 @@ pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Res
     result
 }
 
-async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
+async fn run_inner(
+    cli: &Cli,
+    session: &mut Session,
+    initial: Option<&str>,
+    source: &str,
+) -> Result<()> {
+    let callbacks = session
+        .sdk_hooks
+        .as_ref()
+        .context("SDK callback runtime unavailable")?
+        .broker
+        .clone();
     let updates = Arc::new(permission_updates::Updates::new(
         session.permissions.clone(),
         session.id.clone(),
@@ -409,7 +456,26 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
     }
     let mut eof = false;
     let mut failed = false;
+    let mut started = false;
     loop {
+        if !started && (initialization.is_initialized() || !queue.is_empty()) {
+            initialization.start_user_turn();
+            let requires_host = session
+                .sdk_hooks
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_callbacks());
+            pump_lifecycle(
+                Box::pin(session.start_hooks(source)),
+                &callbacks,
+                &permissions,
+                &mut frames,
+                &mut queue,
+                &mut eof,
+                requires_host,
+            )
+            .await?;
+            started = true;
+        }
         if let Some(message) = queue.pop_front() {
             initialization.start_user_turn();
             ensure!(
@@ -436,10 +502,20 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
                 tokio::select! {
                     result=&mut turn=>{if let Err(error)=result {failed=true;if !error.is::<crate::output::ReportedError>() {crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":format!("{error:#}")}))?;}}break;},
                     frame=frames.recv(),if !eof=>match frame {
-                        None=>{eof=true;permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;},
-                        Some(Err(error))=>{permissions.cancel().await;session.engine.cancel_turn(&session.id).await;return Err(error)},
+                        None=>{
+                            eof=true;
+                            if callbacks.has_pending() || session.sdk_hooks.as_ref().is_some_and(|runtime| runtime.has_callbacks()) {
+                                session.engine.cancel_turn(&session.id).await;
+                                callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                                failed=true;queue.clear();
+                                crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK input closed during hook callback"}))?;
+                                break;
+                            }
+                            callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                        },
+                        Some(Err(error))=>{session.engine.cancel_turn(&session.id).await;callbacks.cancel_all();permissions.cancel().await;return Err(error)},
                         Some(Ok(Frame::User(user)))=>{ensure!(queue.len()<32,"SDK pending user queue exceeds 32 messages");queue.push_back(user);},
-                        Some(Ok(Frame::Response(value)))=>{permissions.respond(&value).await?;},
+                        Some(Ok(Frame::Response(value)))=>{route_response(&permissions, &callbacks, &value).await?;},
                         Some(Ok(Frame::Control(value)))=>{
                             if value["request"]["subtype"]=="initialize" {
                                 response(&value["request_id"],Err(anyhow::anyhow!("Already initialized")))?;
@@ -447,7 +523,9 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
                             }
                             if value["request"]["subtype"]=="interrupt" {
                                 failed=true;
-                                permissions.cancel().await;session.engine.cancel_turn(&session.id).await;
+                                session.engine.cancel_turn(&session.id).await;
+                                callbacks.cancel_all();
+                                permissions.cancel().await;
                                 response(&value["request_id"],Ok(json!({})))?;
                                 crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK turn interrupted"}))?;
                                 break;
@@ -465,13 +543,18 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
         }
         match tokio::select! {frame=frames.recv()=>frame,_=tokio::signal::ctrl_c()=>bail!("SDK input interrupted")}
         {
-            None => eof = true,
+            None => {
+                eof = true;
+                callbacks.close();
+            }
             Some(Err(error)) => return Err(error),
             Some(Ok(Frame::User(user))) => queue.push_back(user),
             Some(Ok(Frame::Control(value))) => {
                 idle_control(cli, &mut initialization, session, &value).await?
             }
-            Some(Ok(Frame::Response(value))) => permissions.respond(&value).await?,
+            Some(Ok(Frame::Response(value))) => {
+                route_response(&permissions, &callbacks, &value).await?
+            }
         }
     }
     if failed {
@@ -481,4 +564,58 @@ async fn run_inner(cli: &Cli, session: &mut Session, initial: Option<&str>) -> R
         .into());
     }
     Ok(())
+}
+
+async fn route_response(
+    permissions: &Permissions,
+    callbacks: &crate::sdk_hooks::Broker,
+    value: &Value,
+) -> Result<()> {
+    let id = value["response"]["request_id"]
+        .as_str()
+        .context("Missing response request_id")?;
+    if callbacks.owns(id) {
+        callbacks.respond(value)
+    } else {
+        permissions.respond(value).await
+    }
+}
+
+// SessionStart may invoke the SDK host. Keep processing control replies while
+// its future borrows the session, and queue user turns until startup is complete.
+async fn pump_lifecycle(
+    future: impl std::future::Future<Output = Result<()>>,
+    callbacks: &crate::sdk_hooks::Broker,
+    permissions: &Permissions,
+    frames: &mut tokio::sync::mpsc::Receiver<Result<Frame>>,
+    queue: &mut VecDeque<UserMessage>,
+    eof: &mut bool,
+    requires_host: bool,
+) -> Result<()> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::signal::ctrl_c() => bail!("SDK startup interrupted"),
+            frame = frames.recv(), if !*eof => match frame {
+                None => {
+                    *eof = true;
+                    let interrupted = requires_host && !queue.is_empty();
+                    callbacks.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
+                    ensure!(!interrupted,"SDK input closed during startup hook callback");
+                },
+                Some(Err(error)) => return Err(error),
+                Some(Ok(Frame::Response(value))) => route_response(permissions,callbacks,&value).await?,
+                Some(Ok(Frame::User(user))) => { ensure!(queue.len()<32,"SDK pending user queue exceeds 32 messages");queue.push_back(user); },
+                Some(Ok(Frame::Control(value))) => {
+                    if value["request"]["subtype"]=="interrupt" {
+                        callbacks.cancel_all();
+                        response(&value["request_id"],Ok(json!({})))?;
+                        bail!("SDK startup interrupted");
+                    }
+                    response(&value["request_id"],Err(anyhow::anyhow!("Control changes require completed session startup")))?;
+                }
+            }
+        }
+    }
 }

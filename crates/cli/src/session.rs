@@ -32,6 +32,7 @@ pub struct Session {
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_content: Option<Value>,
     pub(crate) sdk_overrides: crate::sdk_initialization::Overrides,
+    pub(crate) sdk_hooks: Option<crate::sdk_hooks::Runtime>,
     pub id: String,
     pub store: SessionStore,
     pub engine: NativeEngine,
@@ -261,6 +262,7 @@ impl Session {
             sdk_permissions: None,
             sdk_content: None,
             sdk_overrides: Default::default(),
+            sdk_hooks: None,
             lifecycle_owned: false,
             api_format,
         })
@@ -588,7 +590,7 @@ impl Session {
         // A host flag and a live, session-owned frontend lease are both required.
         // SDK/Desktop engines never enable this local terminal tool.
         self.engine.set_local_goal_frontend(claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_some());
-        let request = self
+        let request = Box::pin(self
             .engine
             .send_message_with_history(
                 ChatRequest {
@@ -607,7 +609,7 @@ impl Session {
                     reasoning_mode: None,
                 },
                 false,
-            );
+            ));
         let worker_cancel = claude_core::services::background_sessions::wait_for_cancellation();
         tokio::pin!(worker_cancel);
         let mut events = tokio::select! {

@@ -421,7 +421,7 @@ impl QueryEngine {
         let available_skills = discovered_skills.values().filter(|skill| skill.model_invocable()).map(|skill| serde_json::json!({"name":skill.name,"description":skill.description,"context":skill.context})).collect::<Vec<_>>();
         if !available_skills.is_empty() { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool. {}\n", serde_json::to_string(&available_skills)?)); }
         crate::tools::configure_lsp_servers(&workspace_path, crate::services::plugins::language_servers(&plugin_context)?)?;
-        let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(&plugin_context, &workspace)?;
+        let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(&plugin_context, &workspace)?.with_session_callbacks(&conv_id);
         let prompt = request.messages.iter().rev().find(|m| m["role"] == "user").map(|m| m["content"].clone()).unwrap_or(Value::Null);
         let hook_result = hooks.run(crate::services::tool_hooks::HookEvent::UserPromptSubmit, &conv_id, serde_json::json!({"prompt":prompt})).await?;
         anyhow::ensure!(!hook_result.blocked, "UserPromptSubmit hook blocked request: {}", hook_result.reason);
@@ -590,8 +590,10 @@ impl QueryEngine {
             // 使用 catch_unwind 捕获 panic
             let exec_result = tokio::select! {
                 biased;
-                result = std::panic::AssertUnwindSafe(executor.execute()).catch_unwind() => result,
+                // A disconnected host must win over callback failures becoming ready
+                // during SDK cleanup; those failures normally permit continuation.
                 _ = event_tx.closed() => Ok(Err(anyhow!("Response receiver disconnected; turn cancelled"))),
+                result = std::panic::AssertUnwindSafe(Box::pin(executor.execute())).catch_unwind() => result,
             };
 
             let exec_result = match exec_result {
