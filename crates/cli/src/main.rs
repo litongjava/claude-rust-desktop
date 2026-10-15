@@ -26,6 +26,7 @@ mod session_commands;
 mod session_trust;
 mod status_commands;
 mod display_commands;
+mod statusline_commands;
 mod doctor_commands;
 mod background_commands;
 mod batch_commands;

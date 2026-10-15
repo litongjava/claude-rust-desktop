@@ -28,7 +28,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/color", "Set this session's prompt border color"),
     ("/focus", "Toggle progress and detail visibility: [on|off]"),
     ("/output-style", "List or select an output style"),
-    ("/statusline", "Configure a custom status line command: COMMAND|off"),
+    ("/statusline", "Configure status line: setup [description]|command SCRIPT|off|show"),
     ("/diff", "Toggle the scrollable Git diff panel: [on|off|staged]"),
     ("/usage", "Show request tokens, configured cost estimates and Anthropic plan usage"),
     ("/memory", "Show or edit project instructions: [show|edit|local]"),

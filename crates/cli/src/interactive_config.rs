@@ -179,6 +179,10 @@ pub async fn handle(
 ) -> Result<bool> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or_default();
+    if command == "/statusline" {
+        crate::statusline_commands::handle(line.strip_prefix("/statusline").unwrap().trim(), session, input).await?;
+        return Ok(true);
+    }
     if command == "/config" {
         return settings_menu(
             line.strip_prefix("/config").unwrap().trim(),
@@ -527,6 +531,8 @@ async fn settings_menu(
                 input,
             ))
             .await?;
+        } else if setting == "statusline" {
+            crate::statusline_commands::handle(&value, session, input).await?;
         } else if setting == "permissions" {
             if value.is_empty() {
                 eprintln!("Permission mode: {}", session.permission_mode());

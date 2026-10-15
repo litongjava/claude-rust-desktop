@@ -35,14 +35,16 @@ impl Default for Settings {
 }
 
 pub fn load(session: &Session) -> Result<Settings> {
-    session.store.db.with_conn(|conn| -> Result<Settings> {
+    let mut settings = session.store.db.with_conn(|conn| -> Result<Settings> {
         let mut stmt = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
         let mut rows = stmt.query([format!("cli.display.{}", session.id)])?;
         Ok(match rows.next()? {
             Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
             None => Settings::default(),
         })
-    })?
+    })??;
+    if let Some(global) = claude_core::services::statusline_setup::load(&session.paths.data_dir)? { settings.statusline = global.command; }
+    Ok(settings)
 }
 
 fn save(session: &Session, settings: &Settings) -> Result<()> {
@@ -247,11 +249,7 @@ pub async fn handle(
                     settings.output_style = argument.into();
                 }
                 "/statusline" => {
-                    if argument.is_empty() {
-                        eprintln!("Status line command: {}\n/statusline COMMAND configures a shell command receiving session JSON on stdin; /statusline off disables it.", settings.statusline.as_deref().unwrap_or("off"));
-                        return Ok(true);
-                    }
-                    settings.statusline = (argument != "off").then(|| argument.into());
+                    anyhow::bail!("Use the interactive /statusline setup, command, off or show command");
                 }
                 _ => unreachable!(),
             }
@@ -422,7 +420,7 @@ pub async fn statusline(session: &Session, settings: &Settings) -> Result<Option
     let Some(script) = settings.statusline.as_ref() else {
         return Ok(None);
     };
-    let payload = json!({"session_id":session.id,"model":{"id":session.model,"display_name":session.model},"workspace":{"current_dir":session.workspace},"cwd":session.workspace,"usage":usage(session)?});
+    let payload = crate::statusline_commands::payload(session).await?;
     let result =
         claude_core::services::statusline::run(script, &session.workspace, &payload).await?;
     Ok(Some(result))
