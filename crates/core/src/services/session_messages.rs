@@ -202,6 +202,31 @@ pub fn receiver_active(root: &Path, session: &str) -> Result<bool> {
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
+/// Cross-engine/process execution ownership, including Desktop private sessions.
+pub struct ExecutionLease {
+    _file: File,
+}
+impl ExecutionLease {
+    pub fn acquire(root: &Path, session: &str) -> Result<Option<Self>> {
+        if uuid::Uuid::parse_str(session).is_err() {
+            return Ok(None);
+        }
+        // Lock ownership does not require opening/migrating a second database pool.
+        // UUID validation bounds the filename; workspace/trust validation stays with the executor.
+        let directory = root.join("session-execution-locks");
+        std::fs::create_dir_all(&directory)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join(format!("{session}.lock")))?;
+        file.try_lock()
+            .context("Session is already executing in another owner")?;
+        Ok(Some(Self { _file: file }))
+    }
+}
+
 pub struct Consumer {
     _file: File,
     pub target: Target,

@@ -402,3 +402,94 @@ async fn managed_worktree_owned_child_can_message_parent_without_new_source_trus
     cleanup.0.clear();
     server.abort();
 }
+
+#[tokio::test]
+async fn resident_owner_resumes_same_child_with_original_provider_after_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let parent = store.create(&workspace, "fixture", "cli-runtime").unwrap();
+    let child_id = Arc::new(Mutex::new(None::<String>));
+    let child_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::<(bool, Value)>::new()));
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    for original in [true, false] {
+        let child_id = child_id.clone();
+        let child_calls = child_calls.clone();
+        let requests = requests.clone();
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
+            let child_id=child_id.clone();let child_calls=child_calls.clone();let requests=requests.clone();async move {
+                let child=body.to_string().contains("Child session ID:");requests.lock().unwrap().push((original,body.clone()));
+                let messages=body["messages"].as_array().unwrap();let last=messages.last().unwrap();
+                let tools=if child {assert!(original,"Child must retain its original endpoint");child_calls.fetch_add(1,Ordering::SeqCst);Vec::new()}
+                else if last["role"]=="user" && last["content"]=="create owned child" {vec![("create","Agent",json!({"prompt":"original owned child"}))]}
+                else if last["role"]=="user" && last["content"]=="continue owned child" {vec![("resume","Agent",json!({"resume":child_id.lock().unwrap().clone().unwrap(),"prompt":"resumed through resident worker"}))]}
+                else {Vec::new()};
+                ([("content-type","text/event-stream")],stream("openai",tools))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}/v1", listener.local_addr().unwrap()));
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+    }
+    let executable = temp.path().join(if cfg!(windows) {
+        "resume-fixture.exe"
+    } else {
+        "resume-fixture"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    let host = worker::ensure_worker(&paths.data_dir, &executable, &parent, &workspace)
+        .await
+        .unwrap();
+    let mut cleanup = Cleanup(vec![host.supervisor_pid.unwrap()]);
+    let first = submit(&host, &urls[0], "openai", "create owned child").await;
+    assert_eq!(completed(&paths.data_dir, &first).await.status, "completed");
+    let context = mail::context(&paths.data_dir).unwrap();
+    let peers = mail::peers(&context, &parent).unwrap();
+    let child = peers.iter().find(|entry| entry["id"] != parent).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    *child_id.lock().unwrap() = Some(child.clone());
+    let second = submit(&host, &urls[1], "openai", "continue owned child").await;
+    assert_eq!(
+        completed(&paths.data_dir, &second).await.status,
+        "completed"
+    );
+    assert_eq!(
+        child_calls.load(Ordering::SeqCst),
+        2,
+        "Original child must execute again through endpoint A"
+    );
+    assert!(store
+        .history(&child)
+        .unwrap()
+        .iter()
+        .any(|row| row["content"] == "resumed through resident worker"));
+    mail::send(&context, &parent, &child, "RESIDENT_BOUNDARY_MARKER").unwrap();
+    let third = submit(&host, &urls[1], "openai", "observe queued child").await;
+    assert_eq!(completed(&paths.data_dir, &third).await.status, "completed");
+    assert_eq!(child_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        mail::inbox(&context, &child, false).unwrap()[0].state,
+        "context_committed"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(original, body)| *original
+                && body.to_string().contains("RESIDENT_BOUNDARY_MARKER"))
+    );
+    worker::shutdown(&paths.data_dir, &parent).await.unwrap();
+    cleanup.0.clear();
+    for server in servers {
+        server.abort();
+    }
+}

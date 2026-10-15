@@ -1,5 +1,5 @@
 #[path = "delegation.rs"]
-mod delegation;
+pub(crate) mod delegation;
 #[path = "deep_research.rs"]
 mod deep_research;
 #[cfg(test)]
@@ -155,6 +155,8 @@ pub struct ToolLoopExecutor {
     allowed_tools: Option<Vec<String>>,
     learning_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     delegation_depth: usize,
+    owned_children: delegation::OwnedChildren,
+    child_resumes: AtomicUsize,
     subagent_hook_context: Option<(String, String)>,
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
@@ -163,6 +165,7 @@ pub struct ToolLoopExecutor {
     manual_skill_active: bool,
     durable_user_input: bool,
     message_inbox: Option<crate::services::session_messages::Target>,
+    execution_lease: Option<crate::services::session_messages::ExecutionLease>,
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
@@ -513,6 +516,8 @@ impl ToolLoopExecutor {
             allowed_tools: None,
             learning_tools: None,
             delegation_depth: 0,
+            owned_children: Default::default(),
+            child_resumes: AtomicUsize::new(0),
             subagent_hook_context: None,
             hooks: None,
             stop_hook_active: false,
@@ -521,6 +526,7 @@ impl ToolLoopExecutor {
             manual_skill_active: false,
             durable_user_input: false,
             message_inbox: None,
+            execution_lease: None,
             message_deliveries: 0,
             pending_plan_reset: None,
             allowed_directories: Vec::new(),
@@ -746,7 +752,16 @@ impl ToolLoopExecutor {
         Ok(messages)
     }
 
+    pub(crate) fn with_owned_children(mut self, children: delegation::OwnedChildren) -> Self {
+        self.owned_children = children;
+        self
+    }
+
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        let _execution_owner = if self.execution_lease.is_some() {self.execution_lease.take()} else {match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+            (Some(root),Some(session))=>crate::services::session_messages::ExecutionLease::acquire(root,session)?,
+            _=>None,
+        }};
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
@@ -762,6 +777,7 @@ impl ToolLoopExecutor {
         };
         self.message_inbox = inbox_owner.as_ref().map(|owner| owner.target.clone());
         self.message_deliveries = 0;
+        self.child_resumes.store(0, Ordering::Relaxed);
 
         if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode) {
             if let (Some(root), Some(session)) = (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
@@ -959,6 +975,29 @@ impl ToolLoopExecutor {
                 _ => Err(anyhow::anyhow!("Session-local message routing is unavailable")),
             };
             let failed = result.is_err();
+            let mut result = result;
+            if tool_input["operation"] == "send" {
+                if let (Ok(value),Some(recipient)) = (&mut result,tool_input["to"].as_str()) {
+                    let owned={let registry=self.owned_children.lock().unwrap_or_else(|e|e.into_inner());registry.get(recipient).is_some_and(|entry|Some(entry.parent.as_str())==self.conv_id.as_deref())};
+                    if owned {
+                        match Box::pin(self.resume_owned_child(recipient,None,true)).await {
+                            Ok(resumed)=>{
+                                value["resume"]=resumed;value["delivery"]=json!("resumed_in_owner_turn");
+                                if let Some(root)=self.search_config_path.as_deref().and_then(|path|path.parent()) {
+                                    if let Ok(context)=crate::services::session_messages::context(root) {
+                                        if let Ok(messages)=crate::services::session_messages::sent(&context,self.conv_id.as_deref().unwrap_or_default()) {
+                                            if let Some(message)=messages.into_iter().find(|message|Some(message.id.as_str())==value["message"]["id"].as_str()) {
+                                                value["state"]=json!(message.state);value["message"]=json!(message);
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error)=>{value["resume"]=json!({"status":"needs_resume","reason":error.to_string()});}
+                        }
+                    }
+                }
+            }
             let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
             return (tool_input.clone(), output, failed);
         }
@@ -1332,6 +1371,7 @@ impl ToolLoopExecutor {
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
 
         for iteration in 0..self.max_tool_iterations {
+            self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) });
             }
@@ -1831,6 +1871,7 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
 
         for iteration in 0..self.max_tool_iterations {
+            self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });
             }

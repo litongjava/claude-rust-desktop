@@ -106,6 +106,7 @@ pub struct ToolCallRecord {
 }
 
 pub struct QueryEngine {
+    owned_children: super::tool_loop::delegation::OwnedChildren,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
     db_manager: Arc<DbManager>,
@@ -138,6 +139,7 @@ impl QueryEngine {
     ) -> Self {
         Self {
             bundled_resources: Arc::default(),
+            owned_children: Default::default(),
             provider_manager,
             db_manager,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -510,6 +512,7 @@ impl QueryEngine {
             workspace_path.clone(),
             reasoning_mode.clone(),
         )
+        .with_owned_children(self.owned_children.clone())
         .with_allowed_directories(allowed_directories)
         .with_user_skill(pending_user_skill)
         .with_max_turns(request.max_turns)?

@@ -77,6 +77,21 @@ pub struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// In-memory equality guard for resuming an owned executor; never persisted or logged.
+    pub(crate) fn delegation_policy_snapshot(&self, session: &str) -> serde_json::Value {
+        let callback = self.always_allow_checker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().map(|callback| Arc::as_ptr(callback) as *const () as usize);
+        let mode=self.mode_snapshot();
+        serde_json::json!({
+            "mode":mode.mode.as_str(),
+            "mode_revision":mode.revision,
+            "rules":*self.ruleset.lock().unwrap_or_else(|e|e.into_inner()),
+            "tools":*self.tool_permissions.lock().unwrap_or_else(|e|e.into_inner()),
+            "session":self.session_rules.lock().unwrap_or_else(|e|e.into_inner()).get(session),
+            "runtime":self.runtime_rules.lock().unwrap_or_else(|e|e.into_inner()).get(session),
+            "callback_identity":callback
+        })
+    }
+
     /// Ephemeral host rules, independent of persisted session configuration.
     pub fn set_runtime_rules(
         &self,
