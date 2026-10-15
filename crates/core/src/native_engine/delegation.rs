@@ -256,6 +256,7 @@ impl ToolLoopExecutor {
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
+        entry.executor.permission_mailbox = self.permission_mailbox.clone();
         entry.executor.message_inbox = None;
         entry.executor.stop_hook_active = false;
         if let Some(manager) = &entry.executor.permission_manager {
@@ -506,6 +507,7 @@ impl ToolLoopExecutor {
         .with_prompt_profile(self.prompt_profile)
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
+        .with_permission_mailbox(self.permission_mailbox.clone())
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(self.search_config_path.clone().unwrap());
         child = child.with_response_schema(schema)?;
@@ -682,6 +684,7 @@ impl ToolLoopExecutor {
                         .clone()
                         .map(|client| crate::memory::ContextManager::new(Arc::new(client)));
                     child.answer_waiters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    child.permission_mailbox = Default::default();
                     let (events, _receiver) = tokio::sync::mpsc::channel(1);
                     child.event_tx = events;
                     let mut registry = self

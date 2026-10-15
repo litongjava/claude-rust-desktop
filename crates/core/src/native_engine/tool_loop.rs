@@ -1,3 +1,5 @@
+#[path = "tool_approval.rs"]
+mod tool_approval;
 #[cfg(test)]
 #[path = "auto_permission_tests.rs"]
 mod auto_permission_tests;
@@ -152,6 +154,9 @@ pub struct ToolLoopExecutor {
     streaming_tool_args: HashMap<String, StreamingToolCall>,
     conv_id: Option<String>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    permission_mailbox: crate::native_engine::permission_response::Mailbox,
+    permission_interrupted: Option<String>,
+    approved_call: Option<(String, Value, String)>,
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
     context_manager: Option<ContextManager>,
@@ -515,6 +520,9 @@ impl ToolLoopExecutor {
             streaming_tool_args: HashMap::new(),
             conv_id: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
+            permission_mailbox: Default::default(),
+            permission_interrupted: None,
+            approved_call: None,
             permission_manager: None,
             memex_client: None,
             context_manager: None,
@@ -584,6 +592,7 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_tool_call(&mut self, name: &str, input: &Value, id: &str) -> (Value, String, bool) {
+        if let Err(error) = self.ensure_permission_continuation() { return (input.clone(), error.to_string(), true); }
         if self.pending_plan_reset.is_some() {
             return (input.clone(), "Tool skipped: the user cleared planning context. Request it again from the approved implementation context.".into(), true);
         }
@@ -595,7 +604,7 @@ impl ToolLoopExecutor {
             Err(error) => return (input.clone(), format!("PreToolUse hook failed; tool not executed: {error:#}"), true),
         };
         if pre.blocked { return (input.clone(), format!("PreToolUse hook blocked tool: {}", pre.reason), true); }
-        let input = pre.updated_input.unwrap_or_else(|| input.clone());
+        let mut input = pre.updated_input.unwrap_or_else(|| input.clone());
         if pre.ask_permission {
             if self.permission_manager.as_ref().is_some_and(|manager| manager.get_mode() == crate::permissions::PermissionMode::DontAsk) {
                 return (input, "dontAsk mode: hook requested permission; tool was not executed".into(), true);
@@ -604,18 +613,15 @@ impl ToolLoopExecutor {
             if let PermissionResult::Denied(reason) = hook_decision {
                 return (input, format!("Permission denied: {reason}"), true);
             }
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = oneshot::channel();
-            self.answer_waiters.lock().await.insert(request_id.clone(), tx);
-            let _waiter_guard = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
-            let _ = self.event_tx.send(EngineEvent::ToolPermission { request_id: request_id.clone(), tool_use_id: id.into(), tool_name: name.into(), input: input.clone() }).await;
-            let answer = self.wait_for_user_answer(rx).await;
-            self.answer_waiters.lock().await.remove(&request_id);
-            let approved = answer.ok().and_then(|r| r.ok()).is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "yes"|"allow"|"ok"|"approved"|"always_allow"|"允许"|"是"|"确认"));
-            if !approved { return (input, "Hook requested permission; operation was not approved".into(), true); }
+            input = match self.request_tool_approval(name, &input, id).await {
+                Ok(actual) => actual,
+                Err(error) => return (input, format!("Hook requested permission: {error:#}"), true),
+            };
+            self.approved_call = Some((name.into(), input.clone(), id.into()));
         }
         // Updated arguments pass through the complete normal permission path.
         let (actual, mut output, mut failed) = Box::pin(self.execute_tool_call_inner(name, &input, id)).await;
+        self.approved_call = None;
         for context in pre.additional_context { output.push_str(&format!("\nPreToolUse context: {context}")); }
         for warning in pre.warnings { tracing::warn!("PreToolUse hook: {warning}"); }
         let event = if failed { HookEvent::PostToolUseFailure } else { HookEvent::PostToolUse };
@@ -730,6 +736,9 @@ impl ToolLoopExecutor {
     }
 
     async fn check_permission(&self, tool_name: &str, tool_input: &Value, tool_use_id: &str) -> PermissionResult {
+        if self.approved_call.as_ref().is_some_and(|(name, input, id)| name == tool_name && input == tool_input && id == tool_use_id) {
+            return self.permission_hard_denial(tool_name, tool_input).map(PermissionResult::Denied).unwrap_or(PermissionResult::Granted);
+        }
         if let Some(ref pm) = self.permission_manager {
             let conv_id = self.conv_id.clone().unwrap_or_default();
             let workspace_path = Some(self.workspace_cwd.clone());
@@ -805,6 +814,8 @@ impl ToolLoopExecutor {
         // A previous invocation may have been dropped while executing a manual
         // skill. Explicit invocation authority never carries into the next turn.
         self.manual_skill_active = false;
+        self.permission_interrupted = None;
+        self.approved_call = None;
         if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
             self.messages = vec![json!({"role":"user","content":content})];
             self.stop_hook_active = false;
@@ -1277,139 +1288,6 @@ impl ToolLoopExecutor {
         else { timeout(Duration::from_secs(300), receiver).await }
     }
 
-    async fn execute_ask_user_confirmation(&mut self, tool_name: &str, tool_input: &Value, tool_use_id: &str, _message: &str) -> (Value, String, bool) {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel::<String>();
-        {
-            let mut waiters = self.answer_waiters.lock().await;
-            waiters.insert(request_id.clone(), tx);
-        }
-        let _waiter_guard = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
-
-        let _ = self.event_tx.send(EngineEvent::ToolPermission {
-            request_id: request_id.clone(),
-            tool_use_id: tool_use_id.to_string(),
-            tool_name: tool_name.to_string(),
-            input: tool_input.clone(),
-        }).await;
-
-        match self.wait_for_user_answer(rx).await {
-            Ok(Ok(answer)) => {
-                let answer_lower = answer.trim().to_lowercase();
-                let is_allowed = matches!(answer_lower.as_str(),
-                    "yes" | "allow" | "ok" | "continue" | "proceed" | "approved" | "always_allow" |
-                    "是" | "允许" | "确认" | "继续" | "同意" | "好的" | "可以"
-                );
-
-                let is_denied = matches!(answer_lower.as_str(),
-                    "no" | "cancel" | "deny" | "reject" | "stop" | "abort" |
-                    "否" | "取消" | "拒绝" | "停止" | "不要"
-                );
-
-                if is_allowed {
-                    let conv_id = self.conv_id.clone().unwrap_or_default();
-                    if answer_lower == "always_allow" {
-                        if let Some(ref pm) = self.permission_manager {
-                            pm.set_tool_permission(tool_name, crate::permissions::ToolPermission {
-                                tool_name: tool_name.to_string(),
-                                allowed: true,
-                                requires_confirmation: false,
-                                scope: crate::permissions::PermissionScope::Global,
-                                level: crate::permissions::PermissionLevel::Execute,
-                            });
-                        }
-                    }
-                    if let Some(ref pm) = self.permission_manager {
-                        pm.confirm_permission(&conv_id, tool_name);
-                    }
-
-                    let result = Box::pin(self.execute_tool_call_unchecked(tool_name, tool_input, "")).await;
-                    result
-                } else if is_denied {
-                    (tool_input.clone(), "User denied the operation".to_string(), true)
-                } else {
-                    (tool_input.clone(), "User cancelled the operation".to_string(), true)
-                }
-            }
-            Ok(Err(_)) => {
-                let mut waiters = self.answer_waiters.lock().await;
-                waiters.remove(&request_id);
-                (tool_input.clone(), "User did not respond, operation cancelled".to_string(), true)
-            }
-            Err(_) => {
-                let mut waiters = self.answer_waiters.lock().await;
-                waiters.remove(&request_id);
-                (tool_input.clone(), "User response timed out (300s), operation cancelled".to_string(), true)
-            }
-        }
-    }
-
-    async fn execute_tool_call_unchecked(
-        &mut self,
-        tool_name: &str,
-        tool_input: &Value,
-        _tool_use_id: &str,
-    ) -> (Value, String, bool) {
-        if tool_name == "memory_search" { return self.execute_memory_search(tool_input).await; }
-        if tool_name == "memory_ingest" { return self.execute_memory_ingest(tool_input).await; }
-        if matches!(tool_name, "Agent" | "Delegate" | "Worker") {
-            let result = Box::pin(self.execute_delegated_authorized(tool_input, None, None, true)).await;
-            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Delegation failed: {error:#}") }, result.is_err());
-        }
-        if tool_name == "team" && tool_input["operation"] == "run" {
-            let result = Box::pin(self.execute_team(tool_input)).await;
-            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Team failed: {error:#}") }, result.is_err());
-        }
-        if tool_name == "Workflow" {
-            let result = Box::pin(self.execute_workflow(tool_input)).await;
-            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Workflow failed: {error:#}") }, result.is_err());
-        }
-        if crate::tools::tasks::is_task(tool_name) {
-            let result = async {
-                let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
-                let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
-                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
-            }.await;
-            return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());
-        }
-
-        if tool_name == "Skill" {
-            let result = Box::pin(self.execute_skill_tool(tool_input)).await;
-            return (tool_input.clone(), match &result { Ok(value)=>value.to_string(),Err(error)=>format!("Skill failed: {error:#}") }, result.is_err());
-        }
-        let output_str;
-        let is_error;
-
-        if let Some(ref registry) = self.mcp_registry {
-            if registry.is_mcp_tool(tool_name).await {
-                let result = registry.execute_tool(tool_name, tool_input.clone()).await;
-                output_str = match &result {
-                    Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
-                    Err(e) => format!("Error: {}", e),
-                };
-                is_error = result.is_err();
-            } else {
-                let cwd = self.get_workspace_cwd().to_string();
-                let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
-                output_str = match &result {
-                    Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
-                    Err(e) => format!("Error: {}", e),
-                };
-                is_error = result.is_err();
-            }
-        } else {
-            let cwd = self.get_workspace_cwd().to_string();
-            let result = execute_builtin_tool(tool_name, tool_input.clone(), &cwd, &self.provider, &self.event_tx, self.search_config_path.as_deref(), self.skill_shell_active).await;
-            output_str = match &result {
-                Ok(val) => serde_json::to_string_pretty(val).unwrap_or_default(),
-                Err(e) => format!("Error: {}", e),
-            };
-            is_error = result.is_err();
-        }
-
-        (tool_input.clone(), output_str, is_error)
-    }
-
     async fn execute_anthropic_loop(&mut self) -> Result<(String, Option<String>)> {
         tracing::info!(module = "AnthropicLoop", "ENTRY: building messages, msg_count={}", self.messages.len());
         let mut conversation_messages: Vec<AnthropicMessage> = self.build_anthropic_messages();
@@ -1436,6 +1314,7 @@ impl ToolLoopExecutor {
 
         for iteration in 0..self.max_tool_iterations {
             self.ensure_auto_not_exhausted()?;
+            self.ensure_permission_continuation()?;
             self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(AnthropicMessage { role: "user".into(), content: AnthropicContent::Text(content) });
@@ -1805,6 +1684,9 @@ impl ToolLoopExecutor {
 
                 for tc in &serial_calls {
                     let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    for block in &mut assistant_blocks {
+                        if let ContentBlock::ToolUse { id, input, .. } = block { if id == &tc.id { *input = actual_input.clone(); } }
+                    }
                     if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
@@ -1824,6 +1706,7 @@ impl ToolLoopExecutor {
                     });
                 }
 
+                self.ensure_permission_continuation()?;
                 if !parallel_calls.is_empty() {
                     let total = parallel_calls.len();
                     let completed_count = Arc::new(AtomicUsize::new(serial_calls.len()));
@@ -1939,6 +1822,7 @@ impl ToolLoopExecutor {
 
         for iteration in 0..self.max_tool_iterations {
             self.ensure_auto_not_exhausted()?;
+            self.ensure_permission_continuation()?;
             self.resume_pending_owned_children().await;
             for content in self.drain_peer_messages()? {
                 conversation_messages.push(OpenAIMessage { role: "user".into(), content: OpenAIContent::Text(content), tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None });
@@ -2297,6 +2181,9 @@ impl ToolLoopExecutor {
 
                 for tc in &serial_calls {
                     let (actual_input, output_str, is_error) = self.execute_tool_call(&tc.name, &tc.input, &tc.id).await;
+                    for call in &mut assistant_tool_calls {
+                        if call.id == tc.id { call.function.arguments = actual_input.to_string(); }
+                    }
                     if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
@@ -2315,6 +2202,7 @@ impl ToolLoopExecutor {
                     });
                 }
 
+                self.ensure_permission_continuation()?;
                 if !parallel_calls.is_empty() {
                     let total = parallel_calls.len();
                     let completed_count = Arc::new(AtomicUsize::new(serial_calls.len()));

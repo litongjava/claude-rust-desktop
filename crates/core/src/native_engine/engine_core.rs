@@ -116,6 +116,7 @@ pub struct QueryEngine {
     workspaces_dir: PathBuf,
     mcp_registry: Option<Arc<McpToolRegistry>>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    permission_mailbox: super::permission_response::Mailbox,
     tool_call_history: Arc<Mutex<HashMap<String, Vec<ToolCallRecord>>>>,
     permission_manager: Arc<PermissionManager>,
     skills_manager: Option<Arc<Mutex<SkillsManager>>>,
@@ -149,6 +150,7 @@ impl QueryEngine {
             workspaces_dir,
             mcp_registry: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
+            permission_mailbox: Default::default(),
             tool_call_history: Arc::new(Mutex::new(HashMap::new())),
             permission_manager,
             skills_manager: None,
@@ -534,6 +536,7 @@ impl QueryEngine {
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
+        .with_permission_mailbox(self.permission_mailbox.clone())
         .with_permission_manager(self.permission_manager.clone())
         .with_auto_manual_interactive(self.auto_manual_interactive.load(std::sync::atomic::Ordering::Relaxed))
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(self.file_cache.clone(), workspace_path.clone())));
@@ -803,12 +806,17 @@ impl QueryEngine {
             }
         }
         self.answer_waiters.lock().await.retain(|_, sender| !sender.is_closed());
+        self.permission_mailbox.lock().await.retain(|_, sender| !sender.is_closed());
 
         let mut states = self.conversation_states.lock().await;
         if let Some(state) = states.get_mut(conv_id) {
             state.status = ConversationStatus::Idle;
             state.last_activity = Utc::now().to_rfc3339();
         }
+    }
+
+    pub async fn resume_with_permission(&self, request_id: &str, response: super::permission_response::PermissionResponse) -> Result<()> {
+        super::permission_response::respond(&self.permission_mailbox, request_id, response).await
     }
 
     pub async fn resume_with_answer(&self, conv_id: &str, answer: String) -> Result<()> {

@@ -29,24 +29,16 @@ impl ToolLoopExecutor {
         input: &Value,
         id: &str,
     ) -> (Value, String, bool) {
+        let mut actual = input.clone();
         let result = async {
             match self.check_permission(tool, input, id).await {
                 PermissionResult::Denied(reason) => anyhow::bail!("{reason}"),
                 PermissionResult::RequiresConfirmation(_) => {
-                    let request = uuid::Uuid::new_v4().to_string();
-                    let (tx, rx) = oneshot::channel();
-                    self.answer_waiters.lock().await.insert(request.clone(), tx);
-                    let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request.clone() };
-                    if self.event_tx.send(EngineEvent::ToolPermission {request_id:request.clone(),tool_use_id:id.into(),tool_name:tool.into(),input:input.clone()}).await.is_err() {
-                        self.answer_waiters.lock().await.remove(&request);
-                        anyhow::bail!("Approval host disconnected");
-                    }
-                    let answer = self.wait_for_user_answer(rx).await;
-                    self.answer_waiters.lock().await.remove(&request);
-                    anyhow::ensure!(answer.ok().and_then(|v|v.ok()).is_some_and(|v|matches!(v.trim().to_lowercase().as_str(),"yes"|"y"|"allow"|"approved"|"\u{5141}\u{8bb8}"|"\u{540c}\u{610f}"|"\u{662f}")), "Plan file change was not approved");
+                    actual = self.request_tool_approval(tool, input, id).await?;
                 }
                 PermissionResult::Granted => {}
             }
+            let input = &actual;
             if let PermissionResult::Denied(reason) = self.check_permission(tool, input, id).await { anyhow::bail!("{reason}"); }
             anyhow::ensure!(self.is_plan_document_tool(tool, input), "Plan permission or file path changed; retry the operation");
             let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).context("Plan storage unavailable")?;
@@ -62,7 +54,7 @@ impl ToolLoopExecutor {
             plans::edit_document(root, session, tool, input)
         }.await;
         (
-            input.clone(),
+            actual,
             match &result {
                 Ok(value) => value.to_string(),
                 Err(error) => format!("Plan file: {error:#}"),
@@ -95,33 +87,7 @@ impl ToolLoopExecutor {
         match self.check_permission(tool_name, input, id).await {
             PermissionResult::Denied(reason) => anyhow::bail!("{reason}"),
             PermissionResult::RequiresConfirmation(_) if entering => {
-                let request = uuid::Uuid::new_v4().to_string();
-                let (tx, rx) = oneshot::channel();
-                self.answer_waiters.lock().await.insert(request.clone(), tx);
-                let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request.clone() };
-                if self
-                    .event_tx
-                    .send(EngineEvent::ToolPermission {
-                        request_id: request.clone(),
-                        tool_use_id: id.into(),
-                        tool_name: tool_name.into(),
-                        input: input.clone(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    self.answer_waiters.lock().await.remove(&request);
-                    anyhow::bail!("Approval host disconnected");
-                }
-                let answer = self.wait_for_user_answer(rx).await;
-                self.answer_waiters.lock().await.remove(&request);
-                anyhow::ensure!(
-                    answer.ok().and_then(|a| a.ok()).is_some_and(|a| matches!(
-                        a.trim().to_lowercase().as_str(),
-                        "yes" | "y" | "allow" | "approved" | "允许" | "是"
-                    )),
-                    "Entering plan mode was not approved"
-                );
+                self.request_tool_approval(tool_name, input, id).await?;
             }
             _ => {}
         }

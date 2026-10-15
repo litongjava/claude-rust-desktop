@@ -5,7 +5,12 @@ use crate::{
     session::Session,
 };
 use anyhow::{bail, ensure, Context, Result};
+use claude_core::native_engine::permission_response::PermissionResponse;
 use serde_json::{json, Value};
+enum Reply {
+    Question(String),
+    Permission(PermissionResponse),
+}
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -19,7 +24,7 @@ mod permission_updates;
 
 #[derive(Default)]
 pub struct Permissions {
-    pending: Mutex<HashMap<String, (Value, Option<String>, oneshot::Sender<Result<String>>)>>,
+    pending: Mutex<HashMap<String, (Value, Option<String>, oneshot::Sender<Result<Reply>>)>>,
     closed: AtomicBool,
     updates: Option<Arc<permission_updates::Updates>>,
 }
@@ -30,8 +35,14 @@ impl Permissions {
         tool_use_id: &str,
         tool: &str,
         input: &Value,
-    ) -> Result<String> {
-        self.request(id, tool_use_id, tool, input, None, None).await
+    ) -> Result<PermissionResponse> {
+        match self
+            .request(id, tool_use_id, tool, input, None, None)
+            .await?
+        {
+            Reply::Permission(response) => Ok(response),
+            Reply::Question(_) => bail!("Question answer cannot approve a tool"),
+        }
     }
 
     pub async fn ask_question(
@@ -73,15 +84,20 @@ impl Permissions {
             })
             .collect::<Result<Vec<_>>>()?;
         let input = json!({"questions":[{"question":question,"header":"Question","options":options,"multiSelect":original.get("multiSelect").cloned().unwrap_or(json!(false))}]});
-        self.request(
-            id,
-            tool_use_id,
-            "AskUserQuestion",
-            &input,
-            Some(question.to_owned()),
-            original["description"].as_str(),
-        )
-        .await
+        match self
+            .request(
+                id,
+                tool_use_id,
+                "AskUserQuestion",
+                &input,
+                Some(question.to_owned()),
+                original["description"].as_str(),
+            )
+            .await?
+        {
+            Reply::Question(answer) => Ok(answer),
+            Reply::Permission(_) => bail!("Tool decision cannot answer a question"),
+        }
     }
 
     async fn request(
@@ -92,7 +108,7 @@ impl Permissions {
         input: &Value,
         question: Option<String>,
         description: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Reply> {
         ensure!(
             !self.closed.load(Ordering::SeqCst),
             "SDK input closed before tool approval"
@@ -125,7 +141,7 @@ impl Permissions {
         let Some((input, question, tx)) = self.pending.lock().await.remove(id) else {
             bail!("Unknown or completed SDK permission request: {id}")
         };
-        let answer = (|| -> Result<String> {
+        let answer = (|| -> Result<Reply> {
             ensure!(
                 response["subtype"] == "success",
                 "SDK host rejected permission request: {}",
@@ -134,22 +150,60 @@ impl Permissions {
             let result = &response["response"];
             match result["behavior"].as_str() {
                 Some("allow") => {
-                    let answer = if let Some(question) = question.as_deref() {
-                        question_answer(&input, question, &result["updatedInput"])?
+                    if let Some(question) = question.as_deref() {
+                        let answer = question_answer(&input, question, &result["updatedInput"])?;
+                        if let Some(updates) = result.get("updatedPermissions") {
+                            self.updates
+                                .as_ref()
+                                .context("SDK session permission updates unavailable")?
+                                .apply(updates)?;
+                        }
+                        Ok(Reply::Question(answer))
                     } else {
-                        ensure!(result.get("updatedInput").is_none_or(|v|v==&input),"SDK updatedInput differs from reviewed tool input; no permission was granted");
-                        "yes".into()
-                    };
-                    if let Some(updates) = result.get("updatedPermissions") {
-                        self.updates
-                            .as_ref()
-                            .context("SDK session permission updates unavailable")?
-                            .apply(updates)?;
+                        let updated_input = result
+                            .get("updatedInput")
+                            .map(|value| {
+                                ensure!(value.is_object(), "SDK updatedInput must be an object");
+                                Ok(value.clone())
+                            })
+                            .transpose()?;
+                        let commit = result
+                            .get("updatedPermissions")
+                            .map(|value| {
+                                self.updates
+                                    .as_ref()
+                                    .context("SDK session permission updates unavailable")?
+                                    .prepare(value)
+                            })
+                            .transpose()?;
+                        Ok(Reply::Permission(PermissionResponse::Allow {
+                            updated_input,
+                            commit,
+                        }))
                     }
-                    Ok(answer)
                 }
                 Some("deny") if question.is_some() => bail!("SDK host declined the user question"),
-                Some("deny") => Ok("no".into()),
+                Some("deny") => {
+                    let message = result
+                        .get("message")
+                        .map(|value| value.as_str().context("SDK denial message must be text"))
+                        .transpose()?
+                        .unwrap_or("SDK host denied the operation")
+                        .to_owned();
+                    let interrupt = result
+                        .get("interrupt")
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .context("SDK denial interrupt must be boolean")
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    Ok(Reply::Permission(PermissionResponse::Deny {
+                        message,
+                        interrupt,
+                    }))
+                }
                 _ => bail!("SDK permission response needs behavior allow or deny"),
             }
         })();
@@ -192,7 +246,7 @@ fn question_answer(input: &Value, question: &str, updated: &Value) -> Result<Str
 mod question_tests {
     use super::*;
     #[tokio::test]
-    async fn rewritten_input_cannot_apply_permission_updates() {
+    async fn approval_patch_is_deferred_until_effective_input_is_validated() {
         use claude_core::permissions::{
             AuditLogger, PermissionContext, PermissionManager, PermissionMode, PermissionResult,
         };
@@ -213,7 +267,10 @@ mod question_tests {
             .await
             .insert("request".into(), (json!({"path":"first"}), None, tx));
         permissions.respond(&json!({"response":{"subtype":"success","request_id":"request","response":{"behavior":"allow","updatedInput":{"path":"second"},"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await.unwrap();
-        assert!(rx.await.unwrap().is_err());
+        assert!(matches!(
+            rx.await.unwrap(),
+            Ok(Reply::Permission(PermissionResponse::Allow { .. }))
+        ));
         let context = PermissionContext {
             tool_name: "Write".into(),
             tool_input: json!({"path":"first"}),
@@ -301,7 +358,13 @@ async fn idle_control(
 }
 pub async fn run(cli: &Cli, session: &mut Session, initial: Option<&str>) -> Result<()> {
     let result = run_inner(cli, session, initial).await;
-    session.sdk_permissions = None;
+    if let Some(permissions) = session.sdk_permissions.take() {
+        permissions.closed.store(true, Ordering::SeqCst);
+        permissions.cancel().await;
+    }
+    if result.is_err() {
+        session.engine.cancel_turn(&session.id).await;
+    }
     session.sdk_content = None;
     session.sdk_overrides = Default::default();
     result

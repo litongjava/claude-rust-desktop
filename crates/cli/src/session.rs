@@ -653,7 +653,13 @@ impl Session {
                             format!("Review plan\n{}\n\n{}\n\nApprove this plan and leave plan mode? Implementation will use ask permissions. [y/N]",
                                 tool_input["planFilePath"].as_str().unwrap_or(""), tool_input["plan"].as_str().unwrap_or(""))
                         } else { format!("Allow {tool_name} {}? [y/N]", serde_json::to_string(&tool_input)?) };
-                        let answer = if let Some(sdk)=&self.sdk_permissions { sdk.ask(&request_id,&tool_use_id,&tool_name,&tool_input).await? } else if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { answer } else {
+                        if let Some(sdk) = &self.sdk_permissions {
+                            let decision = sdk.ask(&request_id, &tool_use_id, &tool_name, &tool_input).await?;
+                            self.engine.resume_with_permission(&request_id, decision).await?;
+                            progress.set_activity("Working");
+                            continue;
+                        }
+                        let answer = if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { answer } else {
                             anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
                             turn_answer(self, &mut progress, input, question).await?
                         };

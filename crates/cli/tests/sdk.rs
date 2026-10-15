@@ -78,7 +78,17 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                     json!({"question":"Which language?","description":"Choose the implementation language","multiSelect":true,"options":[{"label":"Rust","description":"Memory safety"},{"label":"Go","description":"Fast compilation"}]}),
                 )
             } else if matches!(state.mode, Mode::Plan) {
-                ("plan-1", "ExitPlanMode", json!({"plan":"APPROVED_PLAN_SENTINEL"}))
+                (
+                    "plan-1",
+                    "ExitPlanMode",
+                    json!({"plan":"APPROVED_PLAN_SENTINEL"}),
+                )
+            } else if matches!(state.mode, Mode::Approval) {
+                (
+                    "write-1",
+                    "Write",
+                    json!({"file_path":"approval.txt","content":"ACTUAL_APPROVED_WRITE"}),
+                )
             } else {
                 ("read-1", "Read", json!({"file_path":"fixture.txt"}))
             };
@@ -608,20 +618,19 @@ async fn controls_replay_and_live_permission_decisions_use_actual_engine() {
         assert!(!root.path().join("approval.txt").exists());
         let mut updated = permission["request"]["input"].clone();
         if mutate {
-            updated["content"] = json!("Changed unreviewed content");
+            updated["content"] = json!("SDK reviewed replacement");
         }
         client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":if allow {"allow"} else {"deny"},"updatedInput":updated}}})).await;
-        assert_eq!(client.result().await["is_error"], mutate);
-        if mutate {
-            assert!(!root.path().join("approval.txt").exists());
-            assert!(!client.finish().await.0.success());
-            continue;
-        }
+        assert_eq!(client.result().await["is_error"], false);
         assert_eq!(root.path().join("approval.txt").exists(), allow);
         if allow {
             assert_eq!(
                 std::fs::read_to_string(root.path().join("approval.txt")).unwrap(),
-                "ACTUAL_APPROVED_WRITE"
+                if mutate {
+                    "SDK reviewed replacement"
+                } else {
+                    "ACTUAL_APPROVED_WRITE"
+                }
             );
         }
         client.send(json!({"type":"control_request","request_id":"mode","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}})).await;
@@ -648,9 +657,14 @@ async fn session_permission_updates_authorize_later_turn_without_another_prompt(
     client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":"allow","updatedInput":permission["request"]["input"],"updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await;
     assert_eq!(client.result().await["is_error"], false);
     std::fs::remove_file(root.path().join("approval.txt")).unwrap();
-    client.send(user("Write the file again using the session grant")).await;
+    client
+        .send(user("Write the file again using the session grant"))
+        .await;
     assert_eq!(client.result().await["is_error"], false);
-    assert_eq!(std::fs::read_to_string(root.path().join("approval.txt")).unwrap(), "ACTUAL_APPROVED_WRITE");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("approval.txt")).unwrap(),
+        "ACTUAL_APPROVED_WRITE"
+    );
     assert!(client.finish().await.0.success());
 }
 
@@ -886,8 +900,14 @@ async fn sdk_plan_clear_boundary_survives_actual_cli_process() {
         client.send(user("OLD_HISTORY_SENTINEL")).await;
         let request = client.frame("control_request").await;
         let mut updated = request["request"]["input"].clone();
-        let question = updated["questions"][0]["question"].as_str().unwrap().to_owned();
-        let choice = updated["questions"][0]["options"][0]["label"].as_str().unwrap().to_owned();
+        let question = updated["questions"][0]["question"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let choice = updated["questions"][0]["options"][0]["label"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert_eq!(choice, claude_core::services::plan_approval::OPTIONS[0]);
         updated["answers"] = json!({question: choice});
         client.send(json!({"type":"control_response","response":{"subtype":"success","request_id":request["request_id"],"response":{"behavior":"allow","updatedInput":updated}}})).await;
@@ -902,8 +922,17 @@ async fn sdk_plan_clear_boundary_survives_actual_cli_process() {
         let paths = claude_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
         let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let session = result["session_id"].as_str().unwrap();
-        assert!(claude_core::services::plan_approval::latest_boundary(&store.db, session).unwrap().is_some());
-        let history = store.model_history(session, &claude_core::native_engine::provider_manager::ApiFormat::OpenAI).unwrap();
+        assert!(
+            claude_core::services::plan_approval::latest_boundary(&store.db, session)
+                .unwrap()
+                .is_some()
+        );
+        let history = store
+            .model_history(
+                session,
+                &claude_core::native_engine::provider_manager::ApiFormat::OpenAI,
+            )
+            .unwrap();
         let history = serde_json::to_string(&history).unwrap();
         assert!(history.contains("APPROVED_PLAN_SENTINEL"));
         assert!(!history.contains("OLD_HISTORY_SENTINEL"));
@@ -933,26 +962,50 @@ async fn auto_extension_uses_only_explicit_classifier_and_never_executes_on_fail
                 Json(json!({"id":"classifier","object":"chat.completion","created":0,"model":"explicit-classifier","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}})).into_response()
             }
         }));
-        let classifier = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let context = claude_core::services::session_messages::context(&root.path().join("data")).unwrap();
+        let classifier = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let context =
+            claude_core::services::session_messages::context(&root.path().join("data")).unwrap();
         std::fs::write(root.path().join("data/providers.json"), json!([{"id":"classifier-only","name":"Fixture","base_url":endpoint,"api_key":"isolated-classifier-fixture","api_format":"openai","enabled":true,"models":[{"id":"explicit-classifier","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]}]).to_string()).unwrap();
-        claude_core::permissions::auto_config::save(&context, &claude_core::permissions::auto_config::AutoConfig {
-            enabled: true,
-            classifier: Some(claude_core::permissions::auto_config::ClassifierSelection::Named { provider_id:"classifier-only".into(), model_id:"explicit-classifier".into() }),
-            timeout_ms: if outcome=="timeout" {100} else {2000},
-            ..Default::default()
-        }).unwrap();
+        claude_core::permissions::auto_config::save(
+            &context,
+            &claude_core::permissions::auto_config::AutoConfig {
+                enabled: true,
+                classifier: Some(
+                    claude_core::permissions::auto_config::ClassifierSelection::Named {
+                        provider_id: "classifier-only".into(),
+                        model_id: "explicit-classifier".into(),
+                    },
+                ),
+                timeout_ms: if outcome == "timeout" { 100 } else { 2000 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut client = Client::start(root.path(), &server, &["--permission-mode", "dontAsk"]);
         client.send(json!({"type":"control_request","request_id":"auto","request":{"subtype":"set_permission_mode","mode":"auto"}})).await;
         assert_eq!(client.frame("control_response").await["response"]["subtype"], "success");
         client.send(json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Write approval.txt with the requested content"},{"type":"text","text":"SDK_AUTHORITY_TEXT: only edit that requested file"}]}})).await;
         loop {
-            let line = tokio::time::timeout(Duration::from_secs(20), client.output.next_line()).await.unwrap().unwrap().unwrap();
+            let line = tokio::time::timeout(Duration::from_secs(20), client.output.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(&line).unwrap();
-            assert_ne!(frame["type"], "control_request", "headless auto never falls back to host approval: {frame}");
-            if frame["type"] == "result" { break; }
+            assert_ne!(
+                frame["type"], "control_request",
+                "headless auto never falls back to host approval: {frame}"
+            );
+            if frame["type"] == "result" {
+                break;
+            }
         }
-        assert_eq!(root.path().join("approval.txt").exists(), outcome=="allow");
+        assert_eq!(
+            root.path().join("approval.txt").exists(),
+            outcome == "allow"
+        );
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(client.finish().await.0.success());
         classifier.abort();
@@ -1219,5 +1272,163 @@ async fn sdk_initialize_is_rejected_during_an_implicitly_initialized_turn() {
         assert_eq!(requests.len(), 2);
         assert!(!requests[1].to_string().contains("MUST_NOT_APPLY"));
         assert!(requests[1]["messages"].to_string().contains("Rust"));
+    }
+}
+
+#[tokio::test]
+async fn typed_sdk_approval_rewrites_both_provider_histories_and_empty_input_preserves_original() {
+    for anthropic in [false, true] {
+        for empty in [false, true] {
+            let server = Server::start(anthropic, Mode::Approval).await;
+            let root = tempfile::tempdir().unwrap();
+            let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+            client.send(user("Write a reviewed file")).await;
+            let permission = client.frame("control_request").await;
+            assert_eq!(permission["request"]["tool_name"], "Write");
+            let replacement = if empty {
+                json!({})
+            } else {
+                json!({"file_path":"replacement.txt","content":"REVIEWED_REPLACEMENT_SENTINEL"})
+            };
+            client.send(json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":permission["request_id"],"response":{"behavior":"allow","updatedInput":replacement}}})).await;
+            assert_eq!(client.result().await["is_error"], false);
+            assert_eq!(root.path().join("approval.txt").exists(), empty);
+            assert_eq!(root.path().join("replacement.txt").exists(), !empty);
+            let requests = server.fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let history = &requests[1]["messages"];
+            if !empty {
+                assert!(
+                    history
+                        .to_string()
+                        .contains("REVIEWED_REPLACEMENT_SENTINEL"),
+                    "{history}"
+                );
+                assert!(
+                    !history.to_string().contains("ACTUAL_APPROVED_WRITE"),
+                    "{history}"
+                );
+            }
+            drop(requests);
+            assert!(client.finish().await.0.success());
+            let db = claude_core::db::DbManager::new(root.path().join("data/claude_desktop.db"))
+                .unwrap();
+            let persisted: String = db
+                .with_conn(|connection| {
+                    connection.query_row(
+                        "SELECT input FROM tool_calls WHERE name = 'Write'",
+                        [],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let persisted: Value = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(
+                persisted["file_path"],
+                if empty {
+                    "approval.txt"
+                } else {
+                    "replacement.txt"
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_sdk_deny_interrupt_stops_both_providers_without_followup_request() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::Approval).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+        client.send(user("Write a file")).await;
+        let permission = client.frame("control_request").await;
+        client.send(json!({"type":"control_response","response":{"subtype":"success",
+            "request_id":permission["request_id"],"response":{"behavior":"deny","message":"INTERRUPT_SENTINEL","interrupt":true}}})).await;
+        let result = client.result().await;
+        assert_eq!(result["is_error"], true, "{result}");
+        assert!(
+            result.to_string().contains("INTERRUPT_SENTINEL"),
+            "{result}"
+        );
+        assert_eq!(server.fixture.requests.lock().unwrap().len(), 1);
+        assert!(!root.path().join("approval.txt").exists());
+        client.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_sdk_replacement_never_commits_session_rules() {
+    for anthropic in [false, true] {
+        for outside_scope in [false, true] {
+            let server = Server::start(anthropic, Mode::Approval).await;
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+            client.send(user("Write a file")).await;
+            let permission = client.frame("control_request").await;
+            let replacement = if outside_scope {
+                json!({"file_path":outside.path().join("outside.txt"),"content":"must not write"})
+            } else {
+                json!({"file_path":"invalid.txt"})
+            };
+            client.send(json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":permission["request_id"],"response":{"behavior":"allow","updatedInput":replacement,
+                "updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await;
+            // The rejected tool is returned to the model, which may still finish its turn normally.
+            assert_eq!(client.result().await["is_error"], false);
+            assert!(!root.path().join("approval.txt").exists());
+            assert!(!root.path().join("invalid.txt").exists());
+            assert!(!outside.path().join("outside.txt").exists());
+            client.send(user("Try the original Write again")).await;
+            let next = client.frame("control_request").await;
+            assert_eq!(
+                next["request"]["tool_name"], "Write",
+                "Invalid input must not publish its allow rule"
+            );
+            client.send(json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":next["request_id"],"response":{"behavior":"deny","message":"DENIAL_REASON_SENTINEL"}}})).await;
+            assert_eq!(client.result().await["is_error"], false);
+            assert!(server
+                .fixture
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("DENIAL_REASON_SENTINEL"));
+            assert!(client.finish().await.0.success());
+        }
+    }
+}
+
+#[tokio::test]
+async fn sdk_unknown_and_completed_permission_ids_cannot_execute_pending_tools() {
+    for completed in [false, true] {
+        let server = Server::start(false, Mode::Approval).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::start(root.path(), &server, &["--permission-mode", "ask"]);
+        client.send(user("Write a file")).await;
+        let permission = client.frame("control_request").await;
+        let id = if completed {
+            client
+                .send(
+                    json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":permission["request_id"],"response":{"behavior":"deny"}}}),
+                )
+                .await;
+            client.result().await;
+            permission["request_id"].clone()
+        } else {
+            json!("unknown-request")
+        };
+        client.send(json!({"type":"control_response","response":{"subtype":"success",
+            "request_id":id,"response":{"behavior":"allow","updatedInput":{},
+            "updatedPermissions":[{"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"Write"}]}]}}})).await;
+        assert!(!client.finish().await.0.success());
+        assert!(!root.path().join("approval.txt").exists());
     }
 }

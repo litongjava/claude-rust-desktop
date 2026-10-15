@@ -37,6 +37,18 @@ impl Updates {
         }
     }
     pub fn apply(&self, value: &Value) -> Result<()> {
+        self.apply_inner(value, true)
+    }
+    pub fn prepare(
+        self: &Arc<Self>,
+        value: &Value,
+    ) -> Result<claude_core::native_engine::permission_response::Commit> {
+        self.apply_inner(value, false)?;
+        let updates = self.clone();
+        let value = value.clone();
+        Ok(Box::new(move || updates.apply(&value)))
+    }
+    fn apply_inner(&self, value: &Value, publish: bool) -> Result<()> {
         let updates: Vec<Update> =
             serde_json::from_value(value.clone()).context("Invalid SDK updatedPermissions")?;
         ensure!(updates.len() <= 256, "Too many SDK permission updates");
@@ -88,8 +100,10 @@ impl Updates {
                 "Unsupported SDK permission update type"
             );
         }
-        self.manager.set_runtime_rules(&self.session, next.clone());
-        *current = next;
+        if publish {
+            self.manager.set_runtime_rules(&self.session, next.clone());
+            *current = next;
+        }
         Ok(())
     }
     pub fn clear(&self) {
@@ -137,7 +151,10 @@ mod tests {
             json!([{"type":"addRules","destination":"session","behavior":"allow","rules":[],"unexpected":true}]),
         ] {
             assert!(updates.apply(&invalid).is_err());
-            assert_eq!(manager.check_permission(&context), PermissionResult::Granted);
+            assert_eq!(
+                manager.check_permission(&context),
+                PermissionResult::Granted
+            );
         }
         let other = PermissionContext {
             conversation_id: "two".into(),
