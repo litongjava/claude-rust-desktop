@@ -1,7 +1,6 @@
 //! Local inspection of the last parent-session request; never prepares a new request.
 use crate::{db::DbManager, native_engine::request_context::ContextUsage};
 use anyhow::Result;
-use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -14,22 +13,29 @@ pub struct LastRequest {
 }
 
 pub fn last_request(db: &DbManager, session: &str) -> Result<Option<LastRequest>> {
-    let raw = db.with_conn(|conn| conn.query_row(
-        "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC LIMIT 1",
-        [session], |row| row.get::<_, String>(0),
-    ).optional())??;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let Ok(snapshots) = serde_json::from_str::<Value>(&raw) else {
-        return Ok(None);
-    };
-    let Some(snapshot) = snapshots.as_array().and_then(|items| {
-        items
-            .iter()
-            .rev()
-            .find(|s| s["source"] == "native_engine" || s.get("source").is_none())
-    }) else {
+    let snapshot = db.with_conn(|conn| -> Result<Option<Value>> {
+        let mut statement = conn.prepare(
+            "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC",
+        )?;
+        let mut rows = statement.query([session])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let Ok(snapshots) = serde_json::from_str::<Value>(&raw) else {
+                // A corrupt row may hide a newer request. Do not report stale data.
+                return Ok(None);
+            };
+            let Some(items) = snapshots.as_array() else { return Ok(None); };
+            if let Some(snapshot) = items.iter().rev().find(|s| s["source"] == "native_engine" || s.get("source").is_none()) {
+                // Preserve unknown metadata on this request; never replace it
+                // with an older request merely because the old one has counts.
+                return Ok(Some(snapshot.clone()));
+            }
+            // Local workflows and failed pre-request turns can persist [].
+            // A row containing only side-query snapshots is not a parent request.
+        }
+        Ok(None)
+    })??;
+    let Some(snapshot) = snapshot else {
         return Ok(None);
     };
     let usage = serde_json::from_value::<ContextUsage>(snapshot["contextUsage"].clone())
@@ -115,6 +121,22 @@ mod tests {
                 .reported_input_tokens,
             Some(100)
         );
+        for snapshots in [
+            json!([]),
+            json!([{"id":"side","source":"web_search","model":"side-query-model"}]),
+        ] {
+            let message = store
+                .append(&parent, "assistant", "local workflow output")
+                .unwrap();
+            store
+                .db
+                .with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &snapshots))
+                .unwrap()
+                .unwrap();
+            let prior = last_request(&store.db, &parent).unwrap().unwrap();
+            assert_eq!(prior.model, "model");
+            assert_eq!(prior.reported_input_tokens, Some(60));
+        }
         let message = store.append(&parent, "assistant", "new response").unwrap();
         store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"new","source":"native_engine","model":"new-model","contextUsage":{"bad":"PRIVATE"}}]))).unwrap().unwrap();
         let result = last_request(&store.db, &parent).unwrap().unwrap();
