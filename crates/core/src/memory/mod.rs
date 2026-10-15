@@ -9,6 +9,7 @@
 mod caveman_rtk;
 mod local;
 mod transfer;
+pub mod dream;
 pub use transfer::{MemoryArchive, MemoryImportReport};
 pub use caveman_rtk::{CavemanRTKStats, CavemanRTKSystem, RTKConfig, TokenImportance};
 

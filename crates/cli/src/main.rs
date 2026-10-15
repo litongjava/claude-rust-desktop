@@ -5,6 +5,9 @@ mod legacy_api_config;
 mod session;
 mod services;
 mod memory;
+mod magic_docs;
+mod plugins;
+mod help;
 mod voice;
 #[allow(dead_code)]
 mod terminal;
@@ -51,6 +54,7 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
 }
 
 async fn run(cli: &Cli) -> Result<()> {
+    if let Some(Commands::Help {topic,command})=&cli.command {return help::show(topic.as_deref(),command); }
     let data_dir = match &cli.data_dir {
         Some(path) => path.clone(),
         None => RuntimePaths::default_data_dir()?,
@@ -65,7 +69,31 @@ async fn run(cli: &Cli) -> Result<()> {
     }
     let mut skill_prompt = None;
     match &cli.command {
-        Some(Commands::Memory { action }) => return memory::run(&paths, action).await,
+        Some(Commands::Plugin { action }) => return plugins::run(&paths,action).await,
+        Some(Commands::Update { url }) => {
+            let update = claude_core::services::updates::check(url,env!("CARGO_PKG_VERSION")).await?;
+            return services::print(&serde_json::json!({"up_to_date":update.is_none(),"update":update}));
+        }
+        Some(Commands::StressTest { concurrency, iterations, endpoint, allow_remote }) => {
+            return tokio::select! {result=claude_core::services::diagnostics::stress(*concurrency,*iterations,endpoint.clone(),*allow_remote)=>services::print(&result?), _=tokio::signal::ctrl_c()=>anyhow::bail!("Diagnostics cancelled")};
+        }
+        Some(Commands::Agents { action }) => {
+            let context = services::context(&paths)?;
+            match action {
+                args::AgentCommands::List => return services::print(&claude_core::services::agents::list(&context)?),
+                args::AgentCommands::Import { source } => {
+                    let definition = serde_json::from_slice(&std::fs::read(source)?)?;
+                    claude_core::services::agents::install(&context, definition)?;
+                    return services::print(&serde_json::json!({"imported":true}));
+                }
+            }
+        }
+        Some(Commands::Agent { agent_type, prompt }) => {
+            claude_core::services::agents::resolve(&services::context(&paths)?, agent_type)?;
+            skill_prompt = Some(prompt.clone());
+        }
+        Some(Commands::MagicDocs { action }) => return magic_docs::run(cli, &paths, action).await,
+        Some(Commands::Memory { action }) => return memory::run(cli, &paths, action).await,
         Some(Commands::VoiceConfig { endpoint, model, credential, language }) => {
             let context = services::context(&paths)?;
             let config = claude_core::services::voice::VoiceConfig {
@@ -91,6 +119,7 @@ async fn run(cli: &Cli) -> Result<()> {
         Some(Commands::Sessions { action }) => {
             let db = paths.open_database()?;
             let value = match action {
+                SessionCommands::ImportLegacy {source,preview} => serde_json::to_value(claude_core::services::session_import::import(&services::context(&paths)?,source,&std::env::current_dir()?,*preview)?)?,
                 SessionCommands::List => serde_json::to_value(
                     db.with_conn(claude_core::db::conversation_repo::list_conversations)??,
                 )?,
@@ -263,6 +292,11 @@ async fn mcp(paths: &RuntimePaths, action: &McpCommands) -> Result<()> {
     let manager = McpServerManager::new(paths.data_dir.join("mcp-servers.json"));
     manager.initialize().await?;
     match action {
+        McpCommands::Hosts => services::print(&claude_core::mcp::control::hosts(&services::context(paths)?)?)?,
+        McpCommands::Restart {name,host} => {
+            let owner=claude_core::mcp::control::restart(&services::context(paths)?,name,host.as_deref()).await?;
+            services::print(&serde_json::json!({"restarted":name,"host":owner}))?;
+        }
         McpCommands::List => {
             let mut value = serde_json::to_value(manager.list_servers().await)?;
             config::redact(&mut value);

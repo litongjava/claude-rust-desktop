@@ -131,7 +131,7 @@ impl PermissionManager {
     fn is_dangerous_tool(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "Bash" | "Delete" | "FileDelete" | "ProcessKill"
+            "Bash" | "PluginRun" | "Delete" | "FileDelete" | "ProcessKill"
         )
     }
 

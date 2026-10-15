@@ -162,3 +162,10 @@ claude-code memory export D:\backup\personal-memory.json
 ```
 
 导入/导出要求 local 后端，支持旧 MemoryEntry 数组和新版本化归档。导入前备份完整 SQLite，报告返回路径；重复导入跳过，冲突整批回滚。导出路径必须不存在。桌面长期记忆面板提供对应预览、确认与下载。dream/auto-dream 尚未实现。
+
+
+## P2/P3 additions (2026-10-15)
+
+Dream/AutoDream, Magic Docs previews and automatic maintenance, agent roles, versioned executable plugin bundles, existing-host MCP restart, project-scoped team model context, legacy session/document imports, local diagnostics and manifest update checks are now exposed by the CLI. Run `claude-code help --topic plugins` (also `memory`, `mcp`, `agents`, `magic-docs`, `team-sync`, `services`, `voice`, `update`) or `help COMMAND` for details.
+
+Complete command examples, format boundaries, screenshots and remaining work are maintained in `D:/code/project/project-harven/claude-code-cli-doc/p2-p3-migration-20261015.md`. This checkpoint does not provide full old plugin/MCP import compatibility or production STT/team deployment.

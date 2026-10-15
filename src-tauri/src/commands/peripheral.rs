@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use claude_core::{
     runtime::RuntimePaths,
-    services::{lifecycle, team, voice, Credentials, ServiceContext},
+    services::{dream, generation::Generator, lifecycle, team, voice, Credentials, ServiceContext},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,6 +39,7 @@ fn context(app: &tauri::AppHandle) -> Result<ServiceContext> {
 #[derive(Default)]
 pub struct PeripheralHost {
     task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
+    memory_tasks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<()>>>>,
     voice_jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 impl Drop for PeripheralHost {
@@ -48,6 +49,7 @@ impl Drop for PeripheralHost {
                 task.abort();
             }
         }
+        if let Ok(tasks) = self.memory_tasks.get_mut() { for (_, task) in tasks.drain() { task.abort(); } }
         if let Ok(jobs) = self.voice_jobs.get_mut() {
             for (_, sender) in jobs.drain() {
                 let _ = sender.send(true);
@@ -62,6 +64,9 @@ pub async fn shutdown(app: &tauri::AppHandle) {
         task.abort();
         let _ = task.await;
     }
+    let tasks: Vec<_> = host.memory_tasks.lock().unwrap().drain().map(|(_, task)| task).collect();
+    for task in &tasks { task.abort(); }
+    for task in tasks { let _ = task.await; }
     for (_, sender) in host.voice_jobs.lock().unwrap().drain() {
         let _ = sender.send(true);
     }
@@ -70,6 +75,25 @@ pub async fn shutdown(app: &tauri::AppHandle) {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+    SessionImport {source:std::path::PathBuf,project_id:String,preview:bool},
+    McpHosts,
+    McpRestart {server:String,host:String},
+    Plugins,
+    PluginSearch {registry:String,query:String},
+    PluginInstall { source:String, update:Option<String> },
+    PluginEnable { id:String, enabled:bool },
+    PluginRemove { id:String },
+    PluginRun { id:String, command:String, input:Value, project_id:String, confirmed:bool },
+    Diagnostics { concurrency:usize, iterations:usize },
+    UpdateCheck { url:String },
+    Agents,
+    AgentImport { definition: claude_core::services::agents::Definition },
+    AgentCreate { project_id:String, agent_type:String, provider:String, model:String },
+    Magic { project_id: String, operation: MagicRequest },
+    DreamStatus,
+    DreamConfig { config: dream::DreamConfig },
+    DreamStart { automatic: bool },
+    DreamStop { automatic: bool },
     Status,
     VoiceConfig {
         config: voice::VoiceConfig,
@@ -78,6 +102,7 @@ pub enum Request {
         config: team::TeamConfig,
     },
     TeamSync,
+    TeamContext {project_id:String,enabled:Option<bool>},
     TeamPut {
         id: Option<String>,
         title: String,
@@ -100,6 +125,20 @@ pub enum Request {
     },
     Stop,
 }
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MagicRequest {
+    ImportLegacy {source:std::path::PathBuf,preview:bool},
+    List,
+    Check { file: std::path::PathBuf },
+    Update { id:String, new_context:String, provider:String, model:String },
+    Apply { id:String },
+    Clear,
+    Auto { id:String, enabled:bool },
+    Start { provider:String, model:String, interval:u64 },
+    Stop { automatic:bool },
+}
 #[tauri::command]
 pub async fn peripheral_command(
     app: tauri::AppHandle,
@@ -109,12 +148,126 @@ pub async fn peripheral_command(
     async {
         let context=context(&app)?;
         match request {
+            Request::SessionImport {source,project_id,preview} => {
+                let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");let root=project.workspace_path.context("Project has no workspace")?;
+                Ok(json!(claude_core::services::session_import::import_into_project(&context,&source,std::path::Path::new(&root),preview,Some(&project_id))?))
+            }
+
+            Request::McpHosts => Ok(json!(claude_core::mcp::control::hosts(&context)?)),
+            Request::McpRestart {server,host} => Ok(json!({"host":claude_core::mcp::control::restart(&context,&server,Some(&host)).await?})),
+            Request::PluginSearch {registry,query} => Ok(json!(claude_core::services::plugins::search(&registry,&query).await?)),
+            Request::Plugins => Ok(json!(claude_core::services::plugins::list(&context)?)),
+            Request::PluginInstall {source,update} => Ok(json!(claude_core::services::plugins::install(&context,&source,update.as_deref()).await?)),
+            Request::PluginEnable {id,enabled} => {claude_core::services::plugins::enable(&context,&id,enabled)?;Ok(json!({"enabled":enabled}))},
+            Request::PluginRemove {id} => {claude_core::services::plugins::remove(&context,&id)?;Ok(json!({"removed":id}))},
+            Request::PluginRun {id,command,input,project_id,confirmed} => {
+                ensure!(confirmed,"Confirm plugin execution first");
+                let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");
+                let root=project.workspace_path.context("Project has no workspace")?;
+                claude_core::services::plugins::run(&context,&id,&command,input,std::path::Path::new(&root)).await
+            },
+            Request::Diagnostics {concurrency,iterations} => Ok(json!(claude_core::services::diagnostics::stress(concurrency,iterations,None,false).await?)),
+            Request::UpdateCheck {url} => {let update=claude_core::services::updates::check(&url,env!("CARGO_PKG_VERSION")).await?;Ok(json!({"up_to_date":update.is_none(),"update":update}))}
+            Request::Agents => Ok(json!(claude_core::services::agents::list(&context)?)),
+            Request::AgentImport { definition } => {claude_core::services::agents::install(&context,definition)?;Ok(json!({"imported":true}))}
+            Request::AgentCreate { project_id,agent_type,provider,model } => {
+                let project = context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");
+                let root = project.workspace_path.context("Project has no workspace")?;
+                let definition = claude_core::services::agents::resolve(&context,&agent_type)?;
+                Generator::saved(&context.paths,&provider,&model)?;
+                let store = claude_core::runtime::SessionStore::new(context.db.clone());
+                let id = store.create(std::path::Path::new(&root),&model,&provider)?;
+                // Preserve the exact project selected by the user, even if roots overlap.
+                context.db.with_conn(|c|c.execute("UPDATE conversations SET project_id=?1,title=?2 WHERE id=?3",rusqlite::params![project_id,format!("{} agent",definition.id),id]))??;
+                claude_core::services::agents::bind(&context.db,&id,&definition)?;
+                Ok(json!({"id":id,"agent":definition.id}))
+            }
+            Request::Magic { project_id, operation } => {
+                use claude_core::services::magic_docs as docs;
+                let project = context.db.with_conn(|c| claude_core::db::project_repo::require_trusted(c, &project_id))??;
+                ensure!(!project.is_archived, "Select an active project");
+                let root = std::path::PathBuf::from(project.workspace_path.context("Project has no workspace")?);
+                match operation {
+                    MagicRequest::ImportLegacy {source,preview}=>Ok(json!(docs::import_legacy(&context,&root,&source,preview)?)),
+                    MagicRequest::List => Ok(json!({"documents":docs::list(&context,&root)?, "previews":docs::previews(&context,&root)?, "services":lifecycle::status(&context)?})),
+                    MagicRequest::Check { file } => Ok(json!(docs::check(&context,&root,&file)?)),
+                    MagicRequest::Update { id,new_context,provider,model } => {
+                        let generator = Generator::saved(&context.paths,&provider,&model)?;
+                        Ok(json!(docs::update(&context,&root,&id,&new_context,&generator).await?))
+                    }
+                    MagicRequest::Apply { id } => {
+                        let permissions = claude_core::runtime::default_permissions();
+                        permissions.set_mode(claude_core::permissions::PermissionMode::AcceptEdits);
+                        docs::apply(&context,&root,&id,&permissions)?; Ok(json!({"applied":id}))
+                    }
+                    MagicRequest::Clear => Ok(json!({"untracked":docs::clear(&context,&root)?})),
+                    MagicRequest::Auto { id,enabled } => {docs::set_auto(&context,&root,&id,enabled)?; Ok(json!({"auto_update":enabled}))}
+                    MagicRequest::Start { provider,model,interval } => {
+                        ensure!((1..=86400).contains(&interval), "Interval must be 1..86400 seconds");
+                        let generator = Generator::saved(&context.paths,&provider,&model)?;
+                        let mut tasks = host.memory_tasks.lock().unwrap();
+                        ensure!(tasks.get("magic-docs").is_none_or(|t|t.is_finished()), "Magic Docs is still running");
+                        let lease = lifecycle::Lease::acquire(&context,"magic-docs")?;
+                        tasks.insert("magic-docs".into(), tokio::spawn(docs::host(context,root,generator,interval,Some(project_id),lease)));
+                        Ok(json!({"started":true}))
+                    }
+                    MagicRequest::Stop { automatic } => {
+                        let name = if automatic {"magic-docs"} else {"magic-docs-update"};
+                        lifecycle::stop(&context,name)?; lifecycle::wait_stopped(&context,name).await?;
+                        let task = host.memory_tasks.lock().unwrap().remove(name);
+                        if let Some(task) = task { let _ = task.await; }
+                        Ok(json!({"stopped":true}))
+                    }
+                }
+            }
+            Request::DreamStatus => Ok(json!({"config":context.setting::<dream::DreamConfig>("auto-dream")?.unwrap_or_default(), "memory":dream::client(&context).dream_status().await?, "services":lifecycle::status(&context)?})),
+            Request::DreamConfig { config } => {
+                config.validate()?;
+                Generator::saved(&context.paths, &config.provider, &config.model)?;
+                context.save_setting("auto-dream", &config)?;
+                Ok(json!(config))
+            }
+            Request::DreamStart { automatic } => {
+                let config: dream::DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+                config.validate()?;
+                ensure!(!automatic || config.enabled, "Enable AutoDream first");
+                let generator = Generator::saved(&context.paths, &config.provider, &config.model)?;
+                // Validate storage before accepting the task.
+                dream::client(&context).dream_status().await?;
+                let name = if automatic { "auto-dream" } else { "memory-dream" };
+                let mut tasks = host.memory_tasks.lock().unwrap();
+                ensure!(tasks.get(name).is_none_or(|t| t.is_finished()), "Task is still running");
+                let lease = lifecycle::Lease::acquire(&context, name)?;
+                tasks.insert(name.into(), tokio::spawn(async move {
+                    if automatic { dream::host(context, 60, lease).await }
+                    else { dream::run_with_lease(&context, &generator, false, lease).await.map(|_| ()) }
+                }));
+                Ok(json!({"started":name}))
+            }
+            Request::DreamStop { automatic } => {
+                let name = if automatic { "auto-dream" } else { "memory-dream" };
+                lifecycle::stop(&context, name)?;
+                lifecycle::wait_stopped(&context, name).await?;
+                let task = host.memory_tasks.lock().unwrap().remove(name);
+                if let Some(task) = task { let _ = task.await; }
+                Ok(json!({"stopped":name}))
+            }
             Request::Status=>Ok(json!({"voice":context.setting::<voice::VoiceConfig>("voice")?,
                 "team":context.setting::<team::TeamConfig>("team-sync")?,"services":lifecycle::status(&context)?,
                 "memories":if context.setting::<team::TeamConfig>("team-sync")?.is_some(){team::list(&context,false)?}else{vec![]},
                 "conflicts":if context.setting::<team::TeamConfig>("team-sync")?.is_some(){team::conflicts(&context)?}else{vec![]}})),
             Request::VoiceConfig {config}=> {config.validate()?;context.save_setting("voice",&config)?;Ok(json!(config))}
             Request::TeamAuth {config}=> {team::auth(&context,config).await?;Ok(json!({"authenticated":true}))}
+            Request::TeamContext {project_id,enabled} => {
+                let project=context.db.with_conn(|c|claude_core::db::project_repo::require_trusted(c,&project_id))??;
+                ensure!(!project.is_archived,"Select an active project");
+                let root=project.workspace_path.context("Project has no workspace")?;
+                if let Some(enabled)=enabled {Ok(json!(team::configure_model_context(&context,std::path::Path::new(&root),enabled)?))}
+                else {Ok(json!(team::model_context_setting(&context,std::path::Path::new(&root))?))}
+            }
             Request::TeamSync=>Ok(json!(team::sync(&context).await?)),
             Request::TeamPut {id,title,content,tags}=>Ok(json!(team::put(&context,id,title,content,tags)?)),
             Request::TeamDelete {id}=> {team::delete(&context,&id)?;Ok(json!({"deleted":id}))}

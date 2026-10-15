@@ -14,6 +14,7 @@ pub fn print(value: &impl Serialize) -> Result<()> {
 }
 pub async fn team(context: &ServiceContext, action: &TeamCommands) -> Result<()> {
     match action {
+        TeamCommands::Context {enabled}=>print(&team::configure_model_context(context,&std::env::current_dir()?,*enabled)?),
         TeamCommands::Status => print(&context.setting::<team::TeamConfig>("team-sync")?),
         TeamCommands::Auth {
             team_id,
@@ -98,6 +99,14 @@ pub async fn services(context: &ServiceContext, action: &ServiceCommands) -> Res
         ServiceCommands::Status => print(&lifecycle::status(context)?),
         ServiceCommands::Start { name, interval } => {
             eprintln!("Hosting {name}; Ctrl+C or services stop {name} stops this instance.");
+            if name == "auto-dream" {
+                let config: claude_core::services::dream::DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+                config.validate()?;
+                anyhow::ensure!(config.enabled, "Enable AutoDream with memory dream-config first");
+                claude_core::services::generation::Generator::saved(&context.paths, &config.provider, &config.model)?;
+                let lease = lifecycle::Lease::acquire(context, name)?;
+                return tokio::select! { result=claude_core::services::dream::host(context.clone(),*interval,lease)=>result, _=tokio::signal::ctrl_c()=>Ok(()) };
+            }
             tokio::select! {result=lifecycle::run_team_sync(context.clone(),*interval)=>result,_=tokio::signal::ctrl_c()=>Ok(())}
         }
         ServiceCommands::Stop { name } => {

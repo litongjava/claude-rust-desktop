@@ -16,6 +16,10 @@ impl LocalMemory {
             id TEXT PRIMARY KEY, content TEXT NOT NULL UNIQUE, importance REAL NOT NULL,
             created_at TEXT NOT NULL, metadata TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memory_settings (id INTEGER PRIMARY KEY CHECK (id = 1), config TEXT NOT NULL);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_migrations(version INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS dream_sources(id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dream_runs(id TEXT PRIMARY KEY, created_at TEXT NOT NULL, source_count INTEGER NOT NULL, summary_id TEXT NOT NULL);
+            INSERT OR IGNORE INTO memory_migrations(version) VALUES(1);")?;
         Ok(conn)
     }
 
@@ -71,7 +75,10 @@ impl LocalMemory {
     }
 
     pub fn clear(&self) -> Result<()> {
-        self.open()?.execute("DELETE FROM memories", [])?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        tx.execute_batch("DELETE FROM memories; DELETE FROM dream_sources; DELETE FROM dream_runs;")?;
+        tx.commit()?;
         Ok(())
     }
 }

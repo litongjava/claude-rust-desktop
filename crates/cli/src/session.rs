@@ -68,6 +68,10 @@ impl Session {
             )
         })??;
         let permissions = runtime::default_permissions();
+        if let Some(crate::args::Commands::Agent { agent_type, .. }) = &cli.command {
+            let definition = claude_core::services::agents::resolve(&crate::services::context(paths)?, agent_type)?;
+            claude_core::services::agents::bind(&store.db, &id, &definition)?;
+        }
         permissions.set_mode(match cli.permission_mode {
             PermissionModeArg::Ask => PermissionMode::AskPermissions,
             PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,

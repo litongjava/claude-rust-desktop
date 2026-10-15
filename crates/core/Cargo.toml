@@ -44,6 +44,8 @@ prometheus = "0.13"
 serde_yaml = "0.9"
 scraper = "0.24"
 
-[dev-dependencies]
 tempfile = "3"
+semver = "1"
+
+[dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

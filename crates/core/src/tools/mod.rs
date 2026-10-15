@@ -50,6 +50,11 @@ pub struct ToolDefinition {
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let mut defs = vec![
         ToolDefinition {
+            name: "PluginRun".into(),
+            description: "Execute an installed, enabled plugin command with OS user permissions. Requires execution approval.".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"plugin":{"type":"string"},"command":{"type":"string"},"input":{}},"required":["plugin","command"]}),
+        },
+        ToolDefinition {
             name: "Read".to_string(),
             description: "Read a file from the local filesystem. Returns content with line numbers.".to_string(),
             input_schema: serde_json::json!({

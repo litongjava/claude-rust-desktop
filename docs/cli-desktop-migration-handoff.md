@@ -1,6 +1,6 @@
 # CLI / Desktop 外围功能迁移交接
 
-更新日期：2026-10-15。本文是持续实施清单，未勾选项目尚未完整验收。P0/P1 已有首批实际实现，详见第 9 节与 [能力矩阵](cli-desktop-capability-matrix.md)；P2–P4 仍需继续实施。
+更新日期：2026-10-15。本文是持续实施清单，未勾选项目尚未完整验收。P0/P1 已有首批实际实现，详见第 9 节与 [能力矩阵](cli-desktop-capability-matrix.md)；P2/P3 新增进展见第 11 节；完整迁移和 P4 仍未验收。
 
 ## 1. 用户目标与约束
 
@@ -208,3 +208,35 @@ git diff --check
 - 验证通过：核心 memory_transfer 2 项、独立 CLI 进程 1 项、前端 6 项、TypeScript、CLI/Desktop cargo check、git diff --check。
 
 仍未完成：dream/auto-dream、Magic Docs、agent 映射及 P3/P4；本次不勾选整个 P2，未做本批真实 GUI 验收或重新打包。详细用法见用户指定文档目录 `D:/code/project/project-harven/claude-code-cli-doc/memory-transfer-20261015.md`。后续浏览器验收使用指定 deepseek-browser-use，展示过程，截图放文档目录 assets。
+
+
+## 11. 2026-10-15 P2/P3 持续实施检查点
+
+本节覆盖前文旧状态：Dream/AutoDream、Magic Docs、agent、自定义插件运行、跨进程 MCP restart、更新检查、诊断及专题帮助已新增实际实现，不再处于“尚未注册”状态。**整份迁移仍未完成。**
+
+- 共享实现位于 `crates/core/src/services/`，CLI 在 `crates/cli/src/`，桌面接入 `commands/peripheral.rs` 与对应 React 组件。服务表迁移版本 4–9。
+- Dream 保留原记忆、追踪来源去重，使用共享模型生成、停止租约及自动间隔/数量门槛。
+- Magic Docs 提供项目范围、持久化预览、写权限/内容冲突校验和原子应用；自动更新须逐文档开启，同输入跳过；旧登记导入支持预览、备份、幂等、回滚。
+- agent 类型/别名与自定义定义复用同一工具循环；只读定义在串行、并行和 bypass 模式下均受额外 allowlist 限制。
+- 插件提供真实 Node.js/Python 执行、目录搜索、升级/启停/卸载、执行中撤销，以及受共享权限检查的 PluginRun 工具。仅支持新 JSON bundle 与声明式 prompt hook，不能视为旧插件所有格式/钩子兼容。
+- MCP restart 请求由已有宿主处理并回执；多宿主必须选择 owner。测试确认实际子进程 PID 更换。
+- 团队记忆可显式按项目授权进入模型上下文，绑定当前 team/endpoint，不携带团队凭据。
+- 旧 sessions JSON 导入保留 ID/时间/文本与原始载荷；预览不创建项目或会话，正式导入先备份，冲突整批回滚。
+- 细节、命令、示例与截图见用户指定目录 `D:/code/project/project-harven/claude-code-cli-doc/p2-p3-migration-20261015.md`。截图均存 assets，真实浏览器界面验证使用模拟 IPC，未冒充原生 Tauri 验收。
+
+剩余：旧 MCP/plugin 格式完整导入、旧 agent 完整 schema 映射、learning/performance/advanced tools/SSH/remote/旧前端独有能力逐项迁移审计，以及真实 STT、生产团队服务、WebView2、其他平台与最终全功能发布验收。缺少外部配置的项目与尚未实施的代码缺项分别保留，不能将后者归因于环境。
+
+
+### Final automated validation at this checkpoint
+
+- Core full suite: 160 passed, 2 ignored; the subsequent focused session import suite passed all 4 cases (one added exact-project case), yielding 161 distinct passing core cases.
+- Standalone CLI: 12 passed, 1 device test ignored. Includes real plugin execution, permission refusal, disable, diagnostics, help, service processes and model fixtures.
+- Desktop: all-target Cargo check and 49 library/integration tests passed.
+- TypeScript passed. Targeted frontend controls: 11 passed. Full frontend: 295 passed, 17 failed, all in the pre-existing locale dictionary completeness tests (`src/locales/languages.test.ts`). No language dictionaries were changed.
+- Concurrent first-open SQLite testing exposed a real WAL initialization race. Idempotent WAL initialization now retries bounded SQLITE_BUSY/LOCKED failures; migrations acquire the writer before schema reads. Three repeated concurrent-host runs passed after the fix.
+- CLI dependency tree contains no Tauri/Wry/WebKit runtime. Original CLI repository and legacy snapshot remain unchanged. `git diff --check` passed.
+- Logs: workspace `artifacts/final-p23-fixed-*.log`, `desktop-final-0.log`, `desktop-verified-*.log`, `final-p23-frontend.log`, `concurrent-start-*.log`.
+
+Packaged CLI smoke verification passed using real Node.js and Python plugin interpreters, one-use explicit execution approval, and four successful local HTTP diagnostic requests. Evidence: the release directory `cli-smoke.json`.
+
+Windows x64 `npm run build:all` passed. CLI, Desktop, MSI and NSIS packages are in `artifacts/3.1.0-release-2026-10-15T03-54-13-572Z/`. Six executable/installer/runtime SHA256 pairs match their sources (`checksums.json`). These packages are this implementation checkpoint, not full legacy migration acceptance.

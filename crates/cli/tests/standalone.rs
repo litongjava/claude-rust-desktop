@@ -131,6 +131,39 @@ fn query(data: &Path, project: &Path, url: &str) -> Command {
 }
 
 #[tokio::test]
+async fn agent_alias_custom_definition_and_readonly_limit_use_shared_tool_loop() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let (url, fixture, task) = server(Some("Write"), false).await;
+    let mut cli = query(&data,temp.path(),&url);
+    cli.args(["--permission-mode","bypass","agent","--agent-type","claude-code-guide","--prompt","Inspect project"]);
+    let output = execute(cli).await;
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    assert!(!temp.path().join("created.txt").exists());
+    let first: Value = serde_json::from_slice(&output.stdout).unwrap();
+    {
+        let requests = fixture.requests.lock().unwrap();
+        assert!(requests[0]["messages"][0]["content"].as_str().unwrap().contains("Agent role (guide)"));
+        assert!(!requests[0]["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="Write"));
+        assert!(requests[1]["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool" && m["content"].as_str().unwrap().contains("not allowed")));
+    }
+    let mut cli = query(&data,temp.path(),&url);
+    cli.args(["--resume",first["session_id"].as_str().unwrap(),"--permission-mode","bypass","query","-p","Continue inspection"]);
+    assert!(execute(cli).await.status.success());
+    assert!(!temp.path().join("created.txt").exists());
+    let source = temp.path().join("agent.json");
+    std::fs::write(&source,json!({"id":"custom","description":"Custom reader","system_prompt":"Report CUSTOM_SENTINEL.","tools":["Read"]}).to_string()).unwrap();
+    let mut cli = command(&data,temp.path()); cli.args(["agents","import",source.to_str().unwrap()]);
+    assert!(execute(cli).await.status.success());
+    let mut cli = query(&data,temp.path(),&url); cli.args(["agent","--agent-type","custom","--prompt","Inspect"]);
+    assert!(execute(cli).await.status.success());
+    assert!(!temp.path().join("created.txt").exists());
+    let mut cli = query(&data,temp.path(),&url); cli.args(["agent","--agent-type","missing","--prompt","Inspect"]);
+    assert!(!execute(cli).await.status.success());
+    task.abort();
+}
+
+#[tokio::test]
 async fn single_query_and_resume_share_sqlite_without_desktop_or_saved_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
@@ -208,7 +241,7 @@ async fn native_read_and_write_tools_operate_in_selected_project() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e|panic!("{e}; stderr: {}",String::from_utf8_lossy(&output.stderr)));
         assert!(result["result"]
             .as_str()
             .unwrap()
@@ -265,7 +298,7 @@ async fn noninteractive_approval_and_api_errors_fail_without_hanging() {
         let output = execute(cli).await;
         assert!(!output.status.success());
         assert!(!temp.path().join("created.txt").exists());
-        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e|panic!("{e}; stderr: {}",String::from_utf8_lossy(&output.stderr)));
         assert_eq!(result["is_error"], true);
         let error = result["error"].as_str().unwrap();
         assert!(

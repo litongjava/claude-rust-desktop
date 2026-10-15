@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Brain, Search, Database, Trash2, Settings, RefreshCw, Clock, Star, X, Plus } from 'lucide-react';
 import { memoryApi, type MemoryConfig, type MemoryItem, type MemoryStats } from '../api/memory';
+import DreamControls from './DreamControls';
 
 const inputClass = 'w-full rounded-lg border border-claude-border bg-claude-bg px-3 py-2 text-sm text-claude-text';
 const buttonClass = 'rounded-lg bg-claude-primary px-4 py-2 text-sm text-white disabled:opacity-50';
@@ -13,6 +14,7 @@ export function MemoryPanel() {
   const [draftConfig, setDraftConfig] = useState<MemoryConfig | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
+  const [showDream, setShowDream] = useState(false);
   const [content, setContent] = useState('');
   const [importance, setImportance] = useState(0.7);
   const [busy, setBusy] = useState(false);
@@ -113,6 +115,8 @@ export function MemoryPanel() {
           </div>
         </details>
         <button onClick={() => setShowAdd(!showAdd)} disabled={busy || !config?.enabled} className="flex items-center gap-1 text-sm text-claude-primary disabled:opacity-40"><Plus size={16} />添加记忆</button>
+        <button className="text-sm text-claude-primary" onClick={() => setShowDream(!showDream)}>记忆整理与自动整理</button>
+        {showDream && <DreamControls onComplete={() => { void refresh(query).catch(e => setError(String(e))); }} />}
         {showAdd && <form onSubmit={e => { e.preventDefault(); void saveMemory(); }} className="space-y-3 rounded-lg border border-claude-border p-3">
           <textarea aria-label="记忆内容" maxLength={32000} required rows={4} value={content} onChange={e => setContent(e.target.value)} placeholder="例如：我偏好中文回复，项目使用 Rust 和 React。" className={inputClass} />
           <label className="flex items-center gap-3 text-xs">重要性 {importance.toFixed(1)}<input aria-label="重要性" type="range" min={config?.min_importance_threshold ?? 0} max="1" step="0.1" value={importance} onChange={e => setImportance(Number(e.target.value))} /></label>

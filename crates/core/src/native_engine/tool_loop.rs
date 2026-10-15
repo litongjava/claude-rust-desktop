@@ -111,6 +111,7 @@ pub struct ToolLoopExecutor {
     reasoning_mode: ReasoningMode,
     prefetch_engine: Option<Arc<PrefetchEngine>>,
     search_config_path: Option<std::path::PathBuf>,
+    allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,13 @@ async fn execute_builtin_tool(
     event_tx: &mpsc::Sender<EngineEvent>,
     search_config_path: Option<&std::path::Path>,
 ) -> Result<Value> {
+    if name == "PluginRun" {
+        let root=search_config_path.and_then(|p|p.parent()).ok_or_else(||anyhow!("Plugin storage is unavailable"))?;
+        let context=crate::services::ServiceContext::open(crate::runtime::RuntimePaths::new(root.to_path_buf())?,std::sync::Arc::new(crate::services::EnvironmentCredentials))?;
+        let id=input["plugin"].as_str().ok_or_else(||anyhow!("plugin is required"))?;
+        let command=input["command"].as_str().ok_or_else(||anyhow!("command is required"))?;
+        return crate::services::plugins::run(&context,id,command,input["input"].clone(),std::path::Path::new(cwd)).await;
+    }
     if name != "WebSearch" {
         return crate::tools::execute_tool_async(name, input, cwd).await;
     }
@@ -255,11 +263,12 @@ async fn execute_tool_standalone(
     total_count: usize,
     provider: ResolvedProvider,
     search_config_path: Option<std::path::PathBuf>,
+    allowed_tools: Option<Vec<String>>,
 ) -> (String, String, Value, String, bool) {
     crate::metrics::TOOL_CALLS_TOTAL.inc();
     let _tool_timer = crate::metrics::TOOL_CALL_DURATION.start_timer();
 
-    let permission_result = if let Some(ref pm) = permission_manager {
+    let permission_result = if allowed_tools.as_ref().is_some_and(|names| !names.contains(&tool_name)) { PermissionResult::Denied("Tool is not allowed by this agent definition".into()) } else if let Some(ref pm) = permission_manager {
         let cid = conv_id.clone().unwrap_or_default();
         let workspace_path = Some(workspace_cwd.clone());
         let context = crate::permissions::PermissionContext {
@@ -394,6 +403,7 @@ impl ToolLoopExecutor {
             reasoning_mode,
             prefetch_engine: None,
             search_config_path: None,
+            allowed_tools: None,
         }
     }
 
@@ -438,8 +448,10 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub fn with_allowed_tools(mut self, tools: Option<Vec<String>>) -> Self { self.allowed_tools = tools; self }
+
     fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
-        adapt_tools(get_tool_definitions(), self.prompt_profile)
+        adapt_tools(get_tool_definitions(), self.prompt_profile).into_iter().filter(|tool| self.allowed_tools.as_ref().is_none_or(|names| names.contains(&tool.name))).collect()
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -613,6 +625,7 @@ impl ToolLoopExecutor {
         tool_input: &Value,
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
+        if self.allowed_tools.as_ref().is_some_and(|names| !names.iter().any(|name| name == tool_name)) { return (tool_input.clone(), "Tool is not allowed by this agent definition".into(), true); }
         if tool_name == "AskUserQuestion" {
             return self.execute_ask_user_question(tool_input).await;
         }
@@ -1323,6 +1336,7 @@ impl ToolLoopExecutor {
                             total + serial_calls.len(),
                             self.provider.clone(),
                             self.search_config_path.clone(),
+                            self.allowed_tools.clone(),
                         );
                         futures.push(fut);
                     }
@@ -1785,6 +1799,7 @@ impl ToolLoopExecutor {
                             total + serial_calls.len(),
                             self.provider.clone(),
                             self.search_config_path.clone(),
+                            self.allowed_tools.clone(),
                         );
                         futures.push(fut);
                     }

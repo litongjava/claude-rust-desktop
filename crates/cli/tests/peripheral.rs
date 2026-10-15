@@ -55,6 +55,31 @@ async fn personal_memory_transfer_is_standalone_and_clear_requires_confirmation(
     assert_eq!(run(dir.path(), &["memory","status"]).await["total_memories"], 1);
     assert_eq!(std::fs::read(source).unwrap(), bytes);
 }
+
+#[tokio::test]
+async fn auto_dream_host_is_shared_and_stoppable_between_processes() {
+    use axum::{routing::post, Json, Router};
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = json!({"id":"fixture","name":"Fixture","base_url":format!("http://{}",listener.local_addr().unwrap()),"api_key":"fixture","api_format":"openai","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]});
+    std::fs::write(dir.path().join("providers.json"),json!([provider]).to_string()).unwrap();
+    let app = Router::new().route("/v1/chat/completions", post(|| async {Json(json!({"id":"r","object":"chat.completion","created":0,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"Project uses PostgreSQL."},"finish_reason":"stop"}]}))}));
+    let server = tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+    let source=dir.path().join("memory.json");
+    std::fs::write(&source,json!([{"id":"a","memory_type":"Knowledge","content":"Remember PostgreSQL architecture","importance":0.8,"timestamp":"2026-10-15T00:00:00Z","metadata":{},"tags":[]}]).to_string()).unwrap();
+    run(dir.path(), &["memory","import",source.to_str().unwrap()]).await;
+    run(dir.path(), &["--provider","fixture","--model","fixture-model","memory","dream-config","--enabled","--min-hours","0","--min-memories","1"]).await;
+    let mut host=cli(dir.path()).args(["services","start","auto-dream","--interval","1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    tokio::time::timeout(Duration::from_secs(15),async {
+        loop {if run(dir.path(), &["memory","dream-status"]).await["memory"]["runs"]==1 {break;} tokio::time::sleep(Duration::from_millis(100)).await;}
+    }).await.unwrap();
+    assert!(!output(dir.path(), &["services","start","auto-dream"]).await.status.success());
+    run(dir.path(), &["services","stop","auto-dream"]).await;
+    assert!(tokio::time::timeout(Duration::from_secs(5),host.wait()).await.unwrap().unwrap().success());
+    assert_eq!(run(dir.path(), &["memory","dream-status"]).await["memory"]["runs"],1);
+    assert_eq!(run(dir.path(), &["memory","status"]).await["total_memories"],2);
+    server.abort();
+}
 async fn start_server(path: &Path) -> (String, Child) {
     let mut child = cli(path)
         .args(["team-sync", "serve"])
@@ -212,4 +237,21 @@ async fn voice_file_is_audio_upload_and_can_be_sent_to_shared_engine_session() {
     assert_eq!(sessions.as_array().unwrap().len(), 1);
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn plugins_diagnostics_and_topic_help_are_standalone() {
+    let dir=tempfile::tempdir().unwrap();let source=dir.path().join("bundle.json");
+    std::fs::write(&source,json!({"id":"fixture","version":"1.0.0","description":"fixture","commands":{"echo":{"description":"echo","interpreter":"node","script":"main.cjs"}},"files":{"main.cjs":"let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>console.log(s));"}}).to_string()).unwrap();
+    run(dir.path(),&["plugin","install",source.to_str().unwrap()]).await;
+    assert!(!output(dir.path(),&["plugin","run","fixture","echo"]).await.status.success());
+    let result=run(dir.path(),&["plugin","run","fixture","echo","--input","{\"ok\":true}","--yes"]).await;
+    assert_eq!(serde_json::from_str::<Value>(result["stdout"].as_str().unwrap()).unwrap()["ok"],true);
+    run(dir.path(),&["plugin","disable","fixture"]).await;
+    assert!(!output(dir.path(),&["plugin","run","fixture","echo","--yes"]).await.status.success());
+    run(dir.path(),&["plugin","enable","fixture"]).await;
+    assert_eq!(run(dir.path(),&["stress-test","-c","2","-i","2"]).await["succeeded"],4);
+    assert!(output(dir.path(),&["help","--topic","plugins"]).await.status.success());
+    assert!(output(dir.path(),&["help","mcp"]).await.status.success());
+    assert!(!output(dir.path(),&["mcp","restart","missing"]).await.status.success());
 }

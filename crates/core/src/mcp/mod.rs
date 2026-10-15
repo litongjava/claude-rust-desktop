@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 
+pub mod control;
 pub mod tool_executor;
 pub mod composio;
 pub use tool_executor::McpToolRegistry;
@@ -88,6 +89,8 @@ impl std::fmt::Debug for McpServerState {
 pub struct McpServerManager {
     servers: Arc<RwLock<HashMap<String, McpServerState>>>,
     config_path: PathBuf,
+    control: std::sync::Mutex<Option<control::Host>>,
+    lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl McpServerManager {
@@ -95,6 +98,8 @@ impl McpServerManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             config_path,
+            control: std::sync::Mutex::new(None),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -103,6 +108,11 @@ impl McpServerManager {
             self.load_config().await?;
         } else {
             self.create_default_config().await?;
+        }
+        let mut control=self.control.lock().unwrap();
+        if control.is_none() {
+            let worker=Self {servers:self.servers.clone(),config_path:self.config_path.clone(),control:std::sync::Mutex::new(None),lifecycle_lock:self.lifecycle_lock.clone()};
+            *control=Some(control::Host::start(worker)?);
         }
         Ok(())
     }
@@ -352,6 +362,7 @@ impl McpServerManager {
             return Err(anyhow!("Server not found: {}", id));
         }
 
+        drop(servers);
         self.save_config().await?;
         Ok(())
     }
@@ -378,6 +389,12 @@ impl McpServerManager {
     }
 
     pub async fn start_server(&self, id: &str) -> Result<()> {
+        let _guard=self.lifecycle_lock.lock().await;
+        self.start_server_inner(id).await
+    }
+    async fn start_server_inner(&self,id:&str)->Result<()> {
+        if self.get_server(id).await.is_some_and(|s|s.running) {return Ok(());}
+
         let config = {
             let servers = self.servers.read().await;
             servers.get(id).map(|s| s.config.clone())
@@ -414,9 +431,14 @@ impl McpServerManager {
     }
 
     pub async fn stop_server(&self, id: &str) -> Result<()> {
+        let _guard=self.lifecycle_lock.lock().await;
+        self.stop_server_inner(id).await
+    }
+    async fn stop_server_inner(&self,id:&str)->Result<()> {
         let connector = {
             let mut servers = self.servers.write().await;
             if let Some(state) = servers.get_mut(id) {
+                state.status.running=false;
                 state.connector.take()
             } else {
                 return Err(anyhow!("Server not found: {}", id));
@@ -440,9 +462,9 @@ impl McpServerManager {
     }
 
     pub async fn restart_server(&self, id: &str) -> Result<()> {
-        self.stop_server(id).await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        self.start_server(id).await?;
+        let _guard=self.lifecycle_lock.lock().await;
+        self.stop_server_inner(id).await?;
+        self.start_server_inner(id).await?;
         Ok(())
     }
 
@@ -595,6 +617,9 @@ impl Default for McpServerManager {
 
 impl McpServerManager {
     pub async fn shutdown_all(&self) -> Result<()> {
+        let control=self.control.lock().unwrap().take();
+        if let Some(mut control)=control {control.stop().await;}
+
         let server_ids: Vec<String> = {
             let servers = self.servers.read().await;
             servers.keys()

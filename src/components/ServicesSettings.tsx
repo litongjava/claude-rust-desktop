@@ -1,5 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import MagicDocsPanel from './MagicDocsPanel';
+import LegacySessionImport from './LegacySessionImport';
+import TeamContextSharing from './TeamContextSharing';
+import McpHosts from './McpHosts';
+import InstalledPlugins from './InstalledPlugins';
+import PeripheralDiagnostics from './PeripheralDiagnostics';
 
 interface Memory { id: string; title: string; content: string; tags: string[]; revision: number; deleted: boolean }
 interface Snapshot {
@@ -23,6 +29,10 @@ async function configure(action: string, config: Record<string, unknown>, value:
 }
 
 export default function ServicesSettings() {
+  const [showTeamContext,setShowTeamContext]=useState(false);
+  const [showImport,setShowImport]=useState(false);
+  const [showPlugins,setShowPlugins]=useState(false);
+  const [showDocs, setShowDocs] = useState(false);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState(''); const [message, setMessage] = useState(''); const [busy, setBusy] = useState(false);
   const [voiceUrl, setVoiceUrl] = useState(''); const [voiceModel, setVoiceModel] = useState('whisper-1'); const [voiceKey, setVoiceKey] = useState('');
@@ -51,6 +61,14 @@ export default function ServicesSettings() {
   return <div className="py-8 space-y-7 text-claude-text">
     <h2 className="text-xl font-semibold">服务与团队</h2>
     {error && <p role="alert" className="text-red-500 whitespace-pre-wrap">{error}</p>}{message && <p role="status">{message}</p>}
+    <button className={buttonStyle} onClick={() => setShowDocs(!showDocs)}>Magic Docs 文档维护</button>
+    {showDocs && <MagicDocsPanel />}
+    <PeripheralDiagnostics />
+    <button className={buttonStyle} onClick={()=>setShowPlugins(!showPlugins)}>插件安装与运行</button>
+    {showPlugins&&<InstalledPlugins />}
+    <McpHosts />
+    <button className={buttonStyle} onClick={()=>setShowImport(!showImport)}>旧会话导入</button>
+    {showImport&&<LegacySessionImport />}
     <section className="space-y-3"><h3 className="font-semibold">语音转写</h3>
       <p className="text-sm">配置音频转写 API 后，使用聊天输入框中的麦克风按钮。凭据留空保留已保存值。</p>
       {field('音频转写地址', voiceUrl, setVoiceUrl)}{field('转写模型', voiceModel, setVoiceModel)}{field('语音凭据', voiceKey, setVoiceKey, true)}
@@ -69,6 +87,8 @@ export default function ServicesSettings() {
       }, '团队认证通过')}>认证并保存</button>
       <button className={buttonStyle} disabled={busy || !snapshot?.team} onClick={() => run(() => command({action: 'team_sync'}), '同步完成；存在冲突时需选择保留版本')}>立即同步</button>
       {snapshot?.team && <>
+        <button className={buttonStyle} onClick={()=>setShowTeamContext(!showTeamContext)}>团队记忆进入模型的项目授权</button>
+        {showTeamContext&&<TeamContextSharing />}
         <div className="space-y-2 border border-claude-border rounded p-4">
           {field('旧团队记忆目录', legacySource, setLegacySource)}
           <button disabled={busy || !legacySource} className={buttonStyle} onClick={() => run(async () => {setImportReport(await command({action:'team_import', source:legacySource, preview:true}) as typeof importReport);}, '预览完成，尚未写入')}>预览导入</button>

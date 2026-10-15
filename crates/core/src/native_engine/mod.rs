@@ -10,5 +10,6 @@ pub mod token_counter;
 pub mod task_context;
 pub mod context_compressor;
 pub mod workspace;
+pub mod generation;
 
 pub use engine_core::NativeEngine;

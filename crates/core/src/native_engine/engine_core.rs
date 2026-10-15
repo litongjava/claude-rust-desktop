@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::cost_tracker::{BudgetCheckResult, CostTracker};
 use crate::db::DbManager;
 use crate::native_engine::provider_manager::ProviderManager;
@@ -115,6 +116,13 @@ pub struct QueryEngine {
 }
 
 impl QueryEngine {
+    /// No tools, automatic memory ingestion, detached tasks, or conversation mutations.
+    /// Dropping this future cancels the underlying HTTP/runtime request.
+    pub async fn generate_text(&self, provider_id: &str, model: &str, system: &str, input: &str) -> Result<String> {
+        let provider = self.provider_manager.lock().await.resolve_selected(provider_id, model)
+            .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
+        super::generation::generate(provider, system, input).await
+    }
     pub fn new(
         provider_manager: Arc<Mutex<ProviderManager>>,
         db_manager: Arc<DbManager>,
@@ -326,6 +334,16 @@ impl QueryEngine {
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
     pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
         let conv_id = request.conversation_id.clone();
+        let plugin_root=self.provider_manager.lock().await.config_path().parent().context("Missing runtime directory")?.to_path_buf();
+        let plugin_context=crate::services::ServiceContext{paths:crate::runtime::RuntimePaths::new(plugin_root)?,db:self.db_manager.clone(),credentials:Arc::new(crate::services::EnvironmentCredentials)};
+        let plugins=crate::services::plugins::list(&plugin_context)?;
+        if plugins.iter().any(|p|p.enabled) {
+            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable PluginRun commands: {}\n{}",serde_json::to_string(&plugins.iter().filter(|p|p.enabled).collect::<Vec<_>>())?,crate::services::plugins::prompt_hooks(&plugin_context)?));
+        }
+        let agent = crate::services::agents::for_session(&self.db_manager, &conv_id)?;
+        if let Some(definition) = &agent {
+            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAgent role ({}):\n{}", definition.id, definition.system_prompt));
+        }
         let db = self.db_manager.clone();
         let project_conv_id = conv_id.clone();
         let workspaces_root = self.workspaces_dir.clone();
@@ -346,6 +364,8 @@ impl QueryEngine {
             let context = format!("\nProject: {}\nProject source folders (the first is the working directory):\n{}\nProject instructions:\n{}", project.name, serde_json::to_string(&folders)?, project.instructions.unwrap_or_default());
             request.system_prompt.get_or_insert_with(String::new).push_str(&context);
         }
+        let team_context=crate::services::team::model_context(&plugin_context,&workspace)?;
+        request.system_prompt.get_or_insert_with(String::new).push_str(&team_context);
         let model = request.model.clone();
 
         tracing::info!(module = "EngineCore", "send_message: conv_id={}, model={}, workspace={}", conv_id, model, workspace_path);
@@ -437,6 +457,7 @@ impl QueryEngine {
             workspace_path.clone(),
             reasoning_mode.clone(),
         )
+        .with_allowed_tools(agent.and_then(|d|d.tools))
         .with_prompt_profile(prompt_profile)
         .with_memex(crate::memory::MemExClient::with_path(
             self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir).join("memory.sqlite3"), None,

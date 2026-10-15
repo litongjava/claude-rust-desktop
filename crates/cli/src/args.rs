@@ -7,6 +7,7 @@ use std::path::PathBuf;
     name = "claude-code",
     version,
     args_override_self = true,
+    disable_help_subcommand = true,
     about = "Claude Rust — standalone CLI using the Desktop engine"
 )]
 pub struct Cli {
@@ -77,6 +78,27 @@ pub enum PermissionModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    Help { #[arg(long)] topic:Option<String>, command:Vec<String> },
+    /// Install and run versioned Node.js/Python plugin bundles.
+    Plugin { #[command(subcommand)] action: PluginCommands },
+    /// Check a real update manifest; does not install or execute downloads.
+    Update { #[arg(long, env="CLAUDE_UPDATE_MANIFEST")] url:String },
+    /// Bounded HTTP diagnostics, using a temporary local server by default.
+    StressTest {
+        #[arg(short='c',long,default_value_t=4)] concurrency:usize,
+        #[arg(short='i',long,default_value_t=10)] iterations:usize,
+        #[arg(long)] endpoint:Option<String>,
+        #[arg(long)] allow_remote:bool,
+    },
+    /// Run a named agent through the shared session, tools, and permissions.
+    Agent {
+        #[arg(long, default_value="general")] agent_type:String,
+        #[arg(short, long)] prompt:String,
+    },
+    Agents { #[command(subcommand)] action:AgentCommands },
+    MagicDocs {
+        #[command(subcommand)] action: MagicCommands,
+    },
     /// Manage personal memory shared with Desktop.
     Memory {
         #[command(subcommand)]
@@ -148,6 +170,17 @@ pub enum Commands {
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommands {
+    /// Consolidate new local memories using the selected model, preserving originals.
+    Dream,
+    /// Force one consolidation, ignoring automatic time/count gates.
+    AutoDream,
+    DreamStatus,
+    /// Configure automatic consolidation using a saved provider/model.
+    DreamConfig {
+        #[arg(long)] enabled: bool,
+        #[arg(long, default_value_t = 24)] min_hours: u64,
+        #[arg(long, default_value_t = 5)] min_memories: usize,
+    },
     Status,
     /// Clear personal memory only. Requires explicit confirmation.
     Clear { #[arg(long)] yes: bool },
@@ -158,7 +191,33 @@ pub enum MemoryCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum MagicCommands {
+    ImportLegacy {source:PathBuf,#[arg(long)] preview:bool},
+    List,
+    Check { file: PathBuf },
+    /// Generate a persisted preview; leaves the source file unchanged.
+    Update { id: String, #[arg(long)] context: String },
+    Previews,
+    Apply { id: String, #[arg(long)] yes: bool },
+    /// Remove tracking and previews only, never document files.
+    Clear,
+    /// Opt one tracked document into automatic updates from matching personal memory.
+    Auto { id: String, #[arg(long)] enabled: bool },
+    /// Foreground host for this project; services stop magic-docs stops it.
+    Start { #[arg(long, default_value_t=3600)] interval: u64 },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommands {
+    List,
+    /// Load a custom JSON definition; source is not modified.
+    Import { source:PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum TeamCommands {
+    /// Allow this project to send shared team memories to its selected model.
+    Context { #[arg(long,action=clap::ArgAction::Set)] enabled:bool },
     Status,
     Auth {
         team_id: String,
@@ -216,7 +275,7 @@ pub enum ServiceCommands {
     Status,
     /// Run a foreground host until Ctrl+C or a stop command from another process.
     Start {
-        #[arg(default_value="team-sync",value_parser=["team-sync"])]
+        #[arg(default_value="team-sync",value_parser=["team-sync", "auto-dream"])]
         name: String,
         #[arg(long, default_value_t = 60)]
         interval: u64,
@@ -243,6 +302,8 @@ pub enum ConfigCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum McpCommands {
+    Hosts,
+    Restart { name:String, #[arg(long)] host:Option<String> },
     List,
     Add {
         name: String,
@@ -273,6 +334,20 @@ pub enum SkillsCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommands {
+    ImportLegacy {source:PathBuf,#[arg(long)] preview:bool},
     List,
     Show { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommands {
+    List,
+    Install { source: String },
+    Update { id: String, source: String },
+    Enable { id: String },
+    Disable { id: String },
+    Search { query:String, #[arg(long,env="CLAUDE_PLUGIN_REGISTRY")] registry:String },
+    Remove { id: String },
+    /// Execute with the current user's permissions in the selected project.
+    Run { id: String, command: String, #[arg(long,default_value="null")] input: String, #[arg(long)] yes: bool },
 }

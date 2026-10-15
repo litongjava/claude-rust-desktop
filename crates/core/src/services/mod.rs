@@ -3,6 +3,14 @@ pub mod lifecycle;
 pub mod team;
 pub mod team_server;
 pub mod voice;
+pub mod generation;
+pub mod dream;
+pub mod magic_docs;
+pub mod agents;
+pub mod diagnostics;
+pub mod updates;
+pub mod plugins;
+pub mod session_import;
 
 use crate::{db::DbManager, runtime::RuntimePaths};
 use anyhow::{ensure, Context, Result};
@@ -104,5 +112,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(2);
         CREATE TABLE IF NOT EXISTS team_bindings(team TEXT PRIMARY KEY,endpoint TEXT NOT NULL);
         INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(3);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS magic_documents(
+        id TEXT PRIMARY KEY, root TEXT NOT NULL, path TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+        auto_update INTEGER NOT NULL DEFAULT 0, updated_at TEXT, update_count INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS magic_previews(
+        id TEXT PRIMARY KEY, document_id TEXT NOT NULL, original TEXT NOT NULL, proposed TEXT NOT NULL,
+        created_at TEXT NOT NULL, FOREIGN KEY(document_id) REFERENCES magic_documents(id) ON DELETE CASCADE);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(4);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS session_agents(conversation_id TEXT PRIMARY KEY, definition TEXT NOT NULL, FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(5);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS installed_plugins(id TEXT PRIMARY KEY, bundle TEXT NOT NULL, source TEXT NOT NULL, enabled INTEGER NOT NULL);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(6);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS mcp_hosts(id TEXT PRIMARY KEY,pid INTEGER NOT NULL,expires_at INTEGER NOT NULL,servers TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS mcp_requests(id TEXT PRIMARY KEY,host TEXT NOT NULL,server TEXT NOT NULL,expires_at INTEGER NOT NULL,state TEXT NOT NULL,error TEXT);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(7);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS legacy_session_imports(id TEXT PRIMARY KEY,source TEXT NOT NULL,payload TEXT NOT NULL,project_id TEXT NOT NULL);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(8);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS magic_auto_inputs(document_id TEXT PRIMARY KEY,input TEXT NOT NULL,FOREIGN KEY(document_id) REFERENCES magic_documents(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS legacy_magic_imports(path TEXT PRIMARY KEY,payload TEXT NOT NULL,document_id TEXT NOT NULL,FOREIGN KEY(document_id) REFERENCES magic_documents(id) ON DELETE CASCADE);
+        INSERT OR IGNORE INTO peripheral_migrations(version) VALUES(9);")?;
     Ok(())
 }

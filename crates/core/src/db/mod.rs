@@ -36,18 +36,23 @@ impl DbManager {
             .idle_timeout(Some(std::time::Duration::from_secs(30)))
             .build(manager)?;
         let conn = pool.get()?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;",
-        )?;
+        // journal_mode can report SQLITE_BUSY immediately during first-open races,
+        // even with busy_timeout. Retry only this idempotent initialization step.
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;") {
+                Ok(())=>break,
+                Err(rusqlite::Error::SqliteFailure(error,_)) if matches!(error.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked) && std::time::Instant::now()<deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(error)=>return Err(error.into()),
+            }
+        }
         Ok(Self { pool })
     }
 
     pub fn init(&self) -> Result<()> {
         self.with_conn(|conn| {
-            conn.execute_batch("BEGIN TRANSACTION")?;
+            // Acquire the writer before schema reads; concurrent hosts must not upgrade a stale WAL snapshot.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
 
             let result: Result<()> = (|| {
                 conn.execute_batch(schema::SCHEMA_SQL)?;
