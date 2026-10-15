@@ -310,3 +310,238 @@ fn private_session_execution_lease_rejects_other_engine_until_drop() {
             .is_some()
     );
 }
+
+fn plan_child_stream(format: &str, call: Option<(&str, &str, Value)>) -> String {
+    let events = if format == "openai" {
+        let delta = match call {
+            Some((id, name, input)) => {
+                json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}]})
+            }
+            None => json!({"content":"CHILD_IMPLEMENTED"}),
+        };
+        let reason = if delta.get("tool_calls").is_some() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        vec![json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]})]
+    } else {
+        let mut events = vec![
+            json!({"type":"message_start","message":{"id":"child-plan","model":"fixture","usage":{"input_tokens":1}}}),
+        ];
+        let reason = if let Some((id, name, input)) = call {
+            events.extend([
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
+                json!({"type":"content_block_stop","index":0}),
+            ]);
+            "tool_use"
+        } else {
+            events.extend([
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHILD_IMPLEMENTED"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ]);
+            "end_turn"
+        };
+        events.extend([json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":1}}),json!({"type":"message_stop"})]);
+        events
+    };
+    let mut stream = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    if format == "openai" {
+        stream.push_str("data: [DONE]\n\n");
+    }
+    stream
+}
+
+#[tokio::test]
+async fn child_plan_clear_is_isolated_persists_new_segment_and_resumes_cleanly() {
+    use crate::native_engine::provider_manager::ApiFormat;
+    use crate::permissions::PermissionMode;
+    for format in ["openai", "anthropic"] {
+        let (_temp, context, store, parent, cwd) = fixture();
+        store
+            .append(&parent, "user", "PARENT_CONTEXT_MUST_SURVIVE")
+            .unwrap();
+        let source = cwd.join("read-before-plan.txt");
+        std::fs::write(&source, "OLD_CHILD_TOOL_CONTENT").unwrap();
+        let destination = cwd.join("implemented-after-plan.txt");
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let capture = requests.clone();
+        let written = destination.clone();
+        let route = if format == "openai" {
+            "/v1/chat/completions"
+        } else {
+            "/v1/messages"
+        };
+        let app = Router::new().route(
+            route,
+            post(move |Json(body): Json<Value>| {
+                let capture = capture.clone();
+                let source = source.clone();
+                let written = written.clone();
+                async move {
+                    let index = {
+                        let mut rows = capture.lock().unwrap();
+                        let index = rows.len();
+                        rows.push(body);
+                        index
+                    };
+                    let call = match index {
+                        0 => Some(("before-clear", "Read", json!({"file_path":source}))),
+                        1 => Some((
+                            "approve-plan",
+                            "ExitPlanMode",
+                            json!({"plan":"# APPROVED_CHILD_PLAN\nWrite the implementation."}),
+                        )),
+                        2 => Some((
+                            "after-clear",
+                            "Write",
+                            json!({"file_path":written,"content":"approved implementation"}),
+                        )),
+                        _ => None,
+                    };
+                    (
+                        [("content-type", "text/event-stream")],
+                        plan_child_stream(format, call),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let registry: OwnedChildren = Default::default();
+        let permissions = crate::runtime::default_permissions();
+        permissions.set_mode(PermissionMode::PlanMode);
+        let parent_mode = permissions.mode_snapshot();
+        let mut executor = owner(&context, &parent, &cwd, &url, registry.clone())
+            .with_permission_manager(permissions.clone());
+        executor.provider.provider.api_format = if format == "openai" {
+            ApiFormat::OpenAI
+        } else {
+            ApiFormat::Anthropic
+        };
+        let (events, mut receiver) = tokio::sync::mpsc::channel(500);
+        executor.event_tx = events;
+        let waiters = executor.answer_waiters.clone();
+        let reader = tokio::spawn(async move {
+            let mut plan_approvals = 0;
+            let mut leaked_resets = 0;
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    EngineEvent::AskUser { request_id, .. } => {
+                        plan_approvals += 1;
+                        waiters
+                            .lock()
+                            .await
+                            .remove(&request_id)
+                            .unwrap()
+                            .send("1".into())
+                            .unwrap();
+                    }
+                    EngineEvent::ToolPermission { request_id, .. } => {
+                        waiters
+                            .lock()
+                            .await
+                            .remove(&request_id)
+                            .unwrap()
+                            .send("yes".into())
+                            .unwrap();
+                    }
+                    EngineEvent::ContextReset { .. } => leaked_resets += 1,
+                    _ => {}
+                }
+            }
+            (plan_approvals, leaked_resets)
+        });
+        let created = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            executor.execute_delegated(&json!({"prompt":"OLD_CHILD_PROMPT_MUST_DISAPPEAR"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let child = created["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "approved implementation"
+        );
+        assert_eq!(
+            permissions.mode_snapshot(),
+            parent_mode,
+            "Child approval changed owner permission mode"
+        );
+        assert!(
+            crate::services::plan_approval::latest_boundary(&context.db, &parent)
+                .unwrap()
+                .is_none()
+        );
+        let boundary = crate::services::plan_approval::latest_boundary(&context.db, &child)
+            .unwrap()
+            .unwrap();
+        let parent_history = serde_json::to_string(
+            &store
+                .model_history(&parent, &executor.provider.provider.api_format)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(parent_history.contains("PARENT_CONTEXT_MUST_SURVIVE"));
+        context.db.with_conn(|conn| {
+            let before:(String,i64)=conn.query_row("SELECT t.message_id,m.sort_order FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.name='Read'",[&child],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            let after:(String,i64,i64,bool)=conn.query_row("SELECT t.message_id,m.sort_order,t.sort_order,t.is_error FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.name='Write'",[&child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            let boundary_order:i64=conn.query_row("SELECT sort_order FROM messages WHERE id=?1",[&boundary],|r|r.get(0)).unwrap();
+            assert_ne!(before.0,after.0,"Child must rotate its assistant segment after clearing context");
+            assert!(before.1<boundary_order && after.1>boundary_order);
+            assert_eq!(after.2,0,"Post-clear tool ordering starts at zero");
+            assert!(!after.3);
+        }).unwrap();
+        {
+            let retained = registry.lock().unwrap();
+            assert_eq!(
+                retained[&child]
+                    .executor
+                    .permission_manager
+                    .as_ref()
+                    .unwrap()
+                    .get_mode(),
+                PermissionMode::AcceptEdits
+            );
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            executor.resume_owned_child(&child, Some("RESUME_IMPLEMENTED_CHILD"), false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(permissions.mode_snapshot(), parent_mode);
+        drop(executor);
+        assert_eq!(
+            reader.await.unwrap(),
+            (1, 0),
+            "Child reset must not reset the parent host"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1]["messages"]
+            .to_string()
+            .contains("OLD_CHILD_TOOL_CONTENT"));
+        for request in &requests[2..] {
+            let history = request["messages"].to_string();
+            assert!(!history.contains("OLD_CHILD_PROMPT_MUST_DISAPPEAR"));
+            assert!(!history.contains("OLD_CHILD_TOOL_CONTENT"));
+            assert!(history.contains("APPROVED_CHILD_PLAN"));
+        }
+        assert!(requests[4]["messages"]
+            .to_string()
+            .contains("RESUME_IMPLEMENTED_CHILD"));
+        assert!(requests[4]["messages"]
+            .to_string()
+            .contains("approved implementation"));
+        server.abort();
+    }
+}
