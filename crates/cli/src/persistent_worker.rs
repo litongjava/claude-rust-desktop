@@ -45,8 +45,10 @@ pub async fn run_from_env() -> Result<bool> {
                     fatal.store(true,Ordering::Release);
                     if let Ok(owner)=service::read_worker(&dir) { if let Some(id)=owner.active_job { let _=jobs::cancel(&worker.root,&id); } }
                 }
-                if active.load(Ordering::Acquire) {idle=Instant::now();}
-                else if fatal.load(Ordering::Acquire) || idle.elapsed()>Duration::from_secs(300) {break;}
+                let turn_active = active.load(Ordering::Acquire);
+                let shell_active = claude_core::tools::background_shell::has_active();
+                if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
+                if turn_active || shell_active {idle=Instant::now();}
             },
             stream=listener.accept()=>{
                 let stream=stream?;
@@ -181,4 +183,16 @@ async fn execute(
         .unwrap()
         .turn(&cli, &prompt, &mut None)
         .await
+}
+
+fn should_expire(turn: bool, shell: bool, fatal: bool, idle: Duration) -> bool {
+    !turn && (fatal || (!shell && idle > Duration::from_secs(300)))
+}
+#[cfg(test)]
+#[test]
+fn idle_expiry_keeps_managed_servers_alive_but_not_fatal_workers() {
+    assert!(!should_expire(false, true, false, Duration::from_secs(301)));
+    assert!(should_expire(false, false, false, Duration::from_secs(301)));
+    assert!(should_expire(false, true, true, Duration::from_secs(301)));
+    assert!(!should_expire(false, false, false, Duration::from_secs(299)));
 }

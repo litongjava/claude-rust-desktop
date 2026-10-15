@@ -22,6 +22,8 @@ pub enum HookEvent {
     PostToolUse,
     UserPromptSubmit,
     Stop,
+    WorktreeCreate,
+    WorktreeRemove,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -30,6 +32,8 @@ impl HookEvent {
             Self::PostToolUse => "PostToolUse",
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::Stop => "Stop",
+            Self::WorktreeCreate => "WorktreeCreate",
+            Self::WorktreeRemove => "WorktreeRemove",
         }
     }
 }
@@ -134,6 +138,8 @@ impl HookRunner {
                     "PostToolUse" => HookEvent::PostToolUse,
                     "UserPromptSubmit" => HookEvent::UserPromptSubmit,
                     "Stop" => HookEvent::Stop,
+                    "WorktreeCreate" => HookEvent::WorktreeCreate,
+                    "WorktreeRemove" => HookEvent::WorktreeRemove,
                     _ => continue,
                 };
                 for group in groups {
@@ -186,6 +192,27 @@ impl HookRunner {
 
     pub fn list(&self) -> &[ActiveHook] {
         &self.hooks
+    }
+
+    /// Worktree hooks return a filesystem path, not tool-permission JSON.
+    pub async fn run_worktree(&self, event: HookEvent, session: &str, mut payload: Value) -> Result<Option<String>> {
+        ensure!(matches!(event, HookEvent::WorktreeCreate | HookEvent::WorktreeRemove), "Invalid worktree hook event");
+        payload["session_id"] = json!(session);
+        payload["cwd"] = json!(self.workspace);
+        payload["hook_event_name"] = json!(event.name());
+        let mut path = None;
+        for hook in self.hooks.iter().filter(|hook|hook.event == event) {
+            let (code, stdout, stderr) = execute(hook, &self.workspace, &payload).await?;
+            ensure!(code == 0, "{} hook failed ({code}): {}", event.name(), stderr.trim());
+            if event == HookEvent::WorktreeCreate && path.is_none() && !stdout.trim().is_empty() {
+                path = Some(if stdout.trim().starts_with('{') {
+                    let value: Value = serde_json::from_str(stdout.trim())?;
+                    value["hookSpecificOutput"]["worktreePath"].as_str().context("WorktreeCreate JSON must provide hookSpecificOutput.worktreePath")?.to_owned()
+                } else { stdout.trim().to_owned() });
+            }
+        }
+        if event == HookEvent::WorktreeCreate { ensure!(path.is_some(), "WorktreeCreate returned no path"); }
+        Ok(path)
     }
 
     pub async fn run(

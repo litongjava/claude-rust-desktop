@@ -249,3 +249,71 @@ async fn named_and_generated_worktrees_isolate_dirty_sources_and_resume_after_pr
     assert_eq!(git(&source, &["status", "--porcelain"]), before);
     server.abort();
 }
+#[tokio::test]
+async fn non_git_hook_worktree_uses_real_cli_tools_and_resumes_without_recreating() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir_all(source.join(".claude")).unwrap();
+    std::fs::write(source.join("tracked.txt"), "source unchanged").unwrap();
+    let script = temp.path().join("create.cjs");
+    std::fs::write(&script,r#"let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const fs=require('fs'),path=require('path'),v=JSON.parse(s);const p=path.join(path.dirname(v.cwd),'hook-'+v.name);fs.mkdirSync(p);process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'WorktreeCreate',worktreePath:p}}));});"#).unwrap();
+    std::fs::write(source.join(".claude/settings.json"),json!({"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":format!("node \"{}\"",script.display())}]}]}}).to_string()).unwrap();
+    let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/v1/chat/completions", post(response)),
+        )
+        .await
+        .unwrap()
+    });
+    let session = uuid::Uuid::new_v4().to_string();
+    let result = cli(
+        &source,
+        &paths.data_dir,
+        &endpoint,
+        &["--session-id", &session, "--worktree", "review"],
+    )
+    .await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let path = store
+        .workspace(&session, &paths.data_dir.join("workspaces"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path.join("tracked.txt")).unwrap(),
+        "worktree edit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("tracked.txt")).unwrap(),
+        "source unchanged"
+    );
+    let fork = store.fork(&session).unwrap();
+    for id in [&session, &fork] {
+        let result = cli(&source, &paths.data_dir, &endpoint, &["--resume", id]).await;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            store
+                .workspace(id, &paths.data_dir.join("workspaces"))
+                .unwrap(),
+            path
+        );
+    }
+    assert_eq!(
+        claude_core::worktree::hooks::status(&store.db, &session)
+            .unwrap()
+            .unwrap()["backend"],
+        "hook"
+    );
+    server.abort();
+}

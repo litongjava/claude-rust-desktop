@@ -401,12 +401,45 @@ mod tests {
 }
 
 pub fn collect_completed(session: &Session) -> Result<Vec<String>> {
-    background_sessions::collect_completed(&session.store, &session.paths.data_dir, &session.id)
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WORKER_WARNING: AtomicBool = AtomicBool::new(false);
+    static SHELL_WARNING: AtomicBool = AtomicBool::new(false);
+    let mut notices = Vec::new();
+    for (source, warning, result) in [
+        ("workers", &WORKER_WARNING, background_sessions::collect_completed(&session.store, &session.paths.data_dir, &session.id)),
+        ("shells", &SHELL_WARNING, claude_core::tools::background_shell::collect_completed(&session.paths.data_dir, &session.id)),
+    ] {
+        match result {
+            Ok(mut messages) => notices.append(&mut messages),
+            Err(_) if !warning.swap(true, Ordering::Relaxed) => notices.push(format!("Background {source} completion notices are temporarily unavailable; active work continues.")),
+            Err(_) => {},
+        }
+    }
+    Ok(notices)
 }
 
 #[cfg(test)]
 mod worker_config_tests {
     use super::*;
+    #[tokio::test]
+    async fn corrupt_shell_notification_store_does_not_fail_active_session() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+        let provider = serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"anthropic","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        let selection = crate::config::Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture-model".into(),
+        };
+        let cli = Cli::parse_from(["claude-code"]);
+        let session = Session::open(&cli, &paths, selection, None).await.unwrap();
+        std::fs::create_dir_all(paths.data_dir.join("tasks")).unwrap();
+        std::fs::write(paths.data_dir.join("tasks").join(format!("{}.sqlite3", session.id)), b"not a SQLite database").unwrap();
+        assert!(claude_core::tools::background_shell::collect_completed(&paths.data_dir, &session.id).is_err());
+        assert!(collect_completed(&session).is_ok());
+        session.close().await.unwrap();
+    }
     #[tokio::test]
     async fn explicit_effort_off_survives_worker_argument_roundtrip() {
         use clap::Parser;

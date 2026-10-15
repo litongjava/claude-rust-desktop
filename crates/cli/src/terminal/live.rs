@@ -963,6 +963,7 @@ mod tests {
 
 /// Unified API: exactly one of the live actor and legacy progress writes output.
 pub struct TurnDisplay {
+    workspace: Option<std::path::PathBuf>,
     pub live: Option<LiveTurn>,
     fallback: super::progress::TurnProgress,
     tools: std::collections::HashMap<String, (Instant, String)>,
@@ -983,6 +984,7 @@ impl TurnDisplay {
         let mut fallback = super::progress::TurnProgress::new(interactive && live.is_none());
         fallback.set_permission_mode(mode);
         Ok(Self {
+            workspace: None,
             live,
             fallback,
             tools: Default::default(),
@@ -991,6 +993,11 @@ impl TurnDisplay {
     }
     pub fn is_live(&self) -> bool {
         self.live.is_some()
+    }
+    pub fn with_workspace(mut self, workspace: &std::path::Path) -> Self {
+        self.workspace = Some(workspace.to_owned());
+        self.fallback.set_workspace(workspace);
+        self
     }
     pub fn set_activity(&mut self, text: &str) {
         if let Some(live) = &self.live {
@@ -1033,7 +1040,7 @@ impl TurnDisplay {
             live.detail(id, name, &format!("Input:\n{}", input));
             live.notice(&format!(
                 "\u{2022} {}",
-                super::progress::tool_preview(name, input)
+                super::progress::tool_preview_in_workspace(name, input, self.workspace.as_deref())
             ));
             live.activity(&format!("Working: {name}"));
         } else {
@@ -1066,7 +1073,9 @@ impl TurnDisplay {
                     &format!("{name} - completed"),
                     &format!("{}\n\n{}", change_view::plain(&lines), body),
                 );
-                let mut preview = lines.iter().take(14).cloned().collect::<Vec<_>>();
+                let display_lines = change_view::change_in_workspace(output, failed, self.workspace.as_deref())
+                    .unwrap_or_else(|| lines.clone());
+                let mut preview = display_lines.iter().take(14).cloned().collect::<Vec<_>>();
                 if lines.len() > 14 {
                     preview.push(change_view::success("More changes in details (Ctrl+O)"));
                 }

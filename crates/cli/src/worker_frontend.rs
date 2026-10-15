@@ -46,7 +46,7 @@ pub async fn turn(
         session.permission_mode(),
         &root.join("keybindings.json"),
         history,
-    )?;
+    )?.with_workspace(&session.workspace);
     let job = if std::env::var("CLAUDE_RUST_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
         jobs::spawn_foreground(
             root,
@@ -92,12 +92,13 @@ pub async fn turn(
 pub async fn attach(session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
     let job = jobs::get(&session.paths.data_dir, id)?;
     authorize_attachment(&job, &session.id)?;
+    let workspace = session.store.workspace(&job.session_id, &session.paths.data_dir.join("workspaces"))?;
     let mut display = TurnDisplay::new(
         true,
         session.permission_mode(),
         &session.paths.data_dir.join("keybindings.json"),
         Vec::new(),
-    )?;
+    )?.with_workspace(&workspace);
     display.notice(&format!(
         "Attached to task {id}. Esc cancels; Ctrl+B or /background detaches without restarting."
     ));

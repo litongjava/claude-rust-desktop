@@ -13,6 +13,7 @@ const TIPS: &[&str] = &[
 ];
 
 pub struct TurnProgress {
+    workspace: Option<std::path::PathBuf>,
     enabled: bool,
     color: bool,
     visible: bool,
@@ -40,6 +41,7 @@ impl TurnProgress {
             && io::stderr().is_terminal()
             && std::env::var("TERM").as_deref() != Ok("dumb");
         let mut progress = Self {
+            workspace: None,
             enabled,
             color: colors_enabled(enabled, std::env::var_os("NO_COLOR").is_some()),
             visible: false,
@@ -65,6 +67,10 @@ impl TurnProgress {
         self.set_status(activity, "");
     }
 
+    pub fn set_workspace(&mut self, workspace: &std::path::Path) {
+        self.workspace = Some(workspace.to_owned());
+    }
+
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.permission_mode = mode.into();
         self.tick();
@@ -86,7 +92,7 @@ impl TurnProgress {
             return;
         }
         self.tools.insert(id.into(), Instant::now());
-        self.notice(&format!("• {}", tool_preview(name, input)));
+        self.notice(&format!("• {}", tool_preview_in_workspace(name, input, self.workspace.as_deref())));
         let label = if matches!(name, "Agent" | "Delegate" | "Worker") {
             format!("Running subagent: {name}")
         } else {
@@ -393,7 +399,12 @@ fn single_line(text: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 pub(crate) fn tool_preview(name: &str, input: &Value) -> String {
+    tool_preview_in_workspace(name, input, None)
+}
+
+pub(crate) fn tool_preview_in_workspace(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> String {
     let name = single_line(name);
     let preview = if name == "Bash" {
         input["command"].as_str().map(|command| {
@@ -418,8 +429,14 @@ pub(crate) fn tool_preview(name: &str, input: &Value) -> String {
     } else {
         ["file_path", "path", "pattern", "agent_type", "operation"]
             .iter()
-            .find_map(|key| input[*key].as_str())
-            .map(single_line)
+            .find_map(|key| input[*key].as_str().map(|value| {
+                if matches!(*key, "file_path" | "path") {
+                    super::display_path::label(value, workspace)
+                } else {
+                    value.to_owned()
+                }
+            }))
+            .map(|value| single_line(&value))
     };
     match preview {
         Some(preview) if !preview.is_empty() => format!("{name}: {}", clipped(&preview, 100)),
@@ -511,6 +528,19 @@ fn clipped(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_preview_changes_labels_only() {
+        let workspace = std::env::temp_dir().join("preview workspace");
+        let path = workspace.join("src").join("中文 file.rs");
+        let input = serde_json::json!({"file_path":path});
+        let original = input.clone();
+        assert_eq!(super::tool_preview_in_workspace("Read", &input, Some(&workspace)), "Read: src/中文 file.rs");
+        assert_eq!(input, original);
+        let command = serde_json::json!({"command":format!("cat {}", path.display())});
+        assert_eq!(super::tool_preview_in_workspace("Bash", &command, Some(&workspace)), super::tool_preview("Bash", &command));
+        let external = serde_json::json!({"path":workspace.with_file_name("other").join("x.rs")});
+        assert_eq!(super::tool_preview_in_workspace("Read", &external, Some(&workspace)), super::tool_preview("Read", &external));
+    }
     use super::*;
 
     #[test]

@@ -45,6 +45,7 @@ pub mod progress;
 pub mod prompt_display;
 pub mod live;
 pub mod change_view;
+mod display_path;
 pub mod style;
 pub mod screen_mode;
 

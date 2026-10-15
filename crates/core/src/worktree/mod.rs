@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod session;
+pub mod hooks;
 pub mod changes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,7 @@
 use crate::{args::Cli, session::Session};
 use anyhow::{ensure, Context, Result};
 #[path = "worktree_startup.rs"]
-mod worktree_startup;
+pub(crate) mod worktree_startup;
 
 pub fn validate(cli: &Cli, workspace: &std::path::Path) -> Result<()> {
     worktree_startup::validate(cli, workspace)?;
@@ -39,7 +39,7 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
             true,
         )?;
     }
-    worktree_startup::apply(cli, session)?;
+    worktree_startup::apply(cli, session).await?;
     if let Some(name) = &cli.name {
         session.store.db.with_conn(|conn| {
             claude_core::db::conversation_repo::update_conversation_title(conn, &session.id, name)

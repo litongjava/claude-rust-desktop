@@ -7,10 +7,19 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
+#[path = "shell_notifications.rs"]
+mod notifications;
+pub use notifications::collect_completed;
 tokio::task_local! { static CONTEXT: Option<(PathBuf, String)>; }
 
 pub(crate) async fn scope<F: Future>(context: Option<(PathBuf, String)>, future: F) -> F::Output {
     CONTEXT.scope(context, future).await
+}
+
+static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Only tasks owned by this process keep its persistent worker alive.
+pub fn has_active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
 struct Completion {
@@ -21,7 +30,7 @@ struct Completion {
 }
 impl Completion {
     fn finish(&mut self, status: &str, output: Value) {
-        let result = super::tasks::execute_for_session(
+        let result = super::tasks::execute_for_shell_owner(
             "TaskUpdate",
             json!({"id":self.id,"status":status,"output":output.to_string()}),
             &self.root,
@@ -32,6 +41,7 @@ impl Completion {
 }
 impl Drop for Completion {
     fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if !self.done {
             self.finish(
                 "cancelled",
@@ -52,7 +62,7 @@ pub(super) fn start(
         .ok()
         .flatten()
         .context("Background Bash requires an owning engine session")?;
-    let task = super::tasks::execute_for_session(
+    let task = super::tasks::execute_for_shell_owner(
         "TaskCreate",
         json!({"subject":description,"metadata":{"managed_shell":true}}),
         &root,
@@ -63,7 +73,7 @@ pub(super) fn start(
     std::fs::create_dir_all(&directory)?;
     let stdout = directory.join("stdout.log");
     let stderr = directory.join("stderr.log");
-    super::tasks::execute_for_session(
+    super::tasks::execute_for_shell_owner(
         "TaskUpdate",
         json!({"id":id,"status":"running"}),
         &root,
@@ -72,6 +82,7 @@ pub(super) fn start(
     std::fs::write(directory.join("heartbeat"), b"running")?;
     let shell = shell.to_string();
     let logs = (stdout.clone(), stderr.clone());
+    ACTIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut completion = Completion {
         root,
         session,
@@ -109,7 +120,15 @@ pub(super) fn control(
     if !matches!(name, "TaskOutput" | "TaskStop") {
         return Ok(None);
     }
-    anyhow::ensure!(input.get("block").is_none() && input.get("timeout").is_none(), "TaskOutput/TaskStop do not support block or timeout; use nonblocking TaskOutput to inspect current state");
+    let policy = if name == "TaskOutput" {
+        Some(wait_policy(input)?)
+    } else {
+        anyhow::ensure!(
+            input.get("block").is_none() && input.get("timeout").is_none(),
+            "TaskStop does not accept block or timeout"
+        );
+        None
+    };
     let id = input["task_id"]
         .as_str()
         .or_else(|| input["taskId"].as_str())
@@ -119,6 +138,7 @@ pub(super) fn control(
     if task["metadata"]["managed_shell"] != true {
         return Ok(None);
     }
+    anyhow::ensure!(policy.is_none_or(|(block, _)| !block), "Blocking TaskOutput requires the asynchronous task entry point; synchronous callers must set block:false");
     let id = uuid::Uuid::parse_str(id)?.to_string();
     let session = uuid::Uuid::parse_str(session)?;
     let directory = root
@@ -157,17 +177,260 @@ pub(super) fn control(
         }
     };
     Ok(Some(
-        json!({"task_id":id,"status":status,"stdout":read("stdout.log")?,"stderr":read("stderr.log")?,"result":task["output"],"block":false}),
+        json!({"task_id":id,"status":status,"stdout":read("stdout.log")?,"stderr":read("stderr.log")?,"result":task["output"],"block":false,"retrieval_status":if terminal(&status) {"success"} else {"not_ready"}}),
     ))
+}
+
+fn terminal(status: &Value) -> bool {
+    matches!(status.as_str(), Some("completed" | "failed" | "cancelled"))
+}
+
+fn wait_policy(input: &Value) -> Result<(bool, Duration)> {
+    let block = input
+        .get("block")
+        .map(|v| v.as_bool().context("block must be boolean"))
+        .transpose()?
+        .unwrap_or(true);
+    let timeout = input
+        .get("timeout")
+        .map(|v| {
+            v.as_u64()
+                .context("TaskOutput timeout must be an integer number of milliseconds")
+        })
+        .transpose()?
+        .unwrap_or(30_000);
+    anyhow::ensure!(
+        timeout <= 600_000,
+        "TaskOutput timeout must be 0..600000 milliseconds"
+    );
+    Ok((block, Duration::from_millis(timeout)))
+}
+
+pub(super) async fn control_async(
+    name: &str,
+    input: &Value,
+    root: &Path,
+    session: &str,
+) -> Result<Option<Value>> {
+    if name != "TaskOutput" {
+        return Ok(None);
+    }
+    let (block, timeout) = wait_policy(input)?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut snapshot_input = input.clone();
+    snapshot_input["block"] = json!(false);
+    let id = input["task_id"]
+        .as_str()
+        .or_else(|| input["taskId"].as_str())
+        .or_else(|| input["id"].as_str())
+        .context("task_id is required")?;
+    let id = uuid::Uuid::parse_str(id)?.to_string();
+    let session_id = uuid::Uuid::parse_str(session)?.to_string();
+    let managed_directory = root
+        .join("shell-tasks")
+        .join(&session_id)
+        .join(&id)
+        .is_dir();
+    let mut last = json!({"task_id":id,"status":"unknown","stdout":"","stderr":"","result":null,"block":block,"retrieval_status":"timeout"});
+    loop {
+        let (root, session, input) = (root.to_owned(), session.to_owned(), snapshot_input.clone());
+        let snapshot =
+            tokio::task::spawn_blocking(move || control("TaskOutput", &input, &root, &session));
+        let snapshot = if block && managed_directory {
+            match tokio::time::timeout_at(deadline, snapshot).await {
+                Ok(result) => result??,
+                Err(_) => {
+                    last["retrieval_status"] = json!("timeout");
+                    return Ok(Some(last));
+                }
+            }
+        } else {
+            snapshot.await??
+        };
+        let Some(mut value) = snapshot else {
+            return Ok(None);
+        };
+        value["block"] = json!(block);
+        if terminal(&value["status"]) || !block {
+            return Ok(Some(value));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            value["retrieval_status"] = json!("timeout");
+            return Ok(Some(value));
+        }
+        last = value;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(50)),
+        )
+        .await;
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn waiting_fixture(root: &Path, session: &str) -> String {
+        let task = super::super::tasks::execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"waiting fixture","metadata":{"managed_shell":true}}),
+            root,
+            session,
+        )
+        .unwrap();
+        let id = task["id"].as_str().unwrap().to_owned();
+        super::super::tasks::execute_for_shell_owner(
+            "TaskUpdate",
+            json!({"id":id,"status":"running"}),
+            root,
+            session,
+        )
+        .unwrap();
+        let directory = root.join("shell-tasks").join(session).join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("heartbeat"), b"alive").unwrap();
+        std::fs::write(directory.join("stdout.log"), b"partial output").unwrap();
+        id
+    }
     #[test]
-    fn unresponsive_owner_still_receives_cancel_and_unsupported_wait_is_rejected() {
+    fn output_wait_policy_uses_milliseconds_and_rejects_invalid_values() {
+        assert_eq!(
+            wait_policy(&json!({})).unwrap(),
+            (true, Duration::from_secs(30))
+        );
+        assert_eq!(
+            wait_policy(&json!({"block":false,"timeout":1})).unwrap(),
+            (false, Duration::from_millis(1))
+        );
+        for input in [
+            json!({"block":"true"}),
+            json!({"timeout":-1}),
+            json!({"timeout":1.5}),
+            json!({"timeout":600001}),
+        ] {
+            assert!(wait_policy(&input).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn output_wait_timeout_snapshot_and_session_isolation() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let task = super::super::tasks::execute_for_session(
+        let id = waiting_fixture(root.path(), &session);
+        let snapshot = super::super::tasks::execute_for_session_async(
+            "TaskOutput",
+            json!({"task_id":id,"block":false}),
+            root.path(),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["retrieval_status"], "not_ready");
+        for timeout in [0, 40] {
+            let started = tokio::time::Instant::now();
+            let value = super::super::tasks::execute_for_session_async(
+                "TaskOutput",
+                json!({"task_id":id,"timeout":timeout}),
+                root.path(),
+                &session,
+            )
+            .await
+            .unwrap();
+            assert_eq!(value["retrieval_status"], "timeout");
+            if timeout != 0 {
+                assert_eq!(value["status"], "running");
+                assert_eq!(value["stdout"], "partial output");
+            }
+            assert!(started.elapsed() >= Duration::from_millis(timeout));
+        }
+        assert!(super::super::tasks::execute_for_session_async(
+            "TaskOutput",
+            json!({"task_id":id,"block":false}),
+            root.path(),
+            &uuid::Uuid::new_v4().to_string()
+        )
+        .await
+        .is_err());
+        assert!(!root
+            .path()
+            .join("shell-tasks")
+            .join(&session)
+            .join(&id)
+            .join("cancel")
+            .exists());
+    }
+    #[tokio::test]
+    async fn output_deadline_bounds_locked_database_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = waiting_fixture(root.path(), &session);
+        let lock = rusqlite::Connection::open(
+            root.path().join("tasks").join(format!("{session}.sqlite3")),
+        )
+        .unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let request = json!({"task_id":id,"timeout":40});
+        let value = tokio::time::timeout(
+            Duration::from_millis(500),
+            control_async("TaskOutput", &request, root.path(), &session),
+        )
+        .await;
+        lock.execute_batch("ROLLBACK").unwrap();
+        let value = value
+            .expect("SQLite busy wait exceeded TaskOutput deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["retrieval_status"], "timeout");
+        assert_eq!(value["status"], "unknown");
+    }
+    #[tokio::test]
+    async fn output_wait_observes_completion_and_cancels_without_stopping_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = waiting_fixture(root.path(), &session);
+        let update = async {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            super::super::tasks::execute_for_shell_owner(
+                "TaskUpdate",
+                json!({"id":id,"status":"completed"}),
+                root.path(),
+                &session,
+            )
+            .unwrap();
+        };
+        let request = json!({"task_id":id});
+        let (value, _) = tokio::join!(
+            control_async("TaskOutput", &request, root.path(), &session),
+            update
+        );
+        assert_eq!(value.unwrap().unwrap()["retrieval_status"], "success");
+        let id = waiting_fixture(root.path(), &session);
+        let request = json!({"task_id":id});
+        assert!(tokio::time::timeout(
+            Duration::from_millis(80),
+            control_async("TaskOutput", &request, root.path(), &session)
+        )
+        .await
+        .is_err());
+        assert!(!root
+            .path()
+            .join("shell-tasks")
+            .join(&session)
+            .join(&id)
+            .join("cancel")
+            .exists());
+        let snapshot = control(
+            "TaskOutput",
+            &json!({"task_id":id,"block":false}),
+            root.path(),
+            &session,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot["status"], "running");
+    }
+    #[test]
+    fn unresponsive_owner_receives_cancel_and_sync_blocking_wait_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = super::super::tasks::execute_for_shell_owner(
             "TaskCreate",
             json!({"subject":"stale shell","metadata":{"managed_shell":true}}),
             root.path(),
@@ -175,7 +438,7 @@ mod tests {
         )
         .unwrap();
         let id = task["id"].as_str().unwrap();
-        super::super::tasks::execute_for_session(
+        super::super::tasks::execute_for_shell_owner(
             "TaskUpdate",
             json!({"id":id,"status":"running"}),
             root.path(),
@@ -203,7 +466,7 @@ mod tests {
             loop {
                 let value = super::super::tasks::execute_for_session(
                     "TaskOutput",
-                    json!({"task_id":id}),
+                    json!({"task_id":id,"block":false}),
                     root,
                     session,
                 )
@@ -235,6 +498,14 @@ mod tests {
         let running = output(root.path(), &session, id, false).await;
         assert_eq!(running["status"], "running");
         assert!(running["stderr"].as_str().unwrap().contains("diagnostic"));
+        for change in [json!({"status":"completed"}),json!({"status":"deleted"}),json!({"output":"fabricated"}),json!({"metadata":{"managed_shell":false}}),json!({"metadata":{"managed_shell":null}})] {
+            let mut change=change;change["id"]=json!(id);
+            assert!(super::super::tasks::execute_for_session("TaskUpdate",change,root.path(),&session).is_err());
+        }
+        super::super::tasks::execute_for_session("TaskUpdate",json!({"id":id,"subject":"renamed server","metadata":{"note":"safe user annotation"}}),root.path(),&session).unwrap();
+        let still_running=output(root.path(),&session,id,false).await;
+        assert_eq!(still_running["status"],"running");
+        assert!(super::super::tasks::execute_for_session("TaskCreate",json!({"subject":"fake managed task","metadata":{"managed_shell":true}}),root.path(),&session).is_err());
         assert!(super::super::tasks::execute_for_session(
             "TaskStop",
             json!({"task_id":id}),

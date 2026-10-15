@@ -12,7 +12,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TaskUpdate", "Update a durable session task. Dependencies must exist and cannot form cycles.", json!({"id":{"type":"string"},"taskId":{"type":"string"},"name":{"type":"string"},"priority":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","running","completed","failed","cancelled","deleted"]},"output":{"type":"string"},"owner":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"},"addBlockedBy":{"type":"array","items":{"type":"string"}},"addBlocks":{"type":"array","items":{"type":"string"}}}),vec![]),
         ("TodoWrite", "Replace the session's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
-        ("TaskOutput", "Read current bounded logs and status of a managed background shell, or saved task output. Nonblocking; retry later if running.",json!({"id":{"type":"string"},"task_id":{"type":"string"}}),vec![]),
+        ("TaskOutput", "Read managed background shell logs and status. block defaults to true; timeout is milliseconds (default 30000, maximum 600000). Use block:false for an immediate snapshot. Saved non-process task records return their saved output.",json!({"id":{"type":"string"},"task_id":{"type":"string"},"block":{"type":"boolean","default":true},"timeout":{"type":"integer","minimum":0,"maximum":600000,"default":30000}}),vec![]),
         ("TaskStop", "Request cancellation of a managed background shell and its descendants. For other task records, changes metadata only; use host cancellation for running agents.",json!({"id":{"type":"string"},"task_id":{"type":"string"}}),vec![]),
         ("todo_write", "Manage durable todos using the legacy create/list/get/update/delete/complete/filter operations.",json!({"operation":{"type":"string","enum":["create","list","get","update","delete","complete","filter"]},"id":{"type":"string"},"content":{"type":"string"},"priority":{"type":"string","enum":["low","medium","high","urgent"]},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"tags":{"type":"array","items":{"type":"string"}},"filter_status":{"type":"string"},"filter_priority":{"type":"string"},"filter_tags":{"type":"array","items":{"type":"string"}}}),vec!["operation"]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).collect()
@@ -49,6 +49,20 @@ pub fn execute_for_session(name: &str, input: Value, root: &Path, session: &str)
     )
 }
 
+pub async fn execute_for_session_async(
+    name: &str,
+    input: Value,
+    root: &Path,
+    session: &str,
+) -> Result<Value> {
+    uuid::Uuid::parse_str(session).context("Invalid task session ID")?;
+    if let Some(output) = super::background_shell::control_async(name, &input, root, session).await? {
+        return Ok(output);
+    }
+    let (name, root, session) = (name.to_owned(), root.to_owned(), session.to_owned());
+    tokio::task::spawn_blocking(move || execute_for_session(&name, input, &root, &session)).await?
+}
+
 pub fn read_legacy(name: &str, input: Value, cwd: &str) -> Result<Value> {
     ensure!(readonly(name, &input), "Legacy project tasks are read-only");
     let path = Path::new(cwd).canonicalize()?.join(".claude/tasks.sqlite3");
@@ -75,7 +89,36 @@ pub(super) fn execute(name: &str, input: Value, cwd: &str) -> Result<Value> {
     )
 }
 
-fn execute_at(name: &str, mut input: Value, path: &Path) -> Result<Value> {
+/// Internal process owner API. This authority is never read from model input.
+pub(crate) fn execute_for_shell_owner(
+    name: &str,
+    input: Value,
+    root: &Path,
+    session: &str,
+) -> Result<Value> {
+    ensure!(
+        matches!(name, "TaskCreate" | "TaskUpdate"),
+        "Invalid shell owner operation"
+    );
+    let session = uuid::Uuid::parse_str(session).context("Invalid task session ID")?;
+    execute_at_owned(
+        name,
+        input,
+        &root.join("tasks").join(format!("{session}.sqlite3")),
+        true,
+    )
+}
+
+fn execute_at(name: &str, input: Value, path: &Path) -> Result<Value> {
+    execute_at_owned(name, input, path, false)
+}
+fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool) -> Result<Value> {
+    if !shell_owner {
+        ensure!(
+            input.get("metadata").and_then(|m| m.get("managed_shell")).is_none(),
+            "managed_shell provenance is reserved for the shell process owner"
+        );
+    }
     if input.get("id").is_none() { if let Some(id) = input.get("task_id").cloned() { input["id"] = id; } }
     if input.get("taskId").is_none() {
         if let Some(id) = input.get("id").cloned() {
@@ -171,6 +214,12 @@ fn execute_at(name: &str, mut input: Value, path: &Path) -> Result<Value> {
         "TaskUpdate" => {
             let id = input["taskId"].as_str().context("taskId is required")?;
             let mut task = get(id)?;
+            if !shell_owner && task["metadata"]["managed_shell"] == true {
+                ensure!(
+                    input.get("status").is_none() && input.get("output").is_none(),
+                    "Managed shell status/output/deletion are owned by the running process; use TaskStop to cancel"
+                );
+            }
             if input["status"] == "deleted" {
                 let mut statement = tx.prepare("SELECT id,body FROM tasks WHERE id!=?1")?;
                 let rows = statement

@@ -21,7 +21,7 @@ pub mod scheduled;
 mod content_compat;
 mod utf8;
 mod bash_process;
-pub(crate) mod background_shell;
+pub mod background_shell;
 pub(crate) mod path_scope;
 mod file_change;
 mod web;

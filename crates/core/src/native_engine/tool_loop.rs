@@ -895,11 +895,11 @@ impl ToolLoopExecutor {
         let is_error;
 
         if crate::tools::tasks::is_task(tool_name) {
-            let result = (|| {
+            let result = async {
                 let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
                 let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
-                crate::tools::tasks::execute_for_session(tool_name, tool_input.clone(), root, session)
-            })();
+                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+            }.await;
             return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());
         }
 
@@ -1152,11 +1152,11 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
     ) -> (Value, String, bool) {
         if crate::tools::tasks::is_task(tool_name) {
-            let result = (|| {
+            let result = async {
                 let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
                 let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
-                crate::tools::tasks::execute_for_session(tool_name, tool_input.clone(), root, session)
-            })();
+                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+            }.await;
             return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());
         }
 

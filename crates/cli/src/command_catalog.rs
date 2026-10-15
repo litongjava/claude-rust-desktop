@@ -1,5 +1,6 @@
 //! Discoverable commands shared by terminal hints, completion, and help.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("/worktree", "Inspect, retain/unbind, or explicitly clean a managed worktree: status|detach|remove"),
     ("/design", "Manage Design consent and project grants: [status|list|grants|grant ID|consent|revoke]"),
     ("/design-login", "Authorize separate Design read/write access"),
     ("/design-sync", "Plan or upload a verified prebuilt Design bundle: plan|show|upload"),

@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS conversation_worktrees (
     branch TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversation_worktree_backends (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversation_worktrees(conversation_id) ON DELETE CASCADE,
+    backend TEXT NOT NULL CHECK (backend = 'hook'),
+    metadata TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,

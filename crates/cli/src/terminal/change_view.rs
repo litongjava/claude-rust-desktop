@@ -283,6 +283,10 @@ fn changed_span(text: &str, other: &str) -> (usize, usize) {
     (prefix, text.len() - tail)
 }
 pub fn change(output: &str, failed: bool) -> Option<Vec<Line>> {
+    change_in_workspace(output, failed, None)
+}
+
+pub fn change_in_workspace(output: &str, failed: bool, workspace: Option<&std::path::Path>) -> Option<Vec<Line>> {
     if failed {
         return None;
     }
@@ -295,9 +299,10 @@ pub fn change(output: &str, failed: bool) -> Option<Vec<Line>> {
     }
     let change = &output["file_change"];
     let path = change["path"].as_str()?;
+    let display_path = super::display_path::label(path, workspace);
     let mut result = vec![Line(vec![
         span("\u{25cf} ", Style::Success),
-        span(format!("Update({path})"), Style::Body),
+        span(format!("Update({display_path})"), Style::Body),
     ])];
     if let Some(notice) = change["notice"].as_str() {
         result.push(Line(vec![span(format!("  {notice}"), Style::Muted)]));
@@ -422,6 +427,19 @@ mod tests {
             let plain = render(&lines[2], width, false);
             assert!(unicode_width::UnicodeWidthStr::width(plain.as_str()) <= width);
             assert!(!plain.contains('\x1b'));
+        }
+    }
+    #[test]
+    fn workspace_diff_title_keeps_full_detail_and_styling() {
+        let workspace = std::env::temp_dir().join("diff workspace");
+        let path = workspace.join("中文 file.ts");
+        let output = serde_json::json!({"success":true,"file_change":{"version":1,"verified":true,"path":path,"added":1,"removed":0,"rows":[{"kind":"added","new_line":1,"text":"const answer = 42;"}]}}).to_string();
+        let full = change(&output, false).unwrap();
+        let preview = change_in_workspace(&output, false, Some(&workspace)).unwrap();
+        assert!(plain(&full).contains(&path.to_string_lossy().to_string()));
+        assert!(plain(&preview).starts_with("● Update(中文 file.ts)\n"));
+        for (original, shown) in full.iter().skip(1).zip(preview.iter().skip(1)) {
+            assert_eq!(render(original, 100, true), render(shown, 100, true));
         }
     }
     #[test]
