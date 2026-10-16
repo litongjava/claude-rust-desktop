@@ -4,6 +4,15 @@ use std::{path::Path, process::Stdio, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn run(script: &str, workspace: &Path, payload: &serde_json::Value) -> Result<String> {
+    run_with_budget(script, workspace, payload, Duration::from_secs(2)).await
+}
+
+async fn run_with_budget(
+    script: &str,
+    workspace: &Path,
+    payload: &serde_json::Value,
+    budget: Duration,
+) -> Result<String> {
     let payload = serde_json::to_vec(payload)?;
     ensure!(payload.len() <= 65536, "Status line input exceeds 64 KiB");
     let utf8_script = format!("[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; {script}");
@@ -35,7 +44,7 @@ pub async fn run(script: &str, workspace: &Path, payload: &serde_json::Value) ->
     let mut child = command.spawn().context("Starting status line command")?;
     let _tree =
         super::tool_hooks::ProcessTree::new(child.id().context("Status line process exited")?)?;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(budget, async {
         let mut stdin = child
             .stdin
             .take()
@@ -187,10 +196,14 @@ mod tests {
         } else {
             "cat"
         };
-        assert!(run(
+        // Content/output bounds are independent of shell startup scheduling.
+        // The separate timeout case still verifies the public two-second budget.
+        let budget = Duration::from_secs(10);
+        assert!(run_with_budget(
             echo,
             cwd.path(),
-            &serde_json::json!({"session_id":"fixture中文😀"})
+            &serde_json::json!({"session_id":"fixture中文😀"}),
+            budget
         )
         .await
         .unwrap()
@@ -201,7 +214,7 @@ mod tests {
             "printf '\\033[32mready'"
         };
         assert_eq!(
-            run(color, cwd.path(), &serde_json::json!({}))
+            run_with_budget(color, cwd.path(), &serde_json::json!({}), budget)
                 .await
                 .unwrap(),
             "\x1b[32mready\x1b[0m"
@@ -211,11 +224,13 @@ mod tests {
         } else {
             "head -c 5000 /dev/zero"
         };
-        assert!(run(excess, cwd.path(), &serde_json::json!({}))
+        let error = run_with_budget(excess, cwd.path(), &serde_json::json!({}), budget)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("4096"));
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("4096"),
+            "Unexpected output-limit error: {error:#}"
+        );
     }
 
     #[tokio::test]
