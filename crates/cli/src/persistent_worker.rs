@@ -106,7 +106,7 @@ pub async fn run_from_env() -> Result<bool> {
                     },
                     Request::GetPermissionMode { job_id } => {
                         let result = current_live_mode(&worker, &mode_target, &job_id);
-                        let reply = match result { Ok((mode, session_id)) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_mode=Some(mode); reply.permission_session_id=Some(session_id); reply }, Err(error)=>Reply::error(error) };
+                        let reply = match result { Ok(mut reply) => { reply.job_id=Some(job_id); reply }, Err(error)=>Reply::error(error) };
                         let _ = service::reply(stream, &reply).await;
                     },
                     Request::Shutdown=>{
@@ -259,13 +259,27 @@ fn update_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str, mode: &s
     Ok(control.session_id.clone())
 }
 
-fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<(String, String)> {
-    let target = target.lock().unwrap_or_else(|e|e.into_inner());
-    let control = target.as_ref().context("Session worker has no active initialized turn")?;
-    ensure!(control.job_id == job_id, "Mode query targets a different job");
+fn current_live_mode(worker: &Worker, target: &ModeTarget, job_id: &str) -> Result<Reply> {
+    let target = target.lock().unwrap_or_else(|e| e.into_inner());
+    let control = target
+        .as_ref()
+        .context("Session worker has no active initialized turn")?;
+    ensure!(
+        control.job_id == job_id,
+        "Mode query targets a different job"
+    );
     let job = jobs::get(&worker.root, job_id)?;
-    ensure!(job.session_id == worker.session_id && job.finished_ms.is_none(), "Mode query targets an inactive session job");
-    Ok((claude_core::services::session_permission_mode::name(control.manager.get_mode()).into(), control.session_id.clone()))
+    ensure!(
+        job.session_id == worker.session_id && job.finished_ms.is_none(),
+        "Mode query targets an inactive session job"
+    );
+    let mut reply = Reply::ok(Some(job_id.into()));
+    reply.permission_mode = Some(
+        claude_core::services::session_permission_mode::name(control.manager.get_mode()).into(),
+    );
+    reply.permission_session_id = Some(control.session_id.clone());
+    reply.launch_rules = Some(control.manager.launch_rules(&control.session_id));
+    Ok(reply)
 }
 
 fn should_expire(turn: bool, shell: bool, fatal: bool, idle: Duration) -> bool {

@@ -175,6 +175,7 @@ impl Session {
             !cli.fork_session || resumed_id.is_some(),
             "--fork-session requires --resume or --continue"
         );
+        let launch_rules = crate::launch_permissions::rules(cli)?;
         cli.system_prompt_text()?;
         claude_core::config::OrchestrationConfig::init_global()?;
         let db = paths.open_database()?;
@@ -215,6 +216,7 @@ impl Session {
             )
         })??;
         let permissions = runtime::default_permissions();
+        permissions.set_launch_rules(&id, launch_rules)?;
         if let Some(crate::args::Commands::Agent { agent_type, .. }) = &cli.command {
             let definition = claude_core::services::agents::resolve(&crate::services::context(paths)?, agent_type)?;
             claude_core::services::agents::bind(&store.db, &id, &definition)?;
@@ -230,6 +232,7 @@ impl Session {
         let explicit_mode = cli.permission_mode_explicit || cli.dangerously_skip_permissions || !matches!(cli.permission_mode, PermissionModeArg::Ask);
         let active_job = if internal_worker { None } else { claude_core::services::background_sessions::list(&paths.data_dir, None)?.into_iter().find(|job|job.session_id == id && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")) };
         if let Some(job) = &active_job {
+            anyhow::ensure!(cli.allowed_tools.is_empty() && cli.disallowed_tools.is_empty(), "This session has active background work; attach without launch tool rules, or stop the worker before changing them");
             anyhow::ensure!(!explicit_mode, "This session has active background work; resume without an explicit permission mode and use /tasks attach {} to change its mode", job.id);
         }
         let selected_mode = if explicit_mode {
@@ -489,6 +492,7 @@ impl Session {
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
         use std::io::IsTerminal;
+        self.permissions.set_launch_rules(&self.id, crate::launch_permissions::rules(cli)?)?;
         // Frontends record original human input before skill expansion/worker handoff.
         // A worker receives synthesized context and must never re-label it as user intent.
         if std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {

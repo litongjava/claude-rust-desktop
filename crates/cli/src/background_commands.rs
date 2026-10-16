@@ -363,6 +363,14 @@ pub(crate) fn arguments(
     if !system_prompt.is_empty() {
         args.extend(["--system-prompt".into(), system_prompt]);
     }
+    for (flag, values) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for value in values {
+            args.extend([flag.into(), value.clone()]);
+        }
+    }
     // A positional prompt after -- cannot be parsed as a CLI flag/subcommand.
     args.extend(["--".into(), prompt.into()]);
     Ok(args)
@@ -565,7 +573,7 @@ mod worker_config_tests {
         session.close().await.unwrap();
     }
     #[tokio::test]
-    async fn explicit_effort_off_survives_worker_argument_roundtrip() {
+    async fn explicit_effort_and_launch_rules_survive_worker_argument_roundtrip() {
         use clap::Parser;
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
@@ -575,17 +583,44 @@ mod worker_config_tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let mut cli = Cli::parse_from(["claude-code", "--effort", "off"]);
+        let mut cli = Cli::parse_from([
+            "claude-code",
+            "--effort",
+            "off",
+            "--allowedTools",
+            "Bash(echo a,b),Read(my files/**)",
+            "Write",
+            "--allowed-tools",
+            r"Read(my\(files\)/**)",
+            "--disallowedTools",
+            "Write,mcp__fixture__*",
+            "--disallowed-tools",
+            "KillShell",
+        ]);
         let session = Session::open(&cli, &paths, selection, None).await.unwrap();
         let mut resolved = session.selected_provider().await.unwrap();
         resolved.model.effort = Some("high".into());
-        let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
+        let prompt = "--disallowed-tools this is literal user input";
+        let args = arguments(&cli, &paths, &session, &session.id, prompt, &resolved).unwrap();
         let worker = Cli::parse_from(std::iter::once("claude-code".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("off"));
+        assert_eq!(worker.prompt.as_deref(), Some(prompt));
+        assert_eq!(worker.allowed_tools, cli.allowed_tools);
+        assert_eq!(worker.disallowed_tools, cli.disallowed_tools);
+        assert_eq!(
+            crate::launch_permissions::rules(&worker).unwrap(),
+            crate::launch_permissions::rules(&cli).unwrap()
+        );
         cli.effort = None;
+        cli.allowed_tools.clear();
+        cli.disallowed_tools.clear();
         let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
         let worker = Cli::parse_from(std::iter::once("claude-code".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("high"));
+        // A new frontend launch must not borrow the previous launch's session snapshot.
+        assert!(crate::launch_permissions::rules(&worker)
+            .unwrap()
+            .is_empty());
         session.close().await.unwrap();
     }
 

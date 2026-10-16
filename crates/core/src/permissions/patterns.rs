@@ -9,6 +9,21 @@ pub struct Rule {
     content: Option<String>,
 }
 
+/// Server-only and server wildcard rules share the upstream namespace boundary.
+fn mcp_server_rule(name: &str) -> Option<&str> {
+    let suffix = name.strip_prefix("mcp__")?;
+    let server = match suffix.split_once("__") {
+        Some((server, "*")) => server,
+        Some(_) => return None,
+        None => suffix,
+    };
+    (!server.is_empty()
+        && server
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    .then_some(server)
+}
+
 impl Rule {
     pub fn parse(value: &str) -> Result<Self> {
         ensure!(
@@ -53,9 +68,10 @@ impl Rule {
         };
         ensure!(
             !tool.is_empty()
-                && tool
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':')),
+                && (tool.chars().all(|c| c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '-' | ':')
+                    || (tool.starts_with("mcp__") && c == '.'))
+                    || mcp_server_rule(tool).is_some_and(|_| tool.ends_with("__*"))),
             "Invalid tool name in permission rule"
         );
         Ok(Self {
@@ -66,7 +82,17 @@ impl Rule {
 
     pub fn matches(&self, context: &PermissionContext, action: &PermissionAction) -> bool {
         if self.tool != context.tool_name {
-            return false;
+            let server_match = self.content.is_none()
+                && mcp_server_rule(&self.tool).is_some_and(|server| {
+                    context
+                        .tool_name
+                        .strip_prefix("mcp__")
+                        .and_then(|value| value.split_once("__"))
+                        .is_some_and(|(target, tool)| target == server && !tool.is_empty())
+                });
+            if !server_match {
+                return false;
+            }
         }
         let Some(pattern) = &self.content else {
             return true;

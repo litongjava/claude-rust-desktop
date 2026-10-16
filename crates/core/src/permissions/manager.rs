@@ -81,6 +81,7 @@ pub struct PermissionManager {
     mode: Mutex<ModeSnapshot>,
     session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
     runtime_rules: Mutex<HashMap<String, Vec<HashMap<String, PermissionAction>>>>,
+    launch_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
     always_allow_checker: Mutex<Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>>,
 }
 
@@ -97,8 +98,43 @@ impl PermissionManager {
             "tools":*self.tool_permissions.lock().unwrap_or_else(|e|e.into_inner()),
             "session":self.session_rules.lock().unwrap_or_else(|e|e.into_inner()).get(session),
             "runtime":self.runtime_rules.lock().unwrap_or_else(|e|e.into_inner()).get(session),
+            "launch":self.launch_rules.lock().unwrap_or_else(|e|e.into_inner()).get(session),
             "callback_identity":callback
         })
+    }
+
+    pub fn launch_rules(&self, conversation: &str) -> HashMap<String, PermissionAction> {
+        self.launch_rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Rules supplied by the launching host; SDK session patches cannot remove them.
+    pub fn set_launch_rules(
+        &self,
+        conversation: &str,
+        rules: HashMap<String, PermissionAction>,
+    ) -> anyhow::Result<()> {
+        for pattern in rules.keys() {
+            super::patterns::validate(pattern)?;
+        }
+        let mut revision = self.policy_revision.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current = self.launch_rules.lock().unwrap_or_else(|e| e.into_inner());
+        if current.get(conversation).is_some_and(|value| *value == rules)
+            || (rules.is_empty() && !current.contains_key(conversation))
+        {
+            return Ok(());
+        }
+        if rules.is_empty() {
+            current.remove(conversation);
+        } else {
+            current.insert(conversation.into(), rules);
+        }
+        *revision = revision.wrapping_add(1);
+        Ok(())
     }
 
     /// Ephemeral host rules, independent of persisted session configuration.
@@ -147,6 +183,10 @@ impl PermissionManager {
         if let Some(rules) = sessions.get(parent).cloned() { sessions.insert(child.to_owned(), rules); }
         let mut runtime = self.runtime_rules.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rules) = runtime.get(parent).cloned() { runtime.insert(child.to_owned(), rules); }
+        let mut launch = self.launch_rules.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rules) = launch.get(parent).cloned() {
+            launch.insert(child.to_owned(), rules);
+        }
     }
 
     /// Independent mutable authority for a delegated session; read-only policy
@@ -188,6 +228,15 @@ impl PermissionManager {
                     .cloned()
                     .unwrap_or_default(),
             )])),
+            launch_rules: Mutex::new(HashMap::from([(
+                child.to_owned(),
+                self.launch_rules
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(parent)
+                    .cloned()
+                    .unwrap_or_default(),
+            )])),
             always_allow_checker: Mutex::new(
                 self.always_allow_checker
                     .lock()
@@ -208,6 +257,7 @@ impl PermissionManager {
             mode: Mutex::new(ModeSnapshot { mode: PermissionMode::default(), revision: 0 }),
             session_rules: Mutex::new(HashMap::new()),
             runtime_rules: Mutex::new(HashMap::new()),
+            launch_rules: Mutex::new(HashMap::new()),
             always_allow_checker: Mutex::new(None),
         }
     }
@@ -419,6 +469,13 @@ impl PermissionManager {
             .chain(explicit)
             .collect();
         drop(runtime);
+        actions.extend(
+            self.launch_rules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&context.conversation_id)
+                .and_then(action),
+        );
         // This ruleset contains explicit overrides only. Defaults are evaluated
         // below by operation, not as an unconditional global Confirm rule.
         for rule in self
@@ -964,3 +1021,7 @@ mod policy_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "launch_rules_tests.rs"]
+mod launch_rule_tests;

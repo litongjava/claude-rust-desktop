@@ -69,6 +69,12 @@ pub struct Cli {
     /// Bypass interactive permission prompts; explicit deny rules still apply.
     #[arg(long, global = true, conflicts_with = "permission_mode")]
     pub dangerously_skip_permissions: bool,
+    /// Allow matching tools without confirmation for this launch; deny and Plan still apply.
+    #[arg(long, visible_alias = "allowedTools", num_args = 1.., global = true)]
+    pub allowed_tools: Vec<String>,
+    /// Deny matching tools for this launch, including in bypass mode.
+    #[arg(long, visible_alias = "disallowedTools", num_args = 1.., global = true)]
+    pub disallowed_tools: Vec<String>,
     #[arg(short = 'r', long, global = true)]
     pub resume: Option<String>,
     /// Continue the most recently updated conversation in this project.

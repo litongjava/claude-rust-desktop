@@ -1739,3 +1739,6 @@ mod hook_callbacks;
 
 #[path = "sdk/mcp_transport.rs"]
 mod mcp_transport;
+
+#[path = "sdk/launch_permissions.rs"]
+mod launch_permissions;

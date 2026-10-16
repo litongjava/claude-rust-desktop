@@ -57,6 +57,8 @@ pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_rules: Option<std::collections::HashMap<String, crate::permissions::rules::PermissionAction>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<super::runtime_status::RuntimeStatus>,
 }
 impl Reply {
@@ -67,6 +69,7 @@ impl Reply {
             error: None,
             permission_mode: None,
             permission_session_id: None,
+            launch_rules: None,
             runtime_status: None,
         }
     }
@@ -77,6 +80,7 @@ impl Reply {
             error: Some(error.to_string()),
             permission_mode: None,
             permission_session_id: None,
+            launch_rules: None,
             runtime_status: None,
         }
     }
@@ -570,12 +574,42 @@ pub async fn permission_mode(root: &Path, session: &str, job_id: &str) -> Result
     Ok(permission_mode_target(root, session, job_id).await?.0)
 }
 
-pub async fn permission_mode_target(root: &Path, session: &str, job_id: &str) -> Result<(String, String)> {
+pub async fn permission_mode_target(
+    root: &Path,
+    session: &str,
+    job_id: &str,
+) -> Result<(String, String)> {
+    let reply = permission_snapshot(root, session, job_id).await?;
+    Ok((
+        reply
+            .permission_mode
+            .context("Worker did not return its permission mode")?,
+        reply
+            .permission_session_id
+            .unwrap_or_else(|| session.to_owned()),
+    ))
+}
+
+/// Read the active executor's authority without changing the frontend's next launch.
+pub async fn permission_snapshot(root: &Path, session: &str, job_id: &str) -> Result<Reply> {
     let worker = current(root, session)?.context("Session has no persistent worker")?;
     let job = jobs::get(root, job_id)?;
-    ensure!(job.session_id == session, "Mode query targets another session");
-    let reply = call(&worker, &Request::GetPermissionMode { job_id: job_id.into() }).await?;
-    Ok((reply.permission_mode.context("Worker did not return its permission mode")?, reply.permission_session_id.unwrap_or_else(||session.to_owned())))
+    ensure!(
+        job.session_id == session,
+        "Mode query targets another session"
+    );
+    let reply = call(
+        &worker,
+        &Request::GetPermissionMode {
+            job_id: job_id.into(),
+        },
+    )
+    .await?;
+    ensure!(
+        reply.job_id.as_deref() == Some(job_id),
+        "Permission response targets a different job"
+    );
+    Ok(reply)
 }
 
 pub fn run_supervisor_from_env() -> Result<bool> {

@@ -573,3 +573,6 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     assert_no_secret(&paths.data_dir.join("background-tasks"));
     server.abort();
 }
+
+#[path = "support/session_worker_launch_rules.rs"]
+mod launch_rules;

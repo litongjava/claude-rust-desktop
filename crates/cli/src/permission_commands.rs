@@ -1,6 +1,6 @@
 //! Explicit per-session tool rules; plan mode remains read-only and deny wins.
 use crate::session::Session;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use claude_core::permissions::rules::PermissionAction;
 use std::collections::HashMap;
 
@@ -72,7 +72,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
     session
         .permissions
         .set_session_rules(&session.id, rules.clone());
-    eprintln!("Permission mode: {}", session.permission_mode());
+    eprintln!("{}", launch_rule_display(session).await?);
     for (tool, action) in rules
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>()
@@ -82,9 +82,94 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+async fn launch_rule_display(session: &Session) -> Result<String> {
+    use claude_core::services::{background_sessions as jobs, session_worker};
+    use std::fmt::Write;
+    let active = jobs::list(&session.paths.data_dir, None)?
+        .into_iter()
+        .find(|job| {
+            job.session_id == session.id
+                && job.finished_ms.is_none()
+                && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")
+        });
+    let (mut display, launch) = if let Some(job) = active {
+        let reply =
+            session_worker::permission_snapshot(&session.paths.data_dir, &session.id, &job.id)
+                .await
+                .context("Active worker permissions unavailable")?;
+        active_launch_snapshot(reply, &job.id)?
+    } else {
+        (
+            format!("Permission mode: {}\n", session.permission_mode()),
+            session.permissions.launch_rules(&session.id),
+        )
+    };
+    display.push_str("Launch rules (command-line options):\n");
+    if !launch.is_empty() {
+        for (pattern, action) in launch
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+        {
+            writeln!(display, "  {pattern}: {action:?}")?;
+        }
+    } else {
+        display.push_str("  (none)\n");
+    }
+    write!(display, "Saved session rules ({}):", session.id)?;
+    Ok(display)
+}
+
+fn active_launch_snapshot(
+    reply: claude_core::services::session_worker::Reply,
+    job_id: &str,
+) -> Result<(String, HashMap<String, PermissionAction>)> {
+    anyhow::ensure!(
+        reply.ok && reply.job_id.as_deref() == Some(job_id),
+        "Permission response targets a different or failed job"
+    );
+    let target = reply
+        .permission_session_id
+        .context("Worker did not identify its permission session")?;
+    let mode = reply
+        .permission_mode
+        .context("Worker did not return its permission mode")?;
+    let rules = reply.launch_rules.context(
+        "Worker does not expose launch rules; restart it to inspect its active permissions",
+    )?;
+    Ok((
+        format!(
+            "Active worker job: {job_id}\nPermission session: {target}\nPermission mode: {mode}\n"
+        ),
+        rules,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_worker_display_requires_authoritative_launch_rules_and_job_identity() {
+        use claude_core::services::session_worker::Reply;
+        let snapshot = || {
+            let mut reply = Reply::ok(Some("active-job".into()));
+            reply.permission_session_id = Some("owned-child".into());
+            reply.permission_mode = Some("bypass".into());
+            reply.launch_rules = Some(HashMap::from([("Write".into(), PermissionAction::Deny)]));
+            reply
+        };
+        let (display, rules) = active_launch_snapshot(snapshot(), "active-job").unwrap();
+        assert!(display.contains("Permission session: owned-child"));
+        assert!(display.contains("Permission mode: bypass"));
+        assert_eq!(rules.get("Write"), Some(&PermissionAction::Deny));
+        assert!(active_launch_snapshot(snapshot(), "another-job").is_err());
+        let mut old_worker = snapshot();
+        old_worker.launch_rules = None;
+        assert!(active_launch_snapshot(old_worker, "active-job")
+            .unwrap_err()
+            .to_string()
+            .contains("does not expose launch rules"));
+    }
 
     #[test]
     fn permission_command_preserves_spaces_in_rule_and_serialization() {

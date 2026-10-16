@@ -1,3 +1,4 @@
+mod launch_permissions;
 mod context_commands;
 mod persistent_worker;
 mod worker_frontend;

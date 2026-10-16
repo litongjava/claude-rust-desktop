@@ -286,6 +286,81 @@ async fn unchanged_mode_keeps_resume_but_mode_away_and_back_invalidates_snapshot
     server.abort();
 }
 
+#[tokio::test]
+async fn launch_rule_changes_block_retained_child_resume_without_consuming_its_inbox() {
+    use crate::permissions::{
+        rules::PermissionAction, PermissionContext, PermissionMode, PermissionResult,
+    };
+    let (_temp, context, store, parent, cwd) = fixture();
+    let (url, api, server) = endpoint().await;
+    let registry: OwnedChildren = Default::default();
+    let permissions = crate::runtime::default_permissions();
+    permissions.set_mode(PermissionMode::BypassPermissions);
+    let original = HashMap::from([("Write".into(), PermissionAction::Deny)]);
+    permissions
+        .set_launch_rules(&parent, original.clone())
+        .unwrap();
+    let executor = owner(&context, &parent, &cwd, &url, registry.clone())
+        .with_permission_manager(permissions.clone());
+    let result = executor
+        .execute_delegated(&json!({"prompt":"original"}))
+        .await
+        .unwrap();
+    let child = result["session_id"].as_str().unwrap();
+    // Reapplying identical launch arguments permits an ordinary next-turn resume.
+    permissions.set_launch_rules(&parent, original).unwrap();
+    executor
+        .resume_owned_child(child, Some("unchanged launch"), false)
+        .await
+        .unwrap();
+    let history_len = store.history(child).unwrap().len();
+    mail::send(
+        &context,
+        &parent,
+        child,
+        "must stay pending after launch change",
+    )
+    .unwrap();
+    for replacement in [
+        HashMap::new(),
+        HashMap::from([("Write".into(), PermissionAction::Allow)]),
+    ] {
+        permissions.set_launch_rules(&parent, replacement).unwrap();
+        let error = executor
+            .resume_owned_child(child, Some("new launch"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Owner policy changed"),
+            "{error:#}"
+        );
+        executor.resume_pending_owned_children().await;
+        assert_eq!(api.requests.lock().unwrap().len(), 2);
+        assert_eq!(store.history(child).unwrap().len(), history_len);
+        assert_eq!(mail::pending_count(&context, child).unwrap(), 1);
+        assert!(!mail::receiver_active(&context.paths.data_dir, child).unwrap());
+        let retained = registry.lock().unwrap();
+        let manager = retained
+            .get(child)
+            .unwrap()
+            .executor
+            .permission_manager
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            manager.check_permission(&PermissionContext {
+                tool_name: "Write".into(),
+                tool_input: json!({"file_path":"blocked.txt","content":"blocked"}),
+                conversation_id: child.into(),
+                user_id: None,
+                workspace_path: Some(cwd.to_string_lossy().into_owned()),
+            }),
+            PermissionResult::Denied(_)
+        ));
+    }
+    server.abort();
+}
+
 #[test]
 fn private_session_execution_lease_rejects_other_engine_until_drop() {
     let (_temp, context, _store, parent, _cwd) = fixture();
