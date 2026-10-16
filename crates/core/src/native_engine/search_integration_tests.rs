@@ -32,9 +32,9 @@ async fn parallel_searches_keep_provider_credentials_and_usage_separate() {
     let (tx, mut rx) = mpsc::channel(32);
     let counter = Arc::new(AtomicUsize::new(0));
     let a = execute_tool_standalone("WebSearch".into(), json!({"query":"Rust release notes"}), "tool-a".into(), tx.clone(), None,
-        ".".into(), None, None, counter.clone(), 2, search_provider(&base, "model-a"), None, None);
+        ".".into(), None, None, counter.clone(), 2, search_provider(&base, "model-a"), None, None, None);
     let b = execute_tool_standalone("WebSearch".into(), json!({"query":"Rust release notes"}), "tool-b".into(), tx.clone(), None,
-        ".".into(), None, None, counter.clone(), 2, search_provider(&base, "model-b"), None, None);
+        ".".into(), None, None, counter.clone(), 2, search_provider(&base, "model-b"), None, None, None);
     let (a, b) = tokio::join!(a, b);
     assert!(!a.4 && !b.4);
     assert!(a.3.contains("model-a.example") && !a.3.contains("model-b.example"));

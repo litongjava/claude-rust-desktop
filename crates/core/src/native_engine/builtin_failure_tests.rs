@@ -36,6 +36,7 @@ async fn builtin_errors_are_failures_in_serial_and_parallel_paths() {
             provider.clone(),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(result.4, failure, "{name}: {result:?}");
@@ -76,6 +77,7 @@ async fn ui_file_change_stays_in_events_but_not_model_results() {
         Arc::new(AtomicUsize::new(0)),
         1,
         provider.clone(),
+        None,
         None,
         None,
     )

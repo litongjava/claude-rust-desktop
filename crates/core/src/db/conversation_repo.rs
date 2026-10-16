@@ -46,6 +46,7 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
             let new_tool_id = uuid::Uuid::new_v4().to_string();
             message_repo::insert_tool_call(&transaction, &new_tool_id, &new_message_id, &tool.name,
                 tool.input.as_deref(), tool.output.as_deref(), tool.is_error, tool.sort_order)?;
+            transaction.execute("INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) SELECT ?1,?2,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs WHERE conversation_id=?3 AND tool_use_id=?4", params![new_id,new_tool_id,source_id,tool.id])?;
             tool_ids.insert(tool.id, new_tool_id);
         }
         let mut snapshots = message_repo::get_request_snapshots(&transaction, &message.id)?;

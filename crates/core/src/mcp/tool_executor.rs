@@ -21,6 +21,16 @@ pub struct McpToolRegistry {
     active_connectors: Arc<Mutex<HashMap<String, Arc<Mutex<McpConnector>>>>>,
 }
 
+pub(crate) struct McpExecution {
+    pub value: serde_json::Value,
+    pub is_tool_call: bool,
+}
+
+impl McpExecution {
+    fn tool(value: serde_json::Value) -> Self { Self { value, is_tool_call: true } }
+    fn resource(value: serde_json::Value) -> Self { Self { value, is_tool_call: false } }
+}
+
 impl McpToolRegistry {
     pub fn new(manager: Arc<McpServerManager>) -> Self {
         Self {
@@ -105,15 +115,23 @@ impl McpToolRegistry {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        Ok(self.execute_with_provenance(name, arguments).await?.value)
+    }
+
+    pub(crate) async fn execute_with_provenance(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpExecution> {
         if name.starts_with("mcp__ide__") {
-            return self.ide.as_ref().ok_or_else(||anyhow::anyhow!("IDE is not connected"))?.call_tool(name, arguments).await;
+            return self.ide.as_ref().ok_or_else(||anyhow::anyhow!("IDE is not connected"))?.call_tool(name, arguments).await.map(McpExecution::tool);
         }
         let manager = &self.manager;
         let servers = manager.list_servers_full().await;
 
         if let Some(sdk) = &self.sdk {
             if sdk.tools().await?.iter().any(|tool| tool.name == name) {
-                return sdk.call(name, arguments).await;
+                return sdk.call(name, arguments).await.map(McpExecution::tool);
             }
         }
 
@@ -127,7 +145,7 @@ impl McpToolRegistry {
                 let uri = if name == "ReadMcpResource" {
                     Some(arguments["uri"].as_str().ok_or_else(|| anyhow::anyhow!("uri is required"))?)
                 } else { None };
-                return sdk.resource(server_name, uri).await;
+                return sdk.resource(server_name, uri).await.map(McpExecution::resource);
             }
             let server = servers
                 .iter()
@@ -144,14 +162,14 @@ impl McpToolRegistry {
                 .lock()
                 .await;
             return if name == "ListMcpResources" {
-                Ok(serde_json::to_value(connector.list_resources().await?)?)
+                Ok(McpExecution::resource(serde_json::to_value(connector.list_resources().await?)?))
             } else {
                 let uri = arguments["uri"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("uri is required"))?;
-                Ok(serde_json::to_value(
+                Ok(McpExecution::resource(serde_json::to_value(
                     connector.read_resource(uri, None).await?,
-                )?)
+                )?))
             };
         }
 
@@ -165,7 +183,7 @@ impl McpToolRegistry {
                 let tools = connector.list_tools().await.unwrap_or_default();
 
                 if tools.iter().any(|t| t.name == name) {
-                    return connector.call_tool(name, arguments).await;
+                    return connector.call_tool(name, arguments).await.map(McpExecution::tool);
                 }
             }
         }

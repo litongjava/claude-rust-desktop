@@ -39,7 +39,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },

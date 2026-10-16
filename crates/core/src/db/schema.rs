@@ -69,6 +69,16 @@ CREATE TABLE IF NOT EXISTS message_user_content (
     content_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mcp_tool_outputs (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    tool_use_id TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    display_text TEXT NOT NULL,
+    is_error INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, tool_use_id)
+);
+
 CREATE TABLE IF NOT EXISTS model_requests (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,

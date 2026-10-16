@@ -178,6 +178,16 @@ pub fn insert_tool_call(
         is_error as i64,
         sort_order,
     ])?;
+    // CLI/archive rows qualify provider IDs with their assistant-message ID.
+    // Bind the typed MCP sidecar to that durable ID in the same save operation.
+    if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
+        conn.execute(
+            "INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
+             SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs \
+             WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5",
+            params![id,message_id,original,output,is_error],
+        )?;
+    }
     Ok(())
 }
 
@@ -196,6 +206,27 @@ pub fn save_stream_tool_result(conn: &Connection, conversation_id: &str, message
 #[cfg(test)]
 mod stream_tool_tests {
     use super::*;
+
+    #[test]
+    fn qualified_tool_ids_keep_mcp_content_without_crossing_session_or_output_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA_SQL).unwrap();
+        for session in ["one", "two"] {
+            crate::db::conversation_repo::insert_conversation(&conn, session, None, None, None, None, None, false, false, false, "now", "now", 0).unwrap();
+            insert_message(&conn, session, session, "assistant", "", None, "now", false, 0).unwrap();
+        }
+        let content = crate::native_engine::mcp_output::McpOutput::from_transport(&serde_json::json!({"content":[{"type":"text","text":"final content"}],"_meta":{"trace":"preserved"}})).unwrap();
+        let display = content.display();
+        content.save(&conn, "one", "call", &display, false).unwrap();
+        insert_tool_call(&conn, "one:call", "one", "mcp__test__call", None, Some(&display), false, 0).unwrap();
+        let saved = crate::native_engine::mcp_output::McpOutput::load(&conn, "one", "one:call", &display).unwrap().unwrap();
+        assert_eq!(saved.content, content.content);
+        assert_eq!(saved.metadata, content.metadata);
+        insert_tool_call(&conn, "two:call", "two", "mcp__test__call", None, Some(&display), false, 0).unwrap();
+        assert!(crate::native_engine::mcp_output::McpOutput::load(&conn, "two", "two:call", &display).unwrap().is_none());
+        insert_tool_call(&conn, "one:call", "one", "Read", None, Some("new native output"), false, 0).unwrap();
+        assert!(crate::native_engine::mcp_output::McpOutput::load(&conn, "one", "one:call", "new native output").unwrap().is_none());
+    }
 
     #[test]
     fn results_survive_reload_before_turn_completion_and_updates_do_not_duplicate() {

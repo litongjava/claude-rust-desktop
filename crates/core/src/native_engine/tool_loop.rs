@@ -31,6 +31,7 @@ use crate::streaming::sse_parser::{consume_sse_payloads, merge_tool_args, recove
 use crate::tools::get_tool_definitions;
 use crate::prompt::{PromptProfile, code::{adapt_tools, is_memory_tool}};
 use crate::mcp::McpToolRegistry;
+use super::mcp_output::McpOutput;
 use crate::memory::{ContextManager, MemExClient, TieredCompressor};
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
@@ -156,6 +157,7 @@ pub struct ToolLoopExecutor {
     openai_client: OpenAIClient,
     workspace_cwd: String,
     mcp_registry: Option<Arc<McpToolRegistry>>,
+    mcp_outputs: HashMap<String, McpOutput>,
     mcp_tools: Vec<crate::tools::ToolDefinition>,
     streaming_tool_args: HashMap<String, StreamingToolCall>,
     conv_id: Option<String>,
@@ -379,7 +381,8 @@ async fn execute_tool_standalone(
     provider: ResolvedProvider,
     search_config_path: Option<std::path::PathBuf>,
     allowed_tools: Option<Vec<String>>,
-) -> (String, String, Value, String, bool) {
+    output_db: Option<Arc<crate::db::DbManager>>,
+) -> (String, String, Value, String, bool, Option<McpOutput>) {
     crate::metrics::TOOL_CALLS_TOTAL.inc();
     let _tool_timer = crate::metrics::TOOL_CALL_DURATION.start_timer();
 
@@ -418,7 +421,7 @@ async fn execute_tool_standalone(
                 completed_count: count,
                 total_count,
             }).await;
-            return (tool_use_id, tool_name, tool_input, output, true);
+            return (tool_use_id, tool_name, tool_input, output, true, None);
         }
         PermissionResult::RequiresConfirmation(_) => {
             let output = "Tool requires user confirmation - must be executed serially".to_string();
@@ -439,16 +442,25 @@ async fn execute_tool_standalone(
                 completed_count: count,
                 total_count,
             }).await;
-            return (tool_use_id, tool_name, tool_input, output, true);
+            return (tool_use_id, tool_name, tool_input, output, true, None);
         }
         PermissionResult::Granted => {}
     }
 
-    let (output_str, is_error) = if let Some(ref registry) = mcp_registry {
+    let mut mcp_output = None;
+    let (mut output_str, mut is_error) = if let Some(ref registry) = mcp_registry {
         if registry.is_mcp_tool(&tool_name).await {
-            let result = registry.execute_tool(&tool_name, tool_input.clone()).await;
+            let result = registry.execute_with_provenance(&tool_name, tool_input.clone()).await;
             match result {
-                Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_default(), val["isError"].as_bool().unwrap_or(false)),
+                Ok(result) => {
+                    let failed = result.value["isError"].as_bool().unwrap_or(false);
+                    if result.is_tool_call {
+                        match McpOutput::from_transport(&result.value) {
+                            Ok(content) => { let output = content.display(); mcp_output = Some(content); (output, failed) }
+                            Err(error) => (format!("Invalid MCP result: {error:#}"), true),
+                        }
+                    } else { (serde_json::to_string_pretty(&result.value).unwrap_or_default(), failed) }
+                }
                 Err(e) => (format!("Error: {}", e), true),
             }
         } else {
@@ -466,6 +478,13 @@ async fn execute_tool_standalone(
         }
     };
 
+    if let (Some(content), Some(db), Some(session)) = (&mcp_output, &output_db, &conv_id) {
+        if let Err(error) = db.with_conn(|conn|content.save(conn, session, &tool_use_id, &output_str, is_error)).and_then(|result|result) {
+            output_str = format!("Cannot retain MCP tool content: {error:#}");
+            is_error = true;
+            mcp_output = None;
+        }
+    }
     let count = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = event_tx.send(EngineEvent::ToolUseDone {
         tool_use_id: tool_use_id.clone(),
@@ -484,7 +503,7 @@ async fn execute_tool_standalone(
         total_count,
     }).await;
 
-    (tool_use_id, tool_name, tool_input, output_str, is_error)
+    (tool_use_id, tool_name, tool_input, output_str, is_error, mcp_output)
 }
 
 impl ToolLoopExecutor {
@@ -529,6 +548,7 @@ impl ToolLoopExecutor {
             openai_client: OpenAIClient::new(),
             workspace_cwd,
             mcp_registry: None,
+            mcp_outputs: HashMap::new(),
             mcp_tools: Vec::new(),
             streaming_tool_args: HashMap::new(),
             conv_id: None,
@@ -631,6 +651,7 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_tool_call(&mut self, name: &str, input: &Value, id: &str) -> (Value, String, bool) {
+        self.mcp_outputs.remove(id);
         if let Err(error) = self.ensure_permission_continuation() { return (input.clone(), error.to_string(), true); }
         if self.pending_plan_reset.is_some() {
             return (input.clone(), "Tool skipped: the user cleared planning context. Request it again from the approved implementation context.".into(), true);
@@ -677,19 +698,33 @@ impl ToolLoopExecutor {
         // Updated arguments pass through the complete normal permission path.
         let (actual, mut output, mut failed) = Box::pin(self.execute_tool_call_inner(name, &input, id)).await;
         self.approved_call = None;
-        for context in pre.additional_context { output.push_str(&format!("\nPreToolUse context: {context}")); }
+        let mut mcp_output = self.mcp_outputs.remove(id);
+        let mut contexts: Vec<String> = pre.additional_context.into_iter().map(|context|format!("PreToolUse context: {context}")).collect();
+        if mcp_output.is_none() {
+            for context in contexts.drain(..) { output.push('\n'); output.push_str(&context); }
+        }
         for warning in pre.warnings { tracing::warn!("PreToolUse hook: {warning}"); }
         let event = if failed { HookEvent::PostToolUseFailure } else { HookEvent::PostToolUse };
         let mut payload = json!({"tool_name":name,"tool_input":actual,"tool_use_id":id});
         if failed { payload["error"] = json!(output); payload["is_interrupt"] = json!(false); }
-        else { payload["tool_response"] = json!(output); }
+        else { payload["tool_response"] = mcp_output.as_ref().map(|value|value.content.clone()).unwrap_or_else(||json!(output)); }
         match hooks.run(event, &session, payload).await {
             Ok(post) => {
-                for context in post.additional_context { output.push_str(&format!("\n{event:?} context: {context}")); }
+                if !failed {
+                    if let (Some(content), Some(replacement)) = (&mut mcp_output, &post.updated_mcp_tool_output) { content.replace(replacement); }
+                }
+                for context in post.additional_context { contexts.push(format!("{event:?} context: {context}")); }
                 for warning in post.warnings { tracing::warn!("{event:?} hook: {warning}"); }
-                if post.blocked { output.push_str(&format!("\n{event:?} hook requires attention: {}", post.reason)); failed = true; }
+                if post.blocked { contexts.push(format!("{event:?} hook requires attention: {}", post.reason)); failed = true; }
             }
-            Err(error) => { output.push_str(&format!("\n{event:?} hook failed: {error:#}")); failed = true; }
+            Err(error) => { contexts.push(format!("{event:?} hook failed: {error:#}")); failed = true; }
+        }
+        if let Some(mut content) = mcp_output {
+            for context in contexts { content.append_context(&context); }
+            output = content.display();
+            self.mcp_outputs.insert(id.to_owned(), content);
+        } else {
+            for context in contexts { output.push('\n'); output.push_str(&context); }
         }
         (actual, output, failed)
     }
@@ -711,6 +746,21 @@ impl ToolLoopExecutor {
             return crate::performance::retain_tool_output(root, output, &preview);
         }
         output.to_string()
+    }
+
+    fn finish_mcp_output(&self, id: &str, name: &str, display: &str, failed: bool, content: Option<McpOutput>) -> Result<Option<McpOutput>> {
+        let Some(mut content) = content else { return Ok(None); };
+        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
+            db.with_conn(|conn|content.save(conn, session, id, display, failed))??;
+        }
+        // Images and structured blocks must remain real provider content. Only
+        // plain text can use the existing spill/preview representation.
+        if !content.has_images() {
+            if let Some(text) = content.content.as_str() {
+                content.content = json!(self.retained_tool_output(name, text));
+            }
+        }
+        Ok(Some(content))
     }
 
     pub fn with_bundled_resources(mut self, resources: Arc<crate::skills::bundled_resources::Resources>) -> Self {
@@ -943,6 +993,9 @@ impl ToolLoopExecutor {
         }
         // MCP discovery is a live external exchange, so execution ownership and
         // authority checks must succeed before any SDK/stdio server is contacted.
+        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
+            db.with_conn(|conn|super::mcp_output::restore_history(&mut self.messages, conn, session))??;
+        }
         Box::pin(self.refresh_mcp_tools()).await?;
         let directories = self.allowed_directories.clone();
         let context = self.search_config_path.as_deref().and_then(|p| p.parent()).map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
@@ -1221,7 +1274,7 @@ impl ToolLoopExecutor {
         }
 
         let output_str;
-        let is_error;
+        let mut is_error;
 
         if tool_name == "Workflow" {
             let result = Box::pin(self.execute_workflow(tool_input)).await;
@@ -1243,11 +1296,19 @@ impl ToolLoopExecutor {
 
         if let Some(ref registry) = self.mcp_registry {
             if registry.is_mcp_tool(tool_name).await {
-                let result = registry.execute_tool(tool_name, tool_input.clone()).await;
+                let result = registry.execute_with_provenance(tool_name, tool_input.clone()).await;
                 match result {
-                    Ok(val) => {
-                        output_str = serde_json::to_string_pretty(&val).unwrap_or_default();
-                        is_error = val["isError"].as_bool().unwrap_or(false);
+                    Ok(result) => {
+                        is_error = result.value["isError"].as_bool().unwrap_or(false);
+                        if result.is_tool_call {
+                            match McpOutput::from_transport(&result.value) {
+                                Ok(content) => {
+                                    output_str = content.display();
+                                    self.mcp_outputs.insert(_tool_use_id.to_owned(), content);
+                                }
+                                Err(error) => { output_str = format!("Invalid MCP result: {error:#}"); is_error = true; }
+                            }
+                        } else { output_str = serde_json::to_string_pretty(&result.value).unwrap_or_default(); }
                     }
                     Err(e) => {
                         output_str = format!("Error: {}", e);
@@ -1525,7 +1586,7 @@ impl ToolLoopExecutor {
                                             "text" => Some(ContentBlock::Text { text: b.get("text")?.as_str()?.to_string() }),
                                             "tool_result" => Some(ContentBlock::ToolResult {
                                                 tool_use_id: b.get("tool_use_id")?.as_str()?.to_string(),
-                                                content: b.get("content")?.as_str()?.to_string(),
+                                                content: b.get("content")?.clone(),
                                                 is_error: b.get("is_error").and_then(|v| v.as_bool()),
                                             }),
                                             "tool_use" => Some(ContentBlock::ToolUse {
@@ -1812,6 +1873,8 @@ impl ToolLoopExecutor {
                     for block in &mut assistant_blocks {
                         if let ContentBlock::ToolUse { id, input, .. } = block { if id == &tc.id { *input = actual_input.clone(); } }
                     }
+                    let mcp = self.mcp_outputs.remove(&tc.id);
+                    let mcp = self.finish_mcp_output(&tc.id, &tc.name, &output_str, is_error, mcp)?;
                     if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
@@ -1820,12 +1883,12 @@ impl ToolLoopExecutor {
                         output: output_str.clone(),
                         is_error,
                     }).await;
-                    let compacted = self.retained_tool_output(&tc.name, &output_str);
+                    let content = mcp.map(|value|value.content).unwrap_or_else(||json!(self.retained_tool_output(&tc.name, &output_str)));
                     tool_results.push(AnthropicMessage {
                         role: "user".to_string(),
                         content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
                             tool_use_id: tc.id.clone(),
-                            content: compacted,
+                            content,
                             is_error: Some(is_error),
                         }]),
                     });
@@ -1857,19 +1920,21 @@ impl ToolLoopExecutor {
                             self.provider.clone(),
                             self.search_config_path.clone(),
                             self.allowed_tools.clone(),
+                            self.goal_db.clone(),
                         );
                         futures.push(fut);
                     }
 
                     let results = futures::future::join_all(futures).await;
 
-                    for (tool_use_id, tool_name, _tool_input, output_str, is_error) in results {
-                        let compacted = self.retained_tool_output(&tool_name, &output_str);
+                    for (tool_use_id, tool_name, _tool_input, output_str, is_error, mcp) in results {
+                        let mcp = self.finish_mcp_output(&tool_use_id, &tool_name, &output_str, is_error, mcp)?;
+                        let content = mcp.map(|value|value.content).unwrap_or_else(||json!(self.retained_tool_output(&tool_name, &output_str)));
                         tool_results.push(AnthropicMessage {
                             role: "user".to_string(),
                             content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
                                 tool_use_id: tool_use_id.clone(),
-                                content: compacted,
+                                content,
                                 is_error: Some(is_error),
                             }]),
                         });
@@ -2296,6 +2361,7 @@ impl ToolLoopExecutor {
                 }
 
                 let mut tool_results: Vec<OpenAIMessage> = Vec::new();
+                let mut tool_images = Vec::new();
                 if pending_tool_calls.iter().any(|t| matches!(t.name.as_str(), "ExitPlanMode" | "plan_mode")) {
                     for call in &mut pending_tool_calls { call.requires_user_interaction = true; }
                 }
@@ -2309,6 +2375,8 @@ impl ToolLoopExecutor {
                     for call in &mut assistant_tool_calls {
                         if call.id == tc.id { call.function.arguments = actual_input.to_string(); }
                     }
+                    let mcp = self.mcp_outputs.remove(&tc.id);
+                    let mcp = self.finish_mcp_output(&tc.id, &tc.name, &output_str, is_error, mcp)?;
                     if !is_error { if let Some(manager) = &self.permission_manager { manager.record_tool_success(self.conv_id.as_deref().unwrap_or("")); } }
                     let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                         tool_use_id: tc.id.clone(),
@@ -2317,7 +2385,8 @@ impl ToolLoopExecutor {
                         output: output_str.clone(),
                         is_error,
                     }).await;
-                    let compacted = self.retained_tool_output(&tc.name, &output_str);
+                    if let Some(content) = &mcp { tool_images.extend(content.openai_images(&tc.id)); }
+                    let compacted = mcp.map(|value|value.openai_text()).unwrap_or_else(||self.retained_tool_output(&tc.name, &output_str));
                     tool_results.push(OpenAIMessage {
                         role: "tool".to_string(),
                         content: OpenAIContent::Text(compacted),
@@ -2353,14 +2422,17 @@ impl ToolLoopExecutor {
                             self.provider.clone(),
                             self.search_config_path.clone(),
                             self.allowed_tools.clone(),
+                            self.goal_db.clone(),
                         );
                         futures.push(fut);
                     }
 
                     let results = futures::future::join_all(futures).await;
 
-                    for (tool_use_id, tool_name, _tool_input, output_str, _is_error) in results {
-                        let compacted = self.retained_tool_output(&tool_name, &output_str);
+                    for (tool_use_id, tool_name, _tool_input, output_str, is_error, mcp) in results {
+                        let mcp = self.finish_mcp_output(&tool_use_id, &tool_name, &output_str, is_error, mcp)?;
+                        if let Some(content) = &mcp { tool_images.extend(content.openai_images(&tool_use_id)); }
+                        let compacted = mcp.map(|value|value.openai_text()).unwrap_or_else(||self.retained_tool_output(&tool_name, &output_str));
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),
@@ -2381,6 +2453,12 @@ impl ToolLoopExecutor {
 
                 for tool_result_msg in tool_results {
                     conversation_messages.push(tool_result_msg);
+                }
+                if !tool_images.is_empty() {
+                    conversation_messages.push(OpenAIMessage {
+                        role: "user".into(), content: serde_json::from_value(json!(tool_images))?,
+                        tool_calls: None, tool_call_id: None, reasoning_content: None, provider_content: None,
+                    });
                 }
                 if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
                     self.messages = vec![json!({"role":"user","content":content})];
@@ -2458,7 +2536,7 @@ impl ToolLoopExecutor {
                         "tool_result" => {
                             Some(ContentBlock::ToolResult {
                                 tool_use_id: block.get("tool_use_id")?.as_str()?.to_string(),
-                                content: block.get("content")?.as_str()?.to_string(),
+                                content: block.get("content")?.clone(),
                                 is_error: block.get("is_error").and_then(|v| v.as_bool()),
                             })
                         }

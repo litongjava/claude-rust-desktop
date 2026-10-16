@@ -74,6 +74,9 @@ pub struct HookOutcome {
     pub reason: String,
     pub additional_context: Vec<String>,
     pub updated_input: Option<Value>,
+    /// Model-facing MCP content, never a replacement transport envelope.
+    pub updated_mcp_tool_output: Option<Value>,
+    mcp_output_order: usize,
     pub warnings: Vec<String>,
     /// An explicit hook request for approval must not become an automatic grant.
     pub ask_permission: bool,
@@ -81,6 +84,35 @@ pub struct HookOutcome {
     /// PermissionDenied advice, never an execution grant.
     pub retry: bool,
 }
+
+impl HookOutcome {
+    fn observe_mcp_output(&mut self, order: &std::sync::atomic::AtomicUsize) {
+        if self.updated_mcp_tool_output.is_some() {
+            self.mcp_output_order = order.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        }
+    }
+
+    fn merge_mcp_output(&mut self, other: &mut Self) {
+        if other.updated_mcp_tool_output.is_some() && other.mcp_output_order >= self.mcp_output_order {
+            self.updated_mcp_tool_output = other.updated_mcp_tool_output.take();
+            self.mcp_output_order = other.mcp_output_order;
+        }
+    }
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+#[cfg(test)]
+#[path = "tool_hook_outputs_tests.rs"]
+mod output_tests;
 
 #[derive(Debug)]
 pub enum HookPermissionResponse {
@@ -376,10 +408,14 @@ impl HookRunner {
             return Ok(result);
         }
         use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+        let output_order = std::sync::atomic::AtomicUsize::new(0);
         let mut pending: FuturesUnordered<BoxFuture<'_, (bool, Result<HookOutcome>)>> =
             FuturesUnordered::new();
         let command_input = input.clone();
         let command_name = name.clone();
+        // Local to this invocation: a slow trailing command must not reorder an
+        // earlier command replacement after a newer SDK callback replacement.
+        let command_order = &output_order;
         pending.push(Box::pin(async move {
             (
                 false,
@@ -407,7 +443,7 @@ impl HookRunner {
                             parse_output(event, output.0, &output.1, &output.2)
                         }
                         .await;
-                        let outcome = match outcome {
+                        let mut outcome = match outcome {
                             Ok(outcome) => outcome,
                             Err(error) if lifecycle => {
                                 result
@@ -417,6 +453,8 @@ impl HookRunner {
                             }
                             Err(error) => return Err(error),
                         };
+                        outcome.observe_mcp_output(command_order);
+                        result.merge_mcp_output(&mut outcome);
                         result.additional_context.extend(outcome.additional_context);
                         result.warnings.extend(outcome.warnings);
                         result.ask_permission |= outcome.ask_permission;
@@ -450,11 +488,14 @@ impl HookRunner {
             for callback in callbacks.matching(event, &name) {
                 let callbacks = callbacks.clone();
                 let input = Value::Object(input.clone());
+                let callback_order = &output_order;
                 pending.push(Box::pin(async move {
                     (
                         true,
                         async {
-                            parse_json_output(event, callbacks.invoke(&callback, input).await?)
+                            let mut outcome = parse_json_output(event, callbacks.invoke(&callback, input).await?)?;
+                            outcome.observe_mcp_output(callback_order);
+                            Ok(outcome)
                         }
                         .await,
                     )
@@ -463,7 +504,7 @@ impl HookRunner {
         }
         let mut result = HookOutcome::default();
         while let Some((callback, outcome)) = pending.next().await {
-            let outcome = match outcome {
+            let mut outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) if callback => {
                     result
@@ -473,6 +514,7 @@ impl HookRunner {
                 }
                 Err(error) => return Err(error),
             };
+            result.merge_mcp_output(&mut outcome);
             result.additional_context.extend(outcome.additional_context);
             result.warnings.extend(outcome.warnings);
             result.ask_permission |= outcome.ask_permission;
@@ -609,6 +651,12 @@ fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
         );
         if let Some(context) = string_field(specific, "additionalContext")? {
             result.additional_context.push(context.into());
+        }
+        if let Some(updated) = specific.get("updatedMCPToolOutput") {
+            ensure!(event == HookEvent::PostToolUse, "updatedMCPToolOutput requires PostToolUse");
+            if json_truthy(updated) {
+                result.updated_mcp_tool_output = Some(updated.clone());
+            }
         }
         if event == HookEvent::PreToolUse {
             if let Some(decision) = string_field(specific, "permissionDecision")? {

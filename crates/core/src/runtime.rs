@@ -387,6 +387,7 @@ impl SessionStore {
                 if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
                 else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
             }
+            crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
             Ok(history)
         })?
     }

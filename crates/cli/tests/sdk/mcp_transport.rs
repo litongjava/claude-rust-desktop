@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "mcp_output_tests.rs"]
+mod output_tests;
+
 #[derive(Clone)]
 struct Model {
     fixture: Fixture,
@@ -127,7 +130,7 @@ fn mcp_response(request: &Value, failure: &str) -> Value {
             if failure == "shape" {
                 json!({"content":[{"type":"text","text":42}]})
             } else {
-                json!({"content":[{"type":"text","text":format!("HOST_{server}_{}",message["params"]["arguments"]["value"].as_str().unwrap())}],"structuredContent":{"server":server},"isError":failure=="is-error"})
+                json!({"content":[{"type":"text","text":"WIRE_TEXT_NOT_SELECTED"}],"structuredContent":{"server":server,"text":format!("HOST_{server}_{}",message["params"]["arguments"]["value"].as_str().unwrap())},"isError":failure=="is-error"})
             }
         }
         "resources/list" => {
