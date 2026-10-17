@@ -1166,6 +1166,11 @@ mod event_tests {
             .await
             .unwrap();
         assert_eq!(session.permission_mode(), "ask");
+        let task = crate::extended_commands::plan_task("  add a cache  ", &paths, &mut session).await.unwrap();
+        assert_eq!(task.as_deref(), Some("add a cache"));
+        assert_eq!(session.permission_mode(), "plan");
+        // Already planning: the description is reported, never submitted twice.
+        assert!(crate::extended_commands::plan_task("other task", &paths, &mut session).await.unwrap().is_none());
         session.close().await.unwrap();
     }
 

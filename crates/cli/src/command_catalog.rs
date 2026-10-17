@@ -54,7 +54,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/tasks",
         "Manage tasks and sessions: list|show|attach|pending|answer|cancel|sessions|stop-session",
     ),
-    ("/plan", "Enter planning mode, show the plan, or open it in an editor"),
+    ("/plan", "Enter planning mode (optionally with a task to plan), show the plan, or open it in an editor"),
     ("/reload-skills", "Reload installed skills from disk"),
     ("/resume", "List saved conversations or resume one: [ID]"),
     (

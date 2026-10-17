@@ -70,7 +70,7 @@ pub async fn handle(
         "/plan" => {
             ensure!(
                 matches!(argument, "" | "show" | "open"),
-                "Usage: /plan [show|open]"
+                "Usage: /plan [show|open|DESCRIPTION]"
             );
             if argument.is_empty() && session.permission_mode() != "plan" {
                 session.set_permission_mode("plan").await?;
@@ -185,6 +185,23 @@ fn peer_sessions(
         peer["status"]=serde_json::json!(if peer["id"]==current {"attached"} else if peer["receiver_active"]==true {"active_receiver"} else {"saved"});
     }
     Ok(peers)
+}
+
+/// `/plan DESCRIPTION` enables plan mode and returns the task to submit once,
+/// as upstream does. Already in plan mode, the description is not submitted.
+pub async fn plan_task(argument: &str, paths: &RuntimePaths, session: &mut Session) -> Result<Option<String>> {
+    let description = argument.trim();
+    if matches!(description, "" | "show" | "open") {
+        handle("/plan", description, paths, session).await?;
+        return Ok(None);
+    }
+    if session.permission_mode() == "plan" {
+        handle("/plan", "show", paths, session).await?;
+        eprintln!("Already in plan mode; the description was not submitted. Send it as a normal message.");
+        return Ok(None);
+    }
+    handle("/plan", "", paths, session).await?;
+    Ok(Some(description.to_owned()))
 }
 
 fn response(history: &[Value], number: usize) -> Result<&str> {

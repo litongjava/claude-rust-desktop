@@ -501,6 +501,16 @@ async fn run(cli: &Cli) -> Result<()> {
                 Err(error) => { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } continue; },
                 Ok(background_commands::Outcome::NotHandled) => {},
             }
+            if command == "/plan" {
+                match extended_commands::plan_task(argument, &paths, &mut session).await {
+                    Ok(Some(task)) => if let Err(error) = session.turn(cli, &task, &mut input).await {
+                        if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); }
+                    },
+                    Err(error) => eprintln!("Error: {error:#}"),
+                    Ok(None) => {},
+                }
+                continue;
+            }
             if command == "/goal" {
                 match session_commands::handle(command, argument, &paths, &mut session).await {
                     Ok(_) if !argument.trim().is_empty() && !session_commands::is_goal_clear(argument) => {
