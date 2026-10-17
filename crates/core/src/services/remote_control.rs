@@ -8,8 +8,9 @@ use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -221,6 +222,119 @@ pub enum Update {
     Status(Status),
     /// The bridge task ended; carries its final status.
     Closed(Status),
+}
+
+type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
+
+/// Cloneable handle that lets a running turn ask the remote client for tool
+/// approval and observe remote interrupts.
+#[derive(Clone)]
+pub struct Relay {
+    outbound: mpsc::UnboundedSender<Value>,
+    session_id: String,
+    pending: Pending,
+    interrupts: watch::Receiver<u64>,
+}
+
+impl Relay {
+    /// Sends a `can_use_tool` request; dropping the result before an answer
+    /// cancels the remote prompt.
+    pub fn request_permission(
+        &self,
+        request_id: &str,
+        tool_name: &str,
+        input: &Value,
+        tool_use_id: &str,
+        description: &str,
+    ) -> PermissionRequest {
+        let (reply, answer) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(request_id.to_owned(), reply);
+        let _ = self.outbound.send(json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "can_use_tool", "tool_name": tool_name, "input": input, "tool_use_id": tool_use_id, "description": description},
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "session_id": self.session_id,
+        }));
+        PermissionRequest {
+            request_id: request_id.to_owned(),
+            relay: self.clone(),
+            answer,
+            answered: false,
+        }
+    }
+
+    /// Interrupts requested after this call.
+    pub fn interrupts(&self) -> Interrupts {
+        let mut receiver = self.interrupts.clone();
+        receiver.borrow_and_update();
+        Interrupts(Some(receiver))
+    }
+}
+
+pub struct PermissionRequest {
+    pub request_id: String,
+    relay: Relay,
+    answer: oneshot::Receiver<Value>,
+    answered: bool,
+}
+
+impl PermissionRequest {
+    /// The remote decision (`true` allows). Pending forever when the remote
+    /// client cannot decide, so a local answer still wins. Cancel-safe.
+    pub async fn decision(&mut self) -> bool {
+        if !self.answered {
+            let response = (&mut self.answer).await;
+            self.answered = true;
+            if let Ok(response) = response {
+                if response["subtype"] == "success" {
+                    return response["response"]["behavior"] == "allow";
+                }
+            }
+        }
+        std::future::pending().await
+    }
+}
+
+impl Drop for PermissionRequest {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        self.relay.pending.lock().unwrap().remove(&self.request_id);
+        let _ = self.relay.outbound.send(json!({
+            "type": "control_cancel_request",
+            "request_id": self.request_id,
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "session_id": self.relay.session_id,
+        }));
+    }
+}
+
+/// The remote decision for an optional request; pending when there is none.
+pub async fn remote_decision(request: &mut Option<PermissionRequest>) -> bool {
+    match request.as_mut() {
+        Some(request) => request.decision().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Remote interrupt notifications; never fires without a relay.
+#[derive(Default)]
+pub struct Interrupts(Option<watch::Receiver<u64>>);
+
+impl Interrupts {
+    pub async fn next(&mut self) {
+        if let Some(receiver) = self.0.as_mut() {
+            if receiver.changed().await.is_ok() {
+                return;
+            }
+        }
+        std::future::pending().await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,6 +604,7 @@ pub struct Bridge {
     status: watch::Receiver<Status>,
     inbound: mpsc::Receiver<Inbound>,
     outbound: mpsc::UnboundedSender<Value>,
+    relay: Relay,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -516,6 +631,14 @@ impl Bridge {
         let (inbound_tx, inbound) = mpsc::channel(64);
         let (outbound, outbound_rx) = mpsc::unbounded_channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
+        let (interrupt, interrupts) = watch::channel(0);
+        let pending = Pending::default();
+        let relay = Relay {
+            outbound: outbound.clone(),
+            session_id: session_id.clone(),
+            pending: pending.clone(),
+            interrupts,
+        };
         let state = Loop {
             client,
             environment_id: environment_id.clone(),
@@ -526,6 +649,8 @@ impl Bridge {
             inbound: inbound_tx,
             outbound: outbound_rx,
             echoes: HashSet::new(),
+            pending,
+            interrupt,
         };
         let task = tokio::spawn(state.run(shutdown_rx));
         Ok(Self {
@@ -535,6 +660,7 @@ impl Bridge {
             status,
             inbound,
             outbound,
+            relay,
             shutdown: Some(shutdown),
             task,
         })
@@ -542,6 +668,10 @@ impl Bridge {
 
     pub fn status(&self) -> Status {
         self.status.borrow().clone()
+    }
+
+    pub fn relay(&self) -> Relay {
+        self.relay.clone()
     }
 
     pub fn is_active(&self) -> bool {
@@ -623,6 +753,8 @@ struct Loop {
     inbound: mpsc::Sender<Inbound>,
     outbound: mpsc::UnboundedReceiver<Value>,
     echoes: HashSet<String>,
+    pending: Pending,
+    interrupt: watch::Sender<u64>,
 }
 
 struct Lease {
@@ -880,6 +1012,14 @@ impl Loop {
                 }
                 None
             }
+            "control_response" => {
+                let response = frame["response"].clone();
+                let request_id = response["request_id"].as_str().unwrap_or_default();
+                if let Some(reply) = self.pending.lock().unwrap().remove(request_id) {
+                    let _ = reply.send(response);
+                }
+                None
+            }
             "control_request" => {
                 let request_id = frame["request_id"].as_str().unwrap_or_default().to_owned();
                 let request = frame["request"].clone();
@@ -889,6 +1029,11 @@ impl Loop {
                         &request_id,
                         Ok(json!({"commands": [], "models": []})),
                     ));
+                }
+                // Observed by a running turn, if any; idle sessions ignore it.
+                if subtype == "interrupt" {
+                    self.interrupt.send_modify(|count| *count += 1);
+                    return Some(control_response(&request_id, Ok(json!({}))));
                 }
                 let (reply, answer) = oneshot::channel();
                 if self

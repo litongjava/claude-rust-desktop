@@ -267,3 +267,147 @@ async fn fatal_poll_failure_and_bad_token_are_reported() {
     assert_eq!(snapshot["deregistered"].as_array().unwrap().len(), 1);
     bridge.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn tool_permissions_and_interrupts_are_relayed() {
+    let server = MockServer::start(0, None, vec![]).await.unwrap();
+    let endpoint = Endpoint::new(&server.url, None, None).unwrap();
+    let mut bridge = Bridge::connect(endpoint, registration(), timing())
+        .await
+        .unwrap();
+    wait_status(&mut bridge, |s| *s == Status::Connected).await;
+    let relay = bridge.relay();
+    let request_for = |id: &'static str| {
+        move |s: &Value| {
+            s["events"].as_array().unwrap().iter().any(|e| {
+                e["type"] == "control_request"
+                    && e["request_id"] == id
+                    && e["request"]["subtype"] == "can_use_tool"
+            })
+        }
+    };
+
+    // The remote client allows the tool.
+    let mut allow = relay.request_permission(
+        "perm-1",
+        "Write",
+        &json!({"file_path": "a.txt"}),
+        "toolu_1",
+        "Allow Write?",
+    );
+    let snapshot = server
+        .wait_for(Duration::from_secs(5), request_for("perm-1"))
+        .await
+        .unwrap();
+    let request = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["request_id"] == "perm-1")
+        .unwrap();
+    assert_eq!(request["request"]["tool_name"], "Write");
+    assert_eq!(request["request"]["input"]["file_path"], "a.txt");
+    assert_eq!(request["request"]["tool_use_id"], "toolu_1");
+    server.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": "perm-1", "response": {"behavior": "allow"}}}));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), allow.decision())
+            .await
+            .unwrap()
+    );
+    drop(allow);
+
+    // Deny, then an answered request is not cancelled.
+    let mut deny = relay.request_permission("perm-2", "Bash", &json!({}), "toolu_2", "Allow?");
+    server
+        .wait_for(Duration::from_secs(5), request_for("perm-2"))
+        .await
+        .unwrap();
+    server.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": "perm-2", "response": {"behavior": "deny", "message": "no"}}}));
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), deny.decision())
+            .await
+            .unwrap()
+    );
+    drop(deny);
+
+    // An error reply never decides; the local prompt keeps control.
+    let mut errored = relay.request_permission("perm-3", "Bash", &json!({}), "toolu_3", "Allow?");
+    server
+        .wait_for(Duration::from_secs(5), request_for("perm-3"))
+        .await
+        .unwrap();
+    server.send(json!({"type": "control_response", "response": {"subtype": "error", "request_id": "perm-3", "error": "unsupported"}}));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), errored.decision())
+            .await
+            .is_err()
+    );
+    drop(errored);
+
+    // A request resolved locally is cancelled on the remote client.
+    let pending = relay.request_permission("perm-4", "Bash", &json!({}), "toolu_4", "Allow?");
+    server
+        .wait_for(Duration::from_secs(5), request_for("perm-4"))
+        .await
+        .unwrap();
+    drop(pending);
+    let snapshot = server
+        .wait_for(Duration::from_secs(5), |s| {
+            s["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "control_cancel_request")
+        })
+        .await
+        .unwrap();
+    let cancelled: Vec<_> = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "control_cancel_request")
+        .map(|e| e["request_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(cancelled, ["perm-4"]);
+
+    // Interrupts reach observers created before the request only.
+    server.send(json!({"type": "control_request", "request_id": "int-0", "request": {"subtype": "interrupt"}}));
+    server
+        .wait_for(Duration::from_secs(5), |s| {
+            s["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["response"]["request_id"] == "int-0")
+        })
+        .await
+        .unwrap();
+    let mut interrupts = relay.interrupts();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), interrupts.next())
+            .await
+            .is_err()
+    );
+    server.send(json!({"type": "control_request", "request_id": "int-1", "request": {"subtype": "interrupt"}}));
+    tokio::time::timeout(Duration::from_secs(5), interrupts.next())
+        .await
+        .unwrap();
+    let snapshot = server
+        .wait_for(Duration::from_secs(5), |s| {
+            s["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["response"]["request_id"] == "int-1")
+        })
+        .await
+        .unwrap();
+    let reply = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["response"]["request_id"] == "int-1")
+        .unwrap();
+    assert_eq!(reply["response"]["subtype"], "success");
+    bridge.disconnect().await.unwrap();
+}

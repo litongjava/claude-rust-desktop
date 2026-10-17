@@ -267,6 +267,9 @@ async fn observe(
     let mut notification_error = None;
     let mut final_mode_synced = false;
     let mut shown_proposal = None::<String>;
+    let relay = session.remote_relay();
+    let mut remote_request: Option<claude_core::services::remote_control::PermissionRequest> = None;
+    let mut remote_interrupts = session.remote_interrupts();
     loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -306,6 +309,15 @@ async fn observe(
                 }
                 let question = jobs::pending_question(root, id, owner)?;
                 let current = question.as_ref().map(|question| question.request_id.as_str());
+                // Dropping a stale remote request cancels it on the remote client.
+                if remote_request.as_ref().is_some_and(|request| Some(request.request_id.as_str()) != current || answered.contains(&request.request_id)) {
+                    remote_request = None;
+                }
+                if let (None, Some(relay), Some(question)) = (&remote_request, &relay, &question) {
+                    if let Some(tool) = question.tool.as_ref().filter(|_| question.kind == "permission" && !answered.contains(&question.request_id)) {
+                        remote_request = Some(relay.request_permission(&question.request_id, tool["tool_name"].as_str().unwrap_or_default(), &tool["input"], tool["tool_use_id"].as_str().unwrap_or_default(), &question.question));
+                    }
+                }
                 if pending.as_ref().is_some_and(|(request, _)| Some(request.as_str()) != current) {
                     // Closing this receiver tells the live renderer to discard
                     // only its answer draft and restore the queued prompt draft.
@@ -349,6 +361,21 @@ async fn observe(
                     }
                     notified = std::time::Instant::now();
                 }
+            },
+            allowed = claude_core::services::remote_control::remote_decision(&mut remote_request) => {
+                let request = remote_request.take().unwrap().request_id.clone();
+                answer_if_current(root, id, owner, &request, if allowed { "y" } else { "n" })?;
+                answered.insert(request.clone());
+                if pending.as_ref().is_some_and(|(pending, _)| *pending == request) { pending = None; }
+                if plain_pending.as_ref().is_some_and(|(pending, _)| *pending == request) {
+                    plain_pending = None;
+                    if let Some(reader) = input.as_mut() { reader.dismiss_answer().await?; }
+                }
+                display.notice(if allowed { "Remote Control allowed the tool request." } else { "Remote Control denied the tool request." });
+                display.set_activity("Working");
+            },
+            _ = remote_interrupts.next() => {
+                if !cancelled { cancel_job(session, id)?; cancelled = true; display.notice("Remote Control interrupted the turn."); display.set_activity("Cancelling worker"); }
             },
             answer = async { match pending.as_mut() { Some((_, answer)) => answer.await, None => std::future::pending().await } } => {
                 let (request, _) = pending.take().unwrap();

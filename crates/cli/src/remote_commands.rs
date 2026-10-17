@@ -99,6 +99,7 @@ impl Remote {
     /// Publishes conversation messages added since the last call.
     pub fn sync(&mut self, session: &Session) -> Result<()> {
         let Some(bridge) = &self.bridge else {
+            session.set_remote_relay(None);
             return Ok(());
         };
         let history = session.store.history(&session.id)?;
@@ -234,6 +235,7 @@ impl Remote {
             "Remote Control active: {}\nUse /remote-control again to see the link or disconnect.",
             bridge.url
         );
+        session.set_remote_relay(Some(bridge.relay()));
         self.bridge = Some(bridge);
         // Only messages from now on are mirrored.
         self.published = session.store.history(&session.id)?.len();
@@ -288,8 +290,6 @@ async fn control(subtype: &str, request: &Value, session: &mut Session) -> Resul
             session.sdk_set_model(model).await?;
             Ok(json!({"model": model}))
         }
-        // Remote requests are only handled while idle, so nothing is running.
-        "interrupt" => Ok(json!({})),
         other => anyhow::bail!("Unsupported Remote Control request: {other}"),
     }
 }

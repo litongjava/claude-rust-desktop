@@ -425,6 +425,10 @@ pub struct PendingQuestion {
     pub request_id: String,
     pub question: String,
     pub kind: String,
+    /// `{tool_name, input, tool_use_id}` for tool approvals, so an attached
+    /// frontend can relay them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<serde_json::Value>,
 }
 
 pub fn pending_question(root: &Path, id: &str, parent: &str) -> Result<Option<PendingQuestion>> {
@@ -530,7 +534,23 @@ pub async fn worker_answer(
     let Some(dir) = worker_directory(root, session)? else {
         return Ok(None);
     };
-    wait_for_answer(&dir, request, kind, question)
+    wait_for_answer(&dir, request, kind, question, None)
+        .await
+        .map(Some)
+}
+
+/// Like [`worker_answer`] for a tool approval with structured details.
+pub async fn worker_permission(
+    root: &Path,
+    session: &str,
+    request: &str,
+    question: &str,
+    tool: serde_json::Value,
+) -> Result<Option<String>> {
+    let Some(dir) = worker_directory(root, session)? else {
+        return Ok(None);
+    };
+    wait_for_answer(&dir, request, "permission", question, Some(tool))
         .await
         .map(Some)
 }
@@ -550,7 +570,7 @@ mod answer_cleanup_tests {
         let id = uuid::Uuid::new_v4().to_string();
         let path = dir.path().to_path_buf();
         let request = id.clone();
-        let task = tokio::spawn(async move { wait_for_answer(&path, &request, "permission", "Allow?").await });
+        let task = tokio::spawn(async move { wait_for_answer(&path, &request, "permission", "Allow?", None).await });
         tokio::time::timeout(Duration::from_secs(3), async {
             while !dir.path().join("pending-question.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
         }).await.unwrap();
@@ -558,7 +578,7 @@ mod answer_cleanup_tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(!dir.path().join("pending-question.json").exists());
         let guard = PendingAnswerCleanup { dir:dir.path().into(), request:id.clone() };
-        save(&dir.path().join("pending-question.json"), &PendingQuestion {request_id:"next".into(),question:"Next?".into(),kind:"permission".into()}).unwrap();
+        save(&dir.path().join("pending-question.json"), &PendingQuestion {request_id:"next".into(),question:"Next?".into(),kind:"permission".into(),tool:None}).unwrap();
         fs::write(response_path(dir.path(), &id).unwrap(), b"late").unwrap();
         drop(guard);
         let pending: PendingQuestion = serde_json::from_slice(&fs::read(dir.path().join("pending-question.json")).unwrap()).unwrap();
@@ -577,7 +597,7 @@ impl Drop for PendingAnswerCleanup {
     }
 }
 
-async fn wait_for_answer(dir: &Path, request: &str, kind: &str, question: &str) -> Result<String> {
+async fn wait_for_answer(dir: &Path, request: &str, kind: &str, question: &str, tool: Option<serde_json::Value>) -> Result<String> {
     let _cleanup = PendingAnswerCleanup { dir: dir.to_path_buf(), request: request.into() };
     save(
         &dir.join("pending-question.json"),
@@ -585,6 +605,7 @@ async fn wait_for_answer(dir: &Path, request: &str, kind: &str, question: &str) 
             request_id: request.into(),
             question: question.into(),
             kind: kind.into(),
+            tool,
         },
     )?;
     loop {
@@ -905,7 +926,7 @@ mod tests {
         let (root, dir, id) = fixture("");
         let worker_dir = dir.clone();
         let worker = tokio::spawn(async move {
-            wait_for_answer(&worker_dir, "request-1", "permission", "Allow test?").await
+            wait_for_answer(&worker_dir, "request-1", "permission", "Allow test?", None).await
         });
         for _ in 0..50 {
             if pending_question(root.path(), &id, "parent")
@@ -930,7 +951,7 @@ mod tests {
     async fn worker_mailbox_cancellation_does_not_approve() {
         let (_root, dir, _) = fixture("");
         fs::write(dir.join("cancel"), b"cancel").unwrap();
-        assert!(wait_for_answer(&dir, "request", "permission", "Allow?")
+        assert!(wait_for_answer(&dir, "request", "permission", "Allow?", None)
             .await
             .is_err());
     }

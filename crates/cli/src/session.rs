@@ -50,9 +50,23 @@ pub struct Session {
     pub(crate) workspace: std::path::PathBuf,
     lifecycle_owned: bool,
     api_format: claude_core::native_engine::provider_manager::ApiFormat,
+    remote_relay: std::sync::Mutex<Option<claude_core::services::remote_control::Relay>>,
 }
 
 impl Session {
+    /// Remote Control channel for tool approvals and interrupts during turns.
+    pub(crate) fn set_remote_relay(&self, relay: Option<claude_core::services::remote_control::Relay>) {
+        *self.remote_relay.lock().unwrap() = relay;
+    }
+
+    pub(crate) fn remote_relay(&self) -> Option<claude_core::services::remote_control::Relay> {
+        self.remote_relay.lock().unwrap().clone()
+    }
+
+    pub(crate) fn remote_interrupts(&self) -> claude_core::services::remote_control::Interrupts {
+        self.remote_relay().map(|relay| relay.interrupts()).unwrap_or_default()
+    }
+
     pub(crate) async fn validate_sdk_mcp_servers(&self, names: &[String]) -> Result<()> {
         if names.is_empty() { return Ok(()); }
         // Initialization validates persisted names without starting any process.
@@ -296,6 +310,7 @@ impl Session {
             sdk_mcp_transport: None,
             lifecycle_owned: false,
             api_format,
+            remote_relay: Default::default(),
         })
     }
 
@@ -662,11 +677,13 @@ impl Session {
         let mut tools = Vec::<message_repo::ToolCallRow>::new();
         let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut remote_interrupts = self.remote_interrupts();
         let turn_result: Result<()> = async {
             loop {
                 let event = tokio::select! {
                     event = events.recv() => event.context("Engine stream closed before completion")?,
                     _ = &mut worker_cancel => bail!("Background task cancelled"),
+                    _ = remote_interrupts.next() => bail!("Interrupted by Remote Control"),
                     _ = tokio::signal::ctrl_c() => bail!("Interrupted"),
                     _ = refresh.tick() => {
                         progress.tick();
@@ -758,22 +775,30 @@ impl Session {
                             progress.set_activity("Working");
                             continue;
                         }
-                        let answer = {
+                        // The remote client may answer first; a local answer cancels its prompt.
+                        let mut remote = self.remote_relay().map(|relay| relay.request_permission(&request_id, &tool_name, &tool_input, &tool_use_id, &question));
+                        let (answer, remote_decided) = {
+                            let tool = json!({"tool_name": tool_name, "input": tool_input, "tool_use_id": tool_use_id});
                             let answering = async {
-                                if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "permission", &question).await? { Ok(answer) } else {
+                                if let Some(answer) = claude_core::services::background_sessions::worker_permission(&self.paths.data_dir, &self.id, &request_id, &question, tool).await? { Ok(answer) } else {
                                     anyhow::ensure!(input.is_some(), "Tool approval required in non-interactive mode; choose --permission-mode explicitly");
                                     turn_answer(self, &mut progress, input, question).await
                                 }
                             };
                             tokio::select! {
                                 biased;
-                                _ = completion.changed() => None,
-                                answer = answering => Some(answer?),
+                                _ = completion.changed() => (None, false),
+                                allowed = claude_core::services::remote_control::remote_decision(&mut remote) => (Some(if allowed { "y".to_owned() } else { "n".to_owned() }), true),
+                                answer = answering => (Some(answer?), false),
                             }
                         };
                         if let Some(answer) = answer {
                             let answer = if ["y", "yes", "\u{662f}", "\u{5141}\u{8bb8}"].contains(&answer.trim().to_lowercase().as_str()) { "yes" } else { "no" };
                             let _ = self.engine.resume_with_answer(&request_id, answer.into()).await;
+                            if remote_decided {
+                                if let Some(reader) = input.as_mut() { reader.dismiss_answer().await?; }
+                                progress.notice(&format!("Remote Control {} {tool_name}.", if answer == "yes" { "allowed" } else { "denied" }));
+                            }
                         } else if let Some(reader) = input.as_mut() {
                             reader.dismiss_answer().await?;
                         }
