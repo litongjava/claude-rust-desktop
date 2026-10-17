@@ -5,7 +5,7 @@ import { useWorkspaceModeStore } from '../stores/useWorkspaceModeStore';
 import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 import { useI18n } from '../hooks/useI18n';
 import { IconCode } from './Icons';
-import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Pin, PinOff, X, Home } from 'lucide-react';
+import { ChevronUp, Settings, HelpCircle, LogOut, Shield, Pin, PinOff, X, Home } from 'lucide-react';
 import { getConversations, getUser, getUserUsage, logout, getUserProfile } from '../api';
 
 import SearchModal from './SearchModal';
@@ -29,7 +29,6 @@ interface SidebarProps {
   refreshTrigger: number;
   onNewChatClick?: () => void;
   onOpenSettings?: () => void;
-  onOpenUpgrade?: () => void;
   onCloseOverlays?: () => void;
   tunerConfig?: any;
   setTunerConfig?: (config: any) => void;
@@ -39,7 +38,7 @@ interface SidebarProps {
   onHelpModalChange: (open: boolean) => void;
 }
 
-const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
+const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onCloseOverlays, tunerConfig, setTunerConfig, titleBarHeight, activeConversationId, showHelpModal, onHelpModalChange: setShowHelpModal }: SidebarProps) => {
   const { t } = useI18n();
   const showCodingView = useGeneralSettingsStore(state => state.showCodingView);
   const navigate = useNavigate();
@@ -470,15 +469,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   <Settings size={16} className="text-claude-textSecondary" />
                   {t('sidebar.settings')}
                 </button>
-                {localStorage.getItem('user_mode') !== 'selfhosted' && (
-                  <button
-                    className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
-                    onClick={() => { setShowUserMenu(false); onOpenUpgrade?.(); }}
-                  >
-                    <CreditCard size={16} className="text-claude-textSecondary" />
-                    {t('sidebar.payment')}
-                  </button>
-                )}
                 {isAdmin && localStorage.getItem('user_mode') !== 'selfhosted' && (
                   <button
                     className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"

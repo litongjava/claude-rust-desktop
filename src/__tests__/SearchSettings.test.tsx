@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SearchSettings from '../components/SearchSettings';
+import { useUIStore } from '../stores/useUIStore';
 import SettingsPage from '../components/SettingsPage';
 import { getProviders, getSearchSettings, getSearchApiKey, updateSearchSettings, testSearchSettings, type SearchSettings as SearchSettingsData, type SearchSettingsTestResult } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
@@ -30,6 +31,7 @@ const searchSuccess: SearchSettingsTestResult = {
 describe('independent DeepSeek search settings', () => {
   beforeEach(() => {
     localStorage.clear();
+    useUIStore.setState({ language: 'zh' });
     vi.clearAllMocks();
     vi.mocked(getSearchSettings).mockResolvedValue(existing);
     vi.mocked(getSearchApiKey).mockResolvedValue('saved-search-secret');
@@ -88,6 +90,16 @@ describe('independent DeepSeek search settings', () => {
     await user.click(screen.getByRole('button', { name: '联网搜索' }));
     expect(await screen.findByRole('heading', { name: 'DeepSeek 联网搜索' })).toBeInTheDocument();
     await waitFor(() => expect(getSearchSettings).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('button', { name: '服务与团队' })).not.toBeInTheDocument();
+    await act(async () => useUIStore.setState({ language: 'en' }));
+    expect(screen.getByRole('button', { name: 'Web search' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'DeepSeek web search' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Search API URL')).toHaveValue(existing.baseUrl);
+    expect(screen.getByLabelText('Search API key')).toHaveAttribute('type', 'password');
+    await user.click(screen.getByRole('button', { name: 'Test search' }));
+    expect(await screen.findByText('Search test succeeded: 1 results · 1.3 s · deepseek-flash')).toBeInTheDocument();
+    await act(async () => useUIStore.setState({ language: 'zh' }));
+    expect(screen.getByText('搜索测试成功：1 条结果 · 1.3 秒 · deepseek-flash')).toBeInTheDocument();
   });
 
   it('tests unsaved address, model and manual key without saving or caching credentials', async () => {

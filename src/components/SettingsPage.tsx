@@ -1,6 +1,6 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Puzzle, Globe, Clock, Settings, Cpu, UserRound, Info } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Puzzle, Globe, Clock, Settings, Cpu, UserRound, Info, BarChart3 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
@@ -11,7 +11,6 @@ import NewTaskModal from './NewTaskModal';
 import { taskAPI, TaskInfo } from '../utils/tauriAPI';
 import { useI18n } from '../hooks/useI18n';
 import GeneralPreferences from './GeneralPreferences';
-import ServicesSettings from './ServicesSettings';
 import { version as appVersion } from '../../package.json';
 import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 
@@ -24,7 +23,7 @@ const WORK_OPTIONS = [
   { value: '其他', key: 'other' },
 ];
 
-type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'customize' | 'tasks' | 'services';
+type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'customize' | 'tasks';
 
 const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void }) => {
   const { t, locale } = useI18n();
@@ -342,14 +341,15 @@ const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void 
             </button>
           )}
           <button onClick={() => setTab('search')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'search' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
-            <Globe size={16} />联网搜索
+            <Globe size={16} />{t('searchSettings.nav')}
           </button>
           {localStorage.getItem('user_mode') !== 'selfhosted' && (
             <button
               onClick={() => setTab('usage')}
-              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
                 }`}
             >
+              <BarChart3 size={16} />
               {t('settings.usage')}
             </button>
           )}
@@ -370,9 +370,6 @@ const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void 
             <Clock size={16} />
             {t('tasks.title')}
           </button>
-          <button onClick={() => setTab('services')} className={`text-left px-3 py-2 rounded-lg text-[15px] flex items-center gap-2 ${tab === 'services' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
-            <Settings size={16} />服务与团队
-          </button>
           <button onClick={() => setTab('about')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'about' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
             <Info size={16} />{t('settings.about')}
           </button>
@@ -381,7 +378,6 @@ const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void 
         {/* Right Content Area */}
         <div className={`flex-1 min-w-0 ${tab === 'customize' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
           {tab === 'customize' ? <CustomizePage onBack={() => setTab('general')} onCreateWithClaude={onCreateWithClaude} /> : <div className="max-w-6xl px-6 lg:px-12 pb-32">
-            {tab === 'services' && <ServicesSettings />}
             {tab === 'general' && renderGeneral()}
             {tab === 'about' && renderAbout()}
             {tab === 'models' && <ProviderSettings />}
