@@ -31,6 +31,19 @@ impl McpExecution {
     fn resource(value: serde_json::Value) -> Self { Self { value, is_tool_call: false } }
 }
 
+/// Upstream `normalizeNameForMCP`: characters outside `[A-Za-z0-9_-]` become `_`.
+fn normalize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' })
+        .collect()
+}
+
+/// Configured servers expose tools as `mcp__<server>__<tool>` so permission
+/// rules and hook matchers can target a server without colliding with builtins.
+pub fn qualified_tool_name(server: &str, tool: &str) -> String {
+    format!("mcp__{}__{}", normalize_name(server), normalize_name(tool))
+}
+
 impl McpToolRegistry {
     pub fn new(manager: Arc<McpServerManager>) -> Self {
         Self {
@@ -83,7 +96,7 @@ impl McpToolRegistry {
 
                 for tool in tools {
                     all_tools.push(McpToolDefinition {
-                        name: tool.name.clone(),
+                        name: qualified_tool_name(&server.config.id, &tool.name),
                         description: tool.description.clone(),
                         input_schema: tool.input_schema.clone(),
                         server_name: server.config.name.clone(),
@@ -182,8 +195,8 @@ impl McpToolRegistry {
                 let connector = connector_arc.lock().await;
                 let tools = connector.list_tools().await.unwrap_or_default();
 
-                if tools.iter().any(|t| t.name == name) {
-                    return connector.call_tool(name, arguments).await.map(McpExecution::tool);
+                if let Some(tool) = tools.iter().find(|t| qualified_tool_name(&server.config.id, &t.name) == name) {
+                    return connector.call_tool(&tool.name, arguments).await.map(McpExecution::tool);
                 }
             }
         }

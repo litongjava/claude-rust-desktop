@@ -197,7 +197,7 @@ async fn sdk_mcp_discovery_calls_resources_hooks_permissions_and_stdio_share_rea
                     "ReadMcpResource",
                     json!({"server_id":"sdk:first","uri":"fixture:first"}),
                 ),
-                ("stdio_echo", json!({"value":"ACTUAL_STDIO"})),
+                ("mcp__native__stdio_echo", json!({"value":"ACTUAL_STDIO"})),
                 (
                     "Write",
                     json!({"file_path":"native.txt","content":"ACTUAL_NATIVE"}),
@@ -231,7 +231,7 @@ async fn sdk_mcp_discovery_calls_resources_hooks_permissions_and_stdio_share_rea
             .any(|frame| frame["request"]["subtype"] == "hook_callback"));
         let requests = server.fixture.requests.lock().unwrap();
         let tools = requests[0]["tools"].as_array().unwrap();
-        for name in ["mcp__first__echo", "mcp__second__echo", "stdio_echo"] {
+        for name in ["mcp__first__echo", "mcp__second__echo", "mcp__native__stdio_echo"] {
             let tool = tools
                 .iter()
                 .find(|tool| {

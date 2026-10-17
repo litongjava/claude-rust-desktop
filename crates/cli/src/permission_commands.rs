@@ -73,6 +73,9 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
         .permissions
         .set_session_rules(&session.id, rules.clone());
     eprintln!("{}", launch_rule_display(session).await?);
+    if rules.is_empty() {
+        eprintln!("  (none)");
+    }
     for (tool, action) in rules
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>()

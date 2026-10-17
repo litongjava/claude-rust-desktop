@@ -16,7 +16,7 @@ fn command_post_hook(root: &Path) {
     let script = root.join("post-hook.cjs");
     std::fs::write(&script, r#"let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const i=JSON.parse(input);if(i.tool_response[0].text!=='STDIO_RESULT')process.exit(7);process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PostToolUse',updatedMCPToolOutput:[{type:'text',text:'COMMAND_REDACTED'}]}}));});"#).unwrap();
     let command = format!("node \"{}\"", script.display());
-    std::fs::write(root.join("data/settings.json"),json!({"hooks":{"PostToolUse":[{"matcher":"^stdio_echo$","hooks":[{"type":"command","command":command}]}]}}).to_string()).unwrap();
+    std::fs::write(root.join("data/settings.json"),json!({"hooks":{"PostToolUse":[{"matcher":"^mcp__native__stdio_echo$","hooks":[{"type":"command","command":command}]}]}}).to_string()).unwrap();
 }
 
 #[tokio::test]
@@ -29,7 +29,7 @@ async fn post_mcp_output_reaches_both_providers_display_storage_and_resume() {
             anthropic,
             vec![
                 ("mcp__first__echo", json!({"value":"RAW_PRIVATE"})),
-                ("stdio_echo", json!({"value":"CALLED_ONCE"})),
+                ("mcp__native__stdio_echo", json!({"value":"CALLED_ONCE"})),
                 ("Read", json!({"file_path":"fixture.txt"})),
                 (
                     "ReadMcpResource",
@@ -86,7 +86,7 @@ async fn post_mcp_output_reaches_both_providers_display_storage_and_resume() {
                                 "HOST_first_RAW_PRIVATE"
                             );
                             json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedMCPToolOutput":replacement(),"additionalContext":"POST_CONTEXT"}})
-                        } else if name == "stdio_echo" {
+                        } else if name == "mcp__native__stdio_echo" {
                             assert_eq!(input["tool_response"][0]["text"], "STDIO_RESULT");
                             json!({})
                         } else {
