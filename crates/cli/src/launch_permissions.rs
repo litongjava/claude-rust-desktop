@@ -61,17 +61,7 @@ pub fn rules(cli: &Cli) -> Result<HashMap<String, PermissionAction>> {
                 "CLI tool rule list exceeds 64 KiB"
             );
             for rule in split(value)? {
-                let rule = rule
-                    .strip_suffix("()")
-                    .or_else(|| rule.strip_suffix("(*)"))
-                    .unwrap_or(&rule);
-                let rule = match rule {
-                    "Task" => "Agent",
-                    "KillShell" => "TaskStop",
-                    "AgentOutputTool" | "BashOutputTool" => "TaskOutput",
-                    rule => rule,
-                }
-                .to_owned();
+                let rule = patterns::canonical_rule(&rule);
                 patterns::validate(&rule)?;
                 result.insert(rule, action.clone());
                 ensure!(result.len() <= 1024, "Too many CLI tool permission rules");

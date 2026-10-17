@@ -228,6 +228,28 @@ fn shell_matches(pattern: &str, command: &str) -> bool {
     regex::Regex::new(&regex).is_ok_and(|r| r.is_match(command))
 }
 
+/// Legacy tool names accepted in rules and hook conditions.
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "Task" => "Agent",
+        "KillShell" => "TaskStop",
+        "AgentOutputTool" | "BashOutputTool" => "TaskOutput",
+        name => name,
+    }
+}
+
+/// Drops empty or match-all content and maps legacy tool names.
+pub fn canonical_rule(rule: &str) -> String {
+    let rule = rule
+        .strip_suffix("()")
+        .or_else(|| rule.strip_suffix("(*)"))
+        .unwrap_or(rule);
+    match rule.split_once('(') {
+        Some((tool, rest)) => format!("{}({rest}", canonical_tool_name(tool)),
+        None => canonical_tool_name(rule).to_owned(),
+    }
+}
+
 pub fn validate(value: &str) -> Result<()> {
     Rule::parse(value).map(|_| ())
 }

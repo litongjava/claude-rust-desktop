@@ -64,6 +64,49 @@ pub struct ActiveHook {
     pub timeout: u64,
     pub source: PathBuf,
     pub shell: Option<String>,
+    /// Permission-rule filter evaluated before spawning (upstream `if`).
+    #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
+    pub if_condition: Option<String>,
+}
+
+impl ActiveHook {
+    /// Hooks with `if` only run for tool events whose call matches the rule.
+    /// Like upstream, a condition the matcher cannot evaluate never matches,
+    /// while ambiguous compound shell commands do match, so a guarding hook is
+    /// not skipped for a call it might cover.
+    fn condition_matches(
+        &self,
+        event: HookEvent,
+        input: &serde_json::Map<String, Value>,
+        workspace: &Path,
+    ) -> bool {
+        let Some(condition) = &self.if_condition else {
+            return true;
+        };
+        if !matches!(
+            event,
+            HookEvent::PreToolUse
+                | HookEvent::PostToolUse
+                | HookEvent::PostToolUseFailure
+                | HookEvent::PermissionRequest
+        ) {
+            return false;
+        }
+        let Ok(rule) = crate::permissions::patterns::Rule::parse(condition) else {
+            return false;
+        };
+        let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or("");
+        rule.matches(
+            &crate::permissions::PermissionContext {
+                tool_name: crate::permissions::patterns::canonical_tool_name(tool).into(),
+                tool_input: input.get("tool_input").cloned().unwrap_or(Value::Null),
+                conversation_id: String::new(),
+                user_id: None,
+                workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            },
+            &crate::permissions::rules::PermissionAction::Deny,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -134,6 +177,8 @@ struct CommandConfig {
     timeout: u64,
     #[serde(default)]
     shell: Option<String>,
+    #[serde(default, rename = "if")]
+    if_condition: Option<String>,
 }
 fn default_timeout() -> u64 {
     60
@@ -248,6 +293,9 @@ impl HookRunner {
                             timeout: hook.timeout,
                             source: source.clone(),
                             shell: hook.shell,
+                            if_condition: hook.if_condition.map(|condition| {
+                                crate::permissions::patterns::canonical_rule(&condition)
+                            }),
                         });
                     }
                 }
@@ -301,7 +349,7 @@ impl HookRunner {
         payload["cwd"] = json!(self.workspace);
         payload["hook_event_name"] = json!(event.name());
         let mut path = None;
-        for hook in self.hooks.iter().filter(|hook|hook.event == event) {
+        for hook in self.hooks.iter().filter(|hook|hook.event == event && hook.if_condition.is_none()) {
             let (code, stdout, stderr) = execute(hook, &self.workspace, &payload).await?;
             ensure!(code == 0, "{} hook failed ({code}): {}", event.name(), stderr.trim());
             if event == HookEvent::WorktreeCreate && path.is_none() && !stdout.trim().is_empty() {
@@ -368,7 +416,9 @@ impl HookRunner {
             let mut pending: FuturesUnordered<futures::future::BoxFuture<'_, Result<HookOutcome>>> =
                 FuturesUnordered::new();
             for hook in self.hooks.iter().filter(|hook| hook.event == event) {
-                if !matches_tool(&hook.matcher, &name)? {
+                if !matches_tool(&hook.matcher, &name)?
+                    || !hook.condition_matches(event, &input, &self.workspace)
+                {
                     continue;
                 }
                 let input = Value::Object(input.clone());
@@ -434,6 +484,9 @@ impl HookRunner {
                             ))
                             && !matches_tool(&hook.matcher, &name)?
                         {
+                            continue;
+                        }
+                        if !hook.condition_matches(event, &input, &self.workspace) {
                             continue;
                         }
                         let outcome = async {
@@ -885,7 +938,7 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into())}).collect(),..Default::default()};
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None}).collect(),..Default::default()};
         let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
         assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
         assert!(root.path().join("slow-started").exists());
@@ -963,6 +1016,7 @@ mod tests {
             timeout: 10,
             source: root.path().into(),
             shell: Some(shell.into()),
+            if_condition: None,
         };
         let runner = HookRunner {
             workspace: root.path().into(),
@@ -975,6 +1029,79 @@ mod tests {
             .unwrap();
         assert!(output.blocked);
         assert_eq!(output.reason, "denied");
+    }
+
+    #[tokio::test]
+    async fn if_condition_filters_tool_hooks_before_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let (shell, command, session) = if cfg!(windows) {
+            (
+                "powershell",
+                "[Console]::Error.Write('ran'); exit 2",
+                "[IO.File]::WriteAllText('session-ran','x')",
+            )
+        } else {
+            ("sh", "printf ran >&2; exit 2", "printf x > session-ran")
+        };
+        let hooks = |condition: &str| {
+            json!({"hooks":{"PreToolUse":[{"matcher":"*","hooks":[
+                {"type":"command","command":command,"shell":shell,"if":condition}
+            ]}],"SessionStart":[{"hooks":[
+                {"type":"command","command":session,"shell":shell,"if":"Bash"}
+            ]}]}})
+        };
+        let blocked = |condition: &'static str, tool: &'static str, input: Value| {
+            let data = data.clone();
+            let workspace = root.path().to_path_buf();
+            async move {
+                std::fs::write(data.join("settings.json"), hooks(condition).to_string()).unwrap();
+                let runner = HookRunner::load(&data, &workspace).unwrap();
+                runner
+                    .run(
+                        HookEvent::PreToolUse,
+                        "test",
+                        json!({"tool_name":tool,"tool_input":input}),
+                    )
+                    .await
+                    .unwrap()
+                    .blocked
+            }
+        };
+        assert!(
+            blocked(
+                "Bash(git push:*)",
+                "Bash",
+                json!({"command":"git push origin"})
+            )
+            .await
+        );
+        assert!(!blocked("Bash(git push:*)", "Bash", json!({"command":"git status"})).await);
+        // Compound commands cannot be proven outside the pattern.
+        assert!(
+            blocked(
+                "Bash(git push:*)",
+                "Bash",
+                json!({"command":"echo ok && git push"})
+            )
+            .await
+        );
+        assert!(!blocked("Bash(git push:*)", "Write", json!({"command":"git push"})).await);
+        assert!(blocked("Write(src/**)", "Write", json!({"file_path":"src/main.rs"})).await);
+        assert!(!blocked("Write(src/**)", "Write", json!({"file_path":"docs/a.md"})).await);
+        assert!(blocked("Task(*)", "Agent", json!({})).await);
+        assert!(blocked("mcp__fixture", "mcp__fixture__echo", json!({})).await);
+        assert!(!blocked("mcp__fixture", "mcp__other__echo", json!({})).await);
+        // Content on a tool without a pattern matcher never matches.
+        assert!(!blocked("Grep(*.rs)", "Grep", json!({"pattern":"x"})).await);
+        let runner = HookRunner::load(&data, root.path()).unwrap();
+        assert_eq!(runner.list()[0].if_condition.as_deref(), Some("Grep(*.rs)"));
+        runner
+            .run(HookEvent::SessionStart, "test", json!({"source":"startup"}))
+            .await
+            .unwrap();
+        assert!(!root.path().join("session-ran").exists());
     }
 
     #[tokio::test]
@@ -992,6 +1119,7 @@ mod tests {
             timeout: 1,
             source: root.path().into(),
             shell: Some(shell.into()),
+            if_condition: None,
         };
         let error = execute(&hook, root.path(), &json!({})).await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -1013,6 +1141,7 @@ mod tests {
             timeout: 10,
             source: cwd.clone(),
             shell: Some(shell.into()),
+            if_condition: None,
         };
         let task = tokio::spawn(async move { execute(&hook, &cwd, &json!({})).await });
         tokio::time::timeout(Duration::from_secs(10), async {
