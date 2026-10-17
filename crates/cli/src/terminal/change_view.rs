@@ -152,8 +152,7 @@ fn painted(
     }
     result
 }
-fn codes(style: Style) -> &'static str {
-    let theme = super::style::theme_variant();
+fn codes(style: Style, theme: u8) -> &'static str {
     if theme >= 4 {
         return match style {
             Style::Body => "39",
@@ -207,6 +206,10 @@ fn codes(style: Style) -> &'static str {
     }
 }
 pub fn render(line: &Line, width: usize, color: bool) -> String {
+    render_with_theme(line, width, color, super::style::theme_variant())
+}
+
+fn render_with_theme(line: &Line, width: usize, color: bool, theme: u8) -> String {
     let mut result = String::new();
     let mut cells = 0;
     for segment in &line.0 {
@@ -225,8 +228,8 @@ pub fn render(line: &Line, width: usize, color: bool) -> String {
         }
         if !text.is_empty() {
             if color {
-                result.push_str(&format!("\x1b[{}m", codes(segment.style)));
-                if super::style::theme_variant() == 0 || super::style::theme_variant() == 2 {
+                result.push_str(&format!("\x1b[{}m", codes(segment.style, theme)));
+                if theme == 0 || theme == 2 {
                     if let Some(syntax) = segment.syntax {
                         result.push_str(&format!("\x1b[{}m", syntax_code(syntax)));
                     }
@@ -250,7 +253,7 @@ pub fn render(line: &Line, width: usize, color: bool) -> String {
             _ => None,
         });
         if let Some(background) = background {
-            result.push_str(&format!("\x1b[{}m", codes(background)));
+            result.push_str(&format!("\x1b[{}m", codes(background, theme)));
             result.push_str(&" ".repeat(width - cells));
             result.push_str("\x1b[0m");
         }
@@ -286,7 +289,11 @@ pub fn change(output: &str, failed: bool) -> Option<Vec<Line>> {
     change_in_workspace(output, failed, None)
 }
 
-pub fn change_in_workspace(output: &str, failed: bool, workspace: Option<&std::path::Path>) -> Option<Vec<Line>> {
+pub fn change_in_workspace(
+    output: &str,
+    failed: bool,
+    workspace: Option<&std::path::Path>,
+) -> Option<Vec<Line>> {
     if failed {
         return None;
     }
@@ -399,6 +406,36 @@ pub fn plain(lines: &[Line]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Palette assertions are independent of concurrently running /config tests.
+    fn render(line: &Line, width: usize, color: bool) -> String {
+        render_with_theme(line, width, color, 0)
+    }
+
+    #[test]
+    fn selected_palette_controls_text_highlights_and_padding() {
+        let line = Line(vec![
+            span("+", Style::AddedGutter),
+            span("42", Style::AddedWord),
+        ]);
+        for (theme, base, word) in [
+            (0, "48;2;2;40;0", "48;2;4;71;0"),
+            (1, "48;2;220;245;220", "48;2;170;225;170"),
+            (2, "48;2;0;25;62", "48;2;0;45;95"),
+            (3, "48;2;220;235;255", "48;2;170;205;245"),
+        ] {
+            let rendered = render_with_theme(&line, 8, true, theme);
+            assert!(rendered.contains(word));
+            assert!(rendered.ends_with(&format!("{base}m     \x1b[0m")));
+            assert_eq!(render_with_theme(&line, 8, false, theme), "+42");
+        }
+        for theme in [4, 5] {
+            let rendered = render_with_theme(&line, 8, true, theme);
+            assert!(rendered.contains("\x1b[32;47m42"));
+            assert!(rendered.ends_with("\x1b[32m     \x1b[0m"));
+            assert!(!rendered.contains(";2;"));
+        }
+    }
+
     #[test]
     fn typed_colors_sanitize_controls_and_bound_unicode_width() {
         let line = Line(vec![span("\x1b[2J\u{4e2d}ab", Style::AddedWord)]);
