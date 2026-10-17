@@ -109,7 +109,7 @@ impl TerminalInput {
                     super::answer_input::read(&mut plain, &request.prompt, &request.cancelled)
                         .map(|value| value.map(PromptEvent::Line))
                 } else if terminal {
-                    editor.readline(&request.prompt)
+                    editor.readline_until(&request.prompt, &request.cancelled)
                 } else {
                     read_plain(&mut plain, &request.prompt)
                         .map(|value| value.map(PromptEvent::Line))
@@ -180,6 +180,33 @@ impl TerminalInput {
     }
     pub fn set_permission_mode(&self, mode: &str) {
         let _ = self.requests.send(Message::PermissionMode(mode.into()));
+    }
+
+    /// Ends an outstanding interactive prompt read so another source can run a
+    /// turn. Its draft is kept, and a line submitted meanwhile is re-queued.
+    /// Returns false when the read cannot be interrupted (plain stdin).
+    pub async fn yield_prompt(&mut self) -> io::Result<bool> {
+        let Some(pending) = self.pending.as_mut() else { return Ok(true) };
+        if !pending.repl {
+            return Ok(false);
+        }
+        pending.cancelled.store(true, Ordering::Release);
+        match tokio::time::timeout(std::time::Duration::from_millis(500), &mut pending.receive).await {
+            Err(_) => {
+                pending.cancelled.store(false, Ordering::Release);
+                Ok(false)
+            }
+            Ok(result) => {
+                self.pending = None;
+                match result {
+                    Ok(Ok(Some(event))) => self.queued.push_front(event),
+                    Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(Err(error)) => return Err(error),
+                    Ok(Ok(None)) | Err(_) => {}
+                }
+                Ok(true)
+            }
+        }
     }
 
     pub async fn read_prompt(&mut self, prompt: &str) -> io::Result<Option<PromptEvent>> {

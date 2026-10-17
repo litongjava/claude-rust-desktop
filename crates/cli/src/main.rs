@@ -48,6 +48,7 @@ mod debug_logging;
 mod resource_commands;
 mod powerup;
 mod feedback_commands;
+mod remote_commands;
 
 use anyhow::{bail, ensure, Context, Result};
 use args::{Cli, Commands, McpCommands, OutputFormat, SessionCommands, SkillsCommands};
@@ -387,8 +388,13 @@ async fn run(cli: &Cli) -> Result<()> {
         let mut composer = terminal::prompt::Composer::default();
         let mut background_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
         background_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut remote = remote_commands::Remote::default();
         'repl: loop {
             for notice in background_commands::collect_completed(&session)? { eprintln!("{notice}"); }
+            if let Some(prompt) = remote.take_deferred() {
+                if let Err(error) = session.turn(cli, &prompt, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } }
+            }
+            if let Err(error) = remote.sync(&session) { eprintln!("Remote Control: {error:#}"); }
             skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
             if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
                 eprintln!("Keybindings: {error:#}");
@@ -447,6 +453,30 @@ async fn run(cli: &Cli) -> Result<()> {
                         input.as_ref().expect("interactive reader").notice(notice);
                     }
                 },
+                update = remote.update() => {
+                    let reader = input.as_ref().expect("interactive reader");
+                    match remote.handle(update, &mut session, |line| reader.notice(line)).await {
+                        Ok(remote_commands::Action::Prompt(prompt)) => {
+                            if !input.as_mut().expect("interactive reader").yield_prompt().await? {
+                                eprintln!("Remote prompt queued until the current input is submitted.");
+                                remote.defer(prompt);
+                            } else if composer.is_pending() {
+                                eprintln!("Remote prompt queued until the multiline prompt is finished.");
+                                remote.defer(prompt);
+                            } else {
+                                eprintln!("Remote prompt: {}", prompt.lines().next().unwrap_or_default());
+                                remote.defer(prompt);
+                                continue 'repl;
+                            }
+                        },
+                        Ok(remote_commands::Action::Refresh) => {
+                            if input.as_mut().expect("interactive reader").yield_prompt().await? { continue 'repl; }
+                        },
+                        Ok(remote_commands::Action::None) => {},
+                        Err(error) => eprintln!("Remote Control: {error:#}"),
+                    }
+                    input.as_ref().expect("interactive reader").set_permission_mode(session.permission_mode());
+                },
                 _ = tokio::signal::ctrl_c() => {
                     if composer.is_pending() {
                         composer.cancel();
@@ -501,6 +531,10 @@ async fn run(cli: &Cli) -> Result<()> {
                 Err(error) => { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } continue; },
                 Ok(background_commands::Outcome::NotHandled) => {},
             }
+            if matches!(command, "/remote-control" | "/rc") {
+                if let Err(error) = remote.command(argument, &paths, &session, &mut input).await { eprintln!("Error: {error:#}"); }
+                continue;
+            }
             if command == "/plan" {
                 match extended_commands::plan_task(argument, &paths, &mut session).await {
                     Ok(Some(task)) => if let Err(error) = session.turn(cli, &task, &mut input).await {
@@ -549,6 +583,9 @@ async fn run(cli: &Cli) -> Result<()> {
                 command if command.starts_with('/') => eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
                 _ => if let Err(error) = session.turn(cli, &line, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } },
             }
+        }
+        if remote.is_connected() {
+            if let Err(error) = remote.disconnect().await { eprintln!("Remote Control: {error:#}"); }
         }
         Ok(())
     }.await;

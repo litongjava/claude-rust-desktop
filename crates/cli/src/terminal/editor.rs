@@ -410,6 +410,16 @@ impl Screen {
         out.flush()
     }
 
+    /// Remove the editor from the screen without echoing a submitted line.
+    fn clear(&mut self) -> io::Result<()> {
+        let mut out = io::stderr();
+        queue!(out, MoveToColumn(0))?;
+        if self.cursor_row > 0 {
+            queue!(out, MoveUp(self.cursor_row as u16))?;
+        }
+        queue!(out, Clear(ClearType::FromCursorDown), ResetColor)?;
+        out.flush()
+    }
     fn finish(&mut self, text: &str, prompt: &str) -> io::Result<()> {
         // Clear menu and borders, retaining just submitted input in scrollback.
         let mut out = io::stderr();
@@ -507,6 +517,16 @@ impl PromptEditor {
         };
     }
     pub fn readline(&mut self, prompt: &str) -> io::Result<Option<super::PromptEvent>> {
+        self.readline_until(prompt, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Like `readline`, but returns `WouldBlock` once `yielded` is set,
+    /// keeping the unfinished text as the next prompt's draft.
+    pub fn readline_until(
+        &mut self,
+        prompt: &str,
+        yielded: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<Option<super::PromptEvent>> {
         terminal::enable_raw_mode()?;
         let _raw = RawMode;
         let mut input_reader = crate::terminal::paste_input::Reader::new()?;
@@ -524,6 +544,12 @@ impl PromptEditor {
         let mut search: Option<String> = None;
         let mut search_pos = self.history.len();
         loop {
+            if yielded.load(std::sync::atomic::Ordering::Acquire) {
+                self.pending_draft = buffer.text();
+                self.pending_cursor = Some(buffer.cursor);
+                screen.clear()?;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "Prompt yielded"));
+            }
             if let Some(notices) = &self.notices {
                 while let Ok(notice) = notices.try_recv() {
                     screen.finish("", "")?;
