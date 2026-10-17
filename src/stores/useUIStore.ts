@@ -8,7 +8,6 @@ interface UIState {
   showPlusMenu: boolean;
   showAgentPanel: boolean;
   showAnalyticsPanel: boolean;
-  showOnboarding: boolean;
   showDirectoryModal: boolean;
   showPromptSuggestions: boolean;
   showArtifacts: boolean;
@@ -33,7 +32,6 @@ interface UIState {
   setShowPlusMenu: (show: boolean | ((prev: boolean) => boolean)) => void;
   setShowAgentPanel: (show: boolean) => void;
   setShowAnalyticsPanel: (show: boolean) => void;
-  setShowOnboarding: (show: boolean) => void;
   setShowDirectoryModal: (show: boolean) => void;
   setShowPromptSuggestions: (show: boolean) => void;
   setShowArtifacts: (show: boolean) => void;
@@ -63,7 +61,6 @@ export const useUIStore = create<UIState>()(
     showPlusMenu: false,
     showAgentPanel: false,
     showAnalyticsPanel: false,
-    showOnboarding: typeof window !== 'undefined' ? !localStorage.getItem('onboarding_done') : false,
     showDirectoryModal: false,
     showPromptSuggestions: true,
     showArtifacts: false,
@@ -91,7 +88,6 @@ export const useUIStore = create<UIState>()(
       })),
     setShowAgentPanel: (showAgentPanel) => set({ showAgentPanel }),
     setShowAnalyticsPanel: (showAnalyticsPanel) => set({ showAnalyticsPanel }),
-    setShowOnboarding: (showOnboarding) => set({ showOnboarding }),
     setShowDirectoryModal: (showDirectoryModal) => set({ showDirectoryModal }),
     setShowPromptSuggestions: (showPromptSuggestions) => set({ showPromptSuggestions }),
     setShowArtifacts: (showArtifacts) => set({ showArtifacts }),

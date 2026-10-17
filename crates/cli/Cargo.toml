@@ -6,7 +6,7 @@ description = "Standalone terminal frontend for the shared Claude Rust engine"
 license = "MIT"
 
 [[bin]]
-name = "claude-code"
+name = "ccl"
 path = "src/main.rs"
 
 [dependencies]

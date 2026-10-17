@@ -9,7 +9,7 @@ pub(crate) const LESSONS: &[(&str, &str, &str)] = &[
     ("rewind", "Restore a checkpoint", "After an editing turn, run /rewind list, then /rewind preview ID. /rewind code ID restores recorded file edits; /rewind conversation ID branches the conversation."),
     ("background", "Run a background task", "Use /subtask PROMPT to start a worker with the current context. /tasks lists its state; /tasks show ID reads its result; /tasks cancel ID stops it."),
     ("memory", "Keep project instructions", "Use /memory edit to write CLAUDE.md or /memory local for personal project instructions. They are loaded on each turn."),
-    ("mcp", "Connect external tools", "Use /mcp to inspect configured tool servers. The claude-code mcp add command registers a stdio server; plugin-provided servers follow the plugin enabled state."),
+    ("mcp", "Connect external tools", "Use /mcp to inspect configured tool servers. The ccl mcp add command registers a stdio server; plugin-provided servers follow the plugin enabled state."),
     ("skills", "Create a reusable skill", "Create .claude/skills/NAME/SKILL.md with YAML name and description, followed by instructions. /reload-skills refreshes the menu; /NAME invokes the skill."),
     ("sessions", "Continue a conversation", "Use /rename TITLE to label this session, /resume to browse saved sessions, and /branch TITLE to continue a copy."),
     ("details", "Inspect work in progress", "Press Ctrl+O to expand tool details. The terminal also supports clicking detail headers and show less. Esc interrupts the active turn."),

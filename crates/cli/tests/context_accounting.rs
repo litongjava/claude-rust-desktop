@@ -36,7 +36,7 @@ async fn cli_persists_final_request_accounting_and_inspects_it_without_network()
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let session = uuid::Uuid::new_v4().to_string();
     let data = temp.path().join("data");
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
     command
         .current_dir(temp.path())
         .env("CLAUDE_CONFIG_DIR", temp.path().join("config"))

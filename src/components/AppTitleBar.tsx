@@ -60,7 +60,7 @@ export default function AppTitleBar({ children, height = 44 }: {
 }
 
 // Keep controls available on screens without the main toolbar. The transformed
-// content area contains fixed onboarding/dialog surfaces below the title bar.
+// content area contains fixed dialog surfaces below the title bar.
 export function WindowFrame({ children }: { children: React.ReactNode }) {
   if (!hasCustomTitleBar()) return <>{children}</>;
   return (

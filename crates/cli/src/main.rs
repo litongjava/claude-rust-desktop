@@ -126,7 +126,7 @@ async fn run(cli: &Cli) -> Result<()> {
         debug_logging::configure_filtered(log, cli.debug.as_deref().unwrap_or(""))?;
     }
     if cli.info {
-        println!("claude-code {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
+        println!("ccl {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
         return Ok(());
     }
     let mut skill_prompt = None;

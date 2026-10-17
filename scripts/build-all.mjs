@@ -28,7 +28,7 @@ function run(command, argv, capture = false) {
 
 if (args.has('--check')) {
   if (cli) run('cargo', ['check', '--locked', '-p', 'claude-code-cli', '--all-targets']);
-  if (desktop) run('cargo', ['check', '--locked', '-p', 'claude-desktop-tauri', '--all-targets']);
+  if (desktop) run('cargo', ['check', '--locked', '-p', 'claude-code-desktop', '--all-targets']);
   process.exit(0);
 }
 
@@ -44,7 +44,7 @@ if (cli) {
   run('cargo', ['build', '--locked', '-p', 'claude-code-cli', ...(debug ? [] : ['--release'])]);
   const cliDir = join(output, 'cli');
   mkdirSync(cliDir, { recursive: true });
-  copyFileSync(join(target, `claude-code${exe}`), join(cliDir, `claude-code${exe}`));
+  copyFileSync(join(target, `ccl${exe}`), join(cliDir, `ccl${exe}`));
   copyFileSync('crates/cli/LICENSE', join(cliDir, 'LICENSE'));
   products.push('cli');
 }
@@ -55,7 +55,7 @@ if (desktop) {
   run(process.execPath, [tauri, 'build', '--ci', ...(debug ? ['--debug'] : []), ...(args.has('--no-bundle') ? ['--no-bundle'] : []), '--', '--locked']);
   const desktopDir = join(output, 'desktop');
   mkdirSync(desktopDir, { recursive: true });
-  copyFileSync(join(target, `claude-desktop-tauri${exe}`), join(desktopDir, `claude-desktop-tauri${exe}`));
+  copyFileSync(join(target, `ccd${exe}`), join(desktopDir, `ccd${exe}`));
   if (!args.has('--no-bundle')) {
     const bundle = join(target, 'bundle');
     let copied = 0;

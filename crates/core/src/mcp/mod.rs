@@ -776,7 +776,7 @@ impl McpConnector {
                     "sampling": {}
                 },
                 "clientInfo": {
-                    "name": "claude-desktop-tauri",
+                    "name": "claude-code-desktop",
                     "version": "1.6.12"
                 }
             })),

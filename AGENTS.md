@@ -4,7 +4,7 @@
 
 - `src/`: React/TypeScript UI, API adapters, hooks, stores, and colocated tests. Assets live in `src/assets/` and `public/`.
 - `crates/core/`: shared Rust engine, persistence, permissions, and services. Keep business logic here, independent of Tauri.
-- `crates/cli/`: standalone `claude-code` executable; it must work without Desktop or the port 30085 Bridge.
+- `crates/cli/`: standalone `ccl` executable; it must work without Desktop or the port 30085 Bridge.
 - `src-tauri/`: Desktop adapters and Bridge routes; `src-tauri/worker/` contains the computer-operation helper.
 - `scripts/`: build orchestration; `docs/`: architecture and migration references. `legacy/claude-code-cli/` is a read-only historical snapshot, excluded from the workspace.
 
@@ -19,8 +19,8 @@ Use Node.js 22+, Rust, and the platform's Tauri prerequisites.
 - `cargo build --locked -p claude-code-cli`: build only the standalone CLI.
 - `npx tsc --noEmit`: check TypeScript types.
 - `npm run test:run`: execute frontend tests once.
-- `cargo test --locked -p claude-core --lib --tests`: run core tests; use `-p claude-code-cli` or `-p claude-desktop-tauri` for those packages.
-- `cargo check --locked -p claude-desktop-tauri --all-targets`: check Desktop targets.
+- `cargo test --locked -p claude-core --lib --tests`: run core tests; use `-p claude-code-cli` or `-p claude-code-desktop` for those packages.
+- `cargo check --locked -p claude-code-desktop --all-targets`: check Desktop targets.
 
 Cargo output is configured under the workspace root `target/`.
 

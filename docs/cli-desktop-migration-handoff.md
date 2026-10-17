@@ -4,11 +4,11 @@
 
 ## 1. 用户目标与约束
 
-用户明确要求：**旧 CLI 的语音、团队同步等外围功能必须在 `claude-rust-desktop` 中具备真实可用的实现，不能以保留历史源码代替功能迁移。**
+用户明确要求：**旧 CLI 的语音、团队同步等外围功能必须在 `claude-code-desktop` 中具备真实可用的实现，不能以保留历史源码代替功能迁移。**
 
 后续按共享业务实现、CLI 命令和 Desktop 图形入口一起交付。旧前端的具体技术栈无需原样搬入，但旧功能需要逐项映射，不能遗漏。初稿 session 只整理交接文档；2026-10-15 已开始实际实施，记录见第 9 节。
 
-- 工作仓库：`D:\code\project\project-harven\claude-rust-desktop`。
+- 工作仓库：`D:\code\project\project-harven\claude-code-desktop`。
 - 已创建并正在使用的分支：`feat/shared-core-cli-desktop`。
 - 旧仓库：`D:\code\project\project-harven\claude-code-cli`，**只读，不修改、不提交、不清理**。
 - 历史源提交：`36a6231ac3134e01c6d9dacafb2094af7afbbe7c`。
@@ -23,7 +23,7 @@
 | `Cargo.toml`、`Cargo.lock`、`.cargo/config.toml` | Workspace；构建缓存在 `src-tauri/target` |
 | `crates/core` (`claude-core`) | 共享模型、工具、权限、配置、SQLite、会话、MCP、技能等 |
 | `crates/core/src/runtime.rs` | 两端共用引擎创建、provider 转换、数据路径、会话与工具历史恢复 |
-| `crates/cli` (`claude-code-cli`) | 独立 `claude-code` 可执行文件 |
+| `crates/cli` (`claude-code-cli`) | 独立 `ccl` 可执行文件 |
 | `src-tauri` | Tauri、React 的后端适配、Bridge、凭据等；库重导出共享核心 |
 | `src-tauri/worker` | 计算机操作辅助进程，仍不是 CLI |
 | `scripts/build-all.mjs` | 一次构建 CLI、Desktop、安装包，复制 provider runtime |
@@ -127,8 +127,8 @@ git -C D:\code\project\project-harven\claude-code-cli status --short
 
 cargo test --locked -p claude-core --lib --tests
 cargo test --locked -p claude-code-cli
-cargo check --locked -p claude-desktop-tauri --all-targets
-cargo test --locked -p claude-desktop-tauri --lib --tests
+cargo check --locked -p claude-code-desktop --all-targets
+cargo test --locked -p claude-code-desktop --lib --tests
 cargo tree -p claude-code-cli
 npm run test:run
 npm run build:all
@@ -150,7 +150,7 @@ git diff --check
 ## 8. 可直接发给新 session 的任务
 
 ```text
-继续在 D:\code\project\project-harven\claude-rust-desktop 工作。
+继续在 D:\code\project\project-harven\claude-code-desktop 工作。
 先读 docs/cli-desktop-migration-handoff.md 和 docs/cli.md，检查 Git 状态。
 现有 feat/shared-core-cli-desktop 分支中已有 workspace 拆分和 CLI 整合，先检查提交记录及未提交改动，保留这些工作，不要重置或重做。
 原 D:\code\project\project-harven\claude-code-cli 仓库只读。

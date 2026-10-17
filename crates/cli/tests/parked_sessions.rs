@@ -32,7 +32,7 @@ async fn idle_park_preserves_history_and_reports_worker_shutdown_honestly() {
     } else {
         "park-test"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ccl"), &executable).unwrap();
     for target in [&parent, &child] {
         session_parking::park(&context, &parent, target, &executable)
             .await

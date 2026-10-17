@@ -119,7 +119,7 @@ pub async fn wizard(
 
 pub fn select(paths: &RuntimePaths, provider: &str, model: &str) -> Result<config::Selection> {
     // Deliberately discard startup endpoint/auth overrides on an explicit switch.
-    let mut cli = Cli::parse_from(["claude-code"]);
+    let mut cli = Cli::parse_from(["ccl"]);
     cli.provider = Some(provider.into());
     cli.model = Some(model.into());
     cli.base_url = None;
@@ -396,7 +396,7 @@ mod tests {
             p.api_key = Some("mock-only".into());
             manager.add_provider(p).unwrap();
         }
-        let cli = Cli::parse_from(["claude-code"]);
+        let cli = Cli::parse_from(["ccl"]);
         let mut session = Session::open(
             &cli,
             &paths,

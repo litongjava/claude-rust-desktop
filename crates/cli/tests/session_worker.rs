@@ -16,7 +16,7 @@ struct Cleanup(Vec<u32>);
 fn test_cli_executable() -> std::path::PathBuf {
     std::env::var_os("CLAUDE_SESSION_WORKER_TEST_EXE")
         .map(Into::into)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code").into())
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_ccl").into())
 }
 
 #[path = "support/session_worker_idle.rs"]

@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn overrides_preserve_unspecified_cli_parts_and_reject_unsupported_payloads() {
         let cli = Cli::parse_from([
-            "claude-code",
+            "ccl",
             "--system-prompt",
             "CLI_BASE",
             "--append-system-prompt",

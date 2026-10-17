@@ -5,7 +5,7 @@ use tokio::process::Command;
 
 async fn execute(args: &[&str]) -> std::process::Output {
     let temp = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ccl"));
     command
         .arg("--data-dir")
         .arg(temp.path().join("data"))

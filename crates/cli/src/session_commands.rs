@@ -646,7 +646,7 @@ mod tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let cli = crate::args::Cli::parse_from(["claude-code", "--print"]);
+        let cli = crate::args::Cli::parse_from(["ccl", "--print"]);
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store
             .create(directory.path(), "fixture-model", "fixture")

@@ -11,7 +11,7 @@ use tokio::{
 };
 
 fn cli(path: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ccl"));
     command
         .arg("--data-dir")
         .arg(path)

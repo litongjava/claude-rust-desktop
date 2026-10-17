@@ -218,7 +218,7 @@ async fn messages_cross_real_workers_at_complete_tool_boundaries_on_both_protoco
         } else {
             "message-fixture"
         });
-        std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_ccl"), &executable).unwrap();
         let target = worker::ensure_worker(&paths.data_dir, &executable, &recipient, &workspace)
             .await
             .unwrap();
@@ -365,7 +365,7 @@ async fn managed_worktree_owned_child_can_message_parent_without_new_source_trus
     } else {
         "child-fixture"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ccl"), &executable).unwrap();
     let host = worker::ensure_worker(&paths.data_dir, &executable, &parent, &prepared.path)
         .await
         .unwrap();
@@ -442,7 +442,7 @@ async fn resident_owner_resumes_same_child_with_original_provider_after_switch()
     } else {
         "resume-fixture"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_claude-code"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ccl"), &executable).unwrap();
     let host = worker::ensure_worker(&paths.data_dir, &executable, &parent, &workspace)
         .await
         .unwrap();

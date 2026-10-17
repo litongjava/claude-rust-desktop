@@ -6,6 +6,11 @@ import './index.css';
 import { initializeGeneralSettings, useGeneralSettingsStore } from './stores/useGeneralSettingsStore';
 import { useChatStore } from './stores/useChatStore';
 
+// First launch uses local providers; preserve an existing hosted-mode choice.
+if (!localStorage.getItem('user_mode')) {
+  localStorage.setItem('user_mode', 'selfhosted');
+}
+
 console.log('[Main] Starting application...');
 console.log('[Main] __TAURI_INTERNALS__:', !!(window as any).__TAURI_INTERNALS__);
 

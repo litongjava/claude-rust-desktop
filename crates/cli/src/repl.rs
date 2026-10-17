@@ -131,7 +131,7 @@ pub async fn handle(line: &str, paths: &RuntimePaths, session: &mut Session) -> 
             use clap::Parser;
             let mut words = crate::display_commands::split_arguments(argument)?;
             if words.is_empty() { words.push("list".into()); }
-            let parsed = crate::args::Cli::try_parse_from(["claude-code".into(), "mcp".into()].into_iter().chain(words))?;
+            let parsed = crate::args::Cli::try_parse_from(["ccl".into(), "mcp".into()].into_iter().chain(words))?;
             let Some(crate::args::Commands::Mcp { action }) = parsed.command else { unreachable!() };
             crate::mcp(paths, &action).await?;
         }

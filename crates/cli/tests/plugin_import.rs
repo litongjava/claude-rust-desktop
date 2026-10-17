@@ -13,7 +13,7 @@ fn imported_python_plugin_runs_in_standalone_cli_with_permission() {
     )
     .unwrap();
     let invoke = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_claude-code"))
+        Command::new(env!("CARGO_BIN_EXE_ccl"))
             .arg("--data-dir")
             .arg(temp.path().join("data"))
             .args(args)

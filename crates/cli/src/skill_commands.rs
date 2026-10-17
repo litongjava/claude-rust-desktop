@@ -445,7 +445,7 @@ mod tests {
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
         let selection=Selection{providers:vec![serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap()],provider_id:"fixture".into(),model:"fixture".into()};
         let cli = Cli::try_parse_with_mode_source([
-            "claude-code",
+            "ccl",
             "--path",
             temp.path().to_str().unwrap(),
             "--permission-mode",
@@ -495,7 +495,7 @@ mod tests {
         }));
         let server = tokio::spawn(async move{axum::serve(listener,app).await.unwrap();});
         let selection=Selection{providers:vec![serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":endpoint,"api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap()],provider_id:"fixture".into(),model:"fixture".into()};
-        let cli = Cli::try_parse_with_mode_source(["claude-code","--path",temp.path().to_str().unwrap(),"--permission-mode","auto"]).unwrap();
+        let cli = Cli::try_parse_with_mode_source(["ccl","--path",temp.path().to_str().unwrap(),"--permission-mode","auto"]).unwrap();
         let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let session_id = store.create(temp.path(), "fixture", "fixture").unwrap();
         let session = Session::open(&cli, &paths, selection, Some(&session_id)).await.unwrap();

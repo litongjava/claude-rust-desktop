@@ -99,7 +99,7 @@ async fn manual_and_model_invocations_read_resources_and_preserve_custom_overrid
             .route("/v1/chat/completions", post(respond))
             .with_state(capture.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
         command
             .current_dir(&workspace)
             .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))

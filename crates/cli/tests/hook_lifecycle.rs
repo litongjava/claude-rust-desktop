@@ -35,7 +35,7 @@ async fn failed_skill_shell_calls_failure_hook_without_starting_model() {
     // A bound but deliberately unserved endpoint proves failure precedes a model request.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
     command
         .current_dir(&workspace)
         .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))

@@ -4,18 +4,18 @@
 Cargo workspace
 ├── crates/core       claude-core：模型、工具、权限、会话、配置、SQLite
 ├── crates/cli        claude-code-cli：命令解析、REPL、流式输出
-├── src-tauri         claude-desktop-tauri：Tauri、React Bridge、系统凭据适配
+├── src-tauri         claude-code-desktop：Tauri、React Bridge、系统凭据适配
 └── src-tauri/worker  agent-worker：计算机操作辅助进程
 ```
 
-`claude-code` 直接调用 `claude-core::NativeEngine`，无需启动 Desktop、WebView 或 30085 服务。核心不依赖 Tauri。桌面库重新导出共享模块，保持原有 Rust 调用路径兼容。
+`ccl` 直接调用 `claude-core::NativeEngine`，无需启动 Desktop、WebView 或 30085 服务。核心不依赖 Tauri。桌面库重新导出共享模块，保持原有 Rust 调用路径兼容。
 
 ## 构建
 
 ```powershell
 # 原生 CLI，可独立于 npm/Tauri 编译
 cargo build --release -p claude-code-cli
-./src-tauri/target/release/claude-code.exe --help
+./target/release/ccl.exe --help
 
 # 一次产出 CLI、Desktop 和桌面安装包
 npm ci
@@ -36,31 +36,31 @@ npm run check:rust
 
 ```powershell
 # 使用 Desktop 已保存的 provider，模型 ID 必须匹配
-claude-code --provider my-provider --model my-model --path D:\code\my-project
+ccl --provider my-provider --model my-model --path D:\code\my-project
 
 # 环境变量仅注入当前运行，不写入 providers.json
 $env:DEEPSEEK_API_KEY = '<your key>'
-claude-code --model deepseek-chat query -p '检查项目并解释测试失败原因'
+ccl --model deepseek-chat query -p '检查项目并解释测试失败原因'
 
 # 单次执行和机器可读输出
-claude-code --model deepseek-chat --print '概述项目结构'
-'解释这段代码' | claude-code --model deepseek-chat --print --output-format json
-claude-code --model deepseek-chat query -p '读取 README' --output-format stream-json
+ccl --model deepseek-chat --print '概述项目结构'
+'解释这段代码' | ccl --model deepseek-chat --print --output-format json
+ccl --model deepseek-chat query -p '读取 README' --output-format stream-json
 
 # 任意兼容端点；传入环境变量名而非命令行明文密钥
-claude-code --model custom-model --base-url https://example.com --api-format openai --api-key-env MY_API_KEY query -p '检查项目'
+ccl --model custom-model --base-url https://example.com --api-format openai --api-key-env MY_API_KEY query -p '检查项目'
 
-claude-code sessions list
-claude-code --resume <session-id>
-claude-code config show
-claude-code config set model deepseek-chat
-claude-code config set base_url https://api.deepseek.com
-claude-code config set api_format openai
-claude-code config import-legacy C:\Users\you\.claude-code\settings.json
-claude-code mcp list
-claude-code mcp add my-server node -- server.mjs
-claude-code skills list
-claude-code skills execute <skill-id> '任务说明'
+ccl sessions list
+ccl --resume <session-id>
+ccl config show
+ccl config set model deepseek-chat
+ccl config set base_url https://api.deepseek.com
+ccl config set api_format openai
+ccl config import-legacy C:\Users\you\.claude-code\settings.json
+ccl mcp list
+ccl mcp add my-server node -- server.mjs
+ccl skills list
+ccl skills execute <skill-id> '任务说明'
 ```
 
 默认数据目录与 Desktop 的 `com.claude.desktop` 应用目录一致，可用 `--info` 查看。`--data-dir` 或 `CLAUDE_RUST_DATA_DIR` 可选择隔离目录。两端使用相同的 `config.json`、`claude_desktop.db` 和 MCP 配置。CLI 创建的会话是绑定项目的 Code 会话，沿用项目目录校验和 Code 提示词；恢复会话时使用原项目，传入冲突的 `--path` 会报错。
@@ -92,11 +92,11 @@ REPL 支持 `/help`、`/status`、`/history`、`/tools`、`/exit`；Ctrl+C 取�
 
 ```powershell
 $env:VOICE_API_KEY = '<audio backend credential>'
-claude-code voice-config https://your-stt-host/v1/audio/transcriptions --model whisper-1 --credential VOICE_API_KEY
-claude-code voice --file D:\audio\recording.wav
-claude-code voice --push-to-talk
-claude-code voice --push-to-talk --continuous --send
-claude-code --resume <session-id> voice --file D:\audio\recording.wav --send
+ccl voice-config https://your-stt-host/v1/audio/transcriptions --model whisper-1 --credential VOICE_API_KEY
+ccl voice --file D:\audio\recording.wav
+ccl voice --push-to-talk
+ccl voice --push-to-talk --continuous --send
+ccl --resume <session-id> voice --file D:\audio\recording.wav --send
 ```
 
 `--push-to-talk`（兼容 `-p`）以 Enter 开始/停止一段录音；`--continuous` 连续采集多个片段，`/exit` 退出。`--send` 将识别文本交给同一个共享引擎会话；不指定时输出 JSON 转写结果。Ctrl+C 取消采集或转写，采集线程退出并释放设备。录音/文件上限 25 MiB；转写请求超时 120 秒。原生音频依赖已包含在 CLI 构建中；Linux 构建需 ALSA 开发库，macOS 使用 CoreAudio，两平台尚未验收。
@@ -110,28 +110,28 @@ Desktop 在「设置 → 服务与团队」配置地址、模型及凭据（系�
 ```powershell
 # 独立终端启动服务端。此 JSON 是运维配置的凭据映射，不会自动生成有效云端 token。
 $env:TEAM_SERVER_TOKENS = '{"replace-with-operator-issued-token":"engineering"}'
-claude-code --data-dir D:\team-server team-sync serve --bind 127.0.0.1:38080
+ccl --data-dir D:\team-server team-sync serve --bind 127.0.0.1:38080
 
 # 客户端使用自己的数据目录，不依赖 Desktop 或 30085。
 $env:TEAM_SYNC_TOKEN = 'replace-with-operator-issued-token'
-claude-code --data-dir D:\team-client-a team-sync auth engineering --endpoint http://127.0.0.1:38080
-claude-code --data-dir D:\team-client-a team-sync create 'Architecture' --content 'Use Rust' --tags 'decision,backend'
-claude-code --data-dir D:\team-client-a team-sync sync
-claude-code --data-dir D:\team-client-a team-sync list
-claude-code --data-dir D:\team-client-a team-sync update <id> 'Architecture' --content 'Revised decision'
-claude-code --data-dir D:\team-client-a team-sync delete <id>
-claude-code --data-dir D:\team-client-a team-sync conflicts
-claude-code --data-dir D:\team-client-a team-sync resolve <id> --keep local
-claude-code --data-dir D:\team-client-a team-sync sync
+ccl --data-dir D:\team-client-a team-sync auth engineering --endpoint http://127.0.0.1:38080
+ccl --data-dir D:\team-client-a team-sync create 'Architecture' --content 'Use Rust' --tags 'decision,backend'
+ccl --data-dir D:\team-client-a team-sync sync
+ccl --data-dir D:\team-client-a team-sync list
+ccl --data-dir D:\team-client-a team-sync update <id> 'Architecture' --content 'Revised decision'
+ccl --data-dir D:\team-client-a team-sync delete <id>
+ccl --data-dir D:\team-client-a team-sync conflicts
+ccl --data-dir D:\team-client-a team-sync resolve <id> --keep local
+ccl --data-dir D:\team-client-a team-sync sync
 
 # 前台常驻；另一终端可控制同一实例。
-claude-code --data-dir D:\team-client-a services start team-sync --interval 60
-claude-code --data-dir D:\team-client-a services status
-claude-code --data-dir D:\team-client-a services stop team-sync
+ccl --data-dir D:\team-client-a services start team-sync --interval 60
+ccl --data-dir D:\team-client-a services status
+ccl --data-dir D:\team-client-a services stop team-sync
 
 # 旧团队 JSON：预览不写入；正式导入先备份目标，再原子导入。
-claude-code --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team --preview
-claude-code --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team
+ccl --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team --preview
+ccl --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.claude-code\team
 ```
 
 只同步用户显式创建/导入的团队记忆（ID、标题、内容、标签、版本、删除标记），不读取个人记忆、provider 配置或模型密钥；团队记忆暂不自动注入模型上下文。不同团队的数据、游标和冲突隔离。团队绑定服务端地址，切换到另一个服务端需隔离数据目录，避免复用旧游标。冲突保留双方版本；`--keep local` 重新基于远端版本上传，`--keep remote` 接受远端（包括删除）。删除以 tombstone 传播。超时或离线不清空本地待上传内容；再次 `sync` 或宿主下次轮询重试。同一 mutation ID 重发不会重复创建/增加版本。
@@ -145,8 +145,8 @@ claude-code --data-dir D:\team-client-a team-sync import-legacy C:\Users\you\.cl
 ```powershell
 cargo test -p claude-core --lib --tests
 cargo test -p claude-code-cli
-cargo check -p claude-desktop-tauri --all-targets
-cargo test -p claude-desktop-tauri --lib --tests
+cargo check -p claude-code-desktop --all-targets
+cargo test -p claude-code-desktop --lib --tests
 ```
 
 CLI 集成测试使用临时数据目录和本机模拟模型服务，实际启动可执行文件，覆盖流式输出、工具读写、权限中断、会话恢复、失败退出和旧配置只读导入，不使用真实 API 密钥。
@@ -156,9 +156,9 @@ CLI 集成测试使用临时数据目录和本机模拟模型服务，实际启�
 `memory status` 查询当前后端。`memory clear --yes` 清空该后端个人记忆，保留会话与团队数据。
 
 ```powershell
-claude-code memory import D:\backup\legacy-memory.json --preview
-claude-code memory import D:\backup\legacy-memory.json
-claude-code memory export D:\backup\personal-memory.json
+ccl memory import D:\backup\legacy-memory.json --preview
+ccl memory import D:\backup\legacy-memory.json
+ccl memory export D:\backup\personal-memory.json
 ```
 
 导入/导出要求 local 后端，支持旧 MemoryEntry 数组和新版本化归档。导入前备份完整 SQLite，报告返回路径；重复导入跳过，冲突整批回滚。导出路径必须不存在。桌面长期记忆面板提供对应预览、确认与下载。dream/auto-dream 尚未实现。
@@ -166,6 +166,6 @@ claude-code memory export D:\backup\personal-memory.json
 
 ## P2/P3 additions (2026-10-15)
 
-Dream/AutoDream, Magic Docs previews and automatic maintenance, agent roles, versioned executable plugin bundles, existing-host MCP restart, project-scoped team model context, legacy session/document imports, local diagnostics and manifest update checks are now exposed by the CLI. Run `claude-code help --topic plugins` (also `memory`, `mcp`, `agents`, `magic-docs`, `team-sync`, `services`, `voice`, `update`) or `help COMMAND` for details.
+Dream/AutoDream, Magic Docs previews and automatic maintenance, agent roles, versioned executable plugin bundles, existing-host MCP restart, project-scoped team model context, legacy session/document imports, local diagnostics and manifest update checks are now exposed by the CLI. Run `ccl help --topic plugins` (also `memory`, `mcp`, `agents`, `magic-docs`, `team-sync`, `services`, `voice`, `update`) or `help COMMAND` for details.
 
 Complete command examples, format boundaries, screenshots and remaining work are maintained in `D:/code/project/project-harven/claude-code-cli-doc/p2-p3-migration-20261015.md`. This checkpoint does not provide full old plugin/MCP import compatibility or production STT/team deployment.

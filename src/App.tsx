@@ -8,7 +8,6 @@ import { IconSidebarToggle } from './components/Icons';
 import { updateConversation, deleteConversation, exportConversation, getUnreadAnnouncements, markAnnouncementRead, getSystemStatus, detectBridgePort } from './api';
 import GitBashRequiredModal from './components/GitBashRequiredModal';
 import Auth from './components/Auth';
-import Onboarding from './components/Onboarding';
 import SettingsPage from './components/SettingsPage';
 import AgentPanel from './components/AgentPanel';
 import { useGeneralSettingsStore } from './stores/useGeneralSettingsStore';
@@ -95,8 +94,6 @@ const Layout = () => {
   const setShowTerminal = useUIStore(s => s.setShowTerminalPanel);
   const terminalHeight = useUIStore(s => s.terminalPanelHeight);
   const setTerminalHeight = useUIStore(s => s.setTerminalPanelHeight);
-  const showOnboarding = useUIStore(s => s.showOnboarding);
-  const setShowOnboarding = useUIStore(s => s.setShowOnboarding);
   const [needsGitBash, setNeedsGitBash] = useState(false);
 
   useEffect(() => {
@@ -360,24 +357,6 @@ const Layout = () => {
 
   if (needsGitBash) {
     return <WindowFrame><GitBashRequiredModal onResolved={() => setNeedsGitBash(false)} /></WindowFrame>;
-  }
-
-  if (showOnboarding) {
-    return <WindowFrame><Onboarding onComplete={() => {
-      setShowOnboarding(false);
-      if (!isTauri) { setAuthValid(true); return; }
-      const mode = localStorage.getItem('user_mode');
-      if (mode === 'selfhosted') {
-        setAuthValid(true);
-        return;
-      }
-      const hasGatewayKey = !!(localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user'));
-      if (hasGatewayKey) {
-        setAuthValid(true);
-      } else {
-        setAuthValid(false);
-      }
-    }} /></WindowFrame>;
   }
 
   if (!authChecked) {

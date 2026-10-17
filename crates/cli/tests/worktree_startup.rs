@@ -43,7 +43,7 @@ async fn response(Json(body): Json<Value>) -> impl axum::response::IntoResponse 
 }
 
 async fn cli(root: &Path, data: &Path, endpoint: &str, options: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
     command
         .current_dir(root)
         .stdin(Stdio::null())

@@ -9,7 +9,7 @@ use std::{
 };
 
 fn cli(data: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_claude-code"))
+    Command::new(env!("CARGO_BIN_EXE_ccl"))
         .args(["--data-dir", data.to_str().unwrap()])
         .args(args)
         .stdin(Stdio::null())

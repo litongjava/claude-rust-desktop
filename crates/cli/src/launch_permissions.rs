@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn legacy_names_and_empty_pattern_have_effective_canonical_rules() {
         let cli = Cli::try_parse_from([
-            "claude-code",
+            "ccl",
             "--disallowedTools",
             "Task(*) KillShell() AgentOutputTool(*) BashOutputTool Bash() Read(*) mcp__fixture__*",
         ])
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn aliases_repeated_values_and_pattern_separators_preserve_rules() {
         let cli = Cli::try_parse_from([
-            "claude-code",
+            "ccl",
             "--allowedTools",
             "Bash(git status *), Read(my files/**)",
             "Edit",
@@ -130,7 +130,7 @@ mod tests {
             "Read(a))",
             "Read(a(b))",
         ] {
-            let cli = Cli::try_parse_from(["claude-code", "--allowed-tools", value]).unwrap();
+            let cli = Cli::try_parse_from(["ccl", "--allowed-tools", value]).unwrap();
             assert!(rules(&cli).is_err(), "{value}");
         }
     }

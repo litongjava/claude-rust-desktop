@@ -5,7 +5,7 @@ pub fn repair_error(paths: &RuntimePaths, id: &str, error: anyhow::Error) -> any
     if !error.to_string().contains("Cannot repair trust while") {
         return error;
     }
-    error.context(format!("Stop the idle worker with:\n  claude-code --data-dir {} sessions shutdown-worker {}\nIf tasks are still active, that command lists their IDs and explicit cancellation commands. No running work is stopped automatically.", quote(&paths.data_dir.to_string_lossy()), quote(id)))
+    error.context(format!("Stop the idle worker with:\n  ccl --data-dir {} sessions shutdown-worker {}\nIf tasks are still active, that command lists their IDs and explicit cancellation commands. No running work is stopped automatically.", quote(&paths.data_dir.to_string_lossy()), quote(id)))
 }
 
 fn shell_tasks(paths: &RuntimePaths, id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -45,7 +45,7 @@ pub async fn shutdown_worker(paths: &RuntimePaths, id: &str) -> anyhow::Result<(
             })
             .map(|job| job.id),
     );
-    anyhow::ensure!(active.is_empty(), "Session has active tasks: {}. Wait for completion or explicitly cancel each with: claude-code --data-dir {} sessions stop-task {} TASK_ID", active.join(", "), quote(&paths.data_dir.to_string_lossy()), quote(id));
+    anyhow::ensure!(active.is_empty(), "Session has active tasks: {}. Wait for completion or explicitly cancel each with: ccl --data-dir {} sessions stop-task {} TASK_ID", active.join(", "), quote(&paths.data_dir.to_string_lossy()), quote(id));
     claude_core::services::session_worker::shutdown(&paths.data_dir, id).await?;
     println!(
         "{}",
@@ -100,7 +100,7 @@ pub fn diagnose(
     };
     let mut message = format!("Session {id} needs explicit project-folder trust.\n");
     let mut command = format!(
-        "claude-code --data-dir {} sessions trust {}",
+        "ccl --data-dir {} sessions trust {}",
         quote(&paths.data_dir.to_string_lossy()),
         quote(id)
     );
@@ -124,7 +124,7 @@ pub fn diagnose(
         message.push_str(&format!("  {} [{label}]\n", safe(&folder.path)));
         command.push_str(&format!(" --folder {}", quote(&path)));
     }
-    message.push_str(&format!("Review every directory, then run:\n  {command}\nResume with:\n  claude-code --data-dir {} --resume {}\nTrust repair affects only this session. A missing or changed source must be restored; it is not relocated by this command.", quote(&paths.data_dir.to_string_lossy()), quote(id)));
+    message.push_str(&format!("Review every directory, then run:\n  {command}\nResume with:\n  ccl --data-dir {} --resume {}\nTrust repair affects only this session. A missing or changed source must be restored; it is not relocated by this command.", quote(&paths.data_dir.to_string_lossy()), quote(id)));
     error.context(message)
 }
 

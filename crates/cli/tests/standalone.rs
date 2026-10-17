@@ -83,7 +83,7 @@ async fn server(tool: Option<&str>, fail: bool) -> (String, Fixture, tokio::task
 }
 
 fn command(data: &Path, project: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-code"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ccl"));
     command.args([
         "--data-dir",
         data.to_str().unwrap(),
