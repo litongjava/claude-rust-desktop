@@ -606,3 +606,6 @@ async fn sdk_mcp_payload_cannot_answer_a_permission_request() {
     }
     assert!(!client.finish().await.0.success());
 }
+
+#[path = "elicitation_tests.rs"]
+mod elicitation_tests;

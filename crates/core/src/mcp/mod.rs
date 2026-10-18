@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub mod composio;
 pub mod control;
+pub mod elicitation;
 pub mod tool_executor;
 pub mod transfer;
 pub mod sdk;
@@ -713,7 +714,7 @@ pub struct McpConnector {
     process: Option<Child>,
     request_id: Mutex<u64>,
     stdin: Mutex<Option<tokio::process::ChildStdin>>,
-    stdout: Mutex<Option<tokio::process::ChildStdout>>,
+    stdout: Mutex<Option<BufReader<tokio::process::ChildStdout>>>,
     retry_config: RetryConfig,
     last_heartbeat: Mutex<std::time::Instant>,
     is_healthy: Mutex<bool>,
@@ -756,7 +757,7 @@ impl McpConnector {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to take stdout"))?;
 
         self.stdin = Mutex::new(Some(stdin));
-        self.stdout = Mutex::new(Some(stdout));
+        self.stdout = Mutex::new(Some(BufReader::new(stdout)));
         self.process = Some(child);
 
         self.initialize().await?;
@@ -767,13 +768,13 @@ impl McpConnector {
     async fn initialize(&self) -> Result<()> {
         let request = McpJsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: 1,
+            id: self.next_id().await,
             method: "initialize".to_string(),
             params: Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-06-18",
                 "capabilities": {
                     "roots": {"listChanged": true},
-                    "sampling": {}
+                    "elicitation": {}
                 },
                 "clientInfo": {
                     "name": "claude-code-desktop",
@@ -783,6 +784,14 @@ impl McpConnector {
         };
 
         self.send_json_rpc(request).await?;
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("MCP stdin unavailable"))?;
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -950,7 +959,12 @@ impl McpConnector {
 
     async fn send_json_rpc(&self, request: McpJsonRpcRequest) -> Result<McpJsonRpcResponse> {
         let mut attempt = 0;
-        let max_retries = self.retry_config.max_retries;
+        // Retrying side effects can repeat elicitation and user decisions.
+        let max_retries = if request.method == "tools/call" {
+            0
+        } else {
+            self.retry_config.max_retries
+        };
 
         loop {
             match self.try_send_json_rpc(&request).await {
@@ -995,12 +1009,30 @@ impl McpConnector {
         let mut stdout_guard = self.stdout.lock().await;
         let stdout = stdout_guard.as_mut().ok_or_else(|| anyhow!("MCP stdout not available"))?;
 
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-
-        tokio::time::timeout(tokio::time::Duration::from_secs(30), reader.read_line(&mut line)).await??;
-
-        let response: McpJsonRpcResponse = serde_json::from_str(&line.trim())?;
+        let response = loop {
+            let mut line = String::new();
+            let bytes = tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                stdout.read_line(&mut line),
+            )
+            .await??;
+            anyhow::ensure!(bytes != 0, "MCP stdout closed");
+            let value: serde_json::Value = serde_json::from_str(line.trim())?;
+            if value.get("method").is_some() {
+                if value.get("id").is_some() {
+                    let reply = elicitation::reply(&self.config.id, &value).await;
+                    let mut guard = self.stdin.lock().await;
+                    let stdin = guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("MCP stdin unavailable"))?;
+                    stdin.write_all(format!("{reply}\n").as_bytes()).await?;
+                    stdin.flush().await?;
+                }
+                continue;
+            }
+            anyhow::ensure!(value["id"] == request.id, "MCP response identity mismatch");
+            break serde_json::from_value::<McpJsonRpcResponse>(value)?;
+        };
 
         if let Some(error) = &response.error {
             return Err(anyhow!("MCP error [{}]: {}", error.code, error.message));
@@ -1105,3 +1137,6 @@ impl McpConfigManager {
         self.servers.values().collect()
     }
 }
+
+#[cfg(test)]
+mod elicitation_tests;

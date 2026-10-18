@@ -39,6 +39,8 @@ pub enum HookEvent {
     ConfigChange,
     InstructionsLoaded,
     CwdChanged,
+    Elicitation,
+    ElicitationResult,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -64,6 +66,8 @@ impl HookEvent {
             Self::ConfigChange => "ConfigChange",
             Self::InstructionsLoaded => "InstructionsLoaded",
             Self::CwdChanged => "CwdChanged",
+            Self::Elicitation => "Elicitation",
+            Self::ElicitationResult => "ElicitationResult",
         }
     }
 }
@@ -143,6 +147,7 @@ pub struct HookOutcome {
     pub updated_input: Option<Value>,
     /// Model-facing MCP content, never a replacement transport envelope.
     pub updated_mcp_tool_output: Option<Value>,
+    pub elicitation_response: Option<Value>,
     mcp_output_order: usize,
     pub warnings: Vec<String>,
     /// An explicit hook request for approval must not become an automatic grant.
@@ -154,13 +159,19 @@ pub struct HookOutcome {
 
 impl HookOutcome {
     fn observe_mcp_output(&mut self, order: &std::sync::atomic::AtomicUsize) {
-        if self.updated_mcp_tool_output.is_some() {
+        if self.updated_mcp_tool_output.is_some() || self.elicitation_response.is_some() {
             self.mcp_output_order = order.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         }
     }
 
     fn merge_mcp_output(&mut self, other: &mut Self) {
-        if other.updated_mcp_tool_output.is_some() && other.mcp_output_order >= self.mcp_output_order {
+        if other.elicitation_response.is_some() && other.mcp_output_order >= self.mcp_output_order {
+            self.elicitation_response = other.elicitation_response.take();
+            self.mcp_output_order = other.mcp_output_order;
+        }
+        if other.updated_mcp_tool_output.is_some()
+            && other.mcp_output_order >= self.mcp_output_order
+        {
             self.updated_mcp_tool_output = other.updated_mcp_tool_output.take();
             self.mcp_output_order = other.mcp_output_order;
         }
@@ -329,6 +340,8 @@ impl HookRunner {
                     "ConfigChange" => HookEvent::ConfigChange,
                     "InstructionsLoaded" => HookEvent::InstructionsLoaded,
                     "CwdChanged" => HookEvent::CwdChanged,
+                    "Elicitation" => HookEvent::Elicitation,
+                    "ElicitationResult" => HookEvent::ElicitationResult,
                     _ => {
                         ensure!(
                             !groups.iter().any(|g| g
@@ -359,6 +372,12 @@ impl HookRunner {
                                     hook["type"]
                                 );
                             }
+                        }
+                        if matches!(event, HookEvent::Elicitation | HookEvent::ElicitationResult) {
+                            ensure!(
+                                hook["async"] != true && hook["asyncRewake"] != true,
+                                "Elicitation hooks must run synchronously"
+                            );
                         }
                         let prompt = prompt::load(&mut hook, event)?;
                         let http = if hook["type"] == "http" {
@@ -564,6 +583,7 @@ impl HookRunner {
                 | HookEvent::InstructionsLoaded
         );
         let match_key = match event {
+            HookEvent::Elicitation | HookEvent::ElicitationResult => "mcp_server_name",
             HookEvent::SessionStart | HookEvent::ConfigChange => "source",
             HookEvent::Setup => "trigger",
             HookEvent::Notification => "notification_type",
@@ -664,7 +684,9 @@ impl HookRunner {
                         if (lifecycle
                             || matches!(
                                 event,
-                                HookEvent::ConfigChange
+                                HookEvent::Elicitation
+                                    | HookEvent::ElicitationResult
+                                    | HookEvent::ConfigChange
                                     | HookEvent::PreToolUse
                                     | HookEvent::PermissionRequest
                                     | HookEvent::PostToolUse
@@ -888,6 +910,33 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
 fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
     ensure!(output.is_object(), "Hook output must be an object");
     let mut result = HookOutcome::default();
+    if matches!(event, HookEvent::Elicitation | HookEvent::ElicitationResult) {
+        result.blocked = string_field(&output, "decision")? == Some("block");
+        result.reason = string_field(&output, "reason")?
+            .unwrap_or("Elicitation blocked by hook")
+            .into();
+        if let Some(specific) = output.get("hookSpecificOutput") {
+            ensure!(specific.is_object(), "hookSpecificOutput must be an object");
+            ensure!(
+                string_field(specific, "hookEventName")? == Some(event.name()),
+                "Hook returned an incorrect hookEventName"
+            );
+            if let Some(action) = string_field(specific, "action")? {
+                ensure!(
+                    ["accept", "decline", "cancel"].contains(&action),
+                    "Invalid elicitation hook action"
+                );
+                let mut response = json!({"action":action});
+                if let Some(content) = specific.get("content") {
+                    ensure!(content.is_object(), "Elicitation content must be an object");
+                    response["content"] = content.clone();
+                }
+                result.blocked |= action == "decline";
+                result.elicitation_response = Some(response);
+            }
+        }
+        return Ok(result);
+    }
     if matches!(
         event,
         HookEvent::Notification

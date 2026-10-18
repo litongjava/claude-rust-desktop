@@ -1397,7 +1397,50 @@ impl ToolLoopExecutor {
 
         if let Some(ref registry) = self.mcp_registry {
             if registry.is_mcp_tool(tool_name).await {
-                let result = registry.execute_with_provenance(tool_name, tool_input.clone()).await;
+                let event_tx = self.event_tx.clone();
+                let waiters = self.answer_waiters.clone();
+                let tool_use_id = _tool_use_id.to_owned();
+                let durable_user_input = self.durable_user_input;
+                let context = crate::mcp::elicitation::RequestContext {
+                    hooks: self.hooks.clone(),
+                    session: self.conv_id.clone().unwrap_or_default(),
+                    ask: Arc::new(move |input| {
+                        let event_tx = event_tx.clone();
+                        let waiters = waiters.clone();
+                        let tool_use_id = tool_use_id.clone();
+                        Box::pin(async move {
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let (tx, rx) = oneshot::channel();
+                            waiters.lock().await.insert(request_id.clone(), tx);
+                            let _guard = PermissionWaiterGuard {
+                                waiters,
+                                request_id: request_id.clone(),
+                            };
+                            let mut input = input;
+                            input["subtype"] = serde_json::json!("elicitation");
+                            event_tx.send(EngineEvent::AskUser {
+                                request_id, tool_use_id, tool_input: input.clone(),
+                                question: format!("MCP {}: {}\nSchema: {}\nEnter a JSON object to accept, or decline / cancel:", input["mcp_server_name"], input["message"], input["requested_schema"]),
+                                options: vec![],
+                            }).await.map_err(|_| anyhow!("Elicitation host closed"))?;
+                            let answer = if durable_user_input {
+                                rx.await
+                            } else {
+                                tokio::time::timeout(Duration::from_secs(300), rx)
+                                    .await
+                                    .map_err(|_| anyhow!("Elicitation timed out"))?
+                            }
+                            .map_err(|_| anyhow!("Elicitation cancelled"))?;
+                            Ok(serde_json::from_str(&answer)?)
+                        })
+                    }),
+                };
+                let result = crate::mcp::elicitation::CONTEXT
+                    .scope(
+                        context,
+                        registry.execute_with_provenance(tool_name, tool_input.clone()),
+                    )
+                    .await;
                 match result {
                     Ok(result) => {
                         is_error = result.value["isError"].as_bool().unwrap_or(false);
@@ -1913,8 +1956,29 @@ impl ToolLoopExecutor {
                                 }).await;
 
                                 // Memory calls need this executor's configured client, not a generic stub.
-                                let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || matches!(name.as_str(), "AskUserQuestion" | "ProposeGoal")
-                                    || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
+                                let requires_user_interaction = matches!(
+                                    name.as_str(),
+                                    "Workflow"
+                                        | "Skill"
+                                        | "Agent"
+                                        | "Delegate"
+                                        | "Worker"
+                                        | "SendMessage"
+                                        | "team"
+                                        | "plan_mode"
+                                        | "EnterPlanMode"
+                                        | "ExitPlanMode"
+                                ) || matches!(
+                                    name.as_str(),
+                                    "AskUserQuestion" | "ProposeGoal"
+                                ) || name.starts_with("mcp__")
+                                    || matches!(
+                                        name.as_str(),
+                                        "ListMcpResources" | "ReadMcpResource"
+                                    )
+                                    || crate::tools::tasks::is_task(&name)
+                                    || is_memory_tool(&name)
+                                    || self.hooks.is_some()
                                     || self.is_plan_document_tool(&name, &input)
                                     || self.check_permission_requires_confirmation(&name, &input);
 
@@ -2459,10 +2523,27 @@ impl ToolLoopExecutor {
                     }).await;
 
                     // Memory calls need this executor's configured client, not a generic stub.
-                    let requires_user_interaction = matches!(name.as_str(), "Workflow" | "Skill" | "Agent" | "Delegate" | "Worker" | "SendMessage" | "team" | "plan_mode" | "EnterPlanMode" | "ExitPlanMode") || matches!(name.as_str(), "AskUserQuestion" | "ProposeGoal")
-                        || crate::tools::tasks::is_task(&name) || is_memory_tool(&name) || self.hooks.is_some()
-                        || self.is_plan_document_tool(name, &input)
-                        || self.check_permission_requires_confirmation(name, &input);
+                    let requires_user_interaction =
+                        matches!(
+                            name.as_str(),
+                            "Workflow"
+                                | "Skill"
+                                | "Agent"
+                                | "Delegate"
+                                | "Worker"
+                                | "SendMessage"
+                                | "team"
+                                | "plan_mode"
+                                | "EnterPlanMode"
+                                | "ExitPlanMode"
+                        ) || matches!(name.as_str(), "AskUserQuestion" | "ProposeGoal")
+                            || name.starts_with("mcp__")
+                            || matches!(name.as_str(), "ListMcpResources" | "ReadMcpResource")
+                            || crate::tools::tasks::is_task(&name)
+                            || is_memory_tool(&name)
+                            || self.hooks.is_some()
+                            || self.is_plan_document_tool(name, &input)
+                            || self.check_permission_requires_confirmation(name, &input);
 
                     assistant_tool_calls.push(crate::native_engine::openai_client::OpenAIToolCall {
                         id: id.clone(),

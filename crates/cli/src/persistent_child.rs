@@ -212,11 +212,15 @@ async fn execute(
                             }
                         }));
                     },
-                    EngineEvent::AskUser { request_id, question, options, .. } => {
+                    EngineEvent::AskUser { request_id, question, options, tool_input, .. } => {
                         let question = format!("Owned child {child}: {question}\n{}", options.iter().enumerate().map(|(i, value)|format!("{}. {value}",i+1)).collect::<Vec<_>>().join("\n"));
                         pending_answer = Some(Box::pin(async move {
                             let answer = jobs::worker_answer(&worker.root, &session.id, &request_id, "question", &question).await?.context("Worker answer channel missing")?;
                             let answer = answer.trim().parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| options.get(i)).cloned().unwrap_or(answer);
+                            let answer = if tool_input["subtype"] == "elicitation" {
+                                claude_core::mcp::elicitation::user_response(&answer)
+                                    .unwrap_or_else(|_| json!({"action":"cancel"})).to_string()
+                            } else { answer };
                             Ok(Some((request_id, answer, false)))
                         }));
                     },

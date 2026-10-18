@@ -85,12 +85,23 @@ impl Run {
     }
     async fn request(&self, server: &str, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
-        let response = self
+        let mut response = self
             .exchange(
                 server,
                 json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
             )
             .await?;
+        for _ in 0..64 {
+            if response.get("method").is_none() {
+                break;
+            }
+            ensure!(
+                response.get("id").is_some(),
+                "Unexpected SDK MCP notification response"
+            );
+            let reply = super::elicitation::reply(server, &response).await;
+            response = self.exchange(server, reply).await?;
+        }
         ensure!(
             response.is_object()
                 && response["jsonrpc"] == "2.0"
@@ -125,7 +136,7 @@ impl Run {
             let mut all_names = HashSet::new();
             let mut schema_bytes = 0usize;
             for name in &self.names {
-                let initialized = self.request(name,"initialize",json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-code-rust","version":env!("CARGO_PKG_VERSION")}})).await?;
+                let initialized = self.request(name,"initialize",json!({"protocolVersion":"2025-06-18","capabilities":{"elicitation":{}},"clientInfo":{"name":"claude-code-rust","version":env!("CARGO_PKG_VERSION")}})).await?;
                 ensure!(matches!(initialized["protocolVersion"].as_str(),Some("2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25")), "Unsupported SDK MCP protocol version");
                 ensure!(initialized["capabilities"].is_object(), "SDK MCP initialize requires capabilities");
                 ensure!(initialized["serverInfo"]["name"].is_string() && initialized["serverInfo"]["version"].is_string(), "SDK MCP initialize requires serverInfo");

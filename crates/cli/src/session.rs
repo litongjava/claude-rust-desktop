@@ -895,6 +895,30 @@ impl Session {
                     },
                     EngineEvent::AskUser { request_id, tool_use_id, tool_input, question, options } => {
                         progress.clear();
+                        if tool_input["subtype"] == "elicitation" {
+                            let answer = if let Some(runtime) = &self.sdk_hooks {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(295)) => json!({"action":"cancel"}),
+                                    result = runtime.broker.request(tool_input.clone()) => result.unwrap_or_else(|_| json!({"action":"cancel"})),
+                                }
+                            } else {
+                                let answer = if let Some(answer) = claude_core::services::background_sessions::worker_answer(&self.paths.data_dir, &self.id, &request_id, "question", &question).await? {
+                                    answer
+                                } else if input.is_some() {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(295)) => "cancel".to_owned(),
+                                        answer = turn_answer(self, &mut progress, input, question) => answer.unwrap_or_else(|_| "cancel".into()),
+                                    }
+                                } else { "cancel".into() };
+                                claude_core::mcp::elicitation::user_response(&answer).unwrap_or_else(|error| {
+                                    progress.notice(&format!("Invalid elicitation response; cancelled: {error}"));
+                                    json!({"action":"cancel"})
+                                })
+                            };
+                            self.engine.resume_with_answer(&request_id, answer.to_string()).await?;
+                            progress.set_activity("Composing");
+                            continue;
+                        }
                         if let Some(sdk)=&self.sdk_permissions {
                             let answer=sdk.ask_question(&request_id,&tool_use_id,&question,&tool_input).await?;
                             self.engine.resume_with_answer(&request_id,answer).await?;

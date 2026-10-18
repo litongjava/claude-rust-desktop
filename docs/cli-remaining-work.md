@@ -63,11 +63,11 @@
 
 ### P2 Hook 生命周期事件（清单 H1）
 
-入口：`tool_hooks.rs` 的 `HookEvent`（当前 21 个）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
+入口：`tool_hooks.rs` 的 `HookEvent`（当前 23 个）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
 
 - [x] 第一批生命周期事件：`Notification`、`StopFailure`、`Setup`、`ConfigChange`、`InstructionsLoaded`、`CwdChanged`。已接入独立 CLI 实际路径、精确 payload/matcher、输出语义、SDK 回调与类型限制；once/if/status/取消/超时复用并测试。core 595/0/7、CLI 261/0/1；transcript 仅在匹配 hook/SDK 实际执行前按 run 生成一次，失败警告不阻断分发；逐事件差异与不可触发子场景见开发记录 `lifecycle-events-acceptance-20261018.md`（ConfigChange 使用轮询/使用前检查，拒绝后阻止后续使用；不声称与原版 watcher 完全等价）。
 - [ ] `FileChanged`：依赖 `watchPaths`，留到任务 09。
-- 需本地 MCP elicitation 请求方：`Elicitation`、`ElicitationResult`。
+- [x] `Elicitation`、`ElicitationResult`（form 模式最小可用链路）：stdio / SDK MCP 反向请求、服务器 matcher、hook 直接 accept/decline/cancel、结果修改/阻止、requested_schema 校验、CLI/worker 交互和 SDK 控制应答；无交互默认 cancel。URL 模式及异步 elicitation hook 明确报错，不宣称支持。验收详见开发记录 `elicitation-hooks-acceptance-20261018.md`。
 - 依赖 P4 团队：`TaskCreated`、`TaskCompleted`（完成前可拒绝）、`TeammateIdle`。
 
 ### P3 Hook 输出与环境（清单 H3）
