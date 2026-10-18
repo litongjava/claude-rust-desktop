@@ -61,6 +61,8 @@ pub struct ActiveHook {
     pub event: HookEvent,
     pub matcher: String,
     pub command: String,
+    #[serde(flatten)]
+    pub http: Option<HttpHook>,
     pub timeout: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
@@ -157,6 +159,10 @@ fn json_truthy(value: &Value) -> bool {
     }
 }
 
+#[path = "tool_hook_http.rs"]
+mod http;
+pub use http::HttpHook;
+
 #[path = "tool_hook_once.rs"]
 mod once;
 
@@ -229,6 +235,8 @@ impl HookRunner {
         ];
         let mut hooks = Vec::new();
         let mut disabled = false;
+        let mut allowed_http_urls: Option<Vec<String>> = None;
+        let mut http_env_vars: Option<Vec<String>> = None;
         for source in sources {
             let content = match std::fs::read_to_string(&source) {
                 Ok(content) => content,
@@ -243,6 +251,12 @@ impl HookRunner {
             configs.push((source, settings));
         }
         for (source, settings) in configs {
+            for (field, target) in [("allowedHttpHookUrls", &mut allowed_http_urls), ("httpHookAllowedEnvVars", &mut http_env_vars)] {
+                if let Some(value) = settings.get(field) {
+                    let entries: Vec<String> = serde_json::from_value(value.clone()).with_context(|| format!("{field} must be an array of strings"))?;
+                    target.get_or_insert_with(Vec::new).extend(entries);
+                }
+            }
             if let Some(value) = settings.get("disableAllHooks") {
                 disabled = value.as_bool().context("disableAllHooks must be boolean")?;
             }
@@ -276,12 +290,22 @@ impl HookRunner {
                         regex::Regex::new(&group.matcher)
                             .context("Invalid hook matcher regular expression")?;
                     }
-                    for hook in group.hooks {
-                        ensure!(hook["type"] == "command", "Unsupported hook type for {name} in {}; only command hooks are implemented", source.display());
-                        ensure!(
-                            hook.get("async").and_then(Value::as_bool) != Some(true),
-                            "Async command hooks are not implemented"
-                        );
+                    for mut hook in group.hooks {
+                        ensure!(hook["type"] == "command" || hook["type"] == "http", "Unsupported hook type for {name} in {}; only command and http hooks are implemented", source.display());
+                        for option in ["async", "asyncRewake"] {
+                            if let Some(value) = hook.get(option) {
+                                ensure!(value.is_boolean(), "Hook {option} must be boolean");
+                                ensure!(value == false, "Hook {option} is not implemented");
+                            }
+                        }
+                        let http = if hook["type"] == "http" {
+                            ensure!(hook.get("command").is_none() && hook.get("shell").is_none(), "HTTP hooks cannot specify command or shell");
+                            let config: HttpHook = serde_json::from_value(hook.clone())?;
+                            config.validate()?;
+                            hook["command"] = json!(config.url());
+                            if hook.get("timeout").is_none() { hook["timeout"] = json!(600); }
+                            Some(config)
+                        } else { None };
                         let hook: CommandConfig = serde_json::from_value(hook)?;
                         ensure!(
                             !hook.command.trim().is_empty(),
@@ -302,6 +326,7 @@ impl HookRunner {
                             event,
                             matcher: group.matcher.clone(),
                             command: hook.command,
+                            http,
                             timeout: hook.timeout,
                             once: hook.once,
                             status_message: hook.status_message,
@@ -313,6 +338,12 @@ impl HookRunner {
                         });
                     }
                 }
+            }
+        }
+        for hook in &mut hooks {
+            if let Some(http) = &mut hook.http {
+                http.allowed_urls = allowed_http_urls.clone();
+                http.policy_env_vars = http_env_vars.clone();
             }
         }
         if disabled {
@@ -439,7 +470,7 @@ impl HookRunner {
                 let input = Value::Object(input.clone());
                 pending.push(Box::pin(async move {
                     let Some((code, stdout, stderr)) = self.execute_once(hook, session_id, &input).await? else { return Ok(HookOutcome::default()); };
-                    parse_output(event, code, &stdout, &stderr)
+                    parse_hook_output(hook, code, &stdout, &stderr)
                 }));
             }
             if let Some(callbacks) = self.callbacks(session_id) {
@@ -509,7 +540,7 @@ impl HookRunner {
                                 self.execute_once(hook, session_id, &Value::Object(input.clone()))
                                     .await?;
                             let Some(output) = output else { return Ok(HookOutcome::default()); };
-                            parse_output(event, output.0, &output.1, &output.2)
+                            parse_hook_output(hook, output.0, &output.1, &output.2)
                         }
                         .await;
                         let mut outcome = match outcome {
@@ -608,6 +639,13 @@ impl HookRunner {
 
 fn matches_tool(matcher: &str, tool: &str) -> Result<bool> {
     Ok(matcher.is_empty() || matcher == "*" || regex::Regex::new(matcher)?.is_match(tool))
+}
+
+fn parse_hook_output(hook: &ActiveHook, code: i32, stdout: &str, stderr: &str) -> Result<HookOutcome> {
+    if hook.http.is_some() {
+        if code == 0 { parse_json_output(hook.event, serde_json::from_str(stdout)?) }
+        else { Ok(HookOutcome { warnings: vec![stderr.into()], ..Default::default() }) }
+    } else { parse_output(hook.event, code, stdout, stderr) }
 }
 
 fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Result<HookOutcome> {
@@ -762,6 +800,7 @@ fn string_field<'a>(value: &'a Value, name: &str) -> Result<Option<&'a str>> {
 }
 
 async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, String, String)> {
+    if let Some(config) = &hook.http { return http::execute_http(hook, config, input).await; }
     let shell = hook
         .shell
         .as_deref()
@@ -956,7 +995,7 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false,status_message:None}).collect(),..Default::default()};
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,http:None,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false,status_message:None}).collect(),..Default::default()};
         let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
         assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
         assert!(root.path().join("slow-started").exists());
@@ -1036,6 +1075,7 @@ mod tests {
             event: HookEvent::PreToolUse,
             matcher: "*".into(),
             command: command.into(),
+            http: None,
             timeout: 10,
             source: root.path().into(),
             shell: Some(shell.into()),
@@ -1141,6 +1181,7 @@ mod tests {
             event: HookEvent::PreToolUse,
             matcher: "".into(),
             command: command.into(),
+            http: None,
             timeout: 1,
             source: root.path().into(),
             shell: Some(shell.into()),
@@ -1165,6 +1206,7 @@ mod tests {
             event: HookEvent::PreToolUse,
             matcher: "".into(),
             command: command.into(),
+            http: None,
             timeout: 10,
             source: cwd.clone(),
             shell: Some(shell.into()),

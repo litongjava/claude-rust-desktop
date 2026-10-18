@@ -51,8 +51,8 @@
 
 入口：`crates/core/src/services/tool_hooks.rs`（`CommandConfig` 约 174 行；loader 只接受 `type: command` 并拒绝 `async: true`；`ActiveHook::condition_matches` 约 77 行，新类型必须复用）。参考：`reference:src/schemas/hooks.ts`、`reference:src/utils/hooks.ts`、`reference:src/utils/hooks/exec{Prompt,Http,Agent}Hook.ts`。
 
-1. `once`：匹配执行一次后注销，重复调用不再运行。
-2. `statusMessage`：hook 运行期间显示、结束清除的进度文本。
+1. [x] `once`：首次成功后按会话持久化注销；并发、重载、失败/取消重试已验证（`5b026c8`，详见开发记录 `once-acceptance-20261018.md`）。
+2. [x] `statusMessage`：CLI/worker 运行进度、完成/失败/取消清除及 ConPTY 恢复验收完成（`a2a0366`，详见 `status-message-acceptance-20261018.md`）。
 3. HTTP hook：本地 HTTP fixture；超时/错误策略；header 环境变量插值需显式白名单。
 4. Command `async`：生命周期托管的后台执行，后续允许的输出投递，进程清理。
 5. `asyncRewake`：完成/唤醒语义（尤其 exit code 2），取消后不重放。
@@ -102,13 +102,15 @@
 代码已存在，缺的是真实环境验证；每项开始前向用户确认所需账号/环境。
 
 - 真实 Remote Control 服务与客户端（授权账号）。
-- 真实账号 OAuth、用量、fast 模式权限、反馈投递。
 - IDE 扩展（真实扩展版本、选区、diff 接受/拒绝、断线重连）。
 - Design 服务（授权、上传、渲染；浏览器测试按 deepseek-browser-use 流程）。
 - 真实 LSP 服务器（rust-analyzer/TypeScript/Python，九种操作、写入后诊断、重启）。
 - Linux/macOS 编译与运行。
 - 与官方 CLI 的终端对比（同宽度/主题/模型，原始 ANSI + 最终屏幕）与响应速度（本地端点同延迟下分离启动/输入/渲染与首 token 延迟）。
 - qwerty-learner issue #1095：先读 `issue1095-pass2-final-review.md` 等已有记录，目标仓库不提交。
+
+### 暂时不做的任务
+- 真实账号 OAuth、用量、fast 模式权限、反馈投递。
 
 ## 6. 每项完成后
 

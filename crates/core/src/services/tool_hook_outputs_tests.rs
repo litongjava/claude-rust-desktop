@@ -75,6 +75,7 @@ async fn delayed_command_tail_cannot_overwrite_newer_callback_output() {
             event: HookEvent::PostToolUse,
             matcher: String::new(),
             command: command.into(),
+            http: None,
             timeout: 20,
             source: root.path().into(),
             shell: Some(shell.into()),

@@ -79,7 +79,7 @@ impl HookRunner {
                     );
                 }
             } else if hook.event != HookEvent::WorktreeRemove {
-                parse_output(hook.event, output.0, &output.1, &output.2)?;
+                parse_hook_output(hook, output.0, &output.1, &output.2)?;
             }
             file.seek(SeekFrom::Start(0))?;
             file.write_all(b"success\n")?;
