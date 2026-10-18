@@ -62,6 +62,7 @@ pub struct ActiveHook {
     pub matcher: String,
     pub command: String,
     pub timeout: u64,
+    pub once: bool,
     pub source: PathBuf,
     pub shell: Option<String>,
     /// Permission-rule filter evaluated before spawning (upstream `if`).
@@ -153,6 +154,9 @@ fn json_truthy(value: &Value) -> bool {
     }
 }
 
+#[path = "tool_hook_once.rs"]
+mod once;
+
 #[cfg(test)]
 #[path = "tool_hook_outputs_tests.rs"]
 mod output_tests;
@@ -173,6 +177,8 @@ struct MatcherConfig {
 #[derive(Debug, Deserialize)]
 struct CommandConfig {
     command: String,
+    #[serde(default)]
+    once: bool,
     #[serde(default = "default_timeout")]
     timeout: u64,
     #[serde(default)]
@@ -187,6 +193,7 @@ fn default_timeout() -> u64 {
 #[derive(Default)]
 pub struct HookRunner {
     workspace: PathBuf,
+    once_directory: PathBuf,
     hooks: Vec<ActiveHook>,
     callbacks: Option<std::sync::Weak<super::hook_callbacks::Registration>>,
     disabled: bool,
@@ -291,6 +298,7 @@ impl HookRunner {
                             matcher: group.matcher.clone(),
                             command: hook.command,
                             timeout: hook.timeout,
+                            once: hook.once,
                             source: source.clone(),
                             shell: hook.shell,
                             if_condition: hook.if_condition.map(|condition| {
@@ -306,6 +314,7 @@ impl HookRunner {
         }
         Ok(Self {
             workspace: workspace.to_path_buf(),
+            once_directory: data_dir.join("hook-once"),
             hooks,
             disabled,
             callbacks: None,
@@ -350,7 +359,7 @@ impl HookRunner {
         payload["hook_event_name"] = json!(event.name());
         let mut path = None;
         for hook in self.hooks.iter().filter(|hook|hook.event == event && hook.if_condition.is_none()) {
-            let (code, stdout, stderr) = execute(hook, &self.workspace, &payload).await?;
+            let Some((code, stdout, stderr)) = self.execute_once(hook, session, &payload).await? else { continue; };
             ensure!(code == 0, "{} hook failed ({code}): {}", event.name(), stderr.trim());
             if event == HookEvent::WorktreeCreate && path.is_none() && !stdout.trim().is_empty() {
                 path = Some(if stdout.trim().starts_with('{') {
@@ -423,7 +432,7 @@ impl HookRunner {
                 }
                 let input = Value::Object(input.clone());
                 pending.push(Box::pin(async move {
-                    let (code, stdout, stderr) = execute(hook, &self.workspace, &input).await?;
+                    let Some((code, stdout, stderr)) = self.execute_once(hook, session_id, &input).await? else { return Ok(HookOutcome::default()); };
                     parse_output(event, code, &stdout, &stderr)
                 }));
             }
@@ -491,8 +500,9 @@ impl HookRunner {
                         }
                         let outcome = async {
                             let output =
-                                execute(hook, &self.workspace, &Value::Object(input.clone()))
+                                self.execute_once(hook, session_id, &Value::Object(input.clone()))
                                     .await?;
+                            let Some(output) = output else { return Ok(HookOutcome::default()); };
                             parse_output(event, output.0, &output.1, &output.2)
                         }
                         .await;
@@ -938,7 +948,7 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None}).collect(),..Default::default()};
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false}).collect(),..Default::default()};
         let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
         assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
         assert!(root.path().join("slow-started").exists());
@@ -1017,6 +1027,7 @@ mod tests {
             source: root.path().into(),
             shell: Some(shell.into()),
             if_condition: None,
+            once: false,
         };
         let runner = HookRunner {
             workspace: root.path().into(),
@@ -1120,6 +1131,7 @@ mod tests {
             source: root.path().into(),
             shell: Some(shell.into()),
             if_condition: None,
+            once: false,
         };
         let error = execute(&hook, root.path(), &json!({})).await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -1142,6 +1154,7 @@ mod tests {
             source: cwd.clone(),
             shell: Some(shell.into()),
             if_condition: None,
+            once: false,
         };
         let task = tokio::spawn(async move { execute(&hook, &cwd, &json!({})).await });
         tokio::time::timeout(Duration::from_secs(10), async {
