@@ -270,3 +270,106 @@ async fn dont_ask_hook_ask_denies_preapproved_write_without_waiter() {
         assert!(!matches!(event, EngineEvent::ToolPermission { .. }));
     }
 }
+
+#[tokio::test]
+async fn permission_notification_precedes_fast_hook_denial_exactly_once() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("notification.cjs");
+    std::fs::write(&script, r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>{fs.appendFileSync('notification.jsonl',JSON.stringify(JSON.parse(s))+'\n');process.exit(2)});"#).unwrap();
+    let hooks = load_hooks(
+        dir.path(),
+        json!({"hooks":{
+            "Notification":[{"matcher":"^permission_prompt$","hooks":[{"type":"command","command":format!("node \"{}\"",script.display())}]}],
+            "PermissionRequest":[{"hooks":[{"type":"command","command":"node -e \"console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'PermissionRequest',decision:{behavior:'deny',message:'fixture'}}}))\""}]}]
+        }}),
+    );
+    let (tx, _rx) = mpsc::channel(16);
+    let mut executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1"),
+        vec![],
+        None,
+        128,
+        tx,
+        dir.path().to_string_lossy().into_owned(),
+        ReasoningMode::Standard,
+    )
+    .with_conv_id("notification-session".into())
+    .with_hooks(hooks);
+    let (_, _, failed) = executor
+        .execute_ask_user_confirmation(
+            "Write",
+            &json!({"file_path":"x","content":"x"}),
+            "write-1",
+            "approve",
+        )
+        .await;
+    assert!(failed);
+    let rows: Vec<Value> = std::fs::read_to_string(dir.path().join("notification.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({"hook_event_name":"Notification","session_id":"notification-session","cwd":dir.path(),"transcript_path":rows[0]["transcript_path"],"notification_type":"permission_prompt","message":"Claude needs your permission to use Write"})
+    );
+    assert!(!dir.path().join("x").exists());
+}
+
+#[tokio::test]
+async fn transcript_write_failure_does_not_block_hooks_or_the_tool() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("hook-transcripts"), "obstruction").unwrap();
+    let script = root.path().join("capture-transcript.cjs");
+    std::fs::write(&script,r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>{fs.appendFileSync('transcript-events.jsonl',JSON.stringify(JSON.parse(s))+'\n');console.log('{}')});"#).unwrap();
+    let command = json!({"type":"command","command":format!("node \"{}\"",script.display())});
+    let hooks = load_hooks(
+        root.path(),
+        json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[command.clone(),command.clone()]}],"PostToolUse":[{"matcher":"Bash","hooks":[command]}]}}),
+    );
+    let (tx, _rx) = mpsc::channel(32);
+    let manager = crate::runtime::default_permissions();
+    manager.set_mode(crate::permissions::PermissionMode::BypassPermissions);
+    let mut executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1"),
+        vec![],
+        None,
+        128,
+        tx,
+        root.path().to_string_lossy().into_owned(),
+        ReasoningMode::Standard,
+    )
+    .with_conv_id("transcript-failure".into())
+    .with_permission_manager(manager)
+    .with_hooks(hooks);
+    let (_, output, failed) = executor
+        .execute_tool_call("Bash", &json!({"command":"echo tool-still-runs"}), "tool-1")
+        .await;
+    assert!(!failed, "{output}");
+    assert!(output.contains("tool-still-runs"));
+    let rows: Vec<Value> = std::fs::read_to_string(root.path().join("transcript-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 3);
+    for (row, event) in rows.iter().zip(["PreToolUse", "PreToolUse", "PostToolUse"]) {
+        assert_eq!(row["hook_event_name"], event);
+        assert_eq!(
+            row["transcript_path"],
+            json!(crate::services::lifecycle_events::transcript_path(
+                &data,
+                "transcript-failure"
+            ))
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(data.join("hook-transcripts")).unwrap(),
+        "obstruction"
+    );
+}

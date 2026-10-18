@@ -1170,6 +1170,7 @@ impl ToolLoopExecutor {
         tracing::info!(module = "ToolLoop", "[E6] API format: {:?}", self.provider.provider.api_format);
 
         let user_skill = self.prepare_user_skill().await;
+        let api_request = matches!(user_skill, Ok(None));
         let loop_result = match user_skill {
             Err(error) => Err(error),
             Ok(Some(text)) => Ok((text, Some("end_turn".into()))),
@@ -1185,6 +1186,38 @@ impl ToolLoopExecutor {
             },
         };
 
+        if api_request {
+            let failure = match &loop_result {
+                Err(error) => Some(error.to_string()),
+                Ok((text, reason))
+                    if matches!(reason.as_deref(), Some("stream_error" | "error" | "failed")) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            };
+            if let (Some(error), Some(hooks)) = (failure, &self.hooks) {
+                if !self.event_tx.is_closed()
+                    && self
+                        .permission_interrupted
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_none()
+                {
+                    let payload = json!({"error":crate::services::lifecycle_events::api_error_kind(&error),"error_details":error});
+                    if let Err(error) = hooks
+                        .run(
+                            crate::services::tool_hooks::HookEvent::StopFailure,
+                            &conv_id,
+                            payload,
+                        )
+                        .await
+                    {
+                        tracing::warn!("StopFailure hook: {error:#}");
+                    }
+                }
+            }
+        }
         let loop_result = loop_result.and_then(|(text, stop_reason)| {
             if let Some(schema) = &self.response_schema {
                 if !matches!(stop_reason.as_deref(),Some("stream_error"|"error"|"interrupted"|"failed"|"cancelled"|"max_iterations"|"max_tokens"|"length"|"incomplete")) {

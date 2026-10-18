@@ -11,6 +11,15 @@ use std::path::PathBuf;
     about = "Claude Rust — standalone CLI using the Desktop engine"
 )]
 pub struct Cli {
+    /// Run initialization hooks before starting the session.
+    #[arg(long, conflicts_with = "maintenance")]
+    pub init: bool,
+    /// Run initialization hooks and exit without a model request.
+    #[arg(long, conflicts_with = "maintenance")]
+    pub init_only: bool,
+    /// Run maintenance hooks before starting the session.
+    #[arg(long)]
+    pub maintenance: bool,
     /// Initial prompt; piped stdin is appended in non-interactive mode.
     pub prompt: Option<String>,
     #[command(subcommand)]

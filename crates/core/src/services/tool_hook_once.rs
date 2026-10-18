@@ -8,7 +8,10 @@ impl HookRunner {
         hook: &ActiveHook,
         session: &str,
         input: &Value,
+        transcript: Option<&std::sync::OnceLock<PathBuf>>,
     ) -> Result<(i32, String, String)> {
+        let prepared = transcript.map(|cache| self.transcript_input(session, input.clone(), cache));
+        let input = prepared.as_ref().unwrap_or(input);
         if let Some(config) = &hook.prompt {
             if config.is_agent() {
                 return agent::execute_agent(
@@ -23,7 +26,7 @@ impl HookRunner {
             return prompt::execute_prompt(hook, config, self.prompt_provider.as_ref(), input)
                 .await;
         }
-        if hook.asynchronous {
+        if hook.asynchronous && !self.force_sync {
             let task = prepare_command(hook, &self.workspace, input)?;
             super::super::async_hooks::register(
                 self.once_directory
@@ -57,10 +60,11 @@ impl HookRunner {
         hook: &ActiveHook,
         session: &str,
         input: &Value,
+        transcript: Option<&std::sync::OnceLock<PathBuf>>,
     ) -> Result<Option<(i32, String, String)>> {
         if !hook.once {
             return self
-                .execute_configured(hook, session, input)
+                .execute_configured(hook, session, input, transcript)
                 .await
                 .map(Some);
         }
@@ -116,9 +120,11 @@ impl HookRunner {
             completed.is_empty(),
             "Invalid once hook state; refusing to replay"
         );
-        let output = self.execute_configured(hook, session, input).await?;
+        let output = self
+            .execute_configured(hook, session, input, transcript)
+            .await?;
         if output.0 == 0 {
-            if hook.asynchronous {
+            if hook.asynchronous && !self.force_sync {
                 // Background registration is success, regardless of eventual exit.
             } else if hook.event == HookEvent::WorktreeCreate {
                 ensure!(
@@ -335,7 +341,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             payload,
-            json!({"session_id":"payload-session", "cwd":root.path(), "hook_event_name":"PreToolUse", "tool_name":"Read", "tool_input":{}})
+            json!({"session_id":"payload-session", "cwd":root.path(), "transcript_path":crate::services::lifecycle_events::transcript(root.path(),"payload-session").unwrap(), "hook_event_name":"PreToolUse", "tool_name":"Read", "tool_input":{}})
         );
     }
 

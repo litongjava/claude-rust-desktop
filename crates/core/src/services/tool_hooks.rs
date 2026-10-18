@@ -33,6 +33,12 @@ pub enum HookEvent {
     SessionEnd,
     PreCompact,
     PostCompact,
+    Notification,
+    StopFailure,
+    Setup,
+    ConfigChange,
+    InstructionsLoaded,
+    CwdChanged,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -52,6 +58,12 @@ impl HookEvent {
             Self::SessionEnd => "SessionEnd",
             Self::PreCompact => "PreCompact",
             Self::PostCompact => "PostCompact",
+            Self::Notification => "Notification",
+            Self::StopFailure => "StopFailure",
+            Self::Setup => "Setup",
+            Self::ConfigChange => "ConfigChange",
+            Self::InstructionsLoaded => "InstructionsLoaded",
+            Self::CwdChanged => "CwdChanged",
         }
     }
 }
@@ -180,6 +192,10 @@ mod once;
 #[path = "tool_hook_outputs_tests.rs"]
 mod output_tests;
 
+#[cfg(test)]
+#[path = "lifecycle_events_tests.rs"]
+mod lifecycle_tests;
+
 #[derive(Debug)]
 pub enum HookPermissionResponse {
     Allow { updated_input: Option<Value>, updated_permissions: Option<Value> },
@@ -222,6 +238,7 @@ pub struct HookRunner {
     hooks: Vec<ActiveHook>,
     callbacks: Option<std::sync::Weak<super::hook_callbacks::Registration>>,
     disabled: bool,
+    force_sync: bool,
     prompt_provider: Option<crate::native_engine::provider_manager::ResolvedProvider>,
 }
 
@@ -248,10 +265,6 @@ impl HookRunner {
             workspace.join(".claude/settings.json"),
             workspace.join(".claude/settings.local.json"),
         ];
-        let mut hooks = Vec::new();
-        let mut disabled = false;
-        let mut allowed_http_urls: Option<Vec<String>> = None;
-        let mut http_env_vars: Option<Vec<String>> = None;
         for source in sources {
             let content = match std::fs::read_to_string(&source) {
                 Ok(content) => content,
@@ -265,6 +278,18 @@ impl HookRunner {
                 .with_context(|| format!("Invalid hook settings: {}", source.display()))?;
             configs.push((source, settings));
         }
+        Self::from_configs(data_dir, workspace, configs)
+    }
+
+    pub(crate) fn from_configs(
+        data_dir: &Path,
+        workspace: &Path,
+        configs: Vec<(PathBuf, Value)>,
+    ) -> Result<Self> {
+        let mut hooks = Vec::new();
+        let mut disabled = false;
+        let mut allowed_http_urls: Option<Vec<String>> = None;
+        let mut http_env_vars: Option<Vec<String>> = None;
         for (source, settings) in configs {
             for (field, target) in [("allowedHttpHookUrls", &mut allowed_http_urls), ("httpHookAllowedEnvVars", &mut http_env_vars)] {
                 if let Some(value) = settings.get(field) {
@@ -298,6 +323,12 @@ impl HookRunner {
                     "SessionEnd" => HookEvent::SessionEnd,
                     "PreCompact" => HookEvent::PreCompact,
                     "PostCompact" => HookEvent::PostCompact,
+                    "Notification" => HookEvent::Notification,
+                    "StopFailure" => HookEvent::StopFailure,
+                    "Setup" => HookEvent::Setup,
+                    "ConfigChange" => HookEvent::ConfigChange,
+                    "InstructionsLoaded" => HookEvent::InstructionsLoaded,
+                    "CwdChanged" => HookEvent::CwdChanged,
                     _ => {
                         ensure!(
                             !groups.iter().any(|g| g
@@ -310,7 +341,10 @@ impl HookRunner {
                     }
                 };
                 for group in groups {
-                    if !group.matcher.is_empty() && group.matcher != "*" {
+                    if event != HookEvent::CwdChanged
+                        && !group.matcher.is_empty()
+                        && group.matcher != "*"
+                    {
                         regex::Regex::new(&group.matcher)
                             .context("Invalid hook matcher regular expression")?;
                     }
@@ -328,7 +362,14 @@ impl HookRunner {
                         }
                         let prompt = prompt::load(&mut hook, event)?;
                         let http = if hook["type"] == "http" {
-                            ensure!(hook.get("command").is_none() && hook.get("shell").is_none(), "HTTP hooks cannot specify command or shell");
+                            ensure!(
+                                event != HookEvent::Setup,
+                                "HTTP hooks are not supported for Setup"
+                            );
+                            ensure!(
+                                hook.get("command").is_none() && hook.get("shell").is_none(),
+                                "HTTP hooks cannot specify command or shell"
+                            );
                             let config: HttpHook = serde_json::from_value(hook.clone())?;
                             config.validate()?;
                             hook["command"] = json!(config.url());
@@ -386,9 +427,14 @@ impl HookRunner {
             once_directory: data_dir.join("hook-once"),
             hooks,
             disabled,
+            force_sync: false,
             callbacks: None,
             prompt_provider: None,
         })
+    }
+
+    pub fn force_synchronous(&mut self) {
+        self.force_sync = true;
     }
 
     pub fn list(&self) -> &[ActiveHook] {
@@ -428,9 +474,22 @@ impl HookRunner {
         payload["cwd"] = json!(self.workspace);
         payload["hook_event_name"] = json!(event.name());
         let mut path = None;
-        for hook in self.hooks.iter().filter(|hook|hook.event == event && hook.if_condition.is_none()) {
-            let Some((code, stdout, stderr)) = self.execute_once(hook, session, &payload).await? else { continue; };
-            ensure!(code == 0, "{} hook failed ({code}): {}", event.name(), stderr.trim());
+        for hook in self
+            .hooks
+            .iter()
+            .filter(|hook| hook.event == event && hook.if_condition.is_none())
+        {
+            let Some((code, stdout, stderr)) =
+                self.execute_once(hook, session, &payload, None).await?
+            else {
+                continue;
+            };
+            ensure!(
+                code == 0,
+                "{} hook failed ({code}): {}",
+                event.name(),
+                stderr.trim()
+            );
             if event == HookEvent::WorktreeCreate && path.is_none() && !stdout.trim().is_empty() {
                 path = Some(if stdout.trim().starts_with('{') {
                     let value: Value = serde_json::from_str(stdout.trim())?;
@@ -452,6 +511,25 @@ impl HookRunner {
         Box::pin(self.run_inner(event, session_id, payload))
     }
 
+    fn transcript_input(
+        &self,
+        session: &str,
+        mut input: Value,
+        cache: &std::sync::OnceLock<PathBuf>,
+    ) -> Value {
+        let path = cache.get_or_init(|| {
+            let root = self.once_directory.parent().unwrap_or(&self.workspace);
+            let path = super::lifecycle_events::transcript_path(root, session);
+            if let Err(error) = super::lifecycle_events::transcript(root, session) {
+                tracing::warn!(session_id = session, transcript_path = %path.display(),
+                    "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
+            }
+            path
+        });
+        input["transcript_path"] = json!(path);
+        input
+    }
+
     async fn run_inner(
         &self,
         event: HookEvent,
@@ -465,6 +543,9 @@ impl HookRunner {
             .as_object()
             .cloned()
             .context("Hook payload must be an object")?;
+        // Shared by actual executions, after matcher/if/once filtering. Initializing
+        // this cell performs no I/O; even a failed snapshot is attempted only once.
+        let transcript = &std::sync::OnceLock::new();
         input.insert("session_id".into(), json!(session_id));
         input.insert("cwd".into(), json!(self.workspace));
         input.insert("hook_event_name".into(), json!(event.name()));
@@ -477,9 +558,17 @@ impl HookRunner {
                 | HookEvent::SubagentStart
                 | HookEvent::PostToolUseFailure
                 | HookEvent::PermissionDenied
+                | HookEvent::Notification
+                | HookEvent::StopFailure
+                | HookEvent::Setup
+                | HookEvent::InstructionsLoaded
         );
         let match_key = match event {
-            HookEvent::SessionStart => "source",
+            HookEvent::SessionStart | HookEvent::ConfigChange => "source",
+            HookEvent::Setup => "trigger",
+            HookEvent::Notification => "notification_type",
+            HookEvent::StopFailure => "error",
+            HookEvent::InstructionsLoaded => "load_reason",
             HookEvent::SessionEnd => "reason",
             HookEvent::PreCompact | HookEvent::PostCompact => "trigger",
             HookEvent::SubagentStart | HookEvent::SubagentStop => "agent_type",
@@ -502,7 +591,12 @@ impl HookRunner {
                 }
                 let input = Value::Object(input.clone());
                 pending.push(Box::pin(async move {
-                    let Some((code, stdout, stderr)) = self.execute_once(hook, session_id, &input).await? else { return Ok(HookOutcome::default()); };
+                    let Some((code, stdout, stderr)) = self
+                        .execute_once(hook, session_id, &input, Some(transcript))
+                        .await?
+                    else {
+                        return Ok(HookOutcome::default());
+                    };
                     parse_hook_output(hook, code, &stdout, &stderr)
                 }));
             }
@@ -511,6 +605,7 @@ impl HookRunner {
                     let callbacks = callbacks.clone();
                     let input = Value::Object(input.clone());
                     pending.push(Box::pin(async move {
+                        let input = self.transcript_input(session_id, input, transcript);
                         parse_json_output(event, callbacks.invoke(&callback, input).await?)
                     }));
                 }
@@ -569,7 +664,8 @@ impl HookRunner {
                         if (lifecycle
                             || matches!(
                                 event,
-                                HookEvent::PreToolUse
+                                HookEvent::ConfigChange
+                                    | HookEvent::PreToolUse
                                     | HookEvent::PermissionRequest
                                     | HookEvent::PostToolUse
                                     | HookEvent::SubagentStop
@@ -582,10 +678,17 @@ impl HookRunner {
                             continue;
                         }
                         let outcome = async {
-                            let output =
-                                self.execute_once(hook, session_id, &Value::Object(input.clone()))
-                                    .await?;
-                            let Some(output) = output else { return Ok(HookOutcome::default()); };
+                            let output = self
+                                .execute_once(
+                                    hook,
+                                    session_id,
+                                    &Value::Object(input.clone()),
+                                    Some(transcript),
+                                )
+                                .await?;
+                            let Some(output) = output else {
+                                return Ok(HookOutcome::default());
+                            };
                             parse_hook_output(hook, output.0, &output.1, &output.2)
                         }
                         .await;
@@ -639,6 +742,7 @@ impl HookRunner {
                     (
                         true,
                         async {
+                            let input = self.transcript_input(session_id, input, transcript);
                             let mut outcome = parse_json_output(event, callbacks.invoke(&callback, input).await?)?;
                             outcome.observe_mcp_output(callback_order);
                             Ok(outcome)
@@ -678,6 +782,10 @@ impl HookRunner {
                     result.reason = outcome.reason;
                 }
             }
+        }
+        if event == HookEvent::ConfigChange && name == "policy_settings" {
+            result.blocked = false;
+            result.prevent_continuation = false;
         }
         Ok(result)
     }
@@ -724,12 +832,22 @@ fn parse_hook_output(
 fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Result<HookOutcome> {
     let mut result = HookOutcome::default();
     if exit == 2 {
-        result.blocked = true;
+        result.blocked = !matches!(
+            event,
+            HookEvent::Notification
+                | HookEvent::StopFailure
+                | HookEvent::InstructionsLoaded
+                | HookEvent::CwdChanged
+                | HookEvent::Setup
+        );
         result.reason = if stderr.trim().is_empty() {
             "Blocked by command hook (exit 2)".into()
         } else {
             stderr.trim().into()
         };
+        if !result.blocked {
+            result.warnings.push(result.reason.clone());
+        }
         return Ok(result);
     }
     if exit != 0 {
@@ -752,7 +870,13 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
         return Ok(result);
     }
     if !output.starts_with('{') {
-        if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart | HookEvent::SubagentStart) {
+        if matches!(
+            event,
+            HookEvent::UserPromptSubmit
+                | HookEvent::SessionStart
+                | HookEvent::SubagentStart
+                | HookEvent::Setup
+        ) {
             result.additional_context.push(output.into());
         }
         return Ok(result);
@@ -764,6 +888,43 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
 fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
     ensure!(output.is_object(), "Hook output must be an object");
     let mut result = HookOutcome::default();
+    if matches!(
+        event,
+        HookEvent::Notification
+            | HookEvent::StopFailure
+            | HookEvent::InstructionsLoaded
+            | HookEvent::CwdChanged
+            | HookEvent::Setup
+            | HookEvent::ConfigChange
+    ) {
+        if let Some(message) = string_field(&output, "systemMessage")? {
+            result.warnings.push(message.into());
+        }
+        if event == HookEvent::ConfigChange && string_field(&output, "decision")? == Some("block") {
+            result.blocked = true;
+            result.reason = string_field(&output, "reason")?
+                .unwrap_or("Configuration change blocked by hook")
+                .into();
+        }
+        if let Some(specific) = output.get("hookSpecificOutput") {
+            ensure!(specific.is_object(), "hookSpecificOutput must be an object");
+            ensure!(
+                string_field(specific, "hookEventName")? == Some(event.name()),
+                "Hook returned an incorrect hookEventName"
+            );
+            ensure!(
+                specific.get("watchPaths").is_none(),
+                "Hook watchPaths is not implemented"
+            );
+            if event == HookEvent::Setup {
+                if let Some(text) = string_field(specific, "additionalContext")? {
+                    result.additional_context.push(text.into());
+                }
+            }
+        }
+        // Observer events cannot grant permission, mutate input, stop a turn or inject context.
+        return Ok(result);
+    }
     if event == HookEvent::PermissionRequest {
         if let Some(message) = string_field(&output, "systemMessage")? { result.warnings.push(message.into()); }
         if let Some(specific) = output.get("hookSpecificOutput") {

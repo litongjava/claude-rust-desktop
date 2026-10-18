@@ -63,9 +63,10 @@
 
 ### P2 Hook 生命周期事件（清单 H1）
 
-入口：`tool_hooks.rs` 的 `HookEvent`（当前 15 个，约 20 行）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
+入口：`tool_hooks.rs` 的 `HookEvent`（当前 21 个）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
 
-- 无外部依赖，先做：`Notification`、`StopFailure`、`Setup`、`ConfigChange`、`InstructionsLoaded`、`CwdChanged`、`FileChanged`。
+- [x] 第一批生命周期事件：`Notification`、`StopFailure`、`Setup`、`ConfigChange`、`InstructionsLoaded`、`CwdChanged`。已接入独立 CLI 实际路径、精确 payload/matcher、输出语义、SDK 回调与类型限制；once/if/status/取消/超时复用并测试。core 595/0/7、CLI 261/0/1；transcript 仅在匹配 hook/SDK 实际执行前按 run 生成一次，失败警告不阻断分发；逐事件差异与不可触发子场景见开发记录 `lifecycle-events-acceptance-20261018.md`（ConfigChange 使用轮询/使用前检查，拒绝后阻止后续使用；不声称与原版 watcher 完全等价）。
+- [ ] `FileChanged`：依赖 `watchPaths`，留到任务 09。
 - 需本地 MCP elicitation 请求方：`Elicitation`、`ElicitationResult`。
 - 依赖 P4 团队：`TaskCreated`、`TaskCompleted`（完成前可拒绝）、`TeammateIdle`。
 

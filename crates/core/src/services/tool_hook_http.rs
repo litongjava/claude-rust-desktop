@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(requests[0].0["x-denied"], "");
         assert_eq!(
             requests[0].1,
-            json!({"session_id":"one","cwd":root.path(),"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"a.txt"},"tool_use_id":"call-id"})
+            json!({"session_id":"one","cwd":root.path(),"transcript_path":crate::services::lifecycle_events::transcript(root.path(),"one").unwrap(),"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"a.txt"},"tool_use_id":"call-id"})
         );
         drop(requests);
         let policy_runner = self::runner(

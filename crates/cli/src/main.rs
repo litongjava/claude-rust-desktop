@@ -281,9 +281,17 @@ async fn run(cli: &Cli) -> Result<()> {
     }
     let explicit_repl = matches!(cli.command, Some(Commands::Repl { .. }));
     let sdk_stream = cli.input_format == args::InputFormat::StreamJson;
-    ensure!(!cli.replay_user_messages || sdk_stream, "--replay-user-messages requires --input-format stream-json");
-    ensure!(!sdk_stream || cli.output_format == OutputFormat::StreamJson, "--input-format stream-json requires --output-format stream-json");
-    let single = sdk_stream || cli.print
+    ensure!(
+        !cli.replay_user_messages || sdk_stream,
+        "--replay-user-messages requires --input-format stream-json"
+    );
+    ensure!(
+        !sdk_stream || cli.output_format == OutputFormat::StreamJson,
+        "--input-format stream-json requires --output-format stream-json"
+    );
+    let single = cli.init_only
+        || sdk_stream
+        || cli.print
         || cli.print_short
         || cli.no_interactive
         || cli.no_interactive_short
@@ -315,7 +323,7 @@ async fn run(cli: &Cli) -> Result<()> {
         }
     }
     ensure!(
-        sdk_stream || !single || !prompt.trim().is_empty(),
+        cli.init_only || sdk_stream || !single || !prompt.trim().is_empty(),
         "A prompt or piped stdin is required"
     );
     let resumed = if let Some(id) = &cli.resume {
@@ -346,6 +354,54 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         std::env::set_current_dir(workspace)?;
     }
+    if cli.init_only {
+        ensure!(
+            !sdk_stream && cli.worktree.is_none() && !cli.fork_session,
+            "--init-only does not support stream-json, worktree or fork-session"
+        );
+        let context = services::context(&paths)?;
+        let workspace = std::env::current_dir()?;
+        let store = SessionStore::new(context.db.clone());
+        let id = if let Some(resumed) = &resumed {
+            resumed.id.clone()
+        } else {
+            store.create_with_id(
+                &workspace,
+                "",
+                "",
+                &cli.session_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            )?
+        };
+        let work = async {
+            claude_core::services::lifecycle_events::check_configuration(&context, &workspace, &id)
+                .await?;
+            for warning in claude_core::services::lifecycle_events::setup(
+                &context, &workspace, &id, "init", true,
+            )
+            .await?
+            {
+                eprintln!("Setup hook: {warning}");
+            }
+            let mut hooks = claude_core::services::tool_hooks::HookRunner::load_with_plugins(
+                &context, &workspace,
+            )?;
+            hooks.force_synchronous();
+            let result = hooks
+                .run(
+                    claude_core::services::tool_hooks::HookEvent::SessionStart,
+                    &id,
+                    serde_json::json!({"source":"startup"}),
+                )
+                .await?;
+            for warning in result.warnings {
+                eprintln!("SessionStart hook: {warning}");
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        return tokio::select! { result = hook_progress::during(&id, true, work) => result, _ = tokio::signal::ctrl_c() => anyhow::bail!("Setup hooks interrupted") };
+    }
     let mut input = if single { None } else { Some(session::terminal_input()) };
     let selection = config::select(
         cli,
@@ -367,6 +423,16 @@ async fn run(cli: &Cli) -> Result<()> {
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     let result = async {
         if !sdk_stream { session.start_hooks(if resumed.is_some() { "resume" } else { "startup" }).await?; }
+        if cli.init || cli.init_only || cli.maintenance {
+            anyhow::ensure!(!sdk_stream, "Setup flags with stream-json input are not supported");
+            let trigger = if cli.maintenance { "maintenance" } else { "init" };
+            let context = session.hook_service_context();
+            let outcome = tokio::select! {
+                result = hook_progress::during(&session.id, true, claude_core::services::lifecycle_events::setup(&context, &session.workspace, &session.id, trigger, false)) => result,
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("Setup hooks interrupted"),
+            }?;
+            for warning in outcome { eprintln!("Setup hook: {warning}"); }
+        }
         if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
         if !sdk_stream && !prompt.trim().is_empty() {
             if !single {
@@ -390,7 +456,10 @@ async fn run(cli: &Cli) -> Result<()> {
         let mut background_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
         background_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut remote = remote_commands::Remote::default();
+        let mut last_config_error = String::new();
         'repl: loop {
+            let idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut idle_notified = false;
             for notice in background_commands::collect_completed(&session)? { eprintln!("{notice}"); }
             if let Some(prompt) = remote.take_deferred() {
                 if let Err(error) = session.turn(cli, &prompt, &mut input).await { if !worker_frontend::already_presented(&error) { eprintln!("Error: {error:#}"); } }
@@ -450,6 +519,18 @@ async fn run(cli: &Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
+                    match claude_core::services::lifecycle_events::check_configuration(&session.hook_service_context(), &session.workspace, &session.id).await {
+                        Ok(()) => last_config_error.clear(),
+                        Err(error) => { let text = format!("{error:#}"); if last_config_error != text { input.as_ref().expect("interactive reader").notice(text.clone()); last_config_error = text; } }
+                    }
+                    if last_config_error.is_empty() && !idle_notified && tokio::time::Instant::now() >= idle_deadline {
+                        idle_notified = true;
+                        if let Err(error) = claude_core::services::lifecycle_events::run(&session.hook_service_context(), &session.workspace, &session.id,
+                            claude_core::services::tool_hooks::HookEvent::Notification,
+                            serde_json::json!({"message":"Claude is waiting for your input","notification_type":"idle_prompt"})).await {
+                            input.as_ref().expect("interactive reader").notice(format!("Notification hook: {error:#}"));
+                        }
+                    }
                     if !composer.is_pending()
                         && claude_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session.id)
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {

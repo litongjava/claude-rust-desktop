@@ -356,6 +356,12 @@ impl Session {
         if !session_hooks::owns_lifecycle(&context, &self.id)? {
             return Ok(());
         }
+        claude_core::services::lifecycle_events::check_configuration(
+            &context,
+            &self.workspace,
+            &self.id,
+        )
+        .await?;
         self.lifecycle_owned = true;
         let outcome = tokio::select! {
             result = crate::hook_progress::during(&self.id, true, session_hooks::start(&context, &self.workspace, &self.id, source, &self.model)) => result,
@@ -391,7 +397,7 @@ impl Session {
         }
     }
 
-    fn hook_service_context(&self) -> claude_core::services::ServiceContext {
+    pub(crate) fn hook_service_context(&self) -> claude_core::services::ServiceContext {
         claude_core::services::ServiceContext {
             paths: self.paths.clone(),
             db: self.store.db.clone(),
@@ -616,6 +622,12 @@ impl Session {
         input: &mut Option<TerminalInput>,
         hook_wake: bool,
     ) -> Result<()> {
+        claude_core::services::lifecycle_events::check_configuration(
+            &self.hook_service_context(),
+            &self.workspace,
+            &self.id,
+        )
+        .await?;
         let turn_goal = claude_core::services::session_goals::active(&self.store.db, &self.id)?;
         if let Err(error) = crate::ide_commands::restore(self).await {
             eprintln!("IDE connection unavailable: {error:#}");

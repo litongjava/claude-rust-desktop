@@ -425,6 +425,12 @@ impl QueryEngine {
             let profile = super::workspace::conversation_prompt_profile(conn, &project_conv_id)?;
             Ok::<_, anyhow::Error>((workspace, project, profile))
         })).await???;
+        crate::services::lifecycle_events::check_configuration(
+            &plugin_context,
+            &workspace,
+            &conv_id,
+        )
+        .await?;
         request.system_prompt = Some(crate::prompt::compose_system_prompt(
             request.system_prompt.as_deref(), &request.model, prompt_profile,
         ));
@@ -515,11 +521,31 @@ impl QueryEngine {
             .get_or_insert_with(String::new)
             .push_str(&format!("\nWorking directory: {workspace_path}\n"));
         let instructions_workspace = workspace.clone();
-        let instructions = tokio::task::spawn_blocking(move || {
-            crate::project_instructions::load(&instructions_workspace)
-        }).await??;
-        request.system_prompt.get_or_insert_with(String::new).push_str(&instructions);
-        let allowed_directories = project.as_ref().map(|project| project.folders.iter().map(|folder| std::path::PathBuf::from(&folder.path)).collect()).unwrap_or_default();
+        let (instructions, instruction_files) = tokio::task::spawn_blocking(move || {
+            crate::project_instructions::load_with_files(&instructions_workspace)
+        })
+        .await??;
+        crate::services::lifecycle_events::instructions(
+            &plugin_context,
+            &hooks,
+            &conv_id,
+            &instruction_files,
+        )
+        .await?;
+        request
+            .system_prompt
+            .get_or_insert_with(String::new)
+            .push_str(&instructions);
+        let allowed_directories = project
+            .as_ref()
+            .map(|project| {
+                project
+                    .folders
+                    .iter()
+                    .map(|folder| std::path::PathBuf::from(&folder.path))
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(project) = project {
             let folders = project.folders.iter().map(|f| f.path.as_str()).collect::<Vec<_>>();
             let context = format!("\nProject: {}\nProject source folders (the first is the working directory):\n{}\nProject instructions:\n{}", project.name, serde_json::to_string(&folders)?, project.instructions.unwrap_or_default());

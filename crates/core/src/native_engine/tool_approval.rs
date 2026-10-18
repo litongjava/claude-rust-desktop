@@ -166,6 +166,13 @@ impl ToolLoopExecutor {
             waiters: self.answer_waiters.clone(),
             request_id: request_id.clone(),
         };
+        if let Some(hooks) = &self.hooks {
+            if let Err(error) = hooks.run(crate::services::tool_hooks::HookEvent::Notification,
+                self.conv_id.as_deref().unwrap_or_default(),
+                json!({"message":format!("Claude needs your permission to use {tool}"),"notification_type":"permission_prompt"})).await {
+                tracing::warn!("Notification hook: {error:#}");
+            }
+        }
         if self.permission_host_available {
             self.event_tx
                 .send(EngineEvent::ToolPermission {

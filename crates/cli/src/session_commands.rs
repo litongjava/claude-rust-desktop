@@ -145,6 +145,7 @@ pub async fn handle(
                     })??;
                 }
             } else {
+                let old_cwd = session.workspace.clone();
                 session.workspace = claude_core::services::session_workspace::change(
                     &session.store.db,
                     &session.id,
@@ -152,6 +153,19 @@ pub async fn handle(
                     argument,
                     command == "/add-dir",
                 )?;
+                if command == "/cd" && old_cwd != session.workspace {
+                    let outcome = claude_core::services::lifecycle_events::run(
+                        &session.hook_service_context(),
+                        &session.workspace,
+                        &session.id,
+                        claude_core::services::tool_hooks::HookEvent::CwdChanged,
+                        serde_json::json!({"old_cwd":old_cwd,"new_cwd":session.workspace}),
+                    )
+                    .await?;
+                    for warning in outcome.warnings {
+                        eprintln!("CwdChanged hook: {warning}");
+                    }
+                }
                 eprintln!(
                     "{}: {}",
                     if command == "/cd" {
@@ -557,6 +571,49 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cd_triggers_once_only_when_directory_changes() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("next");
+        std::fs::create_dir(&target).unwrap();
+        let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let script = dir.path().join("cwd.cjs");
+        std::fs::write(&script, r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>fs.appendFileSync('cwd-events.jsonl',JSON.stringify(JSON.parse(s))+'\n'));"#).unwrap();
+        std::fs::write(paths.data_dir.join("settings.json"), serde_json::json!({"hooks":{"CwdChanged":[{"matcher":"never-matches-but-ignored","hooks":[{"type":"command","command":format!("node \"{}\"",script.display())}]}]}}).to_string()).unwrap();
+        let provider = serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1/v1","api_key":"fixture-only","api_format":"openai","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        let selection = crate::config::Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture-model".into(),
+        };
+        let cli = crate::args::Cli::parse_from(["ccl", "--print"]);
+        let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let id = store
+            .create(dir.path(), "fixture-model", "fixture")
+            .unwrap();
+        let mut session = Session::open(&cli, &paths, selection, Some(&id))
+            .await
+            .unwrap();
+        let old_cwd = session.workspace.clone();
+        for _ in 0..2 {
+            handle("/cd", target.to_str().unwrap(), &paths, &mut session)
+                .await
+                .unwrap();
+        }
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(target.join("cwd-events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"hook_event_name":"CwdChanged","session_id":id,"cwd":session.workspace,"transcript_path":rows[0]["transcript_path"],"old_cwd":old_cwd,"new_cwd":session.workspace})
+        );
+    }
 
     #[test]
     fn auxiliary_model_requests_contribute_usage_without_spending_primary_turn_budget() {

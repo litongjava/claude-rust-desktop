@@ -22,6 +22,10 @@ const MAX_FILES: usize = 128;
 /// Missing files are normal; unreadable, oversized or invalid UTF-8 files fail
 /// explicitly rather than silently dropping user instructions.
 pub fn load(workspace: &Path) -> Result<String> {
+    Ok(load_with_files(workspace)?.0)
+}
+
+pub fn load_with_files(workspace: &Path) -> Result<(String, Vec<(PathBuf, String)>)> {
     let workspace = workspace.canonicalize().with_context(|| {
         format!(
             "Resolving project instructions workspace {}",
@@ -35,10 +39,18 @@ pub fn load(workspace: &Path) -> Result<String> {
     );
     let mut directories: Vec<_> = workspace.ancestors().map(Path::to_path_buf).collect();
     directories.reverse();
-    load_directories(&directories)
+    load_directories_with_files(&directories)
 }
 
+#[cfg(test)]
 fn load_directories(directories: &[PathBuf]) -> Result<String> {
+    Ok(load_directories_with_files(directories)?.0)
+}
+
+fn load_directories_with_files(
+    directories: &[PathBuf],
+) -> Result<(String, Vec<(PathBuf, String)>)> {
+    let mut files = Vec::new();
     let mut seen = HashSet::new();
     let mut total_bytes = 0;
     let mut prompt = String::new();
@@ -99,6 +111,15 @@ fn load_directories(directories: &[PathBuf]) -> Result<String> {
             })?;
             let content = content.trim_start_matches('\u{feff}');
             if !content.trim().is_empty() {
+                let digest = ring::digest::digest(&ring::digest::SHA256, content.as_bytes());
+                files.push((
+                    path.clone(),
+                    digest
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                ));
                 prompt.push_str(&format!(
                     "\nProject instructions ({}):\n{content}\n",
                     path.display()
@@ -106,7 +127,7 @@ fn load_directories(directories: &[PathBuf]) -> Result<String> {
             }
         }
     }
-    Ok(prompt)
+    Ok((prompt, files))
 }
 
 #[cfg(test)]

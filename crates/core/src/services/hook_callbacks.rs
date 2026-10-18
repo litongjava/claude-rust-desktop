@@ -58,7 +58,7 @@ pub fn validate(value: &Value) -> Result<Vec<Callback>> {
                 group.matcher.len() <= 4096,
                 "SDK hook matcher exceeds 4096 bytes"
             );
-            if !group.matcher.is_empty() && group.matcher != "*" {
+            if event != HookEvent::CwdChanged && !group.matcher.is_empty() && group.matcher != "*" {
                 regex::Regex::new(&group.matcher).context("Invalid SDK hook matcher regex")?;
             }
             let seconds = group.timeout.unwrap_or(60.0);
@@ -101,7 +101,8 @@ impl Registration {
             .iter()
             .filter(|callback| {
                 callback.event == event
-                    && (callback.matcher.is_empty()
+                    && (event == HookEvent::CwdChanged
+                        || callback.matcher.is_empty()
                         || callback.matcher == "*"
                         || regex::Regex::new(&callback.matcher)
                             .is_ok_and(|matcher| matcher.is_match(name)))
@@ -313,8 +314,10 @@ mod tests {
         )
         .unwrap();
         let _guard = install(&session, callbacks, host.clone());
-        let runner =
-            super::super::tool_hooks::HookRunner::default().with_session_callbacks(&session);
+        let root = tempfile::tempdir().unwrap();
+        let runner = super::super::tool_hooks::HookRunner::load(root.path(), root.path())
+            .unwrap()
+            .with_session_callbacks(&session);
         assert!(runner.has_hooks());
         let outcome = runner
             .run(

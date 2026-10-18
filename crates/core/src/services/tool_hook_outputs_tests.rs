@@ -136,7 +136,10 @@ async fn callbacks_observe_original_response_and_last_completion_wins() {
         hook_callbacks::validate(&json!({"PostToolUse":[{"hookCallbackIds":["last","first"]}]}))
             .unwrap();
     let _guard = hook_callbacks::install(&session, callbacks, host.clone());
-    let runner = HookRunner::default().with_session_callbacks(&session);
+    let root = tempfile::tempdir().unwrap();
+    let runner = HookRunner::load(root.path(), root.path())
+        .unwrap()
+        .with_session_callbacks(&session);
     let outcome = runner
         .run(
             HookEvent::PostToolUse,
