@@ -68,6 +68,8 @@ pub struct ActiveHook {
     pub once: bool,
     #[serde(rename = "async", skip_serializing_if = "std::ops::Not::not")]
     pub asynchronous: bool,
+    #[serde(rename = "asyncRewake", skip_serializing_if = "std::ops::Not::not")]
+    pub async_rewake: bool,
     #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
     pub source: PathBuf,
@@ -192,6 +194,8 @@ struct CommandConfig {
     once: bool,
     #[serde(default, rename = "async")]
     asynchronous: bool,
+    #[serde(default, rename = "asyncRewake")]
+    async_rewake: bool,
     #[serde(default, rename = "statusMessage")]
     status_message: Option<String>,
     #[serde(default = "default_timeout")]
@@ -300,8 +304,7 @@ impl HookRunner {
                             if let Some(value) = hook.get(option) {
                                 ensure!(value.is_boolean(), "Hook {option} must be boolean");
                                 ensure!(
-                                    value == false
-                                        || (option == "async" && hook["type"] == "command"),
+                                    value == false || hook["type"] == "command",
                                     "Hook {option} is not implemented for {}",
                                     hook["type"]
                                 );
@@ -338,7 +341,8 @@ impl HookRunner {
                             http,
                             timeout: hook.timeout,
                             once: hook.once,
-                            asynchronous: hook.asynchronous,
+                            asynchronous: hook.asynchronous || hook.async_rewake,
+                            async_rewake: hook.async_rewake,
                             status_message: hook.status_message,
                             source: source.clone(),
                             shell: hook.shell,
@@ -1050,6 +1054,7 @@ mod tests {
                     if_condition: None,
                     once: false,
                     asynchronous: false,
+                    async_rewake: false,
                     status_message: None,
                 })
                 .collect(),
@@ -1154,6 +1159,7 @@ mod tests {
             if_condition: None,
             once: false,
             asynchronous: false,
+            async_rewake: false,
             status_message: None,
         };
         let runner = HookRunner {
@@ -1261,6 +1267,7 @@ mod tests {
             if_condition: None,
             once: false,
             asynchronous: false,
+            async_rewake: false,
             status_message: None,
         };
         let error = execute(&hook, root.path(), &json!({})).await.unwrap_err();
@@ -1287,6 +1294,7 @@ mod tests {
             if_condition: None,
             once: false,
             asynchronous: false,
+            async_rewake: false,
             status_message: None,
         };
         let task = tokio::spawn(async move { execute(&hook, &cwd, &json!({})).await });

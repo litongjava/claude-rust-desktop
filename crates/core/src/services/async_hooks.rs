@@ -28,6 +28,7 @@ impl Task {
         self.handle.is_finished()
     }
     fn abort(&self) {
+        let _ = std::fs::write(self.delivery.directory.join("cancel"), "");
         self.handle.abort();
     }
 }
@@ -45,6 +46,7 @@ pub(crate) fn register(
     root: &std::path::Path,
     session: &str,
     task: BoxFuture<'static, Result<(i32, String, String)>>,
+    rewake_name: Option<String>,
 ) -> Result<()> {
     let directory = directory(root, session).join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&directory)?;
@@ -69,11 +71,18 @@ pub(crate) fn register(
                 }
             } => anyhow::bail!("Async hook cancelled"),
         };
-        let messages = output_messages(&output.1);
+        let messages = completion_messages(&output, rewake_name.as_deref());
+        if messages.is_empty() {
+            return Ok(output);
+        }
+        if rewake_name.is_some() {
+            std::fs::write(writer.directory.join("rewake"), "")?;
+        }
         std::fs::write(
             writer.directory.join("pending"),
             serde_json::to_vec(&messages)?,
         )?;
+        std::fs::write(writer.directory.join("published"), "")?;
         std::fs::rename(
             writer.directory.join("pending"),
             writer.directory.join("result"),
@@ -93,16 +102,21 @@ pub(crate) fn register(
 /// lease until consumption/close; stale files from a dead process never replay.
 /// Atomic rename gives competing consumers at most one delivery.
 pub fn drain_shared(root: &std::path::Path, session: &str) -> Vec<String> {
-    drain_directory(&directory(root, session))
+    drain_directory(&directory(root, session), false)
 }
-fn drain_directory(directory: &std::path::Path) -> Vec<String> {
+/// Claim only wake notifications. A racing consumer cannot turn an ordinary
+/// async completion into a new model request.
+pub fn drain_wake(root: &std::path::Path, session: &str) -> Vec<String> {
+    drain_directory(&directory(root, session), true)
+}
+fn drain_directory(directory: &std::path::Path, wake_only: bool) -> Vec<String> {
     let mut messages = Vec::new();
     let Ok(entries) = std::fs::read_dir(directory) else {
         return messages;
     };
     for entry in entries.flatten() {
         let task = entry.path();
-        if task.join("cancel").exists() {
+        if task.join("cancel").exists() || (wake_only && !task.join("rewake").exists()) {
             continue;
         }
         let Ok(owner) = std::fs::OpenOptions::new()
@@ -119,11 +133,14 @@ fn drain_directory(directory: &std::path::Path) -> Vec<String> {
         if std::fs::rename(task.join("result"), &claimed).is_err() {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&claimed) {
-            if let Ok(result) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                messages.extend(result);
+        if !task.join("cancel").exists() {
+            if let Ok(bytes) = std::fs::read(&claimed) {
+                if let Ok(result) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                    messages.extend(result);
+                }
             }
         }
+        let _ = std::fs::write(task.join("consumed"), "");
         let _ = std::fs::remove_file(claimed);
     }
     messages
@@ -148,11 +165,15 @@ pub fn drain(session: &str) -> Vec<String> {
         .collect();
     let messages = directories
         .iter()
-        .flat_map(|path| drain_directory(path))
+        .flat_map(|path| drain_directory(path, false))
         .collect();
     let mut pending = Vec::new();
     for task in tasks.drain(..) {
-        if !task.is_finished() {
+        if !task.is_finished()
+            || (task.delivery.directory.join("published").exists()
+                && !task.delivery.directory.join("consumed").exists()
+                && !task.delivery.directory.join("cancel").exists())
+        {
             pending.push(task);
             continue;
         }
@@ -179,6 +200,42 @@ pub fn signal_cancel(root: &std::path::Path, session: &str) {
             let _ = std::fs::write(entry.path().join("cancel"), "");
         }
     }
+}
+
+fn completion_messages(output: &(i32, String, String), rewake: Option<&str>) -> Vec<String> {
+    match rewake {
+        Some(command) if output.0 == 2 => vec![format!(
+            "Stop hook blocking error from command \"{command}\": {}",
+            if output.2.is_empty() {
+                &output.1
+            } else {
+                &output.2
+            }
+        )],
+        Some(_) => Vec::new(),
+        None => output_messages(&output.1),
+    }
+}
+
+/// Non-consuming idle-host probe. Only live owners and unclaimed wake results count.
+pub fn has_pending_wake(root: &std::path::Path, session: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory(root, session)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let task = entry.path();
+        if task.join("cancel").exists()
+            || !task.join("rewake").exists()
+            || !task.join("result").exists()
+        {
+            return false;
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(task.join("owner"))
+            .is_ok_and(|owner| matches!(owner.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    })
 }
 
 fn output_messages(stdout: &str) -> Vec<String> {
@@ -326,6 +383,140 @@ process.stdin.on('end',()=>{
         assert!(outcome.additional_context.is_empty());
     }
 
+    fn rewake_fixture(root: &Path, timeout: u64) -> HookRunner {
+        fixture(root, timeout);
+        let path = root.join("settings.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let hook = &mut config["hooks"]["PreToolUse"][0]["hooks"][0];
+        hook.as_object_mut().unwrap().remove("async");
+        hook["asyncRewake"] = json!(true);
+        std::fs::write(path, config.to_string()).unwrap();
+        HookRunner::load(root, root).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rewake_exit_codes_stderr_fallback_and_shared_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        for code in [0, 1, 2, 3, -1] {
+            for stderr in ["", "blocking stderr"] {
+                let session = uuid::Uuid::new_v4().to_string();
+                let stdout =
+                    r#"{"systemMessage":"not normal async context","permissionDecision":"allow"}"#;
+                let output = (code, stdout.to_owned(), stderr.to_owned());
+                register(
+                    root.path(),
+                    &session,
+                    async move { Ok(output) }.boxed(),
+                    Some("fixture".into()),
+                )
+                .unwrap();
+                wait_for(|| {
+                    registry()
+                        .lock()
+                        .unwrap()
+                        .get(&session)
+                        .unwrap()
+                        .iter()
+                        .all(Task::is_finished)
+                })
+                .await;
+                assert!(!has_pending_wake(root.path(), "other"));
+                assert_eq!(has_pending_wake(root.path(), &session), code == 2);
+                let messages = drain_shared(root.path(), &session);
+                if code == 2 {
+                    assert_eq!(
+                        messages,
+                        vec![format!(
+                            "Stop hook blocking error from command \"fixture\": {}",
+                            if stderr.is_empty() { stdout } else { stderr }
+                        )]
+                    );
+                } else {
+                    assert!(messages.is_empty());
+                }
+                assert!(!has_pending_wake(root.path(), &session));
+                assert!(drain(&session).is_empty());
+                assert!(drain_shared(root.path(), &session).is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_retains_claimed_result_until_consumer_acknowledges() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        register(
+            root.path(),
+            &session,
+            async { Ok((2, "feedback".into(), String::new())) }.boxed(),
+            Some("fixture".into()),
+        )
+        .unwrap();
+        wait_for(|| {
+            registry()
+                .lock()
+                .unwrap()
+                .get(&session)
+                .unwrap()
+                .iter()
+                .all(Task::is_finished)
+        })
+        .await;
+        let task = std::fs::read_dir(directory(root.path(), &session))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let claimed = task.join("claimed-test-consumer");
+        std::fs::rename(task.join("result"), &claimed).unwrap();
+        assert!(drain(&session).is_empty());
+        assert!(
+            claimed.exists(),
+            "owner deleted a competing consumer's payload"
+        );
+        assert!(std::fs::read_to_string(&claimed)
+            .unwrap()
+            .contains("feedback"));
+        std::fs::write(task.join("consumed"), "").unwrap();
+        assert!(drain(&session).is_empty());
+        assert!(!task.exists());
+    }
+
+    #[tokio::test]
+    async fn rewake_implies_async_once_isolation_restore_and_cancel_completed() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = rewake_fixture(root.path(), 30);
+        let session = uuid::Uuid::new_v4().to_string();
+        run(&runner, &session).await;
+        std::fs::write(root.path().join(format!("{session}.release")), "").unwrap();
+        wait_for(|| has_pending_wake(root.path(), &session)).await;
+        assert!(drain_shared(root.path(), "other").is_empty());
+        let messages = drain(&session);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].starts_with("Stop hook blocking error from command \"PreToolUse:Read\": ")
+        );
+        run(
+            &HookRunner::load(root.path(), root.path()).unwrap(),
+            &session,
+        )
+        .await;
+        assert!(drain(&session).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("{session}.runs"))).unwrap(),
+            "x"
+        );
+        let other = uuid::Uuid::new_v4().to_string();
+        run(&runner, &other).await;
+        std::fs::write(root.path().join(format!("{other}.release")), "").unwrap();
+        wait_for(|| has_pending_wake(root.path(), &other)).await;
+        drop(TurnGuard(Some(other.clone())));
+        assert!(!has_pending_wake(root.path(), &other));
+        assert!(drain_shared(root.path(), &other).is_empty());
+        cancel(&other).await;
+    }
+
     #[tokio::test]
     async fn nonblocking_once_delivery_isolation_and_restore() {
         let root = tempfile::tempdir().unwrap();
@@ -392,63 +583,66 @@ process.stdin.on('end',()=>{
 
     #[tokio::test]
     async fn timeout_cancel_close_and_dropped_turn_kill_process_tree() {
-        for mode in ["timeout", "cancel", "close", "drop", "signal"] {
-            let root = tempfile::tempdir().unwrap();
-            let runner = fixture(root.path(), if mode == "timeout" { 2 } else { 30 });
-            let session = uuid::Uuid::new_v4().to_string();
-            run(&runner, &session).await;
-            let path = root.path().join(format!("{session}.pid"));
-            wait_for(|| path.exists()).await;
-            let pids: Vec<u32> =
-                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            assert!(pids.iter().all(|pid| alive(*pid)));
-            match mode {
-                "timeout" => {
-                    wait_for(|| {
-                        registry()
-                            .lock()
-                            .unwrap()
-                            .get(&session)
-                            .unwrap()
-                            .iter()
-                            .all(Task::is_finished)
-                    })
-                    .await
+        for rewake in [false, true] {
+            for mode in ["timeout", "cancel", "close", "drop", "signal"] {
+                let root = tempfile::tempdir().unwrap();
+                let make = if rewake { rewake_fixture } else { fixture };
+                let runner = make(root.path(), if mode == "timeout" { 2 } else { 30 });
+                let session = uuid::Uuid::new_v4().to_string();
+                run(&runner, &session).await;
+                let path = root.path().join(format!("{session}.pid"));
+                wait_for(|| path.exists()).await;
+                let pids: Vec<u32> =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                assert!(pids.iter().all(|pid| alive(*pid)));
+                match mode {
+                    "timeout" => {
+                        wait_for(|| {
+                            registry()
+                                .lock()
+                                .unwrap()
+                                .get(&session)
+                                .unwrap()
+                                .iter()
+                                .all(Task::is_finished)
+                        })
+                        .await
+                    }
+                    "drop" => drop(TurnGuard(Some(session.clone()))),
+                    "signal" => signal_cancel(root.path(), &session),
+                    "close" => {
+                        let context = crate::services::ServiceContext::open(
+                            crate::runtime::RuntimePaths::new(root.path().join("data")).unwrap(),
+                            std::sync::Arc::new(crate::services::EnvironmentCredentials),
+                        )
+                        .unwrap();
+                        crate::services::session_hooks::end(
+                            &context,
+                            root.path(),
+                            &session,
+                            "test",
+                            Duration::from_secs(2),
+                        )
+                        .await;
+                    }
+                    _ => cancel(&session).await,
                 }
-                "drop" => drop(TurnGuard(Some(session.clone()))),
-                "signal" => signal_cancel(root.path(), &session),
-                "close" => {
-                    let context = crate::services::ServiceContext::open(
-                        crate::runtime::RuntimePaths::new(root.path().join("data")).unwrap(),
-                        std::sync::Arc::new(crate::services::EnvironmentCredentials),
-                    )
-                    .unwrap();
-                    crate::services::session_hooks::end(
-                        &context,
-                        root.path(),
-                        &session,
-                        "test",
-                        Duration::from_secs(2),
-                    )
-                    .await;
-                }
-                _ => cancel(&session).await,
+                wait_for(|| pids.iter().all(|pid| !alive(*pid))).await;
+                cancel(&session).await;
+                assert!(drain(&session).is_empty());
+                assert!(crate::services::hook_progress::subscribe(&session)
+                    .snapshot()
+                    .is_empty());
+                run(
+                    &HookRunner::load(root.path(), root.path()).unwrap(),
+                    &session,
+                )
+                .await;
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join(format!("{session}.runs"))).unwrap(),
+                    "x"
+                );
             }
-            wait_for(|| pids.iter().all(|pid| !alive(*pid))).await;
-            cancel(&session).await;
-            assert!(drain(&session).is_empty());
-            assert!(crate::services::hook_progress::subscribe(&session)
-                .snapshot()
-                .is_empty());
-            run(
-                &HookRunner::load(root.path(), root.path()).unwrap(),
-                &session,
-            )
-            .await;
-            assert_eq!(
-                std::fs::read_to_string(root.path().join(format!("{session}.runs"))).unwrap(),
-                "x"
-            );
         }
     }
 
@@ -487,47 +681,59 @@ process.stdin.on('end',()=>{
 
     #[tokio::test]
     async fn shared_delivery_is_once_and_requires_live_owner() {
-        let root = tempfile::tempdir().unwrap();
-        let session = uuid::Uuid::new_v4().to_string();
-        let runner = fixture(root.path(), 30);
-        run(&runner, &session).await;
-        std::fs::write(root.path().join(format!("{session}.release")), "").unwrap();
-        wait_for(|| {
-            registry()
-                .lock()
+        for rewake in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let session = uuid::Uuid::new_v4().to_string();
+            let runner = if rewake {
+                rewake_fixture(root.path(), 30)
+            } else {
+                fixture(root.path(), 30)
+            };
+            run(&runner, &session).await;
+            std::fs::write(root.path().join(format!("{session}.release")), "").unwrap();
+            wait_for(|| {
+                registry()
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .unwrap()
+                    .iter()
+                    .all(Task::is_finished)
+            })
+            .await;
+            let consume = || {
+                assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "services::async_hooks::tests::shared_delivery_helper"
+                    ])
+                    .env("CCL_ASYNC_SHARED_ROOT", root.path())
+                    .env("CCL_ASYNC_SHARED_SESSION", &session)
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success());
+                serde_json::from_slice::<Vec<String>>(
+                    &std::fs::read(root.path().join("consumed.json")).unwrap(),
+                )
                 .unwrap()
-                .get(&session)
-                .unwrap()
-                .iter()
-                .all(Task::is_finished)
-        })
-        .await;
-        let consume = || {
-            assert!(std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "services::async_hooks::tests::shared_delivery_helper"
-                ])
-                .env("CCL_ASYNC_SHARED_ROOT", root.path())
-                .env("CCL_ASYNC_SHARED_SESSION", &session)
-                .stdout(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success());
-            serde_json::from_slice::<Vec<String>>(
-                &std::fs::read(root.path().join("consumed.json")).unwrap(),
-            )
-            .unwrap()
-        };
-        assert_eq!(consume(), vec!["notice", "context"]);
-        assert!(consume().is_empty());
-        assert!(drain(&session).is_empty());
-        let stale = directory(root.path(), &session).join("dead-owner");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(stale.join("owner"), "").unwrap();
-        std::fs::write(stale.join("result"), r#"["must not replay"]"#).unwrap();
-        assert!(consume().is_empty());
+            };
+            let received = consume();
+            if rewake {
+                assert_eq!(received.len(), 1);
+                assert!(received[0].contains("Stop hook blocking error"));
+            } else {
+                assert_eq!(received, vec!["notice", "context"]);
+            }
+            assert!(consume().is_empty());
+            assert!(drain(&session).is_empty());
+            let stale = directory(root.path(), &session).join("dead-owner");
+            std::fs::create_dir_all(&stale).unwrap();
+            std::fs::write(stale.join("owner"), "").unwrap();
+            std::fs::write(stale.join("result"), r#"["must not replay"]"#).unwrap();
+            assert!(consume().is_empty());
+        }
     }
 
     #[cfg(windows)]

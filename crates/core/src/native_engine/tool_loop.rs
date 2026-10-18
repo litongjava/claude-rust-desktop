@@ -190,6 +190,7 @@ pub struct ToolLoopExecutor {
     durable_user_input: bool,
     message_inbox: Option<crate::services::session_messages::Target>,
     require_pending_peer_message: bool,
+    require_hook_wake: bool,
     execution_lease: Option<crate::services::session_messages::ExecutionLease>,
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
@@ -581,6 +582,7 @@ impl ToolLoopExecutor {
             durable_user_input: false,
             message_inbox: None,
             require_pending_peer_message: false,
+            require_hook_wake: false,
             execution_lease: None,
             message_deliveries: 0,
             pending_plan_reset: None,
@@ -942,14 +944,54 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub(crate) fn with_hook_wake(mut self, required: bool) -> Self {
+        self.require_hook_wake = required;
+        self
+    }
+
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        let _execution_owner = if self.execution_lease.is_some() {
+            self.execution_lease.take()
+        } else {
+            match (
+                self.search_config_path
+                    .as_deref()
+                    .and_then(std::path::Path::parent),
+                self.conv_id.as_deref(),
+            ) {
+                (Some(root), Some(session)) => {
+                    crate::services::session_messages::ExecutionLease::acquire(root, session)?
+                }
+                _ => None,
+            }
+        };
         let mut async_hook_guard = crate::services::async_hooks::TurnGuard(self.conv_id.clone());
-        let _execution_owner = if self.execution_lease.is_some() {self.execution_lease.take()} else {match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
-            (Some(root),Some(session))=>crate::services::session_messages::ExecutionLease::acquire(root,session)?,
-            _=>None,
-        }};
-        if self.permission_manager.as_ref().is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::Auto) {
-            let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Auto permissions require a configured data directory"))?;
+        if self.require_hook_wake {
+            let root = self
+                .search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .ok_or_else(|| anyhow!("Missing hook wake root"))?;
+            let session = self.conv_id.as_deref().unwrap_or_default();
+            anyhow::ensure!(
+                crate::services::async_hooks::has_pending_wake(root, session),
+                "No pending hook wake remains"
+            );
+            let incoming = crate::services::async_hooks::drain_wake(root, session);
+            anyhow::ensure!(!incoming.is_empty(), "Hook wake already consumed");
+            self.messages.extend(incoming.into_iter().map(|content| json!({"role":"user","content":format!("<system-reminder>\n{content}\n</system-reminder>")})));
+            self.require_hook_wake = false;
+        }
+        if self
+            .permission_manager
+            .as_ref()
+            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::Auto)
+        {
+            let root = self
+                .search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .ok_or_else(|| anyhow!("Auto permissions require a configured data directory"))?;
             let context = crate::services::session_messages::context(root)?;
             let (config, _) = super::auto_permissions::configured(&context, &self.provider)?;
             let authority = crate::services::permission_authority::history(&context.db, self.conv_id.as_deref().unwrap_or(""), config.max_input_tokens as usize)?;

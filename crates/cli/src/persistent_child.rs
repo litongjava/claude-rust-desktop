@@ -1,4 +1,4 @@
-//! Idle child jobs stay inside the same supervised owner and never submit a parent turn.
+//! Supervised idle jobs for owned children and internal command-hook feedback.
 use super::{jobs, service, ModeControl, ModeTarget, Session, Worker};
 use anyhow::{bail, Context, Result};
 use claude_core::native_engine::tool_loop::EngineEvent;
@@ -22,13 +22,18 @@ pub(super) async fn start_pending(
     let Some(session) = current.as_ref() else {
         return Ok(());
     };
-    let Some(child) = session
-        .engine
-        .pending_owned_child(&worker.session_id)
-        .await?
-    else {
-        return Ok(());
-    };
+    let child =
+        if claude_core::services::async_hooks::has_pending_wake(&worker.root, &worker.session_id) {
+            String::new()
+        } else if let Some(child) = session
+            .engine
+            .pending_owned_child(&worker.session_id)
+            .await?
+        {
+            child
+        } else {
+            return Ok(());
+        };
     if active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -39,21 +44,27 @@ pub(super) async fn start_pending(
     if let Err(error) = service::begin_job(
         worker,
         &id,
-        &format!("Resume owned child {child} from inbox"),
+        &if child.is_empty() {
+            "Async hook blocking feedback".into()
+        } else {
+            format!("Resume owned child {child} from inbox")
+        },
     ) {
         active.store(false, Ordering::Release);
         return Err(error);
     }
-    // Automatic child work is visible under /tasks and never seizes the input prompt.
+    // Automatic work is visible under /tasks and never seizes the input prompt.
     let publish = (|| -> Result<()> {
-        std::fs::write(
-            worker
-                .root
-                .join("background-tasks")
-                .join(&id)
-                .join("owned-child.json"),
-            serde_json::to_vec(&child)?,
-        )?;
+        if !child.is_empty() {
+            std::fs::write(
+                worker
+                    .root
+                    .join("background-tasks")
+                    .join(&id)
+                    .join("owned-child.json"),
+                serde_json::to_vec(&child)?,
+            )?;
+        }
         jobs::detach(&worker.root, &id, &worker.session_id)
     })();
     if let Err(error) = publish {
@@ -86,7 +97,7 @@ pub(super) async fn start_pending(
                 Some(format!("Owned child worker panicked: {error}"))
             }
         };
-        if error.is_some() {
+        if error.is_some() && !cleanup_child.is_empty() {
             if let Some(session) = cleanup_sessions.lock().await.as_ref() {
                 session
                     .engine
@@ -131,6 +142,23 @@ async fn execute(
         if mode != session.permissions.get_mode() {
             session.permissions.set_mode(mode);
         }
+    }
+    if child.is_empty() {
+        let cli = session
+            .hook_wake_cli
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("Hook wake requires live worker options")?;
+        *mode_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModeControl {
+            job_id: id.into(),
+            session_id: session.id.clone(),
+            manager: session.permissions.clone(),
+            db: session.store.db.clone(),
+            provider: session.selected_provider().await?,
+            owner_manager: None,
+        });
+        return session.wake_hooks(&cli, &mut None).await;
     }
     let (manager, provider) = session
         .engine

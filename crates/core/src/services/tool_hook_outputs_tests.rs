@@ -82,6 +82,7 @@ async fn delayed_command_tail_cannot_overwrite_newer_callback_output() {
             if_condition: None,
             once: false,
             asynchronous: false,
+            async_rewake: false,
             status_message: None,
         })
         .collect();

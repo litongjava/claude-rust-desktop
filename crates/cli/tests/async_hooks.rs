@@ -66,6 +66,15 @@ async fn model(
 
 #[tokio::test]
 async fn command_async_delivers_on_next_model_request_and_once_survives_cli_resume() {
+    busy_fixture(false).await;
+}
+
+#[tokio::test]
+async fn command_rewake_delivers_while_busy_without_permission_or_resume_replay() {
+    busy_fixture(true).await;
+}
+
+async fn busy_fixture(rewake: bool) {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let workspace = root.path().join("workspace");
@@ -78,7 +87,7 @@ const timer=setInterval(()=>{if(!fs.existsSync('release'))return;clearInterval(t
 console.log(JSON.stringify({systemMessage:'ASYNC_SYSTEM_SENTINEL',continue:false,decision:'block',hookSpecificOutput:{hookEventName:'SessionStart',additionalContext:'ASYNC_CONTEXT_SENTINEL',permissionDecision:'deny'}}));
 fs.writeFileSync('finished','');process.exit(2);},20);});
 "#).unwrap();
-    std::fs::write(data.join("settings.json"),json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node hook.cjs","async":true,"once":true,"timeout":20}]}]}}).to_string()).unwrap();
+    std::fs::write(data.join("settings.json"),json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node hook.cjs","async":true,"asyncRewake":rewake,"once":true,"timeout":20}]}]}}).to_string()).unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());

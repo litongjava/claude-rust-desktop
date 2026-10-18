@@ -352,11 +352,48 @@ impl QueryEngine {
     }
 
     /// The desktop SSE route owns its assistant row so snapshots and results share one ID.
-    pub async fn send_message_with_history(&self, mut request: ChatRequest, save_response: bool) -> Result<mpsc::Receiver<EngineEvent>> {
-        crate::services::compaction::apply_boundary(&self.db_manager, &request.conversation_id, &mut request.messages)?;
-        let skill_invocation = request.messages.iter().rev().find(|m| m["role"] == "user")
-            .and_then(|m| m["content"].as_str()).and_then(|text| text.trim_start().strip_prefix('/'))
-            .map(|text| { let mut parts = text.splitn(2, char::is_whitespace); (parts.next().unwrap_or("").to_owned(), parts.next().unwrap_or("").trim().to_owned()) });
+    pub async fn send_message_with_history(
+        &self,
+        request: ChatRequest,
+        save_response: bool,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        self.send_with_origin(request, save_response, false).await
+    }
+
+    /// Internal hook feedback: no user prompt hooks, skill invocation or authority.
+    pub async fn send_hook_wake(
+        &self,
+        request: ChatRequest,
+        save_response: bool,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        self.send_with_origin(request, save_response, true).await
+    }
+
+    async fn send_with_origin(
+        &self,
+        mut request: ChatRequest,
+        save_response: bool,
+        hook_wake: bool,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        crate::services::compaction::apply_boundary(
+            &self.db_manager,
+            &request.conversation_id,
+            &mut request.messages,
+        )?;
+        let skill_invocation = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .and_then(|text| text.trim_start().strip_prefix('/'))
+            .map(|text| {
+                let mut parts = text.splitn(2, char::is_whitespace);
+                (
+                    parts.next().unwrap_or("").to_owned(),
+                    parts.next().unwrap_or("").trim().to_owned(),
+                )
+            });
         let conv_id = request.conversation_id.clone();
         let plugin_root=self.provider_manager.lock().await.config_path().parent().context("Missing runtime directory")?.to_path_buf();
         let plugin_context=crate::services::ServiceContext{paths:crate::runtime::RuntimePaths::new(plugin_root)?,db:self.db_manager.clone(),credentials:Arc::new(crate::services::EnvironmentCredentials)};
@@ -395,9 +432,10 @@ impl QueryEngine {
         let mut discovered_skills = crate::services::plugins::skill_commands(&plugin_context)?;
         discovered_skills.extend(crate::skills::discovery::discover(&workspace)?);
         let mut pending_user_skill = None;
-        if let Some((command, arguments)) = skill_invocation {
+        if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake) {
             let content = if let Some(skill) = discovered_skills.get(&command) {
-                let embedded = skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
+                let embedded =
+                    skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
                 let requires_execution = if embedded {
                     true
                 } else {
@@ -419,16 +457,53 @@ impl QueryEngine {
             if let Some(content) = content { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nSelected skill instructions:\n{content}\n")); }
         }
         let available_skills = discovered_skills.values().filter(|skill| skill.model_invocable()).map(|skill| serde_json::json!({"name":skill.name,"description":skill.description,"context":skill.context})).collect::<Vec<_>>();
-        if !available_skills.is_empty() { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool. {}\n", serde_json::to_string(&available_skills)?)); }
-        crate::tools::configure_lsp_servers(&workspace_path, crate::services::plugins::language_servers(&plugin_context)?)?;
-        let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(&plugin_context, &workspace)?.with_session_callbacks(&conv_id);
-        let prompt = request.messages.iter().rev().find(|m| m["role"] == "user").map(|m| m["content"].clone()).unwrap_or(Value::Null);
-        let hook_result = hooks.run(crate::services::tool_hooks::HookEvent::UserPromptSubmit, &conv_id, serde_json::json!({"prompt":prompt})).await?;
-        anyhow::ensure!(!hook_result.blocked, "UserPromptSubmit hook blocked request: {}", hook_result.reason);
-        for context in hook_result.additional_context { request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nUserPromptSubmit hook context: {context}\n")); }
-        for warning in hook_result.warnings { tracing::warn!("UserPromptSubmit hook: {warning}"); }
+        if !available_skills.is_empty() {
+            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool. {}\n", serde_json::to_string(&available_skills)?));
+        }
+        crate::tools::configure_lsp_servers(
+            &workspace_path,
+            crate::services::plugins::language_servers(&plugin_context)?,
+        )?;
+        let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(
+            &plugin_context,
+            &workspace,
+        )?
+        .with_session_callbacks(&conv_id);
+        let prompt = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .map(|m| m["content"].clone())
+            .unwrap_or(Value::Null);
+        if !hook_wake {
+            let hook_result = hooks
+                .run(
+                    crate::services::tool_hooks::HookEvent::UserPromptSubmit,
+                    &conv_id,
+                    serde_json::json!({"prompt":prompt}),
+                )
+                .await?;
+            anyhow::ensure!(
+                !hook_result.blocked,
+                "UserPromptSubmit hook blocked request: {}",
+                hook_result.reason
+            );
+            for context in hook_result.additional_context {
+                request
+                    .system_prompt
+                    .get_or_insert_with(String::new)
+                    .push_str(&format!("\nUserPromptSubmit hook context: {context}\n"));
+            }
+            for warning in hook_result.warnings {
+                tracing::warn!("UserPromptSubmit hook: {warning}");
+            }
+        }
         request.workspace_path = Some(workspace_path.clone());
-        request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWorking directory: {workspace_path}\n"));
+        request
+            .system_prompt
+            .get_or_insert_with(String::new)
+            .push_str(&format!("\nWorking directory: {workspace_path}\n"));
         let instructions_workspace = workspace.clone();
         let instructions = tokio::task::spawn_blocking(move || {
             crate::project_instructions::load(&instructions_workspace)
@@ -546,6 +621,7 @@ impl QueryEngine {
                 .unwrap_or_default(),
         )
         .with_allowed_directories(allowed_directories)
+        .with_hook_wake(hook_wake)
         .with_user_skill(pending_user_skill)
         .with_max_turns(request.max_turns)?
         .with_response_schema(request.response_schema)?
@@ -825,6 +901,16 @@ impl QueryEngine {
         }
 
         Ok(event_rx)
+    }
+
+    /// Join a completed turn without cancelling background hooks it launched.
+    pub async fn finish_turn(&self, conv_id: &str) {
+        let turn = self.active_turns.lock().await.remove(conv_id);
+        if let Some(mut turn) = turn {
+            if let Some(handle) = turn.executor_handle.take() {
+                let _ = handle.await;
+            }
+        }
     }
 
     pub async fn cancel_turn(&self, conv_id: &str) {

@@ -29,6 +29,8 @@ pub fn terminal_input() -> TerminalInput {
 }
 
 pub struct Session {
+    /// Runtime-only options of the latest worker turn, retained for internal wakes.
+    pub(crate) hook_wake_cli: std::sync::Mutex<Option<Arc<Cli>>>,
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_content: Option<Value>,
     pub(crate) sdk_overrides: crate::sdk_initialization::Overrides,
@@ -289,6 +291,7 @@ impl Session {
             claude_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
         )));
         Ok(Self {
+            hook_wake_cli: std::sync::Mutex::new(None),
             permissions,
             ide,
             paths: paths.clone(),
@@ -593,11 +596,25 @@ impl Session {
         Ok(())
     }
 
+    pub async fn wake_hooks(&self, cli: &Cli, input: &mut Option<TerminalInput>) -> Result<()> {
+        Box::pin(self.run_turn_origin(cli, "", input, true)).await
+    }
+
     async fn run_turn(
         &self,
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
+    ) -> Result<()> {
+        self.run_turn_origin(cli, prompt, input, false).await
+    }
+
+    async fn run_turn_origin(
+        &self,
+        cli: &Cli,
+        prompt: &str,
+        input: &mut Option<TerminalInput>,
+        hook_wake: bool,
     ) -> Result<()> {
         let turn_goal = claude_core::services::session_goals::active(&self.store.db, &self.id)?;
         if let Err(error) = crate::ide_commands::restore(self).await {
@@ -607,9 +624,12 @@ impl Session {
         self.ensure_mcp().await?;
         self.reload_plugins().await?;
         crate::session_commands::prepare_turn(self, self.context_window().await).await?;
-        self.permissions.set_session_rules(&self.id, crate::permission_commands::load(self)?);
+        self.permissions
+            .set_session_rules(&self.id, crate::permission_commands::load(self)?);
         let mut history = self.store.model_history(&self.id, &self.api_format)?;
-        history.push(json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))}));
+        if !hook_wake {
+            history.push(json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))}));
+        }
         let mut system = match &self.sdk_overrides.system_prompt {
             Some(prompt) => prompt.clone(),
             None => cli.system_prompt_text()?,
@@ -628,38 +648,89 @@ impl Session {
         }
         system.push_str("\nThe user is working in the standalone Claude Rust terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
         let cwd = &self.workspace;
-        if self.sdk_content.is_some() {anyhow::ensure!(self.selected_provider().await?.model.supports_vision,"Selected model does not accept Image input");}
-        let user_message_id = match &self.sdk_content {Some(content)=>self.store.append_user_content(&self.id,prompt,content),None=>self.store.append(&self.id,"user",prompt)}.context("Persisting CLI user message")?;
-        let mut checkpoint = match claude_core::services::checkpoints::capture(&self.paths.data_dir, &self.id, &user_message_id, cwd) {
-            Ok(capture) => Some(capture),
-            Err(error) => { if input.is_some() { eprintln!("Code checkpoint unavailable: {error:#}"); } None },
+        if self.sdk_content.is_some() {
+            anyhow::ensure!(
+                self.selected_provider().await?.model.supports_vision,
+                "Selected model does not accept Image input"
+            );
+        }
+        let mut checkpoint = if hook_wake {
+            None
+        } else {
+            let user_message_id = match &self.sdk_content {
+                Some(content) => self.store.append_user_content(&self.id, prompt, content),
+                None => self.store.append(&self.id, "user", prompt),
+            }
+            .context("Persisting CLI user message")?;
+            match claude_core::services::checkpoints::capture(
+                &self.paths.data_dir,
+                &self.id,
+                &user_message_id,
+                cwd,
+            ) {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    if input.is_some() {
+                        eprintln!("Code checkpoint unavailable: {error:#}");
+                    }
+                    None
+                }
+            }
         };
-        let interactive_display = input.is_some() && cli.output_format == OutputFormat::Text && !cli.print && !cli.print_short && !crate::display_commands::load(self)?.focus;
+        let interactive_display = input.is_some()
+            && cli.output_format == OutputFormat::Text
+            && !cli.print
+            && !cli.print_short
+            && !crate::display_commands::load(self)?.focus;
         self.engine.set_auto_manual_interactive(input.is_some());
         self.engine.set_permission_host_available(input.is_some() || self.sdk_permissions.is_some() || std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_some());
         // A host flag and a live, session-owned frontend lease are both required.
         // SDK/Desktop engines never enable this local terminal tool.
-        self.engine.set_local_goal_frontend(claude_core::services::background_sessions::worker_directory(&self.paths.data_dir, &self.id)?.is_some());
-        let request = Box::pin(self
-            .engine
-            .send_message_with_history(
-                ChatRequest {
-                    conversation_id: self.id.clone(),
-                    messages: history,
-                    model: self.model.clone(),
-                    provider_id: if self.auto_route { None } else { Some(self.provider_id.clone()) },
-                    effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
-                    system_prompt: Some(system),
-                    max_tokens: cli.max_tokens,
-                    max_turns: cli.max_turns.map(|limit| turn_goal.as_ref().map_or(limit, |g| limit.saturating_sub(g.model_requests.saturating_sub(g.run_start_requests).min(u64::from(u32::MAX)) as u32).max(1))),
-                    response_schema,
-                    workspace_path: Some(cwd.to_string_lossy().into_owned()),
-                    temperature: None,
-                    top_p: None,
-                    reasoning_mode: None,
-                },
-                false,
-            ));
+        self.engine.set_local_goal_frontend(
+            claude_core::services::background_sessions::worker_directory(
+                &self.paths.data_dir,
+                &self.id,
+            )?
+            .is_some(),
+        );
+        let chat_request = ChatRequest {
+            conversation_id: self.id.clone(),
+            messages: history,
+            model: self.model.clone(),
+            provider_id: if self.auto_route {
+                None
+            } else {
+                Some(self.provider_id.clone())
+            },
+            effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
+            system_prompt: Some(system),
+            max_tokens: cli.max_tokens,
+            max_turns: cli.max_turns.map(|limit| {
+                turn_goal.as_ref().map_or(limit, |g| {
+                    limit
+                        .saturating_sub(
+                            g.model_requests
+                                .saturating_sub(g.run_start_requests)
+                                .min(u64::from(u32::MAX)) as u32,
+                        )
+                        .max(1)
+                })
+            }),
+            response_schema,
+            workspace_path: Some(cwd.to_string_lossy().into_owned()),
+            temperature: None,
+            top_p: None,
+            reasoning_mode: None,
+        };
+        let request = Box::pin(async {
+            if hook_wake {
+                self.engine.send_hook_wake(chat_request, false).await
+            } else {
+                self.engine
+                    .send_message_with_history(chat_request, false)
+                    .await
+            }
+        });
         let worker_cancel = claude_core::services::background_sessions::wait_for_cancellation();
         tokio::pin!(worker_cancel);
         let mut events = tokio::select! {
@@ -862,10 +933,15 @@ impl Session {
             Ok(())
         }.await;
         progress.clear();
-        // Cancel and join before persisting, including Ctrl+C and closed stdin.
-        self.engine.cancel_turn(&self.id).await;
+        // Join before persisting; only interruption cancels background hooks.
+        if completed && turn_result.is_ok() && error.is_none() {
+            self.engine.finish_turn(&self.id).await;
+        } else {
+            self.engine.cancel_turn(&self.id).await;
+        }
         // Cancellation may happen after the atomic boundary commit but before its event.
-        let latest_boundary = claude_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
+        let latest_boundary =
+            claude_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
         if latest_boundary != observed_plan_boundary {
             if let Some(boundary) = latest_boundary {
                 claude_core::services::plan_approval::archive_segment(&self.store.db, &self.id, &boundary, None, &text, &thinking_text, &tools, &snapshots)?;

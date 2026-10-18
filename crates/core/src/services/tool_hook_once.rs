@@ -17,6 +17,21 @@ impl HookRunner {
                     .context("Async hook state directory is missing")?,
                 session,
                 task,
+                hook.async_rewake.then(|| {
+                    let key = match hook.event {
+                        HookEvent::SessionStart => "source",
+                        HookEvent::SessionEnd => "reason",
+                        HookEvent::PreCompact | HookEvent::PostCompact => "trigger",
+                        HookEvent::SubagentStart | HookEvent::SubagentStop => "agent_type",
+                        _ => "tool_name",
+                    };
+                    let query = input.get(key).and_then(Value::as_str).unwrap_or("");
+                    if query.is_empty() {
+                        hook.event.name().to_owned()
+                    } else {
+                        format!("{}:{query}", hook.event.name())
+                    }
+                }),
             )?;
             Ok((0, String::new(), String::new()))
         } else {

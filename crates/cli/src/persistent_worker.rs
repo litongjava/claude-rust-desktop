@@ -235,6 +235,10 @@ async fn execute(
         .unwrap()
         .turn(&cli, &prompt, &mut None)
         .await;
+    *session
+        .hook_wake_cli
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(cli));
     session.engine.set_owned_child_idle_ready(&session.id, result.is_ok());
     let _mode_guard = mode_target.lock().unwrap_or_else(|e|e.into_inner());
     claude_core::services::session_permission_mode::set(&session.store.db, &session.id, &session.permissions, session.permissions.get_mode())?;

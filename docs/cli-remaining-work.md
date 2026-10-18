@@ -55,7 +55,7 @@
 2. [x] `statusMessage`：CLI/worker 运行进度、完成/失败/取消清除及 ConPTY 恢复验收完成（`a2a0366`，详见 `status-message-acceptance-20261018.md`）。
 3. [x] HTTP hook：本地 HTTP fixture、显式 header 环境变量白名单、超时/错误/取消、权限组合与跨进程 once 恢复已验收（详见开发记录 `http-hook-acceptance-20261018.md`）。
 4. [x] Command `async`：会话托管的后台执行、跨进程一次性上下文投递、取消/超时/关闭及 Windows 进程树清理；CLI 集成与 ConPTY 验收完成（详见 `command-async-hook-acceptance-20261018.md`）。
-5. `asyncRewake`：完成/唤醒语义（尤其 exit code 2），取消后不重放。
+5. [x] Command `asyncRewake`：隐含后台执行、exit 2 阻塞反馈、CLI 空闲/运行中恰好一次投递及取消/关闭/恢复隔离；CLI 集成与 ConPTY 验收完成（详见开发记录 `async-rewake-hook-acceptance-20261018.md`）。
 6. Prompt hook：有界的 provider 评估、事件限制、输出校验、失败策略。
 7. Agent hook：有界验证 agent，只用原版允许的工具子集，不继承主会话权限。
 

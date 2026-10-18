@@ -450,6 +450,12 @@ async fn run(cli: &Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
+                    if !composer.is_pending()
+                        && claude_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session.id)
+                        && input.as_mut().expect("interactive reader").yield_prompt().await? {
+                        if let Err(error) = session.wake_hooks(cli, &mut input).await { eprintln!("Hook wake: {error:#}"); }
+                        continue 'repl;
+                    }
                     for notice in background_commands::collect_completed(&session)? {
                         input.as_ref().expect("interactive reader").notice(notice);
                     }
