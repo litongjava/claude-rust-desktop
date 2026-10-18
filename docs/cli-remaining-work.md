@@ -56,7 +56,7 @@
 3. [x] HTTP hook：本地 HTTP fixture、显式 header 环境变量白名单、超时/错误/取消、权限组合与跨进程 once 恢复已验收（详见开发记录 `http-hook-acceptance-20261018.md`）。
 4. [x] Command `async`：会话托管的后台执行、跨进程一次性上下文投递、取消/超时/关闭及 Windows 进程树清理；CLI 集成与 ConPTY 验收完成（详见 `command-async-hook-acceptance-20261018.md`）。
 5. [x] Command `asyncRewake`：隐含后台执行、exit 2 阻塞反馈、CLI 空闲/运行中恰好一次投递及取消/关闭/恢复隔离；CLI 集成与 ConPTY 验收完成（详见开发记录 `async-rewake-hook-acceptance-20261018.md`）。
-6. Prompt hook：有界的 provider 评估、事件限制、输出校验、失败策略。
+6. [x] Prompt hook：有界单次无工具 provider 评估、事件限制、输出校验、失败/取消、once 恢复与权限组合；OpenAI/Anthropic mock 及 CLI Write 阻止集成验收完成（详见开发记录 `prompt-hook-acceptance-20261018.md`；含 built-in provider，传输重试受 hook timeout 约束）。
 7. Agent hook：有界验证 agent，只用原版允许的工具子集，不继承主会话权限。
 
 未支持的选项要明确报错，不能静默接受。验证命令 hook 与 SDK 回调组合时的顺序和 deny/ask 优先级。

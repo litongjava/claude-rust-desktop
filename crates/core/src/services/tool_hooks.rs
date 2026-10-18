@@ -63,6 +63,8 @@ pub struct ActiveHook {
     pub command: String,
     #[serde(flatten)]
     pub http: Option<HttpHook>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<prompt::PromptHook>,
     pub timeout: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
@@ -166,6 +168,8 @@ fn json_truthy(value: &Value) -> bool {
 #[path = "tool_hook_http.rs"]
 mod http;
 pub use http::HttpHook;
+#[path = "tool_hook_prompt.rs"]
+mod prompt;
 
 #[path = "tool_hook_once.rs"]
 mod once;
@@ -216,6 +220,7 @@ pub struct HookRunner {
     hooks: Vec<ActiveHook>,
     callbacks: Option<std::sync::Weak<super::hook_callbacks::Registration>>,
     disabled: bool,
+    prompt_provider: Option<crate::native_engine::provider_manager::ResolvedProvider>,
 }
 
 impl HookRunner {
@@ -291,7 +296,15 @@ impl HookRunner {
                     "SessionEnd" => HookEvent::SessionEnd,
                     "PreCompact" => HookEvent::PreCompact,
                     "PostCompact" => HookEvent::PostCompact,
-                    _ => continue,
+                    _ => {
+                        ensure!(
+                            !groups
+                                .iter()
+                                .any(|g| g.hooks.iter().any(|h| h["type"] == "prompt")),
+                            "Prompt hooks are not supported for {name}"
+                        );
+                        continue;
+                    }
                 };
                 for group in groups {
                     if !group.matcher.is_empty() && group.matcher != "*" {
@@ -299,7 +312,7 @@ impl HookRunner {
                             .context("Invalid hook matcher regular expression")?;
                     }
                     for mut hook in group.hooks {
-                        ensure!(hook["type"] == "command" || hook["type"] == "http", "Unsupported hook type for {name} in {}; only command and http hooks are implemented", source.display());
+                        ensure!(hook["type"] == "command" || hook["type"] == "http" || hook["type"] == "prompt", "Unsupported hook type for {name} in {}; only command, http and prompt hooks are implemented", source.display());
                         for option in ["async", "asyncRewake"] {
                             if let Some(value) = hook.get(option) {
                                 ensure!(value.is_boolean(), "Hook {option} must be boolean");
@@ -310,6 +323,7 @@ impl HookRunner {
                                 );
                             }
                         }
+                        let prompt = prompt::load(&mut hook, event)?;
                         let http = if hook["type"] == "http" {
                             ensure!(hook.get("command").is_none() && hook.get("shell").is_none(), "HTTP hooks cannot specify command or shell");
                             let config: HttpHook = serde_json::from_value(hook.clone())?;
@@ -339,6 +353,7 @@ impl HookRunner {
                             matcher: group.matcher.clone(),
                             command: hook.command,
                             http,
+                            prompt,
                             timeout: hook.timeout,
                             once: hook.once,
                             asynchronous: hook.asynchronous || hook.async_rewake,
@@ -369,6 +384,7 @@ impl HookRunner {
             hooks,
             disabled,
             callbacks: None,
+            prompt_provider: None,
         })
     }
 
@@ -496,6 +512,14 @@ impl HookRunner {
                     }));
                 }
             }
+            // A prompt evaluator is a guard, never an approval source. Do not let
+            // a faster callback approval cancel a pending prompt denial.
+            let has_prompt_guard = self.hooks.iter().any(|hook| {
+                hook.event == event
+                    && hook.prompt.is_some()
+                    && matches_tool(&hook.matcher, &name).unwrap_or(false)
+                    && hook.condition_matches(event, &input, &self.workspace)
+            });
             let mut result = HookOutcome::default();
             while let Some(outcome) = pending.next().await {
                 match outcome {
@@ -504,10 +528,15 @@ impl HookRunner {
                         if outcome.blocked {
                             result.warnings.push(outcome.reason);
                         }
-                        if outcome.permission_response.is_some() {
-                            result.permission_response = outcome.permission_response;
-                            // Dropping the losing futures kills their actual subprocesses.
-                            return Ok(result);
+                        if let Some(response) = outcome.permission_response {
+                            let denied = matches!(response, HookPermissionResponse::Deny { .. });
+                            if denied || result.permission_response.is_none() {
+                                result.permission_response = Some(response);
+                            }
+                            if denied || !has_prompt_guard {
+                                // Dropping losing futures cancels their work and status.
+                                return Ok(result);
+                            }
                         }
                     }
                     Err(error) => result
@@ -656,6 +685,20 @@ fn matches_tool(matcher: &str, tool: &str) -> Result<bool> {
 }
 
 fn parse_hook_output(hook: &ActiveHook, code: i32, stdout: &str, stderr: &str) -> Result<HookOutcome> {
+    if hook.prompt.is_some() && code == 2 {
+        return Ok(HookOutcome {
+            blocked: true,
+            prevent_continuation: true,
+            reason: stderr.into(),
+            permission_response: (hook.event == HookEvent::PermissionRequest).then(|| {
+                HookPermissionResponse::Deny {
+                    message: stderr.into(),
+                    interrupt: true,
+                }
+            }),
+            ..Default::default()
+        });
+    }
     if hook.http.is_some() {
         if code == 0 { parse_json_output(hook.event, serde_json::from_str(stdout)?) }
         else { Ok(HookOutcome { warnings: vec![stderr.into()], ..Default::default() }) }
@@ -1048,6 +1091,7 @@ mod tests {
                     matcher: "Write".into(),
                     command,
                     http: None,
+                    prompt: None,
                     timeout: 35,
                     source: root.path().into(),
                     shell: Some(if cfg!(windows) { "powershell" } else { "sh" }.into()),
@@ -1153,6 +1197,7 @@ mod tests {
             matcher: "*".into(),
             command: command.into(),
             http: None,
+            prompt: None,
             timeout: 10,
             source: root.path().into(),
             shell: Some(shell.into()),
@@ -1261,6 +1306,7 @@ mod tests {
             matcher: "".into(),
             command: command.into(),
             http: None,
+            prompt: None,
             timeout: 1,
             source: root.path().into(),
             shell: Some(shell.into()),
@@ -1288,6 +1334,7 @@ mod tests {
             matcher: "".into(),
             command: command.into(),
             http: None,
+            prompt: None,
             timeout: 10,
             source: cwd.clone(),
             shell: Some(shell.into()),

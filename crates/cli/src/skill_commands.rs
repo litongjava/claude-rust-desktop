@@ -175,7 +175,8 @@ pub async fn prepare_invocation(
     session
         .permissions
         .set_session_rules(&session.id, crate::permission_commands::load(session)?);
-    let hooks = HookRunner::load_with_plugins(&context, &session.workspace)?;
+    let hooks = HookRunner::load_with_plugins(&context, &session.workspace)?
+        .with_prompt_provider(session.sdk_resolve_model(&session.model).await?)?;
     let mut expanded = String::new();
     for segment in segments {
         match segment {

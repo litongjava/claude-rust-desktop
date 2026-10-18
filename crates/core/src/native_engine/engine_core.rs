@@ -464,10 +464,20 @@ impl QueryEngine {
             &workspace_path,
             crate::services::plugins::language_servers(&plugin_context)?,
         )?;
+        let hook_provider = {
+            let pm = self.provider_manager.lock().await;
+            if let Some(id) = request.provider_id.as_deref() {
+                pm.resolve_selected(id, &request.model)
+            } else {
+                pm.resolve_provider(&request.model).await
+            }
+        }
+        .ok_or_else(|| anyhow!("No provider found for model: {}", request.model))?;
         let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(
             &plugin_context,
             &workspace,
         )?
+        .with_prompt_provider(hook_provider)?
         .with_session_callbacks(&conv_id);
         let prompt = request
             .messages

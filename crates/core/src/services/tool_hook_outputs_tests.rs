@@ -76,6 +76,7 @@ async fn delayed_command_tail_cannot_overwrite_newer_callback_output() {
             matcher: String::new(),
             command: command.into(),
             http: None,
+            prompt: None,
             timeout: 20,
             source: root.path().into(),
             shell: Some(shell.into()),

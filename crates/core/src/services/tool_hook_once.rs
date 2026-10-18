@@ -9,6 +9,10 @@ impl HookRunner {
         session: &str,
         input: &Value,
     ) -> Result<(i32, String, String)> {
+        if let Some(config) = &hook.prompt {
+            return prompt::execute_prompt(hook, config, self.prompt_provider.as_ref(), input)
+                .await;
+        }
         if hook.asynchronous {
             let task = prepare_command(hook, &self.workspace, input)?;
             super::super::async_hooks::register(
