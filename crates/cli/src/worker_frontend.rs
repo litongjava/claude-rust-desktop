@@ -153,6 +153,11 @@ fn is_main_execution(root: &std::path::Path, job: &jobs::Job, session: &str) -> 
 
 pub(crate) fn cancel_job(session: &Session, id: &str) -> Result<()> {
     let job = jobs::cancel(&session.paths.data_dir, id)?;
+    let execution_session = claude_core::services::session_worker::job_execution_session(
+        &session.paths.data_dir,
+        &job,
+    )?;
+    claude_core::services::async_hooks::signal_cancel(&session.paths.data_dir, &execution_session);
     if is_main_execution(&session.paths.data_dir, &job, &session.id)? {
         claude_core::services::goal_proposals::discard(&session.store.db, &session.id)?;
     }
@@ -270,8 +275,21 @@ async fn observe(
     let relay = session.remote_relay();
     let mut remote_request: Option<claude_core::services::remote_control::PermissionRequest> = None;
     let mut remote_interrupts = session.remote_interrupts();
+    let mut local_hooks = claude_core::services::hook_progress::subscribe(&session.id);
+    let mut local_hook_ids = Vec::new();
+    for (id, message) in local_hooks.snapshot() {
+        display.hook_progress(&id, Some(&message));
+        local_hook_ids.push(id);
+    }
     loop {
         tokio::select! {
+            hooks = local_hooks.changed() => {
+                for id in local_hook_ids.drain(..) { display.hook_progress(&id, None); }
+                for (id, message) in hooks {
+                    display.hook_progress(&id, Some(&message));
+                    local_hook_ids.push(id);
+                }
+            },
             _ = tick.tick() => {
                 let proposal = proposal_frontend.map(|frontend| frontend.poll()).transpose()?.flatten();
                 let has_proposal = proposal.is_some();

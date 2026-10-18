@@ -38,6 +38,7 @@ pub async fn start(
         ["startup", "resume", "clear", "compact"].contains(&source),
         "Invalid SessionStart source"
     );
+    super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     // Clear previous activation's context before running commands, including failures.
     context.save_setting(&key(session), &"")?;
     let (text, warnings) = collect(context, workspace, session, source, model).await?;
@@ -87,6 +88,7 @@ pub async fn end(
             .await
     })
     .await;
+    super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     match result {
         Ok(Ok(outcome)) => outcome.warnings,
         Ok(Err(error)) => vec![format!("SessionEnd hook: {error:#}")],

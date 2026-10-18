@@ -943,6 +943,7 @@ impl ToolLoopExecutor {
     }
 
     pub async fn execute(&mut self) -> Result<(String, Option<String>)> {
+        let mut async_hook_guard = crate::services::async_hooks::TurnGuard(self.conv_id.clone());
         let _execution_owner = if self.execution_lease.is_some() {self.execution_lease.take()} else {match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
             (Some(root),Some(session))=>crate::services::session_messages::ExecutionLease::acquire(root,session)?,
             _=>None,
@@ -998,8 +999,33 @@ impl ToolLoopExecutor {
         }
         Box::pin(self.refresh_mcp_tools()).await?;
         let directories = self.allowed_directories.clone();
-        let context = self.search_config_path.as_deref().and_then(|p| p.parent()).map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
-        crate::tools::background_shell::scope(context, crate::tools::path_scope::scope(directories, self.execute_scoped())).await
+        let context = self
+            .search_config_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
+        let result = crate::tools::background_shell::scope(
+            context,
+            crate::tools::path_scope::scope(directories, self.execute_scoped()),
+        )
+        .await;
+        if result.is_ok() {
+            async_hook_guard.0 = None;
+        }
+        result
+    }
+
+    fn drain_async_hook_messages(&self) -> Vec<String> {
+        let session = self.conv_id.as_deref().unwrap_or_default();
+        let mut messages = crate::services::async_hooks::drain(session);
+        if let Some(root) = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            messages.extend(crate::services::async_hooks::drain_shared(root, session));
+        }
+        messages
     }
 
     async fn refresh_mcp_tools(&mut self) -> Result<()> {
@@ -1499,6 +1525,14 @@ impl ToolLoopExecutor {
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
 
         for iteration in 0..self.max_tool_iterations {
+            for context in self.drain_async_hook_messages() {
+                conversation_messages.push(AnthropicMessage {
+                    role: "user".into(),
+                    content: AnthropicContent::Text(format!(
+                        "<system-reminder>\nAsync hook context:\n{context}\n</system-reminder>"
+                    )),
+                });
+            }
             self.ensure_auto_not_exhausted()?;
             self.ensure_permission_continuation()?;
             self.resume_pending_owned_children().await;
@@ -2011,6 +2045,18 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
 
         for iteration in 0..self.max_tool_iterations {
+            for context in self.drain_async_hook_messages() {
+                conversation_messages.push(OpenAIMessage {
+                    role: "user".into(),
+                    content: OpenAIContent::Text(format!(
+                        "<system-reminder>\nAsync hook context:\n{context}\n</system-reminder>"
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    provider_content: None,
+                });
+            }
             self.ensure_auto_not_exhausted()?;
             self.ensure_permission_continuation()?;
             self.resume_pending_owned_children().await;

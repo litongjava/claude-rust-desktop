@@ -494,6 +494,7 @@ impl Session {
     }
 
     pub async fn close(&self) -> Result<()> {
+        claude_core::services::async_hooks::cancel_shared(&self.paths.data_dir, &self.id).await;
         self.engine.cancel_turn(&self.id).await;
         self.ide.disconnect().await;
         claude_core::tools::shutdown_lsp_servers().await;

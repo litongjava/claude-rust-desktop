@@ -835,6 +835,7 @@ impl QueryEngine {
                 let _ = handle.await;
             }
         }
+        crate::services::async_hooks::cancel(conv_id).await;
         self.answer_waiters.lock().await.retain(|_, sender| !sender.is_closed());
         self.permission_mailbox.lock().await.retain(|_, sender| !sender.is_closed());
 

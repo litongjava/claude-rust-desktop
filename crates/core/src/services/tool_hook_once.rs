@@ -3,6 +3,26 @@ use super::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 impl HookRunner {
+    async fn execute_configured(
+        &self,
+        hook: &ActiveHook,
+        session: &str,
+        input: &Value,
+    ) -> Result<(i32, String, String)> {
+        if hook.asynchronous {
+            let task = prepare_command(hook, &self.workspace, input)?;
+            super::super::async_hooks::register(
+                self.once_directory
+                    .parent()
+                    .context("Async hook state directory is missing")?,
+                session,
+                task,
+            )?;
+            Ok((0, String::new(), String::new()))
+        } else {
+            execute(hook, &self.workspace, input).await
+        }
+    }
     pub(super) async fn execute_once(
         &self,
         hook: &ActiveHook,
@@ -10,7 +30,10 @@ impl HookRunner {
         input: &Value,
     ) -> Result<Option<(i32, String, String)>> {
         if !hook.once {
-            return execute(hook, &self.workspace, input).await.map(Some);
+            return self
+                .execute_configured(hook, session, input)
+                .await
+                .map(Some);
         }
         ensure!(
             !self.once_directory.as_os_str().is_empty(),
@@ -64,9 +87,11 @@ impl HookRunner {
             completed.is_empty(),
             "Invalid once hook state; refusing to replay"
         );
-        let output = execute(hook, &self.workspace, input).await?;
+        let output = self.execute_configured(hook, session, input).await?;
         if output.0 == 0 {
-            if hook.event == HookEvent::WorktreeCreate {
+            if hook.asynchronous {
+                // Background registration is success, regardless of eventual exit.
+            } else if hook.event == HookEvent::WorktreeCreate {
                 ensure!(
                     !output.1.trim().is_empty(),
                     "WorktreeCreate returned no path"

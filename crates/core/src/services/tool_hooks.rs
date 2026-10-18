@@ -66,6 +66,8 @@ pub struct ActiveHook {
     pub timeout: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
+    #[serde(rename = "async", skip_serializing_if = "std::ops::Not::not")]
+    pub asynchronous: bool,
     #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
     pub source: PathBuf,
@@ -188,6 +190,8 @@ struct CommandConfig {
     command: String,
     #[serde(default)]
     once: bool,
+    #[serde(default, rename = "async")]
+    asynchronous: bool,
     #[serde(default, rename = "statusMessage")]
     status_message: Option<String>,
     #[serde(default = "default_timeout")]
@@ -295,7 +299,12 @@ impl HookRunner {
                         for option in ["async", "asyncRewake"] {
                             if let Some(value) = hook.get(option) {
                                 ensure!(value.is_boolean(), "Hook {option} must be boolean");
-                                ensure!(value == false, "Hook {option} is not implemented");
+                                ensure!(
+                                    value == false
+                                        || (option == "async" && hook["type"] == "command"),
+                                    "Hook {option} is not implemented for {}",
+                                    hook["type"]
+                                );
                             }
                         }
                         let http = if hook["type"] == "http" {
@@ -329,6 +338,7 @@ impl HookRunner {
                             http,
                             timeout: hook.timeout,
                             once: hook.once,
+                            asynchronous: hook.asynchronous,
                             status_message: hook.status_message,
                             source: source.clone(),
                             shell: hook.shell,
@@ -800,7 +810,17 @@ fn string_field<'a>(value: &'a Value, name: &str) -> Result<Option<&'a str>> {
 }
 
 async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, String, String)> {
-    if let Some(config) = &hook.http { return http::execute_http(hook, config, input).await; }
+    if let Some(config) = &hook.http {
+        return http::execute_http(hook, config, input).await;
+    }
+    prepare_command(hook, cwd, input)?.await
+}
+
+fn prepare_command(
+    hook: &ActiveHook,
+    cwd: &Path,
+    input: &Value,
+) -> Result<futures::future::BoxFuture<'static, Result<(i32, String, String)>>> {
     let shell = hook
         .shell
         .as_deref()
@@ -839,7 +859,9 @@ async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, S
         }
     }
     #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    // Assign the suspended process to its kill-on-close job before it can spawn
+    // descendants. Assigning a running process leaves a child-escape race.
+    command.creation_flags(0x08000004);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -849,6 +871,8 @@ async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, S
         .spawn()
         .with_context(|| format!("Starting {} hook", hook.event.name()))?;
     let _tree = ProcessTree::new(child.id().context("Hook has no process ID")?)?;
+    #[cfg(windows)]
+    resume_command(child.id().context("Hook has no process ID")?)?;
     let _progress = super::hook_progress::Running::start(
         input["session_id"].as_str().unwrap_or(""), hook.status_message.as_deref());
     let mut stdin = child.stdin.take().context("Hook stdin unavailable")?;
@@ -856,58 +880,74 @@ async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, S
     let stderr = child.stderr.take().context("Hook stderr unavailable")?;
     let mut data = serde_json::to_vec(input)?;
     data.push(b'\n');
-    let operation = async {
-        let write = async {
-            stdin.write_all(&data).await?;
-            stdin.shutdown().await?;
-            drop(stdin);
-            Ok::<_, std::io::Error>(())
-        };
-        let read_out = async {
-            let mut bytes = Vec::new();
-            stdout
-                .take(OUTPUT_LIMIT + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok::<_, std::io::Error>(bytes)
-        };
-        let read_err = async {
-            let mut bytes = Vec::new();
-            stderr
-                .take(OUTPUT_LIMIT + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok::<_, std::io::Error>(bytes)
-        };
-        let (written, status, stdout, stderr) =
-            tokio::join!(write, child.wait(), read_out, read_err);
-        // A hook may intentionally exit without reading its input.
-        if let Err(error) = written {
-            if error.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(error.into());
+    let timeout = hook.timeout;
+    let event = hook.event;
+    Ok(Box::pin(async move {
+        let _tree = _tree;
+        let _progress = _progress;
+        let operation = async {
+            let write = async {
+                stdin.write_all(&data).await?;
+                stdin.shutdown().await?;
+                drop(stdin);
+                Ok::<_, std::io::Error>(())
+            };
+            let read_out = async {
+                let mut bytes = Vec::new();
+                stdout
+                    .take(OUTPUT_LIMIT + 1)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                Ok::<_, std::io::Error>(bytes)
+            };
+            let read_err = async {
+                let mut bytes = Vec::new();
+                stderr
+                    .take(OUTPUT_LIMIT + 1)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                Ok::<_, std::io::Error>(bytes)
+            };
+            let (written, status, stdout, stderr) =
+                tokio::join!(write, child.wait(), read_out, read_err);
+            // A hook may intentionally exit without reading its input.
+            if let Err(error) = written {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(error.into());
+                }
             }
-        }
-        let stdout = stdout?;
-        let stderr = stderr?;
-        ensure!(
-            stdout.len() <= OUTPUT_LIMIT as usize && stderr.len() <= OUTPUT_LIMIT as usize,
-            "Hook output exceeded 1 MiB"
-        );
-        Ok((
-            status?.code().unwrap_or(-1),
-            String::from_utf8(stdout).context("Hook stdout is not UTF-8")?,
-            String::from_utf8(stderr).context("Hook stderr is not UTF-8")?,
-        ))
-    };
-    tokio::time::timeout(Duration::from_secs(hook.timeout), operation)
-        .await
-        .with_context(|| {
-            format!(
-                "{} hook timed out after {} seconds",
-                hook.event.name(),
-                hook.timeout
-            )
-        })?
+            let stdout = stdout?;
+            let stderr = stderr?;
+            ensure!(
+                stdout.len() <= OUTPUT_LIMIT as usize && stderr.len() <= OUTPUT_LIMIT as usize,
+                "Hook output exceeded 1 MiB"
+            );
+            Ok((
+                status?.code().unwrap_or(-1),
+                String::from_utf8(stdout).context("Hook stdout is not UTF-8")?,
+                String::from_utf8(stderr).context("Hook stderr is not UTF-8")?,
+            ))
+        };
+        tokio::time::timeout(Duration::from_secs(timeout), operation)
+            .await
+            .with_context(|| format!("{} hook timed out after {} seconds", event.name(), timeout))?
+    }))
+}
+
+#[cfg(windows)]
+fn resume_command(pid: u32) -> Result<()> {
+    use windows::Win32::{Foundation::CloseHandle, System::Threading::*};
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtResumeProcess(process: windows::Win32::Foundation::HANDLE) -> i32;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid)?;
+        let status = NtResumeProcess(process);
+        let _ = CloseHandle(process);
+        ensure!(status >= 0, "Resuming hook process failed: {status:#x}");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -995,9 +1035,41 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,http:None,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false,status_message:None}).collect(),..Default::default()};
-        let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
-        assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
+        let runner = HookRunner {
+            workspace: root.path().into(),
+            hooks: commands
+                .into_iter()
+                .map(|command| ActiveHook {
+                    event: HookEvent::PermissionRequest,
+                    matcher: "Write".into(),
+                    command,
+                    http: None,
+                    timeout: 35,
+                    source: root.path().into(),
+                    shell: Some(if cfg!(windows) { "powershell" } else { "sh" }.into()),
+                    if_condition: None,
+                    once: false,
+                    asynchronous: false,
+                    status_message: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.run(
+                HookEvent::PermissionRequest,
+                "session",
+                json!({"tool_name":"Write","tool_use_id":"exact-id"}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            result.permission_response,
+            Some(HookPermissionResponse::Allow { .. })
+        ));
         assert!(root.path().join("slow-started").exists());
     }
 
@@ -1081,6 +1153,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            asynchronous: false,
             status_message: None,
         };
         let runner = HookRunner {
@@ -1187,6 +1260,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            asynchronous: false,
             status_message: None,
         };
         let error = execute(&hook, root.path(), &json!({})).await.unwrap_err();
@@ -1212,6 +1286,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            asynchronous: false,
             status_message: None,
         };
         let task = tokio::spawn(async move { execute(&hook, &cwd, &json!({})).await });
