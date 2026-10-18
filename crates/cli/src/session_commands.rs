@@ -545,7 +545,7 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Res
     ));
     let context = crate::services::context(&session.paths)?;
     tokio::select! {
-        result = claude_core::services::compaction::compact_with_hooks(&session.engine, &context, &session.workspace, &session.id, &session.provider_id, &session.model, "", "auto") => {
+        result = crate::hook_progress::during(&session.id, true, claude_core::services::compaction::compact_with_hooks(&session.engine, &context, &session.workspace, &session.id, &session.provider_id, &session.model, "", "auto")) => {
             for warning in result?.warnings { crate::compaction::notice(&format!("Hook: {warning}")); }
         },
         _ = tokio::signal::ctrl_c() => anyhow::bail!("Autocompact interrupted; check /history for a completed summary. Original transcript retained"),

@@ -62,7 +62,10 @@ pub struct ActiveHook {
     pub matcher: String,
     pub command: String,
     pub timeout: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
+    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
     pub source: PathBuf,
     pub shell: Option<String>,
     /// Permission-rule filter evaluated before spawning (upstream `if`).
@@ -179,6 +182,8 @@ struct CommandConfig {
     command: String,
     #[serde(default)]
     once: bool,
+    #[serde(default, rename = "statusMessage")]
+    status_message: Option<String>,
     #[serde(default = "default_timeout")]
     timeout: u64,
     #[serde(default)]
@@ -299,6 +304,7 @@ impl HookRunner {
                             command: hook.command,
                             timeout: hook.timeout,
                             once: hook.once,
+                            status_message: hook.status_message,
                             source: source.clone(),
                             shell: hook.shell,
                             if_condition: hook.if_condition.map(|condition| {
@@ -804,6 +810,8 @@ async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, S
         .spawn()
         .with_context(|| format!("Starting {} hook", hook.event.name()))?;
     let _tree = ProcessTree::new(child.id().context("Hook has no process ID")?)?;
+    let _progress = super::hook_progress::Running::start(
+        input["session_id"].as_str().unwrap_or(""), hook.status_message.as_deref());
     let mut stdin = child.stdin.take().context("Hook stdin unavailable")?;
     let stdout = child.stdout.take().context("Hook stdout unavailable")?;
     let stderr = child.stderr.take().context("Hook stderr unavailable")?;
@@ -948,7 +956,7 @@ mod tests {
         } else {
             vec!["printf yes > slow-started; sleep 30".into(), "printf '%s' '{invalid'".into(), format!("while [ ! -f slow-started ]; do sleep 0.02; done; printf '%s' '{allow}'")]
         };
-        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false}).collect(),..Default::default()};
+        let runner = HookRunner {workspace:root.path().into(),hooks:commands.into_iter().map(|command| ActiveHook {event:HookEvent::PermissionRequest,matcher:"Write".into(),command,timeout:35,source:root.path().into(),shell:Some(if cfg!(windows) {"powershell"} else {"sh"}.into()),if_condition:None,once:false,status_message:None}).collect(),..Default::default()};
         let result = tokio::time::timeout(Duration::from_secs(10), runner.run(HookEvent::PermissionRequest,"session",json!({"tool_name":"Write","tool_use_id":"exact-id"}))).await.unwrap().unwrap();
         assert!(matches!(result.permission_response,Some(HookPermissionResponse::Allow {..})));
         assert!(root.path().join("slow-started").exists());
@@ -996,7 +1004,12 @@ mod tests {
         let config = r#"{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"echo check"}]}]}}"#;
         std::fs::write(data.join("settings.json"), config).unwrap();
         std::fs::write(workspace.join(".claude/settings.json"), config).unwrap();
-        assert_eq!(HookRunner::load(&data, &workspace).unwrap().list().len(), 2);
+        let runner = HookRunner::load(&data, &workspace).unwrap();
+        assert_eq!(runner.list().len(), 2);
+        // Preserve the serialized provenance of existing hook worktrees.
+        let serialized = serde_json::to_value(&runner.list()[0]).unwrap();
+        assert!(serialized.get("once").is_none());
+        assert!(serialized.get("statusMessage").is_none());
         std::fs::write(
             workspace.join(".claude/settings.local.json"),
             r#"{"disableAllHooks":true}"#,
@@ -1028,6 +1041,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            status_message: None,
         };
         let runner = HookRunner {
             workspace: root.path().into(),
@@ -1132,6 +1146,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            status_message: None,
         };
         let error = execute(&hook, root.path(), &json!({})).await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -1155,6 +1170,7 @@ mod tests {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            status_message: None,
         };
         let task = tokio::spawn(async move { execute(&hook, &cwd, &json!({})).await });
         tokio::time::timeout(Duration::from_secs(10), async {

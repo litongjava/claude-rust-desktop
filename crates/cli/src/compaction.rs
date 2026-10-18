@@ -31,7 +31,7 @@ pub async fn run(cli: &Cli, paths: &RuntimePaths, id: &str, instructions: &str) 
         Arc::new(FileCache::new()),
     );
     tokio::select! {
-        result = claude_core::services::compaction::compact_with_hooks(&engine, &context, &workspace, id, &selected.provider_id, &selected.model, instructions, "manual") => crate::services::print(&result?),
+        result = crate::hook_progress::during(id, true, claude_core::services::compaction::compact_with_hooks(&engine, &context, &workspace, id, &selected.provider_id, &selected.model, instructions, "manual")) => crate::services::print(&result?),
         _ = tokio::signal::ctrl_c() => anyhow::bail!("Compaction interrupted; check /history for a completed summary. Original transcript retained"),
     }
 }

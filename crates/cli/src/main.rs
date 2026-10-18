@@ -1,3 +1,4 @@
+mod hook_progress;
 mod launch_permissions;
 mod context_commands;
 mod persistent_worker;

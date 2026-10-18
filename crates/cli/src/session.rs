@@ -355,7 +355,7 @@ impl Session {
         }
         self.lifecycle_owned = true;
         let outcome = tokio::select! {
-            result = session_hooks::start(&context, &self.workspace, &self.id, source, &self.model) => result,
+            result = crate::hook_progress::during(&self.id, true, session_hooks::start(&context, &self.workspace, &self.id, source, &self.model)) => result,
             _ = tokio::signal::ctrl_c() => anyhow::bail!("SessionStart hooks interrupted"),
             _ = claude_core::services::background_sessions::wait_for_cancellation() => anyhow::bail!("SessionStart hooks cancelled"),
         };
@@ -375,13 +375,13 @@ impl Session {
             return;
         }
         let context = self.hook_service_context();
-        for warning in claude_core::services::session_hooks::end(
+        for warning in crate::hook_progress::during(&self.id, true, claude_core::services::session_hooks::end(
             &context,
             &self.workspace,
             &self.id,
             reason,
             claude_core::services::session_hooks::end_timeout(),
-        )
+        ))
         .await
         {
             eprintln!("Hook: {warning}");
@@ -516,8 +516,10 @@ impl Session {
         // Keep engine/goal futures out of the outer host stack. Debug builds on
         // Windows otherwise exhaust the process stack before a worker can run.
         if self.sdk_content.is_some() {return Box::pin(self.run_turn(cli,prompt,input)).await;}
+        let hook_session = self.id.clone();
+        let hook_interactive = input.is_some() && cli.output_format == OutputFormat::Text;
         let prepared = tokio::select! {
-            prepared = crate::skill_commands::prepare_invocation(cli, self, prompt, input) => prepared?,
+            prepared = crate::hook_progress::during(&hook_session, hook_interactive, crate::skill_commands::prepare_invocation(cli, self, prompt, input)) => prepared?,
             _ = tokio::signal::ctrl_c() => bail!("Skill invocation cancelled"),
         };
         let expanded;
@@ -661,10 +663,12 @@ impl Session {
         tokio::pin!(worker_cancel);
         let mut events = tokio::select! {
             _ = &mut worker_cancel => bail!("Background task cancelled before model request"),
-            result = request => result?,
+            result = crate::hook_progress::during(&self.id, interactive_display, request) => result?,
             _ = tokio::signal::ctrl_c() => bail!("Interrupted before model request"),
         };
         let mut progress = crate::terminal::live::TurnDisplay::new(interactive_display, self.permission_mode(), &self.paths.data_dir.join("keybindings.json"), self.store.history(&self.id)?.iter().filter(|row|row["role"]=="user").filter_map(|row|row["content"].as_str().map(str::to_owned)).collect())?.with_workspace(&self.workspace);
+        let mut hook_progress = claude_core::services::hook_progress::subscribe(&self.id);
+        progress.hook_snapshot(hook_progress.snapshot());
         let mut side_request: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>> = None;
         let mut text = String::new();
         let mut thinking_text = String::new();
@@ -681,6 +685,7 @@ impl Session {
         let turn_result: Result<()> = async {
             loop {
                 let event = tokio::select! {
+                    hooks = hook_progress.changed() => { progress.hook_snapshot(hooks); continue; },
                     event = events.recv() => event.context("Engine stream closed before completion")?,
                     _ = &mut worker_cancel => bail!("Background task cancelled"),
                     _ = remote_interrupts.next() => bail!("Interrupted by Remote Control"),

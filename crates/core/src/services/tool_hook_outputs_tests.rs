@@ -80,6 +80,7 @@ async fn delayed_command_tail_cannot_overwrite_newer_callback_output() {
             shell: Some(shell.into()),
             if_condition: None,
             once: false,
+            status_message: None,
         })
         .collect();
     let outcome = runner

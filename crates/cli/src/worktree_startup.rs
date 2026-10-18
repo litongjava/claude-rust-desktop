@@ -26,13 +26,13 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
         return Ok(());
     };
     let source = session.workspace.clone();
-    if let Some(path) = claude_core::worktree::hooks::create(
+    if let Some(path) = crate::hook_progress::during(&session.id, true, claude_core::worktree::hooks::create(
         &session.paths.data_dir,
         &session.store.db,
         &session.id,
         &source,
         (!name.is_empty()).then_some(name.as_str()),
-    )
+    ))
     .await?
     {
         session.workspace = path;
@@ -95,12 +95,12 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
                 .await?;
             let previous = std::env::current_dir()?;
             std::env::set_current_dir(&source)?;
-            match hooks::release(
+            match crate::hook_progress::during(&session.id, true, hooks::release(
                 &session.paths.data_dir,
                 &session.store.db,
                 &session.id,
                 action == "remove",
-            )
+            ))
             .await
             {
                 Ok(path) => {

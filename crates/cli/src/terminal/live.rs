@@ -33,6 +33,7 @@ enum Update {
     Notice(String),
     Styled(Vec<change_view::Line>),
     Activity(String),
+    HookActivity(Option<String>),
     Usage(Value),
     Question(String, oneshot::Sender<String>),
     Detail(String, String, String),
@@ -222,6 +223,7 @@ struct State {
     goal_proposal: Option<(String, String)>,
     mode: String,
     activity: String,
+    hook_activity: Option<String>,
     draft: Draft,
     saved_draft: Option<Draft>,
     answer: Option<oneshot::Sender<String>>,
@@ -248,6 +250,7 @@ impl State {
             goal_proposal: None,
             mode,
             activity: "Waiting for response".into(),
+            hook_activity: None,
             draft: Draft::default(),
             saved_draft: None,
             answer: None,
@@ -498,7 +501,7 @@ impl Frame {
                 if state.answer.is_some() {
                     "Waiting for your answer"
                 } else {
-                    &state.activity
+                    state.hook_activity.as_deref().unwrap_or(&state.activity)
                 },
                 if state.activity.contains("thinking") {
                     state.activity_started.elapsed().as_secs()
@@ -722,6 +725,10 @@ fn run(
                     for line in lines {
                         write(&format!("{}\r\n", change_view::render(&line, width, color)))?;
                     }
+                    dirty = true;
+                }
+                Ok(Update::HookActivity(activity)) => {
+                    state.hook_activity = activity;
                     dirty = true;
                 }
                 Ok(Update::Activity(activity)) => {
@@ -1229,6 +1236,7 @@ mod tests {
 pub struct TurnDisplay {
     workspace: Option<std::path::PathBuf>,
     pub live: Option<LiveTurn>,
+    hooks: std::collections::BTreeMap<String, String>,
     fallback: super::progress::TurnProgress,
     tools: std::collections::HashMap<String, (Instant, String)>,
     finished: std::collections::HashMap<String, (String, Value, String, bool)>,
@@ -1250,6 +1258,7 @@ impl TurnDisplay {
         Ok(Self {
             workspace: None,
             live,
+            hooks: Default::default(),
             fallback,
             tools: Default::default(),
             finished: Default::default(),
@@ -1273,6 +1282,20 @@ impl TurnDisplay {
         } else {
             self.fallback.set_activity(text);
         }
+    }
+    pub fn hook_progress(&mut self, id: &str, message: Option<&str>) {
+        if let Some(message) = message { self.hooks.insert(id.into(), message.into()); }
+        else { self.hooks.remove(id); }
+        self.render_hooks();
+    }
+    pub fn hook_snapshot(&mut self, hooks: Vec<(String, String)>) {
+        self.hooks = hooks.into_iter().collect();
+        self.render_hooks();
+    }
+    fn render_hooks(&mut self) {
+        let message = (!self.hooks.is_empty()).then(|| self.hooks.values().map(|message| super::progress::single_line(message)).collect::<Vec<_>>().join(" · "));
+        if let Some(live) = &self.live { let _ = live.updates.send(Update::HookActivity(message)); }
+        else { self.fallback.hook_activity(message); }
     }
     pub fn record_thinking(&self, text: &str) {
         if let Some(live) = &self.live {
@@ -1422,6 +1445,19 @@ impl TurnDisplay {
 #[cfg(test)]
 mod completion_tests {
     use super::*;
+    #[test]
+    fn hook_progress_preserves_other_running_hooks_and_underlying_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut display = TurnDisplay::new(false, "ask", &temp.path().join("keys.json"), vec![]).unwrap();
+        display.set_activity("Working: Read");
+        display.hook_progress("one", Some("Check A"));
+        display.hook_progress("two", Some("Check B"));
+        display.hook_progress("one", None);
+        assert_eq!(display.hooks.values().collect::<Vec<_>>(), vec!["Check B"]);
+        display.hook_progress("two", None);
+        assert!(display.hooks.is_empty());
+    }
+
     #[test]
     fn distinct_results_update_live_details_with_actual_input_without_duplicate_counts() {
         let temp = tempfile::tempdir().unwrap();

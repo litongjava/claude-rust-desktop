@@ -636,6 +636,7 @@ fn plan_worker_events_only_apply_successful_transitions() {
 fn render(display: &mut TurnDisplay, event: &Value) {
     let text = |name: &str| event[name].as_str().unwrap_or("");
     match text("type") {
+        "hook_progress" => display.hook_progress(text("hook_id"), event["status_message"].as_str()),
         "notice" => display.notice(text("message")),
         "text" => display.before_text(text("delta")),
         "thinking" => {

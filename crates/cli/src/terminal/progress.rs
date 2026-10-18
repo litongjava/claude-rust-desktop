@@ -15,6 +15,7 @@ const TIPS: &[&str] = &[
 pub struct TurnProgress {
     workspace: Option<std::path::PathBuf>,
     enabled: bool,
+    hook_only: bool,
     color: bool,
     visible: bool,
     visible_rows: usize,
@@ -22,6 +23,7 @@ pub struct TurnProgress {
     rendered_size: (u16, u16),
     permission_mode: String,
     activity: String,
+    hook_activity: Option<String>,
     phase: &'static str,
     started: Instant,
     activity_started: Instant,
@@ -34,6 +36,14 @@ pub struct TurnProgress {
 
 impl TurnProgress {
     pub fn new(interactive_text: bool) -> Self {
+        Self::with_activity(interactive_text, "Waiting for response", false)
+    }
+
+    pub fn for_hook(interactive_text: bool, activity: &str) -> Self {
+        Self::with_activity(interactive_text, activity, true)
+    }
+
+    fn with_activity(interactive_text: bool, activity: &str, hook_only: bool) -> Self {
         let enabled = interactive_text
             && !crate::terminal::screen_reader()
             && io::stdin().is_terminal()
@@ -43,6 +53,7 @@ impl TurnProgress {
         let mut progress = Self {
             workspace: None,
             enabled,
+            hook_only,
             color: colors_enabled(enabled, std::env::var_os("NO_COLOR").is_some()),
             visible: false,
             visible_rows: 0,
@@ -50,6 +61,7 @@ impl TurnProgress {
             rendered_size: (0, 0),
             permission_mode: "ask".into(),
             activity: String::new(),
+            hook_activity: None,
             phase: "",
             started: Instant::now(),
             activity_started: Instant::now(),
@@ -59,12 +71,17 @@ impl TurnProgress {
             finished_tools: HashMap::new(),
             agents: HashMap::new(),
         };
-        progress.set_activity("Waiting for response");
+        progress.set_activity(activity);
         progress
     }
 
     pub fn set_activity(&mut self, activity: &str) {
         self.set_status(activity, "");
+    }
+
+    pub fn hook_activity(&mut self, message: Option<String>) {
+        self.hook_activity = message;
+        self.tick();
     }
 
     pub fn set_workspace(&mut self, workspace: &std::path::Path) {
@@ -210,7 +227,7 @@ impl TurnProgress {
         let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
         let size = (width, height);
         let width = width as usize;
-        let mut status = format!("* {} ({seconds}s{})", self.activity, self.phase);
+        let mut status = format!("* {} ({seconds}s{})", self.hook_activity.as_deref().unwrap_or(&self.activity), if self.hook_activity.is_some() { "" } else { self.phase });
         if let Some(usage) = self.usage.summary() {
             status.push_str(&format!(" · {usage}"));
         }
@@ -224,14 +241,14 @@ impl TurnProgress {
             self.color,
             crate::terminal::style::muted_ansi(),
         );
-        let mut lines = activity_frame(
+        let mut lines = if self.hook_only { vec![status] } else { activity_frame(
             status,
             tip,
             &self.permission_mode,
             width.saturating_sub(1),
             height as usize,
             self.color,
-        );
+        ) };
         let output = if self.visible {
             // Resize invalidates the cached row contents. Reuse only the rows
             // already reserved and still in the viewport; never add new rows
@@ -405,7 +422,7 @@ impl ReportedUsage {
     }
 }
 
-fn single_line(text: &str) -> String {
+pub(super) fn single_line(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || c.is_whitespace())
         .collect::<String>()

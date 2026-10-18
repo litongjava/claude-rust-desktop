@@ -17,6 +17,7 @@ pub mod session_messages;
 pub mod batch;
 pub mod checkpoints;
 pub mod tool_hooks;
+pub mod hook_progress;
 pub mod hook_callbacks;
 pub mod session_hooks;
 pub mod anthropic_auth;
