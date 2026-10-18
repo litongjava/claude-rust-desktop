@@ -13,13 +13,13 @@ const MAX_TOKENS: u32 = 1024;
 pub struct PromptHook {
     #[serde(rename = "type")]
     kind: String,
-    prompt: String,
+    pub(super) prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
 }
 
 pub(super) fn load(value: &mut Value, event: HookEvent) -> Result<Option<PromptHook>> {
-    if value["type"] != "prompt" {
+    if value["type"] != "prompt" && value["type"] != "agent" {
         return Ok(None);
     }
     ensure!(
@@ -33,7 +33,7 @@ pub(super) fn load(value: &mut Value, event: HookEvent) -> Result<Option<PromptH
                 | HookEvent::Stop
                 | HookEvent::SubagentStop
         ),
-        "Prompt hooks are not supported for {}",
+        "Prompt/agent hooks are not supported for {}",
         event.name()
     );
     for key in value.as_object().context("Invalid prompt hook")?.keys() {
@@ -48,7 +48,7 @@ pub(super) fn load(value: &mut Value, event: HookEvent) -> Result<Option<PromptH
                 "statusMessage"
             ]
             .contains(&key.as_str()),
-            "Unsupported prompt hook option: {key}"
+            "Unsupported prompt/agent hook option: {key}"
         );
     }
     let config: PromptHook = serde_json::from_value(value.clone())?;
@@ -58,9 +58,15 @@ pub(super) fn load(value: &mut Value, event: HookEvent) -> Result<Option<PromptH
     );
     value["command"] = json!(config.prompt);
     if value.get("timeout").is_none() {
-        value["timeout"] = json!(30);
+        value["timeout"] = json!(if config.is_agent() { 60 } else { 30 });
     }
     Ok(Some(config))
+}
+
+impl PromptHook {
+    pub(super) fn is_agent(&self) -> bool {
+        self.kind == "agent"
+    }
 }
 
 impl HookRunner {
@@ -75,7 +81,10 @@ impl HookRunner {
     }
 }
 
-fn select_provider(config: &PromptHook, current: &ResolvedProvider) -> Result<ResolvedProvider> {
+pub(super) fn select_provider(
+    config: &PromptHook,
+    current: &ResolvedProvider,
+) -> Result<ResolvedProvider> {
     let mut provider = current.clone();
     if let Some(model) = &config.model {
         provider.model = provider
@@ -97,7 +106,7 @@ fn select_provider(config: &PromptHook, current: &ResolvedProvider) -> Result<Re
     Ok(provider)
 }
 
-fn arguments(prompt: &str, input: &str) -> String {
+pub(super) fn arguments(prompt: &str, input: &str) -> String {
     // JSON is a shell-quoted argument string upstream, not an array of JSON fields.
     let mut words = Vec::new();
     let mut word = String::new();
@@ -248,10 +257,14 @@ async fn evaluate(
     let result: Value =
         serde_json::from_str(text.trim()).context("Prompt hook JSON validation failed")?;
     ensure!(
-        result["ok"].is_boolean() && result.get("reason").is_none_or(Value::is_string),
+        valid_result(&result),
         "Prompt hook schema validation failed"
     );
     Ok(result)
+}
+
+pub(super) fn valid_result(value: &Value) -> bool {
+    value["ok"].is_boolean() && value.get("reason").is_none_or(Value::is_string)
 }
 
 pub(super) async fn execute_prompt(

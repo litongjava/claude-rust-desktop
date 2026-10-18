@@ -170,6 +170,8 @@ mod http;
 pub use http::HttpHook;
 #[path = "tool_hook_prompt.rs"]
 mod prompt;
+#[path = "tool_hook_agent.rs"]
+pub(crate) mod agent;
 
 #[path = "tool_hook_once.rs"]
 mod once;
@@ -298,10 +300,11 @@ impl HookRunner {
                     "PostCompact" => HookEvent::PostCompact,
                     _ => {
                         ensure!(
-                            !groups
+                            !groups.iter().any(|g| g
+                                .hooks
                                 .iter()
-                                .any(|g| g.hooks.iter().any(|h| h["type"] == "prompt")),
-                            "Prompt hooks are not supported for {name}"
+                                .any(|h| h["type"] == "prompt" || h["type"] == "agent")),
+                            "Prompt/agent hooks are not supported for {name}"
                         );
                         continue;
                     }
@@ -312,7 +315,7 @@ impl HookRunner {
                             .context("Invalid hook matcher regular expression")?;
                     }
                     for mut hook in group.hooks {
-                        ensure!(hook["type"] == "command" || hook["type"] == "http" || hook["type"] == "prompt", "Unsupported hook type for {name} in {}; only command, http and prompt hooks are implemented", source.display());
+                        ensure!(hook["type"] == "command" || hook["type"] == "http" || hook["type"] == "prompt" || hook["type"] == "agent", "Unsupported hook type for {name} in {}; only command, http, prompt and agent hooks are implemented", source.display());
                         for option in ["async", "asyncRewake"] {
                             if let Some(value) = hook.get(option) {
                                 ensure!(value.is_boolean(), "Hook {option} must be boolean");
@@ -684,7 +687,20 @@ fn matches_tool(matcher: &str, tool: &str) -> Result<bool> {
     Ok(matcher.is_empty() || matcher == "*" || regex::Regex::new(matcher)?.is_match(tool))
 }
 
-fn parse_hook_output(hook: &ActiveHook, code: i32, stdout: &str, stderr: &str) -> Result<HookOutcome> {
+fn parse_hook_output(
+    hook: &ActiveHook,
+    code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<HookOutcome> {
+    if hook
+        .prompt
+        .as_ref()
+        .is_some_and(prompt::PromptHook::is_agent)
+        && code == 3
+    {
+        return Ok(HookOutcome::default());
+    }
     if hook.prompt.is_some() && code == 2 {
         return Ok(HookOutcome {
             blocked: true,

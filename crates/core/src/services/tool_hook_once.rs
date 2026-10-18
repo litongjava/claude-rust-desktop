@@ -10,6 +10,16 @@ impl HookRunner {
         input: &Value,
     ) -> Result<(i32, String, String)> {
         if let Some(config) = &hook.prompt {
+            if config.is_agent() {
+                return agent::execute_agent(
+                    hook,
+                    config,
+                    self.prompt_provider.as_ref(),
+                    input,
+                    &self.workspace,
+                )
+                .await;
+            }
             return prompt::execute_prompt(hook, config, self.prompt_provider.as_ref(), input)
                 .await;
         }
