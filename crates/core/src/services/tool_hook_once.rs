@@ -26,7 +26,10 @@ impl HookRunner {
             return prompt::execute_prompt(hook, config, self.prompt_provider.as_ref(), input)
                 .await;
         }
-        if hook.asynchronous && !self.force_sync {
+        if hook.asynchronous
+            && !self.force_sync
+            && !matches!(hook.event, HookEvent::CwdChanged | HookEvent::FileChanged)
+        {
             let task = prepare_command(hook, &self.workspace, input)?;
             super::super::async_hooks::register(
                 self.once_directory
@@ -124,7 +127,10 @@ impl HookRunner {
             .execute_configured(hook, session, input, transcript)
             .await?;
         if output.0 == 0 {
-            if hook.asynchronous && !self.force_sync {
+            if hook.asynchronous
+                && !self.force_sync
+                && !matches!(hook.event, HookEvent::CwdChanged | HookEvent::FileChanged)
+            {
                 // Background registration is success, regardless of eventual exit.
             } else if hook.event == HookEvent::WorktreeCreate {
                 ensure!(

@@ -39,6 +39,7 @@ pub enum HookEvent {
     ConfigChange,
     InstructionsLoaded,
     CwdChanged,
+    FileChanged,
     Elicitation,
     ElicitationResult,
 }
@@ -66,6 +67,7 @@ impl HookEvent {
             Self::ConfigChange => "ConfigChange",
             Self::InstructionsLoaded => "InstructionsLoaded",
             Self::CwdChanged => "CwdChanged",
+            Self::FileChanged => "FileChanged",
             Self::Elicitation => "Elicitation",
             Self::ElicitationResult => "ElicitationResult",
         }
@@ -149,6 +151,7 @@ pub struct HookOutcome {
     pub updated_mcp_tool_output: Option<Value>,
     pub elicitation_response: Option<Value>,
     pub initial_user_message: Option<String>,
+    pub watch_paths: Vec<String>,
     mcp_output_order: usize,
     pub warnings: Vec<String>,
     /// An explicit hook request for approval must not become an automatic grant.
@@ -169,6 +172,7 @@ impl HookOutcome {
     }
 
     fn merge_mcp_output(&mut self, other: &mut Self) {
+        self.watch_paths.append(&mut other.watch_paths);
         if other.initial_user_message.is_some() && other.mcp_output_order >= self.mcp_output_order {
             self.initial_user_message = other.initial_user_message.take();
             self.mcp_output_order = other.mcp_output_order;
@@ -250,7 +254,7 @@ fn default_timeout() -> u64 {
     60
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HookRunner {
     workspace: PathBuf,
     once_directory: PathBuf,
@@ -348,6 +352,7 @@ impl HookRunner {
                     "ConfigChange" => HookEvent::ConfigChange,
                     "InstructionsLoaded" => HookEvent::InstructionsLoaded,
                     "CwdChanged" => HookEvent::CwdChanged,
+                    "FileChanged" => HookEvent::FileChanged,
                     "Elicitation" => HookEvent::Elicitation,
                     "ElicitationResult" => HookEvent::ElicitationResult,
                     _ => {
@@ -535,7 +540,21 @@ impl HookRunner {
         payload: Value,
     ) -> futures::future::BoxFuture<'a, Result<HookOutcome>> {
         // Keep command/callback state out of the enclosing engine and CLI futures.
-        Box::pin(self.run_inner(event, session_id, payload))
+        Box::pin(async move {
+            let reset = matches!(event, HookEvent::SessionStart | HookEvent::CwdChanged);
+            if reset || event == HookEvent::SessionEnd {
+                super::file_changed::stop(session_id).await;
+            }
+            let outcome = self.run_inner(event, session_id, payload).await;
+            if reset && !self.disabled {
+                let paths = outcome
+                    .as_ref()
+                    .map(|o| o.watch_paths.clone())
+                    .unwrap_or_default();
+                super::file_changed::start(session_id, self.clone(), paths).await?;
+            }
+            outcome
+        })
     }
 
     fn transcript_input(
@@ -557,7 +576,7 @@ impl HookRunner {
         input
     }
 
-    async fn run_inner(
+    pub(crate) async fn run_inner(
         &self,
         event: HookEvent,
         session_id: &str,
@@ -589,6 +608,7 @@ impl HookRunner {
                 | HookEvent::StopFailure
                 | HookEvent::Setup
                 | HookEvent::InstructionsLoaded
+                | HookEvent::FileChanged
         );
         let match_key = match event {
             HookEvent::Elicitation | HookEvent::ElicitationResult => "mcp_server_name",
@@ -602,11 +622,19 @@ impl HookRunner {
             HookEvent::SubagentStart | HookEvent::SubagentStop => "agent_type",
             _ => "tool_name",
         };
-        let name = input
+        let mut name = input
             .get(match_key)
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        if event == HookEvent::FileChanged {
+            name = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .and_then(|p| Path::new(p).file_name())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
         if event == HookEvent::PermissionRequest {
             use futures::{stream::FuturesUnordered, StreamExt};
             let mut pending: FuturesUnordered<futures::future::BoxFuture<'_, Result<HookOutcome>>> =
@@ -868,6 +896,7 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
                 | HookEvent::StopFailure
                 | HookEvent::InstructionsLoaded
                 | HookEvent::CwdChanged
+                | HookEvent::FileChanged
                 | HookEvent::Setup
         );
         result.reason = if stderr.trim().is_empty() {
@@ -928,6 +957,7 @@ fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
         ensure!(value.is_string(), "initialUserMessage must be a string");
     }
     let mut result = HookOutcome::default();
+    result.watch_paths = watch_paths(event, &output)?;
     if matches!(event, HookEvent::Elicitation | HookEvent::ElicitationResult) {
         result.blocked = string_field(&output, "decision")? == Some("block");
         result.reason = string_field(&output, "reason")?
@@ -961,6 +991,7 @@ fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
             | HookEvent::StopFailure
             | HookEvent::InstructionsLoaded
             | HookEvent::CwdChanged
+            | HookEvent::FileChanged
             | HookEvent::Setup
             | HookEvent::ConfigChange
     ) {
@@ -979,10 +1010,7 @@ fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
                 string_field(specific, "hookEventName")? == Some(event.name()),
                 "Hook returned an incorrect hookEventName"
             );
-            ensure!(
-                specific.get("watchPaths").is_none(),
-                "Hook watchPaths is not implemented"
-            );
+
             if event == HookEvent::Setup {
                 if let Some(text) = string_field(specific, "additionalContext")? {
                     result.additional_context.push(text.into());
@@ -1605,5 +1633,58 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!root.path().join("survived").exists());
+    }
+}
+
+/// Only the reference environment events can register dynamic watch paths.
+pub(crate) fn watch_paths(event: HookEvent, output: &Value) -> Result<Vec<String>> {
+    let Some(specific) = output.get("hookSpecificOutput") else {
+        return Ok(vec![]);
+    };
+    let Some(paths) = specific.get("watchPaths") else {
+        return Ok(vec![]);
+    };
+    ensure!(
+        matches!(
+            event,
+            HookEvent::SessionStart | HookEvent::CwdChanged | HookEvent::FileChanged
+        ),
+        "watchPaths requires SessionStart, CwdChanged or FileChanged"
+    );
+    ensure!(
+        specific.get("hookEventName").and_then(Value::as_str) == Some(event.name()),
+        "Hook returned an incorrect hookEventName"
+    );
+    let paths: Vec<String> =
+        serde_json::from_value(paths.clone()).context("watchPaths must be an array of strings")?;
+    ensure!(
+        paths.iter().all(|p| Path::new(p).is_absolute()),
+        "watchPaths must contain absolute paths"
+    );
+    Ok(paths)
+}
+
+impl HookRunner {
+    pub(crate) fn file_watch_paths(&self, session: &str, dynamic: &[String]) -> Vec<PathBuf> {
+        let mut matchers: Vec<String> = self
+            .hooks
+            .iter()
+            .filter(|h| h.event == HookEvent::FileChanged)
+            .map(|h| h.matcher.clone())
+            .collect();
+        if let Some(callbacks) = self.callbacks(session) {
+            matchers.extend(callbacks.file_watch_matchers());
+        }
+        let mut paths: Vec<PathBuf> = matchers
+            .iter()
+            .flat_map(|m| m.split('|'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| self.workspace.join(p))
+            .collect();
+        paths.extend(dynamic.iter().map(PathBuf::from));
+        paths.sort();
+        paths.dedup();
+        paths
     }
 }

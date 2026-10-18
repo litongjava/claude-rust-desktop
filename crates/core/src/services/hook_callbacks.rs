@@ -90,6 +90,16 @@ pub struct Registration {
     active: AtomicBool,
 }
 impl Registration {
+    pub(crate) fn file_watch_matchers(&self) -> Vec<String> {
+        if !self.active.load(Ordering::Acquire) {
+            return vec![];
+        }
+        self.callbacks
+            .iter()
+            .filter(|c| c.event == HookEvent::FileChanged)
+            .map(|c| c.matcher.clone())
+            .collect()
+    }
     pub fn has_callbacks(&self) -> bool {
         self.active.load(Ordering::Acquire) && !self.callbacks.is_empty()
     }
@@ -133,12 +143,7 @@ impl Registration {
             "Async SDK hook outputs are not implemented"
         );
         if let Some(specific) = output.get("hookSpecificOutput") {
-            for unsupported in ["watchPaths"] {
-                ensure!(
-                    specific.get(unsupported).is_none(),
-                    "SDK hook output {unsupported} is not implemented"
-                );
-            }
+            super::tool_hooks::watch_paths(callback.event, &output)?;
             ensure!(
                 specific.get("initialUserMessage").is_none()
                     || callback.event == HookEvent::SessionStart,

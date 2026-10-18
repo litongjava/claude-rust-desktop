@@ -54,6 +54,7 @@ pub async fn start_with_output(
         ["startup", "resume", "clear", "compact"].contains(&source),
         "Invalid SessionStart source"
     );
+    super::file_changed::stop(session).await;
     super::tool_hooks::agent::cancel_session(session);
     super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     // Clear previous activation's context before running commands, including failures.
@@ -110,6 +111,7 @@ pub async fn end(
     reason: &str,
     budget: Duration,
 ) -> Vec<String> {
+    super::file_changed::stop(session).await;
     super::tool_hooks::agent::cancel_session(session);
     let result = tokio::time::timeout(budget, async {
         HookRunner::load_with_plugins(context, workspace)?
@@ -117,6 +119,7 @@ pub async fn end(
             .await
     })
     .await;
+    super::file_changed::stop(session).await;
     super::tool_hooks::agent::cancel_session(session);
     super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     match result {

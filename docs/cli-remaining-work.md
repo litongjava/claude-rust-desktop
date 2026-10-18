@@ -63,19 +63,19 @@
 
 ### P2 Hook 生命周期事件（清单 H1）
 
-入口：`tool_hooks.rs` 的 `HookEvent`（当前 23 个）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
+入口：`tool_hooks.rs` 的 `HookEvent`（当前 24 个）；loader 会跳过未知事件名。参考：`reference:src/entrypoints/sdk/coreTypes.ts`（27 个）。
 
 - [x] 第一批生命周期事件：`Notification`、`StopFailure`、`Setup`、`ConfigChange`、`InstructionsLoaded`、`CwdChanged`。已接入独立 CLI 实际路径、精确 payload/matcher、输出语义、SDK 回调与类型限制；once/if/status/取消/超时复用并测试。core 595/0/7、CLI 261/0/1；transcript 仅在匹配 hook/SDK 实际执行前按 run 生成一次，失败警告不阻断分发；逐事件差异与不可触发子场景见开发记录 `lifecycle-events-acceptance-20261018.md`（ConfigChange 使用轮询/使用前检查，拒绝后阻止后续使用；不声称与原版 watcher 完全等价）。
-- [ ] `FileChanged`：依赖 `watchPaths`，留到任务 09。
+- [x] `FileChanged`：已接入会话级 watchPaths 监视、basename matcher、精确 payload 与通知型输出；通知通过 tracing，独立 CLI 集成确认 debug-file 收到消息且 stderr 不被直接写入；本次 Windows core 613/0/7、CLI 268/0/1（通过/失败/忽略），详见 `watchpaths-filechanged-acceptance-20261018.md`。Linux/macOS 已尝试完整测试但受既存 computer_use 编译错误阻塞；原生 watcher 隔离验证与边界限制见验收记录。
 - [x] `Elicitation`、`ElicitationResult`（form 模式最小可用链路）：stdio / SDK MCP 反向请求、服务器 matcher、hook 直接 accept/decline/cancel、结果修改/阻止、requested_schema 校验、CLI/worker 交互和 SDK 控制应答；无交互默认 cancel。URL 模式及异步 elicitation hook 明确报错，不宣称支持。验收详见开发记录 `elicitation-hooks-acceptance-20261018.md`。
 - 依赖 P4 团队：`TaskCreated`、`TaskCompleted`（完成前可拒绝）、`TeammateIdle`。
 
 ### P3 Hook 输出与环境（清单 H3）
 
-入口：`crates/core/src/services/hook_callbacks.rs`（拒绝 async SDK 结果、`watchPaths`）。设计参考 `temp/claude-code-cli-dev/sdk-hook-output-parity-plan.md`。
+入口：`crates/core/src/services/hook_callbacks.rs`（仍拒绝 async SDK 结果；watchPaths 已支持）。设计参考 `temp/claude-code-cli-dev/sdk-hook-output-parity-plan.md`。
 
 - [x] `SessionStart.initialUserMessage`：command/HTTP/SDK 最后非空输出按实际观察顺序胜出；打印与 SDK 入口消费一次并先于调用方输入，持久化 hook 来源且不进入用户授权账本；UserPromptSubmit 正常触发一次。REPL/clear/compact 不自动提交，resume 只消费本次新输出，不重放历史。详见开发记录 `initial-user-message-acceptance-20261018.md`（含 ConPTY 与 auto classifier 隔离验收）。
-- `watchPaths`：会话级 watcher，忽略初次发现，稳定的 add/change/unlink，路径不存在时监视父目录，cwd 切换与关闭隔离。
+- [x] `watchPaths`：会话级原生 watcher，忽略初次发现、500 ms 去抖、add/change/unlink；缺失目标监视祖先后转为目标；动态集合替换、cwd 重置与会话隔离。审查修订：空闲不递归扫描，通知/pending 驱动 200 ms 采样，缺失路径 2 s metadata 兜底；spawn_blocking 执行快照与正常关闭；扫描上限 10,000 条，超限告警并降级到已知文件；关闭确认最长 2 s，超时告警。core watcher 8/0/0，含空闲计数、超限降级、关闭超时测试；Windows 全量 core 613/0/7、CLI 268/0/1。详见 `watchpaths-filechanged-acceptance-20261018.md`。历史 Linux inotify 5/0/0、macOS FSEvents 6/0/0 仅对应修订前隔离探针，本次按要求不重跑；完整跨平台编译及非 Windows 会话环境文件仍未验证。
 - 会话环境文件：原版在 Windows 返回 null，Windows 无需实现；Linux/macOS 需另行验证。
 
 ### P4 团队（清单 T1、T2）
