@@ -47,14 +47,15 @@ async fn http_deny_prevents_real_write_and_once_is_not_replayed_after_resume() {
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let hook_endpoint = endpoint.replace("127.0.0.1", "localhost");
     let app = Router::new()
         .route("/hook", post(hook))
-        .route("/chat/completions", post(model))
+        .route("/v1/chat/completions", post(model))
         .with_state(requests.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    std::fs::write(data.join("settings.json"), json!({"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"http","url":format!("{endpoint}/hook"),"once":true,"timeout":5,"statusMessage":"HTTP integration fixture"}]}]}}).to_string()).unwrap();
+    std::fs::write(data.join("settings.json"), json!({"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"http","url":format!("{hook_endpoint}/hook"),"once":true,"timeout":5,"statusMessage":"HTTP integration fixture"}]}]}}).to_string()).unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     for resume in [false, true] {
         let output = tokio::time::timeout(
@@ -83,6 +84,12 @@ async fn http_deny_prevents_real_write_and_once_is_not_replayed_after_resume() {
                     "write the fixture file",
                 ])
                 .env("HTTP_HOOK_FIXTURE_KEY", "fixture-only")
+                // A dead proxy must not intercept the local HTTP hook request.
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                // Only the model endpoint is exempted; localhost is not.
+                .env("NO_PROXY", "127.0.0.1")
                 .output(),
         )
         .await
@@ -95,6 +102,13 @@ async fn http_deny_prevents_real_write_and_once_is_not_replayed_after_resume() {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("HTTP fixture completed"));
         assert_eq!(workspace.join("written.txt").exists(), resume);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        if resume {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("written.txt")).unwrap(),
+                "fixture output"
+            );
+        }
     }
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);

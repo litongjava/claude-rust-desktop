@@ -271,7 +271,10 @@ mod tests {
         let url = format!("http://{}/hook", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/hook", post(endpoint))
-            .route("/redirected", post(endpoint))
+            .route("/redirected", axum::routing::any(|State(state): State<Arc<Fixture>>| async move {
+                state.requests.lock().unwrap().push((HeaderMap::new(), Value::Null));
+                Json(json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}))
+            }))
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -396,6 +399,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_condition_and_network_failure_retry_clear_status() {
+        let (url, state, server) = fixture().await;
+        let root = tempfile::tempdir().unwrap();
+        let filtered = runner(root.path(), &url, json!({"if":"Write"}), json!({}));
+        assert!(run(&filtered, "filtered").await.warnings.is_empty());
+        assert!(state.requests.lock().unwrap().is_empty());
+
+        let session = uuid::Uuid::new_v4().to_string();
+        let progress = super::super::super::hook_progress::subscribe(&session);
+        let runner = runner(
+            root.path(),
+            &url,
+            json!({"once":true,"statusMessage":"Checking HTTP"}),
+            json!({}),
+        );
+        // Stop the listener, then restart on the same port: a transport failure
+        // must leave the durable once registration eligible for a retry.
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let output = run(&runner, &session).await;
+        assert!(!output.allow_permission && !output.ask_permission && !output.blocked);
+        assert!(!output.warnings.is_empty());
+        assert!(progress.snapshot().is_empty());
+        let parsed = Url::parse(&url).unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", parsed.port().unwrap()))
+            .await
+            .unwrap();
+        let app = Router::new()
+            .route("/hook", post(endpoint))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(run(&runner, &session).await.warnings.is_empty());
+        assert!(progress.snapshot().is_empty());
+        run(&runner, &session).await;
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn http_configuration_rejects_unsupported_options_and_preserves_command_identity() {
+        let root = tempfile::tempdir().unwrap();
+        for extra in [
+            json!({"async":true}),
+            json!({"asyncRewake":true}),
+            json!({"timeout":0}),
+            json!({"timeout":1.5}),
+            json!({"url":"http://169.254.169.254/"}),
+            json!({"url":"file:///hook"}),
+            json!({"url":"http://user:secret@localhost/"}),
+            json!({"headers":{"Bad Header":"value"}}),
+            json!({"allowedEnvVars":"TOKEN"}),
+            json!({"shell":"sh"}),
+        ] {
+            let mut hook = json!({"type":"http","url":"http://localhost/hook"});
+            hook.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            std::fs::write(
+                root.path().join("settings.json"),
+                json!({"hooks":{"PreToolUse":[{"hooks":[hook]}]}}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                HookRunner::load(root.path(), root.path()).is_err(),
+                "{extra}"
+            );
+        }
+        std::fs::write(root.path().join("settings.json"), json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo ok","once":true}]}]}}).to_string()).unwrap();
+        let runner = HookRunner::load(root.path(), root.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&runner.list()[0]).unwrap(),
+            json!({
+                "event":"PreToolUse","matcher":"","command":"echo ok","timeout":60,
+                "once":true,"source":root.path().join("settings.json"),"shell":null
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn http_timeout_cancel_and_policy_failures_keep_authority_and_clear_progress() {
         let (url, state, server) = fixture().await;
         let root = tempfile::tempdir().unwrap();
@@ -494,6 +578,13 @@ mod tests {
         let script = "const fs=require('fs');let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{fs.writeFileSync('command-input.json',s);process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'ask'}}));});";
         std::fs::write(root.path().join("hook.cjs"), script).unwrap();
         std::fs::write(root.path().join("settings.json"), json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"http","url":url},{"type":"command","command":"node hook.cjs"}]}]}}).to_string()).unwrap();
+        let output = run(
+            &HookRunner::load(root.path(), root.path()).unwrap(),
+            "ask-priority",
+        )
+        .await;
+        // The engine checks ask before allow, and deny before either.
+        assert!(output.ask_permission && output.allow_permission && !output.blocked);
         let session = uuid::Uuid::new_v4().to_string();
         let host: Arc<dyn Host> = Arc::new(Deny);
         let _guard = hook_callbacks::install(

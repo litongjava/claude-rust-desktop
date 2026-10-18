@@ -53,7 +53,7 @@
 
 1. [x] `once`：首次成功后按会话持久化注销；并发、重载、失败/取消重试已验证（`5b026c8`，详见开发记录 `once-acceptance-20261018.md`）。
 2. [x] `statusMessage`：CLI/worker 运行进度、完成/失败/取消清除及 ConPTY 恢复验收完成（`a2a0366`，详见 `status-message-acceptance-20261018.md`）。
-3. HTTP hook：本地 HTTP fixture；超时/错误策略；header 环境变量插值需显式白名单。
+3. [x] HTTP hook：本地 HTTP fixture、显式 header 环境变量白名单、超时/错误/取消、权限组合与跨进程 once 恢复已验收（详见开发记录 `http-hook-acceptance-20261018.md`）。
 4. Command `async`：生命周期托管的后台执行，后续允许的输出投递，进程清理。
 5. `asyncRewake`：完成/唤醒语义（尤其 exit code 2），取消后不重放。
 6. Prompt hook：有界的 provider 评估、事件限制、输出校验、失败策略。
