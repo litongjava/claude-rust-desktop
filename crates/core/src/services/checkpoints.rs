@@ -113,6 +113,15 @@ fn no_links(path: &Path) -> Result<()> {
                     use std::os::windows::fs::MetadataExt;
                     link |= metadata.file_attributes() & 0x400 != 0;
                 }
+                #[cfg(target_os = "macos")]
+                if link && matches!(cursor.to_str(), Some("/var" | "/tmp" | "/etc")) {
+                    // Only the OS root aliases are allowed. Workspace symlinks
+                    // remain rejected, including links within these directories.
+                    let expected = Path::new("/private").join(cursor.strip_prefix("/")?);
+                    if cursor.canonicalize().is_ok_and(|actual| actual == expected) {
+                        link = false;
+                    }
+                }
                 ensure!(
                     !link,
                     "Checkpoint refuses symlink/junction: {}",
@@ -583,5 +592,19 @@ mod tests {
             fs::read_to_string(outside.path().join("secret")).unwrap(),
             "unchanged"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_alias_tests {
+    use super::*;
+
+    #[test]
+    fn system_temp_alias_is_allowed_but_workspace_links_are_rejected() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        no_links(dir.path()).unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(no_links(&link.join("file")).is_err());
     }
 }

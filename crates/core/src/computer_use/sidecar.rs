@@ -2,6 +2,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 #[cfg(windows)]

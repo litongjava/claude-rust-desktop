@@ -345,3 +345,26 @@ fn close_acknowledgement_has_a_timeout() {
     assert!(started.elapsed() >= CLOSE_TIMEOUT);
     assert!(started.elapsed() < CLOSE_TIMEOUT + Duration::from_secs(3));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_system_alias_events_wake_lexical_paths_including_deleted_files() {
+    use notify::EventHandler;
+    let (wake, mut receiver) = tokio::sync::mpsc::channel(1);
+    let (closed, _) = std::sync::mpsc::channel();
+    let mut handler = Handler {
+        wake,
+        closed,
+        paths: vec![PathBuf::from("/var/folders/ccl-test/missing/file")],
+    };
+    handler.handle_event(Ok(notify::Event::new(notify::EventKind::Remove(
+        notify::event::RemoveKind::File,
+    ))
+    .add_path(PathBuf::from("/private/var/folders/ccl-test/missing/file"))));
+    assert!(receiver.try_recv().is_ok());
+    handler.handle_event(Ok(notify::Event::new(notify::EventKind::Modify(
+        notify::event::ModifyKind::Any,
+    ))
+    .add_path(PathBuf::from("/private/var/folders/unrelated/file"))));
+    assert!(receiver.try_recv().is_err());
+}

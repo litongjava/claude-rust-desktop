@@ -683,6 +683,13 @@ async fn controls_replay_and_live_permission_decisions_use_actual_engine() {
     for (allow, mutate) in [(false, false), (true, false), (true, true)] {
         let server = Server::start(false, Mode::Approval).await;
         let root = tempfile::tempdir().unwrap();
+        // initialize acknowledges registration before SessionStart finishes.
+        // Hold startup open in one case to exercise the busy control response.
+        if !allow {
+            std::fs::create_dir_all(root.path().join("data")).unwrap();
+            std::fs::write(root.path().join("startup.cjs"), "const fs=require('fs');fs.writeFileSync('startup-entered','1');const timer=setInterval(()=>{if(fs.existsSync('startup-release')){clearInterval(timer);console.log('{}')}},10);").unwrap();
+            std::fs::write(root.path().join("data/settings.json"), json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node startup.cjs"}]}]}}).to_string()).unwrap();
+        }
         let mut client = Client::start(
             root.path(),
             &server,
@@ -693,11 +700,31 @@ async fn controls_replay_and_live_permission_decisions_use_actual_engine() {
             client.frame("control_response").await["response"]["subtype"],
             "success"
         );
-        client.send(json!({"type":"control_request","request_id":"model","request":{"subtype":"set_model","model":"fixture-model"}})).await;
-        assert_eq!(
-            client.frame("control_response").await["response"]["subtype"],
-            "success"
-        );
+        if !allow {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !root.path().join("startup-entered").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let mut saw_startup_busy = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                client.send(json!({"type":"control_request","request_id":"model","request":{"subtype":"set_model","model":"fixture-model"}})).await;
+                let reply = client.frame("control_response").await;
+                assert_eq!(reply["response"]["request_id"], "model", "{reply}");
+                if reply["response"]["subtype"] == "success" { break; }
+                assert_eq!(reply["response"]["error"], "Control changes require completed session startup", "{reply}");
+                saw_startup_busy = true;
+                if !allow { std::fs::write(root.path().join("startup-release"), "1").unwrap(); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        if !allow {
+            assert!(saw_startup_busy);
+        }
         let mut message = user("Write approval.txt");
         message["uuid"] = json!("retained-user-uuid");
         client.send(message).await;

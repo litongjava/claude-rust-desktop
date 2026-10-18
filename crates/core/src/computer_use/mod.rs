@@ -387,10 +387,35 @@ impl ComputerUseManager {
             Err(e) => (false, Some(e.to_string())),
         };
 
-        let screenshot = if self.config.require_screenshot_after.contains(&action.action_type) || success {
-            Some(self.take_screenshot().await.unwrap_or_else(|_| "".to_string()))
+        #[cfg(windows)]
+        let screenshot = if self
+            .config
+            .require_screenshot_after
+            .contains(&action.action_type)
+            || success
+        {
+            Some(
+                self.take_screenshot()
+                    .await
+                    .unwrap_or_else(|_| "".to_string()),
+            )
         } else {
             None
+        };
+
+        #[cfg(not(windows))]
+        let (success, error, screenshot) = if success
+            && self
+                .config
+                .require_screenshot_after
+                .contains(&action.action_type)
+        {
+            match self.take_screenshot().await {
+                Ok(image) => (true, None, Some(image)),
+                Err(error) => (false, Some(error.to_string()), None),
+            }
+        } else {
+            (success, error, None)
         };
 
         let action_result = ComputerActionResult {
@@ -430,10 +455,39 @@ impl ComputerUseManager {
     }
 
     async fn execute_action_impl(&self, action: ComputerAction) -> Result<()> {
+        #[cfg(not(windows))]
+        {
+            if action.action_type == ComputerActionType::Screenshot {
+                take_screenshot_powershell()?;
+            }
+            if matches!(
+                action.action_type,
+                ComputerActionType::MouseClick
+                    | ComputerActionType::MouseDown
+                    | ComputerActionType::MouseUp
+            ) {
+                map_mouse_button(action.button.as_ref().unwrap_or(&MouseButton::Left))?;
+            }
+            if matches!(
+                action.action_type,
+                ComputerActionType::KeyPress
+                    | ComputerActionType::KeyDown
+                    | ComputerActionType::KeyUp
+            ) {
+                if let Some(key) = &action.key {
+                    if action.action_type != ComputerActionType::KeyPress || key.len() != 1 {
+                        parse_key(key)?;
+                    }
+                }
+            }
+        }
         match action.action_type {
             ComputerActionType::MouseMove => {
                 if let Some(coord) = &action.coordinate {
                     if let Err(e) = self.real_mouse_move(coord.x, coord.y) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real mouse move failed, using simulated fallback: {}", e);
                     }
                     let mut pos = self.current_position.lock().unwrap_or_else(|e| e.into_inner());
@@ -444,6 +498,9 @@ impl ComputerUseManager {
             ComputerActionType::MouseClick => {
                 if let Some(coord) = &action.coordinate {
                     if let Err(e) = self.real_mouse_move(coord.x, coord.y) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real mouse move for click failed: {}", e);
                     }
                     let mut pos = self.current_position.lock().unwrap_or_else(|e| e.into_inner());
@@ -452,12 +509,18 @@ impl ComputerUseManager {
                 }
                 let button = action.button.as_ref().unwrap_or(&MouseButton::Left);
                 if let Err(e) = self.real_mouse_click(button) {
+                    #[cfg(not(windows))]
+                    return Err(e);
+                    #[cfg(windows)]
                     tracing::warn!("Real mouse click failed, using simulated fallback: {}", e);
                 }
             }
             ComputerActionType::MouseDown => {
                 let button = action.button.as_ref().unwrap_or(&MouseButton::Left);
                 if let Err(e) = self.real_mouse_down(button) {
+                    #[cfg(not(windows))]
+                    return Err(e);
+                    #[cfg(windows)]
                     tracing::warn!("Real mouse down failed: {}", e);
                 }
                 let mut buttons = self.pressed_buttons.lock().unwrap_or_else(|e| e.into_inner());
@@ -468,6 +531,9 @@ impl ComputerUseManager {
             ComputerActionType::MouseUp => {
                 let button = action.button.as_ref().unwrap_or(&MouseButton::Left);
                 if let Err(e) = self.real_mouse_up(button) {
+                    #[cfg(not(windows))]
+                    return Err(e);
+                    #[cfg(windows)]
                     tracing::warn!("Real mouse up failed: {}", e);
                 }
                 if let Some(button) = &action.button {
@@ -478,11 +544,17 @@ impl ComputerUseManager {
             ComputerActionType::MouseScroll => {
                 if let Some(scroll_y) = action.scroll_y {
                     if let Err(e) = self.real_mouse_scroll(scroll_y, true) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real mouse scroll vertical failed: {}", e);
                     }
                 }
                 if let Some(scroll_x) = action.scroll_x {
                     if let Err(e) = self.real_mouse_scroll(scroll_x, false) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real mouse scroll horizontal failed: {}", e);
                     }
                 }
@@ -490,7 +562,11 @@ impl ComputerUseManager {
             ComputerActionType::KeyPress => {
                 if let Some(key) = &action.key {
                     if let Err(e) = self.real_key_press(key) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real key press failed, using simulated fallback: {}", e);
+                        #[cfg(windows)]
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -498,6 +574,9 @@ impl ComputerUseManager {
             ComputerActionType::KeyDown => {
                 if let Some(key) = &action.key {
                     if let Err(e) = self.real_key_down(key) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real key down failed: {}", e);
                     }
                     let mut keys = self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
@@ -509,6 +588,9 @@ impl ComputerUseManager {
             ComputerActionType::KeyUp => {
                 if let Some(key) = &action.key {
                     if let Err(e) = self.real_key_up(key) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real key up failed: {}", e);
                     }
                     let mut keys = self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
@@ -518,8 +600,13 @@ impl ComputerUseManager {
             ComputerActionType::TypeText => {
                 if let Some(text) = &action.text {
                     if let Err(e) = self.real_type_text(text) {
+                        #[cfg(not(windows))]
+                        return Err(e);
+                        #[cfg(windows)]
                         tracing::warn!("Real type text failed, using simulated fallback: {}", e);
+                        #[cfg(windows)]
                         for _ in text.chars() {
+                            #[cfg(windows)]
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
                     }
@@ -549,8 +636,9 @@ impl ComputerUseManager {
     fn real_mouse_click(&self, button: &MouseButton) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default())
             .map_err(|e| anyhow!("Failed to create Enigo: {:?}", e))?;
-        let enigo_button = map_mouse_button(button);
-        enigo.button(enigo_button, Direction::Click)
+        let enigo_button = map_mouse_button(button)?;
+        enigo
+            .button(enigo_button, Direction::Click)
             .map_err(|e| anyhow!("Failed to click: {:?}", e))?;
         Ok(())
     }
@@ -558,8 +646,9 @@ impl ComputerUseManager {
     fn real_mouse_down(&self, button: &MouseButton) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default())
             .map_err(|e| anyhow!("Failed to create Enigo: {:?}", e))?;
-        let enigo_button = map_mouse_button(button);
-        enigo.button(enigo_button, Direction::Press)
+        let enigo_button = map_mouse_button(button)?;
+        enigo
+            .button(enigo_button, Direction::Press)
             .map_err(|e| anyhow!("Failed to press mouse button: {:?}", e))?;
         Ok(())
     }
@@ -567,8 +656,9 @@ impl ComputerUseManager {
     fn real_mouse_up(&self, button: &MouseButton) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default())
             .map_err(|e| anyhow!("Failed to create Enigo: {:?}", e))?;
-        let enigo_button = map_mouse_button(button);
-        enigo.button(enigo_button, Direction::Release)
+        let enigo_button = map_mouse_button(button)?;
+        enigo
+            .button(enigo_button, Direction::Release)
             .map_err(|e| anyhow!("Failed to release mouse button: {:?}", e))?;
         Ok(())
     }
@@ -629,14 +719,23 @@ impl ComputerUseManager {
     }
 }
 
-fn map_mouse_button(button: &MouseButton) -> Button {
-    match button {
+fn map_mouse_button(button: &MouseButton) -> Result<Button> {
+    Ok(match button {
         MouseButton::Left => Button::Left,
         MouseButton::Right => Button::Right,
         MouseButton::Middle => Button::Middle,
+        #[cfg(not(target_os = "macos"))]
         MouseButton::Back => Button::Back,
+        #[cfg(not(target_os = "macos"))]
         MouseButton::Forward => Button::Forward,
-    }
+        #[cfg(target_os = "macos")]
+        MouseButton::Back | MouseButton::Forward => {
+            return Err(anyhow!(
+                "Mouse button {:?} is not supported on macOS",
+                button
+            ))
+        }
+    })
 }
 
 fn parse_key(key: &str) -> Result<Key> {
@@ -672,15 +771,30 @@ fn parse_key(key: &str) -> Result<Key> {
         "super" | "meta" | "win" => Ok(Key::Meta),
         "capslock" | "caps_lock" => Ok(Key::CapsLock),
         "space" => Ok(Key::Space),
+        #[cfg(not(target_os = "macos"))]
         "insert" => Ok(Key::Insert),
+        #[cfg(windows)]
         "printscreen" | "print_screen" | "snapshot" => Ok(Key::Snapshot),
+        #[cfg(windows)]
         "scrolllock" | "scroll_lock" => Ok(Key::Scroll),
+        #[cfg(not(target_os = "macos"))]
         "numlock" | "num_lock" => Ok(Key::Numlock),
+        #[cfg(not(target_os = "macos"))]
         "pause" | "break" => Ok(Key::Pause),
+        #[cfg(all(unix, not(target_os = "macos")))]
+        "printscreen" | "print_screen" | "snapshot" => Ok(Key::Print),
+        #[cfg(all(unix, not(target_os = "macos")))]
+        "scrolllock" | "scroll_lock" => Ok(Key::ScrollLock),
+        #[cfg(target_os = "macos")]
+        "insert" | "numlock" | "num_lock" | "pause" | "break" | "printscreen" | "print_screen"
+        | "snapshot" | "scrolllock" | "scroll_lock" => {
+            Err(anyhow!("Key {} is not supported on macOS", key))
+        }
         _ => Err(anyhow!("Unknown key: {}", key)),
     }
 }
 
+#[cfg(windows)]
 fn get_real_screen_info() -> Result<ScreenInfo> {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -700,6 +814,7 @@ fn get_real_screen_info() -> Result<ScreenInfo> {
     }
 }
 
+#[cfg(windows)]
 pub fn take_screenshot_powershell() -> Result<String> {
     let ps_script = r#"
 Add-Type -AssemblyName System.Windows.Forms
@@ -824,5 +939,124 @@ pub mod action_helpers {
             scroll_x: None,
             duration_ms: None,
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn get_real_screen_info() -> Result<ScreenInfo> {
+    let enigo =
+        Enigo::new(&Settings::default()).map_err(|e| anyhow!("Failed to create Enigo: {:?}", e))?;
+    let (width, height) = enigo
+        .main_display()
+        .map_err(|e| anyhow!("Failed to read display: {:?}", e))?;
+    Ok(ScreenInfo {
+        width: width.try_into()?,
+        height: height.try_into()?,
+        scale_factor: 1.0,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn take_screenshot_powershell() -> Result<String> {
+    Err(anyhow!(
+        "Local screenshots are not supported on {}; select a screenshot-capable backend",
+        std::env::consts::OS
+    ))
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn portable_keys_and_buttons_keep_their_meaning() {
+        assert_eq!(parse_key("enter").unwrap(), Key::Return);
+        assert_eq!(parse_key("ctrl").unwrap(), Key::Control);
+        assert_eq!(map_mouse_button(&MouseButton::Left).unwrap(), Button::Left);
+        assert!(parse_key("unsupported-key").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_special_keys_and_buttons_are_unchanged() {
+        assert_eq!(parse_key("snapshot").unwrap(), Key::Snapshot);
+        assert_eq!(parse_key("scroll_lock").unwrap(), Key::Scroll);
+        assert_eq!(map_mouse_button(&MouseButton::Back).unwrap(), Button::Back);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_special_keys_use_the_matching_native_key() {
+        assert_eq!(parse_key("snapshot").unwrap(), Key::Print);
+        assert_eq!(parse_key("scroll_lock").unwrap(), Key::ScrollLock);
+        assert_eq!(parse_key("insert").unwrap(), Key::Insert);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_unsupported_input_is_rejected_before_any_native_input() {
+        let manager = test_manager();
+        for key in [
+            "insert",
+            "numlock",
+            "num_lock",
+            "pause",
+            "break",
+            "printscreen",
+            "print_screen",
+            "snapshot",
+            "scrolllock",
+            "scroll_lock",
+        ] {
+            assert!(parse_key(key)
+                .unwrap_err()
+                .to_string()
+                .contains("not supported on macOS"));
+            let result = manager
+                .execute_action(action_helpers::key_press(key))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.error.unwrap().contains("not supported on macOS"));
+        }
+        for button in [MouseButton::Back, MouseButton::Forward] {
+            let result = manager
+                .execute_action(action_helpers::mouse_click(0, 0, button))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.error.unwrap().contains("not supported on macOS"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn test_manager() -> ComputerUseManager {
+        ComputerUseManager {
+            config: ComputerUseConfig::default(),
+            action_history: Arc::new(Mutex::new(Vec::new())),
+            current_position: Arc::new(Mutex::new(ScreenCoordinate { x: 0, y: 0 })),
+            pressed_keys: Arc::new(Mutex::new(Vec::new())),
+            pressed_buttons: Arc::new(Mutex::new(Vec::new())),
+            screen_info: ScreenInfo {
+                width: 0,
+                height: 0,
+                scale_factor: 1.0,
+            },
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unsupported_local_screenshot_reports_failure() {
+        assert!(take_screenshot_powershell()
+            .unwrap_err()
+            .to_string()
+            .contains("not supported"));
+        let result = test_manager()
+            .execute_action(action_helpers::screenshot())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not supported"));
     }
 }

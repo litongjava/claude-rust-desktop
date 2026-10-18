@@ -90,6 +90,20 @@ struct Handler {
     closed: std::sync::mpsc::Sender<()>,
     paths: Vec<PathBuf>,
 }
+// FSEvents reports /private/var and /private/tmp even when registered through
+// macOS system aliases. Normalize only for matching, preserving payload paths.
+fn notification_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    #[cfg(target_os = "macos")]
+    for root in ["/private/var", "/private/tmp", "/private/etc"] {
+        if path.starts_with(root) {
+            if let Ok(relative) = path.strip_prefix("/private") {
+                return std::borrow::Cow::Owned(std::path::Path::new("/").join(relative));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 impl notify::EventHandler for Handler {
     fn handle_event(&mut self, event: notify::Result<notify::Event>) {
         match event {
@@ -97,9 +111,11 @@ impl notify::EventHandler for Handler {
                 if !matches!(event.kind, notify::EventKind::Access(_))
                     && (event.paths.is_empty()
                         || event.paths.iter().any(|changed| {
-                            self.paths
-                                .iter()
-                                .any(|path| changed.starts_with(path) || path.starts_with(changed))
+                            self.paths.iter().any(|path| {
+                                let changed = notification_path(changed);
+                                let path = notification_path(path);
+                                changed.starts_with(&path) || path.starts_with(&changed)
+                            })
                         })) =>
             {
                 let _ = self.wake.try_send(());

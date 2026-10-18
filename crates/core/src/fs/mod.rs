@@ -68,6 +68,45 @@ fn blocked_path_prefixes() -> &'static [&'static str] {
 pub fn validate_path(path: &str) -> Result<PathBuf> {
     let p = Path::new(path);
 
+    #[cfg(unix)]
+    {
+        // Check the requested namespace too: /proc/self/exe resolves outside /proc.
+        let absolute = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(p)
+        };
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        for blocked in blocked_path_prefixes() {
+            if normalized.starts_with(blocked) {
+                return Err(anyhow!(
+                    "Access denied: path '{}' is in a protected system directory",
+                    normalized.display()
+                ));
+            }
+            // macOS exposes /etc and /var through /private aliases.
+            if let (Ok(resolved), Ok(blocked)) =
+                (p.canonicalize(), Path::new(blocked).canonicalize())
+            {
+                if resolved.starts_with(blocked) {
+                    return Err(anyhow!(
+                        "Access denied: path '{}' is in a protected system directory",
+                        resolved.display()
+                    ));
+                }
+            }
+        }
+    }
+
     // Canonicalize resolves .. components and symlinks
     let canonical = match p.canonicalize() {
         Ok(c) => c,

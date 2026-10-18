@@ -101,7 +101,7 @@ pub fn import_legacy(context: &ServiceContext, source: &Path, preview: bool) -> 
     ensure!(manifest.permissions.is_empty(), "Legacy sandbox permissions are not enforced by script execution; convert to an explicit reviewed bundle before import");
     let interpreter = match Path::new(&manifest.main).extension().and_then(|s| s.to_str()) {
         Some("js" | "cjs" | "mjs") => "node",
-        Some("py") => "python",
+        Some("py") => if cfg!(windows) { "python" } else { "python3" },
         _ => anyhow::bail!("Only JavaScript/Python legacy entrypoints can be converted; the old native/WASM loader defined no executable ABI"),
     };
     let mut commands = BTreeMap::new();

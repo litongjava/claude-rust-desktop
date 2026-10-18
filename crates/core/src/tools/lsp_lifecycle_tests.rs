@@ -96,6 +96,30 @@ impl Fixture {
         if pids.is_empty() {
             return;
         }
+        #[cfg(unix)]
+        {
+            // A cached Child is still owned by the pool. Reap an exited child
+            // before kill(pid, 0), which also succeeds for Unix zombies.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                let mut live = false;
+                let mut pool = self.runtime.pool.lock().await;
+                for (_, server) in pool.values_mut() {
+                    if server
+                        .child
+                        .id()
+                        .is_some_and(|pid| pids.contains(&u64::from(pid)))
+                    {
+                        live |= server.child.try_wait().unwrap().is_none();
+                    }
+                }
+                drop(pool);
+                if !live || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
         let mut command = tokio::process::Command::new("node");
         command.args(["-e", "const p=JSON.parse(process.argv[1]),end=Date.now()+4000;const check=()=>{let live=p.some(pid=>{try{process.kill(pid,0);return true}catch{return false}});if(!live)process.exit(0);if(Date.now()>end)process.exit(1);setTimeout(check,25)};check();", &serde_json::to_string(&pids).unwrap()]);
         #[cfg(windows)]

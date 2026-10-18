@@ -107,9 +107,15 @@ async fn standalone_session_start_watchpaths_dispatches_filechanged_and_exits_cl
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
     assert_eq!(rows.len(), 1);
+    #[cfg(unix)]
+    let cwd = dir.path().canonicalize().unwrap();
+    #[cfg(windows)]
+    let cwd = dir.path().to_path_buf();
+    #[cfg(unix)]
+    let watched = watched.canonicalize().unwrap();
     assert_eq!(
         rows[0],
-        json!({"hook_event_name":"FileChanged","session_id":id,"cwd":dir.path(),"file_path":watched,"event":"add","transcript_path":rows[0]["transcript_path"]})
+        json!({"hook_event_name":"FileChanged","session_id":id,"cwd":cwd,"file_path":watched,"event":"add","transcript_path":rows[0]["transcript_path"]})
     );
     server.abort();
 }

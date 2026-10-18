@@ -121,3 +121,13 @@ fn empty_path_resolves_to_current_dir() {
     let result = validate_path("");
     assert!(result.is_ok() || result.is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn validate_path_rejects_symlink_into_protected_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let link = directory.path().join("protected");
+    std::os::unix::fs::symlink("/etc", &link).unwrap();
+    assert!(validate_path(link.to_str().unwrap()).is_err());
+    assert!(validate_path("/etc/../etc/passwd").is_err());
+}

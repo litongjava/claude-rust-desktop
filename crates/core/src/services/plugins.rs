@@ -114,7 +114,7 @@ impl Bundle {
             );
             ensure!(
                 valid_name(name)
-                    && matches!(command.interpreter.as_str(), "node" | "python")
+                    && matches!(command.interpreter.as_str(), "node" | "python" | "python3")
                     && self.files.contains_key(&command.script)
                     && safe_path(&command.script),
                 "Invalid plugin command {name}"

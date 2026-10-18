@@ -59,6 +59,9 @@ async fn init_only_without_credentials_runs_setup_then_session_start_and_once_su
     }
     let events = rows(dir.path());
     assert_eq!(events.len(), 2);
+    #[cfg(unix)]
+    let cwd = dir.path().canonicalize().unwrap();
+    #[cfg(windows)]
     let cwd = dir.path();
     assert_eq!(
         events[0],
@@ -128,6 +131,9 @@ async fn model_500_emits_one_stop_failure_and_loaded_instructions() {
     assert_eq!(failures.len(), 1, "{events:?}");
     let event = failures[0];
     assert!(event["error_details"].as_str().unwrap().contains("500"));
+    #[cfg(unix)]
+    let cwd = dir.path().canonicalize().unwrap();
+    #[cfg(windows)]
     let cwd = dir.path();
     assert_eq!(
         *event,
