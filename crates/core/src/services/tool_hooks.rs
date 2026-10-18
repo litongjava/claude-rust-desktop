@@ -148,6 +148,7 @@ pub struct HookOutcome {
     /// Model-facing MCP content, never a replacement transport envelope.
     pub updated_mcp_tool_output: Option<Value>,
     pub elicitation_response: Option<Value>,
+    pub initial_user_message: Option<String>,
     mcp_output_order: usize,
     pub warnings: Vec<String>,
     /// An explicit hook request for approval must not become an automatic grant.
@@ -159,12 +160,19 @@ pub struct HookOutcome {
 
 impl HookOutcome {
     fn observe_mcp_output(&mut self, order: &std::sync::atomic::AtomicUsize) {
-        if self.updated_mcp_tool_output.is_some() || self.elicitation_response.is_some() {
+        if self.updated_mcp_tool_output.is_some()
+            || self.elicitation_response.is_some()
+            || self.initial_user_message.is_some()
+        {
             self.mcp_output_order = order.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         }
     }
 
     fn merge_mcp_output(&mut self, other: &mut Self) {
+        if other.initial_user_message.is_some() && other.mcp_output_order >= self.mcp_output_order {
+            self.initial_user_message = other.initial_user_message.take();
+            self.mcp_output_order = other.mcp_output_order;
+        }
         if other.elicitation_response.is_some() && other.mcp_output_order >= self.mcp_output_order {
             self.elicitation_response = other.elicitation_response.take();
             self.mcp_output_order = other.mcp_output_order;
@@ -909,6 +917,16 @@ fn parse_output(event: HookEvent, exit: i32, stdout: &str, stderr: &str) -> Resu
 
 fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
     ensure!(output.is_object(), "Hook output must be an object");
+    if let Some(value) = output
+        .get("hookSpecificOutput")
+        .and_then(|v| v.get("initialUserMessage"))
+    {
+        ensure!(
+            event == HookEvent::SessionStart,
+            "initialUserMessage requires SessionStart"
+        );
+        ensure!(value.is_string(), "initialUserMessage must be a string");
+    }
     let mut result = HookOutcome::default();
     if matches!(event, HookEvent::Elicitation | HookEvent::ElicitationResult) {
         result.blocked = string_field(&output, "decision")? == Some("block");
@@ -1039,6 +1057,11 @@ fn parse_json_output(event: HookEvent, output: Value) -> Result<HookOutcome> {
             string_field(specific, "hookEventName")? == Some(event.name()),
             "Hook returned an incorrect hookEventName"
         );
+        if let Some(message) = string_field(specific, "initialUserMessage")? {
+            if !message.is_empty() {
+                result.initial_user_message = Some(message.into());
+            }
+        }
         if let Some(context) = string_field(specific, "additionalContext")? {
             result.additional_context.push(context.into());
         }

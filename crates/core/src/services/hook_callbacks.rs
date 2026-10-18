@@ -133,14 +133,22 @@ impl Registration {
             "Async SDK hook outputs are not implemented"
         );
         if let Some(specific) = output.get("hookSpecificOutput") {
-            for unsupported in ["initialUserMessage", "watchPaths"] {
+            for unsupported in ["watchPaths"] {
                 ensure!(
                     specific.get(unsupported).is_none(),
                     "SDK hook output {unsupported} is not implemented"
                 );
             }
-            ensure!(specific.get("updatedMCPToolOutput").is_none() || callback.event == HookEvent::PostToolUse,
-                "updatedMCPToolOutput requires PostToolUse");
+            ensure!(
+                specific.get("initialUserMessage").is_none()
+                    || callback.event == HookEvent::SessionStart,
+                "initialUserMessage requires SessionStart"
+            );
+            ensure!(
+                specific.get("updatedMCPToolOutput").is_none()
+                    || callback.event == HookEvent::PostToolUse,
+                "updatedMCPToolOutput requires PostToolUse"
+            );
         }
         ensure!(
             serde_json::to_vec(&output)?.len() <= 1024 * 1024,

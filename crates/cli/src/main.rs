@@ -322,10 +322,7 @@ async fn run(cli: &Cli) -> Result<()> {
             prompt.push_str(&piped);
         }
     }
-    ensure!(
-        cli.init_only || sdk_stream || !single || !prompt.trim().is_empty(),
-        "A prompt or piped stdin is required"
-    );
+
     let resumed = if let Some(id) = &cli.resume {
         let store = SessionStore::new(paths.open_database()?);
         Some(store.resume(id).map_err(|error| session_trust::diagnose(&store.db, &paths, id, error))?)
@@ -414,7 +411,10 @@ async fn run(cli: &Cli) -> Result<()> {
         Err(error) if !single => {
             eprintln!("Provider setup required: {error:#}");
             interactive_config::setup(&paths, input.as_mut().unwrap()).await?
-        },
+        }
+        Err(error) if single && !sdk_stream && prompt.trim().is_empty() => {
+            return Err(error.context("No prompt was supplied; configure a provider before SessionStart can supply initialUserMessage"));
+        }
         Err(error) => return Err(error),
     };
     startup_options::validate(cli, &std::env::current_dir()?)?;
@@ -434,6 +434,15 @@ async fn run(cli: &Cli) -> Result<()> {
             for warning in outcome { eprintln!("Setup hook: {warning}"); }
         }
         if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
+        if !sdk_stream {
+            let initial = session.initial_hook_message.take();
+            if single {
+                ensure!(initial.is_some() || !prompt.trim().is_empty(), "A prompt or piped stdin is required");
+                if let Some(message) = initial {
+                    Box::pin(session.turn_initial_hook(cli, &message, &mut input, prompt.trim().is_empty() || cli.output_format == OutputFormat::StreamJson)).await?;
+                }
+            }
+        }
         if !sdk_stream && !prompt.trim().is_empty() {
             if !single {
                 let display = display_commands::load(&session)?;

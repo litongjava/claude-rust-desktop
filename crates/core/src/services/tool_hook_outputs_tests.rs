@@ -150,3 +150,105 @@ async fn callbacks_observe_original_response_and_last_completion_wins() {
         .unwrap();
     assert_eq!(outcome.updated_mcp_tool_output, Some(json!("last")));
 }
+
+#[tokio::test]
+async fn initial_message_observation_order_survives_delayed_command_tail() {
+    struct Callback {
+        root: PathBuf,
+    }
+    impl Host for Callback {
+        fn invoke<'a>(
+            &'a self,
+            _: &'a str,
+            input: Value,
+            _: Option<String>,
+        ) -> BoxFuture<'a, Result<Value>> {
+            Box::pin(async move {
+                assert_eq!(
+                    input["tool_response"],
+                    json!([{"type":"text","text":"original"}])
+                );
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while !self.root.join("waiting").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+                std::fs::write(self.root.join("release"), "yes")?;
+                Ok(
+                    json!({"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"callback wins","additionalContext":"kept"}}),
+                )
+            })
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let host: Arc<dyn Host> = Arc::new(Callback {
+        root: root.path().to_path_buf(),
+    });
+    let callbacks = hook_callbacks::validate(
+        &json!({"SessionStart":[{"hookCallbackIds":["post"],"timeout":20}]}),
+    )
+    .unwrap();
+    let _guard = hook_callbacks::install(&session, callbacks, host.clone());
+    let (shell, first, tail) = if cfg!(windows) {
+        ("powershell", "Write-Output '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"initialUserMessage\":\"earlier command\"}}'", "[IO.File]::WriteAllText('waiting','yes'); while (!(Test-Path -LiteralPath 'release')) { Start-Sleep -Milliseconds 10 }; Write-Output '{}'")
+    } else {
+        ("sh", "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"initialUserMessage\":\"earlier command\"}}'", "printf yes > waiting; while [ ! -f release ]; do sleep 0.01; done; printf '{}'")
+    };
+    let mut runner = HookRunner::default().with_session_callbacks(&session);
+    runner.workspace = root.path().to_path_buf();
+    runner.hooks = [first, tail]
+        .into_iter()
+        .map(|command| ActiveHook {
+            event: HookEvent::SessionStart,
+            matcher: String::new(),
+            command: command.into(),
+            http: None,
+            prompt: None,
+            timeout: 20,
+            source: root.path().into(),
+            shell: Some(shell.into()),
+            if_condition: None,
+            once: false,
+            asynchronous: false,
+            async_rewake: false,
+            status_message: None,
+        })
+        .collect();
+    let outcome = runner
+        .run(
+            HookEvent::SessionStart,
+            &session,
+            json!({"tool_name":"fixture","tool_response":[{"type":"text","text":"original"}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.initial_user_message, Some("callback wins".into()));
+    assert_eq!(outcome.additional_context, vec!["kept"]);
+}
+
+#[test]
+fn initial_message_requires_session_start_string_and_keeps_whitespace() {
+    for value in [json!(null), json!(true), json!(1), json!([])] {
+        assert!(parse_json_output(HookEvent::SessionStart, json!({"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":value}})).is_err());
+    }
+    for event in [
+        HookEvent::PreToolUse,
+        HookEvent::PermissionDenied,
+        HookEvent::Notification,
+    ] {
+        assert!(parse_json_output(
+            event,
+            json!({"hookSpecificOutput":{"hookEventName":event.name(),"initialUserMessage":"bad"}})
+        )
+        .is_err());
+    }
+    for text in ["", " ", "hello"] {
+        let output = parse_json_output(HookEvent::SessionStart, json!({"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":text}})).unwrap();
+        assert_eq!(
+            output.initial_user_message.as_deref(),
+            (!text.is_empty()).then_some(text)
+        );
+    }
+}

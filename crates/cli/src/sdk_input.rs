@@ -10,6 +10,7 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub struct UserMessage {
     pub text: String,
+    pub(crate) initial_hook: bool,
     pub session_id: Option<String>,
     pub uuid: Option<String>,
     pub envelope: Value,
@@ -90,6 +91,7 @@ pub fn parse_line(line: &str) -> Result<UserMessage> {
         _ => bail!("SDK message.content must be a string or an array of text blocks"),
     };
     Ok(UserMessage {
+        initial_hook: false,
         text,
         content,
         session_id: optional_string(&frame, "session_id")?,
@@ -145,6 +147,7 @@ pub fn frames_from_reader(
                 let text = std::str::from_utf8(&bytes).context("SDK input must be UTF-8")?;
                 if text.trim().is_empty() {
                     return Ok(Some(Frame::User(UserMessage {
+                        initial_hook: false,
                         text: String::new(),
                         session_id: None,
                         uuid: None,

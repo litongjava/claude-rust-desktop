@@ -331,3 +331,70 @@ async fn sdk_eof_during_model_or_callback_cannot_continue_automatically_allowed_
         }
     }
 }
+
+#[tokio::test]
+async fn initial_message_precedes_queued_user_and_is_not_authority() {
+    for queued in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::start(false, Mode::Text).await;
+        let mut client = Client::start(root.path(), &server, &["--replay-user-messages"]);
+        initialize(&mut client, json!({"SessionStart":[{"hookCallbackIds":["start"]}],"UserPromptSubmit":[{"hookCallbackIds":["submit"]}]})).await;
+        let start = client.frame("control_request").await;
+        if queued {
+            client.send(user("HUMAN_INPUT")).await;
+        }
+        answer(&mut client, &start, json!({"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"HOOK_INITIAL"}})).await;
+        let replay = client.frame("user").await;
+        assert_eq!(replay["origin"]["hookEvent"], "SessionStart");
+        let submit = client.frame("control_request").await;
+        assert_eq!(submit["request"]["input"]["prompt"], "HOOK_INITIAL");
+        answer(&mut client, &submit, json!({})).await;
+        let result = client.result().await;
+        assert_eq!(result["is_error"], false);
+        let id = result["session_id"].as_str().unwrap();
+        if queued {
+            let submit = client.frame("control_request").await;
+            assert_eq!(submit["request"]["input"]["prompt"], "HUMAN_INPUT");
+            answer(&mut client, &submit, json!({})).await;
+            assert_eq!(client.result().await["is_error"], false);
+        }
+        let (status, extra) = client.finish().await;
+        assert!(status.success());
+        assert!(extra.is_empty());
+        let requests = server.fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), if queued { 2 } else { 1 });
+        assert!(requests[0].to_string().contains("HOOK_INITIAL"));
+        assert!(!requests[0].to_string().contains("HUMAN_INPUT"));
+        let context =
+            claude_core::services::session_messages::context(&root.path().join("data")).unwrap();
+        let authority =
+            claude_core::services::permission_authority::history(&context.db, id, 8192).unwrap();
+        assert!(!serde_json::to_string(&authority)
+            .unwrap()
+            .contains("HOOK_INITIAL"));
+        assert_eq!(authority.len(), usize::from(queued));
+    }
+}
+#[tokio::test]
+async fn timed_out_initial_message_cannot_reappear_on_later_user_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let server = Server::start(false, Mode::Text).await;
+    let mut client = Client::start(root.path(), &server, &[]);
+    initialize(
+        &mut client,
+        json!({"SessionStart":[{"hookCallbackIds":["start"],"timeout":0.1}]}),
+    )
+    .await;
+    let start = client.frame("control_request").await;
+    let cancel = client.frame("control_cancel_request").await;
+    assert_eq!(cancel["request_id"], start["request_id"]);
+    answer(&mut client, &start, json!({"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"LATE_INITIAL"}})).await;
+    client.send(user("HUMAN_AFTER_TIMEOUT")).await;
+    assert_eq!(client.result().await["is_error"], false);
+    let (status, extra) = client.finish().await;
+    assert!(status.success());
+    assert!(extra.is_empty());
+    let requests = server.fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].to_string().contains("LATE_INITIAL"));
+}

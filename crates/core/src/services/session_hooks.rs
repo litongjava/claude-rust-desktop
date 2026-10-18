@@ -34,6 +34,22 @@ pub async fn start(
     source: &str,
     model: &str,
 ) -> Result<Vec<String>> {
+    Ok(
+        start_with_output(context, workspace, session, source, model)
+            .await?
+            .warnings,
+    )
+}
+
+/// Activation-local output: never persisted or replayed from a resumed transcript.
+/// Hosts consume the slot once; interactive hosts deliberately discard it.
+pub async fn start_with_output(
+    context: &ServiceContext,
+    workspace: &Path,
+    session: &str,
+    source: &str,
+    model: &str,
+) -> Result<super::tool_hooks::HookOutcome> {
     anyhow::ensure!(
         ["startup", "resume", "clear", "compact"].contains(&source),
         "Invalid SessionStart source"
@@ -42,9 +58,9 @@ pub async fn start(
     super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     // Clear previous activation's context before running commands, including failures.
     context.save_setting(&key(session), &"")?;
-    let (text, warnings) = collect(context, workspace, session, source, model).await?;
-    context.save_setting(&key(session), &text)?;
-    Ok(warnings)
+    let outcome = collect_output(context, workspace, session, source, model).await?;
+    context.save_setting(&key(session), &outcome.additional_context.join("\n"))?;
+    Ok(outcome)
 }
 
 /// Collect context without changing persistence; compaction commits it with its boundary.
@@ -55,6 +71,17 @@ pub(crate) async fn collect(
     source: &str,
     model: &str,
 ) -> Result<(String, Vec<String>)> {
+    let outcome = collect_output(context, workspace, session, source, model).await?;
+    Ok((outcome.additional_context.join("\n"), outcome.warnings))
+}
+
+async fn collect_output(
+    context: &ServiceContext,
+    workspace: &Path,
+    session: &str,
+    source: &str,
+    model: &str,
+) -> Result<super::tool_hooks::HookOutcome> {
     let outcome = HookRunner::load_with_plugins(context, workspace)?
         .run(
             HookEvent::SessionStart,
@@ -62,7 +89,7 @@ pub(crate) async fn collect(
             json!({"source":source,"model":model}),
         )
         .await?;
-    Ok((outcome.additional_context.join("\n"), outcome.warnings))
+    Ok(outcome)
 }
 
 pub fn end_timeout() -> Duration {
@@ -176,6 +203,35 @@ mod tests {
         assert_eq!(events[0]["cwd"], json!(dir.path()));
         assert_eq!(events[2]["reason"], "other");
     }
+    #[tokio::test]
+    async fn initial_message_is_activation_local_and_compaction_only_collects_context() {
+        let (dir, service) = fixture();
+        std::fs::write(dir.path().join("initial.cjs"), r#"let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',initialUserMessage:JSON.parse(s).source,additionalContext:'context'}})));"#).unwrap();
+        configure(
+            dir.path(),
+            json!({"SessionStart":[{"hooks":[{"type":"command","command":"node initial.cjs"}]}]}),
+        );
+        for source in ["startup", "resume", "clear", "compact"] {
+            let mut result = start_with_output(&service, dir.path(), "session", source, "model")
+                .await
+                .unwrap();
+            assert_eq!(result.initial_user_message.take().as_deref(), Some(source));
+            assert!(result.initial_user_message.take().is_none());
+            assert_eq!(context(&service, "session").unwrap(), "context");
+        }
+        let (text, warnings) = collect(&service, dir.path(), "session", "compact", "model")
+            .await
+            .unwrap();
+        assert_eq!(text, "context");
+        assert!(warnings.is_empty());
+        configure(dir.path(), json!({}));
+        let fresh = start_with_output(&service, dir.path(), "session", "resume", "model")
+            .await
+            .unwrap();
+        assert!(fresh.initial_user_message.is_none());
+        assert!(context(&service, "session").unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn session_end_budget_kills_commands_and_descendants() {
         let (dir, service) = fixture();

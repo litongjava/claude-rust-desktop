@@ -393,15 +393,26 @@ impl SessionStore {
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {
-        self.append_with_content(id,role,text,None)
+        self.append_with_content(id, role, text, None, false)
     }
 
-    pub fn append_user_content(&self,id:&str,text:&str,content:&Value)->Result<String>{
-        let content=normalize_user_content(content)?;
-        self.append_with_content(id,"user",text,Some(&content))
+    pub fn append_user_content(&self, id: &str, text: &str, content: &Value) -> Result<String> {
+        let content = normalize_user_content(content)?;
+        self.append_with_content(id, "user", text, Some(&content), false)
     }
 
-    fn append_with_content(&self,id:&str,role:&str,text:&str,content:Option<&Value>)->Result<String>{
+    pub fn append_hook_user(&self, id: &str, text: &str) -> Result<String> {
+        self.append_with_content(id, "user", text, None, true)
+    }
+
+    fn append_with_content(
+        &self,
+        id: &str,
+        role: &str,
+        text: &str,
+        content: Option<&Value>,
+        initial_hook: bool,
+    ) -> Result<String> {
         let message_id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
             // Message ordering is a read/modify/write operation shared by CLI and Desktop hosts.
@@ -423,8 +434,22 @@ impl SessionStore {
                 false,
                 order,
             )?;
+            if initial_hook {
+                tx.execute(
+                    "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
+                    rusqlite::params![
+                        format!("message-origin:{message_id}"),
+                        r#"{"type":"hook","hookEvent":"SessionStart"}"#
+                    ],
+                )?;
+            }
             conversation_repo::increment_message_count(&tx, id)?;
-            if let Some(content)=content {tx.execute("INSERT INTO message_user_content (message_id,content_json) VALUES (?1,?2)",rusqlite::params![message_id,serde_json::to_string(content)?])?;}
+            if let Some(content) = content {
+                tx.execute(
+                    "INSERT INTO message_user_content (message_id,content_json) VALUES (?1,?2)",
+                    rusqlite::params![message_id, serde_json::to_string(content)?],
+                )?;
+            }
             conversation_repo::update_conversation_timestamp(&tx, id, &now)?;
             tx.commit()?;
             Ok(())

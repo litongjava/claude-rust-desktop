@@ -33,6 +33,7 @@ pub struct Session {
     pub(crate) hook_wake_cli: std::sync::Mutex<Option<Arc<Cli>>>,
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_content: Option<Value>,
+    pub(crate) initial_hook_message: Option<String>,
     pub(crate) sdk_overrides: crate::sdk_initialization::Overrides,
     pub(crate) sdk_hooks: Option<crate::sdk_hooks::Runtime>,
     pub(crate) sdk_mcp: Arc<claude_core::mcp::sdk::Runtime>,
@@ -292,6 +293,7 @@ impl Session {
         )));
         Ok(Self {
             hook_wake_cli: std::sync::Mutex::new(None),
+            initial_hook_message: None,
             permissions,
             ide,
             paths: paths.clone(),
@@ -364,13 +366,14 @@ impl Session {
         .await?;
         self.lifecycle_owned = true;
         let outcome = tokio::select! {
-            result = crate::hook_progress::during(&self.id, true, session_hooks::start(&context, &self.workspace, &self.id, source, &self.model)) => result,
+            result = crate::hook_progress::during(&self.id, true, session_hooks::start_with_output(&context, &self.workspace, &self.id, source, &self.model)) => result,
             _ = tokio::signal::ctrl_c() => anyhow::bail!("SessionStart hooks interrupted"),
             _ = claude_core::services::background_sessions::wait_for_cancellation() => anyhow::bail!("SessionStart hooks cancelled"),
         };
         match outcome {
-            Ok(warnings) => {
-                for warning in warnings {
+            Ok(outcome) => {
+                self.initial_hook_message = outcome.initial_user_message;
+                for warning in outcome.warnings {
                     eprintln!("Hook: {warning}");
                 }
             }
@@ -603,7 +606,7 @@ impl Session {
     }
 
     pub async fn wake_hooks(&self, cli: &Cli, input: &mut Option<TerminalInput>) -> Result<()> {
-        Box::pin(self.run_turn_origin(cli, "", input, true)).await
+        Box::pin(self.run_turn_origin(cli, "", input, true, false, true)).await
     }
 
     async fn run_turn(
@@ -612,7 +615,21 @@ impl Session {
         prompt: &str,
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
-        self.run_turn_origin(cli, prompt, input, false).await
+        self.run_turn_origin(cli, prompt, input, false, false, true)
+            .await
+    }
+
+    pub(crate) async fn turn_initial_hook(
+        &self,
+        cli: &Cli,
+        prompt: &str,
+        input: &mut Option<TerminalInput>,
+        publish: bool,
+    ) -> Result<()> {
+        self.permissions
+            .set_launch_rules(&self.id, crate::launch_permissions::rules(cli)?)?;
+        self.run_turn_origin(cli, prompt, input, false, true, publish)
+            .await
     }
 
     async fn run_turn_origin(
@@ -621,6 +638,8 @@ impl Session {
         prompt: &str,
         input: &mut Option<TerminalInput>,
         hook_wake: bool,
+        initial_hook: bool,
+        publish: bool,
     ) -> Result<()> {
         claude_core::services::lifecycle_events::check_configuration(
             &self.hook_service_context(),
@@ -669,9 +688,13 @@ impl Session {
         let mut checkpoint = if hook_wake {
             None
         } else {
-            let user_message_id = match &self.sdk_content {
-                Some(content) => self.store.append_user_content(&self.id, prompt, content),
-                None => self.store.append(&self.id, "user", prompt),
+            let user_message_id = if initial_hook {
+                self.store.append_hook_user(&self.id, prompt)
+            } else {
+                match &self.sdk_content {
+                    Some(content) => self.store.append_user_content(&self.id, prompt, content),
+                    None => self.store.append(&self.id, "user", prompt),
+                }
             }
             .context("Persisting CLI user message")?;
             match claude_core::services::checkpoints::capture(
@@ -819,7 +842,7 @@ impl Session {
                     if let Some(value) = event_json(&event) { emit_json(&value)?; }
                 }
                 match event {
-                    EngineEvent::Text(delta) => { text.push_str(&delta); if cli.output_format == OutputFormat::Text { progress.before_text(&delta); if !progress.is_live() { print!("{delta}"); io::stdout().flush()?; } } },
+                    EngineEvent::Text(delta) => { text.push_str(&delta); if publish && cli.output_format == OutputFormat::Text { progress.before_text(&delta); if !progress.is_live() { print!("{delta}"); io::stdout().flush()?; } } },
                     EngineEvent::Thinking(delta) => {
                         thinking_text.push_str(&delta);
                         progress.record_thinking(&delta);
@@ -838,7 +861,7 @@ impl Session {
                     EngineEvent::Error(message) => { progress.clear(); error = Some(message); },
                     EngineEvent::MessageStop { full_text, stop_reason } => {
                         if structured_output { text = full_text.clone(); }
-                        if text.is_empty() && !full_text.is_empty() { if cli.output_format == OutputFormat::Text { progress.before_text(&full_text); if !progress.is_live() { print!("{full_text}"); } } text = full_text; }
+                        if text.is_empty() && !full_text.is_empty() { if publish && cli.output_format == OutputFormat::Text { progress.before_text(&full_text); if !progress.is_live() { print!("{full_text}"); } } text = full_text; }
                         if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning", "max_tokens", "length", "incomplete"].contains(&s)) {
                             error.get_or_insert_with(|| format!("Turn stopped: {}", stop_reason.unwrap()));
                         }
@@ -1022,13 +1045,27 @@ impl Session {
         }
         if let Some(goal) = turn_goal {
             let (tokens, requests, unreported) = goal_requests.usage();
-            claude_core::services::session_goals::record_turn(&self.store.db, &self.id, &goal.id, tokens, requests, unreported)?;
+            claude_core::services::session_goals::record_turn(
+                &self.store.db,
+                &self.id,
+                &goal.id,
+                tokens,
+                requests,
+                unreported,
+            )?;
         }
-        match cli.output_format {
-            OutputFormat::Text => { if !progress.is_live() { println!(); io::stdout().flush()?; } },
-            _ => emit_json(
-                &json!({"type":"result","session_id":self.id,"result":text,"is_error":error.is_some(),"error":error,"usage":usage,"structured_output":if error.is_none() && structured_output {serde_json::from_str::<Value>(&text).ok()} else {None}}),
-            )?,
+        if publish || error.is_some() {
+            match cli.output_format {
+                OutputFormat::Text => {
+                    if !progress.is_live() {
+                        println!();
+                        io::stdout().flush()?;
+                    }
+                }
+                _ => emit_json(
+                    &json!({"type":"result","session_id":self.id,"result":text,"is_error":error.is_some(),"error":error,"usage":usage,"structured_output":if error.is_none() && structured_output {serde_json::from_str::<Value>(&text).ok()} else {None}}),
+                )?,
+            }
         }
         if let Some(request) = side_request.take() {
             if error.is_none() {

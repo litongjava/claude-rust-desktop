@@ -72,9 +72,9 @@
 
 ### P3 Hook 输出与环境（清单 H3）
 
-入口：`crates/core/src/services/hook_callbacks.rs`（拒绝 async 结果、`initialUserMessage`、`watchPaths`）。设计参考 `temp/claude-code-cli-dev/sdk-hook-output-parity-plan.md`。
+入口：`crates/core/src/services/hook_callbacks.rs`（拒绝 async SDK 结果、`watchPaths`）。设计参考 `temp/claude-code-cli-dev/sdk-hook-output-parity-plan.md`。
 
-- `SessionStart.initialUserMessage`：恰好排队一次，带 hook 来源，不进入用户授权账本。
+- [x] `SessionStart.initialUserMessage`：command/HTTP/SDK 最后非空输出按实际观察顺序胜出；打印与 SDK 入口消费一次并先于调用方输入，持久化 hook 来源且不进入用户授权账本；UserPromptSubmit 正常触发一次。REPL/clear/compact 不自动提交，resume 只消费本次新输出，不重放历史。详见开发记录 `initial-user-message-acceptance-20261018.md`（含 ConPTY 与 auto classifier 隔离验收）。
 - `watchPaths`：会话级 watcher，忽略初次发现，稳定的 add/change/unlink，路径不存在时监视父目录，cwd 切换与关闭隔离。
 - 会话环境文件：原版在 Windows 返回 null，Windows 无需实现；Linux/macOS 需另行验证。
 

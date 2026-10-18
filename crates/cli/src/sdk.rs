@@ -482,6 +482,14 @@ async fn run_inner(
                 requires_host,
             )
             .await?;
+            if let Some(text) = session.initial_hook_message.take() {
+                let mut message = crate::sdk_input::parse_line(
+                    &json!({"type":"user","message":{"role":"user","content":text}}).to_string(),
+                )?;
+                message.initial_hook = true;
+                message.envelope["origin"] = json!({"type":"hook","hookEvent":"SessionStart"});
+                queue.push_front(message);
+            }
             started = true;
         }
         if let Some(message) = queue.pop_front() {
@@ -504,7 +512,15 @@ async fn run_inner(
                 .as_array()
                 .filter(|blocks| blocks.iter().any(|b| b["type"] == "image_url"))
                 .map(|_| message.content.clone());
-            let turn = Box::pin(session.turn(cli, &message.text, &mut terminal));
+            let turn = Box::pin(async {
+                if message.initial_hook {
+                    session
+                        .turn_initial_hook(cli, &message.text, &mut terminal, true)
+                        .await
+                } else {
+                    session.turn(cli, &message.text, &mut terminal).await
+                }
+            });
             tokio::pin!(turn);
             loop {
                 tokio::select! {
