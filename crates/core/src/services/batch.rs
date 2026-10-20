@@ -700,6 +700,41 @@ mod tests {
         assert!(validate(&plan).is_err());
     }
     #[test]
+    fn stale_supervisor_is_marked_unresponsive_without_faking_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init"]).unwrap();
+        fs::write(repo.join("README.md"), "fixture").unwrap();
+        git(&repo, &["add", "README.md"]).unwrap();
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let batch = create(&data, "parent", &repo, "Stale", proposal()).unwrap();
+        let directory = directory(&data, &batch.id).unwrap();
+        let mut state: Batch =
+            serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
+        state.status = "running".into();
+        state.heartbeat_ms = 0;
+        save(&directory.join("state.json"), &state).unwrap();
+        let read = get(&data, &batch.id).unwrap();
+        assert_eq!(read.status, "unresponsive");
+        assert!(read.error.unwrap().contains("heartbeat"));
+        assert!(read.workers.iter().all(|worker| worker.status == "queued"));
+    }
+
+    #[test]
     fn local_git_plan_persists_base_and_keeps_worktrees_isolated() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");

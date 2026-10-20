@@ -4,6 +4,7 @@ mod context_commands;
 mod persistent_worker;
 mod worker_frontend;
 mod command_catalog;
+mod workflow_commands;
 mod interactive_config;
 mod args;
 mod migration;

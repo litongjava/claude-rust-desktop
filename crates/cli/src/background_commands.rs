@@ -1,4 +1,4 @@
-//! Background CLI sessions run in an independent supervisor process.
+﻿//! Background CLI sessions run in an independent supervisor process.
 use crate::{args::Cli, session::Session};
 use anyhow::{ensure, Context, Result};
 use claude_core::{
@@ -81,6 +81,54 @@ pub async fn handle(
             eprintln!("Background task {} starting; child session {}. Use /tasks show {} or /tasks cancel {}. Permission questions remain pending; use /tasks pending ID and /tasks answer ID REQUEST ANSWER.", job.id, child_id, job.id, job.id);
         }
         "/tasks" | "/workflows" => {
+            if command == "/workflows" {
+                let mut probe = argument.split_whitespace();
+                match probe.next().unwrap_or("list") {
+                    "run" => {
+                        let name = probe
+                            .next()
+                            .context("Usage: /workflows run NAME [ARGS]")?;
+                        let args = probe.collect::<Vec<_>>().join(" ");
+                        let job =
+                            crate::workflow_commands::run(cli, paths, session, name, &args)
+                                .await?;
+                        eprintln!(
+                            "Workflow {name} started as task {}. Use /tasks show {} or /tasks cancel {}.",
+                            job.id, job.id, job.id
+                        );
+                        return Ok(Outcome::Handled);
+                    }
+                    "show" => {
+                        let name = probe.next().unwrap_or_default();
+                        let workflow = crate::workflow_commands::discover(
+                            &paths.data_dir,
+                            &session.workspace,
+                        )?
+                        .into_iter()
+                        .find(|workflow| workflow.name == name);
+                        if let Some(workflow) = workflow {
+                            println!("{}", workflow.content);
+                            eprintln!("{}", workflow.path.display());
+                            return Ok(Outcome::Handled);
+                        }
+                    }
+                    "" | "list" => {
+                        let workflows = crate::workflow_commands::discover(
+                            &paths.data_dir,
+                            &session.workspace,
+                        )?;
+                        if workflows.is_empty() {
+                            eprintln!("No local workflows in <data-dir>/workflows or <workspace>/.claude/workflows. Hosted workflows need a vendor account.");
+                        } else {
+                            eprintln!("Local workflows:");
+                        }
+                        for workflow in &workflows {
+                            eprintln!("{}", crate::workflow_commands::print(workflow));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             let mut parts = argument.split_whitespace();
             match parts.next().unwrap_or("list") {
                 "sessions" => {
@@ -110,7 +158,7 @@ pub async fn handle(
                 filter @ ("list" | "running" | "completed" | "failed") => {
                     ensure!(
                         parts.next().is_none(),
-                        "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]"
+                        "Usage: /tasks [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]; /workflows [list|show NAME|run NAME [ARGS]|cancel ID]"
                     );
                     let jobs = background_sessions::list(&paths.data_dir, Some(&session.id))?
                         .into_iter()
@@ -126,7 +174,7 @@ pub async fn handle(
                     };
                     if command == "/workflows" {
                         eprintln!(
-                            "Background workflows: single-task agent runs started by this session."
+                            "Background runs started by this session (local workflow files run as tasks):"
                         );
                     }
                     let parked = if filter == "list" && command == "/tasks" {
@@ -229,7 +277,7 @@ pub async fn handle(
                     eprintln!("Cancellation requested for {id}; /tasks shows the confirmed terminal state.");
                 }
                 _ => anyhow::bail!(
-                    "Usage: /tasks or /workflows [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]"
+                    "Usage: /tasks [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]; /workflows [list|show NAME|run NAME [ARGS]|cancel ID]"
                 ),
             }
         }

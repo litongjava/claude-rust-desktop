@@ -209,3 +209,110 @@ async fn isolated_workers_obey_concurrency_and_preserve_permissions() {
 async fn cancellation_stops_workers_and_keeps_queued_work_unstarted() {
     exercise(true).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_failures_are_reported_and_the_batch_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init"]);
+    std::fs::write(repo.join("README.md"), "fixture").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let root = dir.path().join("data");
+    let paths = RuntimePaths::new(root.clone()).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let parent = store.create(&repo, "fixture-model", "cli-runtime").unwrap();
+    let plan = batch::create(
+        &root,
+        &parent,
+        &repo,
+        "Fail workers",
+        Proposal {
+            summary: "Independent changes".into(),
+            verification: "Check assigned file".into(),
+            units: (0..5)
+                .map(|i| Unit {
+                    title: format!("Task {i}"),
+                    paths: vec![format!("module-{i}")],
+                    instructions: "Inspect and report".into(),
+                })
+                .collect(),
+        },
+    )
+    .unwrap();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "fixture model failure",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let launch = WorkerLaunch {
+        executable: env!("CARGO_BIN_EXE_ccl").into(),
+        arguments: vec![
+            "--data-dir".into(),
+            root.to_string_lossy().into_owned(),
+            "--base-url".into(),
+            url,
+            "--api-format".into(),
+            "openai".into(),
+            "--api-key-env".into(),
+            "BATCH_FIXTURE_KEY".into(),
+            "--model".into(),
+            "fixture-model".into(),
+        ],
+        model: "fixture-model".into(),
+        provider: "cli-runtime".into(),
+        permission_mode: "ask".into(),
+    };
+    batch::start(
+        &root,
+        &plan.id,
+        launch,
+        2,
+        false,
+        &[("BATCH_FIXTURE_KEY".into(), "fixture-not-secret".into())],
+    )
+    .unwrap();
+    let started = Instant::now();
+    let result = loop {
+        let state = batch::get(&root, &plan.id).unwrap();
+        if !matches!(state.status.as_str(), "running" | "unresponsive") {
+            break state;
+        }
+        if started.elapsed() > Duration::from_secs(90) {
+            let _ = batch::cancel(&root, &plan.id);
+            panic!("batch timed out: {state:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(result.status, "failed", "{result:?}");
+    assert!(result
+        .workers
+        .iter()
+        .any(|worker| worker.status == "failed"));
+    for worker in &result.workers {
+        if let Some(job) = &worker.job_id {
+            let job = claude_core::services::background_sessions::get(&root, job).unwrap();
+            assert_ne!(job.status, "running");
+        }
+    }
+    server.abort();
+}
