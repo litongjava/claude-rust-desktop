@@ -156,14 +156,103 @@ impl ToolLoopExecutor {
             .filter(|plan| !plan.trim().is_empty())
             .ok_or_else(|| anyhow!("No plan written yet; write the session plan file, then call ExitPlanMode (or supply plan text)"))?;
         let expected_mode = manager.mode_snapshot();
-        anyhow::ensure!(expected_mode.mode == PermissionMode::PlanMode, "Planning mode changed before approval");
+        anyhow::ensure!(
+            expected_mode.mode == PermissionMode::PlanMode,
+            "Planning mode changed before approval"
+        );
+        if let Some(team) = crate::services::teams::team_for_session(&root, &session)? {
+            if team.lead_session_id != session {
+                use crate::services::teams::{self, PlanDecision};
+                let legacy_warning = if tool_name == "plan_mode" {
+                    crate::tools::coordination::execute(
+                        "plan_mode",
+                        json!({"operation":"exit"}),
+                        &self.workspace_cwd,
+                    )
+                    .err()
+                    .map(|e| format!("Legacy plan state could not be updated: {e:#}"))
+                } else {
+                    None
+                };
+                return match teams::plan_decision(&root, &team.name, &session)? {
+                    PlanDecision::Approved { feedback } => {
+                        let context = crate::services::session_messages::context(&root)?;
+                        crate::services::plan_approval::commit_approved_mode(
+                            &context,
+                            &session,
+                            &manager,
+                            expected_mode,
+                            PermissionMode::AcceptEdits,
+                            &plan,
+                        )?;
+                        Ok(json!({
+                            "approved":true,
+                            "mode":"accept_edits",
+                            "approvedBy":teams::LEAD_NAME,
+                            "feedback":feedback,
+                            "planFilePath":path,
+                            "plan":plan,
+                            "warning":legacy_warning,
+                            "message":"Plan approved by the team leader. Existing deny and confirmation rules remain in force."
+                        }))
+                    }
+                    PlanDecision::Rejected { feedback } => Ok(json!({
+                        "approved":false,
+                        "mode":"plan",
+                        "rejectedBy":teams::LEAD_NAME,
+                        "feedback":feedback,
+                        "message":"The team leader rejected the plan. Keep planning and apply the feedback before requesting approval again."
+                    })),
+                    PlanDecision::Pending => {
+                        if teams::pending_plan_request(&root, &team.name, &session)?.is_none() {
+                            let name = teams::member_for_session(&team, &session)
+                                .map(|member| member.name.clone())
+                                .unwrap_or_else(|| "teammate".into());
+                            let request = teams::create_request(
+                                &root,
+                                &team.name,
+                                "plan_approval",
+                                &session,
+                                &team.lead_session_id,
+                                600_000,
+                                Some(&name),
+                                Some(&plan),
+                            )?;
+                            let content = json!({
+                                "type":"plan_approval_request",
+                                "request_id":request.id,
+                                "teammate":name,
+                                "plan":plan
+                            })
+                            .to_string();
+                            let context = crate::services::session_messages::context(&root)?;
+                            crate::services::session_messages::send(
+                                &context,
+                                &session,
+                                &team.lead_session_id,
+                                &content,
+                            )?;
+                        }
+                        Ok(json!({
+                            "approved":false,
+                            "mode":"plan",
+                            "submitted":true,
+                            "message":"Plan submitted to the team leader for approval. Do not modify project files until the leader responds."
+                        }))
+                    }
+                };
+            }
+        }
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.answer_waiters
             .lock()
             .await
             .insert(request_id.clone(), tx);
-        let _waiter = PermissionWaiterGuard { waiters: self.answer_waiters.clone(), request_id: request_id.clone() };
+        let _waiter = PermissionWaiterGuard {
+            waiters: self.answer_waiters.clone(),
+            request_id: request_id.clone(),
+        };
         let question = format!("Review plan\n{}\n\n{plan}\n\nChoose 1?4, or feedback: <changes>. Clear context preserves this session and its archived transcript.", path.display());
         let sent = self
             .event_tx
@@ -193,22 +282,51 @@ impl ToolLoopExecutor {
             "Permission mode changed during review; approval was not applied"
         );
         if let Choice::Revise(feedback) = choice {
-            return Ok(json!({"approved":false,"mode":"plan","feedback":feedback,"message":"Keep planning. Apply the user's feedback before requesting approval again."}));
+            return Ok(
+                json!({"approved":false,"mode":"plan","feedback":feedback,"message":"Keep planning. Apply the user's feedback before requesting approval again."}),
+            );
         }
         let clear = choice == Choice::ClearEdits;
         let context = crate::services::session_messages::context(&root)?;
         if clear {
             let message = format!("Implement the following approved plan:\n\n{plan}\n\nPrior conversation context has been cleared. Its transcript remains archived locally in session {session}. Existing permission rules remain in force.");
-            let boundary = plan_approval::commit_approved_boundary(&context, &session, &message, &manager, expected_mode)?;
+            let boundary = plan_approval::commit_approved_boundary(
+                &context,
+                &session,
+                &message,
+                &manager,
+                expected_mode,
+            )?;
             self.pending_plan_reset = Some((boundary, message));
         }
-        let mode = if choice == Choice::Manual { PermissionMode::AskPermissions } else { PermissionMode::AcceptEdits };
-        if !clear { plan_approval::commit_approved_mode(&context, &session, &manager, expected_mode, mode, &plan)?; }
+        let mode = if choice == Choice::Manual {
+            PermissionMode::AskPermissions
+        } else {
+            PermissionMode::AcceptEdits
+        };
+        if !clear {
+            plan_approval::commit_approved_mode(
+                &context,
+                &session,
+                &manager,
+                expected_mode,
+                mode,
+                &plan,
+            )?;
+        }
         // The old project-wide plan record is a compatibility mirror, never the
         // authority for permission changes. Update only after approval commits.
         let legacy_warning = if tool_name == "plan_mode" {
-            crate::tools::coordination::execute("plan_mode",json!({"operation":"exit"}),&self.workspace_cwd).err().map(|e|format!("Legacy plan state could not be updated: {e:#}"))
-        } else { None };
+            crate::tools::coordination::execute(
+                "plan_mode",
+                json!({"operation":"exit"}),
+                &self.workspace_cwd,
+            )
+            .err()
+            .map(|e| format!("Legacy plan state could not be updated: {e:#}"))
+        } else {
+            None
+        };
         Ok(
             json!({"approved":true,"mode":if mode == PermissionMode::AskPermissions {"ask"} else {"accept_edits"},"clearContext":clear,"planFilePath":path,"plan":plan,
             "warning":legacy_warning,"message":"Plan approved under the selected permission mode. Existing deny and confirmation rules remain in force."}),
@@ -345,7 +463,7 @@ mod tests {
             Some("legacy"),
         ] {
             let root = tempfile::tempdir().unwrap();
-            let context=crate::services::session_messages::context(root.path()).unwrap();
+            let context = crate::services::session_messages::context(root.path()).unwrap();
             context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('plan-session','','')",[])).unwrap().unwrap();
             let manager = crate::runtime::default_permissions();
             manager.set_mode(PermissionMode::BypassPermissions);
@@ -485,7 +603,7 @@ mod tests {
         Arc<crate::permissions::PermissionManager>,
     ) {
         crate::config::OrchestrationConfig::init_global().unwrap();
-        let context=crate::services::session_messages::context(root).unwrap();
+        let context = crate::services::session_messages::context(root).unwrap();
         context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('file-session','','')",[])).unwrap().unwrap();
         let manager = crate::runtime::default_permissions();
         manager.set_mode(PermissionMode::PlanMode);
@@ -572,7 +690,9 @@ mod tests {
                     .await
             });
             let EngineEvent::AskUser {
-                request_id, tool_input: input, ..
+                request_id,
+                tool_input: input,
+                ..
             } = timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap()

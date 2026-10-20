@@ -214,3 +214,117 @@ async fn clear_plan_context_skips_stale_tools_and_survives_resume_on_both_protoc
         );
     }
 }
+
+#[tokio::test]
+async fn teammate_plan_approval_routes_to_leader_and_never_self_approves() {
+    use crate::services::{session_messages as live, teams};
+    std::env::set_var("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
+    let (_temp, context, sessions, mut executor, mut events, manager) = fixture();
+    let member_session = executor.conv_id.clone().unwrap();
+    let lead = sessions
+        .create(
+            std::path::Path::new(&executor.workspace_cwd),
+            "fixture",
+            "fixture",
+        )
+        .unwrap();
+    let team = teams::create(
+        &context.paths.data_dir,
+        &lead,
+        "approval",
+        None,
+        None,
+        None,
+        std::path::Path::new(&executor.workspace_cwd),
+    )
+    .unwrap()
+    .team;
+    let member = teams::register_member(
+        &context.paths.data_dir,
+        &team.name,
+        &lead,
+        "alpha",
+        None,
+        None,
+        "plan",
+        std::path::Path::new(&executor.workspace_cwd),
+    )
+    .unwrap();
+    teams::bind_member_session(
+        &context.paths.data_dir,
+        &team.name,
+        &member.agent_id,
+        &member_session,
+    )
+    .unwrap();
+
+    let input = json!({"plan":"# teammate plan\n\nDo the work."});
+    let submitted = executor
+        .plan_transition("ExitPlanMode", &input, "exit")
+        .await
+        .unwrap();
+    assert_eq!(submitted["submitted"], true);
+    assert_eq!(submitted["approved"], false);
+    assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+    assert!(
+        events.try_recv().is_err(),
+        "teammate must not prompt the user"
+    );
+    let requests_file = context
+        .paths
+        .data_dir
+        .join("teams")
+        .join(&team.name)
+        .join("requests.json");
+    let request = teams::pending_plan_request(&context.paths.data_dir, &team.name, &member_session)
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "request (member {member_session}, team {}): {}",
+                team.name,
+                std::fs::read_to_string(requests_file).unwrap_or_default()
+            )
+        });
+    assert!(live::inbox(&context, &lead, false)
+        .unwrap()
+        .iter()
+        .any(|message| message.content.contains("plan_approval_request")));
+
+    let rejected = crate::tools::agent_messages::execute_live(
+        &context,
+        &lead,
+        json!({"operation":"plan_approval_response","request_id":request.id,"approve":false,"feedback":"add tests"}),
+    )
+    .unwrap();
+    assert_eq!(rejected["state"], "rejected");
+    let denied = executor
+        .plan_transition("ExitPlanMode", &input, "exit")
+        .await
+        .unwrap();
+    assert_eq!(denied["approved"], false);
+    assert_eq!(denied["feedback"], "add tests");
+    assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+
+    // Request again and approve; the teammate then leaves plan mode on retry.
+    let again = executor
+        .plan_transition("ExitPlanMode", &input, "exit")
+        .await
+        .unwrap();
+    assert_eq!(again["submitted"], true);
+    let request = teams::pending_plan_request(&context.paths.data_dir, &team.name, &member_session)
+        .unwrap()
+        .expect("second request");
+    crate::tools::agent_messages::execute_live(
+        &context,
+        &lead,
+        json!({"operation":"plan_approval_response","request_id":request.id,"approve":true}),
+    )
+    .unwrap();
+    let approved = executor
+        .plan_transition("ExitPlanMode", &input, "exit")
+        .await
+        .unwrap();
+    assert_eq!(approved["approved"], true);
+    assert_eq!(approved["mode"], "accept_edits");
+    assert_eq!(manager.get_mode(), PermissionMode::AcceptEdits);
+}

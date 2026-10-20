@@ -68,7 +68,7 @@
 - [x] 第一批生命周期事件：`Notification`、`StopFailure`、`Setup`、`ConfigChange`、`InstructionsLoaded`、`CwdChanged`。已接入独立 CLI 实际路径、精确 payload/matcher、输出语义、SDK 回调与类型限制；once/if/status/取消/超时复用并测试。core 595/0/7、CLI 261/0/1；transcript 仅在匹配 hook/SDK 实际执行前按 run 生成一次，失败警告不阻断分发；逐事件差异与不可触发子场景见开发记录 `lifecycle-events-acceptance-20261018.md`（ConfigChange 使用轮询/使用前检查，拒绝后阻止后续使用；不声称与原版 watcher 完全等价）。
 - [x] `FileChanged`：已接入会话级 watchPaths 监视、basename matcher、精确 payload 与通知型输出；通知通过 tracing，独立 CLI 集成确认 debug-file 收到消息且 stderr 不被直接写入；本次 Windows core 613/0/7、CLI 268/0/1（通过/失败/忽略），详见 `watchpaths-filechanged-acceptance-20261018.md`。task10 已修复跨平台编译及 macOS 系统路径别名；Linux/macOS 完整 core/CLI 与真实模型冒烟已通过，见开发记录 `unix-build-acceptance-20261018.md`。
 - [x] `Elicitation`、`ElicitationResult`（form 模式最小可用链路）：stdio / SDK MCP 反向请求、服务器 matcher、hook 直接 accept/decline/cancel、结果修改/阻止、requested_schema 校验、CLI/worker 交互和 SDK 控制应答；无交互默认 cancel。URL 模式及异步 elicitation hook 明确报错，不宣称支持。验收详见开发记录 `elicitation-hooks-acceptance-20261018.md`。
-- 依赖 P4 团队：`TaskCreated`、`TaskCompleted`（完成前可拒绝）、`TeammateIdle`。
+- [x] 团队事件 `TaskCreated`、`TaskCompleted`（完成前可拒绝）、`TeammateIdle`（阻止 idle 并带反馈继续工作）：payload/无 matcher 语义按原版，TaskCreated 阻止时回滚任务；TeammateIdle 阻止时恢复 teammate（最多 3 次）。覆盖见 `team-t2-acceptance-20261020.md`。
 
 ### P3 Hook 输出与环境（清单 H3）
 
@@ -83,7 +83,7 @@
 入口：`crates/core/src/tools/coordination.rs`（当前 team 是持久任务记录）、`crates/core/src/native_engine/delegation.rs`（顺序执行委派）、`crates/core/src/tools/agent_messages.rs`（UUID 寻址文本消息）。参考：`reference:src/tools/TeamCreateTool/`、`TeamDeleteTool`、`SendMessageTool/SendMessageTool.ts`；原版受 `isAgentSwarmsEnabled()` 开关控制。
 
 - [x] T1：`TeamCreate`/`TeamDelete` 按原版输入输出；团队文件与 `name@team` 成员持久化在运行时目录；`TeamSpawn`（本项目批量入口）并发运行多个命名 teammate，各自独立会话、transcript 与 fork 权限；leader 取消时成员标记 `cancelled`，重启后 active 但无对应进程的成员标记 `stale`；有活跃成员时拒绝删除并清理目录；`--agent-teams`/环境变量开关。core 625/0/7、CLI 269/0/1，含并发屏障、取消与独立 CLI 集成测试；差异（进程内并发替代 tmux、数字后缀命名、无远端 killswitch）见 `team-t1-acceptance-20261020.md`。
-- T2：按名字投递与 `*` 广播；shutdown_request/response 关联；teammate 计划审批路由到 leader；`/list-agents` 区分子 agent、teammate、独立会话。
+- [x] T2：`SendMessage` 支持 teammate 名字与 `*` 广播（未知名字报错、持久化、空闲成员唤醒）；`shutdown_request`/`shutdown_response`/`request_status` 按 request id 关联，拒绝保持存活、批准标记 stopped、超时变 timeout；teammate ExitPlanMode 路由给 leader（不得自批，批准进入 AcceptEdits、拒绝保留 plan mode）；`/list-agents` 增加 kind（team-lead/teammate/subagent/session）与团队状态。core 632/0/7、CLI 269/0/1；差异（进程内同步成员在下次恢复时消费消息）见 `team-t2-acceptance-20261020.md`。
 
 ### P5 SDK 兼容（清单 S1、S2）
 

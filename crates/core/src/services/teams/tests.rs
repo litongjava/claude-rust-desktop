@@ -174,3 +174,164 @@ fn finishes_are_idempotent_for_removed_teams_and_results_are_bounded() {
     delete(&root, "leader").unwrap();
     finish_member(&root, &team.name, &member.agent_id, "idle", None).unwrap();
 }
+
+#[test]
+fn requests_correlate_reject_timeout_and_plan_decisions() {
+    let _env = enabled_guard();
+    let (_temp, root) = root();
+    let cwd = root.join("project");
+    let team = create(&root, "leader", "req", None, None, None, &cwd)
+        .unwrap()
+        .team;
+    let member =
+        register_member(&root, &team.name, "leader", "tester", None, None, "p", &cwd).unwrap();
+    bind_member_session(&root, &team.name, &member.agent_id, "child").unwrap();
+
+    let shutdown = create_request(
+        &root,
+        &team.name,
+        "shutdown",
+        "leader",
+        "child",
+        60_000,
+        Some("wrap up"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(shutdown.state, "pending");
+    let error =
+        respond_request(&root, &team.name, &shutdown.id, "intruder", true, None).unwrap_err();
+    assert!(error.to_string().contains("another session"));
+    let answered = respond_request(&root, &team.name, &shutdown.id, "child", true, None).unwrap();
+    assert_eq!(answered.state, "approved");
+    let read = read_team(&root, &team.name).unwrap().unwrap();
+    let entry = read.members.iter().find(|m| m.name == "tester").unwrap();
+    assert!(!entry.is_active);
+    assert_eq!(entry.status.as_deref(), Some("stopped"));
+    assert!(respond_request(&root, &team.name, &shutdown.id, "child", false, None).is_err());
+
+    let slow = create_request(
+        &root, &team.name, "shutdown", "leader", "child", 1, None, None,
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let error = respond_request(&root, &team.name, &slow.id, "child", true, None).unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert_eq!(
+        request(&root, &team.name, &slow.id).unwrap().unwrap().state,
+        "timeout"
+    );
+
+    let plan = create_request(
+        &root,
+        &team.name,
+        "plan_approval",
+        "child",
+        "leader",
+        60_000,
+        Some("tester"),
+        Some("# Plan"),
+    )
+    .unwrap();
+    let pending = pending_plan_request(&root, &team.name, "child").unwrap();
+    assert!(
+        pending.is_some(),
+        "{}",
+        std::fs::read_to_string(requests_path(&root, &team.name)).unwrap_or_default()
+    );
+    assert!(matches!(
+        plan_decision(&root, &team.name, "child").unwrap(),
+        PlanDecision::Pending
+    ));
+    respond_request(
+        &root,
+        &team.name,
+        &plan.id,
+        "leader",
+        false,
+        Some("needs tests"),
+    )
+    .unwrap();
+    match plan_decision(&root, &team.name, "child").unwrap() {
+        PlanDecision::Rejected { feedback } => assert_eq!(feedback.as_deref(), Some("needs tests")),
+        _ => panic!("expected rejection"),
+    }
+    // A consumed decision is not replayed.
+    assert!(matches!(
+        plan_decision(&root, &team.name, "child").unwrap(),
+        PlanDecision::Pending
+    ));
+}
+
+#[test]
+fn session_identity_resolves_leader_and_members() {
+    let _env = enabled_guard();
+    let (_temp, root) = root();
+    let cwd = root.join("project");
+    let team = create(&root, "leader", "who", None, None, None, &cwd)
+        .unwrap()
+        .team;
+    let member = register_member(
+        &root,
+        &team.name,
+        "leader",
+        "scout",
+        Some("general"),
+        None,
+        "p",
+        &cwd,
+    )
+    .unwrap();
+    bind_member_session(&root, &team.name, &member.agent_id, "child").unwrap();
+    assert_eq!(
+        identity(&root, "leader").unwrap(),
+        Some(("who".into(), LEAD_NAME.into()))
+    );
+    assert_eq!(
+        identity(&root, "child").unwrap(),
+        Some(("who".into(), "scout".into()))
+    );
+    assert_eq!(identity(&root, "other").unwrap(), None);
+    let refreshed = read_team(&root, &team.name).unwrap().unwrap();
+    assert!(member_by_name(&refreshed, "SCOUT").is_some());
+}
+
+#[test]
+fn classify_peers_distinguishes_team_subagent_and_session() {
+    use serde_json::json;
+    let _env = enabled_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let context = crate::services::session_messages::context(&data).unwrap();
+    let cwd = temp.path().join("project");
+    let team = create(&data, "lead", "view", None, None, None, &cwd)
+        .unwrap()
+        .team;
+    let member =
+        register_member(&data, &team.name, "lead", "alpha", None, None, "p", &cwd).unwrap();
+    bind_member_session(&data, &team.name, &member.agent_id, "child").unwrap();
+    register_live("child");
+    context
+        .save_setting(
+            "delegation.sub",
+            &json!({"parent_session_id":"lead","status":"completed"}),
+        )
+        .unwrap();
+    let mut peers = vec![
+        json!({"id":"lead"}),
+        json!({"id":"child"}),
+        json!({"id":"sub"}),
+        json!({"id":"independent"}),
+    ];
+    classify_peers(&data, &context, &mut peers).unwrap();
+    assert_eq!(peers[0]["kind"], "team-lead");
+    assert_eq!(peers[0]["teammate_name"], LEAD_NAME);
+    assert_eq!(peers[1]["kind"], "teammate");
+    assert_eq!(peers[1]["team"], "view");
+    assert_eq!(peers[1]["teammate_name"], "alpha");
+    assert_eq!(peers[1]["member_status"], "active");
+    assert_eq!(peers[2]["kind"], "subagent");
+    assert_eq!(peers[3]["kind"], "session");
+    unregister_live("child");
+}

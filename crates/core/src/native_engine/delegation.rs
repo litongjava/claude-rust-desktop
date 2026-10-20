@@ -25,8 +25,19 @@ pub(crate) struct OwnedChild {
 }
 
 impl OwnedChild {
-    pub(in crate::native_engine) fn permission_target(&self) -> Result<(Arc<crate::permissions::PermissionManager>, crate::native_engine::provider_manager::ResolvedProvider)> {
-        Ok((self.executor.permission_manager.clone().context("Owned child permissions unavailable")?, self.executor.provider.clone()))
+    pub(in crate::native_engine) fn permission_target(
+        &self,
+    ) -> Result<(
+        Arc<crate::permissions::PermissionManager>,
+        crate::native_engine::provider_manager::ResolvedProvider,
+    )> {
+        Ok((
+            self.executor
+                .permission_manager
+                .clone()
+                .context("Owned child permissions unavailable")?,
+            self.executor.provider.clone(),
+        ))
     }
 }
 
@@ -149,7 +160,9 @@ impl ToolLoopExecutor {
         events: tokio::sync::mpsc::Sender<EngineEvent>,
     ) -> Result<Self> {
         let entries = registry.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = entries.get(child).context("Original child runtime is unavailable; needs_resume")?;
+        let entry = entries
+            .get(child)
+            .context("Original child runtime is unavailable; needs_resume")?;
         ensure!(entry.parent == owner, "Child belongs to another owner");
         let mut host = Self::new(
             entry.executor.provider.clone(),
@@ -169,9 +182,18 @@ impl ToolLoopExecutor {
     }
 
     pub(in crate::native_engine) fn share_owned_child_budget(&self) {
-        let Some(owner) = self.conv_id.as_deref() else { return };
-        for child in self.owned_children.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
-            if child.parent == owner { child.owner_budget = self.child_resumes.clone(); }
+        let Some(owner) = self.conv_id.as_deref() else {
+            return;
+        };
+        for child in self
+            .owned_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            if child.parent == owner {
+                child.owner_budget = self.child_resumes.clone();
+            }
         }
     }
 
@@ -438,9 +460,10 @@ impl ToolLoopExecutor {
                 PermissionResult::Denied(reason) => {
                     anyhow::bail!("Delegation permission denied: {reason}")
                 }
-                PermissionResult::RequiresConfirmation(_) => self
-                    .request_tool_approval("Agent", input, &invocation_id)
-                    .await?,
+                PermissionResult::RequiresConfirmation(_) => {
+                    self.request_tool_approval("Agent", input, &invocation_id)
+                        .await?
+                }
                 PermissionResult::Granted => input.clone(),
             }
         };
@@ -513,7 +536,11 @@ impl ToolLoopExecutor {
                             .collect::<Vec<_>>();
                         if let Some(registry) = &self.mcp_registry {
                             tools.extend(
-                                registry.get_all_tools().await?.into_iter().map(|tool| tool.name),
+                                registry
+                                    .get_all_tools()
+                                    .await?
+                                    .into_iter()
+                                    .map(|tool| tool.name),
                             );
                         }
                         tools
@@ -590,7 +617,9 @@ impl ToolLoopExecutor {
                 &agents::Definition {
                     id: "sdk-runtime-boundary".into(),
                     description: "Inherited tool restrictions from an SDK child".into(),
-                    system_prompt: "This session retains the tool restrictions of its original SDK child task.".into(),
+                    system_prompt:
+                        "This session retains the tool restrictions of its original SDK child task."
+                            .into(),
                     tools: definition.tools.clone(),
                     legacy: None,
                 },
@@ -701,7 +730,9 @@ impl ToolLoopExecutor {
             .conv_id
             .as_deref()
             .context("Team tools require an active session")?;
-        let team_name = input["team_name"].as_str().context("team_name is required")?;
+        let team_name = input["team_name"]
+            .as_str()
+            .context("team_name is required")?;
         let team = teams::read_recovered(root, team_name)?
             .with_context(|| format!("Team not found: {team_name}"))?;
         ensure!(
@@ -709,14 +740,25 @@ impl ToolLoopExecutor {
             "Only the team leader can spawn teammates"
         );
         let members = input["members"].as_array().context("members is required")?;
-        ensure!((1..=8).contains(&members.len()), "TeamSpawn needs 1-8 members");
+        ensure!(
+            (1..=8).contains(&members.len()),
+            "TeamSpawn needs 1-8 members"
+        );
         let mut names = std::collections::HashSet::new();
         for member in members {
             let name = member["name"].as_str().context("member name is required")?;
-            let prompt = member["prompt"].as_str().context("member prompt is required")?;
+            let prompt = member["prompt"]
+                .as_str()
+                .context("member prompt is required")?;
             ensure!(!name.trim().is_empty(), "Teammate name is required");
-            ensure!(name != teams::LEAD_NAME, "team-lead is reserved for the leader");
-            ensure!(names.insert(name.to_ascii_lowercase()), "Duplicate teammate name: {name}");
+            ensure!(
+                name != teams::LEAD_NAME,
+                "team-lead is reserved for the leader"
+            );
+            ensure!(
+                names.insert(name.to_ascii_lowercase()),
+                "Duplicate teammate name: {name}"
+            );
             ensure!(
                 !prompt.trim().is_empty() && prompt.len() <= 64_000,
                 "Teammate prompt must contain 1-64000 bytes"
@@ -772,7 +814,43 @@ impl ToolLoopExecutor {
                     )
                     .await;
                 match result {
-                    Ok(value) => {
+                    Ok(mut value) => {
+                        // A blocking TeammateIdle hook keeps the teammate working
+                        // with its feedback instead of reporting the member idle.
+                        for _ in 0..3 {
+                            let Some(hooks) = &self.hooks else { break };
+                            match hooks
+                                .run(
+                                    crate::services::tool_hooks::HookEvent::TeammateIdle,
+                                    &session_id,
+                                    json!({"teammate_name":name,"team_name":team_name}),
+                                )
+                                .await
+                            {
+                                Ok(outcome) if outcome.blocked => {
+                                    let feedback =
+                                        format!("TeammateIdle hook feedback:
+{}", outcome.reason);
+                                    match self
+                                        .resume_owned_child(&session_id, Some(&feedback), false)
+                                        .await
+                                    {
+                                        Ok(resumed) => value = resumed,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "TeammateIdle feedback could not resume {name}: {error:#}"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(_) => break,
+                                Err(error) => {
+                                    tracing::warn!("TeammateIdle hook failed for {name}: {error:#}");
+                                    break;
+                                }
+                            }
+                        }
                         let summary = value["result"].to_string();
                         let _ = teams::finish_member(root, &team_name, &agent, "idle", Some(&summary));
                         guard.finished = true;

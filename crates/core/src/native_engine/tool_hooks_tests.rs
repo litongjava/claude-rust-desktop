@@ -86,7 +86,9 @@ async fn stop_hook_obeys_shared_default_consecutive_block_cap() {
     let root = tempfile::tempdir().unwrap();
     write_hook(root.path(), "Stop", "exit 2");
     let mut executor = executor(root.path());
-    for _ in 0..8 { assert!(executor.stop_hook("done").await.unwrap().is_some()); }
+    for _ in 0..8 {
+        assert!(executor.stop_hook("done").await.unwrap().is_some());
+    }
     assert!(executor.stop_hook("still done").await.unwrap().is_none());
 }
 
@@ -98,14 +100,31 @@ async fn ordinary_stop_hooks_and_goal_checks_consume_one_session_budget() {
     let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
     db.init().unwrap();
     let goal = goals::set(&db, "parent", "Finish the task").unwrap();
-    for _ in 0..3 { assert_eq!(goals::block(&db,"parent",Some(&goal.id),8).unwrap(),Some(true)); }
-    let mut parent = executor(root.path()).with_conv_id("parent".into()).with_goal_state(db.clone());
-    for _ in 0..5 { assert!(parent.stop_hook("done").await.unwrap().is_some()); }
+    for _ in 0..3 {
+        assert_eq!(
+            goals::block(&db, "parent", Some(&goal.id), 8).unwrap(),
+            Some(true)
+        );
+    }
+    let mut parent = executor(root.path())
+        .with_conv_id("parent".into())
+        .with_goal_state(db.clone());
+    for _ in 0..5 {
+        assert!(parent.stop_hook("done").await.unwrap().is_some());
+    }
     assert!(parent.stop_hook("done").await.unwrap().is_none());
-    assert_eq!(goals::active(&db,"parent").unwrap().unwrap().state,"paused");
-    let mut child = executor(root.path()).with_conv_id("child".into()).with_goal_state(db.clone());
+    assert_eq!(
+        goals::active(&db, "parent").unwrap().unwrap().state,
+        "paused"
+    );
+    let mut child = executor(root.path())
+        .with_conv_id("child".into())
+        .with_goal_state(db.clone());
     assert!(child.stop_hook("child done").await.unwrap().is_some());
-    assert_eq!(goals::active(&db,"parent").unwrap().unwrap().stop_blocks,9);
+    assert_eq!(
+        goals::active(&db, "parent").unwrap().unwrap().stop_blocks,
+        9
+    );
 }
 
 #[tokio::test]
@@ -122,8 +141,72 @@ async fn stop_hook_prevent_continuation_pauses_goal_before_outer_evaluation() {
     let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
     db.init().unwrap();
     let goal = goals::set(&db, "parent", "Keep working").unwrap();
-    let mut parent = executor(root.path()).with_conv_id("parent".into()).with_goal_state(db.clone());
+    let mut parent = executor(root.path())
+        .with_conv_id("parent".into())
+        .with_goal_state(db.clone());
     assert!(parent.stop_hook("done").await.unwrap().is_none());
-    assert_eq!(goals::active(&db, "parent").unwrap().unwrap().state, "paused");
+    assert_eq!(
+        goals::active(&db, "parent").unwrap().unwrap().state,
+        "paused"
+    );
     assert!(!goals::verdict(&db, "parent", &goal.id, "continue", "late check").unwrap());
+}
+
+#[tokio::test]
+async fn task_created_and_completed_hooks_block_and_roll_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let shell = if cfg!(windows) { "powershell" } else { "sh" };
+    let make = executor;
+    std::fs::write(
+        temp.path().join("settings.json"),
+        json!({"hooks":{"TaskCreated":[{"hooks":[{"type":"command","command":"exit 2","shell":shell}]}]}})
+            .to_string(),
+    )
+    .unwrap();
+    let mut executor = executor(temp.path())
+        .with_conv_id(session.clone())
+        .with_search_config_path(data.join("settings.json"));
+    let (_, output, failed) = executor
+        .execute_tool_call("TaskCreate", &json!({"subject":"blocked task"}), "create")
+        .await;
+    assert!(failed, "{output}");
+    assert!(output.contains("TaskCreated hook"), "{output}");
+    let (_, listed, _) = executor
+        .execute_tool_call("TaskList", &json!({}), "list")
+        .await;
+    assert!(!listed.contains("blocked task"), "{listed}");
+
+    std::fs::write(
+        temp.path().join("settings.json"),
+        json!({"hooks":{"TaskCompleted":[{"hooks":[{"type":"command","command":"exit 2","shell":shell}]}]}})
+            .to_string(),
+    )
+    .unwrap();
+    // HookRunner snapshots settings at load time.
+    let mut executor = make(temp.path())
+        .with_conv_id(session)
+        .with_search_config_path(data.join("settings.json"));
+    let (_, created, failed) = executor
+        .execute_tool_call("TaskCreate", &json!({"subject":"kept task"}), "create")
+        .await;
+    assert!(!failed, "{created}");
+    let task: Value = serde_json::from_str(&created).unwrap();
+    let id = task["id"].as_str().unwrap().to_owned();
+    let (_, blocked, failed) = executor
+        .execute_tool_call(
+            "TaskUpdate",
+            &json!({"id":id,"status":"completed"}),
+            "update",
+        )
+        .await;
+    assert!(!failed, "{blocked}");
+    assert!(blocked.contains("TaskCompleted hook"), "{blocked}");
+    let (_, read, _) = executor
+        .execute_tool_call("TaskGet", &json!({"id":id}), "get")
+        .await;
+    let task: Value = serde_json::from_str(&read).unwrap();
+    assert_eq!(task["status"], "pending");
 }

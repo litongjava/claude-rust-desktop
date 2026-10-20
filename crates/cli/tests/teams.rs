@@ -70,7 +70,12 @@ async fn respond(
                     {"name":"beta","prompt":"beta work"}
                 ]}),
             )],
-            2 => vec![("delete", "TeamDelete", json!({}))],
+            2 => vec![(
+                "message",
+                "SendMessage",
+                json!({"operation":"send","to":"alpha","content":"second look"}),
+            )],
+            3 => vec![("delete", "TeamDelete", json!({}))],
             _ => Vec::new(),
         }
     };
@@ -123,6 +128,7 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
             "TeamCreate",
             "TeamSpawn",
             "TeamDelete",
+            "SendMessage",
             "--",
             "start a team",
         ]);
@@ -145,6 +151,7 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
     assert!(joined.contains("TeamCreate"));
     assert!(joined.contains("TeamSpawn"));
     assert!(joined.contains("TeamDelete"));
+    assert!(joined.contains("SendMessage"));
     // Children are independent sessions, not the leader's request.
     let children = requests
         .iter()
@@ -180,7 +187,7 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
-    assert!(children >= 2, "{tail:?}");
+    assert!(children >= 3, "{tail:?}");
     drop(requests);
 
     // A successful TeamDelete removes the persisted team directory.

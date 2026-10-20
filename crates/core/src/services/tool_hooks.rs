@@ -42,6 +42,9 @@ pub enum HookEvent {
     FileChanged,
     Elicitation,
     ElicitationResult,
+    TeammateIdle,
+    TaskCreated,
+    TaskCompleted,
 }
 impl HookEvent {
     fn name(self) -> &'static str {
@@ -70,6 +73,9 @@ impl HookEvent {
             Self::FileChanged => "FileChanged",
             Self::Elicitation => "Elicitation",
             Self::ElicitationResult => "ElicitationResult",
+            Self::TeammateIdle => "TeammateIdle",
+            Self::TaskCreated => "TaskCreated",
+            Self::TaskCompleted => "TaskCompleted",
         }
     }
 }
@@ -355,6 +361,9 @@ impl HookRunner {
                     "FileChanged" => HookEvent::FileChanged,
                     "Elicitation" => HookEvent::Elicitation,
                     "ElicitationResult" => HookEvent::ElicitationResult,
+                    "TeammateIdle" => HookEvent::TeammateIdle,
+                    "TaskCreated" => HookEvent::TaskCreated,
+                    "TaskCompleted" => HookEvent::TaskCompleted,
                     _ => {
                         ensure!(
                             !groups.iter().any(|g| g
@@ -646,7 +655,8 @@ impl HookRunner {
             let mut pending: FuturesUnordered<futures::future::BoxFuture<'_, Result<HookOutcome>>> =
                 FuturesUnordered::new();
             for hook in self.hooks.iter().filter(|hook| hook.event == event) {
-                if !matches_tool(&hook.matcher, &name)?
+                if !(matches!(event, HookEvent::TeammateIdle | HookEvent::TaskCreated | HookEvent::TaskCompleted)
+                    || matches_tool(&hook.matcher, &name)?)
                     || !hook.condition_matches(event, &input, &self.workspace)
                 {
                     continue;

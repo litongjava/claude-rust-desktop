@@ -1,4 +1,4 @@
-//! Local commands backed by the shared conversation store and OS clipboard.
+﻿//! Local commands backed by the shared conversation store and OS clipboard.
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use claude_core::{db::conversation_repo, runtime::RuntimePaths};
@@ -121,7 +121,7 @@ pub async fn handle(
                             peer["worker"]=serde_json::to_value(runtime)?;
                         }
                         println!("{}", serde_json::to_string_pretty(&observed)?);
-                        eprintln!("Trusted source-project sessions, including worktrees. receiver_active is an OS-locked model consumer; worker reports a bounded live probe. Saved alone does not mean running. /list-agents message SESSION_ID TEXT queues context; inbox/sent show delivery state, read MESSAGE_ID marks human read only. Idle recipients consume messages on their next explicit turn. /list-agents inbox legacy reads the old project mailbox.");
+                        eprintln!("Trusted source-project sessions, including worktrees. kind distinguishes teammate, team-lead, subagent and independent session; teammates also report team, teammate_name and member_status. receiver_active is an OS-locked model consumer; worker reports a bounded live probe. Saved alone does not mean running. /list-agents message SESSION_ID TEXT queues context; inbox/sent show delivery state, read MESSAGE_ID marks human read only. Idle recipients consume messages on their next explicit turn. /list-agents inbox legacy reads the old project mailbox.");
                         None
                     }
                     "message" => {
@@ -182,8 +182,11 @@ fn peer_sessions(
     let context=claude_core::services::session_messages::context(root)?;
     let mut peers=claude_core::services::session_messages::peers(&context,current)?;
     for peer in &mut peers {
-        peer["status"]=serde_json::json!(if peer["id"]==current {"attached"} else if peer["receiver_active"]==true {"active_receiver"} else {"saved"});
+        let id=peer["id"].as_str().unwrap_or_default().to_owned();
+        peer["status"]=serde_json::json!(if id==current {"attached"} else if peer["receiver_active"]==true {"active_receiver"} else {"saved"});
+        peer["kind"]=serde_json::json!("session");
     }
+    claude_core::services::teams::classify_peers(root,&context,&mut peers)?;
     Ok(peers)
 }
 

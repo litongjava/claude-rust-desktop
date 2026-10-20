@@ -1293,6 +1293,24 @@ impl ToolLoopExecutor {
                 Box::pin(self.execute_team_spawn(tool_input)).await
             } else {
                 match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+                    (Some(root), Some(session)) => crate::tools::teams::execute(tool_name, tool_input, root, session, std::path::Path::new(&self.workspace_cwd), Some(&self.provider.model.id)),
+                    _ => Err(anyhow::anyhow!("Team tools require an active session and runtime directory")),
+                }
+            };
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
+            return (tool_input.clone(), output, failed);
+        }
+        if matches!(tool_name, "TeamCreate" | "TeamDelete" | "TeamSpawn") {
+            match self.check_permission(tool_name, tool_input, _tool_use_id).await {
+                PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
+                PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
+                PermissionResult::Granted => {},
+            }
+            let result = if tool_name == "TeamSpawn" {
+                Box::pin(self.execute_team_spawn(tool_input)).await
+            } else {
+                match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
                     (Some(root), Some(session)) => crate::tools::teams::execute(
                         tool_name,
                         tool_input,
@@ -1330,26 +1348,19 @@ impl ToolLoopExecutor {
             };
             let failed = result.is_err();
             let mut result = result;
-            if tool_input["operation"] == "send" {
-                if let (Ok(value),Some(recipient)) = (&mut result,tool_input["to"].as_str()) {
-                    let owned={let registry=self.owned_children.lock().unwrap_or_else(|e|e.into_inner());registry.get(recipient).is_some_and(|entry|Some(entry.parent.as_str())==self.conv_id.as_deref())};
-                    if owned {
-                        match Box::pin(self.resume_owned_child(recipient,None,true)).await {
-                            Ok(resumed)=>{
-                                value["resume"]=resumed;value["delivery"]=json!("resumed_in_owner_turn");
-                                if let Some(root)=self.search_config_path.as_deref().and_then(|path|path.parent()) {
-                                    if let Ok(context)=crate::services::session_messages::context(root) {
-                                        if let Ok(messages)=crate::services::session_messages::sent(&context,self.conv_id.as_deref().unwrap_or_default()) {
-                                            if let Some(message)=messages.into_iter().find(|message|Some(message.id.as_str())==value["message"]["id"].as_str()) {
-                                                value["state"]=json!(message.state);value["message"]=json!(message);
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            Err(error)=>{value["resume"]=json!({"status":"needs_resume","reason":error.to_string()});}
+            if matches!(tool_input["operation"].as_str(), Some("send" | "shutdown_request" | "shutdown_response" | "plan_approval_response")) {
+                if let Ok(value) = &mut result {
+                    let targets: Vec<String> = value["delivered"].as_array().map(|items| items.iter().filter_map(|item| item["session_id"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    let mut resumes = Vec::new();
+                    for recipient in targets {
+                        let owned={let registry=self.owned_children.lock().unwrap_or_else(|e|e.into_inner());registry.get(&recipient).is_some_and(|entry|Some(entry.parent.as_str())==self.conv_id.as_deref())};
+                        if !owned { continue; }
+                        match Box::pin(self.resume_owned_child(&recipient,None,true)).await {
+                            Ok(resumed)=>{resumes.push(json!({"session_id":recipient,"status":"resumed_in_owner_turn","resume":resumed}));},
+                            Err(error)=>{resumes.push(json!({"session_id":recipient,"status":"needs_resume","reason":error.to_string()}));}
                         }
                     }
+                    if !resumes.is_empty() { value["resumes"] = json!(resumes); value["delivery"] = json!("resumed_in_owner_turn"); }
                 }
             }
             let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
@@ -1410,6 +1421,37 @@ impl ToolLoopExecutor {
             let result = async {
                 let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
                 let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
+                let identity = crate::services::teams::identity(root, session)?;
+                let payload = |task: &Value| {
+                    let mut payload = json!({"task_id":task["id"],"task_subject":task["subject"],"task_description":task["description"]});
+                    if let Some((team, teammate)) = &identity { payload["team_name"] = json!(team); payload["teammate_name"] = json!(teammate); }
+                    payload
+                };
+                use crate::services::tool_hooks::HookEvent;
+                if tool_name == "TaskCreate" {
+                    let task = crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await?;
+                    if let Some(hooks) = &self.hooks {
+                        let outcome = hooks.run(HookEvent::TaskCreated, session, payload(&task)).await?;
+                        if outcome.blocked {
+                            let id = task["id"].as_str().unwrap_or_default().to_owned();
+                            let _ = crate::tools::tasks::execute_for_session_async("TaskUpdate", json!({"id":id,"status":"deleted"}), root, session).await;
+                            anyhow::bail!("TaskCreated hook: {}", outcome.reason);
+                        }
+                    }
+                    return Ok(task);
+                }
+                if tool_name == "TaskUpdate" && tool_input["status"] == "completed" {
+                    let id = tool_input["id"].as_str().or_else(|| tool_input["taskId"].as_str()).ok_or_else(|| anyhow!("task id is required"))?.to_owned();
+                    let existing = crate::tools::tasks::execute_for_session_async("TaskGet", json!({"id":id}), root, session).await?;
+                    if existing["status"] != "completed" {
+                        if let Some(hooks) = &self.hooks {
+                            let outcome = hooks.run(HookEvent::TaskCompleted, session, payload(&existing)).await?;
+                            if outcome.blocked {
+                                return Ok(json!({"success":false,"taskId":id,"updatedFields":[],"error":format!("TaskCompleted hook: {}", outcome.reason)}));
+                            }
+                        }
+                    }
+                }
                 crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
             }.await;
             return (tool_input.clone(), match &result { Ok(value) => value.to_string(), Err(error) => format!("Task failed: {error:#}") }, result.is_err());

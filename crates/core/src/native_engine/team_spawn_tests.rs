@@ -244,3 +244,84 @@ async fn cancelled_spawn_marks_members_stopped_and_allows_delete() {
     assert!(removed.success, "{}", removed.message);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teammate_idle_hook_receives_identity_and_blocking_feedback_resumes_the_teammate() {
+    use crate::services::tool_hooks::HookRunner;
+    enable_teams();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { ([("content-type", "text/event-stream")], completion()) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let payloads = temp.path().join("idle-payloads.txt");
+    let command = if cfg!(windows) {
+        format!(
+            "$j=[Console]::In.ReadToEnd(); Add-Content -LiteralPath '{}' -Value $j; exit 2",
+            payloads.display()
+        )
+    } else {
+        format!(
+            "cat >> '{}'; printf '\n' >> '{}'; exit 2",
+            payloads.display(),
+            payloads.display()
+        )
+    };
+    std::fs::create_dir_all(temp.path().join("data")).unwrap();
+    std::fs::write(
+        temp.path().join("data").join("settings.json"),
+        json!({"hooks":{"TeammateIdle":[{"hooks":[{"type":"command","command":command,"shell":if cfg!(windows){"powershell"}else{"sh"}}]}]}})
+            .to_string(),
+    )
+    .unwrap_or_else(|error| panic!("settings: {error}"));
+    let parent = uuid::Uuid::new_v4().to_string();
+    let (executor, _context) = executor(temp.path(), &parent, endpoint).await;
+    let mut executor =
+        executor.with_hooks(HookRunner::load(&temp.path().join("data"), temp.path()).unwrap());
+    let root = temp.path().join("data");
+    teams::create(
+        &root,
+        &parent,
+        "fixture",
+        None,
+        None,
+        None,
+        Path::new(&executor.workspace_cwd),
+    )
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        executor.execute_team_spawn(&json!({
+            "team_name":"fixture",
+            "members":[{"name":"alpha","prompt":"alpha work"}]
+        })),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result["members"][0]["status"], "completed");
+
+    let recorded = std::fs::read_to_string(&payloads).unwrap();
+    let events = recorded
+        .matches("\"hook_event_name\":\"TeammateIdle\"")
+        .count();
+    assert!(events >= 2, "{recorded}");
+    assert_eq!(
+        recorded.matches("\"teammate_name\":\"alpha\"").count(),
+        events
+    );
+    assert_eq!(
+        recorded.matches("\"team_name\":\"fixture\"").count(),
+        events
+    );
+    let team = teams::read_team(&root, "fixture").unwrap().unwrap();
+    let member = team.members.iter().find(|m| m.name == "alpha").unwrap();
+    assert!(!member.is_active);
+    assert_eq!(member.status.as_deref(), Some("idle"));
+    assert!(teams::delete(&root, &parent).unwrap().success);
+    server.abort();
+}

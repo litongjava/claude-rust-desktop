@@ -477,5 +477,304 @@ pub fn member(root: &Path, team_name: &str, name: &str) -> Result<Option<TeamMem
     }))
 }
 
+/// Resolves the team a session belongs to, whether as leader or member.
+pub fn team_for_session(root: &Path, session: &str) -> Result<Option<TeamFile>> {
+    let directory = root.join("teams");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(team) = read_recovered(root, &name)? else {
+            continue;
+        };
+        if team.lead_session_id == session
+            || team
+                .members
+                .iter()
+                .any(|member| member.session_id.as_deref() == Some(session))
+        {
+            return Ok(Some(team));
+        }
+    }
+    Ok(None)
+}
+
+/// Adds `kind`, team and member status to `/list-agents` peers.
+pub fn classify_peers(
+    root: &Path,
+    context: &crate::services::ServiceContext,
+    peers: &mut [serde_json::Value],
+) -> Result<()> {
+    for peer in peers {
+        let Some(id) = peer["id"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(team) = team_for_session(root, &id)? {
+            if let Some(member) = member_for_session(&team, &id) {
+                peer["kind"] = serde_json::json!(if member.name == LEAD_NAME {
+                    "team-lead"
+                } else {
+                    "teammate"
+                });
+                peer["team"] = serde_json::json!(team.name);
+                peer["teammate_name"] = serde_json::json!(member.name);
+                peer["member_status"] = serde_json::json!(member.status);
+                peer["is_active"] = serde_json::json!(member.is_active);
+                continue;
+            }
+        }
+        if context
+            .setting::<serde_json::Value>(&format!("delegation.{id}"))?
+            .is_some()
+        {
+            peer["kind"] = serde_json::json!("subagent");
+        } else {
+            peer["kind"] = serde_json::json!("session");
+        }
+    }
+    Ok(())
+}
+
+/// Returns `(team_name, teammate_name)` for a session that belongs to a team.
+pub fn identity(root: &Path, session: &str) -> Result<Option<(String, String)>> {
+    Ok(team_for_session(root, session)?.map(|team| {
+        let name = member_for_session(&team, session)
+            .map(|member| member.name.clone())
+            .unwrap_or_else(|| LEAD_NAME.into());
+        (team.name, name)
+    }))
+}
+
+pub fn member_for_session<'a>(team: &'a TeamFile, session: &str) -> Option<&'a TeamMember> {
+    team.members
+        .iter()
+        .find(|member| member.session_id.as_deref() == Some(session))
+}
+
+pub fn member_by_name<'a>(team: &'a TeamFile, name: &str) -> Option<&'a TeamMember> {
+    team.members
+        .iter()
+        .find(|member| member.name.eq_ignore_ascii_case(name))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamRequest {
+    pub id: String,
+    pub kind: String,
+    pub team: String,
+    pub from: String,
+    pub to: String,
+    pub state: String,
+    pub created_at: i64,
+    pub deadline: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+fn requests_path(root: &Path, team: &str) -> PathBuf {
+    team_dir(root, team).join("requests.json")
+}
+
+fn read_requests(root: &Path, team: &str) -> Result<Vec<TeamRequest>> {
+    match std::fs::read(requests_path(root, team)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_requests(root: &Path, team: &str, requests: &[TeamRequest]) -> Result<()> {
+    let directory = team_dir(root, team);
+    std::fs::create_dir_all(&directory)?;
+    let temp = directory.join(format!("requests.json.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp, serde_json::to_vec_pretty(requests)?)?;
+    std::fs::rename(&temp, requests_path(root, team))?;
+    Ok(())
+}
+
+fn expire(requests: &mut [TeamRequest]) {
+    let now = now();
+    for request in requests {
+        if request.state == "pending" && now > request.deadline {
+            request.state = "timeout".into();
+        }
+    }
+}
+
+pub fn create_request(
+    root: &Path,
+    team: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+    timeout_ms: u64,
+    reason: Option<&str>,
+    plan: Option<&str>,
+) -> Result<TeamRequest> {
+    let _lock = lock(root, team)?;
+    let mut requests = read_requests(root, team)?;
+    expire(&mut requests);
+    let created = now();
+    let request = TeamRequest {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: kind.into(),
+        team: team.into(),
+        from: from.into(),
+        to: to.into(),
+        state: "pending".into(),
+        created_at: created,
+        deadline: created + timeout_ms as i64,
+        reason: reason.map(str::to_owned),
+        plan: plan.map(str::to_owned),
+        feedback: None,
+    };
+    requests.push(request.clone());
+    write_requests(root, team, &requests)?;
+    Ok(request)
+}
+
+pub fn request(root: &Path, team: &str, id: &str) -> Result<Option<TeamRequest>> {
+    let _lock = lock(root, team)?;
+    let mut requests = read_requests(root, team)?;
+    expire(&mut requests);
+    write_requests(root, team, &requests)?;
+    Ok(requests.into_iter().find(|request| request.id == id))
+}
+
+/// Only the addressed session may answer. Expired requests stay expired.
+pub fn respond_request(
+    root: &Path,
+    team: &str,
+    id: &str,
+    responder: &str,
+    approve: bool,
+    feedback: Option<&str>,
+) -> Result<TeamRequest> {
+    let _lock = lock(root, team)?;
+    let mut requests = read_requests(root, team)?;
+    expire(&mut requests);
+    let request = requests
+        .iter_mut()
+        .find(|request| request.id == id)
+        .with_context(|| format!("Request not found: {id}"))?;
+    if request.to != responder {
+        bail!("Request {id} is addressed to another session");
+    }
+    match request.state.as_str() {
+        "pending" => {}
+        "timeout" => bail!("Request {id} timed out"),
+        other => bail!("Request {id} was already {other}"),
+    }
+    request.state = if approve { "approved" } else { "rejected" }.into();
+    request.feedback = feedback.map(str::to_owned);
+    let result = request.clone();
+    write_requests(root, team, &requests)?;
+    if approve && result.kind == "shutdown" {
+        // Update the member record under the same team lock.
+        if let Some(mut file) = read_team(root, team)? {
+            if let Some(member) = file
+                .members
+                .iter_mut()
+                .find(|member| member.session_id.as_deref() == Some(responder))
+            {
+                member.is_active = false;
+                member.status = Some("stopped".into());
+                if let Some(reason) = &result.reason {
+                    member.result = Some(reason.clone());
+                }
+                write_team(root, &file)?;
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub enum PlanDecision {
+    Approved { feedback: Option<String> },
+    Rejected { feedback: Option<String> },
+    Pending,
+}
+
+/// Consumes the latest plan decision addressed to a teammate.
+pub fn plan_decision(root: &Path, team: &str, session: &str) -> Result<PlanDecision> {
+    let _lock = lock(root, team)?;
+    let mut requests = read_requests(root, team)?;
+    expire(&mut requests);
+    let latest = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.kind == "plan_approval" && request.from == session)
+        .max_by_key(|(_, request)| request.created_at)
+        .map(|(index, request)| (index, request.clone()));
+    let Some((index, request)) = latest else {
+        return Ok(PlanDecision::Pending);
+    };
+    let decision = match request.state.as_str() {
+        "approved" => PlanDecision::Approved {
+            feedback: request.feedback.clone(),
+        },
+        "rejected" => PlanDecision::Rejected {
+            feedback: request.feedback.clone(),
+        },
+        _ => return Ok(PlanDecision::Pending),
+    };
+    requests[index].state = "consumed".into();
+    write_requests(root, team, &requests)?;
+    Ok(decision)
+}
+
+/// Returns the latest unanswered plan approval request for a teammate.
+pub fn pending_plan_request(root: &Path, team: &str, session: &str) -> Result<Option<TeamRequest>> {
+    let _lock = lock(root, team)?;
+    let mut requests = read_requests(root, team)?;
+    expire(&mut requests);
+    write_requests(root, team, &requests)?;
+    Ok(requests
+        .into_iter()
+        .filter(|request| {
+            request.kind == "plan_approval" && request.from == session && request.state == "pending"
+        })
+        .max_by_key(|request| request.created_at))
+}
+
+/// Marks a session stopped when a shutdown was approved or the child is gone.
+pub fn stop_member(
+    root: &Path,
+    team: &str,
+    session: &str,
+    status: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    let _lock = lock(root, team)?;
+    let Some(mut file) = read_team(root, team)? else {
+        return Ok(());
+    };
+    if let Some(member) = file
+        .members
+        .iter_mut()
+        .find(|member| member.session_id.as_deref() == Some(session))
+    {
+        member.is_active = false;
+        member.status = Some(status.into());
+        member.result = note.map(str::to_owned);
+        write_team(root, &file)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
