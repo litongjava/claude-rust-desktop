@@ -1040,7 +1040,10 @@ impl ToolLoopExecutor {
             db.with_conn(|conn|super::mcp_output::restore_history(&mut self.messages, conn, session))??;
         }
         Box::pin(self.refresh_mcp_tools()).await?;
-        let directories = self.allowed_directories.clone();
+        let mut directories = self.allowed_directories.clone();
+        if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
+            directories.extend(manager.session_directories(conv));
+        }
         let context = self
             .search_config_path
             .as_deref()

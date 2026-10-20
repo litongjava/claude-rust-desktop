@@ -5,6 +5,7 @@ use super::{
     ToolPermission,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +83,7 @@ pub struct PermissionManager {
     session_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
     runtime_rules: Mutex<HashMap<String, Vec<HashMap<String, PermissionAction>>>>,
     launch_rules: Mutex<HashMap<String, HashMap<String, PermissionAction>>>,
+    session_directories: Mutex<HashMap<String, Vec<PathBuf>>>,
     always_allow_checker: Mutex<Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>>,
 }
 
@@ -176,6 +178,27 @@ impl PermissionManager {
         *revision = revision.wrapping_add(1);
         self.session_rules.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation.to_owned(), rules);
     }
+    pub fn session_directories(&self, conversation: &str) -> Vec<PathBuf> {
+        self.session_directories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_session_directories(&self, conversation: &str, directories: Vec<PathBuf>) {
+        let mut current = self
+            .session_directories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if directories.is_empty() {
+            current.remove(conversation);
+        } else {
+            current.insert(conversation.to_owned(), directories);
+        }
+    }
+
     pub(crate) fn inherit_session_rules(&self, parent: &str, child: &str) {
         let mut revision = self.policy_revision.lock().unwrap_or_else(|e| e.into_inner());
         *revision = revision.wrapping_add(1);
@@ -186,6 +209,13 @@ impl PermissionManager {
         let mut launch = self.launch_rules.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rules) = launch.get(parent).cloned() {
             launch.insert(child.to_owned(), rules);
+        }
+        let mut directories = self
+            .session_directories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entries) = directories.get(parent).cloned() {
+            directories.insert(child.to_owned(), entries);
         }
     }
 
@@ -237,6 +267,15 @@ impl PermissionManager {
                     .cloned()
                     .unwrap_or_default(),
             )])),
+            session_directories: Mutex::new(HashMap::from([(
+                child.to_owned(),
+                self.session_directories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(parent)
+                    .cloned()
+                    .unwrap_or_default(),
+            )])),
             always_allow_checker: Mutex::new(
                 self.always_allow_checker
                     .lock()
@@ -258,6 +297,7 @@ impl PermissionManager {
             session_rules: Mutex::new(HashMap::new()),
             runtime_rules: Mutex::new(HashMap::new()),
             launch_rules: Mutex::new(HashMap::new()),
+            session_directories: Mutex::new(HashMap::new()),
             always_allow_checker: Mutex::new(None),
         }
     }

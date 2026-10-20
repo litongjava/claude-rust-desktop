@@ -1,4 +1,4 @@
-//! SDK control messages share the active engine; stdin remains live during turns.
+﻿//! SDK control messages share the active engine; stdin remains live during turns.
 use crate::{
     args::Cli,
     sdk_input::{Frame, UserMessage},
@@ -441,10 +441,14 @@ async fn run_inner(
         .broker
         .clone();
     let mcp = session.sdk_mcp_transport.as_ref().context("SDK MCP transport unavailable")?.broker.clone();
-    let updates = Arc::new(permission_updates::Updates::new(
-        session.permissions.clone(),
-        session.id.clone(),
-    ));
+    let updates = Arc::new(
+        permission_updates::Updates::new(session.permissions.clone(), session.id.clone())
+            .with_settings(permission_updates::SettingsScope {
+                data_dir: session.paths.data_dir.clone(),
+                workspace: session.workspace.clone(),
+                project_trusted: true,
+            }),
+    );
     let _cleanup = permission_updates::Cleanup(updates.clone());
     let permissions = Arc::new(Permissions {
         updates: Some(updates),

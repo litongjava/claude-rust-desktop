@@ -1769,3 +1769,6 @@ mod mcp_transport;
 
 #[path = "sdk/launch_permissions.rs"]
 mod launch_permissions;
+
+#[path = "sdk/permission_updates.rs"]
+mod permission_updates;

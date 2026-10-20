@@ -1,4 +1,4 @@
-use crate::{
+﻿use crate::{
     args::{Cli, OutputFormat, PermissionModeArg},
     config::Selection,
 };
@@ -233,7 +233,22 @@ impl Session {
             )
         })??;
         let permissions = runtime::default_permissions();
-        permissions.set_launch_rules(&id, launch_rules)?;
+        let loaded = claude_core::services::permission_updates::load_settings(
+            &paths.data_dir,
+            &workspace,
+            true,
+        )?;
+        let mut merged = launch_rules;
+        for (rule, action) in loaded.rules {
+            match merged.get(&rule) {
+                Some(claude_core::permissions::rules::PermissionAction::Deny) => {}
+                _ => {
+                    merged.insert(rule, action);
+                }
+            }
+        }
+        permissions.set_launch_rules(&id, merged)?;
+        permissions.set_session_directories(&id, loaded.directories);
         if let Some(crate::args::Commands::Agent { agent_type, .. }) = &cli.command {
             let definition = claude_core::services::agents::resolve(&crate::services::context(paths)?, agent_type)?;
             claude_core::services::agents::bind(&store.db, &id, &definition)?;
@@ -505,6 +520,28 @@ impl Session {
         Ok(())
     }
 
+    /// CLI launch rules win on conflicts, while a persisted deny is never relaxed.
+    fn apply_settings_permissions(&self, cli: &Cli) -> Result<()> {
+        let loaded = claude_core::services::permission_updates::load_settings(
+            &self.paths.data_dir,
+            &self.workspace,
+            true,
+        )?;
+        let mut rules = crate::launch_permissions::rules(cli)?;
+        for (rule, action) in loaded.rules {
+            match rules.get(&rule) {
+                Some(claude_core::permissions::rules::PermissionAction::Deny) => {}
+                _ => {
+                    rules.insert(rule, action);
+                }
+            }
+        }
+        self.permissions.set_launch_rules(&self.id, rules)?;
+        self.permissions
+            .set_session_directories(&self.id, loaded.directories);
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<()> {
         claude_core::services::async_hooks::cancel_shared(&self.paths.data_dir, &self.id).await;
         self.engine.cancel_turn(&self.id).await;
@@ -520,7 +557,7 @@ impl Session {
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
         use std::io::IsTerminal;
-        self.permissions.set_launch_rules(&self.id, crate::launch_permissions::rules(cli)?)?;
+        self.apply_settings_permissions(cli)?;
         // Frontends record original human input before skill expansion/worker handoff.
         // A worker receives synthesized context and must never re-label it as user intent.
         if std::env::var_os(claude_core::services::background_sessions::CONTROL_ENV).is_none() {
@@ -626,8 +663,7 @@ impl Session {
         input: &mut Option<TerminalInput>,
         publish: bool,
     ) -> Result<()> {
-        self.permissions
-            .set_launch_rules(&self.id, crate::launch_permissions::rules(cli)?)?;
+        self.apply_settings_permissions(cli)?;
         self.run_turn_origin(cli, prompt, input, false, true, publish)
             .await
     }

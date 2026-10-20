@@ -87,7 +87,7 @@
 
 ### P5 SDK 兼容（清单 S1、S2）
 
-- S1，入口 `crates/core/src/services/permission_updates.rs`（只允许 `session` 目标）：实现 user/project/local 目标（原子写、优先级、跨进程持久化）与 setMode/directory 操作；混合批次中有错误则全部不生效；不得绕过显式 deny 或项目信任。
+- [x] S1：`crates/core/src/services/permission_updates.rs` 支持 session/userSettings/projectSettings/localSettings（cliArg 明确报错），六种操作（add/replace/removeRules、setMode、add/removeDirectories）；混合批次全有或全无，设置文件原子写与跨进程锁、BOM/未知字段保留、未信任项目拒绝写项目设置、deny 优先；`load_settings` 按 user→project→local 读取并由 CLI/SDK 合并，附加目录进入 path scope。core 635/0/7、CLI 270/0/1，含 SDK 控制协议集成测试；defaultMode 仅持久化未参与启动选择等差异见 `sdk-permission-updates-acceptance-20261020.md`。
 - S2，入口 `crates/cli/src/sdk_agents.rs`、`crates/cli/src/sdk_initialization.rs`：其余 AgentDefinition 字段（mcp/skills/background/memory/permissionMode/effort/initialPrompt 等）逐项实现；主线程选择 SDK 定义；promptSuggestions 与 agent 进度摘要。
 
 ### P6 命令内部差异（清单 C1、C2）
