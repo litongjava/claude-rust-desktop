@@ -52,7 +52,7 @@ pub struct Session {
     providers: Arc<Mutex<ProviderManager>>,
     pub(crate) workspace: std::path::PathBuf,
     lifecycle_owned: bool,
-    api_format: claude_core::native_engine::provider_manager::ApiFormat,
+    pub(crate) api_format: claude_core::native_engine::provider_manager::ApiFormat,
     remote_relay: std::sync::Mutex<Option<claude_core::services::remote_control::Relay>>,
 }
 
@@ -875,7 +875,7 @@ impl Session {
                     continue;
                 }
                 if cli.output_format == OutputFormat::StreamJson {
-                    if let Some(value) = event_json(&event) { emit_json(&value)?; }
+                    if let Some(value) = event_json_with(&event, self.sdk_overrides.agent_progress_summaries) { emit_json(&value)?; }
                 }
                 match event {
                     EngineEvent::Text(delta) => { text.push_str(&delta); if publish && cli.output_format == OutputFormat::Text { progress.before_text(&delta); if !progress.is_live() { print!("{delta}"); io::stdout().flush()?; } } },
@@ -1221,13 +1221,27 @@ fn duplicate_tool_result(event: &EngineEvent, tools: &[message_repo::ToolCallRow
 }
 
 pub(crate) fn event_json(event: &EngineEvent) -> Option<Value> {
+    event_json_with(event, false)
+}
+
+/// SDK `agentProgressSummaries` adds a concise human-readable summary.
+pub(crate) fn event_json_with(event: &EngineEvent, summaries: bool) -> Option<Value> {
     Some(match event {
         EngineEvent::ContextReset { session_id, boundary_id } => json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id}),
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
         EngineEvent::Thinking(delta) => json!({"type":"thinking","delta":delta}),
         EngineEvent::Usage(usage) => json!({"type":"usage","usage":usage}),
         EngineEvent::MessageStart { model } => json!({"type":"message_start","model":model}),
-        EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => json!({"type":"agent_progress","session_id":session_id,"agent_type":agent_type,"status":status,"tool_name":tool_name}),
+        EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+            let mut value = json!({"type":"agent_progress","session_id":session_id,"agent_type":agent_type,"status":status,"tool_name":tool_name});
+            if summaries {
+                value["summary"] = json!(match tool_name {
+                    Some(tool) => format!("{agent_type}: {status} ({tool})"),
+                    None => format!("{agent_type}: {status}"),
+                });
+            }
+            value
+        }
         EngineEvent::Error(error) => json!({"type":"error","error":error}),
         EngineEvent::ToolUseStart {
             tool_use_id,
@@ -1441,6 +1455,21 @@ mod event_tests {
         }
         session.close().await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn agent_progress_summaries_are_opt_in() {
+        let event = EngineEvent::AgentProgress {
+            session_id: "child-42".into(),
+            agent_type: "reviewer".into(),
+            status: "running".into(),
+            tool_name: Some("Read".into()),
+        };
+        assert_eq!(
+            event_json_with(&event, true).unwrap()["summary"],
+            "reviewer: running (Read)"
+        );
+        assert!(event_json_with(&event, false).unwrap().get("summary").is_none());
     }
 
     #[test]

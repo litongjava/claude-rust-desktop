@@ -104,9 +104,15 @@ struct Fixture {
 async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Response {
     let count = {
         let mut requests = state.requests.lock().unwrap();
-        requests.push(body);
+        requests.push(body.clone());
         requests.len()
     };
+    if body["stream"].as_bool() != Some(true) {
+        if state.anthropic {
+            return Json(json!({"id":"fixture","type":"message","role":"assistant","content":[{"type":"text","text":"suggested-next"}],"model":"fixture","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}})).into_response();
+        }
+        return Json(json!({"id":"fixture","object":"chat.completion","created":0,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"suggested-next"},"finish_reason":"stop"}]})).into_response();
+    }
     if matches!(state.mode, Mode::DelayedApproval) && count == 1 { tokio::time::sleep(Duration::from_secs(2)).await; }
     if matches!(state.mode, Mode::SchemaRejected) {
         return (
@@ -1728,13 +1734,14 @@ async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publicatio
         json!({"description":"bad","prompt":"bad","tools":"Write"}),
         json!({"description":"bad","prompt":"bad","permissionMode":"bypassPermissions"}),
         json!({"description":"bad","prompt":"bad","maxTurns":0}),
-        json!({"description":"bad","prompt":"bad","mcpServers":["host"]}),
-        json!({"description":"bad","prompt":"bad","skills":["custom"]}),
+        json!({"description":"bad","prompt":"bad","mcpServers":[""]}),
+        json!({"description":"bad","prompt":"bad","skills":["missing-skill"]}),
         json!({"description":"bad","prompt":"bad","background":true}),
-        json!({"description":"bad","prompt":"bad","memory":"project"}),
-        json!({"description":"bad","prompt":"bad","effort":"high"}),
-        json!({"description":"bad","prompt":"bad","initialPrompt":"initial"}),
-        json!({"description":"bad","prompt":"bad","criticalSystemReminder_EXPERIMENTAL":"reminder"}),
+        json!({"description":"bad","prompt":"bad","memory":"global"}),
+        json!({"description":"bad","prompt":"bad","effort":3}),
+        json!({"description":"bad","prompt":"bad","effort":"huge"}),
+        json!({"description":"bad","prompt":"bad","permissionMode":"nope"}),
+        json!({"description":"bad","prompt":"bad","mcpServers":[{"inline":{"command":"x"}}]}),
     ] {
         let server = Server::start(false, Mode::Text).await;
         let root = tempfile::tempdir().unwrap();
@@ -1746,7 +1753,7 @@ async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publicatio
         client.send(initialize_request("invalid",json!({"systemPrompt":"MUST_NOT_APPLY","agents":{
             "a-valid-first":{"description":"MUST_NOT_REGISTER","prompt":"MUST_NOT_APPLY"}, "z-invalid-second":bad}}))).await;
         let result = client.frame("control_response").await;
-        assert_eq!(result["response"]["subtype"], "error", "{result}");
+        assert_eq!(result["response"]["subtype"], "error", "{bad}: {result}");
         client.send(initialize_request("retry", json!({}))).await;
         let result = client.frame("control_response").await;
         assert_eq!(result["response"]["subtype"], "success", "{result}");
@@ -1759,6 +1766,134 @@ async fn sdk_agent_initialization_rejects_entire_invalid_batch_before_publicatio
         drop(requests);
         assert!(client.finish().await.0.success());
     }
+}
+
+#[tokio::test]
+async fn sdk_agent_fields_reach_the_child_request() {
+    for anthropic in [false, true] {
+        let server = Server::start(anthropic, Mode::RuntimeAgent).await;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(data.join("skills/sdk-skill")).unwrap();
+        std::fs::write(
+            data.join("skills/sdk-skill/SKILL.md"),
+            "---
+name: sdk-skill
+description: fixture skill
+---
+SKILL_SENTINEL",
+        )
+        .unwrap();
+        std::fs::create_dir_all(data.join("agent-memory/sdk-child")).unwrap();
+        std::fs::write(
+            data.join("agent-memory/sdk-child/notes.md"),
+            "MEMORY_SENTINEL",
+        )
+        .unwrap();
+        let mut client = Client::start(root.path(), &server, &[]);
+        client
+            .send(initialize_request(
+                "init",
+                json!({"agents":{"sdk-child":{
+                    "description":"SDK_CHILD_DESCRIPTION",
+                    "prompt":"SDK_CHILD_PROMPT_SENTINEL",
+                    "skills":["sdk-skill"],
+                    "memory":"user",
+                    "effort":"high",
+                    "permissionMode":"acceptEdits",
+                    "criticalSystemReminder_EXPERIMENTAL":"REMINDER_SENTINEL"
+                }}}),
+            ))
+            .await;
+        let initialized = client.frame("control_response").await;
+        assert_eq!(
+            initialized["response"]["subtype"], "success",
+            "{initialized}"
+        );
+        client.send(user("Delegate the task to sdk-child")).await;
+        let result = client.result().await;
+        assert_eq!(result["is_error"], false, "{result}");
+        let requests = server.fixture.requests.lock().unwrap();
+        let child = requests[1].to_string();
+        for sentinel in [
+            "SDK_CHILD_PROMPT_SENTINEL",
+            "SKILL_SENTINEL",
+            "MEMORY_SENTINEL",
+            "REMINDER_SENTINEL",
+        ] {
+            assert!(child.contains(sentinel), "missing {sentinel}: {child}");
+        }
+        if anthropic {
+            assert_eq!(requests[1]["thinking"]["type"], "enabled");
+        } else {
+            assert_eq!(requests[1]["reasoning_effort"], "high");
+        }
+        drop(requests);
+        assert!(client.finish().await.0.success());
+    }
+}
+
+#[tokio::test]
+async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
+    let server = Server::start(false, Mode::Text).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = Client::start(root.path(), &server, &[]);
+    client
+        .send(initialize_request(
+            "init",
+            json!({
+                "agents":{"main":{
+                    "description":"MAIN_AGENT_DESCRIPTION",
+                    "prompt":"MAIN_AGENT_SYSTEM_SENTINEL",
+                    "initialPrompt":"INITIAL_PROMPT_SENTINEL"
+                }},
+                "agent":"main",
+                "promptSuggestions":true
+            }),
+        ))
+        .await;
+    let initialized = client.frame("control_response").await;
+    assert_eq!(
+        initialized["response"]["subtype"], "success",
+        "{initialized}"
+    );
+    client.send(user("hello")).await;
+    let result = client.result().await;
+    assert_eq!(result["is_error"], false, "{result}");
+    let suggestion = client.frame("prompt_suggestion").await;
+    assert_eq!(suggestion["suggestion"], "suggested-next");
+    assert_eq!(suggestion["session_id"], result["session_id"]);
+    {
+        let requests = server.fixture.requests.lock().unwrap();
+        let first = requests[0].to_string();
+        assert!(first.contains("MAIN_AGENT_SYSTEM_SENTINEL"), "{first}");
+        assert!(first.contains("INITIAL_PROMPT_SENTINEL"), "{first}");
+    }
+    assert!(client.finish().await.0.success());
+}
+
+#[tokio::test]
+async fn sdk_agent_definition_unsupported_fields_are_explicit_errors() {
+    let server = Server::start(false, Mode::Text).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = Client::start(root.path(), &server, &[]);
+    for agent in [
+        json!({"description":"d","prompt":"p","background":true}),
+        json!({"description":"d","prompt":"p","mcpServers":[{"inline":{"command":"x"}}]}),
+        json!({"description":"d","prompt":"p","effort":3}),
+        json!({"description":"d","prompt":"p","memory":"global"}),
+        json!({"description":"d","prompt":"p","skills":["missing-skill"]}),
+    ] {
+        client
+            .send(initialize_request("bad", json!({"agents":{"x":agent}})))
+            .await;
+        let response = client.frame("control_response").await;
+        assert_eq!(
+            response["response"]["subtype"], "error",
+            "{agent}: {response}"
+        );
+    }
+    assert!(client.finish().await.0.success());
 }
 
 #[path = "sdk/hook_callbacks.rs"]

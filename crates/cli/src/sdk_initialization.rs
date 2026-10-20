@@ -1,4 +1,4 @@
-//! Per-run SDK initialization. Validate and gather metadata before publishing overrides.
+﻿//! Per-run SDK initialization. Validate and gather metadata before publishing overrides.
 use crate::{args::Cli, session::Session};
 #[path = "sdk_agents.rs"]
 mod agents;
@@ -14,6 +14,10 @@ pub struct State {
 pub struct Overrides {
     pub system_prompt: Option<String>,
     pub response_schema: Option<Value>,
+    /// Prepended once to the first user turn when a main-thread agent is selected.
+    pub initial_prompt: Option<String>,
+    pub prompt_suggestions: bool,
+    pub agent_progress_summaries: bool,
 }
 
 impl State {
@@ -32,7 +36,7 @@ impl State {
         request: &Value,
     ) -> Result<Value> {
         ensure!(!self.initialized, "Already initialized");
-        let overrides = validate(cli, request)?;
+        let mut overrides = validate(cli, request)?;
         let servers = request.get("sdkMcpServers").map(claude_core::mcp::sdk::validate_names).transpose()?.unwrap_or_default();
         session.validate_sdk_mcp_servers(&servers).await?;
         let mcp_host = session.sdk_mcp_transport.clone().context("SDK MCP transport unavailable")?;
@@ -43,6 +47,34 @@ impl State {
             .transpose()?
             .unwrap_or_default();
         let catalog = agents::prepare(session, request.get("agents")).await?;
+        if let Some(name) = request.get("agent").and_then(Value::as_str) {
+            let agent = catalog
+                .iter()
+                .find(|agent| agent.definition.id == name)
+                .with_context(|| format!("initialize.agent is not a defined agent: {name}"))?;
+            let mut prompt = agent.definition.system_prompt.clone();
+            if let Some(reminder) = &agent.reminder {
+                prompt.push_str("\n\nCritical system reminder:\n");
+                prompt.push_str(reminder);
+            }
+            if let Some(existing) = overrides.system_prompt.take() {
+                if !existing.is_empty() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&existing);
+                }
+            }
+            overrides.system_prompt = Some(prompt);
+            overrides.initial_prompt = agent.initial_prompt.clone();
+            if let Some(provider) = &agent.provider {
+                session.model = provider.model.id.clone();
+                session.provider_id = provider.provider.id.clone();
+            }
+            if let Some(mode) = &agent.permission_mode {
+                session
+                    .permissions
+                    .set_mode(claude_core::permissions::PermissionMode::parse(mode)?);
+            }
+        }
         let mut response = metadata(session).await?;
         let entries = response["agents"]
             .as_array_mut()
@@ -77,6 +109,8 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
     let mut system = None;
     let mut append = None;
     let mut schema = None;
+    let mut suggestions = false;
+    let mut summaries = false;
     for (key, value) in fields {
         match key.as_str() {
             "subtype" => ensure!(value == "initialize", "Expected initialize subtype"),
@@ -101,9 +135,19 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
                 claude_core::services::hook_callbacks::validate(value)?;
             }
             "sdkMcpServers" => { claude_core::mcp::sdk::validate_names(value)?; },
-            "promptSuggestions" | "agentProgressSummaries" => ensure!(
-                value == false,
-                "initialize.{key} is not supported; only false is accepted"
+            "promptSuggestions" => {
+                suggestions = value
+                    .as_bool()
+                    .with_context(|| "initialize.promptSuggestions must be a boolean")?;
+            }
+            "agentProgressSummaries" => {
+                summaries = value
+                    .as_bool()
+                    .with_context(|| "initialize.agentProgressSummaries must be a boolean")?;
+            }
+            "agent" => ensure!(
+                value.as_str().is_some_and(|name| !name.trim().is_empty()),
+                "initialize.agent must be a non-empty agent name"
             ),
             _ => bail!("Unknown initialize field: {key}"),
         }
@@ -137,6 +181,9 @@ fn validate(cli: &Cli, request: &Value) -> Result<Overrides> {
     Ok(Overrides {
         system_prompt,
         response_schema: schema,
+        initial_prompt: None,
+        prompt_suggestions: suggestions,
+        agent_progress_summaries: summaries,
     })
 }
 
@@ -225,7 +272,7 @@ mod tests {
             json!({"hooks":{"PreToolUse":[{"hookCallbackIds":[""]}]}}),
             json!({"agents":[]}),
             json!({"sdkMcpServers":["host","host"]}),
-            json!({"promptSuggestions":true}),
+            json!({"promptSuggestions":"yes"}),
         ] {
             assert!(validate(&cli, &bad).is_err(), "{bad}");
         }

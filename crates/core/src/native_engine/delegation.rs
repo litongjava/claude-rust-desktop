@@ -115,6 +115,57 @@ fn owned_binding(
     })?
 }
 
+/// Loads agent memory Markdown from the upstream scope directories.
+fn agent_memory(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    agent: &str,
+    scope: &str,
+) -> Result<String> {
+    ensure!(
+        !agent.is_empty()
+            && agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+        "Invalid agent type for memory scope"
+    );
+    let directory = match scope {
+        "user" => root.join("agent-memory").join(agent),
+        "project" => workspace.join(".claude/agent-memory").join(agent),
+        "local" => workspace.join(".claude/agent-memory-local").join(agent),
+        _ => anyhow::bail!("Invalid agent memory scope"),
+    };
+    let mut files: Vec<_> = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "md"))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error.into()),
+    };
+    files.sort();
+    let mut memory = String::new();
+    for path in files {
+        let content = std::fs::read_to_string(&path)?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        ensure!(
+            memory.len() + content.len() <= 64 * 1024,
+            "Agent memory exceeds 64 KiB"
+        );
+        memory.push_str(&format!(
+            "## {}\n{}\n\n",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("memory.md"),
+            content
+        ));
+    }
+    Ok(memory)
+}
+
 struct PreparedChild {
     context: ServiceContext,
     id: String,
@@ -520,10 +571,13 @@ impl ToolLoopExecutor {
             Some(agent) => agent.definition.clone(),
             None => agents::resolve(&context, agent_type)?,
         };
-        let provider = runtime
+        let mut provider = runtime
             .as_ref()
             .and_then(|agent| agent.provider.clone())
             .unwrap_or_else(|| self.provider.clone());
+        if let Some(effort) = runtime.as_ref().and_then(|agent| agent.effort.clone()) {
+            provider.model.effort = Some(effort);
+        }
         if let Some(agent) = &runtime {
             if !agent.disallowed_tools.is_empty() {
                 let available = match definition.tools.take() {
@@ -552,6 +606,37 @@ impl ToolLoopExecutor {
                         .filter(|tool| !agent.disallowed_tools.contains(tool))
                         .collect(),
                 );
+            }
+        }
+        if let Some(agent) = &runtime {
+            if !agent.mcp_servers.is_empty() {
+                let mut available: Vec<String> = self
+                    .tool_definitions()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .filter(|name| !name.starts_with("mcp__"))
+                    .collect();
+                if let Some(registry) = &self.mcp_registry {
+                    available.extend(
+                        registry
+                            .get_all_tools()
+                            .await?
+                            .into_iter()
+                            .map(|tool| tool.name)
+                            .filter(|name| {
+                                agent.mcp_servers.iter().any(|server| {
+                                    name.starts_with(&format!("mcp__{server}__"))
+                                })
+                            }),
+                    );
+                }
+                definition.tools = Some(match definition.tools.take() {
+                    Some(tools) => available
+                        .into_iter()
+                        .filter(|tool| tools.contains(tool))
+                        .collect(),
+                    None => available,
+                });
             }
         }
         if let Some(parent) = &self.allowed_tools {
@@ -629,13 +714,35 @@ impl ToolLoopExecutor {
         }
         sessions.append(&id, "user", prompt)?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
-        let system = format!(
+        let mut system = format!(
             "{}\nChild task role:\n{}\nChild session ID: {}\nParent session ID: {}",
             self.system_prompt.as_deref().unwrap_or(""),
             definition.system_prompt,
             id,
             self.conv_id.as_deref().unwrap_or("")
         );
+        if let Some(agent) = &runtime {
+            if let Some(context) = &agent.skill_context {
+                system.push_str("\n\n");
+                system.push_str(context);
+            }
+            if let Some(scope) = &agent.memory {
+                let memory = agent_memory(
+                    root,
+                    std::path::Path::new(&self.workspace_cwd),
+                    &definition.id,
+                    scope,
+                )?;
+                if !memory.is_empty() {
+                    system.push_str("\n\nAgent memory:\n");
+                    system.push_str(&memory);
+                }
+            }
+            if let Some(reminder) = &agent.reminder {
+                system.push_str("\n\nCritical system reminder:\n");
+                system.push_str(reminder);
+            }
+        }
         let child_max_tokens = self
             .max_tokens
             .min(provider.model.max_tokens.unwrap_or(self.max_tokens));
@@ -666,6 +773,22 @@ impl ToolLoopExecutor {
         child.permission_manager = self.permission_manager.as_ref().map(|manager| {
             Arc::new(manager.fork_session(self.conv_id.as_deref().unwrap_or_default(), &id))
         });
+        if let Some(mode) = runtime.as_ref().and_then(|agent| agent.permission_mode.as_ref()) {
+            let mode = crate::permissions::PermissionMode::parse(mode)?;
+            let parent_mode = self
+                .permission_manager
+                .as_ref()
+                .map(|manager| manager.get_mode())
+                .unwrap_or_default();
+            ensure!(
+                mode != crate::permissions::PermissionMode::BypassPermissions
+                    || parent_mode == crate::permissions::PermissionMode::BypassPermissions,
+                "SDK agent {agent_type} cannot enable bypassPermissions"
+            );
+            if let Some(manager) = &child.permission_manager {
+                manager.set_mode(mode);
+            }
+        }
         child.hooks = self.hooks.clone();
         let hook_session = self
             .subagent_hook_context
@@ -1051,3 +1174,7 @@ mod resume_tests;
 #[cfg(test)]
 #[path = "team_spawn_tests.rs"]
 mod team_spawn_tests;
+
+#[cfg(test)]
+#[path = "sdk_agent_fields_tests.rs"]
+mod sdk_agent_fields_tests;

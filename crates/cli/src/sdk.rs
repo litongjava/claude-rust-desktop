@@ -516,26 +516,39 @@ async fn run_inner(
                 .as_array()
                 .filter(|blocks| blocks.iter().any(|b| b["type"] == "image_url"))
                 .map(|_| message.content.clone());
+            let text = match session.sdk_overrides.initial_prompt.take() {
+                Some(initial) if !initial.trim().is_empty() => {
+                    if message.text.trim().is_empty() {
+                        initial
+                    } else {
+                        format!("{initial}
+
+{}", message.text)
+                    }
+                }
+                _ => message.text.clone(),
+            };
             let turn = Box::pin(async {
                 if message.initial_hook {
                     session
-                        .turn_initial_hook(cli, &message.text, &mut terminal, true)
+                        .turn_initial_hook(cli, &text, &mut terminal, true)
                         .await
                 } else {
-                    session.turn(cli, &message.text, &mut terminal).await
+                    session.turn(cli, &text, &mut terminal).await
                 }
             });
             tokio::pin!(turn);
+            let mut turn_failed = false;
             loop {
                 tokio::select! {
-                    result=&mut turn=>{if let Err(error)=result {failed=true;if !error.is::<crate::output::ReportedError>() {crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":format!("{error:#}")}))?;}}break;},
+                    result=&mut turn=>{if let Err(error)=result {turn_failed=true;failed=true;if !error.is::<crate::output::ReportedError>() {crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":format!("{error:#}")}))?;}}break;},
                     frame=frames.recv(),if !eof=>match frame {
                         None=>{
                             eof=true;
                             if callbacks.has_pending() || mcp.has_pending() || session.sdk_hooks.as_ref().is_some_and(|runtime| runtime.has_callbacks()) || !session.sdk_mcp.names().is_empty() {
                                 session.engine.cancel_turn(&session.id).await;
                                 callbacks.close();mcp.close();session.sdk_mcp.clear();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
-                                failed=true;queue.clear();
+                                failed=true;turn_failed=true;queue.clear();
                                 crate::session::emit_json(&json!({"type":"result","is_error":true,"session_id":session.id,"error":"SDK input closed while a hook or MCP host was required"}))?;
                                 break;
                             }
@@ -550,7 +563,7 @@ async fn run_inner(
                                 continue;
                             }
                             if value["request"]["subtype"]=="interrupt" {
-                                failed=true;
+                                failed=true;turn_failed=true;
                                 session.engine.cancel_turn(&session.id).await;
                                 callbacks.cancel_all();
                                 mcp.cancel_all();
@@ -566,6 +579,13 @@ async fn run_inner(
             }
             mcp.cancel_all();
             permissions.cancel().await;
+            if !turn_failed && session.sdk_overrides.prompt_suggestions {
+                if let Err(error) = emit_prompt_suggestion(session).await {
+                    if cli.verbose {
+                        eprintln!("Prompt suggestion skipped: {error:#}");
+                    }
+                }
+            }
             continue;
         }
         if eof {
@@ -596,6 +616,62 @@ async fn run_inner(
         .into());
     }
     Ok(())
+}
+
+/// Best-effort SDK prompt suggestion after a successful turn.
+async fn emit_prompt_suggestion(session: &Session) -> Result<()> {
+    use std::fmt::Write;
+    let history = session.store.model_history(&session.id, &session.api_format)?;
+    let mut transcript = String::new();
+    for message in history.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+        let role = message["role"].as_str().unwrap_or("");
+        let content = match &message["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("
+"),
+            _ => String::new(),
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let _ = write!(
+            transcript,
+            "{role}: {}
+",
+            content.chars().take(2000).collect::<String>()
+        );
+        if transcript.len() > 12_000 {
+            break;
+        }
+    }
+    if transcript.trim().is_empty() {
+        return Ok(());
+    }
+    let suggestion = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        session.engine.generate_text(
+            &session.provider_id,
+            &session.model,
+            "Predict the user's likely next message in this conversation. Reply with only that message, at most 120 characters, without quotes.",
+            &transcript,
+        ),
+    )
+    .await
+    .context("Prompt suggestion timed out")??;
+    let suggestion = suggestion.trim().trim_matches('"').trim();
+    if suggestion.is_empty() || suggestion.len() > 500 {
+        return Ok(());
+    }
+    crate::session::emit_json(&json!({
+        "type":"prompt_suggestion",
+        "suggestion":suggestion,
+        "uuid":uuid::Uuid::new_v4().to_string(),
+        "session_id":session.id
+    }))
 }
 
 async fn route_response(
