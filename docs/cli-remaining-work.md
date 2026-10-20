@@ -92,11 +92,11 @@
 
 ### P6 命令内部差异（清单 C1、C2）
 
-- `/plan`：allowedPrompts 语义化 Bash 授权（入口 `crates/core/src/native_engine/plan_tool.rs`，参考 `reference:src/tools/ExitPlanModeTool/ExitPlanModeV2Tool.ts`）；clear-context 行为验收（保留会话 UUID 是设计差异）。
+- [x] `/plan` allowedPrompts：输入 schema 与校验（Bash、非空、≤500 字符、≤32 条）；批准结果与 teammate 审批请求携带语义提示，但不转成规则、不放宽 Bash（批准后仍需确认）；非法工具在弹审批前拒绝。clear-context 归档/保留 UUID 由既有双协议测试覆盖。详见 `p6-plan-memory-config-acceptance-20261020.md`。
 - `/workflows`（`crates/cli/src/background_commands.rs`）：确定本地 workflow 范围；托管 workflow 需对应账号，不得伪造。
 - `/batch`（`crates/cli/src/batch_commands.rs`）：与原版自动编排对比；分别验收失败、取消、重叠检查、恢复与真实 PR。
-- `/memory`（`crates/cli/src/display_commands.rs`）：原版 MemoryFileSelector 式文件选择。
-- 交互式配置/powerup：按用户操作（选择/编辑/保存/取消）对比原版。
+- [x] `/memory`：`/memory`/`list` 列出 user/project/local 文件与状态；`user|project|local` 用 `$VISUAL`/`$EDITOR` 打开并在缺失时创建；`edit` 兼容 project，`show` 保持打印项目指令。
+- [x] 交互式配置/powerup：既有文本向导覆盖选择/编辑/保存/取消；`/cancel` 与不完整输入路径测试断言配置字节不变；本次无新增交互布局，外观差异属既有实现差异。
 
 ### P7 需要真实环境或账号的验收（清单 D、C3）
 

@@ -1,4 +1,4 @@
-//! Persisted CLI presentation and inspection commands.
+﻿//! Persisted CLI presentation and inspection commands.
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use claude_core::runtime::RuntimePaths;
@@ -298,24 +298,43 @@ pub async fn handle(
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         "/memory" => {
-            let path = match argument {
-                "" | "show" | "edit" => session.workspace.join("CLAUDE.md"),
-                "local" => session.workspace.join("CLAUDE.local.md"),
-                _ => anyhow::bail!("Usage: /memory [show|edit|local]"),
-            };
-            if argument == "edit" || argument == "local" {
-                edit_file(&path, "# Project instructions\n\n").await?;
-                eprintln!("Instructions will be loaded on the next turn.");
-            } else {
-                let instructions = claude_core::project_instructions::load(&session.workspace)?;
-                if instructions.is_empty() {
-                    eprintln!(
-                        "No project instructions found. /memory edit opens {}",
-                        path.display()
-                    );
-                } else {
-                    println!("{instructions}");
+            let paths_by_scope = memory_paths(&paths.data_dir, &session.workspace);
+            match argument.trim() {
+                "" | "list" => {
+                    for (scope, path) in &paths_by_scope {
+                        let status = match std::fs::metadata(path) {
+                            Ok(metadata) => format!("{} bytes", metadata.len()),
+                            Err(_) => "missing".into(),
+                        };
+                        eprintln!("{scope:7} {} [{status}]", path.display());
+                    }
+                    eprintln!("Use /memory user|project|local to open a file (created if missing); /memory show prints loaded project instructions.");
                 }
+                "show" => {
+                    let instructions =
+                        claude_core::project_instructions::load(&session.workspace)?;
+                    if instructions.is_empty() {
+                        eprintln!("No project instructions found. /memory project opens the file.");
+                    } else {
+                        println!("{instructions}");
+                    }
+                }
+                "user" => {
+                    let (_, path) = &paths_by_scope[0];
+                    edit_file(path, "# User instructions\n\n").await?;
+                    eprintln!("Instructions will be loaded on the next session.");
+                }
+                "project" | "edit" => {
+                    let (_, path) = &paths_by_scope[1];
+                    edit_file(path, "# Project instructions\n\n").await?;
+                    eprintln!("Instructions will be loaded on the next turn.");
+                }
+                "local" => {
+                    let (_, path) = &paths_by_scope[2];
+                    edit_file(path, "# Local project instructions\n\n").await?;
+                    eprintln!("Instructions will be loaded on the next turn.");
+                }
+                _ => anyhow::bail!("Usage: /memory [list|show|user|project|local|edit]"),
             }
         }
         "/plugin" => {
@@ -385,6 +404,18 @@ pub fn split_arguments(text: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+/// Upstream MemoryFileSelector scopes: user, project and local files.
+pub(crate) fn memory_paths(
+    data_dir: &Path,
+    workspace: &Path,
+) -> [(&'static str, std::path::PathBuf); 3] {
+    [
+        ("user", data_dir.join("CLAUDE.md")),
+        ("project", workspace.join("CLAUDE.md")),
+        ("local", workspace.join("CLAUDE.local.md")),
+    ]
+}
+
 pub(crate) async fn edit_file(path: &Path, initial: &str) -> Result<()> {
     if !path.exists() {
         use std::io::Write;
@@ -429,6 +460,18 @@ pub async fn statusline(session: &Session, settings: &Settings) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_paths_cover_user_project_and_local_scopes() {
+        let paths = memory_paths(Path::new("/data"), Path::new("/work"));
+        assert_eq!(paths[0].0, "user");
+        assert!(paths[0].1.ends_with("CLAUDE.md"));
+        assert!(paths[0].1.starts_with("/data"));
+        assert_eq!(paths[1].0, "project");
+        assert!(paths[1].1.starts_with("/work"));
+        assert_eq!(paths[2].0, "local");
+        assert!(paths[2].1.ends_with("CLAUDE.local.md"));
+    }
+
     #[test]
     fn argument_parser_preserves_windows_paths_and_rejects_unclosed_quotes() {
         assert_eq!(

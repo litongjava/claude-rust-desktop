@@ -328,3 +328,43 @@ async fn teammate_plan_approval_routes_to_leader_and_never_self_approves() {
     assert_eq!(approved["mode"], "accept_edits");
     assert_eq!(manager.get_mode(), PermissionMode::AcceptEdits);
 }
+
+#[tokio::test]
+async fn allowed_prompts_are_recorded_but_never_grant_bash() {
+    let (temp, _context, _sessions, mut executor, mut events, manager) = fixture();
+    let input = json!({"plan":"# plan\n\nrun tests","allowedPrompts":[{"tool":"Bash","prompt":"run tests"}]});
+    let waiters = executor.answer_waiters.clone();
+    let mut future = Box::pin(executor.plan_transition("ExitPlanMode", &input, "exit"));
+    let event = tokio::select! {event=events.recv()=>event.unwrap(), result=&mut future=>panic!("No approval: {result:?}")};
+    let EngineEvent::AskUser { request_id, .. } = event else {
+        panic!("Wrong event")
+    };
+    waiters
+        .lock()
+        .await
+        .remove(&request_id)
+        .unwrap()
+        .send("2".into())
+        .unwrap();
+    let approved = future.await.unwrap();
+    assert_eq!(approved["approved"], true);
+    assert_eq!(approved["allowedPrompts"][0]["prompt"], "run tests");
+    // Semantic prompts do not become blanket Bash grants.
+    assert!(matches!(
+        executor
+            .check_permission("Bash", &json!({"command":"cargo test"}), "bash-after-plan")
+            .await,
+        PermissionResult::RequiresConfirmation(_)
+    ));
+    drop(temp);
+    manager.set_mode(PermissionMode::PlanMode);
+    assert!(executor
+        .plan_transition(
+            "ExitPlanMode",
+            &json!({"plan":"# p","allowedPrompts":[{"tool":"Write","prompt":"x"}]}),
+            "bad"
+        )
+        .await
+        .is_err());
+    assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
+}

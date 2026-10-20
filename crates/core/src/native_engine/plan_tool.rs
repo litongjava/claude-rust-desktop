@@ -5,6 +5,31 @@ use anyhow::Context;
 #[path = "plan_approval_tests.rs"]
 mod approval_tests;
 
+/// Semantic Bash intents are recorded for review; they never become blanket rules.
+fn plan_allowed_prompts(input: &Value) -> Result<Vec<Value>> {
+    let Some(items) = input.get("allowedPrompts") else {
+        return Ok(Vec::new());
+    };
+    let items = items
+        .as_array()
+        .context("allowedPrompts must be an array")?;
+    anyhow::ensure!(items.len() <= 32, "Too many allowedPrompts");
+    let mut prompts = Vec::with_capacity(items.len());
+    for item in items {
+        anyhow::ensure!(
+            item["tool"] == "Bash",
+            "allowedPrompts only support the Bash tool"
+        );
+        let prompt = item["prompt"]
+            .as_str()
+            .filter(|prompt| !prompt.trim().is_empty())
+            .context("allowedPrompts.prompt is required")?;
+        anyhow::ensure!(prompt.len() <= 500, "allowedPrompts.prompt is too long");
+        prompts.push(json!({"tool":"Bash","prompt":prompt}));
+    }
+    Ok(prompts)
+}
+
 impl ToolLoopExecutor {
     pub(super) fn is_plan_document_tool(&self, tool: &str, input: &Value) -> bool {
         let Some(root) = self
@@ -128,6 +153,7 @@ impl ToolLoopExecutor {
             manager.get_mode() == PermissionMode::PlanMode,
             "Enter plan mode before requesting plan approval"
         );
+        let allowed_prompts = plan_allowed_prompts(input)?;
         if let Some(plan) = input.get("plan") {
             plans::save(
                 &root,
@@ -192,6 +218,7 @@ impl ToolLoopExecutor {
                             "feedback":feedback,
                             "planFilePath":path,
                             "plan":plan,
+                            "allowedPrompts":allowed_prompts,
                             "warning":legacy_warning,
                             "message":"Plan approved by the team leader. Existing deny and confirmation rules remain in force."
                         }))
@@ -222,7 +249,8 @@ impl ToolLoopExecutor {
                                 "type":"plan_approval_request",
                                 "request_id":request.id,
                                 "teammate":name,
-                                "plan":plan
+                                "plan":plan,
+                                "allowedPrompts":allowed_prompts
                             })
                             .to_string();
                             let context = crate::services::session_messages::context(&root)?;
@@ -328,7 +356,7 @@ impl ToolLoopExecutor {
             None
         };
         Ok(
-            json!({"approved":true,"mode":if mode == PermissionMode::AskPermissions {"ask"} else {"accept_edits"},"clearContext":clear,"planFilePath":path,"plan":plan,
+            json!({"approved":true,"mode":if mode == PermissionMode::AskPermissions {"ask"} else {"accept_edits"},"clearContext":clear,"planFilePath":path,"plan":plan,"allowedPrompts":allowed_prompts,
             "warning":legacy_warning,"message":"Plan approved under the selected permission mode. Existing deny and confirmation rules remain in force."}),
         )
     }

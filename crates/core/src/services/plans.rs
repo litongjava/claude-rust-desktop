@@ -339,8 +339,8 @@ pub fn definitions() -> Vec<crate::tools::ToolDefinition> {
         },
         crate::tools::ToolDefinition {
             name: "ExitPlanMode".into(),
-            description: "Read the current session plan file (or save supplied Markdown) and ask the user to approve leaving plan mode. Supply plan text, or omit it to review the existing session plan. The user chooses clear context plus accept-edits, keep context plus accept-edits, manual approval, or further planning. Existing deny/confirmation rules remain enforced; no bypass or auto mode is granted.".into(),
-            input_schema: json!({"type":"object","properties":{"plan":{"type":"string","description":"Complete Markdown implementation and verification plan"}},"additionalProperties":false}),
+            description: "Read the current session plan file (or save supplied Markdown) and ask the user to approve leaving plan mode. Supply plan text, or omit it to review the existing session plan. allowedPrompts describe semantic Bash actions needed by the plan; they are recorded for review and never grant arbitrary Bash. The user chooses clear context plus accept-edits, keep context plus accept-edits, manual approval, or further planning. Existing deny/confirmation rules remain enforced; no bypass or auto mode is granted.".into(),
+            input_schema: json!({"type":"object","properties":{"plan":{"type":"string","description":"Complete Markdown implementation and verification plan"},"allowedPrompts":{"type":"array","maxItems":32,"items":{"type":"object","properties":{"tool":{"type":"string","enum":["Bash"],"description":"The tool this prompt applies to"},"prompt":{"type":"string","description":"Semantic description of the action, e.g. run tests"}},"required":["tool","prompt"],"additionalProperties":false}}},"additionalProperties":false}),
         },
     ]
 }
