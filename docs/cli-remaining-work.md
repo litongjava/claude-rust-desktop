@@ -88,7 +88,7 @@
 ### P5 SDK 兼容（清单 S1、S2）
 
 - [x] S1：`crates/core/src/services/permission_updates.rs` 支持 session/userSettings/projectSettings/localSettings（cliArg 明确报错），六种操作（add/replace/removeRules、setMode、add/removeDirectories）；混合批次全有或全无，设置文件原子写与跨进程锁、BOM/未知字段保留、未信任项目拒绝写项目设置、deny 优先；`load_settings` 按 user→project→local 读取并由 CLI/SDK 合并，附加目录进入 path scope。core 635/0/7、CLI 270/0/1，含 SDK 控制协议集成测试；defaultMode 仅持久化未参与启动选择等差异见 `sdk-permission-updates-acceptance-20261020.md`。
-- S2，入口 `crates/cli/src/sdk_agents.rs`、`crates/cli/src/sdk_initialization.rs`：其余 AgentDefinition 字段（mcp/skills/background/memory/permissionMode/effort/initialPrompt 等）逐项实现；主线程选择 SDK 定义；promptSuggestions 与 agent 进度摘要。
+- [x] S2：`crates/cli/src/sdk_agents.rs`、`sdk_initialization.rs` 实现 AgentDefinition 其余字段——mcpServers 字符串名限制子 agent 工具、skills 预加载、memory 三作用域文件、permissionMode（不得越权、拒绝 auto）、effort（命名等级）、initialPrompt 与 reminder；`background` 与内联 mcpServers 明确报错。新增 `initialize.agent` 主线程选择（本项目扩展），`promptSuggestions` 在成功回合后输出 `prompt_suggestion`，`agentProgressSummaries` 给 `agent_progress` 增加 summary。core 636/0/7、CLI 274/0/1；逐字段表与差异见 `sdk-agent-definition-acceptance-20261020.md`。
 
 ### P6 命令内部差异（清单 C1、C2）
 
