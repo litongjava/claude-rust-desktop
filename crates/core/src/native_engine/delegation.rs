@@ -104,6 +104,41 @@ fn owned_binding(
     })?
 }
 
+struct PreparedChild {
+    context: ServiceContext,
+    id: String,
+    agent_type: String,
+    child: ToolLoopExecutor,
+    receiver: tokio::sync::mpsc::Receiver<EngineEvent>,
+    policy: Value,
+    model: String,
+}
+
+/// Marks a teammate idle when its child finishes, or stopped when the leader
+/// future is cancelled or dropped.
+struct MemberGuard {
+    root: std::path::PathBuf,
+    team: String,
+    agent: String,
+    session: String,
+    finished: bool,
+}
+
+impl Drop for MemberGuard {
+    fn drop(&mut self) {
+        crate::services::teams::unregister_live(&self.session);
+        if !self.finished {
+            let _ = crate::services::teams::finish_member(
+                &self.root,
+                &self.team,
+                &self.agent,
+                "cancelled",
+                None,
+            );
+        }
+    }
+}
+
 impl ToolLoopExecutor {
     /// The worker may coordinate only children whose original runtime it still owns.
     /// This executor never executes a parent model turn or resolves new credentials.
@@ -394,24 +429,44 @@ impl ToolLoopExecutor {
         tools: Option<Vec<String>>,
         preapproved: bool,
     ) -> Result<Value> {
-        let mut approved_input = None;
-        if !preapproved {
+        let input = if preapproved {
+            input.clone()
+        } else {
             use crate::permissions::PermissionResult;
             let invocation_id = uuid::Uuid::new_v4().to_string();
             match self.check_permission("Agent", input, &invocation_id).await {
                 PermissionResult::Denied(reason) => {
                     anyhow::bail!("Delegation permission denied: {reason}")
                 }
-                PermissionResult::RequiresConfirmation(_) => {
-                    approved_input = Some(self.request_tool_approval("Agent", input, &invocation_id).await?);
-                }
-                PermissionResult::Granted => {}
+                PermissionResult::RequiresConfirmation(_) => self
+                    .request_tool_approval("Agent", input, &invocation_id)
+                    .await?,
+                PermissionResult::Granted => input.clone(),
             }
-        }
-        let input = approved_input.as_ref().unwrap_or(input);
+        };
         if let Some(id) = input["resume"].as_str() {
             return Box::pin(self.resume_owned_child(id, input["prompt"].as_str(), false)).await;
         }
+        let prepared = Box::pin(self.prepare_delegated_child(&input, schema, tools)).await?;
+        self.run_owned_child(
+            prepared.context,
+            prepared.id,
+            prepared.agent_type,
+            prepared.child,
+            prepared.receiver,
+            prepared.policy,
+        )
+        .await
+    }
+
+    /// Builds an owned child session without running it so a leader can start
+    /// several teammates before awaiting any of them.
+    async fn prepare_delegated_child(
+        &self,
+        input: &Value,
+        schema: Option<Value>,
+        tools: Option<Vec<String>>,
+    ) -> Result<PreparedChild> {
         ensure!(self.delegation_depth < 2, "Delegation depth limit reached");
         let prompt = input["prompt"].as_str().context("prompt is required")?;
         let max_prompt = if schema.is_some() {
@@ -555,6 +610,7 @@ impl ToolLoopExecutor {
         let child_max_tokens = self
             .max_tokens
             .min(provider.model.max_tokens.unwrap_or(self.max_tokens));
+        let model = provider.model.id.clone();
         let mut child = ToolLoopExecutor::new(
             provider,
             vec![json!({"role":"user","content":prompt})],
@@ -619,8 +675,120 @@ impl ToolLoopExecutor {
             child = child.with_memex(memory.clone());
         }
         let policy = self.child_owner_policy();
-        self.run_owned_child(context, id, definition.id, child, receiver, policy)
-            .await
+        Ok(PreparedChild {
+            model,
+            context,
+            id,
+            agent_type: definition.id.clone(),
+            child,
+            receiver,
+            policy,
+        })
+    }
+
+    /// Runs named teammates concurrently inside the leader's turn. Each child
+    /// owns its session, transcript and forked permission state; dropping the
+    /// leader future cancels all of them and marks the members stopped.
+    pub(super) async fn execute_team_spawn(&self, input: &Value) -> Result<Value> {
+        use crate::services::teams;
+        teams::ensure_enabled()?;
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .context("Runtime unavailable")?;
+        let session = self
+            .conv_id
+            .as_deref()
+            .context("Team tools require an active session")?;
+        let team_name = input["team_name"].as_str().context("team_name is required")?;
+        let team = teams::read_recovered(root, team_name)?
+            .with_context(|| format!("Team not found: {team_name}"))?;
+        ensure!(
+            team.lead_session_id == session,
+            "Only the team leader can spawn teammates"
+        );
+        let members = input["members"].as_array().context("members is required")?;
+        ensure!((1..=8).contains(&members.len()), "TeamSpawn needs 1-8 members");
+        let mut names = std::collections::HashSet::new();
+        for member in members {
+            let name = member["name"].as_str().context("member name is required")?;
+            let prompt = member["prompt"].as_str().context("member prompt is required")?;
+            ensure!(!name.trim().is_empty(), "Teammate name is required");
+            ensure!(name != teams::LEAD_NAME, "team-lead is reserved for the leader");
+            ensure!(names.insert(name.to_ascii_lowercase()), "Duplicate teammate name: {name}");
+            ensure!(
+                !prompt.trim().is_empty() && prompt.len() <= 64_000,
+                "Teammate prompt must contain 1-64000 bytes"
+            );
+        }
+        let cwd = std::path::Path::new(&self.workspace_cwd);
+        let team_name = team.name.clone();
+        let mut prepared = Vec::new();
+        for member in members {
+            let name = member["name"].as_str().unwrap_or_default();
+            let prompt = member["prompt"].as_str().unwrap_or_default();
+            let agent_type = member["agent_type"].as_str().unwrap_or("general");
+            let child = Box::pin(self.prepare_delegated_child(
+                &json!({"prompt":prompt,"agent_type":agent_type}),
+                None,
+                None,
+            ))
+            .await?;
+            let registered = teams::register_member(
+                root,
+                &team.name,
+                session,
+                name,
+                Some(agent_type),
+                Some(&child.model),
+                prompt,
+                cwd,
+            )?;
+            teams::bind_member_session(root, &team.name, &registered.agent_id, &child.id)?;
+            teams::register_live(&child.id);
+            prepared.push((name.to_owned(), registered.agent_id, child));
+        }
+        let results = futures::future::join_all(prepared.into_iter().map(
+            |(name, agent, child)| {
+                let team_name = team_name.clone();
+                async move {
+                let mut guard = MemberGuard {
+                    root: root.to_path_buf(),
+                    team: team_name.clone(),
+                    agent: agent.clone(),
+                    session: child.id.clone(),
+                    finished: false,
+                };
+                let session_id = child.id.clone();
+                let result = self
+                    .run_owned_child(
+                        child.context,
+                        child.id,
+                        child.agent_type,
+                        child.child,
+                        child.receiver,
+                        child.policy,
+                    )
+                    .await;
+                match result {
+                    Ok(value) => {
+                        let summary = value["result"].to_string();
+                        let _ = teams::finish_member(root, &team_name, &agent, "idle", Some(&summary));
+                        guard.finished = true;
+                        json!({"name":name,"agent_id":agent,"session_id":session_id,"status":"completed","result":value["result"]})
+                    }
+                    Err(error) => {
+                        let _ = teams::finish_member(root, &team_name, &agent, "failed", Some(&error.to_string()));
+                        guard.finished = true;
+                        json!({"name":name,"agent_id":agent,"session_id":session_id,"status":"failed","error":error.to_string()})
+                    }
+                }
+                }
+            },
+        ))
+        .await;
+        Ok(json!({"team_name":team_name,"members":results}))
     }
 
     async fn run_owned_child(
@@ -801,3 +969,7 @@ mod workspace_tests;
 #[cfg(test)]
 #[path = "delegation_resume_tests.rs"]
 mod resume_tests;
+
+#[cfg(test)]
+#[path = "team_spawn_tests.rs"]
+mod team_spawn_tests;

@@ -1,4 +1,4 @@
-//! Terminal commands migrated from the former CLI, now backed by claude-core.
+﻿//! Terminal commands migrated from the former CLI, now backed by claude-core.
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -95,6 +95,9 @@ pub struct Cli {
     /// UUID for a new conversation; existing IDs must be resumed explicitly.
     #[arg(long, conflicts_with_all=["resume", "continue_session", "fork_session"], value_parser=parse_session_id)]
     pub session_id: Option<String>,
+    /// Enable experimental agent teams (TeamCreate/TeamDelete/TeamSpawn).
+    #[arg(long = "agent-teams", global = true)]
+    pub agent_teams: bool,
     /// Create an isolated managed Git worktree; omit NAME to generate one.
     #[arg(short='w',long,num_args=0..=1,default_missing_value="",conflicts_with_all=["resume","continue_session","fork_session"])]
     pub worktree: Option<String>,

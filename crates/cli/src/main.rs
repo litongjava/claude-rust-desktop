@@ -1,4 +1,4 @@
-mod hook_progress;
+﻿mod hook_progress;
 mod launch_permissions;
 mod context_commands;
 mod persistent_worker;
@@ -87,6 +87,9 @@ async fn main() -> std::process::ExitCode {
         Err(error) => { eprintln!("Session host failed: {error:#}"); return std::process::ExitCode::FAILURE; },
     }
     let mut cli = Cli::parse_with_mode_source();
+    if cli.agent_teams {
+        std::env::set_var("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
+    }
     cli.normalize();
     terminal::configure_accessibility(cli.ax_screen_reader);
     debug_logging::install(cli.verbose);

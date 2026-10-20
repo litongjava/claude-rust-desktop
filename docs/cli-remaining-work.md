@@ -82,7 +82,7 @@
 
 入口：`crates/core/src/tools/coordination.rs`（当前 team 是持久任务记录）、`crates/core/src/native_engine/delegation.rs`（顺序执行委派）、`crates/core/src/tools/agent_messages.rs`（UUID 寻址文本消息）。参考：`reference:src/tools/TeamCreateTool/`、`TeamDeleteTool`、`SendMessageTool/SendMessageTool.ts`；原版受 `isAgentSwarmsEnabled()` 开关控制。
 
-- T1：团队身份、leader、命名成员与生命周期持久化；至少两个 teammate 并发；崩溃恢复不留孤儿进程；有活跃成员时拒绝删除。
+- [x] T1：`TeamCreate`/`TeamDelete` 按原版输入输出；团队文件与 `name@team` 成员持久化在运行时目录；`TeamSpawn`（本项目批量入口）并发运行多个命名 teammate，各自独立会话、transcript 与 fork 权限；leader 取消时成员标记 `cancelled`，重启后 active 但无对应进程的成员标记 `stale`；有活跃成员时拒绝删除并清理目录；`--agent-teams`/环境变量开关。core 625/0/7、CLI 269/0/1，含并发屏障、取消与独立 CLI 集成测试；差异（进程内并发替代 tmux、数字后缀命名、无远端 killswitch）见 `team-t1-acceptance-20261020.md`。
 - T2：按名字投递与 `*` 广播；shutdown_request/response 关联；teammate 计划审批路由到 leader；`/list-agents` 区分子 agent、teammate、独立会话。
 
 ### P5 SDK 兼容（清单 S1、S2）

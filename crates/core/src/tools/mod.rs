@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+﻿use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +18,7 @@ pub(crate) use lsp::validate_configuration as validate_lsp_configuration;
 mod worktrees;
 pub mod agent_messages;
 pub mod coordination;
+pub mod teams;
 pub mod scheduled;
 mod content_compat;
 mod utf8;
@@ -387,6 +388,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 
     defs.extend(tasks::definitions());
     defs.extend(coordination::definitions());
+    defs.extend(teams::definitions());
     defs.extend(crate::services::plans::definitions());
     defs.extend(content_compat::definitions());
     let mut legacy_lsp=lsp::definition();

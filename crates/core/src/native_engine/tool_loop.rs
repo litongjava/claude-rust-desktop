@@ -1283,6 +1283,31 @@ impl ToolLoopExecutor {
             let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
             return (tool_input.clone(), output, failed);
         }
+        if matches!(tool_name, "TeamCreate" | "TeamDelete" | "TeamSpawn") {
+            match self.check_permission(tool_name, tool_input, _tool_use_id).await {
+                PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
+                PermissionResult::RequiresConfirmation(message) => return self.execute_ask_user_confirmation(tool_name, tool_input, _tool_use_id, &message).await,
+                PermissionResult::Granted => {},
+            }
+            let result = if tool_name == "TeamSpawn" {
+                Box::pin(self.execute_team_spawn(tool_input)).await
+            } else {
+                match (self.search_config_path.as_deref().and_then(std::path::Path::parent), self.conv_id.as_deref()) {
+                    (Some(root), Some(session)) => crate::tools::teams::execute(
+                        tool_name,
+                        tool_input,
+                        root,
+                        session,
+                        std::path::Path::new(&self.workspace_cwd),
+                        Some(&self.provider.model.id),
+                    ),
+                    _ => Err(anyhow::anyhow!("Team tools require an active session and runtime directory")),
+                }
+            };
+            let failed = result.is_err();
+            let output = match result { Ok(value) => value.to_string(), Err(error) => error.to_string() };
+            return (tool_input.clone(), output, failed);
+        }
         if tool_name == "plan_mode" {
             match self.check_permission(tool_name, tool_input, _tool_use_id).await {
                 PermissionResult::Denied(reason) => return (tool_input.clone(), format!("Permission denied: {reason}"), true),
@@ -1964,6 +1989,9 @@ impl ToolLoopExecutor {
                                         | "Delegate"
                                         | "Worker"
                                         | "SendMessage"
+                                        | "TeamCreate"
+                                        | "TeamDelete"
+                                        | "TeamSpawn"
                                         | "team"
                                         | "plan_mode"
                                         | "EnterPlanMode"
@@ -2532,6 +2560,9 @@ impl ToolLoopExecutor {
                                 | "Delegate"
                                 | "Worker"
                                 | "SendMessage"
+                                | "TeamCreate"
+                                | "TeamDelete"
+                                | "TeamSpawn"
                                 | "team"
                                 | "plan_mode"
                                 | "EnterPlanMode"
