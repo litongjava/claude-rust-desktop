@@ -545,6 +545,12 @@ impl HookRunner {
             if reset || event == HookEvent::SessionEnd {
                 super::file_changed::stop(session_id).await;
             }
+            if reset {
+                super::session_environment::clear_cwd(
+                    self.once_directory.parent().unwrap_or(&self.workspace),
+                    session_id,
+                )?;
+            }
             let outcome = self.run_inner(event, session_id, payload).await;
             if reset && !self.disabled {
                 let paths = outcome
@@ -1137,19 +1143,26 @@ async fn execute(hook: &ActiveHook, cwd: &Path, input: &Value) -> Result<(i32, S
     if let Some(config) = &hook.http {
         return http::execute_http(hook, config, input).await;
     }
-    prepare_command(hook, cwd, input)?.await
+    prepare_command(hook, cwd, input, None)?.await
 }
 
 fn prepare_command(
     hook: &ActiveHook,
     cwd: &Path,
     input: &Value,
+    env_file: Option<&Path>,
 ) -> Result<futures::future::BoxFuture<'static, Result<(i32, String, String)>>> {
     let shell = hook
         .shell
         .as_deref()
         .unwrap_or(if cfg!(windows) { "cmd" } else { "sh" });
     let mut command = Command::new(shell);
+    command.env_remove("CLAUDE_ENV_FILE");
+    if !matches!(shell, "powershell" | "pwsh") {
+        if let Some(path) = env_file {
+            command.env("CLAUDE_ENV_FILE", path);
+        }
+    }
     match shell {
         "cmd" => {
             command.args(["/D", "/S", "/C"]);

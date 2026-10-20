@@ -52,7 +52,6 @@ fn blocked_path_prefixes() -> &'static [&'static str] {
             "/sys",
             "/proc",
             "/boot",
-            "/root",
             "/dev",
             "/var/log",
             "/var/run",

@@ -4,6 +4,7 @@ pub use decision::{DecisionOrigin, PermissionDecision};
 pub mod manager;
 pub mod rules;
 pub mod patterns;
+mod protected_paths;
 pub mod audit;
 
 pub use manager::{PermissionManager, PermissionMode};

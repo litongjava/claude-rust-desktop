@@ -32,6 +32,13 @@ pub(crate) async fn scope<F: Future>(context: Option<(PathBuf, String)>, future:
     CONTEXT.scope(context, future).await
 }
 
+pub(super) fn session_environment() -> Result<Option<String>> {
+    match CONTEXT.try_with(Clone::clone).ok().flatten() {
+        Some((root, session)) => crate::services::session_environment::script(&root, &session),
+        None => Ok(None),
+    }
+}
+
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Only tasks owned by this process keep its persistent worker alive.
 pub fn has_active() -> bool {

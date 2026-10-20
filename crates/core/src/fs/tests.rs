@@ -71,10 +71,10 @@ fn validate_path_blocks_proc() {
 }
 
 #[test]
-fn validate_path_blocks_root() {
-    if cfg!(not(windows)) {
-        let result = validate_path("/root/.ssh/id_rsa");
-        assert!(result.is_err());
+fn validate_path_does_not_blanket_block_root_home() {
+    if cfg!(unix) {
+        // Validation only; never create or read real root files.
+        assert!(validate_path("/root/project/probe.txt").is_ok());
     }
 }
 

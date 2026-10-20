@@ -75,8 +75,8 @@
 入口：`crates/core/src/services/hook_callbacks.rs`（仍拒绝 async SDK 结果；watchPaths 已支持）。设计参考 `temp/claude-code-cli-dev/sdk-hook-output-parity-plan.md`。
 
 - [x] `SessionStart.initialUserMessage`：command/HTTP/SDK 最后非空输出按实际观察顺序胜出；打印与 SDK 入口消费一次并先于调用方输入，持久化 hook 来源且不进入用户授权账本；UserPromptSubmit 正常触发一次。REPL/clear/compact 不自动提交，resume 只消费本次新输出，不重放历史。详见开发记录 `initial-user-message-acceptance-20261018.md`（含 ConPTY 与 auto classifier 隔离验收）。
-- [x] `watchPaths`：会话级原生 watcher，忽略初次发现、500 ms 去抖、add/change/unlink；缺失目标监视祖先后转为目标；动态集合替换、cwd 重置与会话隔离。审查修订：空闲不递归扫描，通知/pending 驱动 200 ms 采样，缺失路径 2 s metadata 兜底；spawn_blocking 执行快照与正常关闭；扫描上限 10,000 条，超限告警并降级到已知文件；关闭确认最长 2 s，超时告警。core watcher 8/0/0，含空闲计数、超限降级、关闭超时测试；Windows 全量 core 613/0/7、CLI 268/0/1。详见 `watchpaths-filechanged-acceptance-20261018.md`。历史 Linux inotify 5/0/0、macOS FSEvents 6/0/0 仅对应修订前隔离探针，本次按要求不重跑；task10 已完成完整跨平台编译/测试及 macOS FSEvents 系统别名修复，见 `unix-build-acceptance-20261018.md`；非 Windows 会话环境文件仍未验证。
-- 会话环境文件：原版在 Windows 返回 null，Windows 无需实现；Linux/macOS 需另行验证。
+- [x] `watchPaths`：会话级原生 watcher，忽略初次发现、500 ms 去抖、add/change/unlink；缺失目标监视祖先后转为目标；动态集合替换、cwd 重置与会话隔离。审查修订：空闲不递归扫描，通知/pending 驱动 200 ms 采样，缺失路径 2 s metadata 兜底；spawn_blocking 执行快照与正常关闭；扫描上限 10,000 条，超限告警并降级到已知文件；关闭确认最长 2 s，超时告警。core watcher 8/0/0，含空闲计数、超限降级、关闭超时测试；Windows 全量 core 613/0/7、CLI 268/0/1。详见 `watchpaths-filechanged-acceptance-20261018.md`。历史 Linux inotify 5/0/0、macOS FSEvents 6/0/0 仅对应修订前隔离探针，本次按要求不重跑；task10 已完成完整跨平台编译/测试及 macOS FSEvents 系统别名修复，见 `unix-build-acceptance-20261018.md`；非 Windows 会话环境文件已在 task11 验证（见 `unix-session-env-acceptance-20261018.md`）。
+- [x] 会话环境文件（`CLAUDE_ENV_FILE`）：Windows 按原版返回 null；Linux/macOS 在 Setup/SessionStart/CwdChanged/FileChanged 的非 PowerShell command hook 中提供私有 0700/0600 文件，经 Bash/sh/zsh 的 `eval` 前注入，cwd 重置清空 cwdchanged/filechanged，会话结束删除目录；符号链接拒绝、会话目录名 SHA256。Windows core 618/0/7、CLI 268/0/1；Linux/macOS `session_environment` 4/4、`protected_paths` 与 `fs::tests` 通过；两平台真实模型 Read+Bash 冒烟（含环境变量与清理）通过。详见 `unix-session-env-acceptance-20261018.md`。
 
 ### P4 团队（清单 T1、T2）
 

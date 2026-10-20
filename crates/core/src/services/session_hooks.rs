@@ -122,14 +122,19 @@ pub async fn end(
     super::file_changed::stop(session).await;
     super::tool_hooks::agent::cancel_session(session);
     super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
-    match result {
+    let cleanup = super::session_environment::close(&context.paths.data_dir, session);
+    let mut warnings = match result {
         Ok(Ok(outcome)) => outcome.warnings,
         Ok(Err(error)) => vec![format!("SessionEnd hook: {error:#}")],
         Err(_) => vec![format!(
             "SessionEnd hooks exceeded {} ms; shutdown continues",
             budget.as_millis()
         )],
+    };
+    if let Err(error) = cleanup {
+        warnings.push(format!("Session environment cleanup: {error:#}"));
     }
+    warnings
 }
 
 #[cfg(test)]

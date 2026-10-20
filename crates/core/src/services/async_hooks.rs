@@ -591,9 +591,16 @@ process.stdin.on('end',()=>{
                 let session = uuid::Uuid::new_v4().to_string();
                 run(&runner, &session).await;
                 let path = root.path().join(format!("{session}.pid"));
-                wait_for(|| path.exists()).await;
-                let pids: Vec<u32> =
-                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                let mut pids = Vec::new();
+                // The fixture creates the file before writing it; wait for content.
+                wait_for(|| {
+                    pids = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_default();
+                    !pids.is_empty()
+                })
+                .await;
                 assert!(pids.iter().all(|pid| alive(*pid)));
                 match mode {
                     "timeout" => {
@@ -752,8 +759,15 @@ process.stdin.on('end',()=>{
             .spawn()
             .unwrap();
         let path = root.path().join("exit-test.pid");
-        wait_for(|| path.exists()).await;
-        let pids: Vec<u32> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut pids = Vec::new();
+        wait_for(|| {
+            pids = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            !pids.is_empty()
+        })
+        .await;
         assert!(pids.iter().all(|pid| alive(*pid)));
         process.kill().unwrap();
         process.wait().unwrap();

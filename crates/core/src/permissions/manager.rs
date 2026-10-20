@@ -555,6 +555,21 @@ impl PermissionManager {
         }) {
             return decision(PermissionResult::Granted, SavedApproval);
         }
+        if mode != PermissionMode::BypassPermissions && Self::is_edit_tool(&context.tool_name) {
+            if let Some(path) = context.tool_input["file_path"]
+                .as_str()
+                .or_else(|| context.tool_input["path"].as_str())
+            {
+                let cwd = std::path::Path::new(context.workspace_path.as_deref().unwrap_or("."));
+                if super::protected_paths::requires_edit_approval(
+                    path,
+                    cwd,
+                    dirs::home_dir().as_deref(),
+                ) {
+                    return decision(self.request_confirmation(context), DefaultPrompt);
+                }
+            }
+        }
         if mode == PermissionMode::BypassPermissions
             || (mode == PermissionMode::AcceptEdits && Self::is_edit_tool(&context.tool_name))
         {

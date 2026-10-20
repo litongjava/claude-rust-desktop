@@ -1050,6 +1050,30 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     } else {
         command.to_string()
     };
+    let command = if !cfg!(windows) {
+        match background_shell::session_environment()? {
+            Some(script)
+                if matches!(shell_type.to_lowercase().as_str(), "bash" | "sh" | "zsh") =>
+            {
+                format!(
+                    "{{\n{script}\n}} && eval '{}'",
+                    command.replace('\'', "'\"'\"'")
+                )
+            }
+            // Upstream injects the session environment only through its bash
+            // provider; other shells keep working without it.
+            Some(_) => {
+                tracing::warn!(
+                    shell = %shell_type,
+                    "Session environment files apply to bash, sh and zsh; running without one"
+                );
+                command
+            }
+            None => command,
+        }
+    } else {
+        command
+    };
     #[cfg(windows)]
     if flag == "/C" {
         // cmd uses its own quoting rules; normal Windows argument escaping adds

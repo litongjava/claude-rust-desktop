@@ -26,11 +26,29 @@ impl HookRunner {
             return prompt::execute_prompt(hook, config, self.prompt_provider.as_ref(), input)
                 .await;
         }
+        let env_file = if hook.http.is_none()
+            && !matches!(hook.shell.as_deref(), Some("powershell" | "pwsh"))
+        {
+            let index = self
+                .hooks
+                .iter()
+                .take_while(|entry| !std::ptr::eq(*entry, hook))
+                .filter(|entry| entry.event == hook.event)
+                .count();
+            super::super::session_environment::hook_file(
+                self.once_directory.parent().unwrap_or(&self.workspace),
+                session,
+                hook.event,
+                index,
+            )?
+        } else {
+            None
+        };
         if hook.asynchronous
             && !self.force_sync
             && !matches!(hook.event, HookEvent::CwdChanged | HookEvent::FileChanged)
         {
-            let task = prepare_command(hook, &self.workspace, input)?;
+            let task = prepare_command(hook, &self.workspace, input, env_file.as_deref())?;
             super::super::async_hooks::register(
                 self.once_directory
                     .parent()
@@ -55,7 +73,11 @@ impl HookRunner {
             )?;
             Ok((0, String::new(), String::new()))
         } else {
-            execute(hook, &self.workspace, input).await
+            if hook.http.is_some() {
+                execute(hook, &self.workspace, input).await
+            } else {
+                prepare_command(hook, &self.workspace, input, env_file.as_deref())?.await
+            }
         }
     }
     pub(super) async fn execute_once(
