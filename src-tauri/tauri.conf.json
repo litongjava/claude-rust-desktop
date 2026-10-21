@@ -1,6 +1,6 @@
 {
-  "productName": "ccd",
-  "mainBinaryName": "ccd",
+  "productName": "dcd",
+  "mainBinaryName": "dcd",
   "version": "3.1.0",
   "identifier": "com.claude.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Claude Code Desktop",
+        "title": "DeepSeek Code Desktop",
         "width": 1150,
         "height": 700,
         "minWidth": 800,

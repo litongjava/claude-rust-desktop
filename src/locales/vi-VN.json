@@ -245,7 +245,7 @@
     "closeTrust": "Đóng hộp thoại tin cậy",
     "trustOneTitle": "Tin cậy thư mục này?",
     "trustManyTitle": "Tin cậy những thư mục này?",
-    "trustDescription": "Claude Rust có thể đọc, chỉnh sửa và thực thi các tệp tại đây. Cài đặt thư mục có thể chạy mã tự động. Chỉ tiếp tục nếu bạn tin cậy những tập tin này.",
+    "trustDescription": "DeepSeek Code có thể đọc, chỉnh sửa và thực thi các tệp tại đây. Cài đặt thư mục có thể chạy mã tự động. Chỉ tiếp tục nếu bạn tin cậy những tập tin này.",
     "trustOne": "Thư mục tin cậy",
     "trustMany": "Thư mục tin cậy",
     "saving": "Đang lưu..."

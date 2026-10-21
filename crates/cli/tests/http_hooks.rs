@@ -60,7 +60,7 @@ async fn http_deny_prevents_real_write_and_once_is_not_replayed_after_resume() {
     for resume in [false, true] {
         let output = tokio::time::timeout(
             Duration::from_secs(30),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"))
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
                 .current_dir(&workspace)
                 .stdin(Stdio::null())
                 .kill_on_drop(true)

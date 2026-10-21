@@ -54,7 +54,7 @@ async fn print_initial_turn_once_before_caller_and_resume_only_uses_fresh_output
             std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
             let id = uuid::Uuid::new_v4().to_string();
             for resume in [false, true] {
-                let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+                let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
                 command
                     .current_dir(root.path())
                     .stdin(Stdio::null())

@@ -295,7 +295,7 @@ impl Client {
     }
     fn start(root: &Path, server: &Server, extra: &[&str]) -> Self {
         std::fs::write(root.join("fixture.txt"), "SDK_READ_SENTINEL").unwrap();
-        let mut command = Command::new(std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_ccl").into()));
+        let mut command = Command::new(std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dcl").into()));
         command
             .args([
                 "--data-dir",

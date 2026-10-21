@@ -1,4 +1,4 @@
-use claude_desktop_tauri_lib::db::{DbManager, message_repo};
+use deepseek_desktop_tauri_lib::db::{DbManager, message_repo};
 use serde_json::json;
 
 #[test]

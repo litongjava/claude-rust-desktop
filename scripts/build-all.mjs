@@ -27,8 +27,8 @@ function run(command, argv, capture = false) {
 }
 
 if (args.has('--check')) {
-  if (cli) run('cargo', ['check', '--locked', '-p', 'claude-code-cli', '--all-targets']);
-  if (desktop) run('cargo', ['check', '--locked', '-p', 'claude-code-desktop', '--all-targets']);
+  if (cli) run('cargo', ['check', '--locked', '-p', 'deepseek-code-cli', '--all-targets']);
+  if (desktop) run('cargo', ['check', '--locked', '-p', 'deepseek-code-desktop', '--all-targets']);
   process.exit(0);
 }
 
@@ -41,10 +41,10 @@ const output = join(root, 'artifacts', `${version}-${profile}-${stamp}`);
 mkdirSync(output, { recursive: true });
 const products = [];
 if (cli) {
-  run('cargo', ['build', '--locked', '-p', 'claude-code-cli', ...(debug ? [] : ['--release'])]);
+  run('cargo', ['build', '--locked', '-p', 'deepseek-code-cli', ...(debug ? [] : ['--release'])]);
   const cliDir = join(output, 'cli');
   mkdirSync(cliDir, { recursive: true });
-  copyFileSync(join(target, `ccl${exe}`), join(cliDir, `ccl${exe}`));
+  copyFileSync(join(target, `dcl${exe}`), join(cliDir, `dcl${exe}`));
   copyFileSync('crates/cli/LICENSE', join(cliDir, 'LICENSE'));
   products.push('cli');
 }
@@ -55,7 +55,7 @@ if (desktop) {
   run(process.execPath, [tauri, 'build', '--ci', ...(debug ? ['--debug'] : []), ...(args.has('--no-bundle') ? ['--no-bundle'] : []), '--', '--locked']);
   const desktopDir = join(output, 'desktop');
   mkdirSync(desktopDir, { recursive: true });
-  copyFileSync(join(target, `ccd${exe}`), join(desktopDir, `ccd${exe}`));
+  copyFileSync(join(target, `dcd${exe}`), join(desktopDir, `dcd${exe}`));
   if (!args.has('--no-bundle')) {
     const bundle = join(target, 'bundle');
     let copied = 0;

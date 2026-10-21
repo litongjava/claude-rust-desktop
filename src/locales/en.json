@@ -284,7 +284,7 @@
     "closeTrust": "Close trust dialog",
     "trustOneTitle": "Trust this folder?",
     "trustManyTitle": "Trust these folders?",
-    "trustDescription": "Claude Rust can read, edit, and execute files here. Folder settings may run code automatically. Continue only if you trust these files.",
+    "trustDescription": "DeepSeek Code can read, edit, and execute files here. Folder settings may run code automatically. Continue only if you trust these files.",
     "trustOne": "Trust folder",
     "trustMany": "Trust folders",
     "saving": "Saving..."

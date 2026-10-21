@@ -713,7 +713,7 @@ impl Session {
         if let Some(goal) = crate::session_commands::goal_prompt(self)? {
             system.push_str(&goal);
         }
-        system.push_str("\nThe user is working in the standalone Claude Rust terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
+        system.push_str("\nThe user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
         let cwd = &self.workspace;
         if self.sdk_content.is_some() {
             anyhow::ensure!(
@@ -1341,7 +1341,7 @@ mod event_tests {
             providers: vec![serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap()],
             provider_id:"fixture".into(), model:"fixture".into(),
         };
-        let cli = Cli::try_parse_with_mode_source(["ccl"]).unwrap();
+        let cli = Cli::try_parse_with_mode_source(["dcl"]).unwrap();
         let first = Session::open(&cli, &paths, selection(), None).await.unwrap();
         first.set_permission_mode("plan").await.unwrap();
         let saved = first.id.clone();
@@ -1357,7 +1357,7 @@ mod event_tests {
         restored.cycle_permission_mode().await.unwrap();
         assert_eq!(restored.permission_mode(), "ask");
         restored.close().await.unwrap();
-        let explicit = Cli::try_parse_with_mode_source(["ccl", "--permission-mode", "ask"]).unwrap();
+        let explicit = Cli::try_parse_with_mode_source(["dcl", "--permission-mode", "ask"]).unwrap();
         let overridden = Session::open(&explicit, &paths, selection(), Some(&saved)).await.unwrap();
         assert_eq!(overridden.permission_mode(), "ask");
         overridden.set_permission_mode("bypass").await.unwrap();
@@ -1378,7 +1378,7 @@ mod event_tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let cli = Cli::parse_from(["ccl", "--print", "--permission-mode", "bypass"]);
+        let cli = Cli::parse_from(["dcl", "--print", "--permission-mode", "bypass"]);
         let mut session = Session::open(&cli, &paths, selection, None).await.unwrap();
         crate::extended_commands::handle("/plan", "", &paths, &mut session)
             .await
@@ -1410,7 +1410,7 @@ mod event_tests {
         let dir=tempfile::tempdir().unwrap();let paths=RuntimePaths::new(dir.path().join("data")).unwrap();
         let provider=serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"fixture-only","api_format":"openai","enabled":true,"models":[{"id":"flash","name":"Flash","enabled":true,"supports_vision":false,"supports_web_search":false,"context_window":128000}]})).unwrap();
         let selection=Selection{providers:vec![provider],provider_id:"fixture".into(),model:"flash[1m]".into()};
-        let cli=Cli::parse_from(["ccl","--print"]);
+        let cli=Cli::parse_from(["dcl","--print"]);
         let mut session=Session::open(&cli,&paths,selection,None).await.unwrap();
         assert_eq!(session.context_window().await,Some(1_000_000));assert_eq!(session.model,"flash[1m]");
         let resolved=session.selected_provider().await.unwrap();
@@ -1442,7 +1442,7 @@ mod event_tests {
         let server = tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
         let provider = serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":format!("http://{address}/v1"),"api_key":"fixture-only","api_format":"openai","enabled":true,"web_search_strategy":null,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"max_tokens":64,"supports_vision":false,"supports_web_search":false}]})).unwrap();
         let selection = Selection { providers:vec![provider],provider_id:"fixture".into(),model:"fixture-model".into() };
-        let cli = Cli::try_parse_from(["ccl", "--print", "--output-format", "stream-json"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl", "--print", "--output-format", "stream-json"]).unwrap();
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store.create(directory.path(), "fixture-model", "fixture").unwrap();
         let session = Session::open(&cli, &paths, selection, Some(&id)).await.unwrap();

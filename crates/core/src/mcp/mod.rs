@@ -777,7 +777,7 @@ impl McpConnector {
                     "elicitation": {}
                 },
                 "clientInfo": {
-                    "name": "claude-code-desktop",
+                    "name": "deepseek-code-desktop",
                     "version": "1.6.12"
                 }
             })),

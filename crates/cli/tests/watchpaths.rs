@@ -36,7 +36,7 @@ async fn standalone_session_start_watchpaths_dispatches_filechanged_and_exits_cl
         axum::serve(listener, app).await.unwrap();
     });
     let id = uuid::Uuid::new_v4().to_string();
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"))
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
         .current_dir(dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

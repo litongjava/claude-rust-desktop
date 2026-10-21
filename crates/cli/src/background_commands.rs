@@ -46,7 +46,7 @@ pub async fn handle(
                 claude_core::services::session_parking::park(&context, &session.id, &target, &executable).await
                     .with_context(||format!("Session {target} remains saved; idle worker preparation failed"))?;
                 eprintln!("Session {target}: idle worker waiting for input. No model request or task was started. Worker exits after 5 idle minutes; the saved session remains resumable.");
-                eprintln!("Resume: ccl --data-dir \"{}\" --resume {target}", paths.data_dir.display());
+                eprintln!("Resume: dcl --data-dir \"{}\" --resume {target}", paths.data_dir.display());
                 eprintln!("Saved provider: {}; model: {}. Temporary provider credentials must be supplied again when resuming. Bypass permissions require explicit opt-in on resume.", session.provider_id, session.model);
                 if command == "/background" {
                     eprintln!("Current session moved to the background; returning this terminal to the shell.");
@@ -546,7 +546,7 @@ mod tests {
             .create(directory.path(), "side-model", "side-provider")
             .unwrap();
         store.append(&id, "user", "Main task context").unwrap();
-        let cli = Cli::try_parse_from(["ccl"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
         let session = Session::open(
             &cli,
             &paths,
@@ -612,7 +612,7 @@ mod worker_config_tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let cli = Cli::parse_from(["ccl"]);
+        let cli = Cli::parse_from(["dcl"]);
         let session = Session::open(&cli, &paths, selection, None).await.unwrap();
         std::fs::create_dir_all(paths.data_dir.join("tasks")).unwrap();
         std::fs::write(paths.data_dir.join("tasks").join(format!("{}.sqlite3", session.id)), b"not a SQLite database").unwrap();
@@ -632,7 +632,7 @@ mod worker_config_tests {
             model: "fixture-model".into(),
         };
         let mut cli = Cli::parse_from([
-            "ccl",
+            "dcl",
             "--effort",
             "off",
             "--allowedTools",
@@ -650,7 +650,7 @@ mod worker_config_tests {
         resolved.model.effort = Some("high".into());
         let prompt = "--disallowed-tools this is literal user input";
         let args = arguments(&cli, &paths, &session, &session.id, prompt, &resolved).unwrap();
-        let worker = Cli::parse_from(std::iter::once("ccl".into()).chain(args));
+        let worker = Cli::parse_from(std::iter::once("dcl".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("off"));
         assert_eq!(worker.prompt.as_deref(), Some(prompt));
         assert_eq!(worker.allowed_tools, cli.allowed_tools);
@@ -663,7 +663,7 @@ mod worker_config_tests {
         cli.allowed_tools.clear();
         cli.disallowed_tools.clear();
         let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
-        let worker = Cli::parse_from(std::iter::once("ccl".into()).chain(args));
+        let worker = Cli::parse_from(std::iter::once("dcl".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("high"));
         // A new frontend launch must not borrow the previous launch's session snapshot.
         assert!(crate::launch_permissions::rules(&worker)

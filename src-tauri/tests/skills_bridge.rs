@@ -1,4 +1,4 @@
-use claude_desktop_tauri_lib::{
+use deepseek_desktop_tauri_lib::{
     bridge::BridgeServer,
     runtime::{RuntimePaths, SessionStore},
     skills::SkillsManager,
@@ -11,7 +11,7 @@ use std::sync::{
 
 #[tokio::test]
 async fn skills_bridge_streams_with_permissions_rejects_disabled_and_cancels_disconnect() {
-    claude_desktop_tauri_lib::config::OrchestrationConfig::init_global().unwrap();
+    deepseek_desktop_tauri_lib::config::OrchestrationConfig::init_global().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();
@@ -180,7 +180,7 @@ async fn skills_bridge_streams_with_permissions_rejects_disabled_and_cancels_dis
     );
     let rows = db
         .with_conn(|conn| {
-            claude_desktop_tauri_lib::db::message_repo::get_messages_by_conversation(
+            deepseek_desktop_tauri_lib::db::message_repo::get_messages_by_conversation(
                 conn, &cancel_id,
             )
         })

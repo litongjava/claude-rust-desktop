@@ -245,7 +245,7 @@
     "closeTrust": "Fechar diálogo de confiança",
     "trustOneTitle": "Confia nesta pasta?",
     "trustManyTitle": "Confia nessas pastas?",
-    "trustDescription": "Claude Rust pode ler, editar e executar arquivos aqui. As configurações de pasta podem executar o código automaticamente. Continue apenas se você confiar nesses arquivos.",
+    "trustDescription": "DeepSeek Code pode ler, editar e executar arquivos aqui. As configurações de pasta podem executar o código automaticamente. Continue apenas se você confiar nesses arquivos.",
     "trustOne": "Pasta confiável",
     "trustMany": "Confiar em pastas",
     "saving": "Salvando..."

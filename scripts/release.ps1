@@ -29,7 +29,7 @@ if (-not $SkipBuild) {
     $metadataJson = cargo metadata --no-deps --format-version 1
     if ($LASTEXITCODE -ne 0) { throw "Cannot determine Cargo output directory" }
     $targetDir = ($metadataJson | ConvertFrom-Json).target_directory
-    $exePath = Join-Path $targetDir "release\ccd.exe"
+    $exePath = Join-Path $targetDir "release\dcd.exe"
     $msiPath = Get-ChildItem (Join-Path $targetDir "release\bundle\msi\*.msi") -ErrorAction SilentlyContinue | Select-Object -First 1
     
     if (Test-Path $exePath) {

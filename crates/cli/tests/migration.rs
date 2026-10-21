@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::process::{Command, Output};
 
 fn invoke(root: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ccl"))
+    Command::new(env!("CARGO_BIN_EXE_dcl"))
         .arg("--data-dir")
         .arg(root.join("data"))
         .args(args)

@@ -1,17 +1,17 @@
 [package]
-name = "claude-code-desktop"
-default-run = "ccd"
+name = "deepseek-code-desktop"
+default-run = "dcd"
 version = "3.1.0"
-description = "Claude Desktop - AI assistant with native capabilities (Tauri Edition)"
+description = "DeepSeek Code Desktop - AI assistant with native capabilities (Tauri Edition)"
 authors = ["you"]
 edition = "2021"
 
 [[bin]]
-name = "ccd"
+name = "dcd"
 path = "src/main.rs"
 
 [lib]
-name = "claude_desktop_tauri_lib"
+name = "deepseek_desktop_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

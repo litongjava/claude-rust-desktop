@@ -98,7 +98,7 @@ export default function AdminRedemption() {
 
   const buildRedeemMessage = (code: string) => (
     `您的兑换码：${code}\n` +
-    '请到 Claude Rust 注册一个账号，注册完成后在用户面板进行套餐的兑换。感谢您的支持~'
+    '请到 DeepSeek Code 注册一个账号，注册完成后在用户面板进行套餐的兑换。感谢您的支持~'
   );
 
   const handleQuickGenerateAndCopy = async (plan: any) => {

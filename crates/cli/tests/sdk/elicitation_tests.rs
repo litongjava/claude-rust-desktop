@@ -119,7 +119,7 @@ async fn elicitation_noninteractive_without_hooks_cancels() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
     let server = start_server(false, vec![("mcp__fixture__elicit", json!({}))]).await;
-    let output = Command::new(env!("CARGO_BIN_EXE_ccl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dcl"))
         .args([
             "--data-dir",
             root.path().join("data").to_str().unwrap(),

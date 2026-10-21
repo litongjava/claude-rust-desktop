@@ -778,7 +778,7 @@ mod failure_tests {
         let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
         let child = store.create(temp.path(), "fixture", "fixture").unwrap();
-        let cli = Cli::try_parse_from(["ccl"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
         let mut provider = claude_core::runtime::provider_from_config(&crate::config::provider_template("fixture"));
         provider.id = "fixture".into();
         let session = Session::open(&cli, &paths, crate::config::Selection {
@@ -878,7 +878,7 @@ mod failure_tests {
             "{\"type\":\"result\",\"result\":\"existing answer\"}\n"
         );
         std::fs::write(directory.join("output.jsonl"), events).unwrap();
-        let cli = Cli::try_parse_from(["ccl"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
         for session_id in [&parent, &child] {
             let mut provider = claude_core::runtime::provider_from_config(
                 &crate::config::provider_template("fixture"),
@@ -927,7 +927,7 @@ mod failure_tests {
             &crate::config::provider_template("fixture"),
         );
         provider.id = "fixture".into();
-        let cli = Cli::try_parse_from(["ccl"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
         let session = Session::open(
             &cli,
             &paths,
@@ -985,7 +985,7 @@ mod failure_tests {
             &crate::config::provider_template("fixture"),
         );
         provider.id = "fixture".into();
-        let cli = Cli::try_parse_from(["ccl"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
         let session = Session::open(
             &cli,
             &paths,

@@ -245,7 +245,7 @@
     "closeTrust": "Sluit het vertrouwensdialoogvenster",
     "trustOneTitle": "Deze map vertrouwen?",
     "trustManyTitle": "Deze mappen vertrouwen?",
-    "trustDescription": "Claude Rust kan hier bestanden lezen, bewerken en uitvoeren. Mapinstellingen kunnen code automatisch uitvoeren. Ga alleen verder als u deze bestanden vertrouwt.",
+    "trustDescription": "DeepSeek Code kan hier bestanden lezen, bewerken en uitvoeren. Mapinstellingen kunnen code automatisch uitvoeren. Ga alleen verder als u deze bestanden vertrouwt.",
     "trustOne": "Vertrouwensmap",
     "trustMany": "Vertrouwensmappen",
     "saving": "Opslaan..."

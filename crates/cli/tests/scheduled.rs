@@ -13,7 +13,7 @@ use std::{
 use tokio::process::Command;
 
 fn cli(data: &Path, project: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ccl"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .arg("--data-dir")
         .arg(data)

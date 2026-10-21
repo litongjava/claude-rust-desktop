@@ -245,7 +245,7 @@
     "closeTrust": "Cerrar el diálogo de confianza",
     "trustOneTitle": "¿Confiar en esta carpeta?",
     "trustManyTitle": "¿Confiar en estas carpetas?",
-    "trustDescription": "Claude Rust puede leer, editar y ejecutar archivos aquí. La configuración de la carpeta puede ejecutar código automáticamente. Continúe solo si confía en estos archivos.",
+    "trustDescription": "DeepSeek Code puede leer, editar y ejecutar archivos aquí. La configuración de la carpeta puede ejecutar código automáticamente. Continúe solo si confía en estos archivos.",
     "trustOne": "Carpeta de confianza",
     "trustMany": "Carpetas de confianza",
     "saving": "Guardando..."

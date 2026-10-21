@@ -88,7 +88,7 @@ async fn agent_deny_prevents_real_write() {
     let session = uuid::Uuid::new_v4().to_string();
     let output = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"))
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
             .current_dir(&workspace)
             .stdin(Stdio::null())
             .kill_on_drop(true)

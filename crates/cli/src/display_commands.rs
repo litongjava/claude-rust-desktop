@@ -345,7 +345,7 @@ pub async fn handle(
                 words.push("list".into());
             }
             let parsed = Cli::try_parse_from(
-                ["ccl".into(), "plugin".into()]
+                ["dcl".into(), "plugin".into()]
                     .into_iter()
                     .chain(words),
             )

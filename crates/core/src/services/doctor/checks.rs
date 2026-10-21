@@ -319,9 +319,9 @@ fn installation(report: &mut DoctorReport, env: &Environment) {
     let mut found = Vec::new();
     for directory in env.search_path.iter().take(128) {
         let names: &[&str] = if cfg!(windows) {
-            &["ccl.exe", "ccl.cmd", "ccl.bat"]
+            &["dcl.exe", "dcl.cmd", "dcl.bat"]
         } else {
-            &["ccl"]
+            &["dcl"]
         };
         for name in names {
             let path = directory.join(name);
@@ -333,7 +333,7 @@ fn installation(report: &mut DoctorReport, env: &Environment) {
             }
         }
     }
-    report.add("Rust CLI PATH", if found.len() > 1 { "warning" } else if found.is_empty() { "info" } else { "ok" }, &format!("{} distinct ccl launchers in the first 128 PATH entries; no executable was run; npm/official Claude installation not inferred", found.len()));
+    report.add("Rust CLI PATH", if found.len() > 1 { "warning" } else if found.is_empty() { "info" } else { "ok" }, &format!("{} distinct dcl launchers in the first 128 PATH entries; no executable was run; npm/official Claude installation not inferred", found.len()));
     for path in found {
         report.add("Rust CLI PATH candidate", "info", &path_label(&path));
     }

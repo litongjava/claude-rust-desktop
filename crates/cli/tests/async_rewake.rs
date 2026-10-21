@@ -63,7 +63,7 @@ clearInterval(t);console.log('STDOUT_NOT_PREFERRED');console.error('IDLE_REWAKE_
     } else {
         "hook-worker"
     });
-    std::fs::copy(env!("CARGO_BIN_EXE_ccl"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_dcl"), &executable).unwrap();
     let host = worker::ensure_worker(&paths.data_dir, &executable, &session, &workspace)
         .await
         .unwrap();

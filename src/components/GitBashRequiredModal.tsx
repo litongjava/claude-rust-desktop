@@ -49,7 +49,7 @@ const GitBashRequiredModal: React.FC<Props> = ({ onResolved }) => {
           </div>
           <div className="flex-1">
             <h2 className="text-[17px] font-semibold text-claude-text">需要安装 Git for Windows</h2>
-            <p className="text-[13px] text-claude-textSecondary mt-1">Claude Desktop 在 Windows 上需要 git-bash 才能运行内置工具。</p>
+            <p className="text-[13px] text-claude-textSecondary mt-1">DeepSeek Code Desktop 在 Windows 上需要 git-bash 才能运行内置工具。</p>
           </div>
         </div>
 
@@ -82,7 +82,7 @@ const GitBashRequiredModal: React.FC<Props> = ({ onResolved }) => {
         </div>
 
         <p className="text-[11px] text-claude-textSecondary text-center mt-4">
-          已安装但未生效？请尝试关闭并重新打开 Claude Desktop。
+          已安装但未生效？请尝试关闭并重新打开 DeepSeek Code Desktop。
         </p>
       </div>
     </div>

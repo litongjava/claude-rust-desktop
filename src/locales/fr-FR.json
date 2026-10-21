@@ -245,7 +245,7 @@
     "closeTrust": "Fermer la boîte de dialogue de confiance",
     "trustOneTitle": "Faire confiance à ce dossier ?",
     "trustManyTitle": "Faire confiance à ces dossiers ?",
-    "trustDescription": "Claude Rust peut lire, éditer et exécuter des fichiers ici. Les paramètres du dossier peuvent exécuter le code automatiquement. Continuez uniquement si vous faites confiance à ces fichiers.",
+    "trustDescription": "DeepSeek Code peut lire, éditer et exécuter des fichiers ici. Les paramètres du dossier peuvent exécuter le code automatiquement. Continuez uniquement si vous faites confiance à ces fichiers.",
     "trustOne": "Dossier de confiance",
     "trustMany": "Dossiers de confiance",
     "saving": "Sauvegarde..."

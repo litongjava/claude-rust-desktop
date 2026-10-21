@@ -245,7 +245,7 @@
     "closeTrust": "[0156] Zamknij okno dialogowe zaufania",
     "trustOneTitle": "[0157] Zaufać temu folderowi?",
     "trustManyTitle": "[0158] Zaufać tym folderom?",
-    "trustDescription": "[0159] Claude Rust może tutaj czytać, edytować i wykonywać pliki. Ustawienia folderu mogą automatycznie uruchamiać kod. Kontynuuj tylko wtedy, gdy ufasz tym plikom.",
+    "trustDescription": "[0159] DeepSeek Code może tutaj czytać, edytować i wykonywać pliki. Ustawienia folderu mogą automatycznie uruchamiać kod. Kontynuuj tylko wtedy, gdy ufasz tym plikom.",
     "trustOne": "[0160] Folder zaufania",
     "trustMany": "[0161] Foldery zaufania",
     "saving": "[0162] Zapisywanie..."

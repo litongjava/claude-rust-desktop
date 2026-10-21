@@ -384,7 +384,7 @@
                         <input type="password" id="apiKey" placeholder="sk-ant-api03-… (Anthropic API key)">
                         <button class="btn btn-secondary btn-sm" onclick="detectBridge()">Auto-detect</button>
                     </div>
-                    <p class="api-note" id="apiNote">Leave empty to try the local Claude Desktop bridge. Or paste your Anthropic API key above. Your key is never stored.</p>
+                    <p class="api-note" id="apiNote">Leave empty to try the local DeepSeek Code Desktop bridge. Or paste your Anthropic API key above. Your key is never stored.</p>
                 </details>
             </div>
 
@@ -446,9 +446,9 @@ async function detectBridge() {
         });
         if (resp.ok) {
             bridgeAvailable = true;
-            $('apiNote').innerHTML = '<span class="env-indicator env-ok">✓ Claude Desktop bridge detected</span> — using it for API calls.';
+            $('apiNote').innerHTML = '<span class="env-indicator env-ok">✓ DeepSeek Code Desktop bridge detected</span> — using it for API calls.';
             $('apiKey').value = '';
-            toast('Bridge detected! Using local Claude Desktop.');
+            toast('Bridge detected! Using local DeepSeek Code Desktop.');
         } else {
             throw new Error('Not ok');
         }
@@ -470,7 +470,7 @@ async function detectBridge() {
         });
         if (resp.ok) {
             bridgeAvailable = true;
-            $('apiNote').innerHTML = '<span class="env-indicator env-ok">✓ Claude Desktop bridge detected</span> — using it automatically.';
+            $('apiNote').innerHTML = '<span class="env-indicator env-ok">✓ DeepSeek Code Desktop bridge detected</span> — using it automatically.';
         }
     } catch (_) {
         bridgeAvailable = false;
@@ -586,7 +586,7 @@ async function callClaude(systemPrompt, userMessage) {
         return await callViaBridge(systemPrompt, userMessage);
     }
 
-    throw new Error('No API key and no local bridge. Please enter your Anthropic API key or open Claude Desktop.');
+    throw new Error('No API key and no local bridge. Please enter your Anthropic API key or open DeepSeek Code Desktop.');
 }
 
 async function callAnthropicDirect(apiKey, systemPrompt, userMessage) {

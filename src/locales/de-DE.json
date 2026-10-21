@@ -245,7 +245,7 @@
     "closeTrust": "Vertrauensdialog schließen",
     "trustOneTitle": "Diesem Ordner vertrauen?",
     "trustManyTitle": "Vertrauen Sie diesen Ordnern?",
-    "trustDescription": "Claude Rust kann hier Dateien lesen, bearbeiten und ausführen. Ordnereinstellungen führen möglicherweise automatisch Code aus. Fahren Sie nur fort, wenn Sie diesen Dateien vertrauen.",
+    "trustDescription": "DeepSeek Code kann hier Dateien lesen, bearbeiten und ausführen. Ordnereinstellungen führen möglicherweise automatisch Code aus. Fahren Sie nur fort, wenn Sie diesen Dateien vertrauen.",
     "trustOne": "Vertrauensordner",
     "trustMany": "Vertrauensordner",
     "saving": "Speichern..."

@@ -70,7 +70,7 @@ async fn model_skill_tool_runs_a_real_isolated_child_and_returns_its_result() {
         .route("/v1/chat/completions", post(model_skill_respond))
         .with_state(requests.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .current_dir(&workspace)
         .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
@@ -181,7 +181,7 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
         ("", "bypass", true),
     ] {
         std::fs::write(directory.join("SKILL.md"),format!("---\nshell: {shell}\n{extra}---\nInspect requested target $ARGUMENTS.\n!`{script}`\n")).unwrap();
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
         command
             .current_dir(&workspace)
             .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
@@ -291,7 +291,7 @@ async fn doctor_injects_real_snapshot_despite_bad_skill_and_respects_custom_over
         if prompt == "/doctor custom request" {
             std::fs::write(&bad, "CUSTOM_DOCTOR_INSTRUCTIONS $ARGUMENTS").unwrap();
         }
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
         command
             .current_dir(&workspace)
             .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
@@ -363,7 +363,7 @@ async fn doctor_sdk_manual_invocation_uses_shared_native_snapshot() {
         .route("/v1/chat/completions", post(respond))
         .with_state(requests.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .current_dir(temp.path())
         .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))

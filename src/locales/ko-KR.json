@@ -245,7 +245,7 @@
     "closeTrust": "신뢰 대화 상자 닫기",
     "trustOneTitle": "이 폴더를 신뢰하시겠습니까?",
     "trustManyTitle": "이 폴더를 신뢰하시겠습니까?",
-    "trustDescription": "Claude Rust은 여기에서 파일을 읽고, 편집하고, 실행할 수 있습니다. 폴더 설정은 코드를 자동으로 실행할 수 있습니다. 이 파일을 신뢰하는 경우에만 계속하세요.",
+    "trustDescription": "DeepSeek Code은 여기에서 파일을 읽고, 편집하고, 실행할 수 있습니다. 폴더 설정은 코드를 자동으로 실행할 수 있습니다. 이 파일을 신뢰하는 경우에만 계속하세요.",
     "trustOne": "신뢰 폴더",
     "trustMany": "신뢰 폴더",
     "saving": "저장 중..."

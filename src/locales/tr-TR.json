@@ -245,7 +245,7 @@
     "closeTrust": "Güven iletişim kutusunu kapat",
     "trustOneTitle": "Bu klasöre güvenilsin mi?",
     "trustManyTitle": "Bu klasörlere güvenilsin mi?",
-    "trustDescription": "Claude Rust buradaki dosyaları okuyabilir, düzenleyebilir ve yürütebilir. Klasör ayarları kodu otomatik olarak çalıştırabilir. Yalnızca bu dosyalara güveniyorsanız devam edin.",
+    "trustDescription": "DeepSeek Code buradaki dosyaları okuyabilir, düzenleyebilir ve yürütebilir. Klasör ayarları kodu otomatik olarak çalıştırabilir. Yalnızca bu dosyalara güveniyorsanız devam edin.",
     "trustOne": "Güven klasörü",
     "trustMany": "Güven klasörleri",
     "saving": "Kaydediliyor..."

@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ccl",
+    name = "dcl",
     version,
     args_override_self = true,
     disable_help_subcommand = true,
-    about = "Claude Rust — standalone CLI using the Desktop engine"
+    about = "DeepSeek Code — standalone CLI using the Desktop engine"
 )]
 pub struct Cli {
     /// Run initialization hooks before starting the session.
@@ -551,39 +551,39 @@ pub enum PluginCommands {
 mod tests {
     #[test]
     fn permission_mode_tracks_explicit_ask_without_confusing_default() {
-        assert!(!super::Cli::try_parse_with_mode_source(["ccl"]).unwrap().permission_mode_explicit);
-        assert!(super::Cli::try_parse_with_mode_source(["ccl", "--permission-mode", "ask"]).unwrap().permission_mode_explicit);
+        assert!(!super::Cli::try_parse_with_mode_source(["dcl"]).unwrap().permission_mode_explicit);
+        assert!(super::Cli::try_parse_with_mode_source(["dcl", "--permission-mode", "ask"]).unwrap().permission_mode_explicit);
     }
     use super::*;
     #[test]
     fn original_permission_flags_are_explicit_and_unambiguous() {
-        let mut cli = Cli::try_parse_from(["ccl", "--dangerously-skip-permissions"]).unwrap();
+        let mut cli = Cli::try_parse_from(["dcl", "--dangerously-skip-permissions"]).unwrap();
         cli.normalize();
         assert!(matches!(cli.permission_mode, PermissionModeArg::Bypass));
-        assert!(Cli::try_parse_from(["ccl", "--dangerously-skip-permissions", "--permission-mode", "plan"]).is_err());
-        assert!(matches!(Cli::try_parse_from(["ccl", "--permission-mode", "acceptEdits"]).unwrap().permission_mode, PermissionModeArg::AcceptEdits));
-        assert!(matches!(Cli::try_parse_from(["ccl", "--permission-mode", "bypassPermissions"]).unwrap().permission_mode, PermissionModeArg::Bypass));
+        assert!(Cli::try_parse_from(["dcl", "--dangerously-skip-permissions", "--permission-mode", "plan"]).is_err());
+        assert!(matches!(Cli::try_parse_from(["dcl", "--permission-mode", "acceptEdits"]).unwrap().permission_mode, PermissionModeArg::AcceptEdits));
+        assert!(matches!(Cli::try_parse_from(["dcl", "--permission-mode", "bypassPermissions"]).unwrap().permission_mode, PermissionModeArg::Bypass));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("append.md");
         std::fs::write(&path, "UTF-8 中文").unwrap();
-        let cli = Cli::try_parse_from(["ccl", "--system-prompt", "Base", "--append-system-prompt-file", path.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from(["dcl", "--system-prompt", "Base", "--append-system-prompt-file", path.to_str().unwrap()]).unwrap();
         assert_eq!(cli.system_prompt_text().unwrap(), "Base\n\nUTF-8 中文");
     }
     #[test]
     fn sdk_input_and_turn_budget_preserve_short_print_prompt() {
-        let cli = Cli::try_parse_from(["ccl", "-p", "initial", "--input-format", "stream-json", "--max-turns", "2"]).unwrap();
+        let cli = Cli::try_parse_from(["dcl", "-p", "initial", "--input-format", "stream-json", "--max-turns", "2"]).unwrap();
         assert_eq!(cli.prompt.as_deref(), Some("initial"));
         assert!(cli.print_short);
         assert_eq!(cli.input_format, InputFormat::StreamJson);
         assert_eq!(cli.max_turns, Some(2));
-        assert!(Cli::try_parse_from(["ccl", "--max-turns", "0"]).is_err());
-        assert!(Cli::try_parse_from(["ccl", "--input-format", "invalid"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "--max-turns", "0"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "--input-format", "invalid"]).is_err());
     }
 
     #[test]
     fn prompt_sources_compose_and_reject_ambiguous_input() {
         let cli = Cli::try_parse_from([
-            "ccl",
+            "dcl",
             "--system-prompt",
             "Base",
             "--append-system-prompt",
@@ -592,7 +592,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.system_prompt_text().unwrap(), "Base\n\nExtra");
         assert!(Cli::try_parse_from([
-            "ccl",
+            "dcl",
             "--system-prompt",
             "Base",
             "--system-prompt-file",
@@ -603,7 +603,7 @@ mod tests {
         let path = dir.path().join("prompt.txt");
         std::fs::write(&path, "中文 instructions").unwrap();
         let cli = Cli::try_parse_from([
-            "ccl",
+            "dcl",
             "--system-prompt-file",
             path.to_str().unwrap(),
             "--append-system-prompt",
@@ -623,12 +623,12 @@ mod tests {
     #[test]
     fn continuation_is_exclusive_with_explicit_resume_and_auto_route() {
         assert!(
-            Cli::try_parse_from(["ccl", "-c"])
+            Cli::try_parse_from(["dcl", "-c"])
                 .unwrap()
                 .continue_session
         );
-        assert!(Cli::try_parse_from(["ccl", "-c", "--resume", "id"]).is_err());
-        assert!(Cli::try_parse_from(["ccl", "-c", "--auto-route"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "-c", "--resume", "id"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "-c", "--auto-route"]).is_err());
     }
 
     #[test]
@@ -636,16 +636,16 @@ mod tests {
         use clap::CommandFactory;
         Cli::command().debug_assert();
         assert!(
-            Cli::try_parse_from(["ccl", "-p", "hello"])
+            Cli::try_parse_from(["dcl", "-p", "hello"])
                 .unwrap()
                 .print_short
         );
         assert!(
-            matches!(Cli::try_parse_from(["ccl", "query", "-p", "hello"]).unwrap().command,
+            matches!(Cli::try_parse_from(["dcl", "query", "-p", "hello"]).unwrap().command,
             Some(Commands::Query { prompt: Some(value) }) if value == "hello")
         );
         assert!(matches!(
-            Cli::try_parse_from(["ccl", "stress-test", "-c", "2"])
+            Cli::try_parse_from(["dcl", "stress-test", "-c", "2"])
                 .unwrap()
                 .command,
             Some(Commands::StressTest { concurrency: 2, .. })

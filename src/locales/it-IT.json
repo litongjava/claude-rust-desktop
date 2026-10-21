@@ -245,7 +245,7 @@
     "closeTrust": "Chiudi la finestra di dialogo di fiducia",
     "trustOneTitle": "Fidati di questa cartella?",
     "trustManyTitle": "Fidati di queste cartelle?",
-    "trustDescription": "Claude Rust può leggere, modificare ed eseguire file qui. Le impostazioni della cartella possono eseguire il codice automaticamente. Continua solo se ritieni attendibili questi file.",
+    "trustDescription": "DeepSeek Code può leggere, modificare ed eseguire file qui. Le impostazioni della cartella possono eseguire il codice automaticamente. Continua solo se ritieni attendibili questi file.",
     "trustOne": "Cartella di fiducia",
     "trustMany": "Fidati delle cartelle",
     "saving": "Salvataggio..."

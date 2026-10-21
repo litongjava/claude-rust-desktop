@@ -75,7 +75,7 @@ async fn explicit_review_injects_snapshot_preserves_worktree_and_honors_custom_o
         }
         let status = git(&workspace, &["status", "--porcelain"]);
         let count = requests.lock().unwrap().len();
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
         command
             .current_dir(&workspace)
             .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))

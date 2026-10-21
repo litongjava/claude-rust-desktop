@@ -589,7 +589,7 @@ mod tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let cli = crate::args::Cli::parse_from(["ccl", "--print"]);
+        let cli = crate::args::Cli::parse_from(["dcl", "--print"]);
         let store = claude_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let id = store
             .create(dir.path(), "fixture-model", "fixture")
@@ -703,7 +703,7 @@ mod tests {
             provider_id: "fixture".into(),
             model: "fixture-model".into(),
         };
-        let cli = crate::args::Cli::parse_from(["ccl", "--print"]);
+        let cli = crate::args::Cli::parse_from(["dcl", "--print"]);
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store
             .create(directory.path(), "fixture-model", "fixture")

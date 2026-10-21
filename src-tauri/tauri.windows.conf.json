@@ -2,7 +2,7 @@
   "app": {
     "windows": [
       {
-        "title": "Claude Code Desktop",
+        "title": "DeepSeek Code Desktop",
         "width": 1150,
         "height": 700,
         "minWidth": 800,

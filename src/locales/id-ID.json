@@ -245,7 +245,7 @@
     "closeTrust": "Tutup dialog kepercayaan",
     "trustOneTitle": "Percayai folder ini?",
     "trustManyTitle": "Percayai folder ini?",
-    "trustDescription": "Claude Rust dapat membaca, mengedit, dan mengeksekusi file di sini. Pengaturan folder dapat menjalankan kode secara otomatis. Lanjutkan hanya jika Anda memercayai file-file ini.",
+    "trustDescription": "DeepSeek Code dapat membaca, mengedit, dan mengeksekusi file di sini. Pengaturan folder dapat menjalankan kode secara otomatis. Lanjutkan hanya jika Anda memercayai file-file ini.",
     "trustOne": "Folder kepercayaan",
     "trustMany": "Percayai folder",
     "saving": "Menyimpan..."

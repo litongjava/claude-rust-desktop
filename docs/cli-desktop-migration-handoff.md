@@ -4,11 +4,11 @@
 
 ## 1. 用户目标与约束
 
-用户明确要求：**旧 CLI 的语音、团队同步等外围功能必须在 `claude-code-desktop` 中具备真实可用的实现，不能以保留历史源码代替功能迁移。**
+用户明确要求：**旧 CLI 的语音、团队同步等外围功能必须在 `deepseek-code-desktop` 中具备真实可用的实现，不能以保留历史源码代替功能迁移。**
 
 后续按共享业务实现、CLI 命令和 Desktop 图形入口一起交付。旧前端的具体技术栈无需原样搬入，但旧功能需要逐项映射，不能遗漏。初稿 session 只整理交接文档；2026-10-15 已开始实际实施，记录见第 9 节。
 
-- 工作仓库：`D:\code\project\project-harven\claude-code-desktop`。
+- 工作仓库：`D:\code\project\project-harven\deepseek-code-desktop`。
 - 已创建并正在使用的分支：`feat/shared-core-cli-desktop`。
 - 旧仓库：`D:\code\project\project-harven\claude-code-cli`，**只读，不修改、不提交、不清理**。
 - 历史源提交：`36a6231ac3134e01c6d9dacafb2094af7afbbe7c`。
@@ -23,7 +23,7 @@
 | `Cargo.toml`、`Cargo.lock`、`.cargo/config.toml` | Workspace；构建缓存在 `src-tauri/target` |
 | `crates/core` (`claude-core`) | 共享模型、工具、权限、配置、SQLite、会话、MCP、技能等 |
 | `crates/core/src/runtime.rs` | 两端共用引擎创建、provider 转换、数据路径、会话与工具历史恢复 |
-| `crates/cli` (`claude-code-cli`) | 独立 `ccl` 可执行文件 |
+| `crates/cli` (`deepseek-code-cli`) | 独立 `dcl` 可执行文件 |
 | `src-tauri` | Tauri、React 的后端适配、Bridge、凭据等；库重导出共享核心 |
 | `src-tauri/worker` | 计算机操作辅助进程，仍不是 CLI |
 | `scripts/build-all.mjs` | 一次构建 CLI、Desktop、安装包，复制 provider runtime |
@@ -126,10 +126,10 @@ git branch --show-current
 git -C D:\code\project\project-harven\claude-code-cli status --short
 
 cargo test --locked -p claude-core --lib --tests
-cargo test --locked -p claude-code-cli
-cargo check --locked -p claude-code-desktop --all-targets
-cargo test --locked -p claude-code-desktop --lib --tests
-cargo tree -p claude-code-cli
+cargo test --locked -p deepseek-code-cli
+cargo check --locked -p deepseek-code-desktop --all-targets
+cargo test --locked -p deepseek-code-desktop --lib --tests
+cargo tree -p deepseek-code-cli
 npm run test:run
 npm run build:all
 git diff --check
@@ -150,7 +150,7 @@ git diff --check
 ## 8. 可直接发给新 session 的任务
 
 ```text
-继续在 D:\code\project\project-harven\claude-code-desktop 工作。
+继续在 D:\code\project\project-harven\deepseek-code-desktop 工作。
 先读 docs/cli-desktop-migration-handoff.md 和 docs/cli.md，检查 Git 状态。
 现有 feat/shared-core-cli-desktop 分支中已有 workspace 拆分和 CLI 整合，先检查提交记录及未提交改动，保留这些工作，不要重置或重做。
 原 D:\code\project\project-harven\claude-code-cli 仓库只读。
@@ -170,7 +170,7 @@ git diff --check
 - [x] P1 团队同步业务与双端入口：`team.rs`、`team_server.rs` 实现独立服务、真实 bearer 验证、团队隔离/服务端绑定、增量游标、版本检查、tombstone、持久化冲突、去重 mutation ID、离线保留和重试。服务端不是旧占位的 Claude.ai OAuth。CLI 增加 update/conflicts/resolve/serve；Desktop 在「设置 → 服务与团队」接相同规则。
 - [x] P1 最小团队数据迁移：显式 `team-sync import-legacy <旧 team 目录> [--preview]`；先完整 SQLite 备份，事务导入，重复载荷去重，ID 内容冲突全部回滚。源不修改，旧 ID 保留，原始 author/time/etag 载荷留存；旧 etag/`.team_token` 不作有效远端状态或凭据。个人 memory/session 导入仍待 P2/P3。
 - [x] P1 音频业务与双端入口：CLI CPAL/WASAPI 采集、PCM WAV 编码、25 MiB 限制、线程停止/等待；共享 `services/voice.rs` 向音频 multipart endpoint 上传。支持文件/Enter 按键输入/连续输入/当前共享会话发送。Desktop MediaRecorder 接相同模块，提供录音/处理中/错误/文本编辑状态、设备释放和请求取消；修复 MainContent 导入面板却未渲染的接线问题。
-- [x] 原生 Windows 设备采集检查：`cargo test --locked -p claude-code-cli native_microphone_capture_releases_the_device -- --ignored` 成功采集 250 ms PCM，再次打开设备成功。仅在内存测试，不上传此设备采样。
+- [x] 原生 Windows 设备采集检查：`cargo test --locked -p deepseek-code-cli native_microphone_capture_releases_the_device -- --ignored` 成功采集 250 ms PCM，再次打开设备成功。仅在内存测试，不上传此设备采样。
 - [ ] 语音完整外部验收：未提供真实 STT endpoint/token，没有真实语音识别质量结论；WebView2 权限接受/拒绝、无设备及录音 GUI 仍需现场验收。缺配置会明确报错。
 - [ ] 团队生产部署与 Windows GUI 手工验收：本地独立服务端/真实 HTTP 已测试，生产 HTTPS 端点、运维凭据与安全存储/UI 手工操作尚未验收；不能宣称云端已经部署。
 - [ ] P2 个人记忆导入/导出/整理/AutoDream、Magic Docs、agent 类型/别名与自定义定义。

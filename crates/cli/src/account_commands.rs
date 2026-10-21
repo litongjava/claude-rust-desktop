@@ -12,7 +12,7 @@ pub async fn run(paths: &RuntimePaths, command: &crate::args::AuthCommands) -> R
     match command {
         crate::args::AuthCommands::Login => {
             login_account(paths).await?;
-            eprintln!("Signed in. Start ccl to use the Anthropic account provider.");
+            eprintln!("Signed in. Start dcl to use the Anthropic account provider.");
         }
         crate::args::AuthCommands::Logout => {
             remove_account(paths).await?;

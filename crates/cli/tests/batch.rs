@@ -106,7 +106,7 @@ async fn exercise(cancel: bool) {
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let launch = WorkerLaunch {
-        executable: env!("CARGO_BIN_EXE_ccl").into(),
+        executable: env!("CARGO_BIN_EXE_dcl").into(),
         arguments: vec![
             "--data-dir".into(),
             root.to_string_lossy().into_owned(),
@@ -265,7 +265,7 @@ async fn worker_failures_are_reported_and_the_batch_fails() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let launch = WorkerLaunch {
-        executable: env!("CARGO_BIN_EXE_ccl").into(),
+        executable: env!("CARGO_BIN_EXE_dcl").into(),
         arguments: vec![
             "--data-dir".into(),
             root.to_string_lossy().into_owned(),

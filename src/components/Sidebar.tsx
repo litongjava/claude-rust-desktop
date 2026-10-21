@@ -677,7 +677,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             <h3 id="help-dialog-title" className="text-[16px] font-semibold text-claude-text mb-2">{t('sidebar.supportTitle')}</h3>
             <div className="mb-4 rounded-xl border border-claude-border p-3 space-y-2 text-[13px]">
               <div className="flex items-center justify-between gap-4">
-                <span className="font-medium text-claude-text">Claude Rust</span>
+                <span className="font-medium text-claude-text">DeepSeek Code</span>
                 <span className="text-claude-textSecondary">v{__APP_VERSION__}</span>
               </div>
               <div className="flex items-center justify-between gap-4">

@@ -173,7 +173,7 @@ fn example(id: &str) -> &'static str {
         "rewind" => "Try: /rewind list → /rewind preview ID\nReview a checkpoint before restoring it.",
         "background" => "Try: /subtask inspect the test layout\nUse /tasks to follow progress and read the result.",
         "memory" => "Example CLAUDE.md:\nRun tests with cargo test.\nKeep shared business logic independent of the UI.",
-        "mcp" => "Inspect: /mcp\nConfigure from your shell: ccl mcp add --help",
+        "mcp" => "Inspect: /mcp\nConfigure from your shell: dcl mcp add --help",
         "skills" => "Example: .claude/skills/review/SKILL.md\n---\nname: review\ndescription: Review local changes\n---\nCheck the diff for correctness.\nThen run /reload-skills and /review.",
         "sessions" => "Try: /rename investigate-tests\nUse /branch alternative to try another approach.",
         "details" => "After a tool finishes, click its detail header or press Ctrl+O.\nScroll to Show less to collapse the output.",

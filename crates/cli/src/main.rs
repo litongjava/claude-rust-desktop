@@ -131,7 +131,7 @@ async fn run(cli: &Cli) -> Result<()> {
         debug_logging::configure_filtered(log, cli.debug.as_deref().unwrap_or(""))?;
     }
     if cli.info {
-        println!("ccl {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
+        println!("dcl {}\nOS: {}\nProject: {}\nData: {}\nEngine: claude-core (direct; no Bridge)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::current_dir()?.display(), paths.data_dir.display());
         return Ok(());
     }
     let mut skill_prompt = None;
@@ -437,7 +437,7 @@ async fn run(cli: &Cli) -> Result<()> {
             }?;
             for warning in outcome { eprintln!("Setup hook: {warning}"); }
         }
-        if !single { eprintln!("Claude Rust {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
+        if !single { eprintln!("DeepSeek Code {} — {}\n{}\nSession: {}\n/help for commands; Ctrl+C cancels the current task.", env!("CARGO_PKG_VERSION"), session.model, session.workspace.display(), session.id); }
         if !sdk_stream {
             let initial = session.initial_hook_message.take();
             if single {

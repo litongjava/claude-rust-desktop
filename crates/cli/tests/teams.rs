@@ -101,7 +101,7 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let id = uuid::Uuid::new_v4().to_string();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .current_dir(&project)
         .stdin(Stdio::null())

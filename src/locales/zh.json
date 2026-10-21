@@ -284,7 +284,7 @@
     "closeTrust": "关闭信任文件夹窗口",
     "trustOneTitle": "信任此文件夹？",
     "trustManyTitle": "信任这些文件夹？",
-    "trustDescription": "Claude Rust 可以读取、编辑和执行这些文件夹中的文件。文件夹设置可能会自动运行代码，请仅在信任这些文件时继续。",
+    "trustDescription": "DeepSeek Code 可以读取、编辑和执行这些文件夹中的文件。文件夹设置可能会自动运行代码，请仅在信任这些文件时继续。",
     "trustOne": "信任文件夹",
     "trustMany": "信任这些文件夹",
     "saving": "正在保存…"

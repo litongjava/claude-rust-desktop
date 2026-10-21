@@ -1,4 +1,4 @@
-use claude_desktop_tauri_lib::tools::execute_tool;
+use deepseek_desktop_tauri_lib::tools::execute_tool;
 use serde_json::json;
 
 #[test]

@@ -32,7 +32,7 @@ async fn init_only_without_credentials_runs_setup_then_session_start_and_once_su
     for resume in [false, true] {
         let output = tokio::time::timeout(
             Duration::from_secs(30),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"))
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
                 .current_dir(dir.path())
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
@@ -94,7 +94,7 @@ async fn model_500_emits_one_stop_failure_and_loaded_instructions() {
     let id = uuid::Uuid::new_v4().to_string();
     let output = tokio::time::timeout(
         Duration::from_secs(90),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_ccl"))
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
             .current_dir(dir.path())
             .stdin(Stdio::null())
             .kill_on_drop(true)

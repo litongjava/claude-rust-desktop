@@ -1,21 +1,21 @@
-# claude-code-cli 剩余工作清单（新 session 入口）
+# deepseek-code-cli 剩余工作清单（新 session 入口）
 
 更新：2026-10-18。本文汇总独立 Rust CLI 与原版 Claude Code 对齐的未完成项，供新 session 直接接手。详细审计依据见 `D:/code/project/project-harven/temp/claude-code-cli-dev/remaining-parity-acceptance-checklist.md`（以下简称"清单"）。
 
 ## 1. 起步
 
-- 开发目录：`D:/code/project/project-harven/claude-code-desktop`，分支 `feat/claude-code-optimization`。2026-10-17 已合并全部 worktree 和功能分支并删除，直接在此开发，不再使用 worktree。
+- 开发目录：`D:/code/project/project-harven/deepseek-code-desktop`，分支 `feat/claude-code-optimization`。2026-10-17 已合并全部 worktree 和功能分支并删除，直接在此开发，不再使用 worktree。
 - 未 push。合并备份与已删除分支的 SHA 在 `D:/code/project/project-harven/temp/merge-backup/`；`git stash@{0}` 为合并前原 checkout 的未提交改动（已被合并内容取代，保留以备核对）。
 - 开发记录目录：`D:/code/project/project-harven/temp/claude-code-cli-dev`（状态见其中 `handoff-current.md`、`README.md`）。
 
 ## 2. 约束
 
 - `claude-code-cli-doc` 是 CLI 的**用户使用手册**，`claude-rust-desktop-docs` 是 Desktop 的用户文档；开发记录、终端证据、测试脚本一律写到 `temp/claude-code-cli-dev`。
-- Cargo 命令串行执行，统一 `CARGO_TARGET_DIR=D:/code/project/project-harven/claude-code-desktop/target`。
+- Cargo 命令串行执行，统一 `CARGO_TARGET_DIR=D:/code/project/project-harven/deepseek-code-desktop/target`。
 - 节奏：开发一个、验证一个、commit 一个。英文提交信息，沿用 `feat:`/`fix:`/`docs:` 前缀，结尾 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。不 push，不自动关机。
 - 只读参考：`D:/code/project/project-harven/claude_code_src`（下文 `reference:`）、`D:/code/project/project-harven/codex`、需求列表 `D:/code/project/project-harven/instructions.txt`。官方程序 `E:/package/claude-code/2.1.295/claude.exe`。
 - 源文件多为 CRLF：用 Python 脚本"读入→统一 LF→精确替换→写回 CRLF"编辑（示例 `temp/claude-code-cli-dev/logs/fmt-backup/relay_cli.py`，其中路径需改成当前目录）；`rustfmt` 只用于新文件或测试文件，避免无关格式改动。提交前 `git diff --check`。
-- 结束测试进程按进程名（`ccl.exe`、`remote_control_mock.exe`、`node.exe`）过滤；按 CommandLine 过滤会误杀当前 bash。
+- 结束测试进程按进程名（`dcl.exe`、`remote_control_mock.exe`、`node.exe`）过滤；按 CommandLine 过滤会误杀当前 bash。
 - PowerShell 文本显式 UTF-8，避免控制台表格。不提交凭据；Remote Control 只用自身 token（`CLAUDE_BRIDGE_OAUTH_TOKEN`），绝不发送 Anthropic OAuth 凭据。
 - 保留 `D:/code/project/project-github/qwerty-learner-cli-pass1`、`-cli-pass2` 的未提交改动。
 - 浏览器测试用 `D:/code/project/project-browser-use/deepseek-browser-use`。
@@ -24,9 +24,9 @@
 
 - 测试（最近结果）：
   - `cargo test --locked -p claude-core --lib --tests`：543 通过 / 0 失败 / 4 忽略
-  - `cargo test --locked -p claude-code-cli`：251 / 0 / 1
-  - `cargo check --locked -p claude-code-desktop --all-targets`
-  - `cargo build --locked -p claude-code-cli`
+  - `cargo test --locked -p deepseek-code-cli`：251 / 0 / 1
+  - `cargo check --locked -p deepseek-code-desktop --all-targets`
+  - `cargo build --locked -p deepseek-code-cli`
 - 真实终端（Windows ConPTY），目录 `D:/code/project/project-harven/temp/claude-code-cli-dev/`（旧 spec 中 `evidenceDir` 仍指向 `claude-code-cli-doc`，复用前修改）：
   - `node terminal-harness.mjs <spec.json>`：启动 CLI；运行中向 `<evidence>/input.jsonl` 追加 `{"write": "..."}` 或 `{"snapshot": "name"}` 行进行交互。
   - `node logs/fmt-backup/screen.js <abs path .screen.json> N`：读屏幕快照。

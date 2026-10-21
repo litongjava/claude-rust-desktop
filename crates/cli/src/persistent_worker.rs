@@ -180,7 +180,7 @@ async fn execute(
         );
         std::env::set_var(name, value);
     }
-    let mut cli = Cli::try_parse_with_mode_source(std::iter::once("ccl".to_owned()).chain(arguments))?;
+    let mut cli = Cli::try_parse_with_mode_source(std::iter::once("dcl".to_owned()).chain(arguments))?;
     cli.normalize();
     ensure!(
         cli.resume.as_deref() == Some(worker.session_id.as_str()) && cli.command.is_none(),

@@ -75,7 +75,7 @@ pub async fn run(session: &Session, argument: &str) -> Result<()> {
         "Not checked; /status --check probes HTTP reachability without credentials or a model request".into()
     };
     let mut output = format!(
-        "Claude Rust {version}\nSession: {id}\nProject: {workspace}\nData: {data}\nProvider: {provider} ({provider_id})\nModel: {model}\nRouting: {routing}\nPermissions (frontend): {permissions}\nAccount: {account}\nAPI origin: {origin}\nAPI: {api}\nWorker: {worker}{pid}\nTool observations: {scope}\n",
+        "DeepSeek Code {version}\nSession: {id}\nProject: {workspace}\nData: {data}\nProvider: {provider} ({provider_id})\nModel: {model}\nRouting: {routing}\nPermissions (frontend): {permissions}\nAccount: {account}\nAPI origin: {origin}\nAPI: {api}\nWorker: {worker}{pid}\nTool observations: {scope}\n",
         version = env!("CARGO_PKG_VERSION"),
         id = runtime_status::label(&session.id),
         workspace = runtime_status::label(&session.workspace.to_string_lossy()),

@@ -355,12 +355,12 @@ fn native_system_alias_events_wake_lexical_paths_including_deleted_files() {
     let mut handler = Handler {
         wake,
         closed,
-        paths: vec![PathBuf::from("/var/folders/ccl-test/missing/file")],
+        paths: vec![PathBuf::from("/var/folders/dcl-test/missing/file")],
     };
     handler.handle_event(Ok(notify::Event::new(notify::EventKind::Remove(
         notify::event::RemoveKind::File,
     ))
-    .add_path(PathBuf::from("/private/var/folders/ccl-test/missing/file"))));
+    .add_path(PathBuf::from("/private/var/folders/dcl-test/missing/file"))));
     assert!(receiver.try_recv().is_ok());
     handler.handle_event(Ok(notify::Event::new(notify::EventKind::Modify(
         notify::event::ModifyKind::Any,

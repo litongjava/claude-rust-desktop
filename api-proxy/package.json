@@ -1,7 +1,7 @@
 {
   "name": "claude-api-proxy",
   "version": "1.0.0",
-  "description": "API Proxy for Claude Rust with KIE API",
+  "description": "API Proxy for DeepSeek Code with KIE API",
   "main": "server.js",
   "type": "module",
   "scripts": {

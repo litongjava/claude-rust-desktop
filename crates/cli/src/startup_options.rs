@@ -78,27 +78,27 @@ mod tests {
     #[test]
     fn worktree_optional_name_and_resume_conflicts() {
         for option in ["-w", "--worktree"] {
-            let cli = Cli::try_parse_from(["ccl", option]).unwrap();
+            let cli = Cli::try_parse_from(["dcl", option]).unwrap();
             assert_eq!(cli.worktree.as_deref(), Some(""));
-            let cli = Cli::try_parse_from(["ccl", option, "review/issue"]).unwrap();
+            let cli = Cli::try_parse_from(["dcl", option, "review/issue"]).unwrap();
             assert_eq!(cli.worktree.as_deref(), Some("review/issue"));
         }
         assert!(Cli::try_parse_from([
-            "ccl",
+            "dcl",
             "--worktree",
             "review",
             "--resume",
             "session"
         ])
         .is_err());
-        assert!(Cli::try_parse_from(["ccl", "--worktree", "--continue"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "--worktree", "--continue"]).is_err());
     }
     #[test]
     fn startup_identity_and_paths_are_validated_before_creation() {
         let temp = tempfile::tempdir().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let cli = Cli::try_parse_from([
-            "ccl",
+            "dcl",
             "--session-id",
             &id,
             "--name",
@@ -111,9 +111,9 @@ mod tests {
         assert!(cli.ide);
         validate(&cli, temp.path()).unwrap();
         assert_eq!(cli.session_id.as_deref(), Some(id.as_str()));
-        assert!(Cli::try_parse_from(["ccl", "--session-id", "invalid"]).is_err());
+        assert!(Cli::try_parse_from(["dcl", "--session-id", "invalid"]).is_err());
         assert!(
-            Cli::try_parse_from(["ccl", "--session-id", &id, "--resume", &id]).is_err()
+            Cli::try_parse_from(["dcl", "--session-id", &id, "--resume", &id]).is_err()
         );
         let mut invalid = cli;
         invalid.name = Some("\n".into());

@@ -284,7 +284,7 @@
     "closeTrust": "關閉信任資料夾窗口",
     "trustOneTitle": "信任此資料夾？",
     "trustManyTitle": "信任這些資料夾？",
-    "trustDescription": "Claude Rust 可以讀取、編輯和執行這些資料夾中的檔案。資料夾設定可能會自動運行程式碼，請僅在信任這些文件時繼續。",
+    "trustDescription": "DeepSeek Code 可以讀取、編輯和執行這些資料夾中的檔案。資料夾設定可能會自動運行程式碼，請僅在信任這些文件時繼續。",
     "trustOne": "信任資料夾",
     "trustMany": "信任這些資料夾",
     "saving": "正在保存…"

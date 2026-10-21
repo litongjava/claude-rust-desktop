@@ -1,12 +1,12 @@
 [package]
-name = "claude-code-cli"
+name = "deepseek-code-cli"
 version.workspace = true
 edition.workspace = true
-description = "Standalone terminal frontend for the shared Claude Rust engine"
+description = "Standalone terminal frontend for the shared DeepSeek Code engine"
 license = "MIT"
 
 [[bin]]
-name = "ccl"
+name = "dcl"
 path = "src/main.rs"
 
 [dependencies]

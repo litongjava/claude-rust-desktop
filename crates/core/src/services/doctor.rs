@@ -249,9 +249,9 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let name = if cfg!(windows) {
-            "ccl.exe"
+            "dcl.exe"
         } else {
-            "ccl"
+            "dcl"
         };
         std::fs::write(bin.join(name), b"Not an executable; must never be launched").unwrap();
         std::fs::write(second.join(name), b"Not an executable either").unwrap();
