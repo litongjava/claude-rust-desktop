@@ -1,7 +1,7 @@
 {
   "name": "claude-api-proxy",
   "version": "1.0.0",
-  "description": "API Proxy for Claude Rust with KIE API",
+  "description": "API Proxy for DeepSeek Code with KIE API",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -13,7 +13,7 @@
     "better-sqlite3": "^9.4.3",
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
-    "uuid": "^9.0.0",
+    "uuid": "^14.0.0",
     "cors": "^2.8.5"
   }
 }

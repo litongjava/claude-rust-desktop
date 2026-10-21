@@ -1,3 +1,8 @@
+import { readChatResponseError, formatChatStreamError } from './utils/chatErrors';
+import { pendingMarkerLength } from './utils/streamMarkers';
+import { processMetadata, restoreProcessMetadata } from './features/trajectory/model';
+import { useWorkspaceModeStore, conversationWorkspaceMode } from './stores/useWorkspaceModeStore';
+import { splitModelKey } from './utils/modelConfig';
 import { getErrorMessage } from './utils/errorHelpers';
 import { getSecure, setSecure, removeSecure } from './services/secureStorage';
 import {
@@ -18,80 +23,10 @@ import {
 } from './services/localStorageService';
 import type { LocalConversation } from './services/localStorageService';
 import { trackProviderDeletion, trackConversationDeletion } from './services/syncService';
-const DEFAULT_BRIDGE_PORT = 30085;
-let detectedBridgePort: number | null = null;
-
-export function resetBridgePort(): void {
-  // Bug #10 fix: Allow resetting cached port so Bridge restart on new port is detected
-  detectedBridgePort = null;
-  console.log('[API] Bridge port cache cleared');
-}
-
-export async function detectBridgePort(): Promise<number> {
-  if (detectedBridgePort) return detectedBridgePort;
-  console.log('[API] Starting Bridge port detection...');
-  for (let attempt = 0; attempt < 6; attempt++) {
-    for (let port = DEFAULT_BRIDGE_PORT; port < DEFAULT_BRIDGE_PORT + 10; port++) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/api/system-status`, { signal: AbortSignal.timeout(3000) });
-        if (res.ok) {
-          detectedBridgePort = port;
-          console.log(`[API] Bridge found on port ${port} (attempt ${attempt + 1})`);
-          return port;
-        }
-      } catch {}
-    }
-    if (attempt < 5) {
-      const delay = attempt < 2 ? 1500 : 2000;
-      console.log(`[API] Bridge not found on attempt ${attempt + 1}, retrying in ${delay}ms...`);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  console.log(`[API] Bridge detection failed after 6 attempts. Using default port ${DEFAULT_BRIDGE_PORT}`);
-  return DEFAULT_BRIDGE_PORT;
-}
-
-function getApiBase(): string {
-  if (detectedBridgePort && detectedBridgePort !== DEFAULT_BRIDGE_PORT) {
-    return `http://127.0.0.1:${detectedBridgePort}/api`;
-  }
-  return `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
-}
-
-let API_BASE = `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
+import { API_BASE, isTauriApp, useDevProxy, detectBridgePort, waitForApiReady } from './services/bridgeConnection';
+export { detectBridgePort, resetBridgePort, waitForApiReady } from './services/bridgeConnection';
 const GATEWAY_BASE = 'http://127.0.0.1:30090';
 const CHENGDU_API = 'http://127.0.0.1:30090/api';
-const isTauriApp = typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__;
-
-let apiReady: Promise<void> | null = null;
-
-async function ensureBridgeToken() {
-  if (isTauriApp) {
-    try {
-      const { invoke } = await import('@tauri-apps/api/core');
-      const key: string = await invoke('get_bridge_api_key');
-      if (key) {
-        localStorage.setItem('bridge_api_key', key);
-      }
-    } catch (e) {
-      console.warn('[API] Failed to get bridge API key:', e);
-    }
-  }
-}
-
-if (isTauriApp) {
-  apiReady = (async () => {
-    const port = await detectBridgePort();
-    API_BASE = `http://127.0.0.1:${port}/api`;
-    detectedBridgePort = port;
-    await ensureBridgeToken();
-    console.log('[API] Bridge ready - port:', port);
-  })();
-}
-
-export async function waitForApiReady(): Promise<void> {
-  if (apiReady) await apiReady;
-}
 
 let nativeEngineInitialized = false;
 
@@ -216,6 +151,7 @@ export async function getSystemStatus(): Promise<{
   platform: string;
   gitBash: { required: boolean; found: boolean; path: string | null };
 }> {
+  await waitForApiReady();
   const res = await fetch(`${API_BASE}/system-status`);
   if (!res.ok) throw new Error('Failed to get system status');
   return res.json();
@@ -443,6 +379,10 @@ export async function getUserUsage() {
 }
 
 export async function getUnreadAnnouncements() {
+  // Local usage does not require an account or the separate gateway service.
+  if (localStorage.getItem('user_mode') === 'selfhosted' || !localStorage.getItem('auth_token')) {
+    return { announcements: [] };
+  }
   const res = await request('/user/announcements');
   return res.json();
 }
@@ -557,6 +497,7 @@ export interface Project {
   description: string;
   instructions: string;
   workspace_path: string;
+  folders: Array<{ path: string; trusted: boolean }>;
   is_archived: number;
   file_count?: number;
   chat_count?: number;
@@ -580,10 +521,10 @@ export async function getProjects(): Promise<Project[]> {
   return Array.isArray(data) ? data : (Array.isArray(data?.projects) ? data.projects : []);
 }
 
-export async function createProject(name: string, description?: string): Promise<Project> {
+export async function createProject(name: string, description: string = "", folders: string[] = []): Promise<Project> {
   const res = await request('/projects', {
     method: 'POST',
-    body: JSON.stringify({ name, description: description || '' }),
+    body: JSON.stringify({ name, description, folders }),
   });
   return res.json();
 }
@@ -593,12 +534,26 @@ export async function getProject(id: string) {
   return res.json();
 }
 
-export async function updateProject(id: string, data: Partial<Pick<Project, 'name' | 'description' | 'instructions' | 'is_archived'>>) {
+export async function updateProject(id: string, data: Partial<Pick<Project, 'name' | 'description' | 'instructions' | 'is_archived'>> & { folders?: string[] }) {
   const res = await request(`/projects/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(data),
   });
   return res.json();
+}
+
+export async function trustProjectFolders(id: string, folders: string[]): Promise<Project> {
+  const res = await request(`/projects/${id}/trust`, { method: 'POST', body: JSON.stringify({ folders }) });
+  const project = await res.json();
+  window.dispatchEvent(new Event('projectsChanged'));
+  return project;
+}
+
+export async function attachConversationToProject(conversationId: string, projectId: string): Promise<void> {
+  const res = await request(`/conversations/${conversationId}`, { method: 'POST', body: JSON.stringify({ project_id: projectId }) });
+  const result = await res.json();
+  if (result.ok === false || result.error) throw new Error(result.error || 'Could not select project');
+  window.dispatchEvent(new Event('conversationUpdated'));
 }
 
 export async function deleteProject(id: string) {
@@ -630,10 +585,10 @@ export async function getProjectConversations(projectId: string) {
   return res.json();
 }
 
-export async function createProjectConversation(projectId: string, title?: string, model?: string) {
+export async function createProjectConversation(projectId: string, title?: string, model?: string, gitOptions?: import('./api/projects').ProjectGitOptions) {
   const res = await request(`/projects/${projectId}/conversations`, {
     method: 'POST',
-    body: JSON.stringify({ title, model }),
+    body: JSON.stringify({ title, model, workspace_mode: useWorkspaceModeStore.getState().mode, ...gitOptions }),
   });
   return res.json();
 }
@@ -641,7 +596,7 @@ export async function createProjectConversation(projectId: string, title?: strin
 // 对话相关
 export async function getConversations() {
   console.log('[API] getConversations called, isTauriApp:', isTauriApp);
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
       const res = await fetch(`${API_BASE}/conversations`, {
@@ -661,7 +616,7 @@ export async function getConversations() {
             provider: c.provider,
             workspace_path: c.workspace_path,
             project_id: c.project_id,
-            research_mode: c.research_mode,
+            workspace_mode: conversationWorkspaceMode(c), research_mode: c.research_mode,
             pinned: c.pinned,
             archived: c.archived,
             created_at: c.created_at,
@@ -685,7 +640,7 @@ export async function getConversations() {
         provider: c.provider,
         workspace_path: c.workspace_path,
         project_id: c.project_id,
-        research_mode: c.research_mode,
+        workspace_mode: conversationWorkspaceMode(c), research_mode: c.research_mode,
         pinned: c.pinned,
         archived: c.archived,
         created_at: c.created_at,
@@ -705,7 +660,7 @@ export async function getConversations() {
     provider: c.provider,
     workspace_path: c.workspace_path,
     project_id: c.project_id,
-    research_mode: c.research_mode,
+    workspace_mode: conversationWorkspaceMode(c), research_mode: c.research_mode,
     pinned: c.pinned,
     archived: c.archived,
     created_at: c.created_at,
@@ -729,11 +684,12 @@ export async function createConversation(title?: string, model?: string, extras?
   console.log('[API] createConversation called: model=', model, 'title=', title);
   const modelName = model || 'claude-sonnet-4-6';
   const researchMode = extras?.research_mode || false;
+  const workspaceMode = useWorkspaceModeStore.getState().mode;
 
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
-      const body: any = { model: modelName };
+      const body: any = { model: modelName, workspace_mode: workspaceMode };
       if (title !== undefined) body.title = title;
       if (researchMode) body.research_mode = researchMode;
       const token = getToken();
@@ -759,7 +715,7 @@ export async function createConversation(title?: string, model?: string, extras?
       console.warn('[API] createConversation via SQLite failed:', e);
     }
   } else {
-    const conv = createLocalConversation(title, modelName, { research_mode: researchMode });
+    const conv = createLocalConversation(title, modelName, { research_mode: researchMode, workspace_mode: workspaceMode });
     console.log('[API] createConversation via localStorage:', conv.id);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('conversationCreated', { detail: { id: conv.id } }));
@@ -772,6 +728,7 @@ export async function createConversation(title?: string, model?: string, extras?
   console.warn('[API] Using local fallback conversation id:', fallbackId);
   return {
     id: fallbackId,
+    workspace_mode: workspaceMode,
     title: title || null,
     model: modelName,
     workspace_path: '',
@@ -782,7 +739,7 @@ export async function createConversation(title?: string, model?: string, extras?
 
 export async function getConversation(id: string) {
   console.log('[API] getConversation called for id:', id);
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     try {
       await waitForApiReady();
       const res = await fetch(`${API_BASE}/conversations/${id}`, {
@@ -793,6 +750,7 @@ export async function getConversation(id: string) {
         throw new Error('Conversation not found');
       }
       const data = await res.json();
+      const cachedMessages = getLocalMessages(id);
       console.log('[API] getConversation from SQLite, messages:', data.messages?.length || 0);
       return {
         id: data.id,
@@ -801,13 +759,14 @@ export async function getConversation(id: string) {
         provider: data.provider,
         workspace_path: data.workspace_path,
         project_id: data.project_id,
+        workspace_mode: conversationWorkspaceMode(data),
         research_mode: data.research_mode,
         pinned: data.pinned,
         archived: data.archived,
         created_at: data.created_at,
         updated_at: data.updated_at,
         message_count: data.message_count,
-        messages: (data.messages || []).map((m: any) => {
+        messages: (data.messages || []).map((m: any, index: number) => {
           let toolCalls: any[] = [];
           if (m.tool_calls) {
             if (typeof m.tool_calls === 'string') {
@@ -816,7 +775,8 @@ export async function getConversation(id: string) {
               toolCalls = m.tool_calls;
             }
           }
-          return {
+          return restoreProcessMetadata({
+            requestSnapshots: m.requestSnapshots,
             id: m.id,
             role: m.role || 'assistant',
             content: m.content,
@@ -825,7 +785,7 @@ export async function getConversation(id: string) {
             is_compact_boundary: m.is_compact_boundary,
             sort_order: m.sort_order,
             toolCalls,
-          };
+          }, index, cachedMessages);
         }),
       };
     } catch (e) {
@@ -844,6 +804,7 @@ export async function getConversation(id: string) {
     provider: conv.provider,
     workspace_path: conv.workspace_path,
     project_id: conv.project_id,
+    workspace_mode: conversationWorkspaceMode(conv),
     research_mode: conv.research_mode,
     pinned: conv.pinned,
     archived: conv.archived,
@@ -859,12 +820,13 @@ export async function getConversation(id: string) {
       is_compact_boundary: m.is_compact_boundary,
       sort_order: m.sort_order,
       toolCalls: m.toolCalls || [],
+      ...processMetadata(m),
     })),
   };
 }
 
 export async function deleteConversation(id: string) {
-  if (isTauriApp) {
+  if (isTauriApp || useDevProxy) {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('conversationDeleting', { detail: { id } }));
     }
@@ -896,19 +858,18 @@ export async function deleteConversation(id: string) {
 }
 
 export async function updateConversation(id: string, data: any) {
-  if (isTauriApp) {
-    try {
-      await waitForApiReady();
-      const token = getToken();
-      await fetch(`${API_BASE}/conversations/${id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { 'Authorization': `Bearer ${token}` } : {}) },
-        body: JSON.stringify(data),
-      });
-    } catch (e) {
-      console.error('[API] updateConversation failed:', e);
-    }
+  if (isTauriApp || useDevProxy) {
+    const res = await request(`/conversations/${id}`, { method: 'POST', body: JSON.stringify(data) });
+    const result = await res.json();
+    if (result.ok === false || result.error) throw new Error(result.error || 'Could not update conversation');
     return { ...data, id };
+  }
+  if ('project_id' in data) {
+    if (data.project_id) {
+      const project: Project = await getProject(data.project_id);
+      if (project.folders.some(folder => !folder.trusted)) throw new Error('Trust the project folders before moving this chat.');
+      data = { ...data, workspace_path: project.workspace_path };
+    } else data = { ...data, workspace_path: null };
   }
   updateLocalConversation(id, data);
   return { ...data, id };
@@ -1017,11 +978,16 @@ export async function compactConversation(
 
 export async function branchConversation(
   conversationId: string,
-  fromMessageId?: string
+  fromMessageId?: string,
+  fromMessageIndex?: number
 ): Promise<{ success: boolean; new_conversation_id: string }> {
+  if (!isTauriApp && !useDevProxy) {
+    const { branchConversation: branchLocalConversation } = await import('./api/conversations');
+    return branchLocalConversation(conversationId, fromMessageId, fromMessageIndex);
+  }
   const res = await request(`/conversations/${conversationId}/branch`, {
     method: 'POST',
-    body: JSON.stringify({ from_message_id: fromMessageId }),
+    body: JSON.stringify({ from_message_id: fromMessageId, from_message_index: fromMessageIndex }),
   });
   return res.json();
 }
@@ -1086,20 +1052,25 @@ export function warmEngine(conversationId: string): void {
 }
 
 // ===== Provider Management =====
-export interface ProviderModel { id: string; name: string; enabled?: boolean; }
+export interface ProviderModel {
+  id: string; name: string; enabled?: boolean;
+  contextWindow?: number; maxTokens?: number; inputTypes?: string[];
+  api?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, string | null>;
+}
+export type WebSearchStrategy = 'auto' | 'openai_native' | 'anthropic_native' | 'deepseek_native' | 'public' | 'disabled' | 'dashscope' | 'bigmodel';
 export interface Provider {
   id: string; name: string; apiKey: string; baseUrl: string;
-  format: 'anthropic' | 'openai'; models: ProviderModel[]; enabled: boolean;
+  format: 'anthropic' | 'openai' | 'harness'; category?: 'builtin' | 'custom'; builtinId?: string; models: ProviderModel[]; enabled: boolean;
   icon?: string;
   supportsWebSearch?: boolean;
-  webSearchStrategy?: 'dashscope' | 'bigmodel' | 'anthropic_native' | null;
+  webSearchStrategy?: WebSearchStrategy | null;
   webSearchTestedAt?: number;
   webSearchTestReason?: string | null;
 }
 
 export interface WebSearchTestResult {
   ok: boolean;
-  strategy?: 'dashscope' | 'bigmodel' | 'anthropic_native' | null;
+  strategy?: WebSearchStrategy | null;
   hitCount?: number;
   reason?: string;
 }
@@ -1111,73 +1082,96 @@ export async function testProviderWebSearch(id: string): Promise<WebSearchTestRe
   return res.json();
 }
 
-export async function getProviders(): Promise<Provider[]> {
-  if (isTauriApp) {
-    try {
-      await waitForApiReady();
-      const res = await fetch(`${API_BASE}/providers`, {
-        headers: { ...(getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {}) },
-      });
-      const data = await res.json();
-      return Array.isArray(data) ? data : (Array.isArray(data?.providers) ? data.providers : []);
-    } catch {
-      return [];
-    }
-  }
-  return getLocalProviders();
+async function providerRequest(path: string, method = 'GET', body?: unknown) {
+  await waitForApiReady();
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data: any;
+  try { data = JSON.parse(text); } catch { throw new Error(`本地后端暂不可用（HTTP ${response.status}），请等待项目启动后重试`); }
+  if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
 }
 
-export async function createProvider(p: Partial<Provider>): Promise<Provider> {
-  if (isTauriApp) {
-    await waitForApiReady();
-    const res = await fetch(`${API_BASE}/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {}) }, body: JSON.stringify(p) });
-    return res.json();
-  }
-  return createLocalProvider(p as any);
+export interface SearchSettings {
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+}
+export interface SearchSettingsUpdate {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+function searchSettingsResult(data: SearchSettings): SearchSettings {
+  return { baseUrl: data.baseUrl, model: data.model, hasApiKey: data.hasApiKey };
+}
+export async function getSearchSettings(): Promise<SearchSettings> {
+  return searchSettingsResult(await providerRequest('/search-settings'));
+}
+export async function getSearchApiKey(): Promise<string> {
+  const data = await providerRequest('/search-settings/key', 'POST');
+  if (typeof data.apiKey !== 'string' || !data.apiKey) throw new Error('无法读取搜索密钥，请重试');
+  return data.apiKey;
+}
+export async function updateSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettings> {
+  return searchSettingsResult(await providerRequest('/search-settings', 'PATCH', settings));
+}
+export interface SearchSettingsTestResult {
+  ok: true;
+  model: string;
+  resultCount: number;
+  elapsedMs: number;
+  results: Array<{ title: string; url: string; snippet: string }>;
+}
+export async function testSearchSettings(settings: SearchSettingsUpdate): Promise<SearchSettingsTestResult> {
+  return providerRequest('/search-settings/test', 'POST', settings);
 }
 
-export async function updateProvider(id: string, p: Partial<Provider>): Promise<Provider> {
-  if (isTauriApp) {
-    await waitForApiReady();
-    const res = await fetch(`${API_BASE}/providers/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...(getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {}) }, body: JSON.stringify(p) });
-    return res.json();
-  }
-  return updateLocalProvider(id, p) as Provider;
-}
-
-export async function deleteProvider(id: string): Promise<void> {
-  if (isTauriApp) {
-    await waitForApiReady();
-    await fetch(`${API_BASE}/providers/${id}`, { method: 'DELETE', headers: { ...(getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {}) } });
-    return;
-  }
-  deleteLocalProvider(id);
-  trackProviderDeletion(id);
-}
-
-export async function getProviderModels(): Promise<Array<{ id: string; name: string; providerId: string; providerName: string }>> {
-  if (isTauriApp) {
-    try {
-      await waitForApiReady();
-      const res = await fetch(`${API_BASE}/providers/models`, {
-        headers: { ...(getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {}) },
-      });
-      return res.json();
-    } catch {
-      return [];
-    }
-  }
-  const providers = getLocalProviders();
-  const models: Array<{ id: string; name: string; providerId: string; providerName: string }> = [];
-  for (const p of providers) {
-    if (!p.enabled) continue;
-    for (const m of p.models || []) {
-      if (m.enabled !== false) {
-        models.push({ id: m.id, name: m.name, providerId: p.id, providerName: p.name });
+let providerMigration: Promise<void> | undefined;
+async function migrateLegacyProviders() {
+  if (localStorage.getItem('providers_file_migrated_v1')) return;
+  if (!providerMigration) providerMigration = (async () => {
+    const data = await providerRequest('/providers');
+    const existing: Provider[] = Array.isArray(data) ? data : data.providers || [];
+    for (const provider of getLocalProviders()) {
+      if (!existing.some(p => p.id === provider.id)) {
+        await providerRequest('/providers', 'POST', provider);
       }
     }
-  }
-  return models;
+    localStorage.setItem('providers_file_migrated_v1', '1');
+  })().catch(error => { providerMigration = undefined; throw error; });
+  await providerMigration;
+}
+export async function getProviders(): Promise<Provider[]> {
+  await migrateLegacyProviders();
+  const data = await providerRequest('/providers');
+  return Array.isArray(data) ? data : data.providers || [];
+}
+function providersChanged() { window.dispatchEvent(new Event('providers-changed')); }
+export async function createProvider(p: Partial<Provider>): Promise<Provider> {
+  const result = await providerRequest('/providers', 'POST', p);
+  providersChanged();
+  return result;
+}
+export async function updateProvider(id: string, p: Partial<Provider>): Promise<Provider> {
+  const result = await providerRequest(`/providers/${encodeURIComponent(id)}`, 'PATCH', p);
+  providersChanged();
+  return result;
+}
+export async function deleteProvider(id: string): Promise<void> {
+  await providerRequest(`/providers/${encodeURIComponent(id)}`, 'DELETE');
+  providersChanged();
+}
+export async function fetchProviderModels(id: string): Promise<ProviderModel[]> {
+  return (await providerRequest(`/providers/${encodeURIComponent(id)}/fetch-models`, 'POST')).models;
+}
+export async function getProviderModels(): Promise<Array<ProviderModel & { providerId: string; providerName: string }>> {
+  return (await providerRequest('/providers/models')).models || [];
 }
 
 // Check if a conversation has an active engine stream
@@ -1239,14 +1233,15 @@ export function reconnectStream(
               onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input });
             }
             if (parsed.type === 'tool_use_done' && onToolUse) {
-              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content, is_error: parsed.is_error });
             }
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
             }
-            if (parsed.type === 'tool_permission' && onSystem) {
-              onSystem('tool_permission', '', parsed);
+            if ((parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') && onSystem) {
+              onSystem(parsed.type, '', parsed);
             }
+            if (parsed.type === 'request_snapshot' && onSystem) onSystem('request_snapshot', '', parsed);
             if (parsed.type === 'message_start' && onSystem) {
               onSystem('message_start', '', parsed);
             }
@@ -1271,7 +1266,7 @@ export function reconnectStream(
               if (fullText) { onDone(fullText); return; }
             }
             if (parsed.type === 'error') {
-              onError(parsed.error || 'Stream error');
+              onError(formatChatStreamError(parsed));
               return;
             }
           } catch (_) {}
@@ -1286,7 +1281,7 @@ export function reconnectStream(
 export function persistMessages(conversationId: string, messages: any[]) {
   if (isTauriApp) return;
   const mapped = messages.map((m, i) => ({
-    id: m.id || crypto.randomUUID(),
+    id: m.id || (m.id = crypto.randomUUID()),
     conversation_id: conversationId,
     role: m.role,
     content: m.content || '',
@@ -1295,6 +1290,7 @@ export function persistMessages(conversationId: string, messages: any[]) {
     is_compact_boundary: m.is_compact_boundary,
     sort_order: m.sort_order !== undefined ? m.sort_order : i,
     toolCalls: m.toolCalls || [],
+    ...processMetadata(m),
   }));
   saveLocalMessages(conversationId, mapped);
 }
@@ -1725,7 +1721,7 @@ async function parseProxyStream(stream: ReadableStream, handlers: {
           break;
 
         case 'error':
-          handlers.onError(event.error || 'Unknown error');
+          handlers.onError(formatChatStreamError(event));
           break;
       }
     } catch (e) {
@@ -1800,17 +1796,17 @@ export async function sendMessageNative(
       body: JSON.stringify({
         conversation_id: conversationId,
         messages,
-        model,
+        model: splitModelKey(model).modelId,
+        provider_id: splitModelKey(model).providerId,
         ...resolveEnvCreds(getUserModeForConversation(conversationId)),
         user_mode: getUserModeForConversation(conversationId),
         permission_mode: permissionMode,
-        reasoning_mode: reasoningMode || undefined,
+        effort: ['off', 'low', 'high', 'max'].includes(reasoningMode || '') ? reasoningMode : 'off',
       }),
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: '请求失败' }));
-      onError(err.error || '请求失败');
+      onError(await readChatResponseError(res));
       return () => {};
     }
 
@@ -1866,6 +1862,7 @@ export async function sendMessageNative(
               scheduleFlush();
             } else if (event.type === 'content_block_start') {
               if (event.content_block?.type === 'tool_use') {
+                flushPending();
                 onToolUse?.({
                   type: 'start',
                   tool_use_id: event.content_block.id || '',
@@ -1884,6 +1881,7 @@ export async function sendMessageNative(
               }
             } else if (event.type === 'content_block_stop') {
             } else if (event.type === 'tool_use_start') {
+              flushPending();
               onToolUse?.({
                 type: 'start',
                 tool_use_id: event.tool_use_id || '',
@@ -1893,6 +1891,7 @@ export async function sendMessageNative(
                 is_error: false,
               });
             } else if (event.type === 'tool_use_done') {
+              flushPending();
               onToolUse?.({
                 type: 'done',
                 tool_use_id: event.tool_use_id || '',
@@ -1902,6 +1901,9 @@ export async function sendMessageNative(
                 is_error: event.is_error === true,
               });
             } else if (event.type === 'tool_arg_delta') {
+            } else if (event.type === 'request_snapshot') {
+              flushPending();
+              onSystem?.('request_snapshot', '', event);
             } else if (event.type === 'message_start') {
               onSystem?.('message_start', '', { model: event.message?.model });
             } else if (event.type === 'message_delta') {
@@ -1915,7 +1917,7 @@ export async function sendMessageNative(
               onDone(fullText);
             } else if (event.type === 'error') {
               console.log(`[API] SSE connection closed`);
-              onError(event.error || 'Unknown error');
+              onError(formatChatStreamError(event));
             }
           } catch (e) {
             // Skip malformed JSON
@@ -2015,13 +2017,14 @@ export async function sendMessage(
       body: JSON.stringify({
         conversation_id: conversationId,
         message,
-        model: model || undefined,
+        model: splitModelKey(model || '').modelId,
+        provider_id: splitModelKey(model || '').providerId,
         messages: messages && messages.length > 0 ? messages : undefined,
         attachments: attachments || undefined,
         ...resolveEnvCreds(getUserModeForConversation(conversationId)),
         user_mode: getUserModeForConversation(conversationId),
         permission_mode: permissionMode,
-        reasoning_mode: reasoningMode || undefined,
+        effort: ['off', 'low', 'high', 'max'].includes(reasoningMode || '') ? reasoningMode : 'off',
         user_profile: (() => {
           try {
             const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');
@@ -2035,8 +2038,7 @@ export async function sendMessage(
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: '请求失败' }));
-      onError(err.error || '请求失败');
+      onError(await readChatResponseError(res));
       return;
     }
 
@@ -2145,7 +2147,7 @@ export async function sendMessage(
               appendVisibleText(inlineArtifactBuffer);
               inlineArtifactBuffer = '';
             } else {
-              const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_OPEN.length - 1);
+              const keep = pendingMarkerLength(inlineArtifactBuffer, INLINE_ARTIFACT_OPEN);
               const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
               if (emit) appendVisibleText(emit);
               inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
@@ -2189,7 +2191,7 @@ export async function sendMessage(
             emitInlineArtifactDraft(true);
             activeInlineArtifact = null;
           } else {
-            const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_CLOSE.length - 1);
+            const keep = pendingMarkerLength(inlineArtifactBuffer, INLINE_ARTIFACT_CLOSE);
             const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
             if (emit) appendInlineArtifactPreview(emit);
             inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
@@ -2373,14 +2375,20 @@ export async function sendMessage(
           }
 
           // Handle tool permission request from engine
-          if (parsed.type === 'tool_permission') {
+          if (parsed.type === 'tool_permission' || parsed.type === 'tool_permission_resolved') {
             if (onSystem) {
-              try { onSystem('tool_permission', '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
+              try { onSystem(parsed.type, '', parsed); } catch (err) { console.error('[API] onSystem tool_permission callback error:', err); }
             }
             continue;
           }
 
           // Handle message_start with usage data
+          if (parsed.type === 'request_snapshot') {
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
+            flushPending();
+            onSystem?.('request_snapshot', '', parsed);
+            continue;
+          }
           if (parsed.type === 'message_start') {
             if (onSystem) {
               try { onSystem('message_start', '', parsed); } catch (err) { console.error('[API] onSystem message_start callback error:', err); }
@@ -2406,13 +2414,17 @@ export async function sendMessage(
 
           // Handle tool use events
           if (parsed.type === 'tool_use_start' && onToolUse) {
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
+            flushPending();
             try { onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' }); } catch (err) { console.error('[API] onToolUse start callback error:', err); }
           }
           if (parsed.type === 'tool_use_input' && onToolUse) {
             try { onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input }); } catch (err) { console.error('[API] onToolUse input callback error:', err); }
           }
           if (parsed.type === 'tool_use_done' && onToolUse) {
-            try { onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content || parsed.output, is_error: parsed.is_error }); } catch (err) { console.error('[API] onToolUse done callback error:', err); }
+            if (!activeInlineArtifact) processInlineArtifactText('', true);
+            flushPending();
+            try { onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, content: parsed.content || parsed.output, is_error: parsed.is_error }); } catch (err) { console.error('[API] onToolUse done callback error:', err); }
           }
 
           // Research mode events — forward as system events for MainContent to handle
@@ -2445,11 +2457,10 @@ export async function sendMessage(
           }
 
           if (parsed.type === 'error') {
-            const detail = parsed.detail ? `\n${parsed.detail}` : '';
             processInlineArtifactText('', true);
             flushPending();
             console.log(`[API] SSE connection closed`);
-            try { onError((parsed.error || '未知错误') + detail); } catch (err) { console.error('[API] onError callback error:', err); }
+            try { onError(formatChatStreamError(parsed)); } catch (err) { console.error('[API] onError callback error:', err); }
             return;
           }
         } catch (e) {
@@ -2678,7 +2689,7 @@ export async function multiagentWorkflowStream(
       body: JSON.stringify({
         goal,
         provider_id: providerId || undefined,
-        model: model || undefined,
+        model: splitModelKey(model || '').modelId,
       }),
       signal,
     });

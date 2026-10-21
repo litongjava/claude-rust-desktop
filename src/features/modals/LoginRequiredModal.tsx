@@ -11,11 +11,11 @@ export default function LoginRequiredModal({ onClose }: LoginRequiredModalProps)
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
       <div className="bg-claude-input border border-claude-border rounded-2xl shadow-xl w-[460px] overflow-hidden">
         <div className="px-6 pt-6 pb-4">
-          <h3 className="text-[16px] font-semibold text-claude-text mb-3">需要登录 Claude Rust 账号</h3>
+          <h3 className="text-[16px] font-semibold text-claude-text mb-3">需要登录 DeepSeek Code 账号</h3>
           <p className="text-[14px] text-claude-textSecondary leading-relaxed">
-            你当前在 <span className="text-claude-text font-medium">Claude Rust</span> 模式下，需要登录 <span className="font-mono text-claude-text">Claude Rust</span> 账号才能使用。
+            你当前在 <span className="text-claude-text font-medium">DeepSeek Code</span> 模式下，需要登录 <span className="font-mono text-claude-text">DeepSeek Code</span> 账号才能使用。
             <br /><br />
-            如果你还没有账号，请先去 <span className="font-mono text-claude-text">Claude Rust</span> 注册一个。
+            如果你还没有账号，请先去 <span className="font-mono text-claude-text">DeepSeek Code</span> 注册一个。
             <br /><br />
             或者你也可以在设置的 General 页面切换到 <span className="text-claude-text font-medium">自部署</span> 模式，用你自己的 API Key。
           </p>

@@ -1,28 +1,33 @@
 import { getErrorMessage } from '../utils/errorHelpers';
 import React, { useState, useEffect } from 'react';
-import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Clock } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Puzzle, Globe, Clock, Settings, Cpu, UserRound, Info, BarChart3 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
-import McpSettingsPage from './McpSettingsPage';
+import SearchSettings from './SearchSettings';
+import CustomizePage from './CustomizePage';
 import TaskList from './TaskList';
 import NewTaskModal from './NewTaskModal';
 import { taskAPI, TaskInfo } from '../utils/tauriAPI';
 import { useI18n } from '../hooks/useI18n';
-
-interface SettingsPageProps {
-  onClose: () => void;
-}
+import GeneralPreferences from './GeneralPreferences';
+import { version as appVersion } from '../../package.json';
+import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
 
 const WORK_OPTIONS = [
-  '', '软件工程', '产品管理', '数据科学',
-  '市场营销', '设计', '研究', '教育', '金融',
-  '法律', '医疗健康', '其他',
+  { value: '软件工程', key: 'software' }, { value: '产品管理', key: 'product' },
+  { value: '数据科学', key: 'data' }, { value: '市场营销', key: 'marketing' },
+  { value: '设计', key: 'design' }, { value: '研究', key: 'research' },
+  { value: '教育', key: 'education' }, { value: '金融', key: 'finance' },
+  { value: '法律', key: 'law' }, { value: '医疗健康', key: 'healthcare' },
+  { value: '其他', key: 'other' },
 ];
 
-type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tasks';
+type Tab = 'about' | 'general' | 'account' | 'usage' | 'models' | 'search' | 'customize' | 'tasks';
 
-const SettingsPage = ({ onClose }: SettingsPageProps) => {
-  const { t } = useI18n();
+const SettingsPage = ({ onCreateWithClaude }: { onCreateWithClaude?: () => void }) => {
+  const { t, locale } = useI18n();
+  const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('general');
   const [profile, setProfile] = useState<any>(null);
   const [usage, setUsage] = useState<any>(null);
@@ -34,8 +39,8 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
   const [displayName, setDisplayName] = useState('');
   const [workFunction, setWorkFunction] = useState('');
   const [personalPreferences, setPersonalPreferences] = useState('');
-  const [theme, setTheme] = useState('light');
-  const [chatFont, setChatFont] = useState('default');
+  const theme = useGeneralSettingsStore(s => s.theme);
+  const [chatFont, setChatFont] = useState(localStorage.getItem('chat_font') || 'default');
   const [defaultModel, setDefaultModel] = useState('claude-opus-4-6-thinking');
   const [sessions, setSessions] = useState<any[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState('');
@@ -51,9 +56,6 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
   const [deleteError, setDeleteError] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
-  const [sendKey, setSendKey] = useState(localStorage.getItem('sendKey') || 'enter'); // enter or ctrl+enter
-  const [newlineKey, setNewlineKey] = useState(localStorage.getItem('newlineKey') || (localStorage.getItem('sendKey') === 'enter' ? 'shift_enter' : 'enter'));
-  const [language, setLanguage] = useState(localStorage.getItem('language') || 'zh');
 
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
@@ -83,8 +85,6 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
         setDisplayName(p?.display_name || p?.nickname || '');
         setWorkFunction(p?.work_function || '');
         setPersonalPreferences(p?.personal_preferences || '');
-        setTheme(p?.theme || 'light');
-        setChatFont(p?.chat_font || 'default');
         setDefaultModel(p?.default_model || 'claude-opus-4-6-thinking');
       }).catch(() => { });
     }
@@ -143,30 +143,12 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
     // I'll keep the Save button for Profile but make Theme instant.
   };
 
-  const applyTheme = (t: string) => {
-    setTheme(t);
-    const root = document.documentElement;
-    if (t === 'dark') {
-      root.setAttribute('data-theme', 'dark');
-      root.classList.add('dark');
-    } else if (t === 'auto') {
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      root.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
-      root.classList.toggle('dark', prefersDark);
-    } else {
-      root.setAttribute('data-theme', 'light');
-      root.classList.remove('dark');
-    }
-    localStorage.setItem('theme', t);
-    // Auto-save theme
-    updateUserProfile({ theme: t }).catch(() => { });
-  };
-
   const applyFont = (f: string) => {
     setChatFont(f);
     document.documentElement.setAttribute('data-chat-font', f);
     localStorage.setItem('chat_font', f);
-    updateUserProfile({ chat_font: f }).catch(() => { });
+    useGeneralSettingsStore.getState().update({});
+    if (!isSelfHosted) updateUserProfile({ chat_font: f }).catch(() => { });
   };
 
   const HARDCODED_MODELS = [
@@ -241,7 +223,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to create task:', e);
-      window.alert('Failed to create task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.createFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -268,7 +250,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to update task:', e);
-      window.alert('Failed to update task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.updateFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -278,7 +260,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to delete task:', e);
-      window.alert('Failed to delete task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.deleteFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -288,7 +270,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to execute task:', e);
-      window.alert('Failed to execute task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.executeFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -298,7 +280,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       await loadTasks();
     } catch (e) {
       console.error('Failed to toggle task:', e);
-      window.alert('Failed to toggle task: ' + (e instanceof Error ? getErrorMessage(e) : String(e)));
+      window.alert(t('tasks.toggleFailed', { error: e instanceof Error ? getErrorMessage(e) : String(e) }));
     }
   };
 
@@ -314,103 +296,120 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
 
   // Font selector options
   return (
-    <div className="flex-1 flex h-full overflow-hidden bg-claude-bg text-claude-text">
-      {/* Left Sidebar Navigation */}
-      <div className="w-[200px] flex-shrink-0 pt-16 pl-8 flex flex-col gap-1">
-        <h2
-          className="font-[Spectral] text-[28px] text-claude-text px-3 mb-6"
-          style={{
-            fontWeight: 500,
-            WebkitTextStroke: '0.5px currentColor'
-          }}
-        >
-          {t('settings.title')}
-        </h2>
-
+    <div className="flex-1 flex flex-col min-h-0 h-full overflow-hidden bg-claude-bg text-claude-text">
+      <div className="shrink-0 px-6 pt-8 pb-6 md:px-8">
         <button
-          onClick={() => setTab('general')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
+          onClick={() => navigate('/')}
+          className="flex items-center gap-1.5 text-[14px] text-claude-textSecondary hover:text-claude-text transition-colors"
         >
-          {t('settings.general')}
-        </button>
-        {localStorage.getItem('user_mode') === 'selfhosted' && (
-          <button
-            onClick={() => setTab('models')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.models')}
-          </button>
-        )}
-        {localStorage.getItem('user_mode') !== 'selfhosted' && (
-          <button
-            onClick={() => setTab('account')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'account' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.account')}
-          </button>
-        )}
-        {localStorage.getItem('user_mode') !== 'selfhosted' && (
-          <button
-            onClick={() => setTab('usage')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.usage')}
-          </button>
-        )}
-        <button
-          onClick={() => setTab('mcp')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'mcp' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
-        >
-          <Server size={16} />
-          {t('settings.mcpServers')}
-        </button>
-        <button
-          onClick={() => setTab('tasks')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'tasks' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-            }`}
-        >
-          <Clock size={16} />
-          Scheduled Tasks
+          <ArrowLeft size={16} />
+          <span>{t('common.back')}</span>
         </button>
       </div>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {/* Left Sidebar Navigation */}
+        <div className="w-[180px] md:w-[200px] flex-shrink-0 pl-4 md:pl-8 pb-8 overflow-y-auto flex flex-col gap-1">
+          <h2
+            className="font-[Spectral] text-[28px] text-claude-text px-3 mb-6"
+            style={{
+              fontWeight: 500,
+              WebkitTextStroke: '0.5px currentColor'
+            }}
+          >
+            {t('settings.title')}
+          </h2>
 
-      {/* Right Content Area */}
-      <div className="flex-1 overflow-y-auto min-w-0">
-        <div className="max-w-6xl pt-16 pl-12 pb-32 pr-12">
-          {tab === 'general' && renderGeneral()}
-          {tab === 'models' && <ProviderSettings />}
-          {tab === 'account' && renderAccount()}
-          {tab === 'usage' && renderUsage()}
-          {tab === 'mcp' && <McpSettingsPage />}
-          {tab === 'tasks' && (
-            <div className="h-full flex flex-col">
-              {tasksLoading ? (
-                <div className="flex items-center justify-center h-full">
-                  <span className="text-[13px] text-claude-textSecondary">Loading tasks...</span>
-                </div>
-              ) : (
-                <TaskList
-                  tasks={tasks}
-                  onEdit={handleEditTask}
-                  onDelete={handleDeleteTask}
-                  onExecute={handleExecuteNow}
-                  onToggle={handleToggleTask}
-                  onAdd={handleAddTask}
-                />
-              )}
-            </div>
+          <button onClick={() => setTab('account')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'account' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <UserRound size={16} />{t('settings.account')}
+          </button>
+          <button
+            onClick={() => setTab('general')}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'general' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Settings size={16} />
+            {t('settings.general')}
+          </button>
+          {localStorage.getItem('user_mode') === 'selfhosted' && (
+            <button
+              onClick={() => setTab('models')}
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+                }`}
+            >
+              <Cpu size={16} />
+              {t('settings.models')}
+            </button>
           )}
+          <button onClick={() => setTab('search')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'search' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <Globe size={16} />{t('searchSettings.nav')}
+          </button>
+          {localStorage.getItem('user_mode') !== 'selfhosted' && (
+            <button
+              onClick={() => setTab('usage')}
+              className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'usage' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+                }`}
+            >
+              <BarChart3 size={16} />
+              {t('settings.usage')}
+            </button>
+          )}
+          <button
+            onClick={() => setTab('customize')}
+            aria-current={tab === 'customize' ? 'page' : undefined}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'customize' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Puzzle size={16} />
+            {t('customize.title')}
+          </button>
+          <button
+            onClick={() => setTab('tasks')}
+            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'tasks' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+              }`}
+          >
+            <Clock size={16} />
+            {t('tasks.title')}
+          </button>
+          <button onClick={() => setTab('about')} className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'about' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'}`}>
+            <Info size={16} />{t('settings.about')}
+          </button>
+        </div>
+
+        {/* Right Content Area */}
+        <div className={`flex-1 min-w-0 ${tab === 'customize' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+          {tab === 'customize' ? <CustomizePage onBack={() => setTab('general')} onCreateWithClaude={onCreateWithClaude} /> : <div className="max-w-6xl px-6 lg:px-12 pb-32">
+            {tab === 'general' && renderGeneral()}
+            {tab === 'about' && renderAbout()}
+            {tab === 'models' && <ProviderSettings />}
+            {tab === 'search' && <SearchSettings />}
+            {tab === 'account' && renderAccount()}
+            {tab === 'usage' && renderUsage()}
+            {tab === 'tasks' && (
+              <div className="h-full flex flex-col">
+                {tasksLoading ? (
+                  <div className="flex items-center justify-center h-full">
+                    <span className="text-[13px] text-claude-textSecondary">{t('tasks.loading')}</span>
+                  </div>
+                ) : (
+                  <TaskList
+                    tasks={tasks}
+                    onEdit={handleEditTask}
+                    onDelete={handleDeleteTask}
+                    onExecute={handleExecuteNow}
+                    onToggle={handleToggleTask}
+                    onAdd={handleAddTask}
+                  />
+                )}
+              </div>
+            )}
+          </div>}
         </div>
       </div>
     </div>
   );
 
   function renderAccount() {
+    if (isSelfHosted) return <div className="animate-fade-in">{renderAccountPreferences()}</div>;
     const handleChangePassword = async () => {
       setPwdError(''); setPwdMsg('');
       if (!pwdCurrent || !pwdNew || !pwdConfirm) { setPwdError(t('settings.pleaseFillAllFields')); return; }
@@ -458,18 +457,19 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       const d = new Date(timeStr);
       if (isNaN(d.getTime())) return 'Invalid Date';
 
-      return d.toLocaleString('en-US', {
+      return d.toLocaleString(locale, {
         month: 'short',
         day: 'numeric',
         year: 'numeric',
         hour: 'numeric',
         minute: '2-digit',
-        hour12: true
       });
     };
 
     return (
       <div className="space-y-10 animate-fade-in">
+        {renderAccountPreferences()}
+        <hr className="border-claude-border" />
         {/* 邮箱 */}
         <section>
           <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.account')}</h3>
@@ -655,34 +655,51 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
     );
   }
 
-  function renderGeneral() {
-    return (
-      <div className="space-y-10 animate-fade-in">
-        {/* Language Selector */}
-        <section>
-          <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.language')}</h3>
-          <div>
-            <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.languageLabel')}</label>
-            <div className="relative">
-              <select
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                className="w-full max-w-xs px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
-              >
-                <option value="zh">{t('settings.chinese')}</option>
-                <option value="en">{t('settings.english')}</option>
-              </select>
-              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
-                <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
+  function renderChatFont() {
+    return (<>
+        {/* Chat font family */}
+        <section className="border-b border-claude-border py-6">
+          <h3 className="text-[16px] font-normal text-claude-text mb-4">{t('settings.chatFont')}</h3>
+          <div className="space-y-6">
+            {/* Chat Font - kept for feature parity even if not in screenshot */}
+            <div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                {([
+                  { value: 'default', label: 'Anthropic Serif', sample: 'Aa', font: 'font-serif-claude' },
+                  { value: 'sans', label: 'Anthropic Sans', sample: 'Aa', font: 'font-sans-claude' },
+                  { value: 'system', label: 'System', sample: 'Aa', font: 'font-system' },
+                  { value: 'dyslexic', label: 'OpenDyslexic', sample: 'Aa', font: 'font-dyslexic' },
+                ] as const).map(opt => (
+                  <button
+                    key={opt.value}
+                    aria-pressed={chatFont === opt.value}
+                    onClick={() => applyFont(opt.value)}
+                    className={`
+                      w-full flex flex-col items-center gap-2 py-3 px-2 rounded-lg border transition-all
+                      ${chatFont === opt.value
+                        ? 'border-[#3b82f6]/80 scale-[1.02] bg-claude-input text-claude-text shadow-sm'
+                        : 'border-claude-border bg-claude-input hover:border-[#CCC] text-claude-textSecondary hover:text-claude-text'
+                      }
+                    `}
+                  >
+                    <span className={`text-[20px] leading-none mb-1 ${opt.font}`}>
+                      {opt.sample}
+                    </span>
+                    <span className={`text-[13px] ${chatFont === opt.value ? 'font-medium' : ''}`}>
+                      {opt.label}
+                    </span>
+                  </button>
+                ))}
               </div>
             </div>
           </div>
         </section>
 
-        <hr className="border-claude-border" />
+    </>);
+  }
 
+  function renderAccountPreferences() {
+    return (<div className="space-y-10">
         {/* Profile Section */}
         <section>
           <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.personalInfo')}</h3>
@@ -729,7 +746,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                   className="w-full px-3 py-2.5 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all appearance-none cursor-pointer"
                 >
                   <option value="">{t('settings.occupationPlaceholder')}</option>
-                  {WORK_OPTIONS.filter(Boolean).map(o => <option key={o} value={o}>{o}</option>)}
+                  {WORK_OPTIONS.map(option => <option key={option.key} value={option.value}>{t(`occupations.${option.key}`)}</option>)}
                 </select>
                 <ChevronRight size={16} className="absolute right-3 top-1/2 -translate-y-1/2 rotate-90 text-claude-textSecondary pointer-events-none" />
               </div>
@@ -752,6 +769,61 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
           </div>
         </section>
 
+        <hr className="border-claude-border" />
+        {/* User Mode Switch */}
+        <section>
+          <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.userMode')}</h3>
+          <div className="flex gap-3">
+            {([
+              { value: 'selfhosted', label: t('settings.selfHosted'), desc: t('settings.selfHostedSubtitle') },
+              { value: 'clawparrot', label: t('settings.clawparrot'), desc: t('settings.clawparrotSubtitle') },
+            ] as const).map(opt => {
+              const current = localStorage.getItem('user_mode') || 'selfhosted';
+              const active = current === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  onClick={() => {
+                    localStorage.setItem('user_mode', opt.value);
+                    if (opt.value === 'clawparrot') {
+                      // Check if logged in, if not redirect
+                      const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
+                      if (!hasKey) {
+                        window.location.hash = '#/login';
+                      }
+                    }
+                    window.location.reload();
+                  }}
+                  className={`flex-1 px-4 py-3 rounded-xl border text-left transition-all ${active ? 'border-[#3b82f6]/80 bg-blue-500/5' : 'border-claude-border/60 hover:border-claude-textSecondary/20'
+                    }`}
+                >
+                  <div className={`text-[14px] font-medium ${active ? 'text-claude-text' : 'text-claude-textSecondary'}`}>{opt.label}</div>
+                  <div className="text-[12px] text-claude-textSecondary/60 mt-0.5">{opt.desc}</div>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+    </div>);
+  }
+
+  function renderAbout() {
+    return (<div className="animate-fade-in">
+        {/* About Section */}
+        <section>
+          <h3 className="text-[16px] font-semibold text-claude-text mb-3">{t('settings.about')}</h3>
+          <div className="flex items-center justify-between py-2">
+            <span className="text-[14px] text-claude-textSecondary">{t('settings.currentVersion')}</span>
+            <span className="text-[14px] font-mono text-claude-text">v{appVersion}</span>
+          </div>
+        </section>
+    </div>);
+  }
+
+  function renderGeneral() {
+    return (<div className="space-y-10 animate-fade-in">
+      <GeneralPreferences chatFont={renderChatFont()} />
         {/* Default Model Section — only for Clawparrot (self-hosted configures in Models tab) */}
         {localStorage.getItem('user_mode') !== 'selfhosted' && <><hr className="border-claude-border" /><section>
           <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.defaultModel')}</h3>
@@ -791,234 +863,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
           </div>
         </section></>}
 
-        {/* Send Key Section */}
-        <section>
-          <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.sendMessage')}</h3>
-          <div className="grid grid-cols-2 gap-6">
-            <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.sendMessageLabel')}</label>
-              <div className="relative">
-                <select
-                  value={sendKey}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setSendKey(val);
-                    localStorage.setItem('sendKey', val);
-                    // Smart auto-switch for newline to avoid conflict
-                    if (val === 'enter' && newlineKey === 'enter') {
-                      setNewlineKey('shift_enter');
-                      localStorage.setItem('newlineKey', 'shift_enter');
-                    } else if (val === 'ctrl_enter' && newlineKey === 'ctrl_enter') {
-                      setNewlineKey('enter');
-                      localStorage.setItem('newlineKey', 'enter');
-                    }
-                  }}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
-                >
-                  <option value="enter">Enter</option>
-                  <option value="ctrl_enter">Ctrl+Enter</option>
-                  <option value="cmd_enter">Cmd+Enter</option>
-                  <option value="alt_enter">Alt+Enter</option>
-                </select>
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
-                  <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                </div>
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">{t('settings.newlineLabel')}</label>
-              <div className="relative">
-                <select
-                  value={newlineKey}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setNewlineKey(val);
-                    localStorage.setItem('newlineKey', val);
-                  }}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
-                >
-                  <option value="enter">Enter</option>
-                  <option value="shift_enter">Shift+Enter</option>
-                  <option value="ctrl_enter">Ctrl+Enter</option>
-                  <option value="alt_enter">Alt+Enter</option>
-                </select>
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
-                  <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="border-claude-border" />
-
-        {/* Appearance Section */}
-        <section>
-          <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.appearance')}</h3>
-
-          <div className="space-y-6">
-            <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-2">{t('settings.colorMode')}</label>
-              <div className="flex gap-3">
-                {([
-                  { value: 'light', label: t('settings.light') },
-                  { value: 'auto', label: t('settings.auto') },
-                  { value: 'dark', label: t('settings.dark') },
-                ] as const).map(opt => (
-                  <button
-                    key={opt.value}
-                    onClick={() => applyTheme(opt.value)}
-                    className="group flex flex-col items-center gap-3"
-                  >
-                    <div className={`
-                      w-32 h-20 rounded-lg border transition-all relative overflow-hidden flex flex-col shadow-sm
-                      ${theme === opt.value
-                        ? 'border-[#3b82f6]/80 scale-[1.02]'
-                        : 'border-claude-border group-hover:border-[#CCC]'
-                      }
-                    `}>
-                      {/* Theme Preview Content */}
-                      {opt.value === 'light' && (
-                        <div className="flex-1 bg-[#F5F4F1] p-2 flex flex-col gap-1.5">
-                          <div className="flex justify-end mb-0.5">
-                            <div className="w-10 h-2.5 bg-[#E3E3E0] rounded-full"></div>
-                          </div>
-                          <div className="w-12 h-1 bg-[#E3E3E0] rounded-full mb-0.5"></div>
-                          <div className="w-16 h-1 bg-[#E3E3E0] rounded-full"></div>
-                          <div className="mt-auto bg-white rounded border border-[#E3E3E0] h-6 w-full flex items-center justify-end px-1">
-                            <div className="w-2 h-2 bg-[#D97757] rounded-full"></div>
-                          </div>
-                        </div>
-                      )}
-
-                      {opt.value === 'dark' && (
-                        <div className="flex-1 bg-[#1F1F1E] p-2 flex flex-col gap-1.5">
-                          <div className="flex justify-end mb-0.5">
-                            <div className="w-10 h-2.5 bg-[#404040] rounded-full"></div>
-                          </div>
-                          <div className="w-12 h-1 bg-[#404040] rounded-full mb-0.5"></div>
-                          <div className="w-16 h-1 bg-[#404040] rounded-full"></div>
-                          <div className="mt-auto bg-[#30302E] rounded border border-[#323130] h-6 w-full flex items-center justify-end px-1">
-                            <div className="w-2 h-2 bg-[#D97757] rounded-full"></div>
-                          </div>
-                        </div>
-                      )}
-
-                      {opt.value === 'auto' && (
-                        <div className="flex-1 flex w-full h-full">
-                          <div className="w-1/2 bg-[#555] p-2 flex flex-col gap-1.5 border-r border-white/10">
-                            <div className="w-8 h-1 bg-white/20 rounded-full mb-0.5"></div>
-                            <div className="w-10 h-1 bg-white/20 rounded-full"></div>
-                            <div className="mt-auto bg-white/90 rounded h-6 w-[140%] -ml-1 flex items-center px-1 z-10 shadow-sm">
-                            </div>
-                          </div>
-                          <div className="w-1/2 bg-[#2C2C2C] p-2 flex flex-col gap-1.5">
-                            <div className="flex justify-end">
-                              <div className="w-8 h-2.5 bg-[#404040] rounded-full"></div>
-                            </div>
-                            <div className="mt-auto h-6 w-[120%] -ml-4 flex items-center justify-end px-1 z-0">
-                              <div className="w-2 h-2 bg-[#D97757] rounded-full translate-x-3"></div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    <span className={`text-[15px] ${theme === opt.value ? 'text-claude-text font-medium' : 'text-claude-textSecondary'}`}>
-                      {opt.label}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Chat Font - kept for feature parity even if not in screenshot */}
-            <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-2">{t('settings.chatFont')}</label>
-              <div className="flex gap-3">
-                {([
-                  { value: 'default', label: t('settings.default'), sample: 'Aa', font: 'font-serif-claude' },
-                  { value: 'sans', label: t('settings.sans'), sample: 'Aa', font: 'font-sans' },
-                  { value: 'system', label: t('settings.system'), sample: 'Aa', font: 'font-system' }, // approximations for preview
-                  { value: 'dyslexic', label: t('settings.readingDisability'), sample: 'Aa', font: 'font-serif' },
-                ] as const).map(opt => (
-                  <button
-                    key={opt.value}
-                    onClick={() => applyFont(opt.value)}
-                    className={`
-                      w-32 flex flex-col items-center gap-2 py-3 px-2 rounded-lg border transition-all
-                      ${chatFont === opt.value
-                        ? 'border-[#3b82f6]/80 scale-[1.02] bg-claude-input text-claude-text shadow-sm'
-                        : 'border-claude-border bg-claude-input hover:border-[#CCC] text-claude-textSecondary hover:text-claude-text'
-                      }
-                    `}
-                  >
-                    <span className={`text-[20px] leading-none mb-1 ${opt.font}`}>
-                      {opt.sample}
-                    </span>
-                    <span className={`text-[13px] ${chatFont === opt.value ? 'font-medium' : ''}`}>
-                      {opt.label}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="border-claude-border" />
-
-        {/* User Mode Switch */}
-        <section>
-          <h3 className="text-[16px] font-semibold text-claude-text mb-5">{t('settings.userMode')}</h3>
-          <div className="flex gap-3">
-            {([
-              { value: 'selfhosted', label: t('settings.selfHosted'), desc: t('settings.selfHostedSubtitle') },
-              { value: 'clawparrot', label: t('settings.clawparrot'), desc: t('settings.clawparrotSubtitle') },
-            ] as const).map(opt => {
-              const current = localStorage.getItem('user_mode') || 'selfhosted';
-              const active = current === opt.value;
-              return (
-                <button
-                  key={opt.value}
-                  onClick={() => {
-                    localStorage.setItem('user_mode', opt.value);
-                    if (opt.value === 'clawparrot') {
-                      // Check if logged in, if not redirect
-                      const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
-                      if (!hasKey) {
-                        window.location.hash = '#/login';
-                      }
-                    }
-                    window.location.reload();
-                  }}
-                  className={`flex-1 px-4 py-3 rounded-xl border text-left transition-all ${active ? 'border-[#3b82f6]/80 bg-blue-500/5' : 'border-claude-border/60 hover:border-claude-textSecondary/20'
-                    }`}
-                >
-                  <div className={`text-[14px] font-medium ${active ? 'text-claude-text' : 'text-claude-textSecondary'}`}>{opt.label}</div>
-                  <div className="text-[12px] text-claude-textSecondary/60 mt-0.5">{opt.desc}</div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <hr className="border-claude-border" />
-
-        {/* About Section */}
-        <section>
-          <h3 className="text-[16px] font-semibold text-claude-text mb-3">{t('settings.about')}</h3>
-          <div className="flex items-center justify-between py-2">
-            <span className="text-[14px] text-claude-textSecondary">{t('settings.currentVersion')}</span>
-            <span className="text-[14px] font-mono text-claude-text">v{'1.6.12'}</span>
-          </div>
-        </section>
-      </div>
-    );
+    </div>);
   }
 
   function renderUsage() {

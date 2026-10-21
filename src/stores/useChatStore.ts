@@ -34,6 +34,7 @@ export interface CompactStatus {
 }
 
 export interface ChatMessage {
+  requestError?: import('../utils/chatErrors').RequestErrorDetails | null;
   id?: string;
   role?: string;
   content?: string;
@@ -144,10 +145,12 @@ const initialState = {
   webSearchToast: null as string | null,
   permissionMode: (() => {
     try {
-      return localStorage.getItem('permission_mode') || 'accept_edits';
+      const saved = localStorage.getItem('permission_mode');
+      if (saved == null) return 'accept_edits';
+      return ['ask_permissions', 'accept_edits', 'plan_mode', 'bypass_permissions', 'dont_ask'].includes(saved) ? saved : 'ask_permissions';
     } catch { return 'accept_edits'; }
   })() as string,
-  reasoningMode: null as string | null,
+  reasoningMode: localStorage.getItem('model_effort') || 'off',
 };
 
 export const useChatStore = create<ChatState>()(
@@ -243,7 +246,7 @@ export const useChatStore = create<ChatState>()(
         localStorage.setItem('permission_mode', permissionMode);
       } catch {}
     },
-    setReasoningMode: (reasoningMode: string | null) => set({ reasoningMode }),
+    setReasoningMode: (reasoningMode: string | null) => { localStorage.setItem('model_effort', reasoningMode || 'off'); set({ reasoningMode }); },
     resetChat: () => {
       // Bug #7 fix: Flush pending deltas before resetting to avoid data loss
       flushAllDeltas();

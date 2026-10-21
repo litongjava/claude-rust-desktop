@@ -1,70 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod bridge;
-mod api;
-mod commands;
-mod app_studio;
-mod engine;
 
-mod tools;
-mod research;
-mod prompt;
-mod mcp;
-mod streaming;
-mod task;
-mod skills;
-mod git;
-mod config;
-mod fs;
-mod terminal;
-mod process;
-mod watcher;
-mod clipboard;
-mod notification;
-mod logger;
-mod updater;
-mod worktree;
-mod ide;
-mod analytics;
-mod slash_commands;
-mod cost_tracker;
-mod native_engine;
-mod upload;
-mod project;
-mod computer_use;
-mod ask_user;
-mod document;
-mod sandbox;
-mod github;
-mod db;
-mod multiagent;
-mod orchestration;
-mod permissions;
-mod memory;
-mod remotion;
-mod diff;
-mod scheduler;
-mod im_integration;
-mod cache;
-mod prefetch;
-mod metrics;
-mod agent_bus;
-mod preview_engine;
-mod knowledge;
-mod secure_storage;
 
+use deepseek_desktop_tauri_lib::*;
 use bridge::BridgeServer;
 use native_engine::engine_core::NativeEngine;
 use native_engine::provider_manager::ProviderManager;
 use native_engine::session_manager::SessionManager;
 use mcp::McpServerManager;
 use permissions::PermissionManager;
-use memory::MemExClient;
 use tauri::Manager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::sync::Mutex;
-use tokio::process::Child;
 
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, Registry};
@@ -133,13 +81,6 @@ async fn cleanup_all_processes(app_handle: &tauri::AppHandle) {
         }
     }
 
-    if let Some(memex_state) = app_handle.try_state::<Arc<Mutex<Option<Child>>>>() {
-        if let Some(mut child) = memex_state.lock().await.take() {
-            tracing::info!(module = "Shutdown", "Killing MemEx Python backend...");
-            let _ = child.kill().await;
-        }
-    }
-
     tracing::info!(module = "Shutdown", "All processes cleaned up.");
 }
 
@@ -197,10 +138,10 @@ fn main() {
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<ProviderManager>>>)))
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<McpServerManager>>>)))
         .manage(Arc::new(std::sync::Mutex::new(None::<String>)))
-        .manage(Arc::new(Mutex::new(None::<Child>)))
         .manage(Arc::new(Mutex::new(None::<SessionManager>)))
         .manage(Arc::new(Mutex::new(None::<Arc<PermissionManager>>)))
         .setup(|app| {
+            app.manage(commands::peripheral::PeripheralHost::default());
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
             tracing::info!(module = "App", "Data dir: {:?}", data_dir);
 
@@ -316,6 +257,9 @@ fn main() {
 
                         // Build chat request with user's message
                         let chat_req = crate::native_engine::engine_core::ChatRequest {
+                            max_turns: None,
+                            response_schema: None,
+                provider_id: None, effort: None,
                             conversation_id: cid.clone(),
                             messages: vec![serde_json::json!({
                                 "role": "user",
@@ -545,67 +489,6 @@ fn main() {
                 });
             }
 
-            let memex_client = MemExClient::new(None);
-            let memex_base_url = memex_client.base_url.clone();
-            let memex_child_store = app.state::<Arc<Mutex<Option<Child>>>>().inner().clone();
-
-            tauri::async_runtime::spawn(async move {
-                tracing::info!(module = "MemEx", "Attempting to start Python backend on port 8765...");
-
-                let is_running = reqwest::Client::new()
-                    .get(format!("{}/health", memex_base_url))
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-
-                if is_running {
-                    tracing::info!(module = "MemEx", "Backend already running on port 8765");
-                    return;
-                }
-
-                let memex_script = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join("memex")
-                    .join("api.py");
-
-                if !memex_script.exists() {
-                    tracing::warn!(module = "MemEx", "Python backend script not found at {:?}. Memory features will be disabled.", memex_script);
-                    return;
-                }
-
-                let python_cmd = if cfg!(windows) { "python" } else { "python3" };
-                match tokio::process::Command::new(python_cmd)
-                    .arg(&memex_script)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                {
-                    Ok(child) => {
-                        tracing::info!(module = "MemEx", "Python backend started on port 8765");
-                        memex_child_store.lock().await.replace(child);
-                        for i in 0..10 {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            if reqwest::Client::new()
-                                .get(format!("{}/health", memex_base_url))
-                                .send()
-                                .await
-                                .map(|r| r.status().is_success())
-                                .unwrap_or(false)
-                            {
-                                tracing::info!(module = "MemEx", "Backend healthy after {} seconds", i + 1);
-                                return;
-                            }
-                        }
-                        tracing::warn!(module = "MemEx", "Backend health check timeout, memory features may be limited");
-                    }
-                    Err(e) => {
-                        tracing::error!(module = "MemEx", error = %e);
-                    }
-                }
-            });
-
             let db_manager_for_scheduler = match app.try_state::<Arc<crate::db::DbManager>>() {
                 Some(state) => state.inner().clone(),
                 None => {
@@ -723,6 +606,7 @@ fn main() {
                 let window_clone = window.clone();
                 tauri::async_runtime::spawn(async move {
                     cleanup_all_processes(&app_handle).await;
+                    commands::peripheral::shutdown(&app_handle).await;
                     window_clone.destroy().unwrap_or_else(|e| {
                         tracing::error!(module = "Shutdown", error = %e);
                     });
@@ -730,6 +614,12 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::peripheral::peripheral_command,
+            commands::peripheral::peripheral_credential,
+            commands::peripheral::peripheral_credential_delete,
+            commands::peripheral::voice_begin,
+            commands::peripheral::voice_cancel,
+            commands::peripheral::voice_transcribe,
             commands::get_platform,
             commands::select_directory,
             commands::show_item_in_folder,
@@ -763,6 +653,7 @@ fn main() {
             commands::mcp_start_server,
             commands::mcp_stop_server,
             commands::mcp_restart_server,
+            commands::mcp_import_legacy,
             commands::mcp_add_server,
             commands::mcp_update_server,
             commands::mcp_remove_server,
@@ -833,6 +724,9 @@ fn main() {
             commands::remove_always_allow_rule,
             commands::get_always_allow_rules,
             commands::set_permission_mode,
+            commands::general_settings::read_general_settings,
+            commands::general_settings::write_general_settings,
+            commands::general_settings::open_general_settings,
             // Computer Use commands
             commands::computer_use_screenshot,
             commands::computer_use_mouse_click,
@@ -859,30 +753,30 @@ fn main() {
             commands::feishu_chat::feishu_list_conversations,
             commands::feishu_chat::feishu_delete_conversation,
             // Knowledge Base commands
-            crate::knowledge::kb_list,
-            crate::knowledge::kb_get,
-            crate::knowledge::kb_search,
-            crate::knowledge::kb_add,
-            crate::knowledge::kb_delete,
-            crate::knowledge::kb_graph,
-            crate::knowledge::kb_import,
+            crate::commands::knowledge::kb_list,
+            crate::commands::knowledge::kb_get,
+            crate::commands::knowledge::kb_search,
+            crate::commands::knowledge::kb_add,
+            crate::commands::knowledge::kb_delete,
+            crate::commands::knowledge::kb_graph,
+            crate::commands::knowledge::kb_import,
             // Knowledge Flow commands
-            crate::knowledge::kb_ingest_conversation,
-            crate::knowledge::kb_prepare_context,
-            crate::knowledge::kb_digest,
-            crate::knowledge::kb_patterns,
+            crate::commands::knowledge::kb_ingest_conversation,
+            crate::commands::knowledge::kb_prepare_context,
+            crate::commands::knowledge::kb_digest,
+            crate::commands::knowledge::kb_patterns,
             // Project Intelligence commands
-            crate::knowledge::intel_analyze,
-            crate::knowledge::intel_find_fusions,
-            crate::knowledge::intel_generate_skill,
+            crate::commands::knowledge::intel_analyze,
+            crate::commands::knowledge::intel_find_fusions,
+            crate::commands::knowledge::intel_generate_skill,
             // GitHub Hub commands
-            crate::knowledge::gh_trending,
-            crate::knowledge::gh_search,
-            crate::knowledge::gh_user_repos,
-            crate::knowledge::gh_set_token,
-            crate::knowledge::gh_watch,
-            crate::knowledge::gh_get_watched,
-            crate::knowledge::gh_oauth_url,
+            crate::commands::knowledge::gh_trending,
+            crate::commands::knowledge::gh_search,
+            crate::commands::knowledge::gh_user_repos,
+            crate::commands::knowledge::gh_set_token,
+            crate::commands::knowledge::gh_watch,
+            crate::commands::knowledge::gh_get_watched,
+            crate::commands::knowledge::gh_oauth_url,
             // App Studio commands
             commands::app_studio_generate_project,
             commands::get_context_size,

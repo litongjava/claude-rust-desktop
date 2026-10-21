@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-runtime
 *.local
 .env
 .env.*
@@ -59,3 +60,8 @@ src-tauri/bridge_api_key.txt
 
 # Trae IDE specs (development only)
 .trae/
+
+# Unified workspace artifacts
+/target/
+/artifacts/
+legacy/**/target/

@@ -1,11 +1,15 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { planModeFromTool, approvedPermissionModeFromTool } from '../features/streaming/planMode';
 import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, Loader2, Smartphone, Terminal, Monitor } from 'lucide-react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconWebSearch } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getGenerationStatus, stopGeneration, getContextSize, getStreamStatus, reconnectStream, getSkills, warmEngine, getProjects, createProject, Project, getProviders } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getGenerationStatus, stopGeneration, getContextSize, getStreamStatus, reconnectStream, getSkills, warmEngine, getProjects, getProject, createProjectConversation, attachConversationToProject, Project, getProviders } from '../api';
 import PermissionDialog, { ApprovalInfo } from './PermissionDialog';
 import { permissionApprovalAPI } from '../utils/tauriAPI';
+import { useGeneralSettingsStore } from '../stores/useGeneralSettingsStore';
+import { useWorkspaceModeStore, conversationWorkspaceMode } from '../stores/useWorkspaceModeStore';
+import { useBusySendStore } from '../stores/useBusySendStore';
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
 import { useUIStore } from '../stores/useUIStore';
@@ -15,13 +19,24 @@ import { useToolStore } from '../stores/useToolStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import PermissionModeSelector from './PermissionModeSelector';
+import HomeModeSelector, { type HomeMode } from './HomeModeSelector';
+import PromptSuggestionsPanel from './PromptSuggestionsPanel';
 import FileUploadPreview, { PendingFile } from './FileUploadPreview';
 import AddFromGithubModal from './AddFromGithubModal';
 import CompactingStatus from '../features/compact/CompactingStatus';
 import CompactDialog from '../features/compact/CompactDialog';
 import CreateProjectDialog from '../features/project/CreateProjectDialog';
+import { useCreatedProject } from '../features/project/useCreatedProject';
+import ProjectWorkspaceBar from '../features/project/ProjectWorkspaceBar';
+import SessionGitSettings, { type SessionGitSelection } from '../features/project/SessionGitSettings';
+import ConversationWorkspaceBar from '../features/project/ConversationWorkspaceBar';
+import GitChangesPanel from '../features/project/GitChangesPanel';
+import { useConversationGit } from '../features/project/useConversationGit';
+import TrustProjectDialog from '../features/project/TrustProjectDialog';
+import { useLastCodeProject } from '../features/project/useLastCodeProject';
 import MessageList, { draftsStore } from '../features/message-list/MessageList';
 import { handleSlashCommand, SLASH_COMMANDS } from '../features/slash-commands/registry';
+import SlashCommandSuggestions from '../features/slash-commands/SlashCommandSuggestions';
 import { createStreamCallbacks } from '../features/streaming/createStreamCallbacks';
 import { useStreamSession } from '../features/streaming/useStreamSession';
 import PanelsRenderer from '../features/panels/PanelsRenderer';
@@ -55,7 +70,7 @@ import VoiceInput from './VoiceInput';
 import { useVoiceInput } from '../features/voice/useVoiceInput';
 import { useFileUpload, ACCEPTED_TYPES } from '../features/file-upload/useFileUpload';
 import { useModelCatalog } from '../features/model-catalog/useModelCatalog';
-import TabBar from './TabBar';
+import TrajectoryView from '../features/trajectory/TrajectoryView';
 import { getCrossModeOverride, setCrossModeOverride, clearCrossModeOverride } from '../features/cross-mode/crossModeStorage';
 import { useI18n } from '../hooks/useI18n';
 import { trackMessageSent, trackConversationCreated } from '../hooks/useAnalytics';
@@ -65,8 +80,10 @@ import { formatChatError } from '../utils/chatErrors';
 import SkillTag from '../features/chat/SkillTag';
 import { useScrollToBottom } from '../features/chat/useScrollToBottom';
 import { useDraftPersistence } from '../features/chat/useDraftPersistence';
+import { submitBusyMessage } from '../features/chat/submitBusyMessage';
 
 import { SkillInputOverlay } from '../features/input-bar/SkillInputOverlay';
+import SessionUsageBar from '../features/usage/SessionUsageBar';
 
 interface MainContentProps {
   onNewChat: () => void; // Callback to tell sidebar to refresh
@@ -82,6 +99,21 @@ interface MainContentProps {
 
 const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtifactsUpdate, onOpenArtifacts, onTitleChange, onChatModeChange }: MainContentProps) => {
   const { t } = useI18n();
+  const showCodingView = useGeneralSettingsStore(s => s.showCodingView);
+  const showAiDisclaimer = useGeneralSettingsStore(s => s.showAiDisclaimer);
+  const workspaceMode = useWorkspaceModeStore(s => s.mode);
+  const showUsage = useGeneralSettingsStore(s => s.showUsageByMode[workspaceMode]);
+  const isCodeMode = workspaceMode === 'code';
+  const [modeChanging, setModeChanging] = useState(false);
+  const [modeError, setModeError] = useState('');
+  const [conversationView, setConversationView] = useState<'chat' | 'trajectory'>('chat');
+  const [inspectId, setInspectId] = useState<string | null>(null);
+  const busySendBehavior = useGeneralSettingsStore(state => state.busySendBehavior);
+  const queues = useBusySendStore(state => state.queues);
+  const queueProcessing = useRef(false);
+  const [queueVersion, setQueueVersion] = useState(0);
+  const [readyConversationId, setReadyConversationId] = useState<string | null>(null);
+  const steering = useRef(false);
   const { id } = useParams(); // Get conversation ID from URL
   const location = useLocation();
   const [localId, setLocalId] = useState<string | null>(null);
@@ -151,6 +183,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   } = useToolStore();
 
   const [permissionApproval, setPermissionApproval] = useState<ApprovalInfo | null>(null);
+  const [sessionGit, setSessionGit] = useState<SessionGitSelection | null>(null);
+  const [showGitChanges, setShowGitChanges] = useState(false);
+  const conversationGit = useConversationGit(activeId, isCodeMode ? currentProjectId : null, loading);
+  useEffect(() => { setShowGitChanges(false); }, [activeId, currentProjectId, isCodeMode]);
+  const gitSetupPending = !activeId && isCodeMode && !!pendingProjectId && (sessionGit?.projectId !== pendingProjectId || !sessionGit.ready);
+  const codeProjectRequired = isCodeMode && !(activeId ? currentProjectId : pendingProjectId);
+
+  useEffect(() => {
+    if (!pendingProjectId) setSessionGit(null);
+  }, [pendingProjectId]);
 
 
   // Initialize providersCache
@@ -195,6 +237,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const isChat = !!(activeId || messages.length > 0);
     onChatModeChange?.(isChat);
   }, [activeId, messages.length, onChatModeChange]);
+
+  useEffect(() => { setConversationView('chat'); setInspectId(null); }, [activeId]);
 
   // Sync active conversation with tabs
   useEffect(() => {
@@ -245,6 +289,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     selectorModels,
     isModelSelectable,
     resolveModelForNewChat,
+    resolveModelForMode,
     currentProviderSupportsWebSearch,
     isSelfHostedMode,
   } = useModelCatalog(viewingIdRef);
@@ -276,7 +321,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const inputBarWidth = 768;
   const inputBarMinHeight = 32;
   const inputBarRadius = 22;
-  const inputBarBottom = 0;
   const inputBarBaseHeight = inputBarMinHeight + 16; // border-box: content + padding (pt-4=16px + pb-0=0px)
   const textareaHeightVal = useRef(inputBarBaseHeight);
 
@@ -343,7 +387,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const {
     scrollContainerRef,
     isAtBottomRef,
-    scrollbarWidth,
     scrollToBottom,
     scheduleScrollToBottomAfterRender,
     handleScroll,
@@ -366,10 +409,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   // Add-to-project state
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
-  const [newProjectName, setNewProjectName] = useState('');
-  const [newProjectDescription, setNewProjectDescription] = useState('');
+  const [projectToTrust, setProjectToTrust] = useState<Project | null>(null);
   const [projectAddToast, setProjectAddToast] = useState<string | null>(null);
   const [slashCommandFilter, setSlashCommandFilter] = useState<string | null>(null);
+  const slashCommandAnchorRef = useRef<HTMLDivElement>(null);
+  const slashCommandBoundaryRef = useRef<HTMLDivElement>(null);
 
   const filteredCommands = slashCommandFilter !== null
     ? SLASH_COMMANDS.filter(c => c.name.startsWith(slashCommandFilter))
@@ -377,6 +421,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const [showH5Panel, setShowH5Panel] = useState(false);
   const [showTerminalPanel, setShowTerminalPanel] = useState(false);
+  useEffect(() => {
+    const handler = (event: Event) => {
+      if ((event as CustomEvent).detail === 'terminal') setShowTerminalPanel(true);
+      if ((event as CustomEvent).detail === 'h5') setShowH5Panel(true);
+    };
+    window.addEventListener('chat-header-action', handler);
+    return () => window.removeEventListener('chat-header-action', handler);
+  }, []);
+
   const [showComputerUsePanel, setShowComputerUsePanel] = useState(false);
 
   // 草稿持久化 refs（跟踪最新值，供 effect cleanup 读取）
@@ -416,14 +469,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   }, [id]);
 
-  // 动态调整 paddingBottom，使聊天列表能滚到输入框上方
+  // Keep bottom-follow behavior in sync with composer height changes.
   useEffect(() => {
     const el = inputWrapperRef.current;
     if (!el) return;
 
     const updateHeight = () => {
-      // 底部留白 = 输入框高度 + 底部边距(48px)
-      setInputHeight(el.offsetHeight + 48);
+      setInputHeight(el.offsetHeight);
     };
 
     // 初始测量
@@ -468,6 +520,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   useEffect(() => {
     if (resetKey && resetKey !== lastResetKeyRef.current) {
       lastResetKeyRef.current = resetKey;
+      setSessionGit(null);
       setLocalId(null);
       setMessages([]);
       setCurrentModelString(resolveModelForNewChat());
@@ -538,6 +591,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   }, [resetKey, resolveModelForNewChat]);
 
+  useLastCodeProject(activeId);
+
   useDraftPersistence(
     activeId, inputBarBaseHeight,
     inputTextRef, pendingFilesRef, textareaHeightRef, inputRef,
@@ -569,6 +624,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     setAskUserDialog(null);
     isCreatingRef.current = false;
     viewingIdRef.current = activeId || null;
+    setReadyConversationId(null);
 
     // Pre-warm engine when user opens a conversation (init in background before they send)
     if (activeId) warmEngine(activeId);
@@ -585,9 +641,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           if (data?.model && viewingIdRef.current === buffConvId) {
             setCurrentModelString(isModelSelectable(data.model) ? data.model : resolveModelForNewChat(data.model));
           }
+          if (viewingIdRef.current === buffConvId) {
+            useWorkspaceModeStore.getState().setMode(conversationWorkspaceMode(data));
+            setReadyConversationId(buffConvId);
+          }
         }).catch(() => {});
       } else {
         setLoading(false);
+        setMessages([]);
         loadConversation(activeId);
         // Check if server has an active stream we can reconnect to
         const convId = activeId;
@@ -647,8 +708,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 });
               },
               (event, message, data) => {
+                if (event === 'context_reset' && data?.boundary_id) {
+                  setMessagesFor(convId, prev => prev.some(item => item.id === data.boundary_id) ? prev : [...prev, { id: data.boundary_id, role: 'user', content: data.content, is_compact_boundary: true }, { id: data.assistant_id, role: 'assistant', content: '' }]);
+                  setPlanMode(false);
+                }
                 if (event === 'ask_user' && data) {
                   setAskUserDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, questions: data.questions || [], answers: {} });
+                }
+                if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string' && (!data.conversation_id || data.conversation_id === convId)) {
+                  setToolPermissionDialog(current => current?.request_id === data.request_id ? null : current);
+                  setPermissionApproval(current => current?.id === data.request_id ? null : current);
                 }
                 if (event === 'tool_permission' && data) {
                   setToolPermissionDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, tool_name: data.tool_name, input: data.input });
@@ -683,10 +752,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 }
               },
               (toolEvent) => {
-                if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
-                if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
-                const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-                if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+                const planMode = planModeFromTool(toolEvent);
+                if (planMode !== null) setPlanMode(planMode);
+                const approvedMode = approvedPermissionModeFromTool(toolEvent);
+                if (approvedMode) useChatStore.getState().setPermissionMode(approvedMode);
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
@@ -761,11 +830,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, [abortStreamSession]);
 
   const loadConversation = async (conversationId: string) => {
+    let loaded = false;
     console.log('[MainContent] loadConversation called for:', conversationId);
     stopPolling();
     try {
       console.log('[MainContent] Calling getConversation...');
       const data = await getConversation(conversationId);
+      if (viewingIdRef.current !== conversationId) return;
       console.log('[MainContent] getConversation returned:', data ? 'success' : 'null', 'messages:', data?.messages?.length);
       // Restore conversation model. If the stored model isn't available in the
       // current user_mode (typical case: user switched modes after the conv was
@@ -798,6 +869,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
       }
+      useWorkspaceModeStore.getState().setMode(conversationWorkspaceMode(data));
       // Restore research mode toggle
       setResearchMode(!!data.research_mode);
       const normalizedMessages = (data.messages || []).map((msg: any) => {
@@ -815,6 +887,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         return sanitizeInlineArtifactMessage(msg);
       });
       setMessages(normalizedMessages);
+      loaded = true;
       isAtBottomRef.current = true;
       scheduleScrollToBottomAfterRender();
       setConversationTitle(data.title || 'New Chat');
@@ -823,6 +896,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       // 检查是否有活跃的后台生成
       try {
         const genStatus = await getGenerationStatus(conversationId);
+        if (viewingIdRef.current !== conversationId) return;
         if (genStatus.active && genStatus.status === 'generating') {
           // 追加占位 assistant 消息（如果最后一条不是 assistant）
           setMessages(prev => {
@@ -922,6 +996,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     } catch (err) {
       console.error(err);
       setLoading(false);
+    } finally {
+      if (loaded && viewingIdRef.current === conversationId) setReadyConversationId(conversationId);
     }
   };
 
@@ -942,19 +1018,46 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
+  const handleHomeModeChange = async (mode: HomeMode) => {
+    if (modeChanging || loading || workspaceMode === mode || (activeId && readyConversationId !== activeId)) return;
+    const conversationId = activeId;
+    setModeChanging(true);
+    setModeError('');
+    try {
+      if (conversationId) await updateConversation(conversationId, { workspace_mode: mode });
+      if (viewingIdRef.current === (conversationId || null) && useWorkspaceModeStore.getState().mode !== 'code') {
+        useWorkspaceModeStore.getState().setMode(mode);
+        if (!conversationId) setCurrentModelString(resolveModelForMode(mode, currentModelString));
+      }
+      window.dispatchEvent(new CustomEvent('conversationUpdated', { detail: { id: conversationId } }));
+    } catch (error) {
+      setModeError(error instanceof Error ? error.message : 'Could not change mode');
+    } finally {
+      setModeChanging(false);
+    }
+  };
+
   const handleAttachToProject = async (project: Project) => {
     setShowPlusMenu(false);
     setShowProjectsSubmenu(false);
+    const latest: Project = await getProject(project.id);
+    if (!latest.folders?.length) {
+      setProjectAddToast('Add a source folder from Projects before selecting this project');
+      return;
+    }
+    if (latest.folders.some(folder => !folder.trusted)) { setProjectToTrust(latest); return; }
     if (activeId) {
       if (currentProjectId === project.id) return;
       try {
-        await updateConversation(activeId, { project_id: project.id });
+        await attachConversationToProject(activeId, project.id);
         setCurrentProjectId(project.id);
         onNewChat();
         setProjectAddToast(`Added to ${project.name}`);
         setTimeout(() => setProjectAddToast(null), 2500);
       } catch (err) {
         console.error('Failed to add conversation to project', err);
+        setProjectAddToast(err instanceof Error ? err.message : 'Could not select project');
+        throw err;
       }
     } else {
       setPendingProjectId(project.id);
@@ -963,42 +1066,61 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
-  const handleCreateProjectFromMenu = async () => {
-    const name = newProjectName.trim();
-    if (!name) return;
+  const handleSend = async (overrideText?: string, queuedFiles?: PendingFile[], queuedMessageId?: string) => {
+    if (modeChanging || (!activeId && isCreatingRef.current) || gitSetupPending) return;
     try {
-      const project = await createProject(name, newProjectDescription.trim());
-      setShowNewProjectDialog(false);
-      setNewProjectName('');
-      setNewProjectDescription('');
-      setProjectList(prev => [project, ...prev]);
-      await handleAttachToProject(project);
-    } catch (err) {
-      console.error('Failed to create project', err);
-    }
-  };
-
-  const handleSend = async (overrideText?: string) => {
-    try {
+    const files = queuedFiles ?? pendingFiles;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
+    const selectedProjectId = activeId ? currentProjectId : pendingProjectId;
+    if (isCodeMode && !selectedProjectId) {
+      setProjectAddToast(t('chat.selectCodeProject'));
+      return;
+    }
+    if (selectedProjectId) {
+      const project: Project = await getProject(selectedProjectId);
+      if (project.is_archived) { setProjectAddToast(t('chat.selectCodeProject')); return; }
+      if (!project.folders?.length) { setProjectAddToast('Add a source folder before sending'); return; }
+      if (project.folders.some(folder => !folder.trusted)) { setProjectToTrust(project); return; }
+    }
     if (await handleSlashCommand(effectiveText, activeId)) return;
     // Skill slug is already in the text (inserted when selected from menu)
     setSelectedSkill(null);
-    const hasFiles = pendingFiles.some(f => f.status === 'done');
-    const hasErrorFiles = pendingFiles.some(f => f.status === 'error');
-    if ((!effectiveText.trim() && !hasFiles) || loading) {
+    const hasFiles = files.some(f => f.status === 'done');
+    const hasErrorFiles = files.some(f => f.status === 'error');
+    if (!effectiveText.trim() && !hasFiles) {
       if (!loading && !effectiveText.trim() && !hasFiles && hasErrorFiles) {
         alert('有文件上传失败，请先删除失败文件后再发送');
       }
       return;
     }
-    if (activeRequestCountRef.current >= 2) {
+    if (!loading && activeRequestCountRef.current >= 2) {
       alert('最多同时进行 2 个对话，请等待其他对话完成');
       return;
     }
-    const isUploading = pendingFiles.some(f => f.status === 'uploading');
+    const isUploading = files.some(f => f.status === 'uploading');
     if (isUploading) {
       alert('文件仍在上传中，请稍等完成后再发送');
+      return;
+    }
+
+    if (loading && activeId) {
+      if (steering.current) return;
+      steering.current = busySendBehavior === 'steer';
+      try {
+        await submitBusyMessage(activeId, effectiveText, files, busySendBehavior, async () => {
+          await stopGeneration(activeId);
+          abortStreamSession(activeId);
+          stopPolling();
+          removeStreaming(activeId);
+          setLoading(false);
+        });
+      } catch (error) {
+        alert(formatChatError(error instanceof Error ? error.message : String(error)));
+        return;
+      } finally { steering.current = false; }
+      setInputText('');
+      setPendingFiles([]);
+      draftsStore.delete(activeId);
       return;
     }
 
@@ -1010,7 +1132,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const userMode = localStorage.getItem('user_mode');
     const hasGatewayKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
     if (isTauriApp && userMode !== 'selfhosted' && !hasGatewayKey) {
-      pendingLoginSendRef.current = () => handleSend(effectiveText);
+      pendingLoginSendRef.current = () => handleSend(effectiveText, queuedFiles, queuedMessageId);
       setShowLoginRequired(true);
       return;
     }
@@ -1020,16 +1142,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // show the modal. The modal's callbacks will re-invoke handleSend after
     // the user picks "keep cross-mode" or "switch model".
     if (crossModeWarning && crossModeWarning.convId === activeId) {
-      pendingCrossModeSendRef.current = () => handleSend(effectiveText);
+      pendingCrossModeSendRef.current = () => handleSend(effectiveText, queuedFiles, queuedMessageId);
       return;
     }
 
     const userMessageText = effectiveText;
-    setInputText(""); // Clear input
+    if (queuedMessageId && activeId) useBusySendStore.getState().take(activeId);
+    if (!queuedFiles) setInputText(""); // Preserve a draft when draining the queue
 
     // 收集已上传的附件
-    const uploadedFiles = pendingFiles.filter(f => f.status === 'done' && f.fileId);
-    const githubFiles = pendingFiles.filter(f => f.status === 'done' && f.source === 'github');
+    const uploadedFiles = files.filter(f => f.status === 'done' && f.fileId);
+    const githubFiles = files.filter(f => f.status === 'done' && f.source === 'github');
     const uploadedPayload = uploadedFiles.map(f => ({ fileId: f.fileId!, fileName: f.fileName, fileType: f.fileType, mimeType: f.mimeType, size: f.size }));
     const githubPayload = githubFiles.map(f => ({
       fileId: `github:${f.ghRepo || f.fileName}`,
@@ -1068,9 +1191,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
 
     // 清空 pendingFiles 并释放预览 URL
-    pendingFiles.forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
-    setPendingFiles([]);
-    draftsStore.delete(activeId || '__new__');
+    files.forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+    if (!queuedFiles) {
+      setPendingFiles([]);
+      draftsStore.delete(activeId || '__new__');
+    }
 
     // 重置 textarea 高度
     textareaHeightVal.current = inputBarBaseHeight;
@@ -1080,15 +1205,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
 
     // Optimistic UI: Add user message immediately
-    const imageFiles = pendingFiles.filter(f => f.status === 'done' && f.fileType === 'image' && f.previewUrl);
+    const imageFiles = files.filter(f => f.status === 'done' && f.fileType === 'image' && f.previewUrl);
     const hasImages = imageFiles.length > 0;
 
     let tempUserMsg: any;
     if (hasImages) {
       // Multi-content block message with images
-      const contentBlocks: any[] = imageFiles.map(f => ({
-        type: 'image_url' as const,
-        image_url: { url: f.previewUrl!, detail: 'high' },
+      const contentBlocks: any[] = await Promise.all(imageFiles.map(async f => {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(new Error(`无法读取图片：${f.fileName}`));
+          reader.readAsDataURL(f.file);
+        });
+        return { type: 'image_url' as const, image_url: { url: dataUrl, detail: 'high' } };
       }));
       if (userMessageText.trim()) {
         contentBlocks.push({ type: 'text', text: userMessageText });
@@ -1116,6 +1246,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // If no ID, create conversation first
     if (!conversationId) {
       isCreatingRef.current = true; // Block useEffect fetch
+      setLoading(true);
       try {
         const modelForCreate = isModelSelectable(currentModelString)
           ? currentModelString
@@ -1125,7 +1256,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         }
         // 不传临时标题，让后端生成
         console.log("Creating conversation with model:", modelForCreate);
-        const newConv = await createConversation(undefined, modelForCreate, { research_mode: researchMode });
+        const newConv = pendingProjectId
+          ? await createProjectConversation(pendingProjectId, undefined, modelForCreate, isCodeMode && sessionGit?.projectId === pendingProjectId ? { branch: sessionGit.branch, use_worktree: sessionGit.use_worktree } : undefined)
+          : await createConversation(undefined, modelForCreate, { research_mode: researchMode });
         console.log("Created conversation response:", newConv);
 
         if (!newConv || !newConv.id) {
@@ -1138,14 +1271,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         conversationId = newConv.id;
         console.log("New Conversation ID:", conversationId);
         trackConversationCreated();
-        // Attach to pending project if user chose one before sending
         if (pendingProjectId) {
-          try {
-            await updateConversation(conversationId!, { project_id: pendingProjectId });
-            setCurrentProjectId(pendingProjectId);
-          } catch (e) {
-            console.error('Failed to attach new conversation to project', e);
-          }
+          setCurrentProjectId(pendingProjectId);
           setPendingProjectId(null);
         }
         if (conversationId) warmEngine(conversationId); // Pre-warm engine while user waits
@@ -1169,15 +1296,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       } catch (err: any) {
         console.error("Failed to create conversation", err);
         isCreatingRef.current = false;
-        setMessages(prev => {
-          const newMsgs = [...prev];
-          // Find the last assistant message (placeholder) and update it
-          if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'assistant') {
-            const errorMsg = err.message || String(err);
-            newMsgs[newMsgs.length - 1].content = "Error: Failed to create conversation. " + errorMsg + " Please check your model provider settings in Settings > Models.";
-          }
-          return newMsgs;
-        });
+        setLoading(false);
+        // Keep the draft available for retry after a Git setup error.
+        setMessages(messages);
+        setInputText(effectiveText);
+        setPendingFiles(files);
+        setProjectAddToast(err.message || String(err));
+        setTimeout(() => setProjectAddToast(null), 8000);
         return;
       }
     }
@@ -1256,6 +1381,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
+  // Keep queued messages bound to their conversation, including across tab switches.
+  useEffect(() => {
+    if (!activeId || readyConversationId !== activeId || loading || queueProcessing.current || steering.current || activeRequestCountRef.current >= 2) return;
+    if (!queues[activeId]?.length) return;
+    queueProcessing.current = true;
+    const message = queues[activeId][0];
+    if (message) void handleSend(message.text, message.files, message.id).finally(() => {
+      queueProcessing.current = false;
+      // Retry only after a send was committed; authorization gates retain the message.
+      if (useBusySendStore.getState().queues[activeId]?.[0]?.id !== message.id) setQueueVersion(version => version + 1);
+    });
+    else queueProcessing.current = false;
+  }, [activeId, readyConversationId, loading, queues, queueVersion]);
+
+  useEffect(() => {
+    if (!activeId && !loading) setPermissionMode(useGeneralSettingsStore.getState().defaultPermissionMode);
+  }, [activeId]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' || e.nativeEvent.isComposing) return;
 
@@ -1263,15 +1406,23 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // Normalize format (settings uses underscore, old might use plus)
     const sk = sendKey.replace('+', '_').toLowerCase();
 
-    let shouldSend = false;
-    if (sk === 'enter') {
-      if (!e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) shouldSend = true;
-    } else if (sk === 'ctrl_enter') {
-      if (e.ctrlKey) shouldSend = true;
-    } else if (sk === 'cmd_enter') {
-      if (e.metaKey) shouldSend = true;
-    } else if (sk === 'alt_enter') {
-      if (e.altKey) shouldSend = true;
+    const matches = (key: string) => {
+      const normalized = key.replace('+', '_').toLowerCase();
+      return (normalized === 'enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+        || (normalized === 'shift_enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+        || (normalized === 'ctrl_enter' && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey)
+        || (normalized === 'cmd_enter' && e.metaKey && !e.shiftKey && !e.ctrlKey && !e.altKey)
+        || (normalized === 'alt_enter' && e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey);
+    };
+    const shouldSend = matches(sk);
+    if (!shouldSend && matches(localStorage.getItem('newlineKey') || 'shift_enter')) {
+      e.preventDefault();
+      const input = inputRef.current;
+      if (input) {
+        const start = input.selectionStart;
+        setInputText(inputText.slice(0, start) + '\n' + inputText.slice(input.selectionEnd));
+        requestAnimationFrame(() => input.setSelectionRange(start + 1, start + 1));
+      }
     }
 
     if (shouldSend) {
@@ -1414,12 +1565,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (!activeId || loading) return;
     const msg = messages[idx];
     try {
-      const result = await branchConversation(activeId, msg.id);
+      const result = await branchConversation(activeId, msg.id, idx);
       if (result.success && result.new_conversation_id) {
         window.dispatchEvent(new CustomEvent('conversationCreated', { detail: { id: result.new_conversation_id } }));
+        navigate(`/chat/${result.new_conversation_id}`);
+      } else {
+        throw new Error('Failed to create conversation branch');
       }
     } catch (err) {
       console.error('Failed to branch conversation:', err);
+      throw err;
     }
   };
 
@@ -1548,6 +1703,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const handleNewChat = useCallback(() => {
     // Navigate to root chat path (no conversation ID)
     navigate('/', { replace: true });
+    setLocalId(null);
+    setCurrentProjectId(null);
+    setPendingProjectId(null);
     // Reset messages and state for new chat
     setMessages([]);
     setLoading(false);
@@ -1555,7 +1713,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     setInputText('');
     setPendingFiles([]);
     setEditingMessageIdx(null);
-  }, [navigate, setMessages, setLoading, setConversationTitle, setInputText, setPendingFiles, setEditingMessageIdx]);
+  }, [navigate, setMessages, setLoading, setConversationTitle, setInputText, setPendingFiles, setEditingMessageIdx, setCurrentProjectId, setPendingProjectId]);
+
+  useCreatedProject(handleNewChat);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -1621,8 +1781,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     onCreateProject: () => {
       setShowProjectsSubmenu(false);
       setShowPlusMenu(false);
-      setNewProjectName('');
-      setNewProjectDescription('');
       setShowNewProjectDialog(true);
     },
     onSelectSkill: (skill: any) => {
@@ -1653,16 +1811,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // Shared overlays rendered in both MODE 1 and MODE 2
   const sharedProjectOverlays = (
     <>
+      <VoiceInput isOpen={showVoicePanel} onResult={handleVoiceResult} onClose={closeVoicePanel} />
       {showNewProjectDialog && (
-        <CreateProjectDialog
-          newProjectName={newProjectName}
-          newProjectDescription={newProjectDescription}
-          onNameChange={setNewProjectName}
-          onDescriptionChange={setNewProjectDescription}
-          onCreate={handleCreateProjectFromMenu}
-          onClose={() => { setShowNewProjectDialog(false); setNewProjectName(''); setNewProjectDescription(''); }}
-        />
+        <CreateProjectDialog onCreated={async project => {
+          setProjectList(prev => [project, ...prev.filter(p => p.id !== project.id)]);
+          await handleAttachToProject(project);
+          setShowNewProjectDialog(false);
+        }} onClose={() => setShowNewProjectDialog(false)} />
       )}
+      {projectToTrust && <TrustProjectDialog project={projectToTrust} onTrusted={async project => { await handleAttachToProject(project); setProjectToTrust(null); }} onClose={() => setProjectToTrust(null)} />}
       {projectAddToast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[300] px-4 py-2 bg-claude-input border border-claude-border rounded-lg shadow-lg text-[13px] text-claude-text flex items-center gap-2">
           <Check size={14} className="text-[#C6613F]" />
@@ -1681,30 +1838,29 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // MODE 1: Landing Page (No ID)
   if (!activeId && messages.length === 0) {
     return (
-      <div className={`flex-1 bg-claude-bg h-screen flex flex-col relative overflow-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
+      <div ref={slashCommandBoundaryRef} className={`flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col relative overflow-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
 
         {/* Centered Content */}
         <div
-          className="flex-1 flex flex-col items-center w-full mx-auto px-4"
+          className="flex flex-col items-center min-w-0 w-full mx-auto px-4 py-6 flex-1 min-h-0 overflow-y-auto"
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
-            marginTop: `${tunerConfig?.mainContentMt || 0}px`,
-            paddingTop: '40vh'
+            paddingTop: '24px',
           }}
         >
 
           <div
-            className="flex items-center gap-4"
-            style={{ marginBottom: `${tunerConfig?.welcomeMb || 40}px` }}
+            className="flex items-center justify-center gap-4 w-full min-w-0 shrink-0 mt-auto"
+            style={{ marginBottom: 0 }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
               <ClaudeLogo color="#D97757" maxScale={0.17} />
             </div>
             <h1
-              className="text-claude-text dark:!text-[#d6cec3] tracking-tight leading-none pt-1 transition-all duration-100 ease-out whitespace-nowrap"
+              className="min-w-0 text-claude-text dark:!text-[#d6cec3] tracking-tight leading-tight pt-1 transition-all duration-100 ease-out"
               style={{
                 fontFamily: 'Optima, Candara, "Segoe UI", Segoe, "Humanist 521", sans-serif',
-                fontSize: '46px',
+                fontSize: 'clamp(28px, 3.2vw, 46px)',
                 fontWeight: 500,
                 letterSpacing: '-0.05em',
               }}
@@ -1714,24 +1870,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
 
           {/* 输入框区域 */}
-          <div className="w-full relative group">
+          <div ref={slashCommandAnchorRef} className="w-full relative z-20 group shrink-0 bg-claude-bg pt-2">
+            <ProjectWorkspaceBar projectId={pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
+              {isCodeMode && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+            </ProjectWorkspaceBar>
+            {codeProjectRequired && <p className="mb-2 text-xs text-claude-textSecondary">{t('chat.selectCodeProject')}</p>}
             {filteredCommands.length > 0 && (
-              <div className="absolute bottom-full left-0 right-0 mb-1 bg-claude-bg border border-claude-border rounded-xl shadow-lg overflow-hidden z-50">
-                {filteredCommands.map(cmd => (
-                  <button
-                    key={cmd.name}
-                    className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-claude-hover transition-colors text-left"
-                    onClick={() => {
-                      setInputText(cmd.name + ' ');
-                      setSlashCommandFilter(null);
-                      inputRef.current?.focus();
-                    }}
-                  >
-                    <span className="text-[14px] font-mono font-semibold text-[#C6613F]">{cmd.name}</span>
-                    <span className="text-[13px] text-claude-textSecondary">{cmd.description}</span>
-                  </button>
-                ))}
-              </div>
+              <SlashCommandSuggestions
+                anchorRef={slashCommandAnchorRef}
+                boundaryRef={slashCommandBoundaryRef}
+                commands={filteredCommands}
+                onSelect={command => {
+                  setInputText(command + ' ');
+                  setSlashCommandFilter(null);
+                  inputRef.current?.focus();
+                }}
+              />
             )}
             <input
               type="file"
@@ -1756,12 +1910,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <div className="relative">
                   <SkillInputOverlay
                     text={inputText}
-                    className="pl-5 pr-4 pt-5 pb-1 text-[16px] font-sans font-[350] overflow-hidden"
+                    className="pl-5 pr-4 pt-5 pb-1 text-[16px] font-sans font-normal overflow-hidden"
                     style={{ minHeight: '48px' }}
                   />
                   <textarea
                     ref={inputRef}
-                    className={`w-full pl-5 pr-4 pt-5 pb-1 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans font-[350] ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
+                    className={`w-full pl-5 pr-4 pt-5 pb-1 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans font-normal ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
                     style={{ minHeight: '48px', borderRadius: `${tunerConfig?.inputRadius || 16}px ${tunerConfig?.inputRadius || 16}px 0 0` }}
                     placeholder={selectedSkill ? `Describe what you want ${selectedSkill.name} to do...` : t('chat.inputPlaceholder')}
                     value={inputText}
@@ -1792,7 +1946,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   />
                 </div>
               </div>
-              <div className="px-4 pb-3 pt-1 flex items-center justify-between flex-shrink-0">
+              <div className="px-4 pb-3 pt-1 flex flex-wrap gap-2 items-center justify-between flex-shrink-0">
                 <div className="relative flex items-center">
                   <button
                     ref={plusBtnRef}
@@ -1812,14 +1966,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       {...plusMenuCallbacks}
                     />
                   )}
+                  {!isCodeMode && <button type="button" onClick={() => fileInputRef.current?.click()} aria-label={t('chat.addAttachment')} title={t('chat.addAttachment')}
+                    className="p-2 text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-lg transition-colors">
+                    <Paperclip size={20} />
+                  </button>}
+                  {!isCodeMode && <HomeModeSelector mode={workspaceMode} onChange={handleHomeModeChange} disabled={loading || modeChanging} />}
                   {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
                 </div>
-                <div className="flex items-center gap-3">
-                  <PermissionModeSelector />
+                <div className="flex flex-wrap justify-end items-center gap-2 ml-auto">
+                  {isCodeMode && <PermissionModeSelector neutral />}
                   <ModelSelector
                     currentModelString={currentModelString}
                     models={selectorModels}
                     onModelChange={handleModelChange}
+                    effort={reasoningMode}
+                    onEffortChange={setReasoningMode}
                     isNewChat={true}
                   />
                   {speechSupported && (
@@ -1832,21 +1993,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       <IconVoice size={20} />
                     </button>
                   )}
-                  <select
-                    value={reasoningMode || 'auto'}
-                    onChange={(e) => setReasoningMode(e.target.value === 'auto' ? null : e.target.value)}
-                    className="h-8 px-1.5 text-xs rounded-lg border border-claude-border bg-claude-bgSecondary text-claude-textSecondary hover:bg-claude-hover focus:outline-none focus:ring-1 focus:ring-[#C6613F] cursor-pointer"
-                    title="推理模式"
-                  >
-                    <option value="auto">Auto</option>
-                    <option value="quick">Quick</option>
-                    <option value="standard">Standard</option>
-                    <option value="deep">Deep</option>
-                  </select>
                   <button
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => handleSend()}
-                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || loading || pendingFiles.some(f => f.status === 'uploading')}
+                    disabled={codeProjectRequired || gitSetupPending || modeChanging || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                    title={codeProjectRequired ? t('chat.selectCodeProject') : t('chat.send')}
                     className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUp size={22} strokeWidth={2.5} />
@@ -1865,6 +2016,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 </button>
               </div>
             )}
+            {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
+            {!isCodeMode && showAiDisclaimer && <p className="pt-2 pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
+          </div>
+          <div className="w-full shrink-0 mb-auto pb-4">
+            <PromptSuggestionsPanel key={isCodeMode ? 'code' : 'home'} mode={isCodeMode ? 'code' : 'home'} onSelectPrompt={(prompt) => {
+              setInputText(prompt);
+              setSlashCommandFilter(null);
+              inputRef.current?.focus();
+            }} />
           </div>
         </div>
         <AddFromGithubModal
@@ -1881,35 +2041,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // MODE 2: Chat Interface (Has ID or Messages)
   return (
-    <div className="flex-1 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
-      {/* TabBar for conversation switching */}
-      <TabBar
-        onNewChat={handleNewChat}
-        rightActions={
-          <div className="flex items-center gap-0.5 mr-1">
-            <button
-              onClick={() => setShowH5Panel(true)}
-              className="flex-shrink-0 w-8 h-8 flex items-center justify-center text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-md transition-colors"
-              title="H5 远程访问"
-            >
-              <Smartphone size={16} />
-            </button>
-            <button
-              onClick={() => setShowTerminalPanel(true)}
-              className="flex-shrink-0 w-8 h-8 flex items-center justify-center text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-md transition-colors"
-              title="终端"
-            >
-              <Terminal size={16} />
-            </button>
-          </div>
-        }
-      />
+    <div className="relative flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
+    <div className="flex-1 min-h-0 min-w-0 bg-claude-bg h-full flex flex-col overflow-clip text-claude-text chat-root chat-font-scope">
+      {showCodingView && <div className="flex shrink-0 gap-5 border-b border-claude-border px-5 text-sm" role="tablist" aria-label="会话视图">
+        {(['chat', 'trajectory'] as const).map(view => <button type="button" key={view} role="tab" aria-selected={conversationView === view} onClick={() => setConversationView(view)} className={`py-3 ${conversationView === view ? 'border-b-2 border-blue-500 text-blue-500' : 'text-claude-textSecondary'}`}>{view === 'chat' ? 'Chat' : 'Trajectory'}</button>)}
+      </div>}
+      {showCodingView && conversationView === 'trajectory' && <div className="min-h-0 flex-1"><TrajectoryView messages={messages} loading={loading} focusId={inspectId} /></div>}
 
       {/* Content area - positioning container for scroll + bottom bars */}
-      <div className="flex-1 min-h-0 relative">
+      <div className={`flex-1 min-h-0 relative ${showCodingView && conversationView === 'trajectory' ? 'hidden' : 'flex flex-col'}`}>
         <div
-          className="absolute inset-0 overflow-y-auto chat-scroll"
-          style={{ paddingBottom: `${inputHeight}px` }}
+          className="flex-1 min-h-0 overflow-y-auto chat-scroll"
           ref={scrollContainerRef}
           onScroll={handleScroll}
         >
@@ -1918,6 +2060,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ maxWidth: `${tunerConfig?.mainContentWidth || 768}px` }}
           >
             <MessageList
+              conversationId={activeId}
+              onInspect={id => { setInspectId(id); setConversationView('trajectory'); }}
               messages={messages}
               loading={loading}
               expandedMessages={expandedMessages}
@@ -1943,18 +2087,18 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
         </div>
 
-        {/* 免责声明 - 固定在最底部 */}
-        <div className="absolute bottom-0 left-0 z-10 bg-claude-bg flex items-center justify-center text-[12px] text-claude-textSecondary h-7 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
-          Claude is AI and can make mistakes. Please double-check responses.
-        </div>
-
-        {/* 输入框 - 浮动在内容上方，底部距离可调 */}
-        <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ bottom: `${inputBarBottom + 28}px`, paddingLeft: '16px', paddingRight: `${16 + scrollbarWidth}px` }}>
+        {/* Keep the complete opaque composer below the message scroller. */}
+        <div className="relative shrink-0 z-20 bg-claude-bg pt-2 px-4">
           <div
             className="mx-auto pointer-events-auto"
             style={{ maxWidth: `${inputBarWidth}px` }}
           >
             <div className="w-full relative group" ref={inputWrapperRef}>
+              {activeId && isCodeMode && currentProjectId ? <ConversationWorkspaceBar key={`workspace:${activeId}`} id={activeId} projectId={currentProjectId} data={conversationGit.data} error={conversationGit.error} disabled={loading || modeChanging} onSelect={handleAttachToProject} onViewChanges={() => { setShowGitChanges(true); conversationGit.refresh(); }} onRefresh={conversationGit.refresh} /> :
+                <ProjectWorkspaceBar projectId={activeId ? currentProjectId : pendingProjectId} onSelect={handleAttachToProject} disabled={loading || modeChanging}>
+                  {!activeId && isCodeMode && pendingProjectId && <SessionGitSettings key={`${pendingProjectId}:${resetKey}`} projectId={pendingProjectId} disabled={loading || modeChanging} initialSelection={sessionGit} onChange={setSessionGit} />}
+                </ProjectWorkspaceBar>}
+              {codeProjectRequired && <p className="mb-2 text-xs text-claude-textSecondary">{t('chat.selectCodeProject')}</p>}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -1977,12 +2121,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <div className="relative">
                   <SkillInputOverlay
                     text={inputText}
-                    className="px-4 pt-4 pb-0 text-[16px] font-sans font-[350]"
+                    className="px-4 pt-4 pb-0 text-[16px] font-sans font-normal"
                     style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflow: 'hidden' }}
                   />
                   <textarea
                     ref={inputRef}
-                    className={`w-full px-4 pt-4 pb-0 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-[350] ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
+                    className={`w-full px-4 pt-4 pb-0 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-normal ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
                     style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflowY: 'hidden' }}
                     placeholder={selectedSkill ? `Describe what you want ${selectedSkill.name} to do...` : t('chat.inputPlaceholder')}
                     value={inputText}
@@ -2012,7 +2156,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     onPaste={handlePaste}
                   />
                 </div>
-                <div className="px-4 pb-3 pt-1 flex items-center justify-between">
+                <div className="px-4 pb-3 pt-1 flex flex-wrap gap-2 items-center justify-between">
                   <div className="relative flex items-center">
                     <button
                       ref={plusBtnRef}
@@ -2037,40 +2181,27 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         {...plusMenuCallbacks}
                       />
                     )}
+                    {!isCodeMode && <button type="button" onClick={() => fileInputRef.current?.click()} aria-label={t('chat.addAttachment')} title={t('chat.addAttachment')}
+                      className="p-2 text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-lg transition-colors">
+                      <Paperclip size={20} />
+                    </button>}
                     {researchMode && <ResearchBadge onToggle={toggleResearchMode} />}
-                    {contextInfo && contextInfo.tokens > 0 && (() => {
-                      const pct = Math.min(contextInfo.tokens / contextInfo.limit!, 1);
-                      const color = pct > 0.8 ? '#dc2626' : pct > 0.5 ? '#d97706' : '#6b7280';
-                      const r = 7, c = 2 * Math.PI * r, dash = pct * c;
-                      const label = contextInfo.tokens.toLocaleString() + ' tokens';
-                      const pctLabel = (pct * 100).toFixed(1) + '% 上下文已使用';
-                      return (
-                        <div className="flex items-center gap-1 ml-1 select-none" title={pctLabel}>
-                          <svg width="18" height="18" viewBox="0 0 18 18">
-                            <circle cx="9" cy="9" r={r} fill="none" stroke="#d4d4d4" strokeWidth="2" />
-                            <circle cx="9" cy="9" r={r} fill="none" stroke={color} strokeWidth="2"
-                              strokeDasharray={`${dash} ${c}`} strokeLinecap="round"
-                              transform="rotate(-90 9 9)" />
-                          </svg>
-                          <span className="text-[11px] whitespace-nowrap" style={{ color: '#6b7280' }}>{label}</span>
-                        </div>
-                      );
-                    })()}
-                    {tokenUsage && (tokenUsage.input_tokens! > 0 || tokenUsage.output_tokens! > 0) && (
-                      <div className="flex items-center gap-1 ml-1 select-none" title={`Input: ${tokenUsage.input_tokens!.toLocaleString()} | Output: ${tokenUsage.output_tokens!.toLocaleString()}`}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-                        <span className="text-[11px] whitespace-nowrap" style={{ color: '#6b7280' }}>
-                          {(tokenUsage.input_tokens! + tokenUsage.output_tokens!).toLocaleString()} tokens
-                        </span>
-                      </div>
-                    )}
                   </div>
-                  <div className="flex items-center gap-3">
-                    <PermissionModeSelector />
+                  <div className="flex flex-wrap justify-end items-center gap-3 ml-auto">
+                    {activeId && queues[activeId]?.length > 0 && <div className="max-w-[200px] text-xs text-claude-textSecondary">
+                      <span>{t('general.queued')} ({queues[activeId].length})</span>
+                      {queues[activeId].map(message => <div key={message.id} className="flex items-center gap-1">
+                        <span className="truncate">{message.text || message.files.map(file => file.fileName).join(', ')}</span>
+                        <button aria-label={t('general.cancelQueued')} onClick={() => useBusySendStore.getState().cancel(activeId, message.id)}>&times;</button>
+                      </div>)}
+                    </div>}
+                    {isCodeMode && <PermissionModeSelector neutral />}
                     <ModelSelector
                       currentModelString={currentModelString}
                       models={selectorModels}
                       onModelChange={handleModelChange}
+                    effort={reasoningMode}
+                    onEffortChange={setReasoningMode}
                       isNewChat={false}
                       dropdownPosition="top"
                     />
@@ -2084,7 +2215,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <IconVoice size={20} />
                       </button>
                     )}
-                    {loading ? (
+                    {loading && !inputText.trim() && !pendingFiles.some(f => f.status === 'done') ? (
                       <button
                         onClick={handleStop}
                         className="p-2 text-claude-text hover:bg-claude-hover rounded-lg transition-colors"
@@ -2106,21 +2237,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       </button>
                     ) : (
                       <>
-                        <select
-                          value={reasoningMode || 'auto'}
-                          onChange={(e) => setReasoningMode(e.target.value === 'auto' ? null : e.target.value)}
-                          className="h-8 px-1.5 text-xs rounded-lg border border-claude-border bg-claude-bgSecondary text-claude-textSecondary hover:bg-claude-hover focus:outline-none focus:ring-1 focus:ring-[#C6613F] cursor-pointer"
-                          title="推理模式"
-                        >
-                          <option value="auto">Auto</option>
-                          <option value="quick">Quick</option>
-                          <option value="standard">Standard</option>
-                          <option value="deep">Deep</option>
-                        </select>
                         <button
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => handleSend()}
-                        disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                        disabled={codeProjectRequired || gitSetupPending || modeChanging || (!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
+                        title={codeProjectRequired ? t('chat.selectCodeProject') : t('chat.send')}
                         className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <ArrowUp size={22} strokeWidth={2.5} />
@@ -2130,6 +2251,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   </div>
                 </div>
               </div>
+              {modeError && <p role="alert" className="text-xs text-red-500">{modeError}</p>}
+              {showUsage && messages.some(message => message.role === 'user') && <SessionUsageBar key={`usage:${activeId || 'new'}`} messages={messages} contextLimit={selectorModels.find(model => model.id === currentModelString)?.contextWindow} />}
+              {!isCodeMode && showAiDisclaimer && <p className="pt-2 pb-2 text-center text-[12px] text-claude-textSecondary font-sans">Claude is AI and can make mistakes. Please double-check responses.</p>}
               {false && (
                 <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs pointer-events-auto">
                   <span>您当前没有可用套餐，无法发送消息</span>
@@ -2439,6 +2563,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         inputRef={inputRef}
         activeId={activeId}
       />
+    </div>
+    {showGitChanges && activeId && <GitChangesPanel key={activeId} id={activeId} data={conversationGit.data} error={conversationGit.error} onRefresh={conversationGit.refresh} onClose={() => setShowGitChanges(false)} />}
     </div>
   );
 };

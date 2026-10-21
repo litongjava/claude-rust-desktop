@@ -1,0 +1,162 @@
+{
+  "source": "Claude Code 2.1.295 executable, supplied and authorized by project owner",
+  "executable_sha256": "a30012741c3d0b55e2a6c252dab3781134b75be95896ae89d40a93e10f83bcd6",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "source_offset": 257077411,
+      "compression": "zstd",
+      "sha256": "c6e0680ba50cd02193edaa373bac768346a465302dbbcdd68938bc2972d26c33"
+    },
+    {
+      "path": "non-storybook/SKILL.md",
+      "source_offset": 257055690,
+      "compression": "zstd",
+      "sha256": "78fa6e4ce2153422b8598b6702f9363dc6f8c789569463f94b6a36fd5d24eb53"
+    },
+    {
+      "path": "storybook/SKILL.md",
+      "source_offset": 257088163,
+      "compression": "zstd",
+      "sha256": "25714b54d589b5d8bc5a1ad2460f361f4f5f14d21eeeeace6a98f19e0d2267e7"
+    },
+    {
+      "path": "package-build.mjs",
+      "source_offset": 257112639,
+      "compression": "zstd",
+      "sha256": "3e6584fdad080a45aee401860decd7fa1992c9088182f2cd3e1b6d2d67681d7a"
+    },
+    {
+      "path": "package-validate.mjs",
+      "source_offset": 257131399,
+      "compression": "zstd",
+      "sha256": "0b84d3ea1c7c62093e6eb64f2028bb25adf5c97e0e2751195ae45105b19a88f7"
+    },
+    {
+      "path": "lib/common.mjs",
+      "source_offset": 257148826,
+      "compression": "zstd",
+      "sha256": "92890bbce8d3d76d9473c6c7a09f83622730f8806811ac4bfbb63f157901f0ec"
+    },
+    {
+      "path": "lib/bundle.mjs",
+      "source_offset": 257155719,
+      "compression": "zstd",
+      "sha256": "2680b62649b8fb24650cee9c16ea37f0ebb1872def756962aa8c6de2def2721d"
+    },
+    {
+      "path": "lib/dts.mjs",
+      "source_offset": 257161751,
+      "compression": "zstd",
+      "sha256": "674618e662674ec8e2d3275df4ad9acf246a2577048cc9fe7a72ae1bc549dd22"
+    },
+    {
+      "path": "lib/css.mjs",
+      "source_offset": 257172480,
+      "compression": "zstd",
+      "sha256": "d8084a4107dc61c64a501491b35656f83cf821c7196f450d80bf93ccc02569ec"
+    },
+    {
+      "path": "lib/source-storybook.mjs",
+      "source_offset": 257175987,
+      "compression": "zstd",
+      "sha256": "90f6a529cbacd220fc98243e667d3b2b9314dcccf7784e098262d2be9085f900"
+    },
+    {
+      "path": "lib/story-imports.mjs",
+      "source_offset": 257190685,
+      "compression": "zstd",
+      "sha256": "6795125e4f7a180d4fc18b6453c047e2d372fae97d0781460c2b1c8b50a76ec3"
+    },
+    {
+      "path": "lib/emit.mjs",
+      "source_offset": 257202462,
+      "compression": "zstd",
+      "sha256": "368f67e69c06c472ee5411f9d00f6ec1fa971438d7c0b1e0390844f8cff5743d"
+    },
+    {
+      "path": "lib/previews.mjs",
+      "source_offset": 257216069,
+      "compression": "zstd",
+      "sha256": "19061b6f2a4236377cb02398eb45049ae1a87e0188f7edb6700a0e0380ac536f"
+    },
+    {
+      "path": "lib/docs.mjs",
+      "source_offset": 257226836,
+      "compression": "zstd",
+      "sha256": "40e5d99baf3c72b0e39249d96613ebe9e4cf3103a2f4c6ce6ea8049431db0108"
+    },
+    {
+      "path": "lib/preview-rebuild.mjs",
+      "source_offset": 257232141,
+      "compression": "zstd",
+      "sha256": "438e0846c7ed985a3800478b17ee6bd879940811265cb77717c8c127d822abd5"
+    },
+    {
+      "path": "storybook/compare.mjs",
+      "source_offset": 257247372,
+      "compression": "zstd",
+      "sha256": "af83862a5d7e1f847b76840e5583be9231b099991ca204bf88e1028044573f89"
+    },
+    {
+      "path": "package-capture.mjs",
+      "source_offset": 257263016,
+      "compression": "zstd",
+      "sha256": "b51d7aff26487cd2fed0ec432a47e2d138c39303437792342f79539f261648b9"
+    },
+    {
+      "path": "lib/sync-hashes.mjs",
+      "source_offset": 257269038,
+      "compression": "zstd",
+      "sha256": "91e02e0761897472e48f89295c521892f1b442fd5b31edf2c7d08b667d616de9"
+    },
+    {
+      "path": "lib/remote-diff.mjs",
+      "source_offset": 257273211,
+      "compression": "zstd",
+      "sha256": "e1ea1b5f09ebfb368a7734f5f8c45d259f7d88dfc6befc9f8c7cdc52b6069b31"
+    },
+    {
+      "path": "resync.mjs",
+      "source_offset": 257277958,
+      "compression": "zstd",
+      "sha256": "509db748227c1ea3a9a8f3d1c3dd2387861058b701ef46c5fefe9f35f8264d43"
+    },
+    {
+      "path": "lib/detect.mjs",
+      "source_offset": 257154211,
+      "compression": "none",
+      "sha256": "47479300b8c49afa78409a2a1c47a2b0b0fa8d8a400b2f5d134d206f8461e759"
+    },
+    {
+      "path": "lib/source-kit.mjs",
+      "source_offset": 257183029,
+      "compression": "none",
+      "sha256": "f59246d33e041229d7d9eb55a9efced676dd794451619d3043bd97cfad6e4987"
+    },
+    {
+      "path": "lib/css-fallback.mjs",
+      "source_offset": 257196900,
+      "compression": "none",
+      "sha256": "05b9498cff750f1b2519ad13c02f097b59f52ef0aa0ddcca8c250d915b33a525"
+    },
+    {
+      "path": "lib/preview-gen-storybook.mjs",
+      "source_offset": 257219783,
+      "compression": "none",
+      "sha256": "9cb720a9fbdc5d1b19fd4578a55778f621c51e21c3504ad73a6c9e3283ea6717"
+    },
+    {
+      "path": "storybook/http-serve.mjs",
+      "source_offset": 257238068,
+      "compression": "none",
+      "sha256": "9936afc8af74258343770ad1497b7f7a7e993a8adeeb92f123e3b1f3896897cd"
+    },
+    {
+      "path": "storybook/probe.mjs",
+      "source_offset": 257240160,
+      "compression": "none",
+      "sha256": "c3881006ee164e46904acaed1dc8541e7adec56d3942a12c141d2cc5de342134"
+    }
+  ]
+}

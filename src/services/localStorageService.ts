@@ -1,4 +1,5 @@
 import type { Provider, ProviderModel } from '../api/providers';
+import { conversationWorkspaceMode, type WorkspaceMode } from '../stores/useWorkspaceModeStore';
 
 const KEYS = {
   providers: 'app_providers',
@@ -7,6 +8,7 @@ const KEYS = {
 };
 
 export interface LocalConversation {
+  workspace_mode?: WorkspaceMode;
   id: string;
   title?: string | null;
   model?: string | null;
@@ -31,6 +33,11 @@ export interface LocalMessage {
   is_compact_boundary?: number;
   sort_order: number;
   toolCalls?: any[];
+  processSteps?: import('../features/trajectory/model').ProcessStep[];
+  processStartedAt?: number;
+  processEndedAt?: number;
+  toolTextEndOffset?: number;
+  requestSnapshots?: import('../features/trajectory/model').RequestSnapshot[];
 }
 
 function safeGet<T>(key: string, fallback: T): T {
@@ -102,7 +109,10 @@ export function deleteLocalProvider(id: string): void {
 // ============ Conversations ============
 
 export function getLocalConversations(): LocalConversation[] {
-  return safeGet<LocalConversation[]>(KEYS.conversations, []);
+  return safeGet<LocalConversation[]>(KEYS.conversations, []).map(conversation => ({
+    ...conversation,
+    workspace_mode: conversationWorkspaceMode(conversation),
+  }));
 }
 
 export function saveLocalConversations(convs: LocalConversation[]): void {
@@ -116,7 +126,7 @@ export function getLocalConversation(id: string): LocalConversation | undefined 
 export function createLocalConversation(
   title?: string | null,
   model?: string | null,
-  extras?: { research_mode?: boolean }
+  extras?: { research_mode?: boolean; workspace_mode?: WorkspaceMode }
 ): LocalConversation {
   const convs = getLocalConversations();
   const now = new Date().toISOString();
@@ -128,6 +138,7 @@ export function createLocalConversation(
     workspace_path: null,
     project_id: null,
     research_mode: extras?.research_mode || false,
+    workspace_mode: extras?.workspace_mode || 'chat',
     pinned: false,
     archived: false,
     created_at: now,

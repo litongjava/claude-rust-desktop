@@ -1,9 +1,11 @@
+> CLI ? Desktop ??? Cargo workspace ?? Rust ????? CLI??????? CLI ????? [docs/cli.md](docs/cli.md)?
+
 
 
 
 <img width="1727" height="1097" alt="52ba2ab78fb1847f8635a9f984779382" src="https://github.com/user-attachments/assets/6ff88823-786f-4211-bb18-6cae6f7ec593" />
 
-# Claude Desktop (Tauri Edition)
+# deepseek-code-desktop
 
 A desktop client for AI chat assistants, built with Tauri 2.0, Rust, and React. Provides a native-feeling GUI for interacting with Claude and other LLM providers, with local data persistence and a plugin-style architecture for extending functionality.
 
@@ -102,7 +104,7 @@ The app uses Tauri 2.0's Rust backend to handle file system access, process mana
 ## Project Structure
 
 ```
-claude-desktop-tauri/
+deepseek-code-desktop/
 ├── src/                          # React frontend source
 │   ├── components/               # UI components
 │   │   ├── chat/                 # Chat interface components
@@ -209,7 +211,7 @@ claude-desktop-tauri/
 ```bash
 # Clone the repository
 git clone <repo-url>
-cd claude-desktop-tauri
+cd deepseek-code-desktop
 
 # Install frontend dependencies
 npm install
@@ -227,8 +229,18 @@ This launches both the Vite dev server (frontend) and the Tauri Rust backend. Th
 npx tauri build
 
 # Build artifacts are placed in:
-#   src-tauri/target/release/bundle/
+#   target/release/dcd.exe (Windows executable)
+#   target/release/bundle/ (dcd installers)
 ```
+
+Build the standalone Rust CLI with `cargo build --locked -p deepseek-code-cli --release`.
+The executable is `target/release/dcl.exe` on Windows and does not require Node.js.
+Use `npm run build:all` to collect `cli/dcl.exe`, `desktop/dcd.exe`, and installers under `artifacts/<build>/`.
+On other platforms the executable names are `dcl` and `dcd` (without `.exe`).
+Node.js is still used for the Desktop frontend, npm build scripts, and optional JavaScript plugins or MCP servers.
+In an interactive CLI session, use `/provider` to configure or select a provider, `/model` to select a model,
+and `/test` to test the connection without changing conversation history. Provider credentials can be referenced
+by environment variable name; set those variables before launching the CLI.
 
 ### Running Tests
 

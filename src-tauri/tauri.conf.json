@@ -1,5 +1,6 @@
 {
-  "productName": "Claude Rust",
+  "productName": "dcd",
+  "mainBinaryName": "dcd",
   "version": "3.1.0",
   "identifier": "com.claude.desktop",
   "build": {
@@ -11,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Claude Rust 3.0.0",
+        "title": "DeepSeek Code Desktop",
         "width": 1150,
         "height": 700,
         "minWidth": 800,
@@ -29,6 +30,8 @@
     "active": true,
     "targets": "all",
     "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
       "icons/icon.ico"
     ],
     "android": {

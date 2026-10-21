@@ -1,21 +1,24 @@
 [package]
-name = "claude-desktop-tauri"
+name = "deepseek-code-desktop"
+default-run = "dcd"
 version = "3.1.0"
-description = "Claude Desktop - AI assistant with native capabilities (Tauri Edition)"
+description = "DeepSeek Code Desktop - AI assistant with native capabilities (Tauri Edition)"
 authors = ["you"]
 edition = "2021"
 
-[workspace]
-members = ["worker"]
+[[bin]]
+name = "dcd"
+path = "src/main.rs"
 
 [lib]
-name = "claude_desktop_tauri_lib"
+name = "deepseek_desktop_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+claude-core = { path = "../crates/core" }
 tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -44,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.24"
 opentelemetry = "0.23"
+# Keep this SDK aligned with opentelemetry 0.23, tracing-opentelemetry 0.24, and opentelemetry-otlp 0.16.
 opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.16"
 futures = "0.3"
@@ -71,6 +75,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 prometheus = "0.13"
 ed25519-dalek = { version = "2", features = ["std"] }
 serde_yaml = "0.9"
+scraper = "0.24"
 
 [dev-dependencies]
 tempfile = "3"

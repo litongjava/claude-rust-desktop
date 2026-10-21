@@ -67,7 +67,7 @@ interface ToolState {
   addTask: (id: string, task: ActiveTask) => void;
   removeTask: (id: string) => void;
   setActiveTasks: (tasks: Map<string, ActiveTask> | ((prev: Map<string, ActiveTask>) => Map<string, ActiveTask>)) => void;
-  setToolPermissionDialog: (dialog: ToolPermissionDialogData | null) => void;
+  setToolPermissionDialog: (dialog: ToolPermissionDialogData | null | ((prev: ToolPermissionDialogData | null) => ToolPermissionDialogData | null)) => void;
   setAskUserDialog: (dialog: AskUserDialogData | null | ((prev: AskUserDialogData | null) => AskUserDialogData | null)) => void;
   toggleExpandedMessage: (idx: number) => void;
   setCopiedMessageIdx: (idx: number | null) => void;
@@ -113,7 +113,9 @@ export const useToolStore = create<ToolState>()(
         activeTasks: typeof activeTasks === 'function' ? activeTasks(state.activeTasks) : activeTasks,
       })),
 
-    setToolPermissionDialog: (toolPermissionDialog) => set({ toolPermissionDialog }),
+    setToolPermissionDialog: (dialog) => set((state) => ({
+      toolPermissionDialog: typeof dialog === 'function' ? dialog(state.toolPermissionDialog) : dialog,
+    })),
 
     setAskUserDialog: (askUserDialog) =>
       set((state) => ({

@@ -177,6 +177,7 @@ pub type AppStateTuple = (
 pub struct BridgeServer {
     engine_pool: Arc<Mutex<EnginePool>>,
     native_engine: Arc<Mutex<Option<NativeEngine>>>,
+    permission_manager: Arc<PermissionManager>,
     mcp_server_manager: Arc<McpServerManager>,
     stream_manager: Arc<Mutex<StreamManager>>,
     research_mode: Arc<Mutex<HashMap<String, bool>>>,
@@ -203,11 +204,11 @@ pub struct BridgeServer {
 
 impl BridgeServer {
     pub fn new(data_dir: PathBuf, db_manager: Arc<DbManager>) -> Self {
-        let _skills_dir = data_dir.join("skills");
+        let skills_dir = data_dir.join("skills");
         let log_dir = data_dir.join("logs");
         let analytics_dir = data_dir.join("analytics");
 
-        let skill_manager = SkillsManager::new();
+        let skill_manager = SkillsManager::with_path(skills_dir);
         if let Err(e) = skill_manager.install_bundled_skills() {
             tracing::error!(module = "Bridge", error = %e);
         }
@@ -255,13 +256,16 @@ impl BridgeServer {
         let file_cache = Arc::new(FileCache::new());
         tracing::info!(module = "Bridge", "FileCache initialized");
 
-        let native_engine = Arc::new(Mutex::new(Some(NativeEngine::new(
-            provider_manager,
+        let skill_manager = Arc::new(Mutex::new(skill_manager));
+        let mcp_server_manager = Arc::new(McpServerManager::new(config_dir.join("mcp-servers.json")));
+        let native_engine = Arc::new(Mutex::new(Some(crate::runtime::create_engine(
+            &crate::runtime::RuntimePaths { data_dir: data_dir.clone() },
             db_manager.clone(),
-            data_dir.join("workspaces"),
-            permission_manager,
+            provider_manager,
+            permission_manager.clone(),
             file_cache.clone(),
-        ))));
+        ).with_skills_manager(skill_manager.clone())
+         .with_mcp_registry(Arc::new(crate::mcp::McpToolRegistry::new(mcp_server_manager.clone()))))));
         tracing::info!(module = "Bridge", "NativeEngine initialized");
 
         let config_path = std::path::Path::new("config/orchestration.toml");
@@ -277,10 +281,15 @@ impl BridgeServer {
         let orchestrator = Arc::new(Mutex::new(Some(orchestrator)));
         tracing::info!(module = "Bridge", "MultiAgentOrchestrator initialized");
 
-        let memex_client = Arc::new(MemExClient::new(None));
+        let memex_client = Arc::new(MemExClient::with_path(data_dir.join("memory.sqlite3"), None));
         tracing::info!(module = "Bridge", "MemExClient initialized (backend: {})", memex_client.base_url);
 
         let api_key = uuid::Uuid::new_v4().to_string();
+        // Only the loopback development server reads this file; never expose it to the browser.
+        #[cfg(debug_assertions)]
+        if let Err(error) = std::fs::write(data_dir.join("dev-bridge-key"), &api_key) {
+            tracing::warn!(module = "Bridge", "Cannot initialize browser development proxy: {}", error);
+        }
         tracing::info!(module = "Bridge", "API Key generated for bridge authentication");
 
         let cost_tracker = Arc::new(CostTracker::new(data_dir.join("costs")));
@@ -298,11 +307,12 @@ impl BridgeServer {
         Self {
             engine_pool: Arc::new(Mutex::new(EnginePool::new())),
             native_engine,
-            mcp_server_manager: Arc::new(McpServerManager::new(config_dir.join("mcp-servers.json"))),
+            permission_manager,
+            mcp_server_manager,
             stream_manager: Arc::new(Mutex::new(StreamManager::new())),
             research_mode: Arc::new(Mutex::new(HashMap::new())),
             config_manager,
-            skill_manager: Arc::new(Mutex::new(skill_manager)),
+            skill_manager,
             db_manager,
             task_executor: Arc::new(Mutex::new(Some(task_executor))),
             process_manager: Arc::new(Mutex::new(ProcessManager::new())),
@@ -360,9 +370,7 @@ impl BridgeServer {
             git_integration: Arc::new(GitIntegration::new(
                 std::env::current_dir().unwrap_or_default(),
             )),
-            permission_manager: Arc::new(PermissionManager::new(
-                Arc::new(crate::permissions::AuditLogger::new(1000)),
-            )),
+            permission_manager: self.permission_manager.clone(),
         };
         tracing::info!(module = "Bridge", "Database manager ready");
 
@@ -448,8 +456,8 @@ impl BridgeServer {
         });
 
         let app = routes::build_all_routes()
-            .layer(cors)
             .layer(auth_middleware)
+            .layer(cors)
             .with_state(state);
 
         let mut bound_port = None;
@@ -791,59 +799,6 @@ async fn tools_list_handler() -> Json<Vec<ToolDefinition>> {
     Json(get_tool_definitions())
 }
 
-async fn projects_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.db_manager.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::db::project_repo::list_projects(conn))
-    }).await;
-    match result {
-        Ok(Ok(Ok(projects))) => Json(serde_json::json!({ "projects": projects })),
-        _ => Json(serde_json::json!({ "projects": [] })),
-    }
-}
-
-#[derive(Deserialize)]
-struct ProjectCreateRequest {
-    name: String,
-    description: Option<String>,
-    instructions: Option<String>,
-    workspace_path: Option<String>,
-}
-
-async fn projects_create(State(state): State<AppState>, Json(req): Json<ProjectCreateRequest>) -> Json<serde_json::Value> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let req_name = req.name.clone();
-    let db = state.db_manager.clone();
-    let id_for_db = id.clone();
-    let name_for_db = req_name.clone();
-    let desc_clone = req.description.clone();
-    let instructions_clone = req.instructions.clone();
-    let workspace_clone = req.workspace_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let now = chrono::Utc::now().to_rfc3339();
-            crate::db::project_repo::insert_project(
-                conn,
-                &id_for_db,
-                &name_for_db,
-                desc_clone.as_deref(),
-                instructions_clone.as_deref(),
-                workspace_clone.as_deref(),
-                false,
-                &now,
-                &now,
-            )
-        })
-    }).await;
-    match result {
-        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "id": id.clone(), "name": req_name })),
-        _ => {
-            tracing::error!(module = "Projects", "Failed to create project {}", id);
-            Json(serde_json::json!({ "error": "Failed to create project" }))
-        }
-    }
-}
-
 static UPLOAD_DIR: once_cell::sync::Lazy<std::sync::Mutex<Option<PathBuf>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
@@ -1011,7 +966,12 @@ async fn config_get(State(state): State<AppState>) -> Json<serde_json::Value> {
     let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
-        return Json(serde_json::to_value(m.get_config()).unwrap_or_default());
+        let mut value = serde_json::to_value(m.get_config()).unwrap_or_default();
+        if let Some(search) = value["deepseek_search"].as_object_mut() {
+            search.remove("api_key");
+            search.insert("has_api_key".into(), serde_json::json!(!m.get_config().deepseek_search.api_key.trim().is_empty()));
+        }
+        return Json(value);
     }
     Json(serde_json::json!({}))
 }
@@ -1020,7 +980,12 @@ async fn config_update(State(state): State<AppState>, Json(config): Json<AppConf
     let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
-        let _ = m.update_config(|c| *c = config);
+        let _ = m.update_config(|c| {
+            // Only /api/search-settings may modify independent search credentials.
+            let search = c.deepseek_search.clone();
+            *c = config;
+            c.deepseek_search = search;
+        });
     }
     Json(serde_json::json!({ "ok": true }))
 }
@@ -2159,6 +2124,7 @@ async fn workflow_execute(
 
     let provider = crate::native_engine::provider_manager::Provider {
         id: provider_config.id.clone(),
+        builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),
         base_url: provider_config.base_url.clone(),
         api_key: provider_config.api_key.clone().unwrap_or_default(),
@@ -2169,6 +2135,7 @@ async fn workflow_execute(
             enabled: m.enabled,
             max_tokens: m.max_tokens,
             supports_vision: m.supports_vision,
+                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None, fast: false,
             supports_web_search: false,
         }).collect(),
         enabled: provider_config.enabled,
@@ -2181,6 +2148,7 @@ async fn workflow_execute(
         enabled: model_config.enabled,
         max_tokens: model_config.max_tokens,
         supports_vision: model_config.supports_vision,
+        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None, fast: false,
         supports_web_search: false,
     };
 
@@ -2244,6 +2212,7 @@ async fn workflow_execute_stream(
 
     let provider = crate::native_engine::provider_manager::Provider {
         id: provider_config.id.clone(),
+        builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),
         base_url: provider_config.base_url.clone(),
         api_key: provider_config.api_key.clone().unwrap_or_default(),
@@ -2254,6 +2223,7 @@ async fn workflow_execute_stream(
             enabled: m.enabled,
             max_tokens: m.max_tokens,
             supports_vision: m.supports_vision,
+                        context_window: m.context_window, supports_text: m.supports_text, api: m.api.clone(), effort: None, fast: false,
             supports_web_search: false,
         }).collect(),
         enabled: provider_config.enabled,
@@ -2266,6 +2236,7 @@ async fn workflow_execute_stream(
         enabled: model_config.enabled,
         max_tokens: model_config.max_tokens,
         supports_vision: model_config.supports_vision,
+        context_window: model_config.context_window, supports_text: model_config.supports_text, api: model_config.api.clone(), effort: None, fast: false,
         supports_web_search: false,
     };
 
@@ -2340,32 +2311,32 @@ async fn workflow_config_set(
 async fn memory_search_handler(
     State(state): State<AppState>,
     Json(req): Json<MemorySearchRequest>,
-) -> Result<Json<Vec<MemoryItem>>, (StatusCode, String)> {
+) -> Result<Json<Vec<MemoryItem>>, (StatusCode, Json<serde_json::Value>)> {
     let memex: Arc<MemExClient> = state.memex_client.clone();
     match memex.search(&req.query, req.top_k).await {
         Ok(results) => Ok(Json(results)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))),
     }
 }
 
 async fn memory_ingest_handler(
     State(state): State<AppState>,
     Json(req): Json<MemoryIngestRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let memex: Arc<MemExClient> = state.memex_client.clone();
     match memex.ingest(&req.content, req.importance, req.metadata).await {
         Ok(()) => Ok(Json(json!({"status": "ok"}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))),
     }
 }
 
 async fn memory_stats_handler(
     State(state): State<AppState>,
-) -> Result<Json<MemoryStats>, (StatusCode, String)> {
+) -> Result<Json<MemoryStats>, (StatusCode, Json<serde_json::Value>)> {
     let memex: Arc<MemExClient> = state.memex_client.clone();
     match memex.stats().await {
         Ok(stats) => Ok(Json(stats)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))),
     }
 }
 
@@ -2379,19 +2350,19 @@ async fn memory_get_config_handler(
 async fn memory_update_config_handler(
     State(state): State<AppState>,
     Json(config): Json<MemoryConfig>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let memex: Arc<MemExClient> = state.memex_client.clone();
-    memex.update_config(config).await;
-    Json(json!({"status": "updated"}))
+    memex.update_config(config).await.map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
+    Ok(Json(json!({"status": "updated"})))
 }
 
 async fn memory_clear_handler(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let memex: Arc<MemExClient> = state.memex_client.clone();
     match memex.clear().await {
         Ok(()) => Ok(Json(json!({"status": "cleared"}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))),
     }
 }
 

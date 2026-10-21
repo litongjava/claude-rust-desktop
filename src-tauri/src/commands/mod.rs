@@ -1,3 +1,5 @@
+pub mod knowledge;
+pub mod peripheral;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
 use crate::db::DbManager;
 use crate::db::diff_repo::CodeDiffRow;
@@ -19,6 +21,7 @@ use crate::slash_commands::{SlashCommand, SlashCommandRegistry};
 use crate::cost_tracker::{CostSummary, CostTracker, SessionCost};
 
 pub mod bridge;
+pub mod general_settings;
 pub mod feishu_chat;
 pub use bridge::*;
 use anyhow::Result;
@@ -265,10 +268,10 @@ pub async fn native_engine_init(
         let permission_manager = Arc::new(crate::permissions::PermissionManager::new(
             Arc::new(crate::permissions::AuditLogger::new(1000)),
         ));
-        let engine = crate::native_engine::NativeEngine::new(
-            provider_manager,
+        let engine = crate::runtime::create_engine(
+            &crate::runtime::RuntimePaths { data_dir },
             db_manager,
-            data_dir.join("workspaces"),
+            provider_manager,
             permission_manager,
             Arc::new(crate::cache::FileCache::new()),
         );
@@ -440,6 +443,23 @@ pub async fn mcp_restart_server(
     } else {
         Err("MCP manager not initialized".to_string())
     }
+}
+
+#[tauri::command]
+pub async fn mcp_import_legacy(
+    app_handle: tauri::AppHandle,
+    source: String,
+    preview: bool,
+) -> Result<claude_core::mcp::transfer::Report, String> {
+    let mcp_state =
+        app_handle.state::<Arc<Mutex<Option<Arc<Mutex<crate::mcp::McpServerManager>>>>>>();
+    let guard = mcp_state.lock().await;
+    let manager = guard.as_ref().ok_or("MCP manager not initialized")?;
+    let manager = manager.lock().await;
+    manager
+        .import_legacy(std::path::Path::new(&source), preview)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1303,7 +1323,8 @@ pub async fn set_permission_mode(
     let permission_state = app_handle.state::<Arc<Mutex<Option<Arc<crate::permissions::PermissionManager>>>>>();
     let permission_guard = permission_state.lock().await;
     if let Some(perm_mgr) = permission_guard.as_ref() {
-        let mode_enum = PermissionMode::from_str(&mode);
+        let mode_enum = PermissionMode::parse(&mode).map_err(|error| error.to_string())?;
+        if mode_enum == PermissionMode::Auto { return Err("Auto permissions are currently a CLI/SDK extension; Desktop requires session-specific authority before enabling this mode".into()); }
         perm_mgr.set_mode(mode_enum);
         Ok(())
     } else {

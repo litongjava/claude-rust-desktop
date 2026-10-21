@@ -117,6 +117,9 @@ async fn h5_chat_handler(
         let mut engine_guard = native_engine.lock().await;
         if let Some(engine) = engine_guard.as_mut() {
             let chat_req = crate::native_engine::engine_core::ChatRequest {
+                max_turns: None,
+                response_schema: None,
+                provider_id: None, effort: None,
                 conversation_id: conv_id.clone(),
                 messages: vec![serde_json::json!({
                     "role": "user",
@@ -156,8 +159,19 @@ async fn h5_chat_handler(
         };
 
         let mut full_text = String::new();
-        while let Some(event) = rx.recv().await {
+        let mut permission_watches = super::permission_watch::PermissionWatches::default();
+        loop {
+            let event = tokio::select! {
+                biased;
+                resolved = permission_watches.next(&conv_id), if !permission_watches.is_empty() => {
+                    yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+                    continue;
+                }
+                event = rx.recv() => match event { Some(event) => event, None => break },
+            };
             let event_data = match event {
+                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(_) => None,
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { .. } => { full_text.clear(); None },
                 crate::native_engine::tool_loop::EngineEvent::MessageStart { model } => {
                     Some(serde_json::json!({
                         "type": "message_start",
@@ -196,12 +210,18 @@ async fn h5_chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::MessageStop { full_text: _ft, stop_reason } => {
+                    for resolved in permission_watches.finish(&conv_id) {
+                        yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+                    }
                     Some(serde_json::json!({
                         "type": "message_stop",
                         "stop_reason": stop_reason,
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::Error(error) => {
+                    for resolved in permission_watches.finish(&conv_id) {
+                        yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+                    }
                     tracing::error!(module = "H5_Chat", "Engine error event: {}", error);
                     Some(serde_json::json!({
                         "type": "error",
@@ -215,6 +235,14 @@ async fn h5_chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input } => {
+                    let closed = match native_engine.lock().await.as_ref() {
+                        Some(engine) => engine.permission_completion(&request_id).await,
+                        None => tokio::sync::watch::channel(true).1,
+                    };
+                    if !permission_watches.register(&request_id, &tool_use_id, closed) {
+                        yield Ok::<Event, Infallible>(Event::default().data(super::permission_watch::resolved(&conv_id, &request_id, &tool_use_id).to_string()));
+                        continue;
+                    }
                     Some(serde_json::json!({
                         "type": "tool_permission",
                         "request_id": request_id,
@@ -227,6 +255,15 @@ async fn h5_chat_handler(
                 crate::native_engine::tool_loop::EngineEvent::MessageDelta { .. } |
                 crate::native_engine::tool_loop::EngineEvent::ToolArgDelta { .. } |
                 crate::native_engine::tool_loop::EngineEvent::PipelineToolResult { .. } => None,
+                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+                    Some(serde_json::json!({
+                        "type": "agent_progress",
+                        "session_id": session_id,
+                        "agent_type": agent_type,
+                        "status": status,
+                        "tool_name": tool_name,
+                    }))
+                }
                 crate::native_engine::tool_loop::EngineEvent::BudgetWarning { message, usage, limit } => {
                     Some(serde_json::json!({
                         "type": "budget_warning",
@@ -242,6 +279,9 @@ async fn h5_chat_handler(
             }
         }
 
+        for resolved in permission_watches.finish(&conv_id) {
+            yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+        }
         let db = db_for_stream.clone();
         let conv_id_save = conv_id.clone();
         let full_text_save = full_text.clone();

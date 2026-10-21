@@ -2,11 +2,13 @@ use super::AppState;
 
 pub mod system;
 pub mod chat;
+mod permission_watch;
 pub mod conversations;
 pub mod tools;
 pub mod projects;
 pub mod uploads;
 pub mod providers;
+pub mod search_settings;
 pub mod config;
 pub mod skills;
 pub mod tasks;
@@ -47,6 +49,7 @@ pub fn build_all_routes() -> Router<AppState> {
         .merge(projects::routes())
         .merge(uploads::routes())
         .merge(providers::routes())
+        .merge(search_settings::routes())
         .merge(config::routes())
         .merge(skills::routes())
         .merge(tasks::routes())

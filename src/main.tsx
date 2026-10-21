@@ -1,7 +1,15 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import BackendStartup from './components/BackendStartup';
 import './index.css';
+import { initializeGeneralSettings, useGeneralSettingsStore } from './stores/useGeneralSettingsStore';
+import { useChatStore } from './stores/useChatStore';
+
+// First launch uses local providers; preserve an existing hosted-mode choice.
+if (!localStorage.getItem('user_mode')) {
+  localStorage.setItem('user_mode', 'selfhosted');
+}
 
 console.log('[Main] Starting application...');
 console.log('[Main] __TAURI_INTERNALS__:', !!(window as any).__TAURI_INTERNALS__);
@@ -131,12 +139,19 @@ if (!rootElement) {
   throw new Error('Root element not found');
 }
 
-console.log('[Main] Root element found, rendering App...');
+async function initializeApp() {
+  await initializeGeneralSettings();
+  useChatStore.getState().setPermissionMode(useGeneralSettingsStore.getState().defaultPermissionMode);
+}
+
+console.log('[Main] Root element found, waiting for backend...');
 
 try {
   ReactDOM.createRoot(rootElement).render(
     <ErrorBoundary>
-      <App />
+      <BackendStartup initialize={initializeApp}>
+        <App />
+      </BackendStartup>
     </ErrorBoundary>,
   );
   console.log('[Main] App rendered successfully');

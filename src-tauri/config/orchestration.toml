@@ -1,5 +1,5 @@
 # =============================================================================
-# Claude Desktop Tauri — Orchestration Configuration
+# DeepSeek Code Desktop Tauri — Orchestration Configuration
 # =============================================================================
 # All magic numbers / tunables previously hard-coded across the codebase are
 # centralised here.  The application reads this file at startup and caches the

@@ -8,18 +8,16 @@ use axum::{
 use axum::response::IntoResponse;
 use serde_json;
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use super::super::{AppState, StreamQuery, set_sse_content_type};
-use crate::memory::MemExClient;
 use crate::native_engine::NativeEngine;
 use crate::native_engine::engine_core::ChatRequest;
 use crate::streaming::{StreamManager, SSE_IDLE_TIMEOUT_SECS, SSE_MAX_DURATION_SECS};
 use crate::config::ConfigManager;
 
-async fn chat_handler(
+pub(super) async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
@@ -43,6 +41,18 @@ async fn chat_handler(
 
     tracing::info!(module = "Chat", "Handler ENTRY POINT");
 
+    // Reject invalid Code/project requests before persisting messages or invoking a model.
+    let db = state.db_manager.clone();
+    let project_conversation_id = req.conversation_id.clone();
+    let project_check = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
+        crate::native_engine::workspace::conversation_project(conn, &project_conversation_id)
+    })).await;
+    match project_check {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(error))) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error.to_string()}))).into_response(),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not validate conversation project"}))).into_response(),
+    }
+
     let native_engine = state.native_engine.clone();
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
@@ -56,7 +66,8 @@ async fn chat_handler(
     {
         let db = state.db_manager.clone();
         let conv_id_save = conv_id.clone();
-        let user_msgs = messages.clone();
+        // The request contains conversation history; only append the current user turn.
+        let user_msgs: Vec<_> = messages.iter().rev().find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user")).cloned().into_iter().collect();
         let model_save = model.clone();
         let _ = tokio::task::spawn_blocking(move || {
             db.with_conn(|conn| {
@@ -65,7 +76,7 @@ async fn chat_handler(
 
                 // Step 1: Ensure conversation exists FIRST (before inserting messages)
                 let existing = crate::db::conversation_repo::get_conversation(conn, &conv_id_save).ok();
-                if existing.is_none() {
+                if existing.flatten().is_none() {
                     tracing::info!(module = "BridgeDB", "Conversation not found, creating new one: id={}, model={}", conv_id_save, model_save);
                     let _ = crate::db::conversation_repo::insert_conversation(
                         conn, &conv_id_save, None, Some(&model_save), None, None, None,
@@ -135,57 +146,15 @@ async fn chat_handler(
     let providers_to_sync = {
         let cm_guard: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
         if let Some(cm) = cm_guard.as_ref() {
-            cm.get_config().providers.iter().map(|p| {
-                crate::native_engine::provider_manager::Provider {
-                    id: p.id.clone(),
-                    name: p.name.clone(),
-                    base_url: p.base_url.clone(),
-                    api_key: p.api_key.clone().unwrap_or_default(),
-                    api_format: {
-                        // DeepSeek uses OpenAI-compatible API even if user selected wrong format
-                        let is_deepseek = p.base_url.contains("deepseek");
-                        if p.provider_type == "anthropic" && !is_deepseek {
-                            crate::native_engine::provider_manager::ApiFormat::Anthropic
-                        } else {
-                            crate::native_engine::provider_manager::ApiFormat::OpenAI
-                        }
-                    },
-                    models: p.models.iter().map(|m| crate::native_engine::provider_manager::ModelConfig {
-                        id: m.id.clone(),
-                        name: m.name.clone(),
-                        enabled: m.enabled,
-                        max_tokens: m.max_tokens,
-                        supports_vision: m.supports_vision,
-                        supports_web_search: false,
-                    }).collect(),
-                    enabled: p.enabled,
-                    web_search_strategy: p.web_search_strategy.clone(),
-                }
-            }).collect::<Vec<_>>()
+            cm.get_config().providers.iter().map(crate::runtime::provider_from_config).collect::<Vec<_>>()
         } else {
             Vec::new()
         }
     };
     tracing::info!(module = "Chat", "[3/7] Providers synced: count={}", providers_to_sync.len());
 
-    tracing::info!(module = "Chat", "[3.5/7] Querying MemEx for relevant memories...");
-    let conv_id_for_memex = conv_id.clone();
-    let memex_injected_context = {
-        let memex: Arc<MemExClient> = state.memex_client.clone();
-        let context_manager = crate::memory::ContextManager::new(memex);
-        let user_message = messages.last()
-            .and_then(|m| m.get("content").and_then(|c: &serde_json::Value| c.as_str()))
-            .unwrap_or_default()
-            .to_string();
-        tokio::spawn(async move {
-            context_manager.before_api_call(&conv_id_for_memex, &user_message).await
-        }).await.unwrap_or_default()
-    };
-    if let Some(mem_context) = &memex_injected_context {
-        tracing::info!(module = "Chat", "[3.5/7] MemEx injected {} chars of context", mem_context.len());
-    }
-
     tracing::info!(module = "Chat", "[4/7] Locking native_engine...");
+    let mut start_error = "Native engine is not initialized".to_string();
     let rx_opt = {
         let mut engine_guard: tokio::sync::MutexGuard<'_, Option<NativeEngine>> = native_engine.lock().await;
         tracing::info!(module = "Chat", "[4/7] NativeEngine lock acquired");
@@ -196,19 +165,12 @@ async fn chat_handler(
             // Sync latest providers
             engine.sync_providers(providers_to_sync).await;
 
-            let mut enhanced_messages = messages.clone();
-
-            if let Some(mem_context) = &memex_injected_context {
-                let memory_message = serde_json::json!({
-                    "role": "system",
-                    "content": mem_context
-                });
-                enhanced_messages.insert(0, memory_message);
-            }
-
             let chat_req = crate::native_engine::engine_core::ChatRequest {
+                max_turns: None,
+                response_schema: None,
+                provider_id: req.provider_id.clone(), effort: req.effort.clone(),
                 conversation_id: conv_id.clone(),
-                messages: enhanced_messages,
+                messages: messages.clone(),
                 model: if model.is_empty() { "claude-sonnet-4-6".to_string() } else { model.clone() },
                 system_prompt: req.system_prompt.clone(),
                 max_tokens: req.max_tokens,
@@ -220,7 +182,7 @@ async fn chat_handler(
 
             tracing::info!(module = "Chat", "[6/7] Calling engine.send_message...");
 
-            match engine.send_message(chat_req).await {
+            match engine.send_message_with_history(chat_req, false).await {
                 Ok(rx) => {
                     tracing::info!(module = "Chat", "[6/7] send_message SUCCESS, got event receiver");
                     Some(rx)
@@ -228,6 +190,7 @@ async fn chat_handler(
                 Err(e) => {
                     let err_msg = format!("{}", e);
                     tracing::error!(module = "Chat", "NativeEngine send_message error: {}", err_msg);
+                    start_error = err_msg;
                     None
                 }
             }
@@ -238,6 +201,8 @@ async fn chat_handler(
     };
     tracing::info!(module = "Chat", "[7/7] Engine guard released, building SSE stream...");
 
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel(64);
+    let transport = sse_tx.clone();
     let db_for_stream = state.db_manager.clone();
     crate::metrics::ACTIVE_SSE_CONNECTIONS.inc();
     let stream = async_stream::stream! {
@@ -246,35 +211,97 @@ async fn chat_handler(
             Some(rx) => rx,
             None => {
                 tracing::error!(module = "Chat", "rx_opt is None - engine failed to start");
-                yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type": "error", "error": "Failed to start engine. Check that a provider with the selected model is configured and enabled in Settings."}).to_string()));
+                yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type": "error", "error": start_error}).to_string()));
                 return;
             }
         };
 
+        let mut assistant_id = uuid::Uuid::new_v4().to_string();
+        let mut observed_plan_boundary = claude_core::services::plan_approval::latest_boundary(&db_clone, &conv_id).unwrap_or(None);
+        let mut request_snapshots = Vec::<serde_json::Value>::new();
+        let db_number = db_clone.clone();
+        let conv_number = conv_id.clone();
+        let mut request_number = tokio::task::spawn_blocking(move || db_number.with_conn(|conn| {
+            conn.query_row("SELECT COALESCE(MAX(request_number), 0) FROM model_requests WHERE conversation_id = ?1", rusqlite::params![conv_number], |row| row.get::<_, i64>(0))
+        })).await.ok().and_then(Result::ok).and_then(Result::ok).unwrap_or(0);
+        let mut terminal_event = None;
+        let mut permission_watches = super::permission_watch::PermissionWatches::default();
         let mut full_text = String::new();
         let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
 
         loop {
-            let event = match rx.recv().await {
+            let next = tokio::select! {
+                biased;
+                _ = transport.closed() => {
+                    terminal_event = Some(serde_json::json!({"type":"message_stop","stop_reason":"cancelled","full_text":full_text,"error":"Response transport disconnected"}));
+                    break;
+                }
+                resolved = permission_watches.next(&conv_id), if !permission_watches.is_empty() => {
+                    yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+                    continue;
+                }
+                event = rx.recv() => event,
+            };
+            let event = match next {
                 Some(e) => e,
                 None => {
                     tracing::error!(module = "Chat", "Event channel closed unexpectedly for conv_id={}", conv_id);
                     if full_text.is_empty() {
-                        yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
+                        terminal_event = Some(serde_json::json!({
                             "type": "error",
                             "error": "Connection to engine lost. The engine may have crashed."
-                        }).to_string()));
+                        }));
                     } else {
-                        yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
+                        terminal_event = Some(serde_json::json!({
                             "type": "message_stop",
                             "stop_reason": "channel_closed",
                             "full_text": full_text.clone(),
-                        }).to_string()));
+                        }));
                     }
                     break;
                 }
             };
             let event_data = match event {
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id } => {
+                    if session_id == conv_id {
+                        let rows = collected_tool_calls.iter().enumerate().map(|(i,(id,name,input,output,is_error))| crate::db::message_repo::ToolCallRow { id:id.clone(),message_id:assistant_id.clone(),name:name.clone(),input:Some(input.clone()),output:output.clone(),is_error:*is_error,sort_order:i as i64 }).collect::<Vec<_>>();
+                        if let Err(error) = claude_core::services::plan_approval::archive_segment(&db_clone, &conv_id, &boundary_id, Some(&assistant_id), &full_text, "", &rows, &request_snapshots) {
+                            terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot archive planning context: {error:#}")}));
+                            break;
+                        }
+                        assistant_id = uuid::Uuid::new_v4().to_string();
+                        full_text.clear(); collected_tool_calls.clear(); request_snapshots.clear();
+                        observed_plan_boundary = Some(boundary_id.clone());
+                    }
+                    let content = db_clone.with_conn(|conn| crate::db::message_repo::get_message(conn, &boundary_id)).ok().and_then(Result::ok).flatten().map(|m|m.content).unwrap_or_default();
+                    Some(serde_json::json!({"type":"context_reset","boundary_id":boundary_id,"content":content,"assistant_id":assistant_id}))
+                }
+                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(mut snapshot) => {
+                    if let Some(existing) = request_snapshots.iter_mut().find(|entry| entry["id"] == snapshot["id"]) {
+                        snapshot["number"] = existing["number"].clone();
+                        *existing = snapshot.clone();
+                    } else {
+                        request_number += 1;
+                        snapshot["number"] = serde_json::json!(request_number);
+                        request_snapshots.push(snapshot.clone());
+                    }
+                    let db = db_clone.clone();
+                    let message_id = assistant_id.clone();
+                    let conversation_id = conv_id.clone();
+                    let snapshots = serde_json::json!(request_snapshots);
+                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| -> anyhow::Result<()> {
+                        let tx = conn.unchecked_transaction()?;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        tx.execute("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'assistant', '', ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))",
+                            rusqlite::params![message_id, conversation_id, now])?;
+                        crate::db::message_repo::save_request_snapshots(&tx, &message_id, &snapshots)?;
+                        tx.commit()?;
+                        Ok(())
+                    })).await;
+                    let persisted = matches!(saved, Ok(Ok(Ok(()))));
+                    if !persisted { tracing::error!("Could not persist trajectory request: {:?}", saved); }
+                    Some(serde_json::json!({"type": "request_snapshot", "snapshot": snapshot, "persisted": persisted}))
+                }
                 crate::native_engine::tool_loop::EngineEvent::MessageStart { model } => {
                     Some(serde_json::json!({
                         "type": "message_start",
@@ -315,6 +342,19 @@ async fn chat_handler(
                     tracing::info!(module = "Chat", "Tool use completed: {} ({}) is_error={}", tool_name, tool_use_id, is_error);
                     let input_json = serde_json::to_string(&tool_input).unwrap_or_default();
                     collected_tool_calls.push((tool_use_id.clone(), tool_name.clone(), input_json, Some(output.clone()), is_error));
+                    let db = db_clone.clone();
+                    let conversation_id = conv_id.clone();
+                    let message_id = assistant_id.clone();
+                    let content = full_text.clone();
+                    let tool = crate::db::message_repo::ToolCallRow {
+                        id: format!("{assistant_id}:{tool_use_id}"), message_id: message_id.clone(), name: tool_name.clone(),
+                        input: Some(serde_json::to_string(&tool_input).unwrap_or_default()), output: Some(output.clone()),
+                        is_error, sort_order: (collected_tool_calls.len() - 1) as i64,
+                    };
+                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
+                        crate::db::message_repo::save_stream_tool_result(conn, &conversation_id, &message_id, &content, &tool)
+                    })).await;
+                    if !matches!(saved, Ok(Ok(Ok(())))) { tracing::error!("Could not persist tool result: {:?}", saved); }
                     Some(serde_json::json!({
                         "type": "tool_use_done",
                         "tool_use_id": tool_use_id,
@@ -332,23 +372,9 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::MessageStop { full_text: _, stop_reason } => {
-                    let assistant_message = full_text.clone();
-                    let user_msg = messages.last()
-                        .and_then(|m| m.get("content").and_then(|c: &serde_json::Value| c.as_str()))
-                        .unwrap_or_default()
-                        .to_string();
-                    let conv = conv_id.clone();
-                    tokio::spawn(async move {
-                        let memex: Arc<MemExClient> = state.memex_client.clone();
-                        let context_manager = crate::memory::ContextManager::new(memex);
-                        context_manager.after_response(&conv, &user_msg, &assistant_message).await;
-                    });
-
-                    yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({
-                        "type": "message_stop",
-                        "stop_reason": stop_reason,
-                        "full_text": full_text.clone(),
-                    }).to_string()));
+                    terminal_event = Some(serde_json::json!({
+                        "type": "message_stop", "stop_reason": stop_reason, "full_text": full_text.clone(),
+                    }));
                     break;
                 }
                 crate::native_engine::tool_loop::EngineEvent::Error(err) => {
@@ -364,7 +390,7 @@ async fn chat_handler(
                         "usage": usage,
                     }))
                 }
-                crate::native_engine::tool_loop::EngineEvent::AskUser { request_id, question, options } => {
+                crate::native_engine::tool_loop::EngineEvent::AskUser { request_id, question, options, .. } => {
                     let options_json: Vec<serde_json::Value> = options.iter()
                         .map(|o| serde_json::json!({"label": o, "description": ""}))
                         .collect();
@@ -379,6 +405,14 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input } => {
+                    let closed = match native_engine.lock().await.as_ref() {
+                        Some(engine) => engine.permission_completion(&request_id).await,
+                        None => tokio::sync::watch::channel(true).1,
+                    };
+                    if !permission_watches.register(&request_id, &tool_use_id, closed) {
+                        yield Ok::<Event, Infallible>(Event::default().data(super::permission_watch::resolved(&conv_id, &request_id, &tool_use_id).to_string()));
+                        continue;
+                    }
                     Some(serde_json::json!({
                         "type": "tool_permission",
                         "request_id": request_id,
@@ -399,6 +433,15 @@ async fn chat_handler(
                         "total_count": total_count,
                     }))
                 }
+                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+                    Some(serde_json::json!({
+                        "type": "agent_progress",
+                        "session_id": session_id,
+                        "agent_type": agent_type,
+                        "status": status,
+                        "tool_name": tool_name,
+                    }))
+                }
                 crate::native_engine::tool_loop::EngineEvent::BudgetWarning { message, usage, limit } => {
                     Some(serde_json::json!({
                         "type": "budget_warning",
@@ -412,41 +455,63 @@ async fn chat_handler(
             if let Some(data) = event_data {
                 let is_stop = data.get("type").and_then(|t| t.as_str()) == Some("message_stop")
                     || data.get("type").and_then(|t| t.as_str()) == Some("error");
+                if is_stop { terminal_event = Some(data); break; }
                 yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
-                if is_stop {
-                    break;
-                }
             }
         }
 
+        // Closing this turn's receiver cancels its executor without addressing a newer turn.
+        drop(rx);
         tracing::info!(module = "Chat", "Stream ended for conv_id={}", conv_id);
 
         crate::metrics::ACTIVE_SSE_CONNECTIONS.dec();
 
+        // A cancelled/crashed engine may never emit its final RequestSnapshot.
+        // Persist a terminal status without inventing missing usage or timings.
+        let mut pending_snapshot_updates = Vec::new();
+        for snapshot in &mut request_snapshots {
+            if snapshot["status"] == "running" {
+                let error = terminal_event.as_ref().and_then(|event| event.get("error")).cloned();
+                snapshot["status"] = serde_json::json!(if error.is_some() { "error" } else { "interrupted" });
+                snapshot["endedAt"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+                if let Some(error) = error { snapshot["error"] = error; }
+                pending_snapshot_updates.push(snapshot.clone());
+            }
+        }
+
+        for resolved in permission_watches.finish(&conv_id) {
+            yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
+        }
         // Save assistant message to SQLite after stream ends
-        if !full_text.is_empty() {
+        if !full_text.is_empty() || !request_snapshots.is_empty() || !collected_tool_calls.is_empty() {
             let db = db_clone;
             let conv_id_save = conv_id.clone();
             let assistant_text = full_text.clone();
             let tool_calls_save = collected_tool_calls.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let snapshots_save = serde_json::json!(request_snapshots);
+            let saved = tokio::task::spawn_blocking(move || {
                 db.with_conn(|conn| {
+                    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+                    let conn = &*tx;
                     tracing::info!(module = "BridgeDB", "Saving assistant message for conv_id={}", conv_id_save);
-                    let msg_id = uuid::Uuid::new_v4().to_string();
+                    let msg_id = assistant_id;
                     let now = chrono::Utc::now().to_rfc3339();
-                    let sort_order = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
-                        .unwrap_or_default()
-                        .len() as i64;
+                    let (sort_order, archive) = claude_core::services::plan_approval::final_response_order(conn, &conv_id_save, observed_plan_boundary.as_deref())?;
                     tracing::info!(module = "BridgeDB", "Inserting assistant message: id={}, content_len={}, sort_order={}", msg_id, assistant_text.len(), sort_order);
-                    let insert_result = crate::db::message_repo::insert_message(
-                        conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order,
-                    );
+                    let insert_result = if let Some(message) = crate::db::message_repo::get_message(conn, &msg_id)? {
+                        anyhow::ensure!(message.conversation_id == conv_id_save && message.role == "assistant", "Response session identity changed");
+                        if archive { conn.execute("UPDATE messages SET sort_order=?2 WHERE id=?1",rusqlite::params![msg_id,sort_order])?; }
+                        crate::db::message_repo::update_message_content(conn, &msg_id, &assistant_text)
+                    } else {
+                        crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order)
+                    };
                     tracing::info!(module = "BridgeDB", "Assistant message insert result: {:?}", insert_result.is_ok());
 
                     // Save tool calls for this message
                     if insert_result.is_ok() {
-                        for (i, (_tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
-                            let tc_row_id = uuid::Uuid::new_v4().to_string();
+                        crate::db::message_repo::save_request_snapshots(conn, &msg_id, &snapshots_save)?;
+                        for (i, (tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
+                            let tc_row_id = format!("{msg_id}:{tc_id}");
                             let _ = crate::db::message_repo::insert_tool_call(
                                 conn,
                                 &tc_row_id,
@@ -461,7 +526,7 @@ async fn chat_handler(
                         if !tool_calls_save.is_empty() {
                             tracing::info!(module = "BridgeDB", "Saved {} tool_calls for message {}", tool_calls_save.len(), msg_id);
                         }
-                    }
+                    } else { insert_result?; }
 
                     // Update conversation message_count and updated_at
                     let total_msgs = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
@@ -472,13 +537,31 @@ async fn chat_handler(
                         rusqlite::params![total_msgs, &now, &conv_id_save],
                     );
 
+                    tx.commit()?;
                     Ok::<(), anyhow::Error>(())
                 })
             }).await;
+            let persisted = matches!(saved, Ok(Ok(Ok(()))));
+            if !persisted { tracing::error!("Could not persist final assistant trajectory: {:?}", saved); }
+            for snapshot in pending_snapshot_updates {
+                yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"request_snapshot", "snapshot":snapshot, "persisted":persisted}).to_string()));
+            }
+        }
+        if let Some(event) = terminal_event {
+            yield Ok::<Event, Infallible>(Event::default().data(event.to_string()));
         }
     };
 
-    let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    // The collector observes transport closure, cancels only its executor, and
+    // finishes persisting the partial trajectory before this writer exits.
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            let _ = sse_tx.send(event).await;
+        }
+    });
+    let mut response = Sse::new(tokio_stream::wrappers::ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()).into_response();
     set_sse_content_type(&mut response);
     response
 }

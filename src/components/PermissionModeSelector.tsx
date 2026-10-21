@@ -1,10 +1,11 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useChatStore } from '../stores/useChatStore';
 import { useI18n } from '../hooks/useI18n';
 import { Shield, ShieldCheck, ShieldOff, Eye } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
-type PermissionMode = 'ask_permissions' | 'accept_edits' | 'plan_mode' | 'bypass_permissions';
+import type { PermissionMode } from '../stores/useGeneralSettingsStore';
 
 interface PermissionModeOption {
   value: PermissionMode;
@@ -20,8 +21,8 @@ const MODE_OPTIONS: PermissionModeOption[] = [
     value: 'ask_permissions',
     label: 'Ask permissions',
     labelZh: '询问权限',
-    description: 'All tool calls require user confirmation',
-    descriptionZh: '所有工具调用都需要用户确认',
+    description: 'Allow reads; confirm actions without prior permission',
+    descriptionZh: '允许读取，未预先授权的操作需要确认',
     icon: <Shield size={14} />,
   },
   {
@@ -41,54 +42,92 @@ const MODE_OPTIONS: PermissionModeOption[] = [
     icon: <Eye size={14} />,
   },
   {
+    value: 'dont_ask',
+    label: "Don't ask",
+    labelZh: '不询问权限',
+    description: 'Allow pre-approved actions; deny actions that need permission',
+    descriptionZh: '允许已授权操作，拒绝需要询问权限的操作',
+    icon: <Shield size={14} />,
+  },
+  {
     value: 'bypass_permissions',
     label: 'Bypass permissions',
     labelZh: '全托管模式',
-    description: 'All operations auto-approved, no confirmation needed',
-    descriptionZh: '所有操作自动通过，无需任何确认',
+    description: 'Approve unconfigured actions; explicit deny and ask rules still apply',
+    descriptionZh: '自动允许未配置的操作；仍遵循明确的拒绝和询问规则',
     icon: <ShieldOff size={14} />,
   },
 ];
 
 interface PermissionModeSelectorProps {
+  neutral?: boolean;
   className?: string;
+  value?: PermissionMode;
+  onChange?: (mode: PermissionMode) => void;
 }
 
-export default function PermissionModeSelector({ className = '' }: PermissionModeSelectorProps) {
+export default function PermissionModeSelector({ className = '', value, onChange, neutral = false }: PermissionModeSelectorProps) {
   const { t } = useI18n();
-  const permissionMode = useChatStore((s) => s.permissionMode);
+  const activePermissionMode = useChatStore((s) => s.permissionMode);
+  const permissionMode = value ?? activePermissionMode;
   const setPermissionMode = useChatStore((s) => s.setPermissionMode);
   const [isOpen, setIsOpen] = useState(false);
   const [showBypassWarning, setShowBypassWarning] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const [dropdownPosition, setDropdownPosition] = useState<'bottom' | 'top'>('bottom');
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({});
 
-  const currentMode = MODE_OPTIONS.find((m) => m.value === permissionMode) || MODE_OPTIONS[1];
+  const currentMode = MODE_OPTIONS.find((m) => m.value === permissionMode) || MODE_OPTIONS[0];
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      if (!dropdownRef.current?.contains(e.target as Node) && !menuRef.current?.contains(e.target as Node)) {
         setIsOpen(false);
+      }
+    };
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+        buttonRef.current?.focus();
       }
     };
     if (isOpen) {
       document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('keydown', handleEscape);
     }
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
   }, [isOpen]);
 
-  useEffect(() => {
-    if (isOpen && buttonRef.current) {
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    const updatePosition = () => {
+      if (!buttonRef.current || !menuRef.current) return;
       const rect = buttonRef.current.getBoundingClientRect();
-      const spaceBelow = window.innerHeight - rect.bottom;
-      const dropdownHeight = 240;
-      if (spaceBelow < dropdownHeight && rect.top > dropdownHeight) {
-        setDropdownPosition('top');
-      } else {
-        setDropdownPosition('bottom');
-      }
-    }
+      const gap = 8;
+      const width = Math.min(288, window.innerWidth - gap * 2);
+      const below = Math.max(0, window.innerHeight - rect.bottom - gap * 2);
+      const above = Math.max(0, rect.top - gap * 2);
+      const height = menuRef.current.scrollHeight;
+      const openAbove = height > below && above > below;
+      const maxHeight = openAbove ? above : below;
+      setMenuStyle({
+        width,
+        maxHeight,
+        left: Math.max(gap, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - gap)),
+        top: openAbove ? rect.top - gap - Math.min(height, maxHeight) : rect.bottom + gap,
+      });
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
   }, [isOpen]);
 
   const handleModeChange = (mode: PermissionMode) => {
@@ -100,6 +139,11 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
         return;
       }
     }
+    if (onChange) {
+      onChange(mode);
+      setIsOpen(false);
+      return;
+    }
     setPermissionMode(mode as PermissionMode);
     setIsOpen(false);
     localStorage.setItem('permission_mode', mode);
@@ -110,8 +154,9 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
 
   const confirmBypass = () => {
     localStorage.setItem('permission_bypass_confirmed', 'true');
-    setPermissionMode('bypass_permissions');
     setShowBypassWarning(false);
+    if (onChange) { onChange('bypass_permissions'); return; }
+    setPermissionMode('bypass_permissions');
     invoke('set_permission_mode', { mode: 'bypass_permissions' }).catch((err) => {
       console.warn('[PermissionMode] Failed to sync mode to backend:', err);
     });
@@ -121,6 +166,7 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
     switch (mode) {
       case 'ask_permissions': return 'bg-claude-textSecondary/20 text-claude-textSecondary';
       case 'accept_edits': return 'bg-green-500/20 text-green-500';
+      case 'dont_ask': return 'bg-claude-textSecondary/20 text-claude-textSecondary';
       case 'plan_mode': return 'bg-blue-500/20 text-blue-500';
       case 'bypass_permissions': return 'bg-orange-500/20 text-orange-500';
       default: return 'bg-claude-textSecondary/20 text-claude-textSecondary';
@@ -132,22 +178,25 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
       <div className={`relative ${className}`} ref={dropdownRef}>
         <button
           ref={buttonRef}
+          aria-expanded={isOpen}
+          aria-haspopup="dialog"
           onClick={() => setIsOpen(!isOpen)}
           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium bg-claude-input border border-claude-border hover:bg-claude-hover transition-colors"
         >
           {currentMode.icon}
-          <span className={getModeBadgeColor(permissionMode as PermissionMode)}>{currentMode.label}</span>
+          <span className={neutral ? 'text-claude-text' : getModeBadgeColor(permissionMode as PermissionMode)}>{currentMode.label}</span>
           <svg width="10" height="6" viewBox="0 0 10 6" fill="none" className={`text-claude-textSecondary transition-transform ${isOpen ? 'rotate-180' : ''}`}>
             <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </button>
 
-        {isOpen && (
+        {isOpen && createPortal(
           <div
-            className={`absolute z-50 w-72 rounded-xl shadow-xl border border-claude-border bg-claude-input overflow-hidden ${
-              dropdownPosition === 'top' ? 'bottom-full mb-2' : 'top-full mt-2'
-            }`}
-            style={{ left: '50%', transform: 'translateX(-50%)' }}
+            ref={menuRef}
+            role="dialog"
+            aria-label="Permission Mode"
+            className="fixed z-[120] w-72 rounded-xl shadow-xl border border-claude-border bg-claude-input overflow-y-auto"
+            style={menuStyle}
           >
             <div className="px-3 py-2 border-b border-claude-border">
               <span className="text-[11px] font-medium text-claude-textSecondary uppercase tracking-wide">
@@ -179,14 +228,15 @@ export default function PermissionModeSelector({ className = '' }: PermissionMod
                   {permissionMode === option.value && (
                     <div className="flex-shrink-0 mt-1">
                       <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                        <path d="M2 7L5.5 10.5L12 3.5" stroke="#387ee0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M2 7L5.5 10.5L12 3.5" stroke={neutral ? 'currentColor' : '#387ee0'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </div>
                   )}
                 </button>
               ))}
             </div>
-          </div>
+          </div>,
+          document.body
         )}
       </div>
 

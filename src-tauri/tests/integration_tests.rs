@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
-use claude_desktop_tauri_lib::db::DbManager;
-use claude_desktop_tauri_lib::cost_tracker::CostTracker;
-use claude_desktop_tauri_lib::preview_engine::PreviewEngine;
-use claude_desktop_tauri_lib::analytics::AnalyticsStore;
-use claude_desktop_tauri_lib::engine::EnginePool;
-use claude_desktop_tauri_lib::streaming::StreamManager;
-use claude_desktop_tauri_lib::skills::SkillsManager;
-use claude_desktop_tauri_lib::process::ProcessManager;
-use claude_desktop_tauri_lib::watcher::FileWatcher;
-use claude_desktop_tauri_lib::clipboard::ClipboardManager;
-use claude_desktop_tauri_lib::notification::NotificationManager;
-use claude_desktop_tauri_lib::logger::Logger;
-use claude_desktop_tauri_lib::mcp::McpServerManager;
-use claude_desktop_tauri_lib::config::ConfigManager;
-use claude_desktop_tauri_lib::memory::MemExClient;
+use deepseek_desktop_tauri_lib::db::DbManager;
+use deepseek_desktop_tauri_lib::cost_tracker::CostTracker;
+use deepseek_desktop_tauri_lib::preview_engine::PreviewEngine;
+use deepseek_desktop_tauri_lib::analytics::AnalyticsStore;
+use deepseek_desktop_tauri_lib::engine::EnginePool;
+use deepseek_desktop_tauri_lib::streaming::StreamManager;
+use deepseek_desktop_tauri_lib::skills::SkillsManager;
+use deepseek_desktop_tauri_lib::process::ProcessManager;
+use deepseek_desktop_tauri_lib::watcher::FileWatcher;
+use deepseek_desktop_tauri_lib::clipboard::ClipboardManager;
+use deepseek_desktop_tauri_lib::notification::NotificationManager;
+use deepseek_desktop_tauri_lib::logger::Logger;
+use deepseek_desktop_tauri_lib::mcp::McpServerManager;
+use deepseek_desktop_tauri_lib::config::ConfigManager;
+use deepseek_desktop_tauri_lib::memory::MemExClient;
 
 #[tokio::test]
 async fn test_db_manager_creation() {
@@ -69,7 +69,7 @@ fn test_cost_tracker_creation() {
 
     let tracker = CostTracker::new(costs_dir);
     let budget_check = tracker.check_budget(1000);
-    assert!(matches!(budget_check, claude_desktop_tauri_lib::cost_tracker::BudgetCheckResult::WithinBudget));
+    assert!(matches!(budget_check, deepseek_desktop_tauri_lib::cost_tracker::BudgetCheckResult::WithinBudget));
 }
 
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn test_memex_client_creation() {
 
 #[tokio::test]
 async fn test_bridge_server_api_key_uniqueness() {
-    use claude_desktop_tauri_lib::bridge::BridgeServer;
+    use deepseek_desktop_tauri_lib::bridge::BridgeServer;
 
     let temp_dir1 = tempfile::tempdir().expect("Failed to create temp dir");
     let db_path1 = temp_dir1.path().join("test1.db");

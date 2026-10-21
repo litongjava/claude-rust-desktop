@@ -4,7 +4,7 @@
 // All secrets go through Tauri's secure-storage plugin via invoke().
 // localStorage is NOT used as fallback for sensitive keys — if Tauri is
 // unavailable (e.g. browser dev), secrets are simply not persisted.
-// Non-sensitive keys (language, zoom, onboarding_done) may still use
+// Non-sensitive keys (language, zoom) may still use
 // localStorage directly in their own modules.
 
 // ---------------------------------------------------------------------------

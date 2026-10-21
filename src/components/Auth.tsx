@@ -231,7 +231,7 @@ const Auth = () => {
           <div className="mb-4 p-3 bg-[#F5F0E9] border border-[#E5D9C8] text-[#6B4E3D] text-[13px] rounded-lg leading-relaxed">
             首次使用请先在{' '}
             <button onClick={openClawparrot} className="text-[#CC7C5E] underline hover:text-[#B96B4E] font-medium">
-              Claude Rust
+              DeepSeek Code
             </button>
             {' '}用邮箱注册账号，然后回到这里登录。右上角可跳过登录、改用自部署模式。
           </div>

@@ -1,9 +1,13 @@
+import { useChatStore } from '../../stores/useChatStore';
 import { getConversation, getContextSize, getAttachmentUrl } from '../../api';
+import { planModeFromTool, approvedPermissionModeFromTool } from './planMode';
 import { persistMessages } from '../../api/conversations';
 import { compactConversation } from '../../api';
 import { useTabStore } from '../../stores/useTabStore';
 import { executeCode, sendCodeResult } from '../../pyodideRunner';
 import { trackTokensUsed } from '../../hooks/useAnalytics';
+import { recordText, recordTool, finishProcess } from '../trajectory/model';
+import { parseBadRequest } from '../../utils/chatErrors';
 import {
   mergeDocumentsIntoMessage,
   mergeDocumentDraftIntoMessage,
@@ -155,6 +159,7 @@ export function createStreamCallbacks(ctx: StreamContext) {
       const newMsgs = [...prev];
       const lastMsg = newMsgs[newMsgs.length - 1];
       if (lastMsg && lastMsg.role === 'assistant') {
+        recordText(lastMsg, 'text', full);
         lastMsg.content = full;
         lastMsg.isThinking = false;
       }
@@ -173,8 +178,15 @@ export function createStreamCallbacks(ctx: StreamContext) {
     setMessagesFor(conversationId, prev => {
       const newMsgs = [...prev];
       if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
-        newMsgs[newMsgs.length - 1].content = 'Error: ' + err;
-        newMsgs[newMsgs.length - 1].isThinking = false;
+        const lastMsg = newMsgs[newMsgs.length - 1];
+        lastMsg.requestError = parseBadRequest(err);
+        if (!lastMsg.requestError) {
+          const content = `${lastMsg.content || ''}\n\nError: ${err}`.trim();
+          recordText(lastMsg, 'text', content);
+          lastMsg.content = content;
+        }
+        lastMsg.isThinking = false;
+        finishProcess(lastMsg);
       }
       persistMessages(conversationId, newMsgs);
       return newMsgs;
@@ -193,6 +205,8 @@ export function createStreamCallbacks(ctx: StreamContext) {
       const newMsgs = [...prev];
       const lastMsg = newMsgs[newMsgs.length - 1];
       if (lastMsg && lastMsg.role === 'assistant') {
+        recordText(lastMsg, 'text', full);
+        finishProcess(lastMsg);
         lastMsg.content = full;
         lastMsg.isThinking = false;
       }
@@ -234,6 +248,7 @@ export function createStreamCallbacks(ctx: StreamContext) {
       const newMsgs = [...prev];
       const lastMsg = newMsgs[newMsgs.length - 1];
       if (lastMsg && lastMsg.role === 'assistant') {
+        recordText(lastMsg, 'thinking', thinkingFull, Date.now(), _thinkingDelta);
         lastMsg.thinking = thinkingFull;
         lastMsg.isThinking = true;
         delete lastMsg.searchStatus;
@@ -242,8 +257,38 @@ export function createStreamCallbacks(ctx: StreamContext) {
     });
   };
 
+  const onRequestSnapshot = (data: any) => {
+    if (!data?.snapshot?.id) return;
+    setMessagesFor(conversationId, prev => {
+      const next = [...prev];
+      const last = next[next.length - 1];
+      if (!last || last.role !== 'assistant') return prev;
+      const steps = last.processSteps || [];
+      const tail = steps[steps.length - 1];
+      const snapshots = [...(last.requestSnapshots || [])];
+      const existing = snapshots.findIndex((r: any) => r.id === data.snapshot.id);
+      if (existing >= 0) snapshots[existing] = { ...snapshots[existing], ...data.snapshot, persisted: data.persisted };
+      else {
+        if (data.snapshot.source !== 'web_search') {
+          if (tail && tail.endedAt == null) tail.endedAt = Date.now();
+          last.currentRequestId = data.snapshot.id;
+        }
+        snapshots.push({ ...data.snapshot, persisted: data.persisted });
+      }
+      last.requestSnapshots = snapshots;
+      return next;
+    });
+  };
+
   const onSystemEvents = (event: string, message: string, data: any) => {
     if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+    if (event === 'request_snapshot') { onRequestSnapshot(data); return; }
+    if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string') {
+      if (data.conversation_id && data.conversation_id !== conversationId) return;
+      setToolPermissionDialog((current: any) => current?.request_id === data.request_id ? null : current);
+      setPermissionApproval((current: any) => current?.id === data.request_id ? null : current);
+      return;
+    }
 
     if (event === 'metadata' && data?.user_message_id) {
       setMessages(prev => {
@@ -296,6 +341,15 @@ export function createStreamCallbacks(ctx: StreamContext) {
       }
     }
     if (event === 'context_size' && data) setContextInfo({ tokens: data.tokens, limit: data.limit });
+    if (event === 'context_reset' && data?.boundary_id) {
+      setMessagesFor(conversationId, prev => {
+        if (prev.some(message => message.id === data.boundary_id)) return prev;
+        const next = [...prev, { id: data.boundary_id, role: 'user', content: data.content, is_compact_boundary: true }, { id: data.assistant_id, role: 'assistant', content: '' }];
+        messagesBufferRef.current.set(conversationId, next);
+        return next;
+      });
+      setPlanMode(false);
+    }
     if (event === 'tool_text_offset' && data?.offset != null) {
       setMessages(prev => {
         const newMsgs = [...prev];
@@ -458,10 +512,10 @@ export function createStreamCallbacks(ctx: StreamContext) {
         content: toolEvent.content, is_error: toolEvent.is_error, status: toolEvent.is_error ? 'error' : 'done',
       });
     }
-    if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
-    if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
-    const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-    if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+    const planMode = planModeFromTool(toolEvent);
+    if (planMode !== null) setPlanMode(planMode);
+                const approvedMode = approvedPermissionModeFromTool(toolEvent);
+                if (approvedMode) useChatStore.getState().setPermissionMode(approvedMode);
 
     setMessagesFor(conversationId, prev => {
       const newMsgs = [...prev];
@@ -475,8 +529,9 @@ export function createStreamCallbacks(ctx: StreamContext) {
           if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
           if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
         } else {
-          toolCalls.push({ id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: toolEvent.tool_input || {}, status: 'running' as const, textBefore: toolEvent.textBefore || '' });
+          toolCalls.push({ id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: toolEvent.tool_input || {}, status: 'running' as const, textBefore: toolEvent.textBefore || '', startedAt: Date.now(), schema: toolEvent.schema });
         }
+        recordTool(lastMsg, toolCalls.find((t: any) => t.id === toolEvent.tool_use_id));
       } else if (toolEvent.type === 'input') {
         const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
         if (tc) tc.input = toolEvent.tool_input || {};
@@ -489,6 +544,12 @@ export function createStreamCallbacks(ctx: StreamContext) {
           tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
           tc.result = toolEvent.content;
         }
+        tc.status = toolEvent.is_error ? 'error' : 'done';
+        if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length) tc.input = toolEvent.tool_input;
+        tc.endedAt = Date.now();
+        recordTool(lastMsg, tc);
+        const step = lastMsg.processSteps?.find((s: any) => s.toolId === tc.id);
+        if (step) step.endedAt = tc.endedAt;
       }
       lastMsg.toolCalls = toolCalls;
       persistMessages(conversationId, newMsgs);
@@ -507,6 +568,8 @@ export function createStreamCallbacks(ctx: StreamContext) {
       const newMsgs = [...prev];
       const lastMsg = newMsgs[newMsgs.length - 1];
       if (lastMsg && lastMsg.role === 'assistant') {
+        recordText(lastMsg, 'text', full);
+        finishProcess(lastMsg);
         lastMsg.content = full;
         lastMsg.isThinking = false;
       }
@@ -517,6 +580,13 @@ export function createStreamCallbacks(ctx: StreamContext) {
 
   const onSystemEventsLight = (event: string, message: string, data: any) => {
     if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+    if (event === 'request_snapshot') { onRequestSnapshot(data); return; }
+    if (event === 'tool_permission_resolved' && typeof data?.request_id === 'string') {
+      if (data.conversation_id && data.conversation_id !== conversationId) return;
+      setToolPermissionDialog((current: any) => current?.request_id === data.request_id ? null : current);
+      setPermissionApproval((current: any) => current?.id === data.request_id ? null : current);
+      return;
+    }
     if (event === 'metadata' && data?.user_message_id) {
       setMessagesFor(conversationId, prev => {
         const newMsgs = [...prev];

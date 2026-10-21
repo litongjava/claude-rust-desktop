@@ -1044,7 +1044,7 @@ app.get('/register', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>注册 - Claude Rust</title>
+  <title>注册 - DeepSeek Code</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8F8F6; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -1068,7 +1068,7 @@ app.get('/register', (req, res) => {
 </head>
 <body>
   <div class="container">
-    <h1>Claude Rust</h1>
+    <h1>DeepSeek Code</h1>
     <p class="subtitle">创建你的账号</p>
     <div id="message"></div>
     <form id="registerForm">
@@ -1127,7 +1127,7 @@ app.get('/login', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>登录 - Claude Rust</title>
+  <title>登录 - DeepSeek Code</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8F8F6; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -1152,7 +1152,7 @@ app.get('/login', (req, res) => {
 </head>
 <body>
   <div class="container">
-    <h1>Claude Rust</h1>
+    <h1>DeepSeek Code</h1>
     <p class="subtitle">登录你的账号</p>
     <div id="message"></div>
     <form id="loginForm">
@@ -1191,7 +1191,7 @@ app.get('/login', (req, res) => {
         if (!res.ok) throw new Error(data.error || '登录失败');
 
         msg.className = 'message success';
-        msg.innerHTML = '登录成功！<br><br>你的 API Key:<div class="api-key">' + (data.apiKey || '已生成') + '</div><br>请在 Claude Rust 应用中使用此 Key。';
+        msg.innerHTML = '登录成功！<br><br>你的 API Key:<div class="api-key">' + (data.apiKey || '已生成') + '</div><br>请在 DeepSeek Code 应用中使用此 Key。';
         btn.textContent = '登录成功';
         setTimeout(() => { window.close(); }, 5000);
       } catch (err) {
