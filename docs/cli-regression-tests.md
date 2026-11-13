@@ -176,6 +176,12 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 5. 思考内容 `Thought ... (click to expand)` 和较长的用户消息也能展开、收起。
 6. `Ctrl+O` 的详细记录不受影响，也不出现点击提示。
 
+### C2. 紧凑工具组与复制不跳动
+
+1. 用 `runs/ux/drive.py` 和开发目录 `.venv/bin/python` 在独立数据目录驱动真实 PTY。分别直连和独立 tmux 运行 `/rename control`、`/copy-session-id`，保存 Enter 前后原始字节与快照。复制反馈在原输入框状态行；没有擦除到屏幕末尾、切换输入模式或重画边框。OSC 52 只传剪贴板数据，不能包含来自文本的光标/清屏控制。tmux 的 `show-buffer` 必须为会话 ID。运行中复制仍需保留当前工具和输入区。
+2. 本地模型 fixture 运行 Bash、Glob、失败 Read，Alt+M 摘要应显示 shell/read/patterns 和失败数。点摘要展开，点组顶部 `click to collapse` 收起；组内工具仍可独立切换短结果/完整结果。Alt+M 关闭再打开恢复摘要；普通视图和 Ctrl+O 不受影响。恢复会话后重复同一检查。
+3. `cargo test --locked -p deepseek-code-cli --bin dcl terminal::scrollback` 覆盖真实工具名分类（包括 PowerShell 和全部编辑工具）、同名计数、宽度截断/剩余调用数、失败数、组级状态、模式重开和 reasoning 不算工具。自定义标题包含 Bash/Read 文本不能改变工具分类。
+
 ### D. 中途关闭后恢复
 
 这些场景都要在关闭后立刻恢复一次，因为被杀的前端留下的占用记录要几秒后才过期。
@@ -665,6 +671,25 @@ cargo test --locked -j 2 -p deepseek-code-cli --test toolscript_history -- --noc
 - `taskget_background::cli_task_get_pages_a_background_shell_to_its_exit_status` 专测分页执行，在独立数据目录通过 `support/tool_loading.rs` 显式开启 TaskGet，保留完整分页、字节上限和终态断言；同文件另一用例仍验证模型自行搜索 TaskGet。
 - `sdk` 全文件中的 `apply_patch_permissions::sdk_input_closed_while_the_patch_waits_for_approval_never_writes` 是监督者确认的公共 ApplyPatch 取消问题，交由运行时分支处理，不因本轮默认工具修复放宽断言。
 
+## ToolScript 内层审批桥接（J4）
+
+内层调用的 `RequiresConfirmation` 经 job 内 UUID request/response 文件转交拥有该调用的前端，继续使用普通 `ToolPermission` mailbox、SDK `can_use_tool`、终端审批菜单和 Desktop 审批通道。请求保留实际输入与内层 occurrence ID；`toolscript` 来源包含 `parent_tool_use_id` 和 `task_id`。来源不是工具参数，不改变执行输入。父上下文处理普通审批超时、用户选择、改写输入与规则提交；worker 接收结果后再严格读取持久权限并校验输入，显式 deny 与 Super 门禁不能被批准覆盖。
+
+每个审批文件只属于一个内层调用。一次允许不改变脚本权限；用户明确选择现有持久规则或会话授权时，后续调用按该规则判定。审批宿主持有独立 OS 文件锁，worker 在等候回复时检测宿主消失；TaskStop、脚本取消/结束和宿主关闭都使待定请求失效，取消 mailbox watcher，拒绝迟到回复。worker 的 500 ms 严格刷新在等待期间继续运行，刷新失败仍记为 `policy_refresh_failed`。普通无宿主 `--print` 明确拒绝；SDK 可用 `initialize.canUseTool=false` 明确关闭审批能力，省略时保持原 SDK 默认行为。
+
+```bash
+cargo test --locked -j 2 -p deepseek-code-cli --test sdk toolscript_approval -- --nocapture
+cargo test --locked -j 2 -p deepseek-code-core --lib -- toolscript services::permission_updates native_engine::tool_loop::tool_approval tool_loading_tests executor_lifetime_tests child_transcript::tests
+cargo test --locked -j 2 -p deepseek-code-cli --test toolscript_history --test toolscript_super_agent --test sdk
+cargo check --locked -j 2 -p deepseek-code-core -p deepseek-code-cli -p deepseek-code-desktop --all-targets
+```
+
+SDK 用例通过真实 CLI、本地 OpenAI mock、ToolSearch 与私有 worker 验证允许/拒绝、两次独立审批、持久规则、批准改写输入、等待时 EOF、真实模型 TaskStop 与迟到 allow、持久 deny 和损坏策略刷新、无审批能力、Router/Coder 门禁优先，以及 PreToolUse 强制 ask 不被普通 allow 规则绕过。测试输出 `J4_APPROVAL`、`J4_STATE`、`J4_LOG`、`J4_DB`，逐项核对调用 ID、父 ID、输入、输出、错误终态和文件副作用，不预造 assistant 或工具行。Super 场景仅预设真实会话角色及任务关系。夹具在 ask 模式只预先允许外层 ToolScript；内层 Write 必须独立审批。TaskStop 场景另允许 TaskStop，以便模型能够取消待审脚本，这不授权 Write。
+
+另外重跑相邻 dev-support 中 `toolscript-20261111/j2a/run_j2a.py` 和 `j2b/run_j2b.py`：先读脚本用法，以本 worktree 构建的 `target/debug/dcl` 和全新临时 fixture 目录执行，不能复用旧证据。J2 脚本只验私有 worker，J4 SDK 用例才验证真实模型入口。
+
+人工终端/ Desktop 验收：ask 模式让 ToolScript 执行 Write，现有审批框应显示原工具预览和 `From ToolScript (parent …)`，分别选择一次允许、拒绝、会话/规则授权；取消脚本后旧提示消失，迟到允许不得写文件。编译、组件测试、SDK 协议测试不能替代真实 TUI / Desktop 运行验收。Windows/macOS、远程提供商、跨回合后台提示接管和磁盘故障须单独报告，不推断为通过。
+
 ## 按改动范围选择场景
 
 - `terminal/editor.rs`、`terminal/live.rs` 的按键处理：A、B、E1、E2、E3
@@ -1019,3 +1044,46 @@ ToolScript 保持按需加载。Router 可以加载它来组合允许的工具�
 5. `cargo test --locked -p deepseek-code-cli --test standalone a_queued_request_compacts_before_the_next_prompt_with_the_keep_text`：真实 CLI + 本地 mock，排队的请求在下一提示前发送摘要请求并带上 `keep` 文本，之后的历史从新边界开始且请求行已被删除。
 6. `cargo test --locked -p deepseek-code-cli --test standalone manual_compact_clears_a_queued_request`：手动 `/compact` 成功后清除排队请求。
 7. 真实终端：在历史超过窗口 30% 的会话里，让模型完成任务并请求压缩；下一条提示时确认显示 `Compacting the conversation as the model requested…`，且摘要保留 `keep` 中列出的待办、决定和路径。工具默认按需加载，先经 ToolSearch 加载 `CompactContext`；SDK、`--print` 和子代理中不应出现该工具。回合实际在会话 Worker 里执行（`input` 为 `None`），有主判定必须同时接受 Worker 控制目录；远端/SDK 宿主不得据此启用。
+
+## Super Agent Watcher 核心与安全续接（阶段 6 第一部分）
+
+改动 `super_agent/watcher.rs`、恢复配置、Launcher 续接或 CLI `super_agent_tick` 时：
+
+- `cargo test --locked -j 2 -p deepseek-code-core --lib super_agent::`：包括工具超时保护、指数退避上限和恢复配置边界；继续运行现有状态机、交付身份和清理门禁断言。
+- `cargo test --locked -j 2 -p deepseek-code-cli --test super_agent_watcher`：Linux 上真实 detached `dcl` 子进程、本地 SSE mock、临时 Git。覆盖已提交后 kill 只续接一次且 HEAD/提交数不变、审批等待及暂停不恢复、双宿主在 reservation 屏障实际竞争、重试上限与一次 Router 通知、存活旧实例先 TaskStop 后续接、持久退避/时间预算、spawn 后宿主中断重开接管、Reviewer 同会话同工作目录续接、外部 SessionClaim 占用时拒绝新实例。测试仅按自身 Job 的 PID 与进程启动标识发信号。
+- 回归 `cargo test --locked -j 2 -p deepseek-code-cli --test super_agent_child --test super_agent_router --test super_agent_review_loop --test agent_fork`；`cargo check --locked -j 2 -p deepseek-code-core -p deepseek-code-cli --all-targets`。
+
+Watcher 只执行一次判定，调度由宿主负责；CLI 现有 tick 调用它，无新增常驻循环或界面。缺失/无法确认 Job 身份或副作用结果时保守 BLOCKED；审批/用户/依赖等待不自动续接。未知工具起始时间使用持久首次观察时间计算超时，没有 timeout 的活动工具持续受保护。恢复预算为自首次中断起的墙钟时间，跨宿主重启保留；不声称实现 token/费用预算。非 Git 缺少事后 hash 基线、未完成副作用工具、Git 合并/变基中间态，以及未由现有 typed delivery 路径证实完成的交付，均要求人工核对，不盲目重放。Windows/macOS 的真实 kill/双宿主场景需对应平台另验；上述 Linux 集成不替代 Desktop/Watcher 常驻调度验证。
+
+### Windows ConPTY（Codex 03；Windows 结果以平台 CI 为准）
+
+Windows 测试编译回归（Codex 04）：core 的 `--lib <filter>` 仍会编译整个 lib 测试单元，不能只检查过滤器命中的函数。Unix shell supervisor 夹具的实际执行测试应为 `cfg(unix)`；纯持久状态 adoption 测试仍跨平台运行。依赖 `/proc/self/fd`、inode 和 `dup/fcntl` 的 owner 辅助函数及其类型应与调用测试一样限制为 Linux。ConPTY 测试中 `std::process::Child` 同时实现 portable-pty `Child` 和标准库 `AsRawHandle`，获取原始句柄必须用 `AsRawHandle::as_raw_handle(&child)` 消歧。改动这些测试后，Linux 跑 `tools::background_shell`、`services::background_sessions` 和 core/CLI/Desktop `--all-targets` 检查；Windows CI 跑下面全部过滤器与 CLI 目标，非零测试结果才算通过，Linux 不执行 Windows-only `tools::conpty` 的空过滤器。
+
+`.github/workflows/platform-tests.yml` 在 `ci/**` push 或 workflow_dispatch 运行。测试列表集中在 matrix 的 `core-filters` / `cli-tests`；每条命令保存退出码与实际执行数，0 项失败，日志以 `runtime-tests-<os>` artifact 保存。Windows 运行 `tools::pty_bash`、`tools::conpty`、`tools::shell_input` 和 CLI `conpty_worker`。Linux 保留 `tools::pty`（owner/transport/gate/supervisor/adapter）、`owner_loss`、pipe owner/input 和六个 PTY/pipe/TaskGet CLI 目标；macOS 验证明确拒绝 PTY。Linux 结果不能替代 Windows 编译或运行。
+
+- Windows Bash PTY 复用 portable-pty ConPTY，仍使用正常 Bash 的配置 shell/program/argv/env/cwd；环境移除/覆盖保持 Windows 大小写不敏感。初始 rows/cols、sandbox/timeout/Monitor 拒绝与 Linux 相同；Windows WSL、cmd（raw 命令行引号）和 pipe 保持明确不支持。
+- 控制只在原 owner 进程的 canonical root/session/task 注册表中进行；TaskInput 先经过真实任务会话归属检查。持久 worker resume 可继续写，其他进程明确报不支持，不以 PID/心跳或模型 metadata 授权。TaskGet 读取现有合并 stdout 与分页，等待 timeout 不停止任务；TaskStop 使用正常取消标记。
+- ConPTY 的内部 gate 在启动用户 shell 前加入 Job Object，关闭 gate 的 job 句柄后才启动实际命令；不允许 breakaway。owner 最后句柄关闭（含强杀）由 Windows 清理任务树。正常退出/停止后查询 Job Object 的 ActiveProcesses=0，再落真实终态。输出独立持续读取，处理 portable-pty 要求的 DSR 光标查询，避免 ClosePseudoConsole 与输出互相阻塞。
+- Windows `eof:true` 本轮明确不支持，data+eof 整次拒绝且不写；Ctrl+Z/Ctrl+D 可通过 data 显式发送，由应用解释，不能当通用 EOF。同步匿名管道写由精确线程句柄 CancelSynchronousIo 取消并 join；错误时 `bytes_written_lower_bound:true,outcome:"unknown"` 不承诺不存在未报告的部分写入，不能自动重放。
+- `conpty_worker` 使用本地 mock + 真实持久 worker，Windows 检查控制台、回显、resize、跨轮、TaskGet timeout、Job Object 子孙清理、外 session 与同 session 外进程输入拒绝、plan、EOF/非法参数无效果、正常退出、初始化失败、Git Bash 默认 shell、SQLite 独立调用 ID。`CONPTY_ID`/`CONPTY_TREE`/`CONPTY_CLEANUP` 用固定进程句柄记录身份，清理断言先于测试失败兜底清理。
+- 退出码 259 的真实 CLI 用例先等待 PowerShell 输出 `EXIT_259_READY`，固定 gate 的进程句柄并确认尚未退出，再通过 TaskInput 释放真实 `exit 259`；随后仍用原 20 秒 TaskGet 上限断言 `failed`、精确退出码 259、清理完成及同一句柄已退出。不能把冷启动尚未完成时的 `running` 当成 STILL_ACTIVE 误判的证据，也不能延长退出等待或放宽终态断言。
+- Windows core 另测 Job Object terminate/最后句柄关闭、过期 gate 拒绝、同步写阻塞时超时与取消、DSR 分片、环境/argv/cwd。`job_member_fixture` 是子进程夹具，普通套件调用不启动子进程；子进程重复输出不增加独立用例数量。
+
+平台结果以对应提交的 Actions 日志为准，未运行项必须单列；Desktop 实际 UI、真实 Windows Terminal 仍需人工验证。Windows owner 强杀后的日志尾部/SQLite 终态 reconcile 尚未移植；TaskGet 保留 unresponsive 与已捕获日志，不虚构 completed 或 cleanup_complete。人工步骤见 [Windows ConPTY 人工验证](./windows-conpty-validation.md)，使用同次检出的仓库夹具与本地 mock。
+
+### 会话持久活动时间
+
+`db/schema.rs` 的 activity triggers 与 `conversation_repo` 的时间更新：跑 core 的 `db::schema::activity_tests`、`db::turn_repo`、`session_workflows`，以及完整 core/CLI 回归和三个包 all-targets check。消息内容/思考、多模态内容、工具结果实际变化与回合结束在同一事务刷新 `updated_at`；重复快照、只读查询、worker 心跳、重开 schema 不刷新。SQLite 活动触发器使用毫秒墙钟，回合完成同时保留精确 RFC3339 结束时间。检查事务回滚不留下时间变化、两个连接中较旧候选不覆盖新时间、十分钟注入回合结束后时间不早于最后结果/回合端点。不回填历史会话，不改 Goal proposal contention 提示。
+
+### 完整模型请求记录（默认关闭）
+
+开关顺序：`--record-requests` 强制开启；否则 `DEEPSEEK_CODE_RECORD_REQUESTS=1/true/0/false` 覆盖数据目录 `settings.json` 的 `requestRecording.enabled`；两者均未指定时才使用 `--full-access` / `--yolo` 的自动开启。显式环境变量或配置 `false` 关闭自动开启；无效环境值视为未指定。运行时按会话保存 CLI 策略，子代理通过显式父会话继承，后台 Worker 参数继续携带 CLI 开关；不会改写 settings。
+
+- `cargo test --locked -j 2 -p deepseek-code-core --lib native_engine::request_recording::tests`：三通道本地 HTTP 请求体与原始 SSE 字节相等；非流式原始 JSON；认证头过滤；并发编号；重试 a1/a2；中途取消保留部分字节；记录关闭/路径不可写不影响响应；Unix 目录 0700/文件 0600；14 天最新修改时间与活跃锁排除；会话策略隔离。
+- `cargo test --locked -j 2 -p deepseek-code-cli --test request_recording --test deepseek_harness_headers`：真实 CLI 开关组合、普通请求与自动超限压缩、`model_requests` ID 关联、compaction 文件的摘要/边界/请求序号，以及 `dcl requests SESSION` 的纯文本列表、帮助、不存在提示和路径穿越拒绝。缺少记录时查看命令不得创建数据目录。
+- `cargo test --locked -j 2 -p deepseek-code-core --test compaction_truncation --test native_compaction --test compaction_overflow --test compaction_status_regressions`：段摘要、合并、截断恢复的记录阶段与顺序；原生 Responses 压缩和运行中的不透明窗口。`a_truncated_merge_splits_at_the_configured_budget_and_reports_its_own_stage` 必须观察到 7 份记录，阶段依次 segment/segment/merge/recovery/recovery/recovery/final，不能只看 compaction 文件存在。
+- 同时跑 `native_engine::request_options::tests`、`native_engine::stream_retry::tests`、`native_engine::utf8_stream::tests`、`native_engine::provider_runtime::tests`、`request_failure` / `reconnect_policy`、CLI `sdk`，最后执行本文必跑的 core/CLI 全套和 `cargo check --locked -j 2 -p deepseek-code-core -p deepseek-code-cli -p deepseek-code-desktop --all-targets`。
+
+记录保存在 `<数据目录>/request-records/<会话ID>/NNNN-<请求ID>-aK.*`，请求体及响应不脱敏；元数据 URL 去掉查询、fragment 和 userinfo。头名称包含 auth/cookie/api-key/apikey/api_key/token/secret/credential/password 或以 -key 结尾时移除；任意头值匹配 Bearer/Basic、sk-/sk_、ghp_/github_pat_、AIza、AKIA、eyJ 前缀也移除；所有头值中，长度至少 32、混合字母数字、仅含 token 字符且不是 UUID 的值视为不透明密钥移除。合法 UUID 保留，但敏感头名称和已知密钥前缀仍优先移除。逐块写并 sync_data；开始时元数据即为未完成，收到完整结束标记或正常非流式 EOF 后标记完成；进程突然退出至少保留初始未完成元数据。
+
+需另行验证 Windows 路径、ACL/文件锁/替换行为、ConPTY、Desktop 实际运行、真实供应商与 Bedrock 二进制事件。Linux 本地 mock 和 all-targets 编译不能代替这些证据。

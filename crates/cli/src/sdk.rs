@@ -121,6 +121,15 @@ impl Permissions {
             .await
             .insert(id.into(), (input.clone(), question, tx));
         let mut frame = json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":tool,"input":input,"tool_use_id":tool_use_id}});
+        if let Some(origin) =
+            deepseek_code_core::native_engine::permission_response::toolscript_origin(id)
+        {
+            frame["request"]["toolscript"] = serde_json::to_value(&origin)?;
+            frame["request"]["description"] = json!(format!(
+                "From ToolScript (parent {})",
+                origin.parent_tool_use_id
+            ));
+        }
         if let Some(description) = description {
             frame["request"]["description"] = json!(description);
         }
@@ -880,7 +889,7 @@ async fn emit_prompt_suggestion(session: &Session) -> Result<()> {
     }
     let suggestion = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        session.engine.generate_text_for_session(Some(&session.id),
+        session.engine.generate_text_for_purpose(Some(&session.id), "suggestion",
             &session.provider_id,
             &session.model,
             "Predict the user's likely next message in this conversation. Reply with only that message, at most 120 characters, without quotes.",

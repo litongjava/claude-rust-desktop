@@ -492,6 +492,9 @@ impl Session {
         } else {
             id
         };
+        store
+            .db
+            .set_request_recording_policy(&id, cli.record_requests, cli.full_access);
         let internal_worker = deepseek_code_core::services::background_sessions::worker_directory(
             &paths.data_dir,
             &id,
@@ -811,6 +814,11 @@ impl Session {
         crate::session_commands::copy_settings(&self.store.db, &self.id, &id)?;
         let lifecycle_owned = self.lifecycle_owned;
         self.end_hooks("clear").await;
+        if let Some(policy) = self.store.db.request_recording_policy(&self.id) {
+            self.store
+                .db
+                .set_request_recording_policy(&id, policy.cli, policy.full_access);
+        }
         self.id = id.clone();
         self.waiting_for_continue
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -847,6 +855,11 @@ impl Session {
         self.model = model;
         self.provider_id = provider_id;
         self.auto_route = false;
+        if let Some(policy) = self.store.db.request_recording_policy(&self.id) {
+            self.store
+                .db
+                .set_request_recording_policy(id, policy.cli, policy.full_access);
+        }
         self.id = id.to_owned();
         self.waiting_for_continue
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1626,13 +1639,13 @@ impl Session {
             && !crate::display_commands::load(self)?.focus;
         self.engine.set_auto_manual_interactive(
             input.is_some()
-                || self.sdk_permissions.is_some()
+                || (self.sdk_permissions.is_some() && !self.sdk_overrides.disable_tool_approval)
                 || std::env::var_os(deepseek_code_core::services::background_sessions::CONTROL_ENV)
                     .is_some(),
         );
         self.engine.set_permission_host_available(
             input.is_some()
-                || self.sdk_permissions.is_some()
+                || (self.sdk_permissions.is_some() && !self.sdk_overrides.disable_tool_approval)
                 || std::env::var_os(deepseek_code_core::services::background_sessions::CONTROL_ENV)
                     .is_some(),
         );
@@ -1949,7 +1962,10 @@ impl Session {
                     EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input: tool_input } => {
                         progress.clear();
                         let auto = tool_name != "ExitPlanMode" && self.approval_auto_available().await;
-                        let approval = (tool_name != "ExitPlanMode").then(|| crate::terminal::tool_view::approval(&tool_name, &tool_input, Some(&self.workspace), auto));
+                        let mut approval = (tool_name != "ExitPlanMode").then(|| crate::terminal::tool_view::approval(&tool_name, &tool_input, Some(&self.workspace), auto));
+                        if let (Some(approval), Some(origin)) = (&mut approval, deepseek_code_core::native_engine::permission_response::toolscript_origin(&request_id)) {
+                            approval.question = format!("From ToolScript (parent {})\n{}", origin.parent_tool_use_id, approval.question);
+                        }
                         let question = match &approval {
                             Some(approval) => approval.text(),
                             None => format!("Review plan\n{}\n\n{}\n\nApprove this plan and leave plan mode? Implementation will use ask permissions. [y/N]",
