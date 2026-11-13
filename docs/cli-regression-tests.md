@@ -238,6 +238,19 @@ python3 dev-support/deepseek-code/super-agent-20261110/harness-fix/h1_pty_accept
 3. 详情里 `e` 编辑后列表立即更新并保留重要性，`x` 删除，`←` 返回，`Esc` 关闭。
 4. `/memory` 的说明文件选项和 `/memory show` 不受影响。
 
+#### 文件记忆 P1（独立 core 模块，尚未接入运行时）
+
+修改 `crates/core/src/memory/files/` 后运行 `cargo test --locked -j 2 -p deepseek-code-core --lib memory::files::tests:: -- --nocapture`，并运行现有 `cargo test --locked -j 2 -p deepseek-code-core --test memory_transfer --test dream`、`cargo test --locked -j 2 -p deepseek-code-cli --test peripheral`。构建/测试命令使用任务指定的 run_checked.py 和共享 Cargo 队列；保留完整日志、真实退出码、实际测试名和数量。
+
+- `scope_git_common_directory_shares_worktrees_and_subdirectories`：临时 Git 元数据夹具，只读 rev-parse；同仓库 worktree/子目录同 key，不同 clone 不同 key。`scope_non_git_multi_root_private_and_trust_are_explicit` 覆盖非 Git、多根去重/排序与 trust，`default_home_and_empty_workspace_use_persistent_private_owner` 覆盖默认 Home/空工作区及 owner 隔离；Unix 另测非 UTF-8 路径无 lossy 碰撞。
+- `format_*` 与 `external_bad_files_are_retained_diagnosed_and_not_indexed`：中英文、四类/必填字段、Why/How、重复 YAML key、alias/tag、深度/大小/编码、凭据；坏文件留在磁盘且不进索引。
+- `two_processes_racing_one_hash_yield_one_success_and_one_conflict`：两个真实子进程先读同一 hash，再由屏障同时放行，断言恰好 1 success/1 Conflict 和最终 generation。`cross_process_lock_times_out_and_cancellation_does_not_write` 另验真实进程锁和取消。
+- `process_crashes_at_each_commit_boundary_recover_consistent_index_and_generation`：暂存、journal、正文、索引、catalog、generation、清理七个边界使真实子进程不运行析构直接退出，重开核对内容/索引/generation 和重复恢复幂等；另测删除恢复、外部冲突和 journal checksum 损坏不覆盖。
+- `index_*` 与 `external_body_only_changes_invalidate_generation_without_rewriting_index`：索引自动修复/CAS/不能隐藏文件，200 行、25 KiB、4096 tokens 独立限额，整行截断与省略数；仅正文变化同样使 generation 失效。
+- Unix 运行 `symlink_files_and_directory_swaps_never_follow_outside_targets`、`symlink_in_state_or_project_parent_is_rejected_before_creation`、`hardlinks_are_never_read_modified_or_deleted_by_the_store` 和路径穿越/设备名用例。
+- Windows CI 预期运行同一测试过滤及 `windows_reparse_points_are_rejected_and_pinned_directories_cannot_be_swapped`、`windows_directory_reparse_point_is_not_a_managed_project_root`、`windows_junction_is_rejected_before_any_external_file_is_created`、`windows_canonical_path_case_aliases_have_one_scope`；符号链接用例要求 Developer Mode/创建符号链接权限，不能无声跳过。Linux 结果不构成 Windows 测试通过。
+- P1 未切换旧 SQLite 后端，不把上述存储层测试当成模型权限、自动召回、CLI picker 或 Desktop/WebView2 验收；后续接入仍要执行本节原有 1–4 与 Desktop A。
+
 ### H. 提示词与工具配置
 
 在数据目录写 `customization.json` 后，用 `dcl -p` 验证：

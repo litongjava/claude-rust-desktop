@@ -8,6 +8,8 @@
 
 mod caveman_rtk;
 mod local;
+/// Opt-in file storage primitives; not wired into the current memory backend.
+pub mod files;
 mod transfer;
 pub mod dream;
 pub use transfer::{MemoryArchive, MemoryImportReport};
