@@ -135,6 +135,12 @@ use crate::performance::{retry_with_backoff, checked_response};
 
 pub struct OpenAIClient {
     client: Client,
+    /// Built once and reused by every stream send; a stream is idle-bounded.
+    stream_client: std::sync::OnceLock<Client>,
+    /// Replacement POSTs disable redirects and reqwest's internal retries.
+    single_client: std::sync::OnceLock<Client>,
+    /// Test injection also covers the streaming transport.
+    stream_override: Option<Client>,
     response_schema: Option<Value>,
     retry_requests: bool,
     pub(super) request_options: super::request_options::RequestOptions,
@@ -148,10 +154,49 @@ impl OpenAIClient {
             .unwrap_or_else(|_| Client::new());
         Self {
             client,
+            stream_client: std::sync::OnceLock::new(),
+            single_client: std::sync::OnceLock::new(),
+            stream_override: None,
             request_options: Default::default(),
             response_schema: None,
             retry_requests: true,
         }
+    }
+
+    /// The streaming transport keeps no total deadline; each read is bounded by
+    /// the configured idle timeout instead.
+    pub(super) fn streaming_client(&self) -> Result<Client> {
+        if let Some(client) = &self.stream_override {
+            return Ok(client.clone());
+        }
+        if let Some(client) = self.stream_client.get() {
+            return Ok(client.clone());
+        }
+        let client = super::model_http::streaming_client(super::model_http::Redirect::Default)?;
+        let _ = self.stream_client.set(client);
+        Ok(self
+            .stream_client
+            .get()
+            .expect("the streaming client was just set")
+            .clone())
+    }
+
+    /// A replacement POST must not become two physical requests through a
+    /// redirect or reqwest's internal protocol-nack retry.
+    pub(super) fn single_post_client(&self) -> Result<Client> {
+        if let Some(client) = &self.stream_override {
+            return Ok(client.clone());
+        }
+        if let Some(client) = self.single_client.get() {
+            return Ok(client.clone());
+        }
+        let client = super::model_http::single_post_client()?;
+        let _ = self.single_client.set(client);
+        Ok(self
+            .single_client
+            .get()
+            .expect("the single-post client was just set")
+            .clone())
     }
 
     pub fn with_request_options(mut self, options: super::request_options::RequestOptions) -> Self {
@@ -161,7 +206,8 @@ impl OpenAIClient {
 
     #[cfg(test)]
     pub(super) fn with_http_client(mut self, client: Client) -> Self {
-        self.client = client;
+        self.client = client.clone();
+        self.stream_override = Some(client);
         self
     }
 
@@ -379,11 +425,44 @@ impl OpenAIClient {
         Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
         crate::performance::AttemptCounter,
     )> {
+        // The budget getter caches built-in defaults after a TOML parse error,
+        // so the fallible load must run first. Otherwise the later streaming
+        // client validation would accept that cached config and a standalone
+        // caller could still put a POST on the wire.
+        crate::config::OrchestrationConfig::init_global()?;
+        self.send_message_stream_counted_budget(
+            provider,
+            messages,
+            system_prompt,
+            tools,
+            max_tokens,
+            context_capture,
+            crate::performance::AttemptBudget::configured(),
+        )
+        .await
+    }
+
+    /// Internal entry that lets the caller own the attempt budget. A
+    /// single-post budget is one authorized replacement: it uses a client
+    /// without redirects or internal retries.
+    pub(crate) async fn send_message_stream_counted_budget(
+        &self,
+        provider: &ResolvedProvider,
+        messages: Vec<OpenAIMessage>,
+        system_prompt: Option<&str>,
+        tools: Vec<ToolDefinition>,
+        max_tokens: u32,
+        context_capture: Option<&super::request_context::ContextCapture>,
+        budget: crate::performance::AttemptBudget,
+    ) -> Result<(
+        Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+        crate::performance::AttemptCounter,
+    )> {
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            // Built-in adapters use their own transport, so the attempt count is
-            // not observable here and stays unknown rather than being invented.
-            let stream = super::provider_runtime::stream_with_options(
+            // The built-in transport returns the HTTP attempts it really made;
+            // the Chat Completions path shares one budget with its body.
+            return super::provider_runtime::stream_with_options_counted_budget(
                 provider,
                 messages,
                 system_prompt,
@@ -392,9 +471,9 @@ impl OpenAIClient {
                 self.response_schema.as_ref(),
                 context_capture,
                 &self.request_options,
+                budget,
             )
-            .await?;
-            return Ok((stream, crate::performance::AttemptCounter::default()));
+            .await;
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -449,17 +528,23 @@ impl OpenAIClient {
         if let Some(capture) = context_capture { capture.record("openai-completions", &body, provider.model.context_window, max_tokens).await; }
         let harness_headers = self.request_options.headers(provider)?;
         let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
-        let request = self.client.post(&url)
+        let client = if budget.is_single_post() {
+            self.single_post_client()?
+        } else {
+            self.streaming_client()?
+        };
+        let request = client.post(&url)
             .headers(harness_headers)
             .header("Authorization", format!("Bearer {}", provider.provider.api_key))
             .header("content-type", "application/json")
             .json(&body);
-        super::stream_retry::response(
+        super::stream_retry::response_with_budget(
             request,
             identity,
             self.request_options.clone().observed(context_capture),
             provider.clone(),
             "openai-completions",
+            budget,
         )
         .await
     }

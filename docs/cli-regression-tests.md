@@ -407,6 +407,17 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 - `cargo test --locked -p deepseek-code-core --test api_failure_reaudit_probe`：二次审计的输入（带空白的 JSON 键、短纯文本回显、多种嵌套与转义形式），以及“可识别类别仍保留”的反向用例。
 - `cargo test --locked -p deepseek-code-core --test api_failure_review3_probe`：三次审计的输入（`message`、`detail`、`error_description`、`code` 四个字段中的纯自由文本）。
 - `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics`：真实 CLI 进程对本地故障服务，核对最终输出、服务端实际请求数与 SQLite 中的请求快照。
+- `cargo test --locked -p deepseek-code-core --lib builtin_chat_`：内置 Chat Completions 的发送重试与“内容前正文重试”共用一个预算，核对真实回环 HTTP 的次数、请求 ID、重试头、可取消等待、已开始内容不重放、原始帧/终端标记/未知内容边界、提供方错误脱敏、损坏配置在开请求前失败与本地请求记录。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics builtin_chat_`：真实 CLI 使用 `config.json` 中的内置 OpenCode Go，内容前断流后重连成功，覆盖只有思考或未完成工具调用的失败，并核对提供方错误回显不会进入最终输出、尝试事件/日志与 SQLite 快照。
+- `cargo test --locked -p deepseek-code-core --lib native_engine::model_http::tests::`：流式客户端的空闲读取超时按每个线上分块重置（注释、跨分块的 SSE 帧与跨分块的 UTF-8 字符），并区分“等待响应头”和“正文静默”两种超时；取消挂起的读取会关闭正文，配置为 0 时在开请求前报错。
+- `cargo test --locked -p deepseek-code-core --lib buffered_model_requests_keep_the_total_deadline`：直连 OpenAI 与直连 Anthropic 的缓冲请求仍受各自总超时约束，缓慢正文超时后只发送一次且不含 `stream:true`。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics stream_timeout_uses_idle_configuration_for_all_model_transports`：真实 CLI 在本地正值空闲配置下覆盖四种模型传输的健康流、内容后静默、只有响应头、两次 POST 恢复、内置 Responses 单次与退避取消，以及内置 Chat 的原始边界。
+- `cargo test --locked -p deepseek-code-core --lib typed_stream_body_timeout_survives_the_retry_layer`：正文读取超时、终端标记、提前 EOF、提供方超时形状的 SSE 错误与响应头前超时在共享重试层后的类型化事实（见下方第 18 条）。
+- `cargo test --locked -p deepseek-code-core --lib single_attempt_chat_stream_never_spends_a_second_post`：内置与直连 Chat 传输在单次预算下，503、响应头停顿、空握手正文超时与 307 重定向都只产生一次物理 POST（见下方第 18 条）。
+- `cargo test --locked -p deepseek-code-core --lib post_content_timeout_recovery_defaults_to_false`：可选项的内置默认、缺省该键的旧文件、显式 `false` 与显式 `true` 的解析结果。
+- `cargo test --locked -p deepseek-code-core --lib openai_counted_stream_invalid_orchestration_fails_before_open`：内置 OpenCode Go 与直连 Chat 都在各自的全新进程中，经 `send_message_stream_counted` 使用损坏的 cwd `orchestration.toml`：返回真实 TOML 错误且本地服务收到 0 次 POST（`builtin_chat_invalid_orchestration_fails_before_open` 保持为对照）。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_`：第 19 条的开启/关闭、可重放边界与取消（见下方“第十三轮”）。
+- `cargo test --locked -p deepseek-code-core --test post_content_recovery post_content_recovery_receiver_close_cancels_backoff_open_and_read`：真实执行器在退避、替换开打与替换读取三个阶段遇到消费端关闭时立即返回 `interrupted`（见下方第 19 条）。
 - `cargo test --locked -p deepseek-code-cli --test background_failure_diagnostics`：真实 supervisor 启动真实 CLI Worker，核对服务端请求数、任务输出（`/tasks show` 展示的内容）与会话快照三者一致；同一目标覆盖后台任务的认证错误与取消。
 
 以下终端步骤需要在真实 ConPTY 中手工执行，使用本次构建的 `dcl.exe`。原有的 `terminal_acceptance.py` 自动化脚本已在 2026-11-10 的开发支持目录清理中随证据删除，步骤本身仍然适用。
@@ -419,7 +430,22 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 6. 401 与 400 参数错误：只请求一次，摘要分别显示认证失败与“参数错误”类别；服务端自由描述文字不再出现，已知错误标识（如 `invalid_request_error`）会保留。
 7. 脱敏输入：`Cookie` 的每一项、`Authorization` 与 `Proxy-Authorization` 的完整值（含 `Basic` 编码凭据）、URL 查询参数，以及服务端回显的请求正文，都不出现在摘要、日志、事件、请求快照或会话记录中。服务端把用户提问回显到 `error.message` 时同样不出现。
 8. 底层错误经过多层包装后仍能显示阶段、类别和次数；三处（最终输出、请求快照、任务记录）的数字一致。
-9. 流式响应在收到部分内容后正常结束但缺少完成标记：阶段为流式中断、HTTP 状态为已收到的 200、尝试次数为发送层真实值。OpenAI 与 Anthropic 两条协议各跑一次；内置适配器与 Responses 协议不经过共享发送层，次数与状态保持 `unknown`，不能用推测值替代。
+9. 流式响应在收到部分内容后正常结束但缺少完成标记：阶段为流式中断、HTTP 状态为已收到的 200、尝试次数为发送层真实值。OpenAI、Anthropic 与内置 Chat Completions 都要报告真实次数与状态；Responses、Anthropic（内置）等其它内置协议仍按发送层单独重试，正文读取不再计入预算，次数与状态保持 `unknown`，不能用推测值替代。
+10. 内置 OpenCode Go 的 Chat Completions 先返回 503，再返回 200 且只有响应头、正文停住，最后成功：共 3 次 POST，同一请求 ID 与重试计数 0/1/2，保留 OpenCode 会话头，两次重连都等待，正文只出现一次；若每次都在内容前结束且只有空握手，则 8 次 POST、7 次等待后报告 HTTP 200、尝试 8、重试 7、`content_started=false`，退避期间取消只发送 1 次。只有思考、未完成工具调用、被截断的原始 SSE 帧、未知数据或显式提供方错误都只发送 1 次。
+11. 内置 Chat Completions 的原始数据边界以“原始帧”而不是归一化结果判定：未完成的原始 SSE 帧、单独的 `[DONE]`、以及只含未知类型的非空 `content` 数组，在正文被中断（chunked 未结束）或一直保持到注入的客户端超时后，都只发送 1 次 POST；第 2 个 POST 即使有成功回复也不会发出，不出现重连等待、替换正文或完成标记，失败为流阶段、HTTP 200、尝试 1、重试 0；超时用例的类别为 transient 且原因包含超时。干净 EOF 的半帧仍只发送 1 次，正常完整流仍只发送 1 次并成功。`max_retries=1` 时先 503、再 200 只有角色握手的干净 EOF、第 3 个请求有待发的成功回复：共 2 次 POST、1 次等待，最终为流阶段失败、HTTP 200、尝试 2、重试 1。
+12. 内置 Chat Completions 的提供方 SSE 错误即使在 `error.message` 里回显请求内容，也只发送 1 次并退出 1；最终输出、`request_attempt/stream_failed` 事件、磁盘上的尝试日志与 SQLite 请求快照都只保留固定词表（如 `invalid_request_error`）与安全原因，回显标记不出现，失败为流阶段、HTTP 200、尝试 1。
+13. 独立内置 Chat 传输在未初始化进程中使用损坏的 `config/orchestration.toml`：返回配置错误且在打开任何请求之前结束，本地服务收到 0 次 POST；同时核对正常配置下共享预算仍按 `max_retries` 生效。
+14. 流式模型请求按“每次读取的空闲超时”计时，没有整段总超时。`[http].request_timeout_secs` 设为 1 秒时，内置 OpenCode Chat、直连 OpenAI、直连 Anthropic 与内置 Responses 都能在约 3 秒内持续收到字节后正常完成：各 1 次 POST、退出 0、输出完整；该值必须为正，0 在建立请求前就报配置错误且不产生 POST。缓冲式请求（非流式 `send_message` 与 Google 令牌交换）仍使用 300 秒总超时：缓慢输出但总时长超过期限的 JSON 正文仍以超时失败，只发送 1 次且请求体不含 `stream:true`。
+15. 内容后停止发送：1 次 POST、退出 1、已输出的部分正文保留一次、失败为流阶段；即使还有重试预算也不重放。已刷新 HTTP 200 响应头但正文 0 字节：内置 Chat 与直连 OpenAI/Anthropic 在预算内重连（两次 POST 的第二次成功），内置 Responses 仍按发送层策略只发送 1 次。共享层可观测时报告 `http=200`、尝试 1，其余内置协议保持 `unknown`；退避取消以尝试日志中的 `retry_wait` 为起点写后台任务取消文件，之后不再产生新的 POST。
+16. 内置 Chat 的三类原始边界（未完成的原始 SSE 帧、单独的 `[DONE]`、只含未知类型的非空 `content` 数组）在空闲超时生效后仍各只发送 1 次，尝试日志中没有重连等待，细节为流阶段、HTTP 200、尝试 1、重试 0。
+17. 单次 `--print --output-format stream-json`（纯文本输入）在收到部分正文后停止发送：1 次 POST、退出 1，结果带 `stream_error`，部分正文只保留一次，持久化恰好一个 failed 回合和一条 `request_turn_end`。随后用 `--resume <同一会话>` 对成功回复再运行一次：原 failed 行保持不变，新回合 completed，两次调用共用同一存储会话，第二次退出 0 且只新增 1 次 POST。
+18. 内容后恢复的传输准备（第 13 轮；功能默认关闭，配置、工具循环重放与可见提示留到第 14 轮）。结构化失败携带两个独立的内部事实：`is_stream_body_timeout()` 只有“流阶段 + reqwest 正文读取超时”为真，响应头前超时、提前 EOF、提供方 SSE 错误与解析错误都为假；`terminal_marker_observed()` 记录解码器在正文停止前是否已看到原始 `[DONE]`，与超时事实互不推导。内置 Chat 在真实文本后收到原始 `[DONE]` 再停住时两个事实都为真，只有文本超时时终端事实为假；失败 JSON 字段与脱敏结果不变。单次预算（`AttemptBudget::single_attempt()`）下，内置与直连 Chat 对 503、响应头停顿、已刷新空握手正文超时和 307 都只发 1 次 POST、没有 `retry_wait`，307 的目标收到 0 次；健康流只发 1 次、输出完整，认证头、请求身份头、重试计数与本地请求记录仍走原路径。证据见 `dev-support/deepseek-code/dcl-stream-retry-20261117/round-04-report.md`；可选重放本身见第 19 条。
+19. 内容后超时的一次可选重放（第 14 轮，`[http].post_content_timeout_recovery`，默认 `false`）。开启时只对内置与直连 Chat Completions 生效，整个回合最多一次，且只重放“尚未提交的当前模型步骤”：
+    - 关闭（省略该键或显式写 `false`）：文本/思考仍实时输出；正文在内容后超时只发送 1 次 POST、没有重放提示，最终结果 `is_error=true`、`stop_reason=stream_error`、部分正文只保留一次，未完成的工具调用不执行、不落行，回合为 failed、退出 1。
+    - 开启：失败的那一步丢弃本步暂存的文本、思考与未完成工具参数，快照带 `abandonedForRecovery=true` 并保留诊断用的部分块；随后通过既有 `request_attempt` 通道发出且仅发出 1 条 `outcome=post_content_retry` 提示（含被放弃的 request ID、真实尝试次数与脱敏失败），等待既有的、可取消的退避后只发 1 次替换 POST。替换请求沿用同一会话、同一回合、同一模型步骤号，`replacesRequestId` 链接两张快照；`MessageStart` 仍只有一次，被放弃的那条不产生终止结果。替换成功后该步骤正常提交文本并继续工具调用与持久化；成功回合的最终状态为 completed，且不挂被放弃尝试的失败。
+    - 只有 `class=transient`、`is_stream_body_timeout()` 为真、当前响应已观察到内容、`terminal_marker_observed() != Some(true)`、请求快照未记录 `[DONE]`/任意 choice 的 `finish_reason`/提供方 SSE 错误、消费端仍在，且首段真实尝试次数小于 `AttemptBudget::configured().max()` 时才重放。替换本身只有一个 POST（响应头停顿、重定向都不额外发）。替换再次失败、后续步骤超时或预算已用尽都不再重放，只提交最后一次尝试的暂存输出并走原有失败路径。
+    - 开启期间该步骤的文本/思考在步骤完成时才出现（实时增量暂时缺失）；取消发生在提示之后、替换之前时不发替换 POST，发生在替换正文打开期间时不再读取、也不再发 POST，未提交的暂存输出被丢弃。
+    - 第 14 轮修复（第 15 轮验证）：直连 Chat 的两种提供方错误形态（嵌套 `error` 与顶层 `{"type":"error"}`）都在正文随后真的空闲超时时否决重放；文本/思考/工具增量出现在非首个 choice 时同样算作已产生内容并允许重放（仅角色或空增量仍走 A 的内容前重试，且请求 ID 不变）。关闭（省略或显式 `false`）时快照键集与 `stop_reason` 与第 13 轮对照完全一致：`message_trajectory.requests_json` 的 41 个键（第二个模型步骤多 `responseModel`），既没有 `replacesRequestId` 也没有 `abandonedForRecovery`，结果 `stop_reason` 为第一步的 `stop`、正文为 `Before \n\nAfter`。消费端关闭会在退避、替换开打与替换读取三个阶段立即返回 `interrupted`，不再等待计时器或空闲超时。
 
 同一目录的 `desktop/fixture.py` 配合真实 Desktop 窗口核对错误卡片上的阶段、次数与脱敏结果。
 
@@ -506,6 +532,38 @@ stream-json 宿主在一轮进行中发送的普通用户消息不再只等这�
 - 真实模型（本地不接受真实密钥的步骤不在此列）：用 `--input-format stream-json` 保持 stdin 打开，先发送要求三次 `sleep` 工具调用的消息，8 秒后发送“跳过剩余 sleep”的消息。预期 `queued_input` 事件在第一次工具结果之后出现，第二个模型请求包含该文本，剩余调用可以不再执行。2026-11-10 的基线与本地模拟证据在相邻开发支持目录 `steer-20261110/`。
 
 事件形状（与 REPL/Desktop 共用的 `queued_input` 行）：`{"type":"queued_input","text":"…","content":"…","origin":"queue-input-<id>"}`。`origin` 是持久队列项的 handoff 标识；引导消息自己的 `messages` 行已由 handoff 保存，故不再作为工具附件重复写入。REPL/Desktop 的 legacy 队列项保持原有 `origin`（`user`、`task_notification`）并继续依附最近工具结果。
+
+### 第十二轮：失败回合后的 SDK 继续输入与单次 --print
+
+模型流在“已输出正文后静默”时以流超时失败，但失败回合既不结束仍打开的 SDK 输入，也不改变单次 `--print` 的退出约定。全部使用本机回环 HTTP、假密钥与临时项目/数据目录；空闲超时使用 cwd 中正的 `[http].request_timeout_secs = 1`，不是 300 秒生产值。
+
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_recovery_vetoes_top_level_and_nested_provider_errors`：直连 Chat 开启后，嵌套 `error` 与顶层 `{"type":"error"}` 都在正文真的空闲超时时各只有 1 次 POST、无提示、一个失败 `stream_error` 结果、退出 1、保留部分正文；等待中的成功回复（唯一标记）未被使用。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_recovery_counts_content_on_non_leading_choices`：非首个 choice 上的正文、思考或未完成工具增量都能触发重放（各 2 次 POST、提示指向被放弃的请求、两张快照互相链接、1 次 `message_start`、completed）；被放弃的内容不出现在输出、替换请求体或已存助手正文中，也没有孤儿工具行或文件。整帧只有角色或空增量时仍走 A 的内容前重试：同一 request ID、`retry_wait` 存在、无 C 提示。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_disabled_matches_pre_c_snapshot_keys_and_stop_reason`：直连 Chat 省略该键与显式 `false` 时，第一步给出 `stop` 与工具调用、第二步只给正文与原始 `[DONE]`：2 次 POST、marker 为 `one`、结果 `stop_reason:"stop"`、正文 `Before \n\nAfter`；`message_trajectory.requests_json` 的键集与第 13 轮对照一致（第一步 41 键，第二步加 `responseModel`），两个恢复专用键都不存在。
+- `cargo test --locked -p deepseek-code-core --test post_content_recovery post_content_recovery_receiver_close_cancels_backoff_open_and_read`：三个独立子进程分别在退避等待、替换响应头前、替换正文读取中关闭事件接收端：执行器都返回 `interrupted`、返回文本为空，且在各自的 watchdog 内返回（远小于 5 秒退避 / 3 秒空闲超时）；物理 POST 分别为 1 / 2 / 2，任何未授权 POST 都不会被等待中的成功回复消费，未完成的 Write 不执行。
+- `cargo test --locked -p deepseek-code-cli --test sdk model_stream_timeout_keeps_sdk_stdin_live_after_failed_result`：真实 SDK 子进程（`--input-format stream-json`，工作目录和数据目录都在临时项目中，stderr 被捕获）。stdin 顺序固定：
+  1. 只写第一条普通用户帧，stdin 保持打开；
+  2. 服务端在 1 次 POST 中刷新 HTTP 200 并发出一个文本增量，随后不再发送任何字节；
+  3. 客户端按空闲超时失败，读到 1 个 `result`（`is_error=true`、`stop_reason=stream_error`）；该回合 1 个终止 `turn_timing`（允许此前 1 个 running 帧）、1 个 `request_turn_end`，按 turn ID 与 SQLite 的 failed 行对齐；
+  4. 读到失败 `result` 之后才写第二条普通用户帧，仍使用同一进程和同一会话；
+  5. 第二次 POST 返回完整回答，第二个 `result` 成功、`session_id` 不变，SQLite 出现 completed 行，两个回合各 1 个 `result`；
+  6. 最后才关闭 stdin；只有此时才出现一次 “One or more SDK turns failed or were interrupted”，进程退出 1。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics single_print_model_stream_timeout_fails_once`：单次 `--print --output-format stream-json` 的同一超时形态：1 次 POST、退出 1、1 个 `stream_error` 结果、部分正文一次、1 个 failed 回合与 1 条终止记录；随后 `--resume` 同一会话对成功回复运行，原 failed 行保留、新回合 completed、退出 0，只新增 1 次 POST。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics stream_timeout_uses_idle_configuration_for_all_model_transports`：退避取消子用例改用同文件的后台任务取消夹具：先轮询隔离的尝试日志直到出现 `retry_wait`，再写 `cancel` 文件，仍断言退出非 0，且超过计划的重试时刻后只有 1 次 POST；不再依赖 `kill -INT` 和固定 sleep。
+
+自动化只覆盖本机回环与 Linux 进程，不代表 Windows/ConPTY、Desktop 运行时或真实提供商。
+
+### 第十三轮：内容后超时的一次可选重放
+
+`[http].post_content_timeout_recovery` 默认 `false`；开启后仅内置与直连 Chat Completions 生效，整个回合最多一次。全部使用本机回环 HTTP、假密钥、临时项目与数据目录，空闲超时用 cwd 中正的 `[http].request_timeout_secs`（1 秒或 5 秒），退避用毫秒级配置。
+
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_timeout_replays_only_the_uncommitted_model_step`：内置 OpenCode Go 与直连 Chat 各跑一次。第 1 个 POST 由模型请求一个经批准的本地 Bash 工具（`printf one >> marker.txt`）并提交；第 2 个 POST 发出思考、正文与一个未完成的 Write，然后保持正文打开直到空闲超时；第 3 个 POST 是替换，返回完整回答。断言：共 3 次 POST；marker 恰为 `one`（工具只运行一次），未完成的 Write 不产生 `orphan.txt`、也不留工具行；最终回答只含替换文本，`ABANDONED_*` 不出现在任何输出；两条被记录的请求体 `messages` 完全相同，且都含先前工具调用/结果与本轮用户输入；尝试日志中恰好 1 条 `post_content_retry`、没有 `retry_wait`，该提示在结果帧之前且只出现一次；该步骤的两张快照通过 `replacesRequestId` 互相链接，被放弃的一张带 `abandonedForRecovery=true`，用量分别为 55/111 的输入 token，结果 `usage` 合计 176/12（按快照 ID 分别记账，不推测被放弃响应的用量）；回合终态 completed、只有 1 条 `request_turn_end`。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_timeout_recovery_is_bounded_and_cancellable`：六个子用例——(1) 替换自身在输出后再次停滞：共 2 次 POST，只提交第二次尝试的文本，回合 failed；(2) 替换在响应头前失败：共 2 次 POST，不再重放；(3) 成功重放后下一步骤再超时：共 3 次 POST、只 1 条提示，已提交工具仍只运行一次；(4) 首段已用 `max_retries=1` 把预算花在内容前重试上：共 2 次 POST、无提示；(5) 在提示之后、替换之前写后台任务 `cancel`：超过退避时限仍只有 1 次 POST，1 个终止 `result`，回合为 cancelled；(6) 在替换正文打开时取消：仍为 2 次 POST，未完成的 Write 不执行。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_timeout_without_opt_in_retains_the_existing_partial_result`：内置 Chat 分别省略该键与显式 `false`。正文保持打开时即可读到 `VISIBLE_PARTIAL` 增量（早于 `result` 帧），最终 1 次 POST、无 `post_content_retry`、`is_error=true`、`stop_reason=stream_error`、部分正文只出现一次、无 `orphan.txt`、恰好 1 个 failed 回合、退出 1。
+- `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics post_content_recovery_does_not_retry_non_timeout_stream_failures`：开启后四个非超时/终止形态各 1 次 POST 且无提示——文本后干净 EOF（无超时）；内置 Chat 文本 + 原始 `[DONE]` 后正文超时；直连 Chat 文本 + 提供方 SSE 错误后正文超时；`finish_reason` 只出现在非首个 choice 后正文超时。每种都保留文本并给出 1 个失败结果。
+- `cargo test --locked -p deepseek-code-cli --test sdk model_stream_timeout_keeps_sdk_stdin_live_after_failed_result` 与 `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics single_print_model_stream_timeout_fails_once`：默认（关闭）配置下重跑，SDK 的 stdin 继续输入与单次 `--print` 的退出 1/`--resume` 约定不变。
+
+未覆盖：Desktop 运行时、真实外部提供商、Windows/ConPTY，以及启用期间的实时增量（开启时该步骤的文本与思考在步骤完成时才出现）。
 
 ## ApplyPatch 补丁工具
 
@@ -758,7 +816,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolSearch 与私有 worker �
 - `terminal/editor.rs`、`terminal/input.rs` 的命令补全：`refresh_subcommands`（`/model r`、`/provider r`、`/provider refresh `）
 - `native_engine/request_identity.rs`：M 的会话头
 - `native_engine/provider_runtime.rs`：M 的目录 baseUrl 推导和四种协议真实对话
-- `native_engine/stream_retry.rs`、`native_engine/utf8_stream.rs`、`native_engine/request_trace.rs`、`performance/`：K，以及 E1
+- `native_engine/stream_retry.rs`、`native_engine/utf8_stream.rs`、`native_engine/model_http.rs`、`native_engine/request_options.rs`、`native_engine/request_trace.rs`、`performance/`：K（含空闲超时与缓冲总超时的区别），以及 E1
 - `project_instructions.rs`、`services/lifecycle_events.rs`：`cargo test --locked -p deepseek-code-core --lib project_instructions`，并确认用户级说明只来自数据目录、项目说明只取用户主目录以下的上级目录
 - `native_engine/tool_loop.rs` 的错误与请求快照路径：K、H
 - `native_engine/generation.rs`、`services/compaction.rs`、`services/compaction/`：L，以及 E5

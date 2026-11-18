@@ -573,6 +573,51 @@ fn merge_tool_call_name(name: &mut String, delta: &str) {
     name.push_str(delta);
 }
 
+/// Record one visible fragment of the current attempt.
+///
+/// With staging on, an attempt's text and thinking are held in order — adjacent
+/// fragments of the same kind coalesce — until the step is committed. With it
+/// off, the fragment reaches the host immediately, as it always has.
+async fn emit_or_stage(
+    sender: &tokio::sync::mpsc::Sender<EngineEvent>,
+    staged: &mut Vec<(bool, String)>,
+    thinking: bool,
+    text: &str,
+    staging: bool,
+) {
+    if !staging {
+        let event = if thinking {
+            EngineEvent::Thinking(text.to_owned())
+        } else {
+            EngineEvent::Text(text.to_owned())
+        };
+        let _ = sender.send(event).await;
+        return;
+    }
+    match staged.last_mut() {
+        Some((kind, held)) if *kind == thinking => held.push_str(text),
+        _ => staged.push((thinking, text.to_owned())),
+    }
+}
+
+/// Emit an attempt's staged fragments in order, exactly once, and return the
+/// committed assistant text so the caller can append it to the turn's output.
+async fn flush_staged(
+    sender: &tokio::sync::mpsc::Sender<EngineEvent>,
+    staged: &mut Vec<(bool, String)>,
+) -> String {
+    let mut committed = String::new();
+    for (thinking, text) in std::mem::take(staged) {
+        if thinking {
+            let _ = sender.send(EngineEvent::Thinking(text)).await;
+        } else {
+            committed.push_str(&text);
+            let _ = sender.send(EngineEvent::Text(text)).await;
+        }
+    }
+    committed
+}
+
 fn compact_tool_output(tool_name: &str, output: &str) -> String {
     let cleaned = model_tool_output(tool_name, output);
     let output = cleaned.as_str();
@@ -6113,6 +6158,22 @@ impl ToolLoopExecutor {
         let api_key_len = self.provider.provider.api_key.len();
         let mut output_recoveries = 0;
 
+        // Read once per turn. The opt-in replay covers the Chat Completions
+        // transport only, and both the built-in and direct routes resolve
+        // through it; other protocols keep their existing behaviour.
+        let post_content_recovery =
+            crate::config::OrchestrationConfig::post_content_timeout_recovery()
+                && super::provider_runtime::chat_completions_eligible(&self.provider);
+        // The budget getter caches built-in defaults after a parse error, so a
+        // fallible load runs first while the feature is enabled.
+        let recovery_limit = if post_content_recovery {
+            crate::config::OrchestrationConfig::init_global()?;
+            Some(crate::performance::AttemptBudget::configured().max())
+        } else {
+            None
+        };
+        let mut recovery_used = false;
+
         let mut after_tool_results = false;
         for iteration in 0usize.. {
             for context in self.drain_async_hook_messages() {
@@ -6263,87 +6324,14 @@ impl ToolLoopExecutor {
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
-            let PreparedRequest { tools, system_prompt } = self.prepare_request()?;
+            let PreparedRequest {
+                tools,
+                system_prompt,
+            } = self.prepare_request()?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
-            self.streaming_tool_args.clear();
-            let mut request_trace = RequestTrace::new(json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "number": iteration + 1,
-                "startedAt": chrono::Utc::now().timestamp_millis(),
-                "model": self.provider.model.id,
-                "providerId": self.provider.provider.id,
-                "providerName": self.provider.provider.name,
-                "apiFormat": self.provider.provider.api_format,
-                "maxOutputTokens": self.max_tokens,
-                "contextWindow": self.provider.model.context_window.map(|n| n as usize).unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id)),
-                "reservedForCompletion": (self.max_tokens as u64) * 2,
-                "effort": self.provider.model.effort,
-                "systemPrompt": system_prompt.as_deref(),
-                "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
-                "tools": tools,
-                "contextBoundary": self.context_boundary(),
-                "source": "native_engine"
-            }));
-            let _ = self
-                .event_tx
-                .send(EngineEvent::RequestSnapshot(request_trace.started()))
-                .await;
-            // Real HTTP attempts observed by the send layer, so a clean
-            // end-of-stream still reports a count instead of "unknown".
-            let http_attempts: crate::performance::AttemptCounter;
-            let context_capture = request_trace.capture_context(self.event_tx.clone());
-            let stream = self
-                .openai_client
-                .send_message_stream_counted(
-                    &self.provider,
-                    conversation_messages.clone(),
-                    system_prompt.as_deref(),
-                    tools.clone(),
-                    self.max_tokens,
-                    Some(&context_capture),
-                )
-                .await;
-
-            let mut stream = match stream {
-                Ok((s, attempts)) => {
-                    tracing::info!(module = "OpenAILoop", "Stream created successfully");
-                    http_attempts = attempts;
-                    s
-                }
-                Err(e) => {
-                    // Keep the typed cause for classification; only sanitized
-                    // text reaches events, snapshots and session records.
-                    let diagnostic = crate::performance::request_diagnostic(&e);
-                    tracing::error!(
-                        module = "OpenAILoop",
-                        "Stream creation FAILED: {}",
-                        diagnostic
-                    );
-                    let mut snapshot = request_trace.finish("error", Some(&diagnostic));
-                    if let Some(failure) = crate::performance::find_failure(&e) {
-                        snapshot["failure"] = failure.as_json();
-                    }
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::RequestSnapshot(snapshot))
-                        .await;
-                    let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
-                    return Err(e.context("API request failed"));
-                }
-            };
-
-            // One start per logical response, announced once the provider has
-            // accepted the request. Compatible providers repeat
-            // "role":"assistant" in every chunk; those are deltas of the same
-            // response. A request that fails before any response is not a
-            // round, and send-layer retries do not create a second start.
-            let _ = self
-                .event_tx
-                .send(EngineEvent::MessageStart {
-                    model: self.provider.model.id.clone(),
-                })
-                .await;
-            let mut sse_buffer = String::new();
+            // One attempt of this model step. A stalled attempt that is replaced
+            // must leave nothing behind, so the parser state belongs to the
+            // attempt and is only committed here once it succeeds.
             let mut has_tool_calls = false;
             let mut assistant_content: Option<OpenAIContent> = None;
             let mut assistant_reasoning: Option<String> = None;
@@ -6351,233 +6339,490 @@ impl ToolLoopExecutor {
             let mut assistant_tool_calls: Vec<crate::native_engine::openai_client::OpenAIToolCall> =
                 Vec::new();
             let mut openai_tool_args: HashMap<usize, (String, String, String)> = HashMap::new();
-
-            loop {
-                let chunk_result = match stream.next().await {
-                    Some(chunk) => chunk,
-                    None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
-                    None => break,
-                };
-                if self.event_tx.is_closed() {
-                    drop(stream);
-                    break;
+            // Ordered text/thinking of this attempt, held while staging is on.
+            let mut staged: Vec<(bool, String)> = Vec::new();
+            // Set when this attempt is the single authorized replacement.
+            let mut replaces_request_id: Option<String> = None;
+            'attempt: loop {
+                // A pending replacement never opens for a consumer that has
+                // already gone away.
+                if replaces_request_id.is_some() && self.event_tx.is_closed() {
+                    staged.clear();
+                    openai_tool_args.clear();
+                    return Ok((full_text, Some("interrupted".to_string())));
                 }
-                let chunk = match chunk_result {
-                    Ok(c) => c,
+                has_tool_calls = false;
+                assistant_content = None;
+                assistant_reasoning = None;
+                assistant_provider_content = None;
+                assistant_tool_calls.clear();
+                openai_tool_args.clear();
+                staged.clear();
+                // The pre-C loop kept one stop reason for the whole turn; only
+                // the staging path needs a fresh one per attempt.
+                if post_content_recovery {
+                    stop_reason = None;
+                }
+                self.streaming_tool_args.clear();
+                let mut snapshot = json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "number": iteration + 1,
+                    "startedAt": chrono::Utc::now().timestamp_millis(),
+                    "model": self.provider.model.id,
+                    "providerId": self.provider.provider.id,
+                    "providerName": self.provider.provider.name,
+                    "apiFormat": self.provider.provider.api_format,
+                    "maxOutputTokens": self.max_tokens,
+                    "contextWindow": self.provider.model.context_window.map(|n| n as usize).unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id)),
+                    "reservedForCompletion": (self.max_tokens as u64) * 2,
+                    "effort": self.provider.model.effort,
+                    "systemPrompt": system_prompt.as_deref(),
+                    "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
+                    "tools": tools,
+                    "contextBoundary": self.context_boundary(),
+                    "source": "native_engine",
+                });
+                // Only a replacement names the attempt it replaces, so an
+                // initial request keeps the pre-C snapshot shape exactly.
+                if let Some(replaced) = &replaces_request_id {
+                    snapshot["replacesRequestId"] = json!(replaced);
+                }
+                let mut request_trace = RequestTrace::new(snapshot);
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::RequestSnapshot(request_trace.started()))
+                    .await;
+                // Real HTTP attempts observed by the send layer, so a clean
+                // end-of-stream still reports a count instead of "unknown".
+                let http_attempts: crate::performance::AttemptCounter;
+                let context_capture = request_trace.capture_context(self.event_tx.clone());
+                // The replacement is one authorized POST through a client without
+                // redirects or internal retries; the first leg keeps the ordinary
+                // budgeted entry point.
+                let stream = match replaces_request_id.is_some() {
+                    false => {
+                        self.openai_client
+                            .send_message_stream_counted(
+                                &self.provider,
+                                conversation_messages.clone(),
+                                system_prompt.as_deref(),
+                                tools.clone(),
+                                self.max_tokens,
+                                Some(&context_capture),
+                            )
+                            .await
+                    }
+                    // An already closed receiver must not poll the opener at all.
+                    true => {
+                        tokio::select! {
+                            biased;
+                            _ = self.event_tx.closed() => {
+                                staged.clear();
+                                openai_tool_args.clear();
+                                return Ok((full_text, Some("interrupted".to_string())));
+                            }
+                            opened = self.openai_client.send_message_stream_counted_budget(
+                                &self.provider,
+                                conversation_messages.clone(),
+                                system_prompt.as_deref(),
+                                tools.clone(),
+                                self.max_tokens,
+                                Some(&context_capture),
+                                crate::performance::AttemptBudget::single_attempt(),
+                            ) => opened,
+                        }
+                    }
+                };
+
+                let mut stream = match stream {
+                    Ok((s, attempts)) => {
+                        tracing::info!(module = "OpenAILoop", "Stream created successfully");
+                        http_attempts = attempts;
+                        s
+                    }
                     Err(e) => {
-                        // No replay after exposed content; keep partial output and
-                        // report the stage, attempts and sanitized cause.
-                        let failure = crate::performance::RequestFailure::stream(
-                            &e,
-                            http_attempts.attempts(),
-                            http_attempts.status(),
-                            !full_text.is_empty()
-                                || assistant_content.is_some()
-                                || !assistant_tool_calls.is_empty(),
-                        );
-                        let diagnostic = failure.diagnostic();
+                        // Keep the typed cause for classification; only sanitized
+                        // text reaches events, snapshots and session records.
+                        let diagnostic = crate::performance::request_diagnostic(&e);
                         tracing::error!(
                             module = "OpenAILoop",
-                            "Stream chunk error: {}",
+                            "Stream creation FAILED: {}",
                             diagnostic
                         );
                         let mut snapshot = request_trace.finish("error", Some(&diagnostic));
-                        snapshot["failure"] = failure.as_json();
+                        if let Some(failure) = crate::performance::find_failure(&e) {
+                            snapshot["failure"] = failure.as_json();
+                        }
                         let _ = self
                             .event_tx
                             .send(EngineEvent::RequestSnapshot(snapshot))
                             .await;
                         let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
-                        let _ = self
-                            .event_tx
-                            .send(EngineEvent::MessageStop {
-                                full_text: full_text.clone(),
-                                stop_reason: Some("stream_error".to_string()),
-                            })
-                            .await;
-                        drop(stream);
-                        return Ok((full_text, Some("stream_error".to_string())));
+                        return Err(e.context("API request failed"));
                     }
                 };
 
-                sse_buffer.push_str(&chunk);
-                let consumed = consume_sse_payloads(&sse_buffer);
-                sse_buffer = consumed.remainder;
+                // One start per logical response, announced once the provider has
+                // accepted the request. Compatible providers repeat
+                // "role":"assistant" in every chunk; those are deltas of the same
+                // response. A request that fails before any response is not a
+                // round, and send-layer retries do not create a second start. A
+                // recovered step keeps the start its abandoned attempt announced.
+                if replaces_request_id.is_none() {
+                    let _ = self
+                        .event_tx
+                        .send(EngineEvent::MessageStart {
+                            model: self.provider.model.id.clone(),
+                        })
+                        .await;
+                }
+                let mut sse_buffer = String::new();
+                let replacing = replaces_request_id.is_some();
 
-                for payload in &consumed.payloads {
-                    if payload == "[DONE]" {
-                        request_trace.mark_completed();
-                        continue;
+                loop {
+                    // The replacement is abandoned the moment its consumer goes
+                    // away; the ordinary read path keeps its existing shape.
+                    let chunk_result = if replacing {
+                        tokio::select! {
+                            biased;
+                            _ = self.event_tx.closed() => {
+                                staged.clear();
+                                openai_tool_args.clear();
+                                return Ok((full_text, Some("interrupted".to_string())));
+                            }
+                            chunk = stream.next() => match chunk {
+                                Some(chunk) => chunk,
+                                None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                                None => break,
+                            },
+                        }
+                    } else {
+                        match stream.next().await {
+                            Some(chunk) => chunk,
+                            None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                            None => break,
+                        }
+                    };
+                    if self.event_tx.is_closed() {
+                        drop(stream);
+                        break;
                     }
-
-                    let event: Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let chunk = match chunk_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // No replay after exposed content by default; keep partial
+                            // output and report the stage, attempts and sanitized cause.
+                            let failure = crate::performance::RequestFailure::stream(
+                                &e,
+                                http_attempts.attempts(),
+                                http_attempts.status(),
+                                request_trace.first_content_observed(),
+                            );
+                            let diagnostic = failure.diagnostic();
+                            // A replay needs a real mid-body stall: transient, typed
+                            // body timeout, content already produced, no terminal
+                            // signal, an unspent application budget and a live
+                            // consumer. Anything else is final.
+                            let recoverable = !recovery_used
+                                && !self.event_tx.is_closed()
+                                && failure.class() == crate::performance::ErrorClass::Transient
+                                && failure.is_stream_body_timeout()
+                                && request_trace.openai_recovery_content_observed()
+                                && failure.terminal_marker_observed() != Some(true)
+                                && !request_trace.post_content_recovery_blocked()
+                                && http_attempts
+                                    .attempts()
+                                    .zip(recovery_limit)
+                                    .is_some_and(|(used, limit)| used < limit);
+                            tracing::error!(
+                                module = "OpenAILoop",
+                                "Stream chunk error: {}",
+                                diagnostic
+                            );
+                            if recoverable {
+                                let request_id = request_trace.started()["id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                let attempts = http_attempts.attempts().unwrap_or(1);
+                                // The abandoned attempt keeps its own diagnostic
+                                // blocks but owns no terminal result.
+                                let mut abandoned =
+                                    request_trace.finish("error", Some(&diagnostic));
+                                abandoned["failure"] = failure.as_json();
+                                abandoned["abandonedForRecovery"] = json!(true);
+                                let _ = self
+                                    .event_tx
+                                    .send(EngineEvent::RequestSnapshot(abandoned))
+                                    .await;
+                                drop(stream);
+                                let delay = crate::performance::retry_events::delay(attempts, None);
+                                crate::performance::retry_events::emit_post_content_retry(
+                                    self.event_tx.clone(),
+                                    &request_id,
+                                    attempts,
+                                    failure.as_json(),
+                                    delay,
+                                )
+                                .await;
+                                // The same cancellable backoff, with closure
+                                // prioritised: a consumer that goes away here
+                                // issues no replacement POST.
+                                tokio::select! {
+                                    biased;
+                                    _ = self.event_tx.closed() => {
+                                        staged.clear();
+                                        openai_tool_args.clear();
+                                        return Ok((full_text, Some("interrupted".to_string())));
+                                    }
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                // `closed()` can become ready together with the
+                                // timer, so the outcome is rechecked before the
+                                // replacement is opened.
+                                if self.event_tx.is_closed() {
+                                    staged.clear();
+                                    openai_tool_args.clear();
+                                    return Ok((full_text, Some("interrupted".to_string())));
+                                }
+                                recovery_used = true;
+                                replaces_request_id = Some(request_id);
+                                continue 'attempt;
+                            }
+                            // Final failure: commit only this attempt's staged output.
+                            if !self.event_tx.is_closed() {
+                                full_text
+                                    .push_str(&flush_staged(&self.event_tx, &mut staged).await);
+                            } else {
+                                staged.clear();
+                            }
+                            let mut snapshot = request_trace.finish("error", Some(&diagnostic));
+                            snapshot["failure"] = failure.as_json();
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::RequestSnapshot(snapshot))
+                                .await;
+                            let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::MessageStop {
+                                    full_text: full_text.clone(),
+                                    stop_reason: Some("stream_error".to_string()),
+                                })
+                                .await;
+                            drop(stream);
+                            return Ok((full_text, Some("stream_error".to_string())));
+                        }
                     };
 
-                    request_trace.observe_openai(&event);
-                    if let Some(content) = event.get("provider_content") {
-                        assistant_provider_content = Some(content.clone());
-                    }
-                    // Usage-only final chunks have no choices and must still be recorded.
-                    if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
-                        let _ = self
-                            .event_tx
-                            .send(EngineEvent::RequestSnapshot(request_trace.started()))
-                            .await;
-                        if let Some(tokens) = usage.get("prompt_tokens").and_then(|v| v.as_f64()) {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
-                        }
-                        if let Some(tokens) =
-                            usage.get("completion_tokens").and_then(|v| v.as_f64())
-                        {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
-                        }
-                        let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
-                    }
-                    let choices = match event.get("choices").and_then(|c| c.as_array()) {
-                        Some(c) => c,
-                        None => continue,
-                    };
+                    sse_buffer.push_str(&chunk);
+                    let consumed = consume_sse_payloads(&sse_buffer);
+                    sse_buffer = consumed.remainder;
 
-                    for choice in choices {
-                        let delta = match choice.get("delta") {
-                            Some(d) => d,
+                    for payload in &consumed.payloads {
+                        if payload == "[DONE]" {
+                            request_trace.mark_completed();
+                            continue;
+                        }
+
+                        let event: Value = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        request_trace.observe_openai(&event);
+                        if let Some(content) = event.get("provider_content") {
+                            assistant_provider_content = Some(content.clone());
+                        }
+                        // Usage-only final chunks have no choices and must still be recorded.
+                        if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::RequestSnapshot(request_trace.started()))
+                                .await;
+                            if let Some(tokens) =
+                                usage.get("prompt_tokens").and_then(|v| v.as_f64())
+                            {
+                                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+                            }
+                            if let Some(tokens) =
+                                usage.get("completion_tokens").and_then(|v| v.as_f64())
+                            {
+                                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+                            }
+                            let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
+                        }
+                        let choices = match event.get("choices").and_then(|c| c.as_array()) {
+                            Some(c) => c,
                             None => continue,
                         };
 
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            if !content.is_empty() {
-                                full_text.push_str(content);
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::Text(content.to_string()))
+                        for choice in choices {
+                            let delta = match choice.get("delta") {
+                                Some(d) => d,
+                                None => continue,
+                            };
+
+                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                if !content.is_empty() {
+                                    // Staged output is committed only when the step
+                                    // succeeds, so an abandoned attempt leaves no text.
+                                    if !post_content_recovery {
+                                        full_text.push_str(content);
+                                    }
+                                    emit_or_stage(
+                                        &self.event_tx,
+                                        &mut staged,
+                                        false,
+                                        content,
+                                        post_content_recovery,
+                                    )
                                     .await;
-                                match &assistant_content {
-                                    None => {
-                                        assistant_content =
-                                            Some(OpenAIContent::Text(content.to_string()));
-                                    }
-                                    Some(OpenAIContent::Text(existing)) => {
-                                        assistant_content = Some(OpenAIContent::Text(format!(
-                                            "{}{}",
-                                            existing, content
-                                        )));
-                                    }
-                                    Some(OpenAIContent::Multi(_)) => {}
-                                }
-                            }
-                        }
-
-                        if let Some(reasoning) =
-                            delta.get("reasoning_content").and_then(|r| r.as_str())
-                        {
-                            if !reasoning.is_empty() {
-                                match &mut assistant_reasoning {
-                                    None => assistant_reasoning = Some(reasoning.to_string()),
-                                    Some(r) => r.push_str(reasoning),
-                                }
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::Thinking(reasoning.to_string()))
-                                    .await;
-                            }
-                        }
-
-                        if let Some(tool_calls_arr) =
-                            delta.get("tool_calls").and_then(|tc| tc.as_array())
-                        {
-                            has_tool_calls = true;
-                            for tc_delta in tool_calls_arr {
-                                let index =
-                                    tc_delta.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
-                                        as usize;
-
-                                let entry = openai_tool_args.entry(index).or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                });
-
-                                if let Some(id) = tc_delta.get("id").and_then(|i| i.as_str()) {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(func) = tc_delta.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        merge_tool_call_name(&mut entry.1, name);
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
-                                    {
-                                        entry.2.push_str(args);
+                                    match &assistant_content {
+                                        None => {
+                                            assistant_content =
+                                                Some(OpenAIContent::Text(content.to_string()));
+                                        }
+                                        Some(OpenAIContent::Text(existing)) => {
+                                            assistant_content = Some(OpenAIContent::Text(format!(
+                                                "{}{}",
+                                                existing, content
+                                            )));
+                                        }
+                                        Some(OpenAIContent::Multi(_)) => {}
                                     }
                                 }
                             }
-                        }
 
-                        if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                            if finish != "tool_calls" {
-                                stop_reason = Some(finish.to_string());
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::MessageDelta {
-                                        stop_reason: Some(finish.to_string()),
-                                    })
+                            if let Some(reasoning) =
+                                delta.get("reasoning_content").and_then(|r| r.as_str())
+                            {
+                                if !reasoning.is_empty() {
+                                    match &mut assistant_reasoning {
+                                        None => assistant_reasoning = Some(reasoning.to_string()),
+                                        Some(r) => r.push_str(reasoning),
+                                    }
+                                    emit_or_stage(
+                                        &self.event_tx,
+                                        &mut staged,
+                                        true,
+                                        reasoning,
+                                        post_content_recovery,
+                                    )
                                     .await;
+                                }
+                            }
+
+                            if let Some(tool_calls_arr) =
+                                delta.get("tool_calls").and_then(|tc| tc.as_array())
+                            {
+                                has_tool_calls = true;
+                                for tc_delta in tool_calls_arr {
+                                    let index =
+                                        tc_delta.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
+
+                                    let entry =
+                                        openai_tool_args.entry(index).or_insert_with(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
+
+                                    if let Some(id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                        entry.0 = id.to_string();
+                                    }
+                                    if let Some(func) = tc_delta.get("function") {
+                                        if let Some(name) =
+                                            func.get("name").and_then(|n| n.as_str())
+                                        {
+                                            merge_tool_call_name(&mut entry.1, name);
+                                        }
+                                        if let Some(args) =
+                                            func.get("arguments").and_then(|a| a.as_str())
+                                        {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(finish) =
+                                choice.get("finish_reason").and_then(|f| f.as_str())
+                            {
+                                if finish != "tool_calls" {
+                                    stop_reason = Some(finish.to_string());
+                                    let _ = self
+                                        .event_tx
+                                        .send(EngineEvent::MessageDelta {
+                                            stop_reason: Some(finish.to_string()),
+                                        })
+                                        .await;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let interrupted = self.event_tx.is_closed();
-            let mut snapshot = request_trace.finish_observed(
+                let interrupted = self.event_tx.is_closed();
+                // Commit this attempt's staged text once, before any tool can run or
+                // the step finishes. An explicit cancellation discards it instead.
                 if interrupted {
-                    "interrupted"
+                    staged.clear();
                 } else {
-                    "completed"
-                },
-                None,
-                http_attempts.attempts(),
-                http_attempts.status(),
-            );
-            // A stream that stopped without a completion marker is a stream
-            // failure. The send layer knows the real HTTP attempt count.
-            let stream_failure =
-                (!interrupted && snapshot["status"] == "stream_error").then(|| {
-                    crate::performance::RequestFailure::stream_incomplete(
-                        http_attempts.attempts(),
-                        http_attempts.status(),
-                        !full_text.is_empty()
-                            || assistant_content.is_some()
-                            || !assistant_tool_calls.is_empty(),
-                    )
-                });
-            if let Some(failure) = &stream_failure {
-                snapshot["failure"] = failure.as_json();
-                snapshot["error"] = json!(failure.diagnostic());
-            }
-            let response_status = snapshot["status"]
-                .as_str()
-                .unwrap_or("interrupted")
-                .to_string();
-            let response_error = snapshot["error"]
-                .as_str()
-                .unwrap_or("Model response ended before completion")
-                .to_string();
-            let _ = self
-                .event_tx
-                .send(EngineEvent::RequestSnapshot(snapshot))
-                .await;
-            // A response cut off by the output limit is "incomplete" in the
-            // trace; continue it below instead of ending the turn.
-            let continue_cut_off = response_status == "incomplete"
-                && stop_reason.as_deref() == Some("length")
-                && output_recoveries < MAX_OUTPUT_RECOVERIES
-                && self
-                    .max_tool_iterations
-                    .is_none_or(|limit| iteration + 1 < limit);
-            if response_status != "completed" && !continue_cut_off {
-                let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
-                return Ok((full_text, Some(response_status)));
+                    full_text.push_str(&flush_staged(&self.event_tx, &mut staged).await);
+                }
+                // The observation is per response: reasoning, tool deltas and an
+                // adapter's content-start marker all count, while turn-wide text
+                // and already assembled tool calls do not.
+                let content_observed = request_trace.first_content_observed();
+                let mut snapshot = request_trace.finish_observed(
+                    if interrupted {
+                        "interrupted"
+                    } else {
+                        "completed"
+                    },
+                    None,
+                    http_attempts.attempts(),
+                    http_attempts.status(),
+                );
+                // A stream that stopped without a completion marker is a stream
+                // failure. The send layer knows the real HTTP attempt count.
+                let stream_failure =
+                    (!interrupted && snapshot["status"] == "stream_error").then(|| {
+                        crate::performance::RequestFailure::stream_incomplete(
+                            http_attempts.attempts(),
+                            http_attempts.status(),
+                            content_observed,
+                        )
+                    });
+                if let Some(failure) = &stream_failure {
+                    snapshot["failure"] = failure.as_json();
+                    snapshot["error"] = json!(failure.diagnostic());
+                }
+                let response_status = snapshot["status"]
+                    .as_str()
+                    .unwrap_or("interrupted")
+                    .to_string();
+                let response_error = snapshot["error"]
+                    .as_str()
+                    .unwrap_or("Model response ended before completion")
+                    .to_string();
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::RequestSnapshot(snapshot))
+                    .await;
+                // A response cut off by the output limit is "incomplete" in the
+                // trace; continue it below instead of ending the turn.
+                let continue_cut_off = response_status == "incomplete"
+                    && stop_reason.as_deref() == Some("length")
+                    && output_recoveries < MAX_OUTPUT_RECOVERIES
+                    && self
+                        .max_tool_iterations
+                        .is_none_or(|limit| iteration + 1 < limit);
+                if response_status != "completed" && !continue_cut_off {
+                    let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
+                    return Ok((full_text, Some(response_status)));
+                }
+                break 'attempt;
             }
             if stop_reason.as_deref() == Some("length")
                 && output_recoveries < MAX_OUTPUT_RECOVERIES

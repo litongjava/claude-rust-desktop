@@ -126,6 +126,9 @@ enum Mode {
     /// must stay independent.
     ApplyPatchReusedId,
     RoleEveryChunk,
+    /// The first response sends a text delta, then stops sending bytes forever,
+    /// so only the configured streaming idle deadline can end it.
+    TimeoutAfterText,
 }
 /// The provider id the ApplyPatch fixture reuses; occurrences must not expose it.
 const APPLY_PATCH_PROVIDER_ID: &str = "apply-1";
@@ -415,6 +418,26 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         ));
         chunks
     };
+    if matches!(state.mode, Mode::TimeoutAfterText) && count == 1 {
+        use futures::StreamExt;
+        let first = format!(
+            "data: {}\n\n",
+            json!({"id":"fixture","choices":[{"index":0,"delta":{"content":"partial timeout text"},"finish_reason":null}]})
+        );
+        // The second frame never arrives; when the client's idle deadline fires
+        // it drops the body, and this stream with it.
+        let stream = futures::stream::once(async move {
+            Ok::<_, std::io::Error>(first)
+        })
+        .chain(futures::stream::once(async move {
+            std::future::pending::<Result<String, std::io::Error>>().await
+        }));
+        return (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
     if matches!(state.mode, Mode::HeldText) && count == 1 {
         // One live turn is held across the control exchange: the protocol's
         // first frame is streamed, the completion frames wait for the test.
@@ -597,6 +620,8 @@ struct Client {
     child: Child,
     input: Option<ChildStdin>,
     output: Lines<BufReader<ChildStdout>>,
+    /// Only captured when the test asserts the process's own diagnostics.
+    stderr: Option<tokio::process::ChildStderr>,
 }
 impl Client {
     async fn frame(&mut self, kind: &str) -> Value {
@@ -638,6 +663,25 @@ impl Client {
             extra,
         )
     }
+    /// Start with the temporary project as the process working directory, so a
+    /// cwd-local `config/orchestration.toml` is what the model transport reads,
+    /// and capture stderr for the end-of-input diagnostic.
+    fn start_in_project_capturing(root: &Path, server: &Server, extra: &[&str]) -> Self {
+        Self::launch_with(
+            root,
+            Some((
+                &server.url,
+                if server.fixture.anthropic {
+                    "anthropic"
+                } else {
+                    "openai"
+                },
+            )),
+            extra,
+            Some(root),
+            true,
+        )
+    }
     /// Start against a provider declared in the data directory's `config.json`
     /// instead of `--base-url`/`--api-format`, which clear the provider's
     /// built-in id and so cannot reach the Responses transport.
@@ -645,8 +689,20 @@ impl Client {
         Self::launch(root, None, extra)
     }
     fn launch(root: &Path, provider: Option<(&str, &str)>, extra: &[&str]) -> Self {
+        Self::launch_with(root, provider, extra, None, false)
+    }
+    fn launch_with(
+        root: &Path,
+        provider: Option<(&str, &str)>,
+        extra: &[&str],
+        directory: Option<&Path>,
+        capture_stderr: bool,
+    ) -> Self {
         std::fs::write(root.join("fixture.txt"), "SDK_READ_SENTINEL").unwrap();
         let mut command = Command::new(std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dcl").into()));
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         command.args([
             "--data-dir",
             root.join("data").to_str().unwrap(),
@@ -677,7 +733,11 @@ impl Client {
             .env("CLAUDE_SDK_FIXTURE_KEY", "fixture-only")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .kill_on_drop(true);
         for key in [
             "ANTHROPIC_API_KEY",
@@ -693,10 +753,12 @@ impl Client {
         let mut child = command.spawn().unwrap();
         let input = child.stdin.take();
         let output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = child.stderr.take();
         Self {
             child,
             input,
             output,
+            stderr,
         }
     }
     async fn send(&mut self, value: Value) {
@@ -753,6 +815,50 @@ impl Client {
                 }
             }
             (self.child.wait().await.unwrap(), results, transcript)
+        })
+        .await
+        .expect("CLI failed to exit after stdin EOF")
+    }
+    /// Close stdin, then report the remaining frames and stderr, so the
+    /// aggregate end-of-input diagnostic can be asserted exactly.
+    async fn finish_with_stderr(
+        mut self,
+    ) -> (
+        std::process::ExitStatus,
+        Vec<Value>,
+        String,
+        String,
+    ) {
+        self.input.take();
+        let mut stderr = self.stderr.take();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let read_stderr = async {
+                let mut text = String::new();
+                if let Some(pipe) = stderr.as_mut() {
+                    let _ = tokio::io::AsyncReadExt::read_to_string(pipe, &mut text).await;
+                }
+                text
+            };
+            let read_stdout = async {
+                let mut results = Vec::new();
+                let mut transcript = String::new();
+                while let Some(line) = self.output.next_line().await.unwrap() {
+                    transcript.push_str(&line);
+                    transcript.push('\n');
+                    let frame: Value = serde_json::from_str(&line).unwrap();
+                    if frame["type"] == "result" {
+                        results.push(frame);
+                    }
+                }
+                (results, transcript)
+            };
+            let ((results, transcript), stderr) = tokio::join!(read_stdout, read_stderr);
+            (
+                self.child.wait().await.unwrap(),
+                results,
+                transcript,
+                stderr,
+            )
         })
         .await
         .expect("CLI failed to exit after stdin EOF")
@@ -1246,6 +1352,159 @@ async fn streaming_process_handles_two_messages_before_eof_in_one_session() {
         assert_eq!(requests.len(), 2);
         assert!(requests[1]["messages"].to_string().contains("first"));
     }
+}
+
+/// A positive streaming idle deadline in the cwd config the child reads.
+fn write_stream_timeout_policy(root: &Path, idle_secs: u64, retries: u32, backoff_ms: u64) {
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    let config = include_str!("../../../src-tauri/config/orchestration.toml")
+        .replace(
+            "request_timeout_secs = 300",
+            &format!("request_timeout_secs = {idle_secs}"),
+        )
+        .replace("max_retries = 7", &format!("max_retries = {retries}"))
+        .replace(
+            "retry_base_backoff_ms = 2000",
+            &format!("retry_base_backoff_ms = {backoff_ms}"),
+        );
+    std::fs::write(root.join("config/orchestration.toml"), config).unwrap();
+}
+
+fn turn_rows(data: &Path, session: &str) -> Vec<(String, String)> {
+    let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
+    let db = paths.open_database().unwrap();
+    db.with_conn(|conn| -> anyhow::Result<Vec<(String, String)>> {
+        let mut statement = conn.prepare(
+            "SELECT id,status FROM execution_turns WHERE conversation_id=?1 ORDER BY started_at, rowid",
+        )?;
+        let mut rows = statement.query([session])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(out)
+    })
+    .unwrap()
+    .unwrap()
+}
+
+fn turn_end_records(data: &Path, session: &str) -> Vec<Value> {
+    let path = data
+        .join("logs/request-attempts")
+        .join(format!("{session}.jsonl"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["type"] == "request_turn_end")
+        .collect()
+}
+
+/// A failed model turn must not end SDK input: the host sends its next prompt
+/// only after reading the failure result, and that turn completes normally.
+#[tokio::test]
+async fn model_stream_timeout_keeps_sdk_stdin_live_after_failed_result() {
+    let root = tempfile::tempdir().unwrap();
+    write_stream_timeout_policy(root.path(), 1, 2, 10);
+    let server = Server::start(false, Mode::TimeoutAfterText).await;
+    let mut client = Client::start_in_project_capturing(root.path(), &server, &[]);
+    client.send(user("first question")).await;
+    let mut first_frames = Vec::new();
+    let first = loop {
+        let frame = client.next_frame().await;
+        let result = frame["type"] == "result";
+        first_frames.push(frame.clone());
+        if result {
+            break frame;
+        }
+    };
+    let session = first["session_id"].as_str().unwrap().to_owned();
+    let first_turn = first["turn"]["turnId"].as_str().unwrap().to_owned();
+    assert_eq!(first["is_error"], true, "{first}");
+    assert_eq!(first["stop_reason"], "stream_error", "{first}");
+    assert_eq!(
+        server.fixture.requests.lock().unwrap().len(),
+        1,
+        "a post-content failure is never replayed"
+    );
+    let timings: Vec<Value> = first_frames
+        .iter()
+        .filter(|frame| frame["type"] == "turn_timing")
+        .cloned()
+        .collect();
+    let terminal: Vec<&Value> = timings
+        .iter()
+        .filter(|frame| frame["turn"]["status"] != "running")
+        .collect();
+    assert_eq!(terminal.len(), 1, "one terminal timing per turn: {timings:?}");
+    assert_eq!(terminal[0]["turn"]["turnId"], first_turn.as_str());
+    assert_eq!(terminal[0]["turn"]["status"], "failed");
+    let ends = turn_end_records(&root.path().join("data"), &session);
+    assert_eq!(ends.len(), 1, "one terminal record per turn: {ends:?}");
+    assert_eq!(ends[0]["turnId"], first_turn.as_str());
+    assert_eq!(ends[0]["outcome"], "failed", "{}", ends[0]);
+
+    // stdin stays open, and the host sends its next prompt after the failure.
+    client.send(user("second unique follow-up")).await;
+    let mut second_frames = Vec::new();
+    let second = loop {
+        let frame = client.next_frame().await;
+        let result = frame["type"] == "result";
+        second_frames.push(frame.clone());
+        if result {
+            break frame;
+        }
+    };
+    let second_turn = second["turn"]["turnId"].as_str().unwrap().to_owned();
+    assert_eq!(second["is_error"], false, "{second}");
+    assert_eq!(second["result"], "reply-2", "{second}");
+    assert_eq!(second["session_id"], session.as_str());
+    assert_ne!(second_turn, first_turn);
+    let second_terminal: Vec<Value> = second_frames
+        .iter()
+        .filter(|frame| frame["type"] == "turn_timing")
+        .filter(|frame| frame["turn"]["status"] != "running")
+        .cloned()
+        .collect();
+    assert_eq!(second_terminal.len(), 1, "{second_frames:?}");
+    assert_eq!(second_terminal[0]["turn"]["turnId"], second_turn.as_str());
+    assert_eq!(second_terminal[0]["turn"]["status"], "completed");
+    {
+        let requests = server.fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "exactly one additional POST");
+        assert!(requests[0].to_string().contains("first question"));
+        assert!(requests[1].to_string().contains("second unique follow-up"));
+    }
+    let rows = turn_rows(&root.path().join("data"), &session);
+    assert_eq!(rows, vec![
+        (first_turn.clone(), "failed".to_owned()),
+        (second_turn.clone(), "completed".to_owned()),
+    ]);
+    let ends = turn_end_records(&root.path().join("data"), &session);
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    assert_eq!(ends[1]["turnId"], second_turn.as_str());
+    assert_eq!(ends[1]["outcome"], "completed", "{}", ends[1]);
+
+    // Only end-of-input turns the sticky failure into the aggregate exit.
+    let (status, extra_results, _transcript, stderr) = client.finish_with_stderr().await;
+    assert!(extra_results.is_empty(), "duplicate result: {extra_results:?}");
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(
+        stderr
+            .matches("One or more SDK turns failed or were interrupted")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    eprintln!(
+        "sdk-timeout: session={session} first={first_turn} second={second_turn} posts={} rows={rows:?} exit_after_eof={:?} aggregate={}",
+        server.fixture.requests.lock().unwrap().len(),
+        status.code(),
+        stderr
+            .matches("One or more SDK turns failed or were interrupted")
+            .count(),
+    );
 }
 
 #[tokio::test]

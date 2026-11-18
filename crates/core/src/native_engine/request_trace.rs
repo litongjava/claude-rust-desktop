@@ -15,8 +15,14 @@ pub struct RequestTrace {
     finish_reason: Option<String>,
     response_id: Option<String>,
     response_finished: bool,
+    /// A `finish_reason` arrived on some choice, which is as terminal as `[DONE]`.
+    terminal_observed: bool,
     /// A provider error event, already reduced to the shared vocabulary.
     remote_failure: Option<crate::performance::RequestFailure>,
+    /// Recovery-only: any shape of provider error event was seen.
+    openai_provider_error: bool,
+    /// Recovery-only: content on a choice the first-choice assembly may skip.
+    openai_recovery_content: bool,
 }
 
 impl RequestTrace {
@@ -37,7 +43,10 @@ impl RequestTrace {
             finish_reason: None,
             response_id: None,
             response_finished: false,
+            terminal_observed: false,
             remote_failure: None,
+            openai_provider_error: false,
+            openai_recovery_content: false,
         }
     }
 
@@ -58,6 +67,30 @@ impl RequestTrace {
 
     pub fn mark_completed(&mut self) {
         self.response_finished = true;
+        self.terminal_observed = true;
+    }
+
+    /// Recovery-only view of this response.
+    ///
+    /// A replay is safe only while the provider had not finished: a raw
+    /// `[DONE]`, a `finish_reason` on *any* choice (a non-leading choice can
+    /// carry `tool_calls`), or a provider SSE error event all mean the model
+    /// already produced its answer, so a later body timeout is not a stall.
+    /// This does not alter the ordinary completion or failure outcome.
+    pub fn post_content_recovery_blocked(&self) -> bool {
+        self.response_finished
+            || self.terminal_observed
+            || self.remote_failure.is_some()
+            || self.openai_provider_error
+    }
+
+    /// Recovery-only view of how much of the response was already produced.
+    ///
+    /// Direct Chat can deliver content on a choice the first-choice assembly
+    /// skips, so this flag counts the deltas the tool loop actually consumes.
+    /// The adapter's content-start marker remains content too.
+    pub fn openai_recovery_content_observed(&self) -> bool {
+        self.openai_recovery_content || self.first_content_observed()
     }
 
     /// A provider error event is remote data: it is reduced here, before the
@@ -78,6 +111,13 @@ impl RequestTrace {
     fn first_content(&mut self) {
         self.first_content_ms
             .get_or_insert(self.clock.elapsed().as_millis() as u64);
+    }
+
+    /// Whether the response being observed has exposed content of any kind:
+    /// text, reasoning, a tool call, or an adapter's content-start marker.
+    /// Turn-wide text and assembled tool calls are not part of this decision.
+    pub fn first_content_observed(&self) -> bool {
+        self.first_content_ms.is_some()
     }
 
     fn merge_usage(&mut self, usage: &Value) {
@@ -114,6 +154,11 @@ impl RequestTrace {
 
     pub fn observe_openai(&mut self, event: &Value) {
         self.observe_error(event);
+        // Both provider error shapes are terminal for recovery, even when a
+        // later read of the still-open body genuinely times out.
+        if super::provider_runtime::chat_error(event).is_some() {
+            self.openai_provider_error = true;
+        }
         if event["response_content_started"] == true {
             self.first_content();
         }
@@ -147,6 +192,30 @@ impl RequestTrace {
                 })
                 .collect();
             self.arguments.clear();
+        }
+        // A finish reason on any choice is terminal, including `tool_calls` on a
+        // non-leading choice that the block assembly below does not read.
+        if let Some(choices) = event["choices"].as_array() {
+            if choices
+                .iter()
+                .any(|choice| choice["finish_reason"].is_string())
+            {
+                self.terminal_observed = true;
+            }
+            // The loop consumes text, thinking and tool deltas from every
+            // choice, so recovery content counts them all; role-only and empty
+            // deltas stay prelude.
+            self.openai_recovery_content |= choices.iter().any(|choice| {
+                let delta = &choice["delta"];
+                ["content", "reasoning_content"].iter().any(|field| {
+                    delta
+                        .get(*field)
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|text| !text.is_empty())
+                }) || delta["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty())
+            });
         }
         let Some(choice) = event["choices"]
             .as_array()
@@ -452,6 +521,90 @@ mod tests {
         assert!(result["contentTokens"].is_null());
         assert_eq!(result["responseBlocks"][0]["text"], "你好");
     }
+    #[test]
+    fn partial_output_alone_does_not_block_recovery_but_every_terminal_signal_does() {
+        // Text without a terminal signal: a later body stall is still a stall.
+        let mut trace = RequestTrace::new(json!({"id":"request"}));
+        trace.observe_openai(&json!({"choices":[{"delta":{"content":"Partial"}}]}));
+        assert!(trace.first_content_observed());
+        assert!(!trace.post_content_recovery_blocked());
+
+        // A raw `[DONE]` closes the response.
+        let mut done = RequestTrace::new(json!({"id":"request"}));
+        done.observe_openai(&json!({"choices":[{"delta":{"content":"Partial"}}]}));
+        done.mark_completed();
+        assert!(done.post_content_recovery_blocked());
+
+        // A finish reason on the leading choice.
+        let mut lead = RequestTrace::new(json!({"id":"request"}));
+        lead.observe_openai(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+        assert!(lead.post_content_recovery_blocked());
+
+        // A finish reason on a non-leading choice, which block assembly ignores.
+        let mut trailing = RequestTrace::new(json!({"id":"request"}));
+        trailing.observe_openai(&json!({"choices":[
+            {"delta":{"content":"Partial"},"finish_reason":null},
+            {"delta":{},"finish_reason":"tool_calls"}
+        ]}));
+        assert!(trailing.post_content_recovery_blocked());
+
+        // A provider SSE error event is terminal even if the body then times out.
+        let mut remote = RequestTrace::new(json!({"id":"request"}));
+        remote.observe_openai(&json!({"error":{"type":"overloaded_error","message":"busy"}}));
+        assert!(remote.post_content_recovery_blocked());
+
+        // Direct Chat can forward the top-level form instead; it vetoes too.
+        let mut top_level = RequestTrace::new(json!({"id":"request"}));
+        top_level.observe_openai(&json!({"type":"error","error":{"type":"overloaded_error"}}));
+        assert!(top_level.post_content_recovery_blocked());
+        let mut bare = RequestTrace::new(json!({"id":"request"}));
+        bare.observe_openai(&json!({"type":"error","message":"busy"}));
+        assert!(bare.post_content_recovery_blocked());
+    }
+
+    #[test]
+    fn recovery_content_counts_every_choice_the_loop_consumes() {
+        // A role-only first choice with text on the second: the loop consumes
+        // it even though the first-choice assembly sees nothing.
+        let mut later_text = RequestTrace::new(json!({"id":"request"}));
+        later_text.observe_openai(&json!({"choices":[
+            {"delta":{"role":"assistant"},"finish_reason":null},
+            {"delta":{"content":"Later"},"finish_reason":null}
+        ]}));
+        assert!(!later_text.first_content_observed());
+        assert!(later_text.openai_recovery_content_observed());
+        assert!(!later_text.post_content_recovery_blocked());
+
+        let mut later_thinking = RequestTrace::new(json!({"id":"request"}));
+        later_thinking.observe_openai(&json!({"choices":[
+            {"delta":{"role":"assistant"},"finish_reason":null},
+            {"delta":{"reasoning_content":"Later"},"finish_reason":null}
+        ]}));
+        assert!(later_thinking.openai_recovery_content_observed());
+
+        let mut later_calls = RequestTrace::new(json!({"id":"request"}));
+        later_calls.observe_openai(&json!({"choices":[
+            {"delta":{"role":"assistant"},"finish_reason":null},
+            {"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"Bash"}}]},"finish_reason":null}
+        ]}));
+        assert!(later_calls.openai_recovery_content_observed());
+
+        // Prelude alone is not content, so A may still retry it.
+        let mut prelude = RequestTrace::new(json!({"id":"request"}));
+        prelude.observe_openai(&json!({"choices":[
+            {"delta":{"role":"assistant"},"finish_reason":null},
+            {"delta":{"content":""},"finish_reason":null},
+            {"delta":{"tool_calls":[]},"finish_reason":null}
+        ]}));
+        assert!(!prelude.openai_recovery_content_observed());
+        assert!(!prelude.first_content_observed());
+
+        // The adapter's content-start marker still counts as content.
+        let mut adapter = RequestTrace::new(json!({"id":"request"}));
+        adapter.observe_openai(&json!({"response_content_started":true}));
+        assert!(adapter.openai_recovery_content_observed());
+    }
+
     #[test]
     fn no_content_failure_does_not_invent_ttft_or_throughput() {
         let trace = RequestTrace::new(json!({"id":"request", "startedAt":1000}));

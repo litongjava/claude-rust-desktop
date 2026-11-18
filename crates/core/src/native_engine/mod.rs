@@ -22,6 +22,7 @@ mod tool_call_ids;
 mod file_state;
 mod utf8_stream;
 mod stream_retry;
+mod model_http;
 
 pub use engine_core::{ExecutorWait, NativeEngine};
 

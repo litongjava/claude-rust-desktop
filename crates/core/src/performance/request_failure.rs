@@ -57,6 +57,12 @@ pub struct RequestFailure {
     status: Option<u16>,
     attempts: Option<u32>,
     content_started: Option<bool>,
+    /// The body read failed with a reqwest timeout. Typed from the transport
+    /// chain, never inferred from provider text or a generic timeout.
+    stream_body_timeout: bool,
+    /// A decoder saw the provider's terminal marker before the body stopped.
+    /// Independent of `stream_body_timeout` and of any no-replay disposition.
+    terminal_marker: Option<bool>,
     cause: String,
     /// Validated correlation ID from the response, when one was provided.
     server_request_id: Option<String>,
@@ -78,6 +84,8 @@ impl RequestFailure {
             status: status_of(error),
             attempts: Some(attempts),
             content_started: None,
+            stream_body_timeout: false,
+            terminal_marker: None,
             cause: sanitized_chain(error),
             server_request_id: api.and_then(|api| api.server_request_id.clone()),
         }
@@ -98,6 +106,7 @@ impl RequestFailure {
             existing.status = existing.status.or(status);
             existing.content_started =
                 Some(existing.content_started.unwrap_or(false) || content_started);
+            existing.stream_body_timeout |= stream_body_timeout_in_chain(error);
             return existing;
         }
         let api = find_in_chain::<super::ApiError>(error);
@@ -107,6 +116,8 @@ impl RequestFailure {
             status: status.or_else(|| status_of(error)),
             attempts,
             content_started: Some(content_started),
+            stream_body_timeout: stream_body_timeout_in_chain(error),
+            terminal_marker: Some(false),
             cause: sanitized_chain(error),
             server_request_id: api.and_then(|api| api.server_request_id.clone()),
         }
@@ -120,6 +131,8 @@ impl RequestFailure {
             status,
             attempts: Some(attempts),
             content_started: Some(false),
+            stream_body_timeout: false,
+            terminal_marker: None,
             cause: format!(
                 "stream closed before any content or completion marker after {attempts} attempts"
             ),
@@ -141,6 +154,8 @@ impl RequestFailure {
             status,
             attempts,
             content_started: Some(content_started),
+            stream_body_timeout: false,
+            terminal_marker: Some(false),
             cause: "provider stream closed without a completion marker".to_owned(),
             server_request_id: None,
         }
@@ -161,6 +176,8 @@ impl RequestFailure {
             status,
             attempts,
             content_started: Some(content_started),
+            stream_body_timeout: false,
+            terminal_marker: Some(false),
             cause: super::safe_remote_value(value),
             server_request_id: super::remote_event_request_id(value),
         }
@@ -182,6 +199,8 @@ impl RequestFailure {
             status: None,
             attempts: Some(attempts),
             content_started: None,
+            stream_body_timeout: false,
+            terminal_marker: None,
             cause: format!("model request attempt budget exhausted after {attempts} attempts"),
             server_request_id: None,
         }
@@ -209,6 +228,29 @@ impl RequestFailure {
 
     pub fn content_started(&self) -> Option<bool> {
         self.content_started
+    }
+
+    /// The response body read failed with a reqwest timeout.
+    ///
+    /// A header or connect timeout, a provider event, a plain EOF and a parser
+    /// error do not qualify, and neither does provider text that merely says
+    /// "timeout": only the transport chain sets this fact.
+    pub fn is_stream_body_timeout(&self) -> bool {
+        self.stage == RequestStage::Stream && self.stream_body_timeout
+    }
+
+    /// Whether the decoder observed the provider's terminal marker before the
+    /// body stopped. `None` means the failure carries no stream observation;
+    /// this bit is never implied by a no-replay disposition.
+    pub fn terminal_marker_observed(&self) -> Option<bool> {
+        self.terminal_marker
+    }
+
+    /// Attach the decoder's terminal observation. The fact can only be raised,
+    /// so wrapping a failure that already recorded one cannot erase it.
+    pub(crate) fn with_terminal_marker(mut self, observed: bool) -> Self {
+        self.terminal_marker = Some(self.terminal_marker.unwrap_or(false) || observed);
+        self
     }
 
     pub fn server_request_id(&self) -> Option<&str> {
@@ -390,6 +432,16 @@ fn status_of(error: &anyhow::Error) -> Option<u16> {
         })
 }
 
+/// A read of the response body itself timed out. `is_body()` separates this
+/// from a header or connect timeout, which carries the same `is_timeout()` bit.
+fn stream_body_timeout_in_chain(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|http| http.is_timeout() && http.is_body())
+    })
+}
+
 /// Join every cause into one sanitized line, dropping duplicate context.
 pub fn sanitized_chain(error: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -568,6 +620,9 @@ pub struct AttemptBudget {
     pub(super) events: Option<tokio::sync::mpsc::Sender<crate::native_engine::tool_loop::EngineEvent>>,
     max: u32,
     used: AtomicU32,
+    /// This budget authorizes a replacement POST: the transport must not add a
+    /// hidden request through redirects or reqwest's internal retries.
+    single_post: bool,
 }
 
 impl AttemptBudget {
@@ -581,7 +636,22 @@ impl AttemptBudget {
             id: uuid::Uuid::new_v4().to_string(),
             events: super::retry_events::sender(),
             used: AtomicU32::new(0),
+            single_post: false,
         }
+    }
+
+    /// One replacement POST, and no physical request the budget did not
+    /// authorize. The transport uses a client without redirects or internal
+    /// retries for this budget.
+    pub fn single_attempt() -> Self {
+        Self {
+            single_post: true,
+            ..Self::new(1)
+        }
+    }
+
+    pub fn is_single_post(&self) -> bool {
+        self.single_post
     }
 
     /// Take the next 0-based attempt index, or `None` when the budget is spent.
@@ -649,6 +719,8 @@ mod tests {
             status: None,
             attempts: Some(3),
             content_started: Some(true),
+            stream_body_timeout: false,
+            terminal_marker: None,
             cause: "body [stage=send; class=permanent] trailing".into(),
             server_request_id: None,
         };
