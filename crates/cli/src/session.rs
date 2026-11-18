@@ -1527,6 +1527,10 @@ impl Session {
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
+        // Captures the signal count synchronously, before any await. A Ctrl-C
+        // delivered while an event is being handled is therefore still seen by
+        // the next wait, instead of becoming that wait's baseline.
+        let mut interrupt = crate::signals::interrupt_scope();
         self.sdk_cancellable(
             deepseek_code_core::services::lifecycle_events::check_configuration(
                 &self.hook_service_context(),
@@ -1726,7 +1730,7 @@ impl Session {
             },
             _ = &mut worker_cancel => bail!("Background task cancelled before model request"),
             result = crate::hook_progress::during(&self.id, interactive_display, request) => result?,
-            _ = crate::signals::interrupted() => {
+            _ = interrupt.interrupted() => {
                 // The engine may have spawned its executor before the request
                 // future completed; cancel it so the turn and its owned tools
                 // are cleaned up instead of left running.
@@ -1819,7 +1823,7 @@ impl Session {
                     event = events.recv() => event.context("Engine stream closed before completion")?,
                     _ = &mut worker_cancel => bail!("Background task cancelled"),
                     _ = remote_interrupts.next() => bail!("Interrupted by Remote Control"),
-                    _ = crate::signals::interrupted() => bail!("Interrupted"),
+                    _ = interrupt.interrupted() => bail!("Interrupted"),
                     _ = refresh.tick() => {
                         progress.tick();
                         if background_transcript {
@@ -2544,7 +2548,10 @@ impl Session {
                             Some(crate::terminal::live::Action::Submit(prompt) | crate::terminal::live::Action::Queue(prompt)) => if let Some(reader)=input.as_mut() { reader.queue_prompt(prompt); },
                             Some(_) => progress.notice("Finishing the current side question; another can be sent from the next prompt."),
                         },
-                        _ = crate::signals::interrupted() => break,
+                        // The turn scope was created before this loop, so a
+                        // Ctrl-C handled while an event above was processed is
+                        // still observed here.
+                        _ = interrupt.interrupted() => break,
                     }
                 }
             }
@@ -2750,6 +2757,9 @@ async fn wait_answer(
     input: &mut Option<TerminalInput>,
     mut answer: tokio::sync::oneshot::Receiver<String>,
 ) -> Result<String> {
+    // Captured before the first poll: this loop handles actions and renders
+    // before waiting again, and a signal in that gap must not be lost.
+    let mut interrupt = crate::signals::interrupt_scope();
     {
         loop {
             tokio::select! {
@@ -2769,7 +2779,7 @@ async fn wait_answer(
                     Some(crate::terminal::live::Action::SideQuestion(question))=>if let Some(reader)=input.as_mut(){reader.queue_prompt(format!("/btw {question}"));},
                     Some(crate::terminal::live::Action::Draft(draft))=>if let Some(reader)=input.as_ref(){reader.restore_draft(draft);},
                 },
-                _=crate::signals::interrupted()=>bail!("Interrupted"),
+                _=interrupt.interrupted()=>bail!("Interrupted"),
             }
         }
     }

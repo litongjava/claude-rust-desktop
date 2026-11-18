@@ -651,6 +651,9 @@ pub fn retryable_goal_error(error: &anyhow::Error, has_worker_frontend: bool) ->
 
 pub async fn wait_goal_retry(session: &Session, id: &str) -> Result<bool> {
     use deepseek_code_core::services::session_goals as goals;
+    // Captured before the first poll: each iteration reads the goal and sleeps,
+    // and a signal during that work must still stop the retry wait.
+    let mut interrupt = crate::signals::interrupt_scope();
     loop {
         let Some(goal) = goals::active(&session.store.db, &session.id)?
             .filter(|g| g.id == id && g.state == "waiting")
@@ -671,7 +674,7 @@ pub async fn wait_goal_retry(session: &Session, id: &str) -> Result<bool> {
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
             _ = deepseek_code_core::services::background_sessions::wait_for_cancellation() => anyhow::bail!("Goal retry interrupted"),
-            _ = crate::signals::interrupted() => anyhow::bail!("Goal retry interrupted"),
+            _ = interrupt.interrupted() => anyhow::bail!("Goal retry interrupted"),
         }
     }
 }

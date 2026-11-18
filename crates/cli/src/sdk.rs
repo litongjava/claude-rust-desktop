@@ -623,6 +623,10 @@ async fn run_inner(
     let mut failed = false;
     let mut started = false;
     let mut answered = Vec::<(String, String)>::new();
+    // Captures the count before the first poll, so a signal received while a
+    // frame, a turn or a control reply is being handled still ends the input
+    // loop instead of becoming the next wait's baseline.
+    let mut signal_scope = crate::signals::interrupt_scope();
     loop {
         for (uuid, id) in std::mem::take(&mut answered) {
             session.sdk_overrides.message_ids.insert(uuid, id);
@@ -703,7 +707,10 @@ async fn run_inner(
             let mut steered = Vec::<SteeredFrame>::new();
             let (interrupt, interrupted) = tokio::sync::watch::channel(false);
             session.sdk_interrupt = Some(interrupted);
-            let turn = Box::pin(async {
+            // The turn's own observation: every signal waiter polled inside
+            // this future records here, so the handoff below is exactly what
+            // this message handled rather than whatever else saw the signal.
+            let turn = Box::pin(crate::signals::capture_turn_interrupt(async {
                 if message.initial_hook {
                     session
                         .turn_initial_hook(cli, &text, &mut terminal, true)
@@ -711,12 +718,14 @@ async fn run_inner(
                 } else {
                     session.turn(cli, &text, &mut terminal).await
                 }
-            });
+            }));
             tokio::pin!(turn);
             let mut turn_failed = false;
-            loop {
+            // The generation this message's turn observed, or `None` when no
+            // waiter inside it returned for an OS signal.
+            let handled = loop {
                 tokio::select! {
-                    result=&mut turn=>{if let Err(error)=result {turn_failed=true;failed=true;if !error.is::<crate::output::ReportedError>() {crate::session::emit_json(&crate::sdk_messages::error_result(&session.id,&format!("{error:#}")))?;}}break;},
+                    (result, observed)=&mut turn=>{if let Err(error)=result {turn_failed=true;failed=true;if !error.is::<crate::output::ReportedError>() {crate::session::emit_json(&crate::sdk_messages::error_result(&session.id,&format!("{error:#}")))?;}}break observed;},
                     frame=frames.recv(),if !eof=>match frame {
                         None=>{
                             eof=true;
@@ -726,7 +735,7 @@ async fn run_inner(
                                 failed=true;turn_failed=true;queue.clear();
                                 discard_steered(&steer_db,&steer_session,&mut steered);
                                 crate::session::emit_json(&crate::sdk_messages::error_result(&session.id,"SDK input closed while a hook or MCP host was required"))?;
-                                break;
+                                break None;
                             }
                             callbacks.close();mcp.close();permissions.closed.store(true,Ordering::SeqCst);permissions.cancel().await;
                         },
@@ -794,7 +803,7 @@ async fn run_inner(
                         },
                     },
                 }
-            }
+            };
             mcp.cancel_all();
             permissions.cancel().await;
             // Frames the turn never read run next, exactly once; delivered ones
@@ -813,12 +822,15 @@ async fn run_inner(
                     }
                 }
             }
+            // Signals the turn handled must not end the session; one that
+            // arrived after the turn stopped watching still does.
+            signal_scope.rearm_to(handled);
             continue;
         }
         if eof {
             break;
         }
-        match tokio::select! {frame=frames.recv()=>frame,_=crate::signals::interrupted()=>bail!("SDK input interrupted")}
+        match tokio::select! {frame=frames.recv()=>frame,_=signal_scope.interrupted()=>bail!("SDK input interrupted")}
         {
             None => {
                 eof = true;
@@ -932,10 +944,13 @@ async fn pump_lifecycle(
     requires_host: bool,
 ) -> Result<()> {
     tokio::pin!(future);
+    // One scope for the whole pump: control replies are handled between waits,
+    // and a signal received then must still interrupt startup.
+    let mut interrupt = crate::signals::interrupt_scope();
     loop {
         tokio::select! {
             result = &mut future => return result,
-            _ = crate::signals::interrupted() => bail!("SDK startup interrupted"),
+            _ = interrupt.interrupted() => bail!("SDK startup interrupted"),
             frame = frames.recv(), if !*eof => match frame {
                 None => {
                     *eof = true;
