@@ -949,14 +949,19 @@ mod tests {
 
     #[cfg(unix)]
     fn make_fifo(root: &Path, name: &str) {
-        use std::os::fd::AsFd;
-        let directory = std::fs::File::open(root).unwrap();
-        rustix::fs::mkfifoat(
-            directory.as_fd(),
-            name,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )
-        .unwrap();
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = root.join(name);
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path remains alive and NUL-terminated throughout the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "creating fixture FIFO {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
     }
 
     #[cfg(unix)]

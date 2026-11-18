@@ -993,7 +993,7 @@ mod tests {
 
     #[cfg(unix)]
     impl UmaskGuard {
-        fn set(mask: u32) -> Self {
+        fn set(mask: rustix::fs::RawMode) -> Self {
             Self(rustix::process::umask(rustix::fs::Mode::from_raw_mode(
                 mask,
             )))
