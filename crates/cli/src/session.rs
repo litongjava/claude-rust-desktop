@@ -91,6 +91,38 @@ pub struct Session {
     lifecycle_owned: bool,
     pub(crate) api_format: deepseek_code_core::native_engine::provider_manager::ApiFormat,
     remote_relay: std::sync::Mutex<Option<deepseek_code_core::services::remote_control::Relay>>,
+    /// Registry incarnation owned by this session; closed on resume or teardown.
+    pub(crate) coordination:
+        Option<deepseek_code_core::services::local_coordination::RegistryGuard>,
+    /// Launch decision retained so a later incarnation registers the same root.
+    coordination_context: Option<crate::local_coordination::CoordinationContext>,
+    /// Whether this session registers itself or a host owns the only row.
+    coordination_mode: crate::local_coordination::RegistrationMode,
+}
+
+/// Publishes `Active` for one turn and `Idle` on every exit, including errors
+/// and cancellation. Only the typed activity value is ever published.
+struct CoordinationActivity<'a>(
+    Option<&'a deepseek_code_core::services::local_coordination::RegistryGuard>,
+);
+
+impl<'a> CoordinationActivity<'a> {
+    fn new(
+        guard: Option<&'a deepseek_code_core::services::local_coordination::RegistryGuard>,
+    ) -> Self {
+        if let Some(guard) = guard {
+            guard.set_activity(deepseek_code_core::services::local_coordination::Activity::Active);
+        }
+        Self(guard)
+    }
+}
+
+impl Drop for CoordinationActivity<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.0 {
+            guard.set_activity(deepseek_code_core::services::local_coordination::Activity::Idle);
+        }
+    }
 }
 
 /// Takes back what the model has not read, steered or Tab-queued, in the order
@@ -458,8 +490,30 @@ impl Session {
     pub async fn open(
         cli: &Cli,
         paths: &RuntimePaths,
+        selection: Selection,
+        resumed_id: Option<&str>,
+    ) -> Result<Self> {
+        Self::open_with_registration(
+            cli,
+            paths,
+            selection,
+            resumed_id,
+            crate::local_coordination::RegistrationMode::Automatic,
+        )
+        .await
+    }
+
+    /// Open a session and register it according to `mode`.
+    ///
+    /// A persistent worker host owns its session's only incarnation, so its
+    /// `Session` opens with [`crate::local_coordination::RegistrationMode::HostOwned`]
+    /// while the host guard registered at startup stands for it.
+    pub(crate) async fn open_with_registration(
+        cli: &Cli,
+        paths: &RuntimePaths,
         mut selection: Selection,
         resumed_id: Option<&str>,
+        mode: crate::local_coordination::RegistrationMode,
     ) -> Result<Self> {
         anyhow::ensure!(
             !cli.fork_session || resumed_id.is_some(),
@@ -683,6 +737,8 @@ impl Session {
         .with_skills_manager(Arc::new(Mutex::new(
             deepseek_code_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
         )));
+        // Registration is a separate step: it waits until startup options chose
+        // the final workspace, so a failed startup publishes no incarnation.
         Ok(Self {
             waiting_for_continue: std::sync::atomic::AtomicBool::new(resumed_id.is_some()),
             hook_wake_cli: std::sync::Mutex::new(None),
@@ -713,6 +769,9 @@ impl Session {
             lifecycle_owned: false,
             api_format,
             remote_relay: Default::default(),
+            coordination: None,
+            coordination_context: None,
+            coordination_mode: mode,
         })
     }
 
@@ -747,21 +806,43 @@ impl Session {
     }
 
     pub async fn start_hooks(&mut self, source: &str) -> Result<()> {
-        use deepseek_code_core::services::session_hooks;
         if self.lifecycle_owned {
             return Ok(());
         }
-        let context = self.hook_service_context();
-        if !session_hooks::owns_lifecycle(&context, &self.id)? {
+        if !self.prepare_start_hooks(&self.id, &self.workspace).await? {
             return Ok(());
         }
+        self.start_prepared_hooks(source).await
+    }
+
+    /// Decide whether this host owns the lifecycle for `id`, and that the hook
+    /// configuration for `workspace` can be read.
+    ///
+    /// A resume or clear runs this against the target before it commits, so a
+    /// failure leaves the current conversation and its incarnation untouched.
+    async fn prepare_start_hooks(&self, id: &str, workspace: &std::path::Path) -> Result<bool> {
+        use deepseek_code_core::services::session_hooks;
+        let context = self.hook_service_context();
+        if !session_hooks::owns_lifecycle(&context, id)? {
+            return Ok(false);
+        }
         deepseek_code_core::services::lifecycle_events::check_configuration(
-            &context,
-            &self.workspace,
-            &self.id,
+            &context, workspace, id,
         )
         .await?;
+        Ok(true)
+    }
+
+    /// Run SessionStart hooks for the committed conversation.
+    ///
+    /// Called only after the preflight succeeded, so a hook failure is a
+    /// diagnostic rather than a session failure: the committed identity and its
+    /// registry row stay valid. Initial startup keeps the returned cancellation
+    /// so an interrupted first hook still fails the launch.
+    async fn start_prepared_hooks(&mut self, source: &str) -> Result<()> {
+        use deepseek_code_core::services::session_hooks;
         self.lifecycle_owned = true;
+        let context = self.hook_service_context();
         let outcome = tokio::select! {
             result = crate::hook_progress::during(&self.id, true, session_hooks::start_with_output(&context, &self.workspace, &self.id, source, &self.model)) => result,
             _ = crate::signals::interrupted() => anyhow::bail!("SessionStart hooks interrupted"),
@@ -777,6 +858,17 @@ impl Session {
             Err(error) => eprintln!("SessionStart hook: {error:#}"),
         }
         Ok(())
+    }
+
+    /// Run the already-preflighted hooks after a committed switch.
+    ///
+    /// The conversation and its registry incarnation are already committed, so a
+    /// cancellation here is one bounded diagnostic: the caller still returns the
+    /// successful switch instead of an error the switch could not undo.
+    async fn finish_committed_start_hooks(&mut self, source: &str) {
+        if let Err(error) = self.start_prepared_hooks(source).await {
+            eprintln!("SessionStart hook: {error:#}");
+        }
     }
 
     pub async fn end_hooks(&mut self, reason: &str) {
@@ -812,9 +904,18 @@ impl Session {
     pub async fn clear(&mut self) -> Result<String> {
         let id = self.store.clear(&self.id)?;
         crate::session_commands::copy_settings(&self.store.db, &self.id, &id)?;
-        let lifecycle_owned = self.lifecycle_owned;
+        // Everything fallible runs before the commit: the target hooks are
+        // preflighted while the old conversation still owns the lifecycle.
+        let prepared = if self.lifecycle_owned {
+            Some(self.prepare_start_hooks(&id, &self.workspace).await?)
+        } else {
+            None
+        };
+        // Read under the old id, before the commit below.
+        let policy = self.store.db.request_recording_policy(&self.id);
         self.end_hooks("clear").await;
-        if let Some(policy) = self.store.db.request_recording_policy(&self.id) {
+        // Commit: no fallible step between these assignments.
+        if let Some(policy) = policy {
             self.store
                 .db
                 .set_request_recording_policy(&id, policy.cli, policy.full_access);
@@ -822,8 +923,9 @@ impl Session {
         self.id = id.clone();
         self.waiting_for_continue
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        if lifecycle_owned {
-            self.start_hooks("clear").await?;
+        self.replace_coordination().await;
+        if prepared == Some(true) {
+            self.finish_committed_start_hooks("clear").await;
         }
         Ok(id)
     }
@@ -849,13 +951,30 @@ impl Session {
         let lifecycle_owned = self.lifecycle_owned;
         // As in the reference CLI, the resumed conversation keeps the mode in use.
         let mode = self.permissions.get_mode();
+        // Everything fallible runs before the commit. The target's permission
+        // write used to run after self.id changed, so a failure left the Session
+        // pointing at a conversation with no registry row; it now runs first.
+        let prepared = if lifecycle_owned {
+            Some(self.prepare_start_hooks(id, &workspace).await?)
+        } else {
+            None
+        };
+        deepseek_code_core::services::session_permission_mode::set(
+            &self.store.db,
+            id,
+            &self.permissions,
+            mode,
+        )?;
+        // Read under the old id, before the commit below.
+        let policy = self.store.db.request_recording_policy(&self.id);
         self.end_hooks("other").await;
+        // Commit: no fallible step between these assignments.
         self.workspace = workspace;
         self.api_format = resolved.provider.api_format;
         self.model = model;
         self.provider_id = provider_id;
         self.auto_route = false;
-        if let Some(policy) = self.store.db.request_recording_policy(&self.id) {
+        if let Some(policy) = policy {
             self.store
                 .db
                 .set_request_recording_policy(id, policy.cli, policy.full_access);
@@ -863,14 +982,9 @@ impl Session {
         self.id = id.to_owned();
         self.waiting_for_continue
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        deepseek_code_core::services::session_permission_mode::set(
-            &self.store.db,
-            &self.id,
-            &self.permissions,
-            mode,
-        )?;
-        if lifecycle_owned {
-            self.start_hooks("resume").await?;
+        self.replace_coordination().await;
+        if prepared == Some(true) {
+            self.finish_committed_start_hooks("resume").await;
         }
         Ok(())
     }
@@ -1091,6 +1205,89 @@ impl Session {
         self.mcp.shutdown_all().await
     }
 
+    /// Close this session's registry incarnation, if any.
+    ///
+    /// Best effort by design: peer visibility must never turn teardown into a
+    /// failure, and a killed process is reported as `Gone` by owner proof.
+    pub(crate) async fn close_coordination(&mut self) {
+        if let Some(mut guard) = self.coordination.take() {
+            let _ = guard.close().await;
+        }
+    }
+
+    /// Shut the session down and always await registry closure afterwards.
+    ///
+    /// The shutdown result is preserved, so a caller that reports it still sees
+    /// the original error even though the incarnation was released.
+    pub(crate) async fn close_owned(&mut self) -> Result<()> {
+        let shutdown = self.close().await;
+        self.close_coordination().await;
+        shutdown
+    }
+
+    /// Publish the launch's registry incarnation now that startup succeeded.
+    pub(crate) async fn activate_coordination(
+        &mut self,
+        prepared: crate::local_coordination::PreparedCoordination,
+    ) {
+        if self.coordination_mode != crate::local_coordination::RegistrationMode::Automatic {
+            return;
+        }
+        self.publish_coordination(&prepared).await;
+    }
+
+    /// Publish one prepared decision and keep it for the next incarnation.
+    async fn publish_coordination(
+        &mut self,
+        prepared: &crate::local_coordination::PreparedCoordination,
+    ) {
+        self.coordination_context = Some(prepared.context.clone());
+        self.coordination = if prepared.enabled {
+            crate::local_coordination::register_with_context(
+                &prepared.context,
+                self.paths.data_dir.clone(),
+                self.id.clone(),
+                self.workspace.clone(),
+            )
+            .await
+        } else {
+            None
+        };
+    }
+
+    /// The native launch root a child of this session must inherit.
+    pub(crate) fn coordination_child_root(&self) -> Option<&std::ffi::OsStr> {
+        self.coordination_context
+            .as_ref()
+            .and_then(|context| context.child_root())
+    }
+
+    /// Replace the incarnation after a committed transition.
+    ///
+    /// The opt-in decision is read again once. A disabled edit therefore closes
+    /// the old row and publishes nothing, while the launch context is retained
+    /// so a later re-enable never re-resolves the root. An unchanged session
+    /// keeps its guard: this only runs from a committed resume, clear or switch.
+    async fn replace_coordination(&mut self) {
+        if self.coordination_mode != crate::local_coordination::RegistrationMode::Automatic {
+            return;
+        }
+        let Some(context) = self.coordination_context.clone() else {
+            return;
+        };
+        let prepared = crate::local_coordination::prepare_next_incarnation(
+            context,
+            self.paths.data_dir.clone(),
+        )
+        .await;
+        let previous = self.coordination.take();
+        self.publish_coordination(&prepared).await;
+        // Closed even when the new attempt is disabled or failed.
+        if let Some(mut previous) = previous {
+            let _ = previous.close().await;
+        }
+    }
+
     /// Follows EnterWorktree/ExitWorktree from the last turn: the bound
     /// worktree, or the recorded source folder once a worktree is left.
     pub fn sync_workspace(&mut self) -> Result<()> {
@@ -1113,6 +1310,11 @@ impl Session {
         if let Some(target) = target.filter(|path| path.is_dir() && *path != self.workspace) {
             std::env::set_current_dir(&target)?;
             self.workspace = target;
+            // Only an actual change asks the registry worker for a new
+            // observation; the fenced write stays on that worker.
+            if let Some(guard) = self.coordination.as_ref() {
+                guard.request_workspace_refresh(self.workspace.clone());
+            }
         }
         Ok(())
     }
@@ -1540,6 +1742,12 @@ impl Session {
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
+        // Each later turn start re-observes the workspace even when the path
+        // did not change, so a branch checkout made elsewhere becomes visible.
+        if let Some(guard) = self.coordination.as_ref() {
+            guard.request_workspace_refresh(self.workspace.clone());
+        }
+        let _coordination_activity = CoordinationActivity::new(self.coordination.as_ref());
         self.sdk_cancellable(
             deepseek_code_core::services::lifecycle_events::check_configuration(
                 &self.hook_service_context(),
@@ -3996,6 +4204,566 @@ mod event_tests {
                 "agent_type": "reviewer", "status": "tool_failed", "tool_name": "Read"
             })
         );
+    }
+
+    /// Runs the isolated incarnation fixture in its own process: the fixture
+    /// changes the process working directory, which must not leak into the
+    /// shared test runner. The helper's result is this test's result.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_resume_replaces_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session::event_tests::lc_registry_session_workspace_helper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("DCL_LC_SESSION_FIXTURE", dir.path())
+            .env("DCL_LC_SESSION_NONCE", &nonce)
+            .env_remove("DEEPSEEK_CODE_COORDINATION_DIR")
+            .env_remove("DEEPSEEK_CODE_DATA_DIR")
+            .output()
+            .expect("the isolated fixture process starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the isolated fixture failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("session::event_tests::lc_registry_session_workspace_helper")
+                && stdout.contains("1 passed"),
+            "the exact helper ran once: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A successful resume closes the old incarnation and publishes a fresh one
+    /// for the new id and workspace; a failed resume keeps the current row.
+    /// A workspace change is only requested for the registry worker to observe.
+    ///
+    /// Infrastructure for the parent test above, never an acceptance test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "process helper: run by registry_resume_replaces_incarnation"]
+    async fn lc_registry_session_workspace_helper() {
+        use clap::Parser;
+        use deepseek_code_core::services::local_coordination::{
+            CoordinationPaths, Lifecycle, Store,
+        };
+
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("DCL_LC_SESSION_FIXTURE").expect("isolated fixture directory"),
+        );
+        assert!(
+            std::env::var_os("DCL_LC_SESSION_NONCE").is_some(),
+            "the fixture was started with a private nonce"
+        );
+        let paths = RuntimePaths::new(dir.join("data")).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join("settings.json"),
+            r#"{"localCoordination":{"enabled":true,"registry":true}}"#,
+        )
+        .unwrap();
+        let root = dir.join("coord");
+        let cli = Cli::parse_from(["dcl", "--print", "--coordination-dir", root.to_str().unwrap()]);
+        let provider = serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        let selection = Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture".into(),
+        };
+        let first_workspace = dir.join("first");
+        let second_workspace = dir.join("second");
+        let third_workspace = dir.join("third");
+        for workspace in [&first_workspace, &second_workspace, &third_workspace] {
+            std::fs::create_dir_all(workspace).unwrap();
+        }
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first = store
+            .create(&first_workspace, "fixture", "fixture")
+            .unwrap();
+        let second = store
+            .create(&second_workspace, "fixture", "fixture")
+            .unwrap();
+        let rows = || {
+            let paths = CoordinationPaths { root: root.clone() };
+            Store::open_read(&paths)
+                .unwrap()
+                .map(|store| store.rows(100).unwrap())
+                .unwrap_or_default()
+        };
+
+        let mut session = Session::open(&cli, &paths, selection, Some(&first))
+            .await
+            .unwrap();
+        // Opening has no registry side effect; startup publishes explicitly.
+        assert!(session.coordination.is_none());
+        let prepared =
+            crate::local_coordination::prepare_startup(&cli, &paths, Some(dir.as_path())).await;
+        assert!(prepared.enabled, "the fixture opts in");
+        session.activate_coordination(prepared).await;
+        assert_eq!(
+            session.workspace.canonicalize().unwrap(),
+            first_workspace.canonicalize().unwrap()
+        );
+        let first_instance = session
+            .coordination
+            .as_ref()
+            .expect("the session registered")
+            .instance_id()
+            .to_owned();
+        let first_row = rows()
+            .into_iter()
+            .find(|row| row.instance_id == first_instance)
+            .expect("the first incarnation is stored");
+        assert_eq!(first_row.session_id.as_deref(), Some(first.as_str()));
+        assert_eq!(first_row.lifecycle, Lifecycle::Open);
+
+        // A successful saved resume replaces the old incarnation.
+        session.resume_saved(&paths, &second).await.unwrap();
+        assert_eq!(session.id, second);
+        assert_eq!(
+            session.workspace.canonicalize().unwrap(),
+            second_workspace.canonicalize().unwrap()
+        );
+        let second_instance = session
+            .coordination
+            .as_ref()
+            .expect("the resumed session registered")
+            .instance_id()
+            .to_owned();
+        assert_ne!(first_instance, second_instance, "a resume is a new incarnation");
+        let stored = rows();
+        let closed = stored
+            .iter()
+            .find(|row| row.instance_id == first_instance)
+            .expect("the old row is retained");
+        assert_eq!(closed.lifecycle, Lifecycle::Closed);
+        let fresh = stored
+            .iter()
+            .find(|row| row.instance_id == second_instance)
+            .expect("the fresh row exists");
+        assert_eq!(fresh.session_id.as_deref(), Some(second.as_str()));
+        assert_eq!(fresh.lifecycle, Lifecycle::Open);
+        assert_eq!(
+            fresh.workspace.to_path().unwrap().canonicalize().unwrap(),
+            second_workspace.canonicalize().unwrap()
+        );
+
+        // A failed resume preserves the current guard and its open row.
+        assert!(session
+            .resume_saved(&paths, &uuid::Uuid::new_v4().to_string())
+            .await
+            .is_err());
+        assert_eq!(
+            session.coordination.as_ref().unwrap().instance_id(),
+            second_instance
+        );
+        assert!(rows()
+            .iter()
+            .any(|row| row.instance_id == second_instance && row.lifecycle == Lifecycle::Open));
+
+        // A changed workspace asks the registry worker to observe it.
+        session
+            .store
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        session.id,
+                        "round06-project",
+                        second_workspace.display().to_string(),
+                        second_workspace.display().to_string(),
+                        third_workspace.display().to_string(),
+                        "round06"
+                    ],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        session.sync_workspace().unwrap();
+        std::env::set_current_dir(&original_cwd).unwrap();
+        assert_eq!(session.workspace, third_workspace);
+        let expected = third_workspace.canonicalize().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let observed = rows()
+                .into_iter()
+                .find(|row| row.instance_id == second_instance)
+                .and_then(|row| row.workspace.to_path().ok())
+                .and_then(|path| path.canonicalize().ok());
+            if observed.as_deref() == Some(expected.as_path()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the registry never observed the changed workspace"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Normal teardown closes the final frontend row.
+        session.close_coordination().await;
+        assert!(session.coordination.is_none());
+        assert!(rows()
+            .iter()
+            .any(|row| row.instance_id == second_instance && row.lifecycle == Lifecycle::Closed));
+    }
+
+    /// One provider entry for the coordination lifecycle fixtures.
+    #[cfg(target_os = "linux")]
+    fn lc_selection() -> Selection {
+        let provider = serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":true,"models":[{"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
+        Selection {
+            providers: vec![provider],
+            provider_id: "fixture".into(),
+            model: "fixture".into(),
+        }
+    }
+
+    /// An opted-in data directory plus the explicit absolute coordination root.
+    #[cfg(target_os = "linux")]
+    fn lc_fixture(
+        dir: &std::path::Path,
+        enabled: bool,
+    ) -> (RuntimePaths, Cli, std::path::PathBuf) {
+        use clap::Parser;
+        let paths = RuntimePaths::new(dir.join("data")).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        lc_set_enabled(&paths, enabled);
+        let root = dir.join("coord");
+        let cli = Cli::parse_from(["dcl", "--print", "--coordination-dir", root.to_str().unwrap()]);
+        (paths, cli, root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lc_set_enabled(paths: &RuntimePaths, enabled: bool) {
+        std::fs::write(
+            paths.data_dir.join("settings.json"),
+            format!(r#"{{"localCoordination":{{"enabled":{enabled},"registry":true}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lc_rows(
+        root: &std::path::Path,
+    ) -> Vec<deepseek_code_core::services::local_coordination::Registration> {
+        let paths = deepseek_code_core::services::local_coordination::CoordinationPaths {
+            root: root.to_path_buf(),
+        };
+        deepseek_code_core::services::local_coordination::Store::open_read(&paths)
+            .unwrap()
+            .map(|store| store.rows(100).unwrap())
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lc_owner_files(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("owners"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// Open one saved conversation and publish it, as startup does.
+    #[cfg(target_os = "linux")]
+    async fn lc_open(
+        cli: &Cli,
+        paths: &RuntimePaths,
+        id: &str,
+        dir: &std::path::Path,
+    ) -> Session {
+        let mut session = Session::open(cli, paths, lc_selection(), Some(id))
+            .await
+            .unwrap();
+        let prepared = crate::local_coordination::prepare_startup(cli, paths, Some(dir)).await;
+        assert!(prepared.enabled, "the fixture opts in");
+        session.activate_coordination(prepared).await;
+        assert!(session.coordination.is_some(), "the fixture registered");
+        session
+    }
+
+    /// A permission write for the target fails before the commit, so the old ID,
+    /// workspace, provider and guard stay aligned with the still-open row.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn registry_resume_permission_write_failure_preserves_incarnation() {
+        use deepseek_code_core::services::local_coordination::Lifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, cli, root) = lc_fixture(dir.path(), true);
+        let first_workspace = dir.path().join("first");
+        let second_workspace = dir.path().join("second");
+        for workspace in [&first_workspace, &second_workspace] {
+            std::fs::create_dir_all(workspace).unwrap();
+        }
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first = store.create(&first_workspace, "fixture", "fixture").unwrap();
+        let second = store
+            .create(&second_workspace, "fixture", "fixture")
+            .unwrap();
+
+        let mut session = lc_open(&cli, &paths, &first, dir.path()).await;
+        let guard = session
+            .coordination
+            .as_ref()
+            .unwrap()
+            .instance_id()
+            .to_owned();
+        let waiting = session.waiting_for_continue();
+        // The durable mode write is the last fallible step before the commit.
+        session
+            .store
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER lc_fixture_permission BEFORE INSERT ON peripheral_settings \
+                     WHEN NEW.key='cli.permission-mode.{second}' \
+                     BEGIN SELECT RAISE(ABORT,'fixture permission write'); END;"
+                ))
+            })
+            .unwrap()
+            .unwrap();
+
+        let error = session
+            .resume_saved(&paths, &second)
+            .await
+            .expect_err("the fixture write fails");
+        assert!(
+            format!("{error:#}").contains("fixture permission write"),
+            "{error:#}"
+        );
+        assert_eq!(session.id, first, "the old identity is kept");
+        assert_eq!(session.provider_id, "fixture");
+        assert_eq!(session.model, "fixture");
+        assert_eq!(
+            session.workspace.canonicalize().unwrap(),
+            first_workspace.canonicalize().unwrap()
+        );
+        assert_eq!(
+            session.waiting_for_continue(),
+            waiting,
+            "the waiting state is unchanged"
+        );
+        assert_eq!(session.coordination.as_ref().unwrap().instance_id(), guard);
+        let rows = lc_rows(&root);
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == guard && row.lifecycle == Lifecycle::Open));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.session_id.as_deref() == Some(second.as_str())),
+            "no target row was published"
+        );
+
+        // Without the fault the same resume commits a fresh incarnation.
+        session
+            .store
+            .db
+            .with_conn(|conn| conn.execute_batch("DROP TRIGGER lc_fixture_permission"))
+            .unwrap()
+            .unwrap();
+        session.resume_saved(&paths, &second).await.unwrap();
+        assert_eq!(session.id, second);
+        let fresh = session
+            .coordination
+            .as_ref()
+            .expect("the resumed session registered")
+            .instance_id()
+            .to_owned();
+        assert_ne!(fresh, guard);
+        let rows = lc_rows(&root);
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == guard && row.lifecycle == Lifecycle::Closed));
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == fresh && row.lifecycle == Lifecycle::Open));
+        session.close_coordination().await;
+        assert!(lc_rows(&root)
+            .iter()
+            .any(|row| row.instance_id == fresh && row.lifecycle == Lifecycle::Closed));
+    }
+
+    /// A target whose hook configuration cannot be read fails the preflight, so
+    /// the old lifecycle owner, identity and guard are untouched; once the
+    /// fixture is restored the same transition commits and runs hooks once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn registry_resume_hook_preflight_failure_preserves_incarnation() {
+        use deepseek_code_core::services::local_coordination::Lifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, cli, root) = lc_fixture(dir.path(), true);
+        let first_workspace = dir.path().join("first");
+        let second_workspace = dir.path().join("second");
+        for workspace in [&first_workspace, &second_workspace] {
+            std::fs::create_dir_all(workspace).unwrap();
+        }
+        let marker = dir.path().join("hook-runs");
+        std::fs::write(
+            paths.data_dir.join("settings.json"),
+            serde_json::json!({
+                "localCoordination": {"enabled": true, "registry": true},
+                "hooks": {"SessionStart": [{"hooks": [{
+                    "type": "command",
+                    "command": format!("printf x >> '{}'", marker.display())
+                }]}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first = store.create(&first_workspace, "fixture", "fixture").unwrap();
+        let second = store
+            .create(&second_workspace, "fixture", "fixture")
+            .unwrap();
+
+        let mut session = lc_open(&cli, &paths, &first, dir.path()).await;
+        let guard = session
+            .coordination
+            .as_ref()
+            .unwrap()
+            .instance_id()
+            .to_owned();
+        // Stand in for a host that already owns this conversation's lifecycle.
+        session.lifecycle_owned = true;
+
+        // A directory where the settings file belongs makes the read fail.
+        std::fs::create_dir_all(second_workspace.join(".claude/settings.json")).unwrap();
+        let error = session
+            .resume_saved(&paths, &second)
+            .await
+            .expect_err("the preflight read fails");
+        assert!(
+            format!("{error:#}").contains("settings.json"),
+            "{error:#}"
+        );
+        assert_eq!(session.id, first, "the old identity is kept");
+        assert_eq!(
+            session.workspace.canonicalize().unwrap(),
+            first_workspace.canonicalize().unwrap()
+        );
+        assert!(session.lifecycle_owned, "the old lifecycle is still owned");
+        assert_eq!(session.coordination.as_ref().unwrap().instance_id(), guard);
+        assert!(
+            !lc_rows(&root)
+                .iter()
+                .any(|row| row.session_id.as_deref() == Some(second.as_str())),
+            "no target row was published"
+        );
+        assert!(!marker.exists(), "no hook ran before the commit");
+
+        // Restore the fixture: the transition commits and runs hooks exactly once.
+        std::fs::remove_dir_all(second_workspace.join(".claude/settings.json")).unwrap();
+        session.resume_saved(&paths, &second).await.unwrap();
+        assert_eq!(session.id, second);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x", "SessionStart ran once");
+        assert!(session.lifecycle_owned);
+        let rows = lc_rows(&root);
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == guard && row.lifecycle == Lifecycle::Closed));
+        assert!(rows.iter().any(|row| {
+            row.session_id.as_deref() == Some(second.as_str()) && row.lifecycle == Lifecycle::Open
+        }));
+        session.close_coordination().await;
+    }
+
+    /// Turning coordination off replaces nothing: a committed resume or clear
+    /// closes the old row and publishes no new row or owner lease, while the
+    /// unchanged session keeps its row until the transition.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn registry_settings_off_prevents_resume_and_clear_incarnations() {
+        use deepseek_code_core::services::local_coordination::Lifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, cli, root) = lc_fixture(dir.path(), true);
+        let mut ids = Vec::new();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        for name in ["first", "second", "third"] {
+            let workspace = dir.path().join(name);
+            std::fs::create_dir_all(&workspace).unwrap();
+            ids.push(store.create(&workspace, "fixture", "fixture").unwrap());
+        }
+        let (first, second, third) = (&ids[0], &ids[1], &ids[2]);
+
+        let mut session = lc_open(&cli, &paths, first, dir.path()).await;
+        let guard = session
+            .coordination
+            .as_ref()
+            .unwrap()
+            .instance_id()
+            .to_owned();
+        // Disabling settings must not take down the running incarnation.
+        lc_set_enabled(&paths, false);
+        assert!(lc_rows(&root)
+            .iter()
+            .any(|row| row.instance_id == guard && row.lifecycle == Lifecycle::Open));
+        let owners = lc_owner_files(&root);
+
+        session.resume_saved(&paths, second).await.unwrap();
+        assert_eq!(&session.id, second);
+        assert!(session.coordination.is_none(), "no incarnation while off");
+        let rows = lc_rows(&root);
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == guard && row.lifecycle == Lifecycle::Closed));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.session_id.as_deref() == Some(second.as_str())),
+            "no row for the off transition"
+        );
+        assert_eq!(lc_owner_files(&root), owners, "no new owner lease");
+
+        // The positive control: re-enabling publishes the next transition.
+        lc_set_enabled(&paths, true);
+        session.resume_saved(&paths, third).await.unwrap();
+        assert!(session.coordination.is_some(), "re-enabled transition registers");
+        session.close_coordination().await;
+
+        // The clear path behaves the same way on its own fixture.
+        let clear_dir = tempfile::tempdir().unwrap();
+        let (clear_paths, clear_cli, clear_root) = lc_fixture(clear_dir.path(), true);
+        let workspace = clear_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let id = SessionStore::new(clear_paths.open_database().unwrap())
+            .create(&workspace, "fixture", "fixture")
+            .unwrap();
+        let mut cleared = lc_open(&clear_cli, &clear_paths, &id, clear_dir.path()).await;
+        let clear_guard = cleared
+            .coordination
+            .as_ref()
+            .unwrap()
+            .instance_id()
+            .to_owned();
+        lc_set_enabled(&clear_paths, false);
+        let clear_owners = lc_owner_files(&clear_root);
+        let new_id = cleared.clear().await.unwrap();
+        assert_ne!(new_id, id);
+        assert!(cleared.coordination.is_none(), "no incarnation while off");
+        assert_eq!(cleared.id, new_id);
+        let rows = lc_rows(&clear_root);
+        assert!(rows
+            .iter()
+            .any(|row| row.instance_id == clear_guard && row.lifecycle == Lifecycle::Closed));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.session_id.as_deref() == Some(new_id.as_str())),
+            "no row for the cleared conversation"
+        );
+        assert_eq!(lc_owner_files(&clear_root), clear_owners);
     }
 }
 

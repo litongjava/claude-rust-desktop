@@ -58,6 +58,7 @@ pub mod updates;
 pub mod plugins;
 pub mod session_import;
 pub mod skill_usage;
+pub mod local_coordination;
 
 use crate::{db::DbManager, runtime::RuntimePaths};
 use anyhow::{ensure, Context, Result};

@@ -156,6 +156,7 @@ pub async fn run(
     push_to_talk: bool,
     continuous: bool,
     send: bool,
+    coordination: Option<crate::local_coordination::PreparedCoordination>,
 ) -> Result<()> {
     use std::io::IsTerminal;
     ensure!(
@@ -208,7 +209,7 @@ pub async fn run(
     } else {
         None
     };
-    let session = if send {
+    let mut session = if send {
         Some(
             crate::session::Session::open(
                 cli,
@@ -226,6 +227,10 @@ pub async fn run(
     } else {
         None
     };
+    // Configuration validated and the sending session exists: publish now.
+    if let (Some(prepared), Some(session)) = (coordination, session.as_mut()) {
+        session.activate_coordination(prepared).await;
+    }
     let mut input = if file.is_none() {
         Some(crate::session::terminal_input())
     } else {
@@ -285,8 +290,9 @@ pub async fn run(
         Ok::<_, anyhow::Error>(())
     };
     let result = tokio::select! {result=operation=>result,_=crate::signals::interrupted()=>Ok(())};
-    if let Some(session) = session {
-        session.close().await?;
+    if let Some(mut session) = session {
+        // The operation result is captured above; shutdown still reports first.
+        session.close_owned().await?;
     }
     Ok(result?)
 }
