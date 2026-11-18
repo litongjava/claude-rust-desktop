@@ -1141,3 +1141,284 @@ Windows 测试编译回归（Codex 04）：core 的 `--lib <filter>` 仍会编�
 2. `cargo test --locked -p deepseek-code-core --lib background_shell`：`stop_running_session_tasks_stops_only_its_own_running_shells`（同一会话一个运行中、一个已完成，另一个会话一个运行中；只请求第一个）、`a_failing_stop_does_not_skip_the_other_tasks`（B 的 cancel 路径被目录占据时 A、C 仍确认停止，B 记入 failed）、`a_task_that_ends_by_itself_is_not_reported_as_stopped`（请求后任务自行 `completed`，不记入 stopped/requested）、`an_unreadable_log_does_not_hide_a_cancelled_status`（`stdout.log` 换成目录后仍确认 cancelled）、`confirmation_respects_one_deadline_with_a_locked_task_database`（另一个连接 `BEGIN EXCLUSIVE` 持有任务库时，current-thread 运行时上的停止在 6 秒内返回且并发 ticker 仍在推进）、`an_abandoned_request_sends_no_further_stops` / `an_expired_deadline_sends_no_further_stops`（放弃标志或已过期预算下请求阶段不发出任何停止）、`a_request_that_stopped_itself_is_reported_as_incomplete`（请求阶段自行发现超时并准时返回时仍带 `timed out after 5 seconds before every task was checked`，已发布的 A 记入 requested、B 记入 failed；完全空结果同样带该行）、`a_timed_out_request_keeps_its_partial_results_and_stops_no_more`（调用方超时后保留已发布的 A/B，释放阻塞的请求任务后它不再启动新的停止）。
 3. `cargo test --locked -p deepseek-code-core --lib a_foreground_call_that_reaches_its_timeout_moves_to_the_background`：前台超时仍转入后台；Ctrl+B 转后台用例保持通过。
 4. 真实终端：让子代理启动 `sleep 300` 后台命令后结束；父会话结果出现 `Stopped 1 background task(s)`，`ps` 中不再有该 `sleep 300`。
+
+### 本地协调根与默认关闭设置（R1 第 1 轮）
+
+协调根独立于会话数据目录：`--coordination-dir` > `DEEPSEEK_CODE_COORDINATION_DIR` > `home/.deepseek-code/coordination/v1`；相对路径以调用方显式传入的启动目录（`-C` 之前）为基准。解析、读取设置和只读命令不得创建目录或文件；只有 `CoordinationPaths::prepare_private` 才创建协调子树。
+
+- `cargo test --locked -p deepseek-code-core --lib services::local_coordination`：本轮四个用例必须全部匹配并通过。
+- `coordination_paths_ignore_data_dir`：两个互不相关的数据目录及其中不同的 `localCoordination` 设置不参与解析；显式参数 > 环境变量 > home；相对覆盖跟随启动目录而不是 `-C`；空覆盖、缺少 home、根以上路径穿越报错；`database()` 固定为 `root/coordination.sqlite3`。
+- `coordination_disabled_creates_nothing`：缺失设置和显式 `enabled:false` 都是关闭；缺失文件不创建数据目录；解析不存在的根后目录项数量不变。
+- `coordination_settings_validate_section`：允许 UTF-8 BOM 和无关顶层键；JSON 损坏、根非对象、段内类型错误或未知键报错；成功与失败加载前后文件字节完全相同（从不回写）。
+- `coordination_paths_are_private`：Unix/Linux 下新建目录 0700、文件 0600（创建后显式设置，不受 umask 影响）；符号链接叶、普通文件叶、过宽权限的既有根目录被拒绝且不被 chmod；私有文件检查属主与普通文件；空格/Unicode 路径可写入并读回。
+
+原生权限断言仅在 Linux/Unix 上运行，不能当作 Windows ACL 证据；非 Linux 的运行期参与能力拒绝属于后续 owner 适配器，本模块的纯路径解析不承担该拒绝。本轮不创建 SQLite、心跳或 CLI 接线。
+
+#### 第 1 轮修复（描述符相对创建与校验）
+
+`prepare_private` 与 `private_file` 改为从 `/` 开始逐组件用 `openat`/`mkdirat`/`statat` 遍历并使用已持有的目录描述符：解析得到的路径只是定位器。创建后通过该描述符 `fchmod`，不按路径名 chmod；既有对象只校验不修复；`AlreadyExists` 只接受安全的对等目录。过滤命令同上；实际应匹配 17 个通过用例与 1 个默认忽略的 `lc_process_helper`（子进程夹具，不算独立验收）。
+
+- `coordination_created_leaf_swap_never_chmods_target`：`AfterMkdir` 把新目录移走并换成指向无关 0755 目录的符号链接；必须报错，目标目录 dev/inode、0755 模式和哨兵字节不变，目标下不新增文件，钩子只触发一次。
+- `coordination_parent_replacement_cannot_redirect_creation`：解析后把父路径替换为符号链接必须失败且替换目录为空；在 `BeforeMkdir`（父描述符已持有）替换时，要么在改名后的原目录下创建成功，要么检测到替换后失败，替换目录始终为空；`private_file` 父路径含符号链接时报错且目标目录无状态文件。
+- `coordination_concurrent_prepare_accepts_valid_peer`：两个真实子进程（`current_exe` 加 `--exact ... lc_process_helper --ignored --test-threads=1`，仅子进程环境变量携带模式、夹具目录与 nonce）在缺失单组件根上同时 `prepare_private`；两者 umask 0077，在 `BeforeMkdir` 发布 ready-PID 后等待父进程 release。父进程确认两个不同 PID、两份结果标记的 dev/inode 相同且模式 0700，请求名下恰好一个目录。
+- `coordination_competing_unsafe_leaf_is_preserved`：`BeforeMkdir` 放入 0755 目录或符号链接，生产 `mkdirat` 收到 EEXIST；两种情况都失败，前者 0755 与 inode 保留，后者符号链接与目标内容/模式保留。
+- `coordination_competing_unsafe_intermediate_is_rejected`：根为 `<夹具>/a/b/coord`，`a` 已是 0700、`b` 缺失；在 `b` 的 `BeforeMkdir` 创建 `b` 为 0755 目录，生产 `mkdirat` 收到 EEXIST。`prepare_private` 必须报错，`b` 保持 0755 与同一 inode，`b/coord` 与 `b` 下任何条目都不存在。空 `mkdirat` 之后的 EEXIST 一律按私有后缀校验（`was_missing: true`），因此合法的 0700 对等中间目录仍被接受，`coordination_concurrent_prepare_accepts_valid_peer` 继续通过。
+- `coordination_existing_root_requires_exact_0700`：既有 0400、0500、0755、01700 根都失败且模式/inode 不变；0700 成功且不变。
+- `coordination_fifo_rejection_preserves_metadata`：0700 父目录中的 0644 FIFO 被 `private_file(false)` 立即拒绝，类型/inode/模式不变（FIFO 无普通文件内容可比）。
+- `coordination_file_reopen_preserves_mode_and_bytes`：既有 0644 拒绝且不变；既有 0600 在 `false` 下打开而不截断/改权限，`true` 报已存在且不替换；缺失叶在 `false` 下可创建为 0600 普通文件；符号链接叶报错且目标字节/模式不变。
+- `coordination_uid_mismatch_is_rejected`：`check_uid` 正反例；把真实 `Stat` 复制后只改 `st_uid`，目录创建前校验、既有目录校验和描述符文件校验都拒绝；把目录描述符的 `fstat` 交给常规文件校验也拒绝（证明校验基于描述符而非路径）。
+- `coordination_private_file_has_cloexec`：新建与既有返回文件都断言 `FD_CLOEXEC`。
+- `coordination_restrictive_umask_still_creates_private_state`：子进程把 umask 设为 0777 后创建两级缺失目录与标记文件，恢复 umask 后报告模式；父进程独立断言 0700/0700/0600 与当前 UID。该兜底仅在 Linux 上经 `/proc/self/fd` 的 `chmodat` 完成；其他 Unix 分支直接报错。
+- `coordination_data_dir_env_does_not_split_default_root`：两个子进程带不同 `DEEPSEEK_CODE_DATA_DIR`，解析结果都是同一 `home/.deepseek-code/coordination/v1`，不落在数据目录内，且不创建协调根或数据目录项。
+- `coordination_non_directory_ancestor_is_rejected`：普通文件作为祖先时解析报错；直接构造的 `prepare_private` 与 `private_file` 也报错，文件字节与 0644 模式不变。
+- `coordination_disabled_creates_nothing` 与 `coordination_settings_validate_section` 现在直接比较字面量 `{ enabled:false, registry:true }`，并覆盖仅有无关键的对象和只含 `enabled:true` 的部分段（`registry` 仍为 true）。
+
+本轮证据只来自 Linux 非特权用户。macOS 缺少 `O_PATH`、无 `AT_EMPTY_PATH` 平台对限制性 umask 的兜底、Windows ACL/句柄语义都未运行；非 Unix 构建只保留可编译的 std 回退，不提供原生身份保证。
+
+macOS 权限位宽度只做过源码核对：Apple 目标的 `rustix::fs::Stat` 是 `libc::stat`，其 `st_mode` 为 16 位 `mode_t`，而 Linux 为 `u32`。所有权限掩码、比较与错误信息中的模式值现统一经 `mode_bits(&Stat) -> u32`，`FileType::from_raw_mode` 仍接收原生 `st_mode`；`grep -n "st_mode &" paths.rs` 必须无输出。本机只安装 `x86_64-unknown-linux-gnu`，未安装其他目标或工具链，因此 macOS 构建仍未实际编译，属于源码核对而非通过证据。
+
+### 版本化注册表存储（R1 第 2 轮）
+
+协调注册表使用独立的 `coordination.sqlite3` 与私有 `domain-id` 标记，不进入会话数据库。`open_rw` 在 `fs::OwnedFileLock` 保护的 `schema.lock` 下（最多等待 2 秒）先 create-new 创建并同步标记，再创建数据库，并在一个 `BEGIN IMMEDIATE` 事务中建立 v1 schema 与匹配的 `domain_meta` 行；标记存在但数据库缺失/损坏、数据库存在但无标记、标记与数据库身份不一致、初始化被中断都只报错，不替换或重建任何字节。`open_read` 使用只读连接，不 bootstrap、不迁移、不执行写 PRAGMA，完全不存在时返回 `None`。写入使用 WAL、`synchronous=FULL`、外键与 100 ms busy timeout，并在每个事务内复核版本；心跳/关闭只对 `lifecycle='open'` 且 generation 匹配的行生效，绝不会复活已关闭的行。
+
+- `cargo test --locked -p deepseek-code-core --lib services::local_coordination`：本轮新增六个用例全部通过，旧有用例保持通过。
+- `cargo test --locked -p deepseek-code-core --lib fs::file_lock`：锁实现未改动，仍需通过；见上文“文件锁的平台一致性”。
+- `local_coordination_registry_roundtrip`：插入包含全部可选字段（含非 UTF-8 分支引用、仓库/工作树哈希、父实例/worker/job 链接）的行，关闭并重开数据库后逐字段比较；重复 instance_id 被拒绝；generation 不匹配的心跳/关闭返回 false 且行不变；正确心跳更新活动与时间，重复活动保留起始时间；关闭后再次关闭或心跳都不会复活。
+- `local_coordination_two_data_dirs_share_root`：两个无关数据目录（不同 `localCoordination` 设置）不参与存储；同一 session UUID 在两个命名空间共存且可分别定位；协调根内不出现数据目录内容。
+- `local_coordination_two_roots_isolate`：两个根拥有不同 domain ID，左侧插入的行在右侧读取中为零。
+- `local_coordination_unsupported_schema_and_corrupt_db`：新版本号、损坏字节、缺失数据库、无标记数据库、标记/数据库不匹配、空数据库的中断初始化都失败并保持字节/文件不变；完全缺失时只读打开返回 `None` 且不创建目录。
+- `local_coordination_redaction_and_native_paths`：`PRAGMA table_info` 列集合与允许清单完全一致（没有 prompt/title/argv/环境/命令字段）；JSON 仅以 base64 表示原生字节，不含禁用字段，也不直接包含控制字节；非 UTF-8 路径与分支字节逐字节往返；`NativePath` 的显示保持不透明。
+- `local_coordination_concurrent_bootstrap`：两个线程经 barrier 同时初始化，得到同一 domain 与唯一 `domain_meta` 行，版本为 1，先创建的身份不被改写；持有 `schema.lock` 时 `open_rw` 返回 `Busy` 而不是空的成功注册表。
+
+本轮证据仅覆盖 Linux 上的本地临时根（0700/0600 权限校验只在 Unix 生效，非 Unix 只校验普通文件）；WAL 只读打开在只读文件系统或缺少 `-shm` 写权限时的可用性、NFS/网络文件系统、以及并发初始化中的真实崩溃恢复都未验证。
+
+#### 第 2 轮修复（读取不落盘、拒绝不改写）
+
+写入连接在打开后立即设置 `SQLITE_FCNTL_PERSIST_WAL`，最后一次正常关闭后仍保留私有的 `-wal`/`-shm`；读取端用 `READ_ONLY|NOFOLLOW|NO_MUTEX`，不 bootstrap、不迁移、不执行写 PRAGMA，缺失或不安全的 sidecar 直接报错而不是新建。所有打开路径共用一次 `inspect_state`：先看 `-journal`（任何条目都视为不支持的恢复证据），再用有界、仅既有、no-follow 的私有打开读取 `domain-id`（恰好 36 字节规范 UUID）与主文件头部（`SQLite format 3\0`，写/读版本字节均为 2），并要求已初始化域同时具备私有 `schema.lock`、`-wal`、`-shm`。只有真正空根（或仅有本 bootstrap 的锁）才允许创建标记、数据库和锁；已存在的标记/数据库不一致、孤立 sidecar、无标记的数据库都不改写任何字节。过滤命令同第 2 轮；实际应匹配 16 个通过用例与 1 个默认忽略的 `lc_store_repair_helper`（子进程夹具，不算验收）。
+
+- `local_coordination_read_idle_wal_keeps_entries`：写入一行并关闭最后一个写者后，根目录恰好是主文件、标记、锁、`-wal`、`-shm` 且都是本人 0600 普通文件；读取可见该行，读取期间与结束后条目集合、类型、模式、inode 以及主文件/标记/WAL 字节都不变（SHM 可由 SQLite 正常更新）。
+- `local_coordination_read_live_wal_keeps_entries_and_sees_commit`：关闭写者后快照主文件，重开写者并关闭其自动 checkpoint，插入新行后主文件字节仍与之前一致；读取端能看到这条仅存在于 WAL 的提交，且条目集合与主文件/WAL/标记字节在打开前后都不变。
+- `local_coordination_missing_or_unsafe_wal_pair_is_preserved`：分别删除一个或两个 sidecar，或把 sidecar 换成符号链接、FIFO、0644 普通文件；两种打开都返回 `Corrupt`，不新增条目，主文件/标记与符号链接目标字节、模式保持不变。
+- `local_coordination_rejects_hot_rollback_journal_without_recovery`：子进程用 DELETE 模式、`cache_size=2`、`cache_spill=ON` 打开 0600 且 `user_version=2` 的 30×3500 字节载荷库，`BEGIN IMMEDIATE` 更新后直接 `process::exit(0)` 留下热日志；父进程确认日志存在且带签名、主文件已含未提交页，两种打开都返回 `Corrupt`，数据库/标记/日志字节与条目集合（无新增 `schema.lock`）全部不变。
+- `local_coordination_rejects_symlink_fifo_and_open_mode_markers`：标记换成指向内容相同的 0600 外部文件的符号链接、0644 普通文件或 FIFO 时两种打开都返回 `Corrupt`；外部目标字节与根目录条目不变。FIFO 用例在带超时的子进程中执行，若实现先打开后校验会因死锁超时而失败而不是挂住套件。
+- `local_coordination_orphan_sidecars_are_errors_without_new_lock`：完全缺失的根读取返回 `None` 且不创建目录；空 0700 根与仅有合法 `schema.lock` 的根返回 `None` 并保留条目；只有 WAL、只有 SHM、两者都有或有无关键时两种打开都返回 `Corrupt` 且条目/字节不变；无标记、无锁的数据库返回有界错误且不新增锁。
+- `local_coordination_native_path_validation_fences_insert_and_decode`：外来编码、空/超长路径、内嵌 NUL 的插入返回 `InvalidRecord` 且有效行集合不变；合法的非 UTF-8 路径可经 SQL 往返并用 `to_path` 精确还原；直接 SQL 注入坏编码、空路径、非 UUID 实例或负时间戳后 `rows()` 返回 `Corrupt`，每次恢复后重新可用；未知编码的 `to_path` 也被拒绝。
+- `local_coordination_sqlite_corruption_maps_to_corrupt`：0600 垃圾主文件配合匹配标记时两种打开都返回 `Corrupt` 且文件布局与字节不变；另外直接构造 `SQLITE_NOTADB`/`SQLITE_CORRUPT`/`SQLITE_BUSY`/`SQLITE_LOCKED` 并断言映射到 `Corrupt`/`Busy`，即使坏头部预检通常先拒绝也能覆盖映射本身。
+- `local_coordination_write_rechecks_schema_after_immediate_begin`：对端持有 `BEGIN IMMEDIATE` 预留时 `Store::write` 返回 `Busy` 且闭包不执行；释放后对端把 `user_version` 改为 2，同一已打开句柄再次写入返回 `UnsupportedSchema(2)` 且闭包仍不执行（覆盖 IMMEDIATE 与事务内版本复查）。
+- `local_coordination_rows_are_sorted_and_capped_at_101`：逆序插入 110 行、时间戳重复且交错，`rows(usize::MAX)` 与 `rows(100)` 都恰好返回按 `(started_ms, instance_id)` 排序的前 101 行，`rows(1)` 返回前两行（包含截断预读行）。
+
+原生编码证据只在 Linux 上执行：Windows 的 UTF-16LE 偶数长度与零码元检查、macOS 的 `O_PATH`/procfs 兜底、只读文件系统或缺少 `-shm` 写权限时的 WAL 读取、NFS/网络文件系统，以及真实崩溃（而非受控子进程退出）都未验证。
+
+#### 第 2 轮修复二（保持 SQLite WAL 预留锁）
+
+SQLite 管理的主库、`-wal`、`-shm` 与回滚日志不再由本进程用独立描述符打开：独立描述符的关闭会清除该进程在同一 inode 上的 POSIX 字节范围锁，从而释放其他连接持有的 WAL 写预留。这些条目改用 `statat(..., SYMLINK_NOFOLLOW)` 元数据校验（普通文件、本人、0600）；主文件头部通过 `SQLITE_FCNTL_FILE_POINTER` 取得 SQLite 自己的 VFS 文件并用 `xRead` 读取（魔法 `SQLite format 3\0`，物理 WAL 版本字节 18/19 均为 2），随后仍用 SQL 事务确认 `user_version` 与 domain。标记与 `schema.lock` 仍用私有描述符（创建、加锁需要 FD）。非 Unix 构建把 `anyhow_error`/`is_missing` 等 rustix 依赖置于 `cfg(unix)`，Store 入口继续返回 `UnsupportedPlatform`。
+
+- 过滤命令同上；实际应匹配 18 个通过用例与 1 个默认忽略的 `lc_store_repair_helper`（子进程夹具，不算验收）。
+- `local_coordination_public_store_open_preserves_peer_process_writer_lock`（仅 Linux）：父进程打开写连接并持有 `BEGIN IMMEDIATE` 预留；子进程观察者只读打开 `coordination.sqlite3-shm`，以 `F_GETLK` 查询字节 120（SQLite 3.45 Unix 的 WAL 写锁字节），记录锁类型与持有者 PID，绝不调用 `F_SETLK`。第二次打开（读用例 `open_read`，写用例 `open_rw`）之后再次观察，必须在**第二个句柄与事务都仍存活**时仍看到 `F_WRLCK` 且持有者为父进程 PID；回滚并关闭后额外观察一次应为 `F_UNLCK`。观察在两次用例中使用各自的临时根，结果的 nonce 必须完全相等，旧结果文件会先被删除。
+- 快照规则：涉及 SQLite 管理文件的字节比较一律由没有该库任何连接的子进程（`snapshot-sqlite-bytes` 模式）复制到 `fixture/` 下的独立文件后由父进程读取；父进程只在相关句柄全部关闭后才直接读主库/`-wal` 字节。`local_coordination_read_live_wal_keeps_entries_and_sees_commit` 现用该子进程快照证明“新行只在 WAL 中”（主文件字节不变、WAL 字节变化）以及读取前后条目集合不变。
+- `local_coordination_rejects_hot_rollback_journal_without_recovery` 增加带真实 `schema.lock` 的第二阶段：拿到锁后仍以 `Corrupt` 拒绝热日志，数据库/标记/日志字节与包含该锁在内的条目集合完全不变。
+
+平台证据：观察者与锁字节位置只在 Linux 上验证；macOS 的锁语义、Windows 的无 POSIX 锁路径、只读挂载与网络文件系统都未运行。非 Unix 仅做了宿主上的 cfg 类型检查（可选 surrogate），不构成原生编译或运行证据。
+
+#### 第 3 轮：Linux 所有者证明与不可变租约
+
+所有权证明从 `tools/background_shell.rs` 抽到 `services::local_coordination::process_identity`（`LinuxIdentity`、`valid_pid`、`read_boot_id`、`process_start_time`、`pidfd_exited`），Bash/TaskGet 的 `OwnerIdentity` 只是同一实现的别名，锁、租约和超时语义不变。新的 `OwnerLease` 把身份与随机 generation 先写入私有 staging 文件并 `fsync`，取得排他 `OwnedFileLock` 后用不能替换的硬链接发布为 `owners/<instance>.lock`，`fsync` 目录后只删除 staging；租约文件永久保留，复用同一 UUID 即使旧所有者已死也拒绝覆盖。`probe_owner` 以仅既有、有界、no-follow 的私有打开读取租约，要求 version、instance、generation 与 owner 全部等于数据库记录；身份在 `pidfd_open` 前后各校验一次并 poll 退出。精确证明已死的进程返回 `Gone`（即使 fork 子进程仍持有描述符），活进程且租约仍被持有返回 `Alive`，活进程但租约已释放、证据缺失/损坏/不可读一律 `Unknown`。探测不发送任何信号，只短暫取得共享锁且立即释放。
+
+- `cargo test --locked -p deepseek-code-core --lib services::local_coordination`：本轮应匹配 35 个通过用例与 2 个默认忽略的进程夹具。
+- `cargo test --locked -p deepseek-code-core --test local_coordination_process -- --nocapture`：6 个通过、1 个默认忽略的 `lc_process_helper`（子进程夹具，不算验收）。
+- `local_coordination_owner_killed`：独立所有者发布就绪后，父进程只对夹具 PID 发 `SIGKILL` 并 `wait`，探测从 `Alive` 变为 `Gone`，不依赖超时或心跳。
+- `local_coordination_pid_reuse`：夹具记录一个真实存活 PID 但写入错误的 start tick/boot；探测返回 `Gone`，且该存活进程未被信号终止。
+- `local_coordination_live_stale_heartbeat_retained`：集成用例确认打开数据库后活锁租约仍为 `Alive`；模块内用例通过 crate 内 `Store::insert` 写入 `heartbeat_ms=1` 的旧行，证明注册表年龄不参与所有者证明（不扩大 Store 变更可见性）。
+- `local_coordination_duplicate_descriptor_release`：fork 子进程继承同一打开文件描述；错误 generation 的探测不释放租约，随后 `Alive`；显式释放后即使重复描述符仍打开，锁也被释放（`flock` 立即成功），探测变为 `Unknown`。
+- `local_coordination_preexec_descriptor_owner_death`：单线程夹具 fork 一个阻塞在管道 gate 上的子进程保留描述符；杀死原所有者后锁仍被继承描述符持有，但探测按记录身份返回 `Gone`，另一活所有者对照仍为 `Alive`。子进程从不执行父进程的解锁析构。
+- `local_coordination_owner_unknown_is_not_gone`：缺失、非法 JSON、generation 不匹配、0644 租约、不可解析 creation tick 全部返回 `Unknown`，不构成回收许可。
+- 邻接回归：`--lib fs::file_lock`（锁一致性场景）、`--lib tools::background_shell`、`--lib tools::tasks`、`--lib services::session_messages`、`--lib services::session_worker`，以及 `-p deepseek-code-cli --test taskget_backends --test taskget_background --test session_messages`；委派与前台超时用例必须与抽离前一致。
+
+平台证据：进程身份、`pidfd` 与继承描述符场景只在 Linux 上运行。macOS/其他 Unix 的锁语义、原生 Windows、只读挂载、NFS 网络文件系统未验证；非 Linux 的 `acquire` 返回 `UnsupportedPlatform`、`probe` 返回 `Unknown`，只有类型检查证据。
+
+#### 第 3 轮修复（不可读证据与夹具所有权）
+
+`probe_owner` 现在先验证证据再解释身份：解码 JSON 后只接受当前租约版本与目标实例，随后 `identity_from_record` 调用 `OwnerRecord::validate`（Linux 平台、正 PID、规范 boot/generation UUID、有界 creation token）、`valid_pid` 上界与 creation 十进制规范形式；验证失败一律 `Unknown`，通过后才比较期望记录并查进程。`acquire` 用同一规则在创建私有 staging 文件之前校验本条记录。
+
+进程判定区分“有效观测到的差异”和“无法观测”：同一 boot 内 creation tick 明确不同、或 boot UUID 规范但不同，是 `Gone`；`/proc/<pid>/stat` 的 `ENOENT`/`EACCES` 等不可读证据本身不构成死亡，必须再取 `ESRCH` 或已固定 pidfd 报告退出才算 `Gone`，其余一律 `Unknown`；pidfd 的 `EPERM`/`ENOSYS`/poll 错误都不是死亡证据。只有两次 tick 读取一致（`verified`）时才检查租约锁，活进程 + 已释放租约仍为 `Unknown`。`prove_same_boot` 通过闭包注入观测，测试不修改宿主 procfs 或权限。
+
+进程夹具改为所有权安全：`OwnedChild` 持有 `Child` 并在正常、超时与 unwind 路径都通过该句柄 kill+wait；FIFO keeper 由测试父进程以 close-on-exec 打开，helper 只打开读端再 fork，并在父分支读取 fork 子进程的 start ticks 后发布。`ForkGuard` 在 `pidfd_open` 前后各校验一次已发布 start 与 helper PPID，之后只用 `pidfd_send_signal` 或接管 EOF 结束子进程；不再对数字 PID 发送信号，也没有丢弃 gate 后的 sleep。
+
+- 过滤命令同第 3 轮；本轮应匹配 38 个通过库用例、2 个默认忽略夹具，以及 `local_coordination_process` 的 9 个通过、1 个默认忽略。
+- `local_coordination_unreadable_owner_stat_is_unknown`：注入首个或第二次 stat `ENOENT`（配活 pidfd）与 `EACCES`（两个位置），全部 `Unknown`，且从不检查锁；首个 `ENOENT` 分支仍会 pin。
+- `local_coordination_missing_owner_stat_requires_pidfd_death`：stat `ENOENT` + pin `ESRCH` 得 `Gone`；缺失读取 + 成功 pin + 退出得 `Gone`，并断言确实轮询了固定描述符。
+- `local_coordination_pidfd_errors_do_not_prove_owner_death`：pin 返回 `EPERM`/`ENOSYS`、或在 tick 匹配/缺失后 poll 返回 `EIO`，全部 `Unknown`，锁闭包被调用即 panic。
+- `local_coordination_malformed_matching_identity_is_unknown`：先以真实持有租约证明活本进程 `Alive`；随后分别把租约与期望记录改成相同非法 boot、非法 generation、带前导零的 tick（保持 inode 与 0600），全部 `Unknown`；换成另一个规范 boot UUID 则为 `Gone` 且本进程仍在运行。
+- `local_coordination_fixture_cleanup_reaps_child_on_unwind`：`catch_unwind` 中故意 panic，守卫在 unwind 时终止并回收 helper；之后 pidfd 可读，且 `waitpid(..., WNOHANG)` 返回 `ECHILD`。
+- `local_coordination_reused_uuid_preserves_original_lease`：同一 UUID 在租约被持有时与 owner 被 kill/reap 后都返回 `InvalidRecord`，inode、字节、0600 模式与 owners 目录条目集合均不变，无 staging 残留。
+- `local_coordination_duplicate_descriptor_release` / `local_coordination_preexec_descriptor_owner_death` 使用已验证的 fork pidfd：显式释放后与杀死原 owner 后都断言 fork 子进程仍存活，释放 gate 后经 pidfd 观察到退出；重复描述符场景由仍存活的 helper 自己 `waitpid` 回收子进程并写 `reaped` 标记。
+
+平台证据仍是 Linux-only；不可读 stat/pidfd 错误用注入闭包覆盖，不依赖受限挂载或权限变更。
+
+#### 第 4 轮：注册表生命周期与工作区快照
+
+`registry.rs` 把存储与所有者证明变成可用的注册服务：`RegistryGuard::register` 先 `Store::open_rw`（空根上先建 `owners/` 会成为 bootstrap 拒绝的孤立证据），再发布租约，最后写入 open 行；插入失败时丢弃租约但保留不可变证据。心跳线程独占 Store 与租约，每 5 秒把最新活动与心跳合并成一次带 generation CAS 的写入，Close 会等待该线程排空后关闭行并释放租约；`Drop` 只发送停止信号，不做无界等待。`update_workspace` 与心跳、关闭同样以 generation + `lifecycle='open'` 为栅栏，过期 generation 或终态行是空操作。`registry_snapshot` 只读：先用 `WHERE lifecycle='open'` 再排序限行（第 101 行仅作截断预读），因此旧的终态行不会吃掉 100 行窗口；open 但 owner `Gone`/`Unknown` 的行仍然显示。`workspace.rs` 用规范化路径字节加 Linux dev/inode 计算数据域、仓库与工作树哈希（各字段长度前缀），有界只读 Git 探测（2 秒、64 KiB、空 stdin、超时 kill/reap、每次只取一个路径输出）失败时 Metadata 缺失而不是伪造仓库；`escaped_native` 把非可打印字节渲染为 `\xNN`。
+
+- `cargo test --locked -p deepseek-code-core --lib services::local_coordination`：本轮应匹配 44 个通过用例、2 个默认忽略夹具。
+- `cargo test --locked -p deepseek-code-core --test local_coordination_process -- --nocapture`：10 个通过、1 个默认忽略的 `lc_process_helper`。
+- `local_coordination_guard_heartbeat_and_close`：受控时钟推进一次只产生一个心跳；十次 `set_activity` 合并进下一次写入；`close` 排空后行为 `closed`；随后同 generation 的 `heartbeat`/`close` 都返回 false 且行不复活；再次注册得到新实例与新 generation。
+- `local_coordination_live_cap_applies_after_lifecycle_filter`：先放 101 条更早的 closed 行再加 1 条 open 行，快照只显示该 open 行且未截断；再加 105 条 open 行后正好显示 100 条、`truncated` 为真，且第 101 条 open 行（预读行）不出现。
+- `local_coordination_grouped_frontend_worker`：两个真实进程以同一 namespace/session 注册 frontend 与 executor（带 worker 链接），快照为同一组、两个不同 owner PID 且都为 `Alive`；同一 session UUID 换一个数据目录后成为第二组；全部关闭后不再出现在快照中。
+- `local_coordination_snapshot_is_read_only`：完全不存在的根返回空快照且不创建目录；活但心跳很旧的 owner 是 `Unresponsive` + `Alive`，无租约的 owner 是 `Unknown`，两者都保留；重复读取前后根目录条目与行内容完全不变（不恢复 worker/job）。
+- `local_coordination_workspace_paths`：临时 Git 仓库与其 linked worktree 共享 repo ID、worktree ID 不同；独立 clone 的 repo ID 不同；符号链接别名与真实路径同一身份；非 Git 目录 repo/worktree/branch 为 null；detached HEAD 的 branch 为 null。另有 `local_coordination_workspace_escapes_native_bytes` 验证非 UTF-8 与控制字节的往返与转义。
+- `local_coordination_clock_jump_is_not_death`：向前/向后墙钟跳变只改变 `Responsiveness`（`ClockUncertain`/`Unresponsive`），owner 仍是 `Alive`，行保持 open，没有清理或接管。
+- 平台证据：Hash 的 dev/inode 部分与 Git 场景只在 Linux 运行；macOS/Windows 只做了类型检查，原生运行未验证。Git 元数据测试不做出任何 claims 变更。
+
+#### 第 4 轮修复（共享工作区校验、独占心跳线程与有界 Git 读取）
+
+工作区字段的校验规则集中到 `types::validate_workspace_fields`（绝对原生路径、仓库/工作树各为 64 位小写 hex、引用 1–1024 字节且不含 NUL/LF、观测时间非负），`Registration::validate`、`WorkspaceIdentity::validate`、`Store::update_workspace` 与 `Store::heartbeat_with_workspace` 共用同一实现，因此任何被拒绝的刷新都不会写库，也不会让下一次快照解码失败。Git 生产者把超限或非法引用降级为 null，注册时 `last_git_observed_ms` 取工作区自身的 `observed_ms`。心跳与刷新在同一 `Store::write` 事务里写入（先心跳行、命中 open 行且 generation 一致时才写工作区），刷新不再顶替心跳。
+
+注册改为每次一个独占的 `dcl-registry` 线程：先 `Store::open_rw`，再发布租约、校验工作区、插入 open 行，最后才向调用方确认成功；无 Tokio 运行时也能注册。`Mailbox { activity, refresh, stopping }` 只有一个最新值槽位，`request_workspace_refresh` 只覆盖路径，`update_workspace` 用有界 `try_send`；循环用单调 `next_tick` 推进并跳过错过的刻度。`close` 先停止、等待 worker 完成“关闭行→释放租约”后返回；`Drop` 只发停止信号。
+
+Git 读取改为增量排空：`run_git_command` 在 spawn 前检查截止时间，`collect_git_output` 用 rustix 的 `fcntl_getfl/setfl` 设非阻塞、每次最多读 8 KiB、每轮检查截止时间、64 KiB 上限与 `try_wait`，失败时只 `kill`/`wait` 自己拥有的子进程。`git_path` 只去掉一个命令分隔 LF 并保留内部/结尾原生字节与非 UTF-8 字节。
+
+- 过滤命令同第 4 轮；本轮应匹配 55 个通过库用例、3 个默认忽略夹具（`lc_process_helper`、`lc_store_repair_helper`、`lc_git_fixture_helper`），以及 `local_coordination_process` 的 10 个通过、1 个默认忽略。
+- `local_coordination_invalid_workspace_updates_leave_snapshot_unchanged`：分别提交相对路径、非法 repo/worktree ID、空引用、1025 字节引用、含 NUL/LF 引用与负观测时间，全部 `InvalidRecord` 且固定 `now_ms` 快照逐字段不变；随后合法改动可读；过期 generation 的写入是 `false` 空操作。
+- `local_coordination_registration_uses_workspace_observation_time`：仓库观测时间 1000、注册时钟 2000 → `last_git_observed_ms==Some(1000)`、`started_ms/heartbeat_ms==2000`；无仓库对照为 `None`。
+- `local_coordination_workspace_refresh_coalesces_and_preserves_heartbeat`：A 被门控时提交 B、C，下一次观察到的是 C；A 的刻度提交其工作区 + 心跳 2000 + `Active`；C 返回 `WorkspaceUnavailable` 时丢弃工作区但仍推进到心跳 3000 + `Idle`。
+- `local_coordination_close_drains_a_gated_inflight_refresh`：门控观察进行中首次 `poll(close)` 为 `Pending`；放行后 `close().await` 返回即读到 `Closed`、新工作区已提交、owner `Unknown`，同 generation 的迟到心跳返回 `false`。
+- `local_coordination_register_without_runtime` / `local_coordination_register_on_stopped_runtime`：无运行时或进入已丢弃运行时句柄时注册仍得到活 guard 与一条 `Alive` open 行，随后在新运行时上 `close` 得到 `Closed` 且租约释放。
+- `local_coordination_bare_drop_closes_and_releases_lease`：不调用 `close` 直接丢弃 guard 并关闭其运行时，进程仍存活时受限轮询到 `Closed` + `Unknown`，原租约文件保留。
+- `local_coordination_git_drains_pipe_backpressure`（Linux）：4 KiB 管道输出 32 KiB，增量排空取得完整载荷；先等子进程退出再读会死锁。
+- `local_coordination_git_deadline_covers_inherited_stdout`（Linux）：直接子进程已成功退出但另一子进程仍持有 stdout 写端时，收集器在短截止时间内返回 `None`，且从未向该子进程发信号。
+- `local_coordination_git_rejects_output_over_cap`（Linux）：60 KiB 对照被完整捕获，64 KiB+1 字节返回 `None`。
+- `local_coordination_git_paths_preserve_lf_and_non_utf8`（Linux）：目录名含内部 LF、结尾 LF 与非法 UTF-8 字节的真实仓库，其规范化原生工作区字节、repo/worktree ID 与 `refs/heads/main` 均精确保留；符号链接别名得到同一身份。
+- 分组进程夹具改为逐个等待 ready、快照后再逐个释放并回收，避免无关的启动/关闭争用。
+
+平台证据：Linux 之外的注册（`local_coordination_unsupported_registration_creates_nothing`）与原生非 Linux 运行未验证；Git 管道的截止时间/上限证据仅来自 Linux 合成夹具，不涉及真实仓库构建。
+
+#### 第 4 轮修复二（stdout EOF 后仍等待并回收自有子进程）
+
+`run_git_command` spawn 后统一走 `finish_git_child`：即使 `child.stdout.take()` 为空、fcntl 设置失败、读取/状态错误、非零退出、超限或超时，也都会在返回 `None` 前回收自己拥有的直接子进程。`collect_git_output` 把“stdout EOF”和“直接子进程已成功退出”当作两个独立观测：只有两者都成立且未过截止时间才返回字节；只有 EOF 时不再重复读取，而是以最多 5 ms 的间隔继续轮询状态；子进程已退出但仍可能排空剩余输出；不进行阻塞式 `wait`。`reap_owned` 先 `try_wait`，已有缓存状态就不再发信号，随后只 `wait` 自己的子进程，绝不按数字 PID 发信号、不杀进程组、不遍历后代。
+
+测试夹具新增 `GitFixtureChild` 守卫（Drop 中 `try_wait` / `kill` / `wait`），`spawn_git_fixture` 返回该守卫；keeper 作为 stdin 门控时总是先关闭门控再断言收集结果、截止时间或退出状态，超时路径先放行 keeper 再 join。`lc_git_fixture_helper` 新增 `eof:<code>` 模式：写入固定 `coord-eof-payload` 并 flush，用 `libc::close(STDOUT_FILENO)` 关闭自己的 stdout，等待私有 stdin 上的 EOF 后以 `code` 退出。
+
+- 过滤命令同第 4 轮；本轮应匹配 58 个通过库用例、3 个默认忽略夹具。
+- `local_coordination_git_eof_before_exit_returns_payload_after_reap`（Linux）：门控持有期间观察到 EOF 通知，收集结果仍为 pending；放行后退出码 0，收集结果以 `coord-eof-payload` 结尾，且直接子进程已被回收、缓存状态为 0。
+- `local_coordination_git_eof_before_nonzero_exit_returns_none_and_reaps`（Linux）：同样先 EOF，放行后退出码 7；结果为 `None`，子进程已被回收且缓存状态为 7 —— 在 EOF 处立即 kill 的实现会得到 SIGKILL 而失败。
+- `local_coordination_git_eof_before_deadline_kills_and_reaps_owned_child`（Linux）：EOF 后门控保持不动超过收集截止时间；结果为 `None`，返回前已完成回收，缓存状态信号为 `SIGKILL`。
+- 平台门控：`local_coordination_git_drains_pipe_backpressure`（使用 `F_SETPIPE_SZ`）与上述三个用例仅在 Linux 运行；`local_coordination_guard_heartbeat_and_close`、`local_coordination_snapshot_is_read_only`、`local_coordination_clock_jump_is_not_death` 也标记为 Linux-only，因为注册需要 Linux 所有者适配；仅存储的行上限用例仍留在 Unix，非 Linux 的 `local_coordination_unsupported_registration_creates_nothing` 保留。
+
+#### 第 5 轮：只读 `dcl sessions live`
+
+`dcl sessions live [--json]` 在 `RuntimePaths` 构造之后、资源采样器/日志/环境变量/provider/会话数据库之前分派，只读渲染共享注册表：不注册参与者、不打开会话数据库、不连接 provider，也不受 `enabled=false` 影响。协调根按显式 `--coordination-dir` > `DEEPSEEK_CODE_COORDINATION_DIR` > 家目录共享根解析（环境变量由解析器显式读取以便测试优先级），相对路径锚定在 `-C` 之前的启动目录。空注册表是成功结果（`domain_id` 为 null、空分组），缺失存储不创建任何目录。JSON 输出为单个对象加一个 LF：`format_version=1`、无损 root（`encoding`/`base64`/转义 `display`）、`coverage`、分组内每个实例的完整 UUID、kind/role/worker/job 链接、owner pid/platform/boot/creation/generation、转义的 workspace 与 branch_ref、activity/start/heartbeat/proof/responsiveness。文本输出为纯行（`Local coordination:`、`Coverage:`、`No live local sessions.`、分组行、每个 owner 一行），ID 缩短为 12 个十六进制字符（前缀冲突时用完整 UUID），截断时追加 `More participants exist; output limited to 100.`。失败时 stderr 输出 `Local coordination unavailable: <busy|unsupported_schema|corrupt|missing_database|domain_mismatch|unavailable>. No state was reset.` 并以非零退出，不打印原始错误文本或错误链。
+
+- `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：9 个验收用例全部通过，另有 1 个默认忽略的 `lc_registry_helper`（子进程夹具，不算验收）。
+- `sessions_live_empty_does_not_create_state`：不存在的协调根与数据目录下，文本与 JSON 均为空视图、退出 0，且两者都未被创建。
+- `sessions_live_groups_frontend_and_worker`：启动两个真实 helper 进程（同一个已构建测试可执行文件的 `lc_registry_helper`，逐个等 ready）在同一 namespace/session 注册 frontend 与 executor，CLI `--json` 得到一组两个实例、owner PID 恰为两个 helper 的 PID、generation 不同且均为 `alive`；同一 session 换数据目录后成为第二组。helper 由 `Helper` 守卫 kill/wait，释放后各自 `close` 并写 `closed` 标记。
+- `sessions_live_respects_root_precedence`：显式参数压过环境变量，环境变量压过默认根；无关的 `--data-dir` 与 `-C` 不改变根；相对覆盖以启动目录为基准。
+- `sessions_live_redacts_and_escapes`：路径中的换行/ESC/非法 UTF-8 在文本里转义、在 JSON 中 base64 无损；API key/token/model 哨兵值不出现在 stdout 或 stderr。
+- `sessions_live_errors_do_not_reset`：回滚日志 → `corrupt`、只有 domain 标记 → `missing_database`、更高 `user_version` → `unsupported_schema`；三者都非零退出、stderr 恰为该类别一行，证据文件与会话数据库均未被创建或修改。
+- `sessions_live_accepts_non_utf8_coordination_dir_argv`（Linux）：`--coordination-dir` 的值是一个含 ESC、LF 与 0xFF 的原生路径，分别放在子命令前后两次运行；两次都退出 0 且 stderr 为空；JSON 以 `{` 开头、以 `}\n` 结尾且只含一个 LF，`root.encoding` 为 `unix_bytes`，base64 解码后与 `OsStr` 原生字节完全相等，转义 display 以 `coord-\x1b-\x0a-\xff` 结尾；文本恰好三行且首行以同一转义结尾；没有创建协调根、数据目录或其他条目。
+- `sessions_live_invalid_native_root_error_is_bounded`（Linux）：以含 ESC/换行/0xFF 名字的普通文件为祖先传入原生 `--coordination-dir`；退出码 1、stdout 为空、stderr 逐字节等于 `Error: Local coordination unavailable: unavailable. No state was reset.\n`（没有 ESC、路径文本、额外换行或 panic）；证据文件内容与父目录条目集合不变，且不创建数据目录。
+- `sandbox_bridge_exact_role_still_dispatches`（Unix）：以恰好 `__sandbox-bridge` 启动真实二进制并关闭 stdin；缺少 socket 操作数时退出 126、stdout 为空、stderr 仅为 `sandbox bridge: socket path missing\n`，证明私有角色在普通解析之前仍被识别。
+- `sessions_saved_list_behavior_is_unchanged`：`sessions list` 仍是 JSON 数组、`sessions show` 仍是 `{session,messages}` 对象，且都不会创建协调状态。
+
+#### 第 6 轮：CLI 与持久 Worker 注册生命周期（R1 设计收尾）
+
+本轮把只读注册表接上真实参与者：`Session::open` 保持原签名，委托给 `open_with_registration(cli, paths, selection, resumed_id, mode)`；`mode=Automatic` 在全部初始化与 workspace 解析成功后读取 `settings.json` 的设置快照，仅当 `enabled && registry` 时解析根、观察 workspace 并注册；`mode=HostOwned` 供持久 Worker 宿主使用，避免同一会话出现第二行。注册失败只输出一次 `Local coordination registry unavailable: <category>. Session continues without peer visibility.`，不打印原始错误、路径或提示；禁用时既解析根也不创建心跳任务。
+
+- 普通会话是 `cli/frontend`；经 `worker_directory` 验证为内部作业的会话是 `background_agent/executor`，`job_id` 只接受规范 UUID。`data_namespace` 与 `RegistryGuard::register` 都在有限的 `spawn_blocking` 中执行，异步注册线程只等待 `observe_workspace`。
+- 持久 Worker 宿主在验证 worker 身份/生命周期锁之后、监听循环之前注册一个 `background_agent/executor` 宿主守卫，其 `worker_id` 是已验证的 Worker 实例 UUID，空闲与逐轮期间都保持；`Session::open` 用 `HostOwned`，宿主退出时先尝试 Session 关闭，再等待注册关闭（即使关闭报错）。恶意或过时的宿主进程被强杀后，其 Open 行由 owner proof 报告为 `Gone`。
+- `resume_saved` 成功后以新会话 ID/workspace 注册新代际，并等待旧守卫关闭；失败时保留旧守卫。`clear` 同样替换行。`sync_workspace` 只在路径真实变化时调用 `request_workspace_refresh`，观察与栅栏写入仍由注册线程完成；每轮开始还会对同一路径请求一次刷新，使外部 checkout 的分支可见。`run_timed_turn` 周围用 RAII 只发布类型化的 `Active`→`Idle`（含错误与取消）。
+- `main` 在 `-C` 之前捕获启动目录；仅在启用协调或显式 `--coordination-dir` 时把解析后的绝对根写入 `DEEPSEEK_CODE_COORDINATION_DIR`，所有已知宿主子进程（supervisor、Worker 宿主、SDK/远端子进程）继承它，注册不再依赖当前目录。正常退出在 `session.close().await` 之后调用 `close_coordination()`（即使关闭报错），远端交接在 `std::process::exit` 前也调用。注册租约与 PresenceLease、ExecutionLease 相互独立。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl registry_resume_replaces_incarnation -- --nocapture
+```
+
+- `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：14 个验收用例通过，另有 2 个默认忽略的进程夹具 `lc_registry_helper`、`lc_registry_lifecycle_helper`（不算验收）。
+- `registry_disabled_real_session_creates_no_state`（Linux）：真实 CLI + 本地 SSE 夹具，`enabled:false`、显式 `--coordination-dir` 完成一次普通回合；退出 0、结果 JSON 正常、模型请求恰为 1 次，协调根不存在且没有注册行，stderr 不提协调。
+- `registry_real_frontend_and_worker_share_group`（Linux）：真实 stream-json 前端先打开会话并保持空闲，随后 `ensure_worker` 启动真实持久宿主并提交带 `ROUND06_GATE` 的回合；在模型请求被夹具门控、回合未完成时读取注册表：同一 data namespace/session 恰好两个 Open 实例（`cli/frontend` 与 `background_agent/executor`，不同 PID/generation），executor 的 `worker_id` 等于宿主实例 UUID，没有第三行；放行后回合只发一次模型请求，宿主正常停止后两行都是 `Closed`。
+- `registry_worker_survives_frontend_exit`（Linux）：同样的门控回合中由夹具进程终止前端（精确 PID）并回收；`registry_snapshot` 显示前端 `owner_proof=gone`、executor 仍 `alive`；`ExecutionLease::acquire` 仍被拒绝（现有执行租约未被绕过），后台作业仍未完成；放行后完成且只发过一次请求，宿主正常关闭，前端遗留的 Open 行仍可见为 `Gone`。
+- `registry_resume_replaces_incarnation`（Linux，位于 `--bin dcl` 单元测试，见下）：成功 `resume_saved` 关闭旧行并以新 ID/workspace 产生新 `instance_id`；失败的恢复保留当前守卫与 Open 行；`sync_workspace` 改变 workspace 后，注册线程在 10 秒内把新 workspace 写入同一行；`close_coordination` 后最终行 `Closed`。
+- `registry_failure_does_not_break_session`（Linux）：0700 根中放入回滚日志证据；真实回合在模型请求门控时，第二次 `ExecutionLease::acquire` 被拒绝；放行后原回合成功、模型请求恰为 1 次；stderr 恰有一行 `Local coordination registry unavailable: corrupt. Session continues without peer visibility.`；日志字节与根目录条目集合完全不变。
+- `registry_worker_restart_has_new_owner`（Linux）：两个独立数据目录的会话先后启动/停止真实宿主，但都从同一继承根注册；旧行在正常停止后为 `Closed` 且不被重复行替代；新宿主具有不同 `instance_id`、不同 worker 实例 UUID、不同 owner generation，并与旧宿主属于不同 data namespace，证明根来自继承而不是数据目录。
+
+`registry_resume_replaces_incarnation` 需要真实的进程内 `Session`/`resume_saved`，而集成测试只链接 core，因此放在 `crates/cli/src/session.rs` 的单元测试中，命令如上；其名称与断言仍按验收矩阵。纯黑盒的启动 `--resume` 只覆盖 `open_with_registration`，不能替代此用例。
+
+未运行/未验证（不得由上述自动化推断）：真实 TTY 的交互式 frontend 交棒（本用例用空闲 stream-json 前端 + 真实宿主验证分组，未驱动 raw-mode UI 交棒）；B 运行中排队与撤回、D 中途关闭/`/continue` 挂接/恢复、E 取消与 Worker 清理的终端人工场景；活动 `Active`→`Idle` 的 5 秒心跳时序与 Drop 取消边界；`/clear` 的行替换；复用旧 Worker 属于另一协调根时的根不匹配展示；`busy`、`domain_mismatch` 与其它类型化存储错误经 CLI 的警告分类；100 个参与者截断；macOS/Windows 的原生进程证据与非 UTF-8 Worker workspace；只读/NFS 挂载、真实崩溃与 PID 复用竞争、权限受限的 procfs/pidfd、非回收 init 下的孙进程重新挂靠。
+
+#### 第 6b 轮：启动根贯穿前端与子进程、初始化完成后再发布
+
+本轮修正 review-06 的前两项：协调根只在启动边界决定一次，前端、重启、远程交接和 Worker 子进程共用同一个原生绝对根；注册推迟到初始化成功之后；所有正常退出路径都显式等待注册关闭。
+
+- `local_coordination::{RootSelection, CoordinationContext, PreparedCoordination, prepare_startup}`：`prepare_startup` 在 `spawn_blocking` 中读取一次设置；只有 `enabled && registry` 或存在显式 `--coordination-dir` 时才用调用方传入的启动目录（`-C` 之前）解析根，绝不再读 `current_dir`。关闭且无显式覆盖时保持 `Deferred`（完全不做协调根查找）；解析失败保持 `Rejected`。每次尝试最多一条 `Local coordination registry warning/unavailable` 有界提示。`CoordinationContext::child_root` 对 Ready 返回精确原生字节，对 Deferred 返回 None，对 Rejected 返回空原生值（解析器会拒绝空覆盖，因此子进程不会回落到默认根）。只有启动边界调用 `export_child_root` 写入 `DEEPSEEK_CODE_COORDINATION_DIR`。
+- `Session::open_with_registration` 不再注册，只记录 `RegistrationMode`；`activate_coordination(prepared)` 在启动选项（含 `--worktree` 的最终 workspace）与 SessionStart/初始化钩子成功之后发布；`HostOwned` 会话返回而不注册。`replace_coordination` 只在 `Automatic` 且启动决定的 `enabled` 为真时执行，因此“显式根 + 关闭”不会因为根存在就注册。`close_owned()` 先取 `Session::close` 结果，再等待 `close_coordination`，最后返回原结果；正常 teardown、`/restart`、voice 与远程交接都走它或显式 `close_coordination`。
+- `persistent_worker::run_from_env` 先 `Listener::bind` 再 `register_worker`，并把监听循环包进 `let serve_result: Result<()> = async { … Ok(()) }.await`：绑定、accept 或普通循环错误都会汇聚到同一条 teardown，先尝试 Session 关闭，再等待宿主守卫关闭，最后按服务错误、Session 关闭结果的顺序返回。孤儿强制 `process::exit(1)` 与宿主生命周期锁不变。
+- `child_argv_without_coordination` 在解码前用原生字节扫描参数：丢弃分离形式 `--coordination-dir <value>` 与内联形式 `--coordination-dir=…`，保留其余顺序和 `--` 之后的位置参数；剩余参数必须为 UTF-8。`/restart`、交互式远程交接和直接 `RemoteControl::Listen` 都用它过滤原始 argv，子进程只继承导出的原生根。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl registry_child_argv_uses_exported_native_root_for_handoff -- --nocapture
+```
+
+- `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：本轮 18 个验收用例通过，另有 2 个默认忽略的进程夹具（`lc_registry_helper`、`lc_registry_lifecycle_helper`，不算验收）。
+- `registry_relative_override_uses_launch_root_for_frontend_and_child`（Linux）：从临时启动目录以 `-C <other project>` 和相对 `--coordination-dir coord-rel` 运行真实 CLI 完成一次本地 SSE 回合；启动根只在 `<launch>/coord-rel` 出现且唯一前端行正常 `Closed`，`<project>/coord-rel` 不存在；同步 SessionStart 钩子进程把继承的 `DEEPSEEK_CODE_COORDINATION_DIR` 写成原始字节，与同一绝对根逐字节相等。
+- `registry_worktree_startup_publishes_final_workspace_before_first_turn`（Linux）：临时 Git 仓库提交后以空闲 SDK（stdin 保持打开）启动 `--worktree reviewer`；等待真实 `Worktree: ` 公告与一条 Open 注册行，首行 workspace 即链接工作树（不是源 checkout）、`branch_ref` 为 `refs/heads/worktree/reviewer`、`worktree_id` 存在，且模型请求为 0；关闭 stdin 后正常退出，同一行变为 `Closed`。
+- `registry_failed_worktree_startup_publishes_no_row`（Linux）：PATH 中的 Git 包装器只让 `worktree add` 以唯一诊断和退出码 7 失败；真实 CLI 以非零退出并报出该诊断，模型请求为 0，协调根（含 owner 租约）完全不存在，证明发布发生在启动成功之后。
+- `registry_failed_host_bind_publishes_no_row`（Linux）：按真实服务目录写入类型化 `worker.json` 与 `host.lock`，endpoint 指向一个已存在的普通文件；以 `DEEPSEEK_CODE_SESSION_HOST` 启动真实宿主，退出码 1、stderr 报 `Session host failed`，协调根不存在，endpoint 证据字节不变，证明绑定先于注册。
+- `registry_child_argv_uses_exported_native_root_for_handoff`（CLI 单元，Linux）：分离形式的值与内联形式的后缀都是非 UTF-8 原生字节；两者在解码前被移除，其余参数顺序不变，`--` 之后形似该 flag 的位置参数原样保留；过滤结果分别喂给 `remote_host::launch_args`、`remote_host::child_args`、`restart::args` 后，分隔符之前都不再出现原覆盖；Ready 的 child root 等于精确原生绝对字节，Rejected 的空值无法解析成默认根；不做任何进程环境写入。
+- `registry_resume_replaces_incarnation`（更新后的 CLI 单元用例）：`Session::open` 后断言没有注册行，再以 `prepare_startup` 的启动输入调用 `activate_coordination`；其后全部原有断言（成功恢复替换、失败恢复保留、workspace 刷新、最终 `Closed`）不变。
+
+未运行/未验证（不得由上述自动化推断）：Linux TTY 交互式交棒（B 排队与撤回、D 中途关闭/`/continue`、E 取消与 Worker 清理）；直接 `RemoteControl::Listen` 与交互式 `/rc` 交棒的真实子进程端到端重启（本轮只验证 argv 过滤与单元级构建器输出）；voice 发送路径的真实音频端到端；`Deferred` 起步后在后续 incarnation 首次开启协调（留待 06c）；跨 `-C` 的 Worker 继承根的真实多进程重启；macOS/Windows 原生路径与非 UTF-8 参数。
+
+#### 第 6c 轮：事务式切换与宿主自身刷新
+
+本轮修正 review-06 的第 3、4 项：resume/clear 只有一个提交点，失败时旧会话与旧注册行保持一致；提交后的新代际按当前设置重新决定是否注册；持久宿主在接纳回合时刷新自身行，并拒绝非规范 Worker 身份。
+
+- `session.rs`：`start_hooks` 拆为 `prepare_start_hooks(id, workspace)`（检查 `owns_lifecycle` 与 `lifecycle_events::check_configuration`，不启动任何钩子）和 `start_prepared_hooks(source)`（置位 `lifecycle_owned`、执行 SessionStart 并把失败记为 `SessionStart hook: {error:#}` 诊断）。`resume_saved` 在结束旧钩子之前完成目标钩子预检和以目标 ID 为准的 `session_permission_mode::set`（原先在 `self.id` 赋值之后执行的可失败写入）；`clear` 在结束旧钩子之前完成目标预检。两者此后只有字段赋值：workspace/provider/model/auto_route、请求录制策略、ID、等待状态，然后替换注册并（必要时）运行已预检的钩子。任何预检或权限写入失败都会在提交前返回，旧 ID、workspace、等待状态、provider、lifecycle 与注册守卫全部保持。
+- `local_coordination.rs`：`prepare_startup` 与新增 `prepare_next_incarnation(context, data_dir)` 共用同一个 `spawn_blocking` 决策函数。每次切换只读一次设置并要求 `enabled && registry`；`Ready` 根按字节复用，`Rejected` 在本次启动内保持，`Deferred` 最多解析一次且只用保存的启动目录与原生输入。`export_session_child_root` 由 `main` 在启动边界调用。
+- `session.rs`：`replace_coordination` 改为“先取旧守卫 → 用 `prepare_next_incarnation` 重新决定 → 发布新行（仅在 enabled 且 Ready 时）→ 显式等待旧守卫关闭”。禁用设置不会关闭仍在运行的会话；下一次已提交的切换会关闭旧行且不产生新行或新租约。`Session::coordination_child_root` 暴露上下文的原生启动值，`main` 在每轮 REPL 起点、重启与远程交接前重新导出（覆盖“Deferred 启动在后续代际首次开启”的场景）。
+- `persistent_worker.rs`：`Request::Submit` 在 `begin_job` 成功之后、启动回合之前对宿主守卫调用 `request_workspace_refresh(worker.workspace)` 并置 `Activity::Active`；空闲心跳发现子进程发起的 idle→active 转换时也入队一次刷新。同一 workspace 路径换分支即可被观察到，不产生每回合注册。
+- `local_coordination.rs::register_worker`：在 `enabled && registry` 决定之后、任何根/存储/租约工作之前要求 `canonical_uuid(&worker.id)`；不满足时恰好输出一次 `Local coordination registry unavailable: unavailable. Session continues without peer visibility.` 并返回 `Ok(None)`，宿主继续提供 IPC 与生命周期锁。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl registry_ -- --nocapture
+```
+
+- `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：21 个验收用例通过，另有 2 个默认忽略的进程夹具（不算验收）。
+- `registry_host_owned_turn_refreshes_branch_without_duplicate_row`（Linux）：共享 workspace 在宿主启动前初始化为已提交仓库；宿主启动后初始 Open executor 行为 `refs/heads/main`；在同一目录切换到 `after` 后再放行被门控的提交，轮询同一 instance/generation 直到字节引用变为 `refs/heads/after`；workspace 字节不变、恰好一个 executor、无每回合新行、`ExecutionLease::acquire` 仍被拒绝（回合持有执行租约）；放行后只发一次模型请求，正常停止后该行 `Closed`。
+- `registry_rejects_noncanonical_worker_id_without_stopping_host`（Linux）：按真实服务目录写入 `id=sentinel-free-form-worker-id` 的类型化 `worker.json` 与 `host.lock`，endpoint 为真实的空闲短 Unix 路径；真实宿主对 `Ping` 与 `Shutdown` 均正常应答、干净退出 0；stderr 恰好一行有界警告；协调根不存在，sentinel 从未进入注册输出。
+- `registry_same_session_worker_restart_replaces_owner`（Linux）：同一数据目录/workspace/会话先后两次 `ensure_worker`；旧宿主行 Open→Closed 后新宿主注册；新 worker UUID、instance 与 owner generation 均不同，同一 namespace/session 内恰好一条新 Open 行且旧 Closed 行保留一次；结束并正常关闭。既有的双数据目录 `registry_worker_restart_has_new_owner` 保留为独立对照。
+- `registry_resume_permission_write_failure_preserves_incarnation`（CLI 单元，Linux）：在会话数据库的 `peripheral_settings` 上为目标键安装 `BEFORE INSERT` 触发器；`resume_saved` 必须命中该写入并报出标记。断言旧 ID、workspace、provider、等待状态、守卫 instance 与 Open 行不变，且没有目标行；移除触发器后同一恢复成功，旧行 `Closed`、新 instance 与 generation 不同、显式关闭后新行 `Closed`。
+- `registry_resume_hook_preflight_failure_preserves_incarnation`（CLI 单元，Linux）：旧 `lifecycle_owned` 为真，目标 `.claude/settings.json` 是目录使配置读取失败；要求在提交前报错，旧 ID、workspace、lifecycle 与守卫不变且无目标行；恢复该夹具后同一切换提交，SessionStart 钩子恰好执行一次。
+- `registry_settings_off_prevents_resume_and_clear_incarnations`（CLI 单元，Linux）：resume 与 clear 各自使用独立的启用夹具；首次守卫 Open 后在磁盘把 `localCoordination.enabled` 置 false，未变动的会话仍 Open；完成切换后会话 ID 改变、旧行 `Closed`、没有新行/新 owner 文件/新守卫；重新启用后下一次切换恢复注册（阳性对照）；全程使用同一原始绝对根。
+- `registry_resume_replaces_incarnation`（CLI 单元，Linux）：现为隔离父用例——它用 `std::env::current_exe()` 以 `--exact session::event_tests::lc_registry_session_workspace_helper --ignored --test-threads=1` 启动私有夹具进程并断言恰好运行该用例；原先的恢复/工作区/关闭断言全部移入该忽略辅助用例，cwd 变更只发生在它自己的进程里。
+
+未运行/未验证（不得由上述自动化推断）：Linux TTY 交互式交棒（B 排队与撤回、D 中途关闭/`/continue`、E 取消与 Worker 清理）；`/restart` 与 `/rc` 的端到端重启（本轮只验证主流程重新导出与构建器输出）；voice 真实音频；`Deferred` 启动后在后续代际首次开启协调的端到端多进程证据（只有源码级重新导出）；`Rejected` 之后拒绝回落的路径；macOS/Windows 原生路径与 IPC；只读/NFS 挂载、真实崩溃与 PID 复用竞争。
+
+#### 第 6d 轮：提交后钩子取消、print 启动校验与宿主活动去重
+
+本轮修正 review-06c 的两个阻塞项，并移除 `Request::Submit` 中重复的宿主活动写入。
+
+- `session.rs`：新增私有 `finish_committed_start_hooks(source)`，其内容为 `if let Err(error) = self.start_prepared_hooks(source).await { eprintln!("SessionStart hook: {error:#}"); }`。`start_prepared_hooks` 的唯一返回错误是 `tokio::select!` 的两个固定取消（`SessionStart hooks interrupted` 与 `SessionStart hooks cancelled`），普通钩子失败本来就只作诊断。`clear` 与 `resume_saved` 在提交（字段赋值 + `replace_coordination`）之后改用该辅助函数并返回成功结果；初始启动仍经 `start_hooks` 直接传播取消错误（`--resume ID` 首次启动的 source 字符串同为 `"resume"`，但走的是传播路径）。
+- `main.rs`：把一次性运行的输入校验移到 `activate_coordination` 之前——`if !sdk_stream && single { ensure!(session.initial_hook_message.is_some() || !prompt.trim().is_empty(), "A prompt or piped stdin is required") }`，并删除 `initial_hook_message` 消费分支里的旧 `ensure!`。钩子提供初始消息的回合因此先通过校验、先发布，再发出唯一一次模型请求。
+- `persistent_worker.rs`：`Request::Submit` 在 `active.compare_exchange` 与 `*current_turn.lock()` 之间不再写注册活动；`begin_job` 成功之后的 workspace 刷新与 `Activity::Active` 写入保持不变。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture
+cargo test --locked -p deepseek-code-cli --test initial_user_message --test interrupt_signals
+```
+
+- `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：24 个验收用例通过，另有 2 个默认忽略的进程夹具（不算验收）。
+- `registry_clear_sigint_after_commit_returns_success`（Linux，真实 PTY）：在 `--ax-screen-reader` 交互式 dcl 中先等到一条 Open 前端行，发送 `/clear` 并等到 clear-only SessionStart 钩子（`matcher:"clear"`、`timeout:20`、由 `sh` 阻塞等待释放标记）写下的进入标记。钩子仍被持有时断言旧行 `Closed`，且恰好一条不同会话/实例的新 Open 行。用 `kill -s INT <pid>`（PID 来自该受控子进程，且发送前刚确认 `try_wait()` 为 None）后：转录中出现且仅出现一条 `SessionStart hook: SessionStart hooks interrupted`，以及精确的 `New session: <new>. Previous history retained: <old>`，没有 `Error: SessionStart hooks interrupted`；子进程仍在运行、新行仍 `Open`、模型请求为 0。随后释放钩子、发送 `/exit`，正常退出且同一新实例变为 `Closed`。该用例已通过“临时还原为 `start_prepared_hooks("clear").await?` 则超时失败”的反向验证，确认它确实覆盖该缺陷。
+- `registry_print_without_prompt_publishes_no_incarnation`（Linux）：`--print`、`Stdio::null()` 标准输入、无位置提示、无钩子；退出码 1，stderr 含精确行 `Error: A prompt or piped stdin is required`，模型请求为 0，且在任何辅助代码打开存储之前观察到：协调根不存在、没有任何行（含 `Closed`）、没有 owner 文件。
+- `registry_print_with_hook_prompt_publishes_incarnation`（Linux）：同样的 print 设置加 `--output-format json`，同步 SessionStart 命令钩子返回 `{"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"ROUND06_GATE"}}`，标准输入为空、argv 无提示；现有模型门控捕获到 `ROUND06_GATE` 时断言恰好一条 Open 前端行；放行后退出 0、同一会话一个成功 JSON 结果、模型请求恰好一次，且该实例 `Closed`。
+
+未运行/未验证（不得由上述自动化推断）：`resume_saved` 提交后钩子取消的运行时用例（与 clear 共用同一辅助函数，仅有源码级证据）；初始启动钩子取消仍传播错误的运行时用例（仅保留源码中的错误传播调用）；挂起场景下的 `SessionStart hooks cancelled`（后台取消分支）；B/D/E 交互式交棒矩阵；与 main 的集成合并；macOS/Windows PTY 与信号语义；voice 真实音频。

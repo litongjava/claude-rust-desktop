@@ -43,6 +43,7 @@ mod keybindings;
 mod launch_permissions;
 #[allow(dead_code)]
 mod legacy_api_config;
+mod local_coordination;
 mod lsp_commands;
 mod magic_docs;
 mod mcp_menu;
@@ -312,6 +313,20 @@ async fn run(cli: &Cli) -> Result<()> {
         None => deepseek_code_core::runtime::resolve_default_data_dir()?,
     };
     let paths = RuntimePaths::new(absolute(data_dir)?)?;
+    // The coordination root resolves against the launch directory, before `-C`,
+    // and the same absolute root is exported for every host child later.
+    let launch_cwd = std::env::current_dir().ok();
+    // Read-only coordination inspection runs before the resource sampler, logs,
+    // environment mutation, provider setup or conversation database.
+    if let Some(Commands::Sessions {
+        action: SessionCommands::Live { json },
+    }) = &cli.command
+    {
+        let launch_cwd =
+            launch_cwd.as_deref().ok_or_else(|| local_coordination::unavailable(None))?;
+        let coordination = local_coordination::resolve_paths(cli, launch_cwd)?;
+        return local_coordination::show_live(&coordination, *json);
+    }
     // Explicit task maintenance runs before any other startup work so it never
     // creates logs, environment state or task storage on its own, and never
     // imports anything automatically.
@@ -475,7 +490,13 @@ async fn run(cli: &Cli) -> Result<()> {
                 port: *port,
             })
             .await?;
-            let args = remote_host::launch_args(&std::env::args().skip(1).collect::<Vec<_>>());
+            // This launcher has no Session row, but its child must still inherit
+            // the root prepared from the pre-`-C` launch directory.
+            let prepared = local_coordination::prepare_startup(cli, &paths, launch_cwd.as_deref()).await;
+            local_coordination::export_child_root(&prepared);
+            let original =
+                local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
+            let args = remote_host::launch_args(&original);
             let workspace = cli.path.clone().unwrap_or(std::env::current_dir()?);
             let code = remote_host::run(listening, args, &workspace, &paths.data_dir).await?;
             std::process::exit(code);
@@ -542,6 +563,15 @@ async fn run(cli: &Cli) -> Result<()> {
             send,
         }) => {
             let context = services::context(&paths)?;
+            // Sending constructs a Session, so the launch decision is prepared
+            // and exported before voice can change the current directory.
+            let coordination = if *send {
+                let prepared = local_coordination::prepare_startup(cli, &paths, launch_cwd.as_deref()).await;
+                local_coordination::export_child_root(&prepared);
+                Some(prepared)
+            } else {
+                None
+            };
             return voice::run(
                 cli,
                 &paths,
@@ -550,6 +580,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 *push_to_talk,
                 *continuous,
                 *send,
+                coordination,
             )
             .await;
         }
@@ -573,9 +604,9 @@ async fn run(cli: &Cli) -> Result<()> {
             }
             let db = paths.open_database()?;
             let value = match action {
-                SessionCommands::ShutdownWorker { .. } | SessionCommands::StopTask { .. } => {
-                    unreachable!()
-                }
+                SessionCommands::Live { .. }
+                | SessionCommands::ShutdownWorker { .. }
+                | SessionCommands::StopTask { .. } => unreachable!(),
                 SessionCommands::Trust { id, folders } => serde_json::to_value(
                     deepseek_code_core::services::session_trust::repair(
                         &db,
@@ -875,6 +906,11 @@ async fn run(cli: &Cli) -> Result<()> {
     deepseek_code_core::permissions::set_full_access(
         cli.full_access && matches!(cli.permission_mode, args::PermissionModeArg::Bypass),
     );
+    // One prepared decision covers export, activation and later incarnations.
+    // It resolves against the launch directory captured before `-C`, and every
+    // known host child inherits that absolute native root.
+    let prepared = local_coordination::prepare_startup(cli, &paths, launch_cwd.as_deref()).await;
+    local_coordination::export_child_root(&prepared);
     let mut session = session::Session::open(
         cli,
         &paths,
@@ -883,11 +919,13 @@ async fn run(cli: &Cli) -> Result<()> {
     )
     .await?;
     resource_sampling::session(&session.id);
-    startup_options::apply(cli, &mut session).await?;
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     // Set by /restart; the replacement starts after this session is closed.
     let mut restart_args: Option<Vec<String>> = None;
     let result = async {
+        // Applied inside the cleanup scope so a startup failure reaches teardown
+        // and publishes no incarnation.
+        startup_options::apply(cli, &mut session).await?;
         if !sdk_stream { session.start_hooks(if resumed.is_some() { "resume" } else { "startup" }).await?; }
         if cli.init || cli.init_only || cli.maintenance {
             anyhow::ensure!(!sdk_stream, "Setup flags with stream-json input are not supported");
@@ -899,6 +937,16 @@ async fn run(cli: &Cli) -> Result<()> {
             }?;
             for warning in outcome { eprintln!("Setup hook: {warning}"); }
         }
+        // Startup succeeded and the final workspace is known: publish now, so a
+        // failed startup never leaves a registry row or owner lease behind.
+        // A one-shot run with nothing to do is rejected before it can publish.
+        if !sdk_stream && single {
+            anyhow::ensure!(
+                session.initial_hook_message.is_some() || !prompt.trim().is_empty(),
+                "A prompt or piped stdin is required"
+            );
+        }
+        session.activate_coordination(prepared).await;
         if !single {
             if std::env::var_os(remote_host::HANDOFF_ENV).is_none() {
                 let banner = terminal::banner(&session.model, &session.workspace);
@@ -915,7 +963,6 @@ async fn run(cli: &Cli) -> Result<()> {
         if !sdk_stream {
             let initial = session.initial_hook_message.take();
             if single {
-                ensure!(initial.is_some() || !prompt.trim().is_empty(), "A prompt or piped stdin is required");
                 if let Some(message) = initial {
                     Box::pin(session.turn_initial_hook(cli, &message, &mut input, prompt.trim().is_empty() || cli.output_format == OutputFormat::StreamJson)).await?;
                 }
@@ -989,6 +1036,9 @@ async fn run(cli: &Cli) -> Result<()> {
             if crate::signals::terminating() {
                 break 'repl;
             }
+            // A committed transition may have resolved a root this launch deferred,
+            // so children of this iteration inherit the current native value.
+            local_coordination::export_session_child_root(session.coordination_child_root());
             resource_sampling::session(&session.id);
             // Router sessions advance their tasks between turns. Normal Agent
             // sessions pay only one setting read.
@@ -1401,7 +1451,16 @@ async fn run(cli: &Cli) -> Result<()> {
                     drop(presence.take());
                     // The old OS input reader must be gone before the host owns stdin.
                     drop(input.take());
-                    let args = remote_host::child_args(&std::env::args().skip(1).collect::<Vec<_>>(), cli.prompt.as_deref(), &session.id, &session.workspace);
+                    // The child inherits the exported native root, so the original
+                    // override is dropped before any non-UTF-8 value is decoded.
+                    let original =
+                        local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
+                    let args = remote_host::child_args(&original, cli.prompt.as_deref(), &session.id, &session.workspace);
+                    // The relay child inherits this session's current native root.
+                    local_coordination::export_session_child_root(session.coordination_child_root());
+                    // The child resumes the session; this owner is deliberately
+                    // handing it off, so its row closes before the transfer.
+                    session.close_coordination().await;
                     let code = remote_host::run(listening, args, &session.workspace, &paths.data_dir).await?;
                     std::process::exit(code);
                 }
@@ -1457,7 +1516,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     continue;
                 }
                 restart_args = Some(restart::args(
-                    &std::env::args().skip(1).collect::<Vec<_>>(),
+                    &local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?,
                     cli.prompt.as_deref(),
                     &session.id,
                     &session.workspace,
@@ -1520,7 +1579,7 @@ async fn run(cli: &Cli) -> Result<()> {
             .store
             .history(&session.id)
             .is_ok_and(|rows| !rows.is_empty());
-    let shutdown = session.close().await;
+    let shutdown = session.close_owned().await;
     // Restore the shell before printing the one message that must survive cleanup.
     drop(input);
     drop(screen_mode);
@@ -1529,6 +1588,8 @@ async fn run(cli: &Cli) -> Result<()> {
         eprintln!("\nResume this session with:\ndcl --resume {}", session.id);
     }
     if let Some(args) = restart_args.take() {
+        // The replacement inherits the session's current native root.
+        local_coordination::export_session_child_root(session.coordination_child_root());
         // Release the session and its database before the replacement opens it.
         shutdown?;
         drop(session);
