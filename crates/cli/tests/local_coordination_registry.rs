@@ -2901,6 +2901,21 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
 
+    /// Releases the hook and cleans up the child if it is still running.
+    struct ClearGuard<'a> {
+        release: &'a Path,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    }
+    impl Drop for ClearGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.release, b"");
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     let workspace = temp.path().join("workspace");
@@ -2962,12 +2977,15 @@ async fn registry_clear_sigint_after_commit_returns_success() {
         "accept-edits",
         "--ax-screen-reader",
     ]);
-    let mut child = pty
-        .slave
-        .spawn_command(command)
-        .expect("the interactive CLI starts");
+    let mut guard = ClearGuard {
+        release: &release,
+        child: pty
+            .slave
+            .spawn_command(command)
+            .expect("the interactive CLI starts"),
+    };
     drop(pty.slave);
-    let pid = child.process_id().expect("the owned child has a pid");
+    let pid = guard.child.process_id().expect("the owned child has a pid");
     let mut writer = pty.master.take_writer().expect("pty writer");
     let mut reader = pty.master.try_clone_reader().expect("pty reader");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -2986,25 +3004,6 @@ async fn registry_clear_sigint_after_commit_returns_success() {
             }
         }
     });
-
-    /// Releases the hook, then kills and reaps the owned child on every path.
-    struct ClearGuard<'a> {
-        release: &'a Path,
-        child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    }
-    impl Drop for ClearGuard<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::write(self.release, b"");
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-    let mut guard = ClearGuard {
-        release: &release,
-        child: Some(child),
-    };
 
     // The startup frontend incarnation is the row the clear must close.
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -3044,7 +3043,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     assert_ne!(new.instance_id, old.instance_id, "and a new instance");
 
     assert!(
-        guard.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+        guard.child.try_wait().unwrap().is_none(),
         "the CLI is still running before the signal"
     );
     let status = std::process::Command::new("kill")
@@ -3082,7 +3081,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     );
     assert_eq!(gate.requests.load(Ordering::SeqCst), 0, "no model request");
     assert!(
-        guard.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+        guard.child.try_wait().unwrap().is_none(),
         "the CLI keeps running after the interruption"
     );
     assert!(poll_rows(&root)
@@ -3095,7 +3094,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     writer.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     let exit = loop {
-        if let Some(status) = guard.child.as_mut().unwrap().try_wait().unwrap() {
+        if let Some(status) = guard.child.try_wait().unwrap() {
             break status;
         }
         assert!(Instant::now() < deadline, "the CLI never exited");
