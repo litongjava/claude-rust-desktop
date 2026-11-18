@@ -432,3 +432,156 @@ async fn auxiliary_generation_search_and_native_compaction_use_explicit_session(
         );
     }
 }
+
+/// A buffered model request keeps its own total deadline. The streaming idle
+/// setting must neither shorten nor extend it.
+#[tokio::test]
+async fn buffered_model_requests_keep_the_total_deadline() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const OPENAI_BODY: &str = "{\"id\":\"r\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"fixture\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"trickled\"},\"finish_reason\":\"stop\"}],\"usage\":null}";
+    const ANTHROPIC_BODY: &str = "{\"id\":\"r\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fixture\",\"content\":[{\"type\":\"text\",\"text\":\"trickled\"}],\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+    for api in ["openai-completions", "anthropic-messages"] {
+        let body = if api == "openai-completions" {
+            OPENAI_BODY
+        } else {
+            ANTHROPIC_BODY
+        };
+        let (base, posts, captured) = trickle(body, 8, Duration::from_millis(100)).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let p = provider(None, &base, api);
+        let started = std::time::Instant::now();
+        let error = if api == "openai-completions" {
+            OpenAIClient::new()
+                .with_http_client(client)
+                .without_retries()
+                .send_message(
+                    &p,
+                    vec![OpenAIMessage {
+                        role: "user".into(),
+                        content: OpenAIContent::Text("hello".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        provider_content: None,
+                    }],
+                    None,
+                    vec![],
+                    1024,
+                )
+                .await
+                .unwrap_err()
+        } else {
+            AnthropicClient::new()
+                .with_http_client(client)
+                .without_retries()
+                .send_message(
+                    &p,
+                    vec![AnthropicMessage {
+                        role: "user".into(),
+                        content: AnthropicContent::Text("hello".into()),
+                    }],
+                    None,
+                    vec![],
+                    1024,
+                )
+                .await
+                .unwrap_err()
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "{api}: one buffered POST");
+        let http = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .unwrap_or_else(|| panic!("{api}: a typed transport error: {error:#}"));
+        assert!(http.is_timeout(), "{api}: {error:#}");
+        assert!(
+            elapsed > Duration::from_millis(300),
+            "{api}: the trickled body outlived the deadline: {elapsed:?}"
+        );
+        let request = String::from_utf8(captured.lock().unwrap()[0].clone()).unwrap();
+        assert!(
+            !request.contains("\"stream\":true"),
+            "{api}: a buffered request must not stream: {request}"
+        );
+    }
+}
+
+/// Answers one connection with a JSON body delivered in delayed pieces.
+async fn trickle(
+    body: &'static str,
+    pieces: usize,
+    gap: std::time::Duration,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let posts = Arc::new(AtomicUsize::new(0));
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+    let (count, requests) = (posts.clone(), captured.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            count.fetch_add(1, Ordering::SeqCst);
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                requests.lock().unwrap().push(buffer);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                if socket.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                let bytes = body.as_bytes();
+                let step = ((bytes.len() + pieces - 1) / pieces).max(1);
+                for piece in bytes.chunks(step) {
+                    tokio::time::sleep(gap).await;
+                    if socket.write_all(piece).await.is_err() || socket.flush().await.is_err() {
+                        return;
+                    }
+                }
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (base, posts, captured)
+}

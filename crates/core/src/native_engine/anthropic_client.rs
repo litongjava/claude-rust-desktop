@@ -147,6 +147,10 @@ pub struct AnthropicClient {
     /// Background generation has no use for reasoning unless the model asks for it.
     plain_text: bool,
     client: Client,
+    /// Built once and reused by every stream send; a stream is idle-bounded.
+    stream_client: std::sync::OnceLock<Client>,
+    /// Test injection also covers the streaming transport.
+    stream_override: Option<Client>,
     response_schema: Option<Value>,
     retry_requests: bool,
     pub(super) request_options: super::request_options::RequestOptions,
@@ -161,11 +165,31 @@ impl AnthropicClient {
             .unwrap_or_else(|_| Client::new());
         Self {
             client,
+            stream_client: std::sync::OnceLock::new(),
+            stream_override: None,
             request_options: Default::default(),
             response_schema: None,
             retry_requests: true,
             plain_text: false,
         }
+    }
+
+    /// The streaming transport keeps no total deadline; each read is bounded by
+    /// the configured idle timeout instead.
+    pub(super) fn streaming_client(&self) -> Result<Client> {
+        if let Some(client) = &self.stream_override {
+            return Ok(client.clone());
+        }
+        if let Some(client) = self.stream_client.get() {
+            return Ok(client.clone());
+        }
+        let client = super::model_http::streaming_client(super::model_http::Redirect::None)?;
+        let _ = self.stream_client.set(client);
+        Ok(self
+            .stream_client
+            .get()
+            .expect("the streaming client was just set")
+            .clone())
     }
 
     pub fn with_request_options(mut self, options: super::request_options::RequestOptions) -> Self {
@@ -175,7 +199,8 @@ impl AnthropicClient {
 
     #[cfg(test)]
     pub(super) fn with_http_client(mut self, client: Client) -> Self {
-        self.client = client;
+        self.client = client.clone();
+        self.stream_override = Some(client);
         self
     }
 
@@ -337,7 +362,8 @@ impl AnthropicClient {
         crate::performance::apply_prompt_cache(&mut body);
         let harness_headers = self.request_options.headers(provider)?;
         let identity = super::request_identity::RequestIdentity::new(None, super::request_identity::is_opencode(provider));
-        let request = self.client.post(&url)
+        let client = self.streaming_client()?;
+        let request = client.post(&url)
             .headers(harness_headers)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -451,7 +477,8 @@ impl AnthropicClient {
         crate::performance::apply_conversation_cache(&mut body);
         let harness_headers = self.request_options.headers(provider)?;
         let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
-        let request = self.client.post(&url)
+        let client = self.streaming_client()?;
+        let request = client.post(&url)
             .headers(harness_headers)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")

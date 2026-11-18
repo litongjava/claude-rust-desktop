@@ -84,6 +84,13 @@ pub struct HttpConfig {
     pub max_retries: u32,
     #[serde(default = "default_retry_base_backoff_ms")]
     pub retry_base_backoff_ms: u64,
+    /// Opt-in: replay one model step that stalled after content arrived.
+    ///
+    /// Defaults to `false`, which keeps the visible partial output and the
+    /// failed turn. Enabled, the uncommitted step is discarded and issued once
+    /// more; nothing is replayed after a terminal marker or a complete stream.
+    #[serde(default)]
+    pub post_content_timeout_recovery: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +154,7 @@ impl Default for OrchestrationConfig {
                 request_timeout_secs: default_request_timeout_secs(),
                 max_retries: default_max_retries(),
                 retry_base_backoff_ms: default_retry_base_backoff_ms(),
+                post_content_timeout_recovery: false,
             },
             logging: LoggingConfig {
                 level: default_log_level(),
@@ -216,6 +224,8 @@ impl OrchestrationConfig {
     pub fn max_retries() -> u32 { Self::get().http.max_retries }
     pub fn retry_base_backoff_ms() -> u64 { Self::get().http.retry_base_backoff_ms }
     pub fn request_timeout_secs() -> u64 { Self::get().http.request_timeout_secs }
+    /// Read once per turn; a stalled post-content step is replayed only when set.
+    pub fn post_content_timeout_recovery() -> bool { Self::get().http.post_content_timeout_recovery }
     pub fn bridge_port() -> u16 { Self::get().bridge.port }
     pub fn memex_backend_url() -> &'static str { &Self::get().memory.memex_backend_url }
 }
@@ -390,6 +400,34 @@ mod tests {
         std::fs::write(root.path().join("config.json"), "invalid").unwrap();
         assert!(desktop.reload().is_err());
         assert_eq!(desktop.get_config().default_provider_id.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn post_content_timeout_recovery_defaults_to_false() {
+        // Built-in defaults never enable a replay of a stalled model step.
+        assert!(
+            !OrchestrationConfig::default()
+                .http
+                .post_content_timeout_recovery
+        );
+        let document = |http: &str| {
+            format!(
+                "[tool_loop]\n[tools]\n[memory]\n[bridge]\n[http]\n{http}[logging]\n[telemetry]\n"
+            )
+        };
+        // An older valid file that predates the setting keeps the opt-out.
+        let older: OrchestrationConfig = toml::from_str(&document("")).unwrap();
+        assert!(!older.http.post_content_timeout_recovery);
+        let off: OrchestrationConfig = toml::from_str(&document(
+            "request_timeout_secs = 30\npost_content_timeout_recovery = false\n",
+        ))
+        .unwrap();
+        assert!(!off.http.post_content_timeout_recovery);
+        let on: OrchestrationConfig = toml::from_str(&document(
+            "request_timeout_secs = 30\npost_content_timeout_recovery = true\n",
+        ))
+        .unwrap();
+        assert!(on.http.post_content_timeout_recovery);
     }
 
     #[test]

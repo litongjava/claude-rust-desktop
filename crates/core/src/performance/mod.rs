@@ -621,6 +621,13 @@ impl AttemptCounter {
             .store(status, std::sync::atomic::Ordering::Release);
     }
 
+    /// Forget the previous response before a new attempt opens, so a failed
+    /// reconnect never inherits an older HTTP status.
+    pub fn clear_status(&self) {
+        self.status
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn status(&self) -> Option<u16> {
         match self.status.load(std::sync::atomic::Ordering::Acquire) {
             0 => None,

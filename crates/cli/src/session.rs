@@ -2515,12 +2515,19 @@ impl Session {
         let usage = request_usage.total();
         completion.requests = snapshots.clone();
         completion.status = Some(terminal_status);
-        completion.failure = snapshots.iter().rev().find_map(|snapshot| {
-            snapshot
-                .get("failure")
-                .filter(|failure| !failure.is_null())
-                .cloned()
-        });
+        // An abandoned attempt is kept for diagnostics and usage, but the
+        // replacement owns this step's outcome: only a non-abandoned failure
+        // can describe how the turn ended.
+        completion.failure = snapshots
+            .iter()
+            .rev()
+            .filter(|snapshot| snapshot["abandonedForRecovery"] != true)
+            .find_map(|snapshot| {
+                snapshot
+                    .get("failure")
+                    .filter(|failure| !failure.is_null())
+                    .cloned()
+            });
         if publish || error.is_some() {
             match cli.output_format {
                 OutputFormat::Text => {
