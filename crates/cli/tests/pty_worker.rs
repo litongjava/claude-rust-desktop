@@ -541,21 +541,42 @@ async fn model_pty_worker_resize_resume_timeout_paging_stop_and_records() {
 
 #[tokio::test]
 async fn model_pty_eof_is_not_a_close_and_normal_exit_is_real() {
+    async fn wait_for_marker(path: &std::path::Path, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let output = tokio::fs::read_to_string(path).await;
+            if output.as_ref().is_ok_and(|text| text.contains(marker)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY output did not contain {marker}: {output:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let snapshot = |id: &'static str| (id, "TaskGet", json!({"task_id":"$start"}));
     let mut h = Harness::new().await;
-    h.turn("bypass",vec![load(),bash("start","stty -echo; echo EOF_READY; if IFS= read -r line; then echo unexpected; else echo VEOF_OBSERVED; fi; IFS= read -r line; printf 'AFTER_EOF:%s\\n' \"$line\"; exit 7"),get("ready")]).await;
+    h.turn("bypass",vec![load(),bash("start","stty -echo; echo EOF_READY; if IFS= read -r line; then echo unexpected; else echo VEOF_OBSERVED; fi; IFS= read -r line; printf 'AFTER_EOF:%s\\n' \"$line\"; exit 7")]).await;
     let (_, pid, tick) = h.track("start");
+    let stdout = PathBuf::from(h.result("start")["stdout_file"].as_str().unwrap());
+    wait_for_marker(&stdout, "EOF_READY").await;
+    h.turn("bypass", vec![snapshot("ready")]).await;
     assert!(h.result("ready")["stdout"]
         .as_str()
         .unwrap()
         .contains("EOF_READY"));
     h.turn(
         "bypass",
-        vec![
-            ("eof", "TaskInput", json!({"task_id":"$start","eof":true})),
-            get("veof"),
-        ],
+        vec![("eof", "TaskInput", json!({"task_id":"$start","eof":true}))],
     )
     .await;
+    let eof = h.result("eof");
+    assert_eq!(eof["ok"], true, "{eof}");
+    assert_eq!(eof["stdin_closed"], false, "{eof}");
+    wait_for_marker(&stdout, "VEOF_OBSERVED").await;
+    h.turn("bypass", vec![snapshot("veof")]).await;
     assert!(h.result("veof")["stdout"]
         .as_str()
         .unwrap()

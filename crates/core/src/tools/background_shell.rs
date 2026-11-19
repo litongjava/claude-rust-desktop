@@ -4543,26 +4543,33 @@ setInterval(() => {}, 10000);
             pipe.session.clone(),
             pipe.id.clone(),
         );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let waiting = std::thread::spawn(move || {
-            super::super::shell_input::execute(
+            let mut entered_tx = Some(entered_tx);
+            super::super::shell_input::capacity_barrier::install(Box::new(move |_| {
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.recv();
+                }
+            }));
+            let result = super::super::shell_input::execute(
                 &json!({"task_id":id,"data":"p".repeat(8 * 1024),"timeout":60000}),
                 &root,
                 &session,
-            )
-            .unwrap()
-        });
-        // Readiness: the blocked call holds the per-task stdin lock while the
-        // pipe has no room (proved by the fill timeouts above).
-        let deadline = std::time::Instant::now() + READINESS_DEADLINE;
-        while !lock_is_held(&pipe.directory) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the blocked write never took the task stdin lock"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            super::super::shell_input::capacity_barrier::clear();
+            result.unwrap()
+        });
+        // The lock can be held before the writer rechecks the owner. Wait for
+        // the actual full-pipe write before releasing the lease.
+        tokio::time::timeout(READINESS_DEADLINE, entered_rx)
+            .await
+            .expect("the write never reached the pipe-capacity wait")
+            .expect("the writer exited before waiting for pipe capacity");
         pipe.lose_owner();
         let started = std::time::Instant::now();
+        resume_tx.send(()).unwrap();
         let outcome = waiting.join().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),
