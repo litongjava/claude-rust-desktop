@@ -1,6 +1,5 @@
 use axum::{extract::State, routing::post, Json, Router};
 use deepseek_code_core::{
-    memory::ContextManager,
     native_engine::provider_manager::Provider,
     runtime::RuntimePaths,
     services::{
@@ -118,12 +117,10 @@ async fn consolidation_is_durable_recalled_once_and_respects_gates() {
     let reopened = Arc::new(dream::client(&context));
     assert_eq!(reopened.stats().await.unwrap().total_memories, 2);
     assert_eq!(reopened.dream_status().await.unwrap().runs, 1);
-    let manager = ContextManager::new(reopened.clone());
-    assert!(manager
-        .before_api_call("next", "Chinese replies")
-        .await
-        .unwrap()
-        .contains("Remember PostgreSQL"));
+    let recalled = reopened.search("Chinese replies", None).await.unwrap();
+    assert!(recalled
+        .iter()
+        .any(|memory| memory.content.contains("Remember PostgreSQL")));
     reopened
         .ingest("New PostgreSQL configuration", Some(0.8), None)
         .await

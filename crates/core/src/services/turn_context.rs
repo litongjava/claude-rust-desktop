@@ -102,8 +102,17 @@ pub fn attach_to_last(root: &Path, session: &str, messages: &[Value], blocks: Ve
     Ok(Some(entry))
 }
 
+/// A block that automatic recall stored in a session before recall was
+/// removed. Such blocks must not be replayed; hooks and skill content must.
+fn is_recall_block(block: &str) -> bool {
+    block
+        .strip_prefix("<system-reminder>\n")
+        .is_some_and(|rest| rest.starts_with(crate::memory::RECALL_LEAD_IN))
+}
+
 /// The blocks for each message of `messages`, empty where none were recorded.
-/// A later entry for the same message adds to the earlier ones.
+/// A later entry for the same message adds to the earlier ones. Stored recall
+/// blocks are skipped; every other block keeps its place.
 pub fn resolve(entries: &[Entry], messages: &[Value]) -> Vec<Vec<String>> {
     locate(messages)
         .into_iter()
@@ -112,6 +121,7 @@ pub fn resolve(entries: &[Entry], messages: &[Value]) -> Vec<Vec<String>> {
                 .iter()
                 .filter(|entry| entry.key == key && entry.occurrence == occurrence)
                 .flat_map(|entry| entry.blocks.iter().cloned())
+                .filter(|block| !is_recall_block(block))
                 .collect(),
             None => Vec::new(),
         })
@@ -170,6 +180,18 @@ mod tests {
         assert_eq!(resolve(&entries, &later), vec![vec!["hook one".to_string()], vec![], vec!["skill two".to_string()]]);
         assert!(load(root.path(), "other").unwrap().is_empty());
         assert!(attach_to_last(root.path(), "s", &[json!({"role":"assistant","content":"x"})], vec!["x".into()]).unwrap().is_none());
+    }
+
+    #[test]
+    fn stored_recall_blocks_are_skipped_but_other_blocks_are_kept() {
+        let messages = vec![json!({"role":"user","content":"go"})];
+        let recall = format!(
+            "<system-reminder>\n{} These are excerpts from earlier conversations.\n\n[Memory 1] old memory\n</system-reminder>",
+            crate::memory::RECALL_LEAD_IN
+        );
+        let hook = "<system-reminder>\nhook context\n</system-reminder>".to_string();
+        let entry = for_last(&messages, vec![recall, hook.clone()]).unwrap();
+        assert_eq!(resolve(&[entry], &messages), vec![vec![hook]]);
     }
 
     #[test]
