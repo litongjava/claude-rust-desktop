@@ -1,5 +1,5 @@
-//! A delegated child runs in its own conversation: the managed shells it leaves
-//! running are stopped when it ends and reported in the result the parent gets.
+//! A delegated child runs in its own conversation. Its managed shells and
+//! monitors are stopped when it ends and reported in the parent's result.
 use super::*;
 use crate::native_engine::{engine_core::ReasoningMode, provider_manager::ResolvedProvider};
 use crate::runtime::{RuntimePaths, SessionStore};
@@ -17,11 +17,13 @@ use std::{
 #[derive(Clone)]
 struct MockModel {
     index: Arc<AtomicUsize>,
-    /// Arguments of the Bash call the child makes first.
+    /// Arguments for the background tool call.
     background: Value,
     /// Answer the next request with an authentication error instead of
     /// finishing the child normally.
     fail_after_background: bool,
+    /// Gates a Monitor-using child's final response until its processes are pinned.
+    monitor_finish: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn provider(endpoint: &str) -> ResolvedProvider {
@@ -53,6 +55,21 @@ async fn reply(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let index = mock.index.fetch_add(1, Ordering::SeqCst);
+    if let Some(finish) = mock.monitor_finish {
+        let body = match index {
+            0 => tool_call_frame(
+                "ToolSearch",
+                "monitor-search",
+                json!({"query":"select:Monitor"}),
+            ),
+            1 => tool_call_frame("Monitor", "monitor-call", mock.background),
+            _ => {
+                finish.notified().await;
+                text_frame("child complete")
+            }
+        };
+        return ([("content-type", "text/event-stream")], body).into_response();
+    }
     if mock.fail_after_background && index > 0 {
         // Give the background shell time to publish its PID before the request
         // fails and the cleanup stops it. Authentication failures are not
@@ -83,16 +100,21 @@ struct Fixture {
 }
 
 async fn fixture(background: Value, fail_after_background: bool) -> Fixture {
+    fixture_with_model(MockModel {
+        index: Arc::new(AtomicUsize::new(0)),
+        background,
+        fail_after_background,
+        monitor_finish: None,
+    })
+    .await
+}
+
+async fn fixture_with_model(mock: MockModel) -> Fixture {
     crate::config::OrchestrationConfig::init_global().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
     let sessions = SessionStore::new(paths.open_database().unwrap());
     let parent = sessions.create(temp.path(), "fixture", "fixture").unwrap();
-    let mock = MockModel {
-        index: Arc::new(AtomicUsize::new(0)),
-        background,
-        fail_after_background,
-    };
     let app = Router::new()
         .route("/v1/chat/completions", post(reply))
         .with_state(mock);
@@ -411,4 +433,200 @@ async fn aborting_the_owner_stops_a_task_created_late() {
     assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
     wait_process_gone(pid, "the aborted subagent's shell").await;
     fixture.server.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+enum MonitorOwnerExit {
+    Return,
+    Abort,
+    ReturnAfterTaskUpdate,
+    ReturnWithHistoricalStatus,
+}
+
+#[cfg(target_os = "linux")]
+async fn verify_delegated_monitor_cleanup(owner_exit: MonitorOwnerExit) {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    use std::os::fd::AsFd;
+
+    // Observe waitability without consuming any result from the monitor's owner.
+    let observe = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let fixture = fixture_with_model(MockModel {
+        index: Arc::new(AtomicUsize::new(0)),
+        background: json!({
+            "command": "printf '%s\\n' \"$$\" > monitor.pid; sleep 60 & printf '%s\\n' \"$!\" > descendant.pid; wait",
+            "description": "delegated monitor",
+            "shell": "sh",
+            "timeout_ms": 1_000,
+            "max_runtime_ms": 60_000,
+        }),
+        fail_after_background: false,
+        monitor_finish: Some(finish.clone()),
+    })
+    .await;
+    let executor = fixture.executor();
+    let mut owners = tokio::task::JoinSet::new();
+    let owner = owners.spawn(async move {
+        executor
+            .execute_delegated(&json!({"prompt":"start a monitor","agent_type":"general"}))
+            .await
+    });
+
+    // The script can publish a PID only after TaskCreate committed the row
+    // and its schema. A SQLite filename alone can appear before either.
+    let mut processes = Vec::new();
+    for path in ["monitor.pid", "descendant.pid"] {
+        let pid = wait_for_pid(&fixture.temp.path().join(path)).await;
+        let process = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        let fd =
+            rustix::process::pidfd_open(process, rustix::process::PidfdFlags::empty()).unwrap();
+        assert!(
+            !process_finished(pid),
+            "{path} should be alive before teardown"
+        );
+        if path == "monitor.pid" {
+            let state = waitid(WaitId::PidFd(fd.as_fd()), observe);
+            assert!(
+                matches!(state, Ok(None)),
+                "expected a live direct monitor child, got {state:?}"
+            );
+        }
+        processes.push((path, tokio::io::unix::AsyncFd::new(fd).unwrap()));
+    }
+
+    let child = wait_for_child_session(&fixture.data, &fixture.parent).await;
+    let id = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let events = crate::tools::monitor::collect_events(&fixture.data, &child).unwrap();
+            if let Some(event) = events.into_iter().find(|event| event.kind == "renewed") {
+                break event.task_id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("delegated monitor should renew before its owner ends");
+    assert_eq!(read_status(&fixture.data, &child, &id), "running");
+
+    if owner_exit == MonitorOwnerExit::ReturnWithHistoricalStatus {
+        // This spelling was writable on older versions. Keep the actual runner
+        // and its pinned descendant alive while seeding its historical row.
+        let db =
+            rusqlite::Connection::open(fixture.data.join("tasks").join(format!("{child}.sqlite3")))
+                .unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE tasks SET body=json_set(body,'$.status','in_progress') WHERE id=?1",
+                [&id],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    if owner_exit == MonitorOwnerExit::ReturnAfterTaskUpdate {
+        for (mut input, expected) in [
+            (json!({"status":"completed"}), "status/deletion"),
+            (json!({"status":"deleted"}), "status/deletion"),
+            (json!({"metadata":{"monitor":null}}), "monitor provenance"),
+            (
+                json!({"metadata":{"log_dir":format!("fg-{}", uuid::Uuid::new_v4())}}),
+                "Monitor log_dir",
+            ),
+        ] {
+            input["id"] = json!(id);
+            let error = crate::tools::tasks::execute_for_session_async(
+                "TaskUpdate",
+                input,
+                &fixture.data,
+                &child,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        crate::tools::tasks::execute_for_session_async(
+            "TaskUpdate",
+            json!({"id":id,"description":"owner annotation","metadata":{"note":"kept"}}),
+            &fixture.data,
+            &child,
+        )
+        .await
+        .unwrap();
+        let task = crate::tools::tasks::read_for_session(&id, &fixture.data, &child).unwrap();
+        assert_eq!(task["description"], "owner annotation");
+        assert_eq!(task["metadata"]["note"], "kept");
+        assert_eq!(task["status"], "running");
+        assert_eq!(task["metadata"]["monitor"], true);
+        assert!(task["metadata"].get("log_dir").is_none());
+    }
+
+    if owner_exit == MonitorOwnerExit::Abort {
+        owner.abort();
+    } else {
+        finish.notify_one();
+    }
+    let joined = tokio::time::timeout(Duration::from_secs(15), owners.join_next())
+        .await
+        .expect("delegated owner should finish")
+        .unwrap();
+    if owner_exit == MonitorOwnerExit::Abort {
+        assert!(joined.unwrap_err().is_cancelled());
+    } else {
+        let result = joined.unwrap().unwrap();
+        assert_eq!(result["session_id"], child);
+        assert_eq!(result["status"], "completed", "{result}");
+        assert!(
+            result["result"].as_str().unwrap().contains(
+                "Stopped 1 background task(s) the subagent left running: delegated monitor."
+            ),
+            "{result}"
+        );
+        assert_eq!(read_status(&fixture.data, &child, &id), "cancelled");
+    }
+
+    wait_for_status(&fixture.data, &child, &id, "cancelled").await;
+    for (path, process) in processes {
+        let _ready = tokio::time::timeout(Duration::from_secs(10), process.readable())
+            .await
+            .unwrap_or_else(|_| panic!("{path} stayed alive after delegated owner teardown"))
+            .unwrap();
+        if path == "monitor.pid" {
+            let state = waitid(WaitId::PidFd(process.get_ref().as_fd()), observe);
+            assert!(
+                matches!(state, Err(rustix::io::Errno::CHILD)),
+                "monitor child was not reaped: {state:?}"
+            );
+        }
+    }
+    let events = crate::tools::monitor::collect_events(&fixture.data, &child).unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].task_id, id);
+    assert_eq!(events[0].kind, "stopped");
+    fixture.server.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewing_monitor_stops_when_its_subagent_finishes() {
+    verify_delegated_monitor_cleanup(MonitorOwnerExit::Return).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewing_monitor_stops_when_its_parent_aborts() {
+    verify_delegated_monitor_cleanup(MonitorOwnerExit::Abort).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewing_monitor_cannot_be_hidden_from_delegated_cleanup_with_task_update() {
+    verify_delegated_monitor_cleanup(MonitorOwnerExit::ReturnAfterTaskUpdate).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegated_cleanup_stops_a_surviving_in_progress_monitor() {
+    verify_delegated_monitor_cleanup(MonitorOwnerExit::ReturnWithHistoricalStatus).await;
 }

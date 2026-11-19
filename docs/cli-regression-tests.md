@@ -240,6 +240,33 @@ python3 dev-support/deepseek-code/super-agent-20261110/harness-fix/h1_pty_accept
 3. 列表和详情里按 `x` 停止：任务立即从列表消失；停止最后一个后列表自动关闭，不再输出其他内容。
 4. 没有任务时输出 `No background tasks.`。`/tasks completed`、`/tasks show ID`、`/tasks attach ID` 文本命令照常可用。
 
+#### I7. Monitor 自动续期
+
+```bash
+cargo test --locked -p deepseek-code-core --lib tools::monitor::tests::
+cargo test --locked -p deepseek-code-core --lib task_cleanup
+cargo test --locked -p deepseek-code-core --lib native_engine::tool_loop::tool_loading_tests::monitor_is_deferred_and_loadable
+cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_once_and_announced idle_session_wakes_for_a_monitor_event
+```
+
+1. 省略 `max_runtime_ms` 时，脚本仍在运行也会在首个 `timeout_ms` 到期后结束，最终事件为 `expired`。`max_runtime_ms` 必须是大于 `timeout_ms` 且不超过 86400000 的整数。
+2. 启动会输出 PID 并等待本地文件的脚本，收到 `renewed` 后用 `TaskGet` 确认同一任务仍为 `running`。创建文件后，第二条输出的 PID 与首条相同，随后仅收到一个 `exited`。
+3. 在收到首次续期通知后调用同一任务的 `TaskStop`，确认任务变为 `cancelled`，最终事件为 `stopped`。
+4. 设置 2 秒间隔和 5 秒总上限。用命名管道让本地脚本等待放行，确认首条输出已写入事件后再推进暂停的 Tokio 时钟。验证两个续期边界以及最后一个间隔缩短至总上限。将时钟保持在上限，用 Linux pidfd 单独确认进程退出，再检查最终任务记录和 `expired` 事件。短间隔一分钟内只发一条 `renewed` 通知，重复收取事件应为空。
+5. 在真实终端用本地模型 mock 通过 `ToolSearch` 加载 `Monitor`，核对请求中的新 schema。让脚本保持运行直到收到续期通知，确认终端显示该通知，模型恰好收到一条新的续期消息。让脚本退出，再检查模型没有收到重复续期通知。
+6. Linux 子代理用本地模型 mock 加载并启动可续期的 Monitor。先等待续期并获取脚本和后代进程的 pidfd，再分别放行子代理正常返回和取消父执行 future。两种情况下任务都进入 `cancelled`，只产生一条 `stopped`，两个 pidfd 都确认原进程已退出，`waitid` 确认直接子进程已回收。正常返回还向父会话报告已停止的任务。
+7. 省略总上限时，在当前线程的 Tokio 运行时第一次调度 Monitor 前把时钟推进 60 秒。它仍有完整的 30 秒间隔，观察期内继续运行。计时器赢得 select 时仍直接走原有的 `expired` 分支。
+8. 子代理的 Monitor 续期后，通过其会话的普通 `TaskUpdate` 尝试完成或删除任务、清除 `metadata.monitor`、改写 `metadata.log_dir`，四项均应被拒绝。说明和普通 metadata 仍可修改。放行子代理返回，确认脚本和后代都退出、直接子进程已回收、任务为 `cancelled` 且仅一条 `stopped`。普通 `TaskCreate` 和 `TaskUpdate` 也不能伪造 Monitor 标记。
+9. 遍历 Monitor 的任务状态表，分别使用普通 TaskUpdate 和进程所有者接口验证所有允许与禁止的状态写入。对三个终态分别测试再次启动、改写结果、重复停止、同态写入和删除；拒绝时同一请求中的说明修改也不能落盘。删除后不能复活原 ID。
+10. 在隔离数据目录用普通文件阻止创建日志目录，另一次用不存在的命令模拟启动失败。两次均应能读到 failed 记录并删除。运行时在首次调度前退出也应使记录进入终态。
+11. 子代理清理测试先等待脚本发布 PID，再查询已提交的任务库。用四个测试线程并行重复运行正常返回及 TaskUpdate 后返回的用例 20 次。
+12. 锁住 SQLite 的 running 提交时，带总上限的脚本不能提前启动。发布成功后以启动脚本时的单调时钟计时；阻止 running 写入时进程的 pre_exec 标记应为空。
+13. 脚本正常退出时保持 SQLite 写锁，确认只收到一次 exited。锁在 10 秒重试窗口内释放时，直接查询数据库应看到 completed 和退出结果；锁保持到写入方重试结束时，原记录应保持 running。再次读取和收取事件后仍应看到原记录。
+14. 子代理的 Monitor 续期后将真实任务行置为历史状态 in_progress。放行子代理返回，验证父代理确认停止，shell 与后代均退出，且只有一个 stopped 事件。
+15. 在上述写锁下归档日志目录，TaskGet 的 4 字节限制和截断标志应与当时已提交的 output 一致。用 1.5 秒后释放的写锁验证普通 TaskUpdate 的备注仍能写入且退出结果保留备注。另一次只将数据库改为只读后释放写锁，确认 TaskGet 和 TaskList 均可读取记录。
+16. Monitor 正常退出后，用写锁挡住第一次终态写入，确保 TaskUpdate 已提交再放行重试。对比编辑回执、TaskGet、TaskList 与 SQLite：状态应为 completed，说明保留，updatedAt 取成功写入时的时间，不能早于已存时间（包括带时区偏移和纳秒的时间）。若编辑还设置了 output，终态摘要里的 task_output 应逐字保留该字符串，包括空串。
+17. 重试合并 TaskUpdate 的 output 时，对照回执、TaskGet、TaskList 和 SQLite，逐字节核对内嵌 NUL、首尾控制字符、Unicode、转义文本及超过 1 MiB 的字符串。用预置的 JSON 行验证孤立代理项转义的原文，带 NUL 后缀的状态或时间戳不能按前缀匹配。通知的 subject 会过滤控制字符，但应保留 NUL 之后的正文。
+
 ### G. 长期记忆
 
 1. `dcl memory add`、`list`、`list 关键词`、`update`、`delete` 输出 JSON；ID 不存在时报错。
@@ -816,6 +843,8 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
   权限：同一工具按操作分类，读操作在 Plan 模式允许、写操作被拒绝；Ask/AcceptEdits 需确认，Bypass 允许；`--disallowed-tools GitHub` 等 deny 规则仍然生效，且"已加载"不构成授权。真实 CLI 用例 `crates/cli/tests/github_tool.rs` 用 PATH 上的假 `gh` 验证：ToolLoad 前请求中没有该工具、加载后 schema 正确、一次读经由正常执行器返回规范化 JSON、Pre/PostToolUse 各触发一次且 `tool_use_id` 与持久的 `tool_calls` 行一致（相互独立的 occurrence id，不是模型给的 id）、Plan 模式与 deny 规则下写操作被拒绝且假 `gh` 从未被启动。
   **明确限制**：全部验证使用本地假 `gh`，未对真实 GitHub 执行任何创建/评论/合并；Windows 与 macOS 上的 `gh` 探测和 CLI 用例未运行（假 `gh` fixture 是 Unix shell 脚本，CLI 用例整体 `#![cfg(unix)]`）；取消/超时只证明自有进程被终止，不证明远端请求是否已被接受，因此写操作一律报 `unknown` 而不是推测结果。
 - `tools/mod.rs` 的 shell 启动、`services/tool_hooks.rs`、`mcp/mod.rs` 的 stdio 启动：`worker_environment`，并按 E4 复核后台与分离命令
+- `tools/monitor.rs`、`tools/monitor_completion.rs`、`tools/mod.rs` 的 Monitor 生命周期、终态写入重试、schema 与分发：I7（含本地脚本和真实终端中的模型通知）
+- `tools/background_shell.rs` 的会话停止扫描、`tools/tasks.rs` 的 Monitor 字段保护与 `native_engine/delegation_task_cleanup_tests.rs`：I7 的子代理清理用例和“子代理结束时停止其后台 shell 任务”。
 - `tools/external_agents.rs`：P
 - `crates/cli/src/signals.rs`、`crates/cli/src/main.rs` 的信号处理：Q，以及 B（运行中排队与撤回）、E3（`Esc` 中断当前一轮）
 - `crates/cli/src/session.rs`、`worker_frontend.rs`、`sdk.rs`、`compaction.rs` 的取消分支：Q，以及 L 的取消场景和 SDK 测试
