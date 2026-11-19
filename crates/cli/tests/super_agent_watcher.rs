@@ -172,11 +172,17 @@ fn signal(pid: u32, start: &str, signal: &str) {
     if process_start(pid).as_deref() != Some(start) {
         return;
     }
-    assert!(Command::new("kill")
+    let output = Command::new("kill")
         .args([format!("-{signal}"), "--".into(), pid.to_string()])
-        .status()
-        .unwrap()
-        .success());
+        .output()
+        .unwrap();
+    // A worker can exit between the identity check and delivery, especially
+    // during teardown. Only the same live worker still needs the signal.
+    assert!(
+        output.status.success() || process_start(pid).as_deref() != Some(start),
+        "could not send {signal} to fixture process {pid}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 }
 struct Fixture {
     _temp: tempfile::TempDir,

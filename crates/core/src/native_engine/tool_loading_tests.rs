@@ -94,6 +94,7 @@ fn the_request_carries_only_the_core_tools_by_default() {
         "WebSearch",
         "computer_use",
         "memory_search",
+        "ContextSearch",
         "Agent",
         "Workflow",
     ] {
@@ -102,6 +103,96 @@ fn the_request_carries_only_the_core_tools_by_default() {
             "{name} stays on demand: {names:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn context_search_follows_loading_settings_and_session_scope() {
+    use crate::runtime::{RuntimePaths, SessionStore};
+
+    let temp = tempfile::tempdir().unwrap();
+    let no_storage = executor(temp.path());
+    let request = no_storage.prepare_request().unwrap();
+    assert!(!request.system_prompt.unwrap().contains("ContextSearch"));
+
+    let db = RuntimePaths::new(temp.path().join("data"))
+        .unwrap()
+        .open_database()
+        .unwrap();
+    let store = SessionStore::new(db.clone());
+    let session = store.create(temp.path(), "fixture", "fixture").unwrap();
+    let message_id = store
+        .append(&session, "user", "old context needle")
+        .unwrap();
+    let mut executor = no_storage.with_conv_id(session).with_goal_state(db);
+    let request = executor.prepare_request().unwrap();
+    executor.exposed_tools = Some(request.tools.iter().map(|tool| tool.name.clone()).collect());
+    assert!(!names(&executor).iter().any(|name| name == "ContextSearch"));
+    let prompt = request.system_prompt.unwrap();
+    assert!(prompt.contains("- `ContextSearch`"));
+    assert!(!prompt.contains("After compaction, load ContextSearch with ToolLoad"));
+
+    let input = json!({"query":"needle"});
+    let (_, output, failed) = executor
+        .execute_tool_call("ContextSearch", &input, "early")
+        .await;
+    assert!(failed && output.contains("not loaded"), "{output}");
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "ToolLoad",
+            &json!({"names":["ContextSearch"]}),
+            "load",
+        )
+        .await;
+    assert!(!failed, "{output}");
+    let result: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result["loaded_tools"], json!(["ContextSearch"]));
+    assert_eq!(
+        result["tools"][0]["input_schema"]["required"],
+        json!(["query"])
+    );
+
+    let (_, output, failed) = executor
+        .execute_tool_call("ContextSearch", &input, "same-request")
+        .await;
+    assert!(failed && output.contains("next model request"), "{output}");
+    let request = executor.prepare_request().unwrap();
+    executor.exposed_tools = Some(request.tools.iter().map(|tool| tool.name.clone()).collect());
+    assert!(!request
+        .system_prompt
+        .unwrap()
+        .contains("After compaction, use ContextSearch"));
+    let (_, output, failed) = executor
+        .execute_tool_call("ContextSearch", &input, "search")
+        .await;
+    assert!(!failed, "{output}");
+    let result: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result["matches"][0]["message_id"], message_id);
+
+    use crate::permissions::{PermissionLevel, PermissionMode, PermissionScope, ToolPermission};
+    let manager = executor.permission_manager.as_ref().unwrap();
+    manager.set_mode(PermissionMode::AskPermissions);
+    manager.set_tool_permission(
+        "ContextSearch",
+        ToolPermission {
+            tool_name: "ContextSearch".into(),
+            allowed: false,
+            requires_confirmation: false,
+            scope: PermissionScope::Global,
+            level: PermissionLevel::None,
+        },
+    );
+    let (_, output, failed) = executor
+        .execute_tool_call("ContextSearch", &input, "denied")
+        .await;
+    assert!(failed && output.contains("Permission denied"), "{output}");
+
+    write_switches(temp.path(), &[("ContextSearch", false, false)]);
+    let request = executor.prepare_request().unwrap();
+    assert!(!request.system_prompt.unwrap().contains("ContextSearch"));
+    let (_, output, failed) = executor
+        .execute_tool_call("ContextSearch", &input, "off")
+        .await;
+    assert!(failed && output.contains("turned off"), "{output}");
 }
 
 #[test]

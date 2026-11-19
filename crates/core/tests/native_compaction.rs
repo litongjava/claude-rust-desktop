@@ -563,3 +563,58 @@ async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn context_search_hint_requires_persisted_compaction_without_host_provenance() {
+    let Fixture {
+        dir,
+        store,
+        id,
+        engine,
+        seen,
+        server,
+        ..
+    } = fixture(0).await;
+    let send = |boundary: Option<&'static str>| {
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        let request: ChatRequest = serde_json::from_value(json!({
+            "conversation_id":id,"messages":history,"model":"gpt-6-astra",
+            "provider_id":"gateway","workspace_path":dir.path(),"context_boundary":boundary
+        }))
+        .unwrap();
+        let engine = &engine;
+        async move {
+            let mut events = engine.send_message(request).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(event) = events.recv().await {
+                    assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");
+                }
+            })
+            .await
+            .unwrap();
+        }
+    };
+
+    // A provenance field alone cannot make the fresh session compacted.
+    send(Some("unverified-boundary")).await;
+    let prepared = compaction::prepare(&store.db, &id).unwrap();
+    compaction::commit(&store.db, prepared, "Host continuation summary").unwrap();
+    store
+        .append(&id, "user", "Continue from the summary")
+        .unwrap();
+    // Desktop supplies host messages without explicit boundary provenance.
+    send(None).await;
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let hint = "After compaction, load ContextSearch with ToolLoad";
+    let fresh = seen[0]["instructions"].as_str().unwrap();
+    assert!(fresh.contains("- `ContextSearch`"), "{fresh}");
+    assert!(!fresh.contains(hint), "{fresh}");
+    let compacted = seen[1]["instructions"].as_str().unwrap();
+    assert!(compacted.contains(hint), "{compacted}");
+    assert!(seen[1]["input"]
+        .to_string()
+        .contains("Host continuation summary"));
+    server.abort();
+}

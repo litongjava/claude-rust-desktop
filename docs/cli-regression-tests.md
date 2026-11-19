@@ -760,6 +760,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `crates/cli/tests/conpty_worker.rs`、`crates/cli/tests/fixtures/conpty-console.ps1`：见“Windows ConPTY”中的并发启动与进程树清理场景。Linux 仅检查此测试目标可以编译。
 - `memory.rs`、`display_commands.rs`、`crates/core/src/memory`：G
 - `services/customization.rs`、`prompt/`、`native_engine/tool_loop.rs`：H，以及 SDK 测试
+- `tools/context_search.rs`、`db/context_search_repo.rs`、`db/context_search_index.rs` 与 ContextSearch 的工具注册：H、L 和下文“压缩后检索当前会话（ContextSearch）”。
 - `crates/core/src/skills/discovery.rs`、`crates/core/src/native_engine/engine_core.rs` 的技能列表、`crates/core/src/native_engine/skill_tool.rs`：N
 - `crates/core/src/skills/mod.rs` 的 bundled 安装、`bundled.rs`、`bundled_resources.rs`、`bundled_manifest.rs`、`skill_creator.rs`、`skills/bundled/`：O（安装与 `ensure_installed` 的旧占位迁移见 N、O 两节）
 - `crates/core/src/skills/bundled.rs` 的 task-template 注册或 `skills/bundled/task-template.md`：O2
@@ -1104,6 +1105,18 @@ ToolScript 保持按需加载。Router 可以加载它来组合允许的工具�
 5. `cargo test --locked -p deepseek-code-cli --test standalone a_queued_request_compacts_before_the_next_prompt_with_the_keep_text`：真实 CLI + 本地 mock，排队的请求在下一提示前发送摘要请求并带上 `keep` 文本，之后的历史从新边界开始且请求行已被删除。
 6. `cargo test --locked -p deepseek-code-cli --test standalone manual_compact_clears_a_queued_request`：手动 `/compact` 成功后清除排队请求。
 7. 真实终端：在历史超过窗口 30% 的会话里，让模型完成任务并请求压缩；下一条提示时确认显示 `Compacting the conversation as the model requested…`，且摘要保留 `keep` 中列出的待办、决定和路径。工具默认按需加载，先经 ToolLoad 加载 `CompactContext`；SDK、`--print` 和子代理中不应出现该工具。回合实际在会话 Worker 里执行（`input` 为 `None`），有主判定必须同时接受 Worker 控制目录；远端/SDK 宿主不得据此启用。
+
+### 压缩后检索当前会话（ContextSearch）
+
+默认通过 `ToolLoad` 加载，从下一次模型请求起可调用。工具目录在新会话中也可供发现，续接说明只在应用了持久压缩边界后出现。搜索只读当前会话已保存的用户及助手文本和工具结果。允许使用该工具的子代理和队友读取各自的会话。可用 `role`、`tool_name`、`range`（`all`、`before`、`after`）和本会话的 `boundary_id` 过滤。省略边界时，第一次请求选择最近一次压缩边界并随游标保留。结果按时间线从新到旧排列，提供消息 ID、已记录的回合 ID、时间戳以及工具调用 ID。
+
+1. `cargo test --locked -p deepseek-code-core --lib context_search -- --nocapture` 验证两次压缩之间的过滤、父会话与实时 Agent、TeamSpawn 队友及续接的隔离、越过行数与字节预算、跨文本窗口的 UTF-8 匹配、结构化结果投影、以及长匹配与结果上限。过滤器也覆盖无存储、关闭工具、未加载和权限拒绝。
+2. `cargo test --locked -p deepseek-code-cli --test standalone context_search_recovers` 使用真实 `dcl --print` 与 SDK stream-json 分别连接本地 mock。先通过 Read 保存唯一值，再用 `sessions compact` 提交省略该值的摘要，最后重启并恢复。核对两次搜索前的模型请求没有该值，ToolLoad 加载后才发出 ContextSearch 的 schema，必需的值来自真实搜索结果，且消息 ID、回合 ID、时间戳和工具调用 ID 与 SQLite 记录一致。
+3. `cargo test --locked -p deepseek-code-core --test native_compaction context_search_hint_requires_persisted_compaction_without_host_provenance` 检查 Desktop 形状的请求。伪造的边界元数据不会带来续接提示，省略元数据但成功应用已保存边界的请求会收到提示。合并回归见 H、L 以及“模型请求压缩（CompactContext）”。Desktop 检查使用 `cargo check --locked -p deepseek-code-desktop --all-targets`。实际界面场景见 `desktop-regression-tests.md` 的 D3。
+4. `cargo test --locked -p deepseek-code-core --lib context_search_cold_reads -- --nocapture` 在冷 SQLite 连接测量跳过四条 32 MiB 记录、以及从深游标继续检索时的读取量。
+5. `cargo test --locked -p deepseek-code-cli --test standalone context_search_resume_preserves_legacy_ties` 由真实 CLI 升级已有数据库。对相同排序值，按插入行号判定摘要前后的记录，检查发给模型的历史、两次搜索结果和消息引用。
+
+每页最多检查 25,000 个消息和工具元数据行。24 MiB 的读取预算包含文本、索引和元数据页，每个文本窗口最多 8 MiB。大文本按可独立读取的 64 KiB 分块存储，小型原始记录可直接读取。收到 `next_cursor` 时，用原查询和过滤条件继续，即使本页没有命中也应如此。普通文本可以继续读同一来源的后续内容。需要完整投影的过大或无效结构化结果计入 `skipped_structured_sources`。最多返回 10 条结果及 12 KiB 的 JSON。`has_more` 表示本页还有已发现但未返回的命中，`scan_truncated` 表示扫描因预算停止或有结构化来源被跳过。`excerpt_truncated` 表示摘录省略了来源的一部分，`match_truncated` 表示匹配本身超过 384 字节。
 
 ## Super Agent Watcher 核心与安全续接（阶段 6 第一部分）
 

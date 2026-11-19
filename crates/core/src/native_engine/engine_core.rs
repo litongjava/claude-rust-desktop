@@ -926,7 +926,7 @@ impl QueryEngine {
                 .map(std::sync::Arc::new)
             }
         };
-        crate::services::compaction::apply_boundary(
+        let applied_compaction = crate::services::compaction::apply_persisted_boundary(
             &self.db_manager,
             &request.conversation_id,
             &mut request.messages,
@@ -1469,6 +1469,7 @@ impl QueryEngine {
         .with_hooks(hooks)
         .with_goal_state(self.db_manager.clone())
         .with_context_boundary(request.context_boundary)
+        .with_applied_compaction(applied_compaction)
         .with_allowed_tools(agent.as_ref().and_then(|d| d.tools.clone()))
         .with_read_only_shell(agent.as_ref().is_some_and(|d| d.read_only_shell))
         .with_prompt_profile(prompt_profile)

@@ -758,7 +758,7 @@ pub(crate) fn record_child_invocation(
     };
     let parent_message_id = context.db.with_conn(|conn| -> Result<String> {
         use rusqlite::OptionalExtension;
-        Ok(conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC LIMIT 1", [parent], |row| row.get(0)).optional()?.unwrap_or_default())
+        Ok(conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC, rowid DESC LIMIT 1", [parent], |row| row.get(0)).optional()?.unwrap_or_default())
     })??;
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let key = format!("subagent_invocation:{parent}:{tool_use_id}:{attempt_id}");

@@ -35,6 +35,7 @@ pub use lsp::{
 pub mod agent_messages;
 mod content_compat;
 pub mod coordination;
+pub(crate) mod context_search;
 pub mod cron_jobs;
 mod findings;
 pub mod linux_env;
@@ -150,6 +151,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         // `cron` stays dispatchable for older transcripts; the model sees the reference trio.
         crate::services::goal_proposals::definition(),
         crate::services::compaction_requests::definition(),
+        context_search::definition(),
         ToolDefinition {
             name: TOOL_LOAD_NAME.into(),
             description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the system prompt and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
