@@ -49,7 +49,7 @@ function ToolBlock({ conversationId, messageId, tool, level, live, id, onInspect
   return <div className="group/process relative min-w-0">
     <button type="button" aria-controls={panelId} aria-expanded={open} onClick={() => setExpanded(!open)} className={`flex w-full min-w-0 items-center gap-2 text-left text-[13px] leading-6 ${failed ? 'text-red-500' : 'text-deepseek-textSecondary'}`}>
       <Connector last={last} /><StatusDot status={status === 'running' && !live ? 'interrupted' : status} />
-      <span className="shrink-0 text-deepseek-text/80">{title !== tool.name ? title : displayName(tool.name)}</span>
+      <span className={`text-deepseek-text/80 ${tool.name === 'ToolLoad' ? 'min-w-0 [overflow-wrap:anywhere]' : 'shrink-0'}`}>{title !== tool.name ? title : displayName(tool.name)}</span>
       {description && <span className="min-w-0 truncate">· {rawText(description).split('\n')[0]}</span>}
       {running && <span className="ml-auto animate-pulse">运行中</span>}{failed && <span className="ml-auto">失败</span>}
       {status === 'running' && !live && <span className="ml-auto">已中断</span>}

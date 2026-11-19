@@ -378,7 +378,7 @@ async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
                     .filter(|output| !output.contains("\"loaded_tools\""))
                     .collect();
                 let call = match searches.len() {
-                    0 if !loaded && outputs.is_empty() => Some(("load", "ToolSearch", json!({"query":"select:ContextSearch"}))),
+                    0 if !loaded && outputs.is_empty() => Some(("load", "ToolLoad", json!({"names":["ContextSearch"]}))),
                     0 => Some(("own", "ContextSearch", json!({"query":"scope-secret-","role":"user"}))),
                     1 => Some(("foreign", "ContextSearch", json!({"query":"scope-secret-","range":"before","boundary_id":foreign}))),
                     _ => {
@@ -465,8 +465,8 @@ async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
 
     let (_, output, failed) = executor
         .execute_tool_call(
-            "ToolSearch",
-            &json!({"query":"select:ContextSearch"}),
+            "ToolLoad",
+            &json!({"names":["ContextSearch"]}),
             "load-parent",
         )
         .await;

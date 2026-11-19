@@ -69,7 +69,7 @@ async fn respond(
         .unwrap()
         .push(assistants);
     let call = match index {
-        0 => Some(("search", "ToolSearch", json!({"query":"select:ToolScript"}))),
+        0 => Some(("search", "ToolLoad", json!({"names":["ToolScript"]}))),
         // Deliberately reuse the provider's raw id in separate model rounds.
         1 | 2 => Some(("same-provider-id", "ToolScript", script_input(index))),
         _ => None,
@@ -220,7 +220,7 @@ async fn cli_toolscript_repeated_calls_keep_history_across_model_rounds_and_reop
             .unwrap()
             .iter()
             .any(|tool| tool["function"]["name"] == "ToolScript");
-        assert_eq!(advertised, i > 0, "ToolSearch must load ToolScript");
+        assert_eq!(advertised, i > 0, "ToolLoad must load ToolScript");
     }
     let results: Vec<Value> = requests[3]["messages"]
         .as_array()
@@ -245,7 +245,7 @@ async fn cli_toolscript_repeated_calls_keep_history_across_model_rounds_and_reop
         .collect();
     assert_eq!(parents.len(), 2);
     assert_eq!(nested.len(), 14); // each script: Bash + five Read + refused Write
-    assert_eq!(rows.len(), 17); // plus ToolSearch and two ToolScript parents
+    assert_eq!(rows.len(), 17); // plus ToolLoad and two ToolScript parents
     let ids: HashSet<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
     assert_eq!(ids.len(), rows.len());
     assert!(ids

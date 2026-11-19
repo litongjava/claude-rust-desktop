@@ -18,6 +18,9 @@ mod search;
 pub mod tasks;
 pub mod toolscript;
 
+pub const TOOL_LOAD_NAME: &str = "ToolLoad";
+const MAX_TOOL_LOAD_NAMES: usize = 64;
+
 /// Whether a plugin language server declaration is usable by the LSP tool.
 pub fn lsp_config_is_valid(server: &serde_json::Value) -> bool {
     lsp::validate_configuration(server).is_ok()
@@ -149,7 +152,24 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         crate::services::goal_proposals::definition(),
         crate::services::compaction_requests::definition(),
         context_search::definition(),
-        ToolDefinition { name: "ToolSearch".into(), description: "Load built-in tools that are not in this request yet. A successful search returns their real definitions with schemas and marks them loaded, so they can be called from the next model request on. Select complete tool names separated by commas or whitespace, e.g. `WebSearch WebFetch` or `WebSearch,WebFetch`; `select:Name1,Name2` (also accepting whitespace) explicitly selects exact names. Otherwise keywords are matched against tool names and descriptions; when no tool matches all of them, a tool matching most of them (one naming the tool) is loaded. Tools that commonly load on demand include listing directories (ListDir), multiple edits (MultiEdit), web access (WebFetch, WebSearch), LSP helpers, subagents (Agent, SendMessage), Workflow, long-term memory, scheduled jobs and desktop control. The runtime tool directory in the system prompt lists every built-in this request can load; only those listed there can be loaded. Searching costs nothing and grants no permission: the tool still goes through the usual approval and scope checks. MCP tools listed as available on demand load the same way.".into(), input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Complete tool names separated by commas or whitespace, or keywords describing what you need"}},"required":["query"]}) },
+        ToolDefinition {
+            name: TOOL_LOAD_NAME.into(),
+            description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the system prompt and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "description": "Exact names of deferred tools to load, in order",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": MAX_TOOL_LOAD_NAMES
+                    }
+                },
+                "required": ["names"],
+                "additionalProperties": false
+            }),
+        },
         ToolDefinition {
             name: "PluginRun".into(),
             description: "Execute an installed, enabled plugin command with OS user permissions. Requires execution approval.".into(),
@@ -187,7 +207,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Bash".to_string(),
-            description: "Executes a shell command and returns its output.\n\nThe shell defaults to shell.toolDefault in settings.json (bash / Git Bash on Windows when unset): use Unix shell syntax there — `/dev/null` not `NUL`, forward slashes, `$VAR` not `%VAR%` or `$env:VAR`. Pass `shell` (powershell, pwsh, cmd, sh, zsh, fish, wsl) to use another shell's syntax; PowerShell input/output is UTF-8.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolSearch and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
+            description: "Executes a shell command and returns its output.\n\nThe shell defaults to shell.toolDefault in settings.json (bash / Git Bash on Windows when unset): use Unix shell syntax there — `/dev/null` not `NUL`, forward slashes, `$VAR` not `%VAR%` or `$env:VAR`. Pass `shell` (powershell, pwsh, cmd, sh, zsh, fish, wsl) to use another shell's syntax; PowerShell input/output is UTF-8.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolLoad (names: [\"TaskGet\"]) and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
 - When a call finishes it cleans up the command's whole process tree, including children the command started. A service that must outlive the call (a local server, a daemon) needs `detach: true`, which starts it outside that tree and returns its pid and log files.
 - With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. `pipeline_sigpipe: true` means the output was only cut short by a reader such as `head`.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.".to_string(),
             input_schema: serde_json::json!({
@@ -442,7 +462,7 @@ macro_rules! tool_dispatch {
             "plan_mode" => Err(anyhow::anyhow!("Unknown tool: plan_mode")),
             "cron" => scheduled::execute($input, $cwd),
             "Config" | "brief" | "SyntheticOutput" => content_compat::execute($name, &$input, $cwd),
-            "ToolSearch" => tool_search($input),
+            TOOL_LOAD_NAME => tool_load($input),
             "ReportFindings" => findings::execute(&$input),
             "TaskCreate" | "TaskGet" | "TaskList" | "TaskUpdate" | "TaskOutput" | "TaskStop" | "TaskInput" | "TodoWrite" | "TodoRead" => tasks::execute($name, $input, $cwd),
             "Read" => read::execute($input, $cwd),
@@ -529,26 +549,51 @@ pub async fn execute_tool_async(
     )
 }
 
-/// The host-level fallback: it only lists definitions and has no session, so it
-/// cannot load anything. `success` stays false so a stored result can never be
-/// read back as a load.
-fn tool_search(input: serde_json::Value) -> Result<serde_json::Value> {
-    let query = input["query"]
-        .as_str()
-        .ok_or_else(|| anyhow!("query is required"))?
-        .to_lowercase();
-    let tools: Vec<_> = get_tool_definitions()
-        .into_iter()
-        .filter(|tool| {
-            tool.name.to_lowercase().contains(&query)
-                || tool.description.to_lowercase().contains(&query)
+pub(crate) fn tool_load_names(input: &serde_json::Value) -> Result<Vec<&str>> {
+    let names = input
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("names"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow!("ToolLoad requires an object with a names array of exact tool names.")
+        })?;
+    anyhow::ensure!(
+        (1..=MAX_TOOL_LOAD_NAMES).contains(&names.len()),
+        "ToolLoad requires between 1 and {MAX_TOOL_LOAD_NAMES} names."
+    );
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow!("ToolLoad name {} must be a non-empty string.", index + 1))
         })
-        .collect();
+        .collect()
+}
+
+/// The host-level fallback resolves definitions without marking them loaded.
+/// Only the session engine can grant a definition to its next request.
+fn tool_load(input: serde_json::Value) -> Result<serde_json::Value> {
+    let names = tool_load_names(&input)?;
+    let catalog = get_tool_definitions();
+    let mut tools = Vec::new();
+    let mut unknown = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in names.into_iter().filter(|name| seen.insert(*name)) {
+        match catalog.iter().find(|tool| tool.name == name) {
+            Some(tool) => tools.push(tool),
+            None => unknown.push(name),
+        }
+    }
+    anyhow::ensure!(unknown.is_empty(), "Unknown tools: {}.", unknown.join(", "));
     Ok(serde_json::json!({
         "success": false,
         "loaded_tools": [],
         "tools": tools,
-        "content": "This host entry only lists definitions; a session loads tools through its own engine.",
+        "content": "A session is required to load definitions into a model request.",
     }))
 }
 

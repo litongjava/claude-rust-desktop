@@ -37,7 +37,7 @@ fn advanced_tools_respect_read_edit_and_execution_modes() {
             "{name}"
         );
     }
-    for name in ["TaskGet", "TaskList", "TodoRead", "ToolSearch"] {
+    for name in ["TaskGet", "TaskList", "TodoRead", "ToolLoad"] {
         assert_eq!(
             manager.check_permission(&context(name)),
             PermissionResult::Granted,
@@ -75,7 +75,7 @@ async fn registered_tools_dispatch_and_project_reads_have_no_side_effects() {
         .await
         .unwrap();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    let search = execute_tool_async("ToolSearch", json!({"query":"notebook"}), cwd)
+    let search = execute_tool_async("ToolLoad", json!({"names":["NotebookEdit"]}), cwd)
         .await
         .unwrap();
     assert!(search["tools"]

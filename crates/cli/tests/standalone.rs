@@ -882,8 +882,8 @@ async fn context_search_provider(
         4 => (
             call(
                 "fixture-load",
-                "ToolSearch",
-                json!({"query":"select:ContextSearch"}),
+                "ToolLoad",
+                json!({"names":["ContextSearch"]}),
             ),
             "tool_calls",
         ),
@@ -1039,7 +1039,7 @@ async fn assert_cli_context_search(sdk: bool) {
     }
     assert!(requests[3]["messages"]
         .to_string()
-        .contains("After compaction, load ContextSearch with ToolSearch"));
+        .contains("After compaction, load ContextSearch with ToolLoad"));
     let tool = |index: usize| {
         requests[index]["tools"]
             .as_array()
@@ -1182,7 +1182,7 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
                 let mut seen = captured.lock().unwrap();
                 seen.push(body);
                 let (name, args) = match seen.len() {
-                    1 => ("ToolSearch", json!({"query":"select:ContextSearch"})),
+                    1 => ("ToolLoad", json!({"names":["ContextSearch"]})),
                     2 => (
                         "ContextSearch",
                         json!({"query":"legacy-marker","range":"before"}),
