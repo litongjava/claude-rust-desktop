@@ -1,6 +1,6 @@
 //! Trusted style tags; file text cannot supply terminal escapes.
 use serde_json::Value;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 #[derive(Clone, Copy, Debug)]
 pub enum Style {
     TerminalDefault,
@@ -230,20 +230,23 @@ pub fn render(line: &Line, width: usize, color: bool) -> String {
 fn render_with_theme(line: &Line, width: usize, color: bool, theme: u8) -> String {
     let mut result = String::new();
     let mut cells = 0;
+    let tool_load = super::tool_view::is_tool_load_header(line);
     for segment in &line.0 {
-        let mut text = String::new();
-        let mut clipped = false;
-        for ch in segment.text.chars().filter(|ch| {
-            !ch.is_control() && !matches!(*ch,'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}')
-        }) {
-            let size = ch.width().unwrap_or(0);
-            if cells + size > width {
-                clipped = true;
-                break;
-            }
-            cells += size;
-            text.push(ch);
-        }
+        let printable: String = segment
+            .text
+            .chars()
+            .filter(|ch| {
+                !ch.is_control() && !matches!(*ch,'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}')
+            })
+            .collect();
+        let remaining = width.saturating_sub(cells);
+        let fitted = tool_load
+            .then(|| super::tool_view::fit_tool_load_label(&printable, remaining))
+            .flatten();
+        let text = fitted
+            .as_deref()
+            .unwrap_or_else(|| super::input::editor::clip_cells(&printable, remaining));
+        cells += text.width();
         if !text.is_empty() {
             if color {
                 result.push_str(&format!("\x1b[{}m", codes(segment.style, theme)));
@@ -253,12 +256,12 @@ fn render_with_theme(line: &Line, width: usize, color: bool, theme: u8) -> Strin
                     }
                 }
             }
-            result.push_str(&text);
+            result.push_str(text);
             if color {
                 result.push_str("\x1b[0m");
             }
         }
-        if clipped || cells >= width {
+        if text != printable || cells >= width {
             break;
         }
     }

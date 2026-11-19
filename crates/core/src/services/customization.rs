@@ -54,7 +54,7 @@ fn enabled_by_default() -> bool {
 }
 
 /// Tools that load by default. Every other built-in is available on demand, so
-/// the model asks ToolSearch for it before the request that uses it.
+/// the model asks ToolLoad for it before the request that uses it.
 pub const CORE_TOOLS: &[&str] = &[
     "Bash",
     "Read",
@@ -63,7 +63,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "Grep",
     "Glob",
     "Skill",
-    "ToolSearch",
+    "ToolLoad",
     "AskUserQuestion",
     "EnterPlanMode",
     "ExitPlanMode",
@@ -82,7 +82,7 @@ pub fn is_core_tool(name: &str) -> bool {
 pub struct ToolLoading {
     /// Load by default: every request carries the definition.
     pub enabled: bool,
-    /// The model may load the tool through ToolSearch.
+    /// The model may load this tool by exact name with ToolLoad.
     pub on_demand: bool,
 }
 
@@ -191,7 +191,7 @@ impl Customization {
     }
 
     /// Legacy entries. A tool disabled before the switches existed keeps its
-    /// "off by default" intent but is still discoverable through ToolSearch.
+    /// "off by default" intent but is still discoverable through ToolLoad.
     pub fn is_disabled(&self, name: &str) -> bool {
         self.disabled_tools.iter().any(|disabled| disabled == name)
     }
@@ -209,7 +209,7 @@ impl Customization {
     }
 
     /// Whether the next request carries this tool. A tool that is only on
-    /// demand appears once ToolSearch loaded it in this session.
+    /// demand appears once ToolLoad loaded it in this session.
     pub fn exposes(&self, name: &str, loaded: &BTreeSet<String>) -> bool {
         let loading = self.loading(name);
         loading.enabled || (loading.on_demand && loaded.contains(name))
@@ -343,8 +343,18 @@ mod tests {
         assert_eq!(
             CORE_TOOLS,
             [
-                "Bash", "Read", "Write", "Edit", "Grep", "Glob", "Skill", "ToolSearch",
-                "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "TaskStop",
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                "Skill",
+                "ToolLoad",
+                "AskUserQuestion",
+                "EnterPlanMode",
+                "ExitPlanMode",
+                "TaskStop",
             ]
         );
         for name in CORE_TOOLS {
