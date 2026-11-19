@@ -117,7 +117,7 @@ enum Mode {
     SchemaGood,
     SchemaBad,
     SchemaRejected,
-    ToolSearch,
+    ToolLoad,
     /// A mixed patch whose `secret.txt` hunk is under an ask rule.
     ApplyPatchMixed,
     /// A patch that only targets an allowed file, so a hook can rewrite it.
@@ -222,7 +222,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         Mode::Truncated | Mode::TruncatedTool | Mode::TruncatedThinking
     ) || matches!(state.mode, Mode::ReadThenTruncated) && count > 1;
     let tool = matches!(state.mode, Mode::RuntimeAgent) && count <= 2
-        || matches!(state.mode, Mode::ToolSearch) && count <= 2
+        || matches!(state.mode, Mode::ToolLoad) && count <= 2
         || matches!(state.mode, Mode::Plan) && count == 1
         || matches!(state.mode, Mode::Tool | Mode::TruncatedTool)
         || matches!(state.mode, Mode::ReadThenTruncated) && count == 1
@@ -256,9 +256,9 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                         json!({"file_path":"child.txt","content":"CHILD_WRITE"}),
                     )
                 }
-            } else if matches!(state.mode, Mode::ToolSearch) {
+            } else if matches!(state.mode, Mode::ToolLoad) {
                 if count == 1 {
-                    ("search-1", "ToolSearch", json!({"query":"ListDir"}))
+                    ("search-1", "ToolLoad", json!({"names":["ListDir"]}))
                 } else {
                     ("list-1", "ListDir", json!({"path":"."}))
                 }
@@ -344,9 +344,9 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
                     )
                 };
                 json!({"tool_calls":[{"index":0,"id":if count==1 {"agent-1"}else{"write-1"},"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
-            } else if matches!(state.mode, Mode::ToolSearch) {
+            } else if matches!(state.mode, Mode::ToolLoad) {
                 let (id, name, args) = if count == 1 {
-                    ("search-1", "ToolSearch", json!({"query":"ListDir"}))
+                    ("search-1", "ToolLoad", json!({"names":["ListDir"]}))
                 } else {
                     ("list-1", "ListDir", json!({"path":"."}))
                 };
@@ -537,7 +537,7 @@ impl ResponsesServer {
                         seen.len()
                     };
                     let stream = match step {
-                        1 => responses_tool_call("search-1", "ToolSearch", json!({"query":"ListDir"})),
+                        1 => responses_tool_call("search-1", "ToolLoad", json!({"names":["ListDir"]})),
                         2 => responses_tool_call("list-1", "ListDir", json!({"path":"."})),
                         _ => responses_text(&format!("reply-{step}")),
                     };
@@ -2619,11 +2619,11 @@ fn request_tool_names(body: &Value, anthropic: bool) -> Vec<String> {
 }
 
 /// The real binary: the first request carries the default core tools only, and a
-/// successful ToolSearch adds an on-demand tool to the next request.
+/// successful ToolLoad adds an on-demand tool to the next request.
 #[tokio::test]
 async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
     for anthropic in [false, true] {
-        let server = Server::start(anthropic, Mode::ToolSearch).await;
+        let server = Server::start(anthropic, Mode::ToolLoad).await;
         let root = tempfile::tempdir().unwrap();
         let mut client = Client::start(root.path(), &server, &["--permission-mode", "bypass"]);
         client.send(initialize_request("init", json!({}))).await;
@@ -2632,16 +2632,49 @@ async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
             "success"
         );
         client.send(user("List the fixture files")).await;
+        let init = client.frame("system").await;
+        assert_eq!(init["subtype"], "init");
+        let advertised = init["tools"].as_array().unwrap();
+        assert_eq!(
+            advertised.iter().filter(|name| *name == "ToolLoad").count(),
+            1
+        );
         let result = client.result().await;
         assert_eq!(result["is_error"], false, "{result}");
         let requests = server.fixture.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
+        let schema = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|tool| {
+                if anthropic && tool["name"] == "ToolLoad" {
+                    Some(&tool["input_schema"])
+                } else if !anthropic && tool["function"]["name"] == "ToolLoad" {
+                    Some(&tool["function"]["parameters"])
+                } else {
+                    None
+                }
+            })
+            .expect("ToolLoad definition");
+        assert_eq!(schema["required"], json!(["names"]));
+        assert_eq!(schema["properties"]["names"]["items"]["type"], "string");
         let first = request_tool_names(&requests[0], anthropic);
         // Exactly the 12 built-in defaults, each once. MCP tools keep their own
         // loading rules and are not part of the switches.
         let mut core = vec![
-            "Bash", "Read", "Write", "Edit", "Grep", "Glob", "Skill", "ToolSearch",
-            "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "TaskStop",
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            "Skill",
+            "ToolLoad",
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "TaskStop",
         ];
         let mut seen: Vec<String> = first
             .iter()
@@ -2681,7 +2714,7 @@ async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
 async fn sdk_cli_resumes_a_searched_tool_after_the_process_restarts() {
     for anthropic in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let server = Server::start(anthropic, Mode::ToolSearch).await;
+        let server = Server::start(anthropic, Mode::ToolLoad).await;
         let mut client = Client::start(root.path(), &server, &["--permission-mode", "bypass"]);
         client.send(initialize_request("init", json!({}))).await;
         assert_eq!(
@@ -2696,7 +2729,7 @@ async fn sdk_cli_resumes_a_searched_tool_after_the_process_restarts() {
         server.task.abort();
 
         // A brand-new process on the same data directory, resuming the session.
-        let resumed = Server::start(anthropic, Mode::ToolSearch).await;
+        let resumed = Server::start(anthropic, Mode::ToolLoad).await;
         let mut client = Client::start(root.path(), &resumed, &["--permission-mode", "bypass", "--resume", &session]);
         client.send(user("Continue from the earlier search")).await;
         let result = client.result().await;
@@ -2709,7 +2742,7 @@ async fn sdk_cli_resumes_a_searched_tool_after_the_process_restarts() {
         resumed.task.abort();
 
         // A new session in the same data directory starts from the defaults.
-        let fresh = Server::start(anthropic, Mode::ToolSearch).await;
+        let fresh = Server::start(anthropic, Mode::ToolLoad).await;
         let mut client = Client::start(root.path(), &fresh, &["--permission-mode", "bypass"]);
         client.send(user("List the fixture files")).await;
         let result = client.result().await;
@@ -2778,7 +2811,7 @@ async fn sdk_cli_resumes_a_searched_tool_in_the_responses_protocol() {
 #[tokio::test]
 async fn sdk_cli_rejects_a_tool_with_both_switches_off() {
     for anthropic in [false, true] {
-        let server = Server::start(anthropic, Mode::ToolSearch).await;
+        let server = Server::start(anthropic, Mode::ToolLoad).await;
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");
         std::fs::create_dir_all(&data).unwrap();

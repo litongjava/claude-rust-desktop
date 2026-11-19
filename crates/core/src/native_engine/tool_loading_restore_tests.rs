@@ -78,12 +78,7 @@ fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
         .unwrap();
     store.append(&session, "assistant", "").unwrap();
     record_call(
-        &store,
-        &session,
-        &assistant,
-        "search-1",
-        "ToolSearch",
-        &marker,
+        &store, &session, &assistant, "search-1", "ToolLoad", &marker,
     );
     store.append(&session, "user", "Continue").unwrap();
 
@@ -127,7 +122,7 @@ fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
         &failed_session,
         &failed_assistant,
         "search-2",
-        "ToolSearch",
+        "ToolLoad",
         &json!({"success":false,"loaded_tools":[],"tools":[]}).to_string(),
     );
     let mut rejected = restore_executor(
@@ -152,7 +147,7 @@ fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let (_, output, failed) = compacted
-            .execute_tool_call("ToolSearch", &json!({"query":"ListDir"}), "search-3")
+            .execute_tool_call("ToolLoad", &json!({"names":["ListDir"]}), "search-3")
             .await;
         assert!(!failed, "{output}");
         let value: Value = serde_json::from_str(&output).unwrap();

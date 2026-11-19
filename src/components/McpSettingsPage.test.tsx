@@ -122,7 +122,7 @@ it("shows each server's state in a selector", async () => {
   render(<McpSettingsPage />);
   expect(await screen.findByLabelText('MCP state Alpha')).toHaveValue('on-demand');
   expect(screen.getByLabelText('MCP state Beta')).toHaveValue('off');
-  expect(screen.getByText('Tools are listed by name and loaded with ToolSearch when needed.')).toBeInTheDocument();
+  expect(screen.getByText('Tools are listed by name and loaded with ToolLoad when needed.')).toBeInTheDocument();
   expect(screen.getByText('Not started; its tools and prompts are unavailable.')).toBeInTheDocument();
 });
 

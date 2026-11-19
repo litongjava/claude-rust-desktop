@@ -1,4 +1,4 @@
-//! Real model -> ToolSearch -> ToolScript -> private worker -> SDK approval.
+//! Real model -> ToolLoad -> ToolScript -> private worker -> SDK approval.
 #![cfg(unix)]
 use super::*;
 
@@ -26,7 +26,7 @@ async fn model(State(f): State<ScriptFixture>, Json(body): Json<Value>) -> Respo
         r.len() - 1
     };
     let call = match index {
-        0 => Some(("search", "ToolSearch", json!({"query":"select:ToolScript"}))),
+        0 => Some(("search", "ToolLoad", json!({"names":["ToolScript"]}))),
         1 => Some((
             "script",
             "ToolScript",

@@ -114,7 +114,7 @@ async fn fixture(mode: u8) -> Fixture {
             let call = |id: &str, name: &str, arguments: Value| json!({"type":"function_call","id":format!("fc-{id}"),"call_id":id,"name":name,"arguments":arguments.to_string()});
             let output = if mode == 5 {
                 match step {
-                    1 => json!([call("search-1", "ToolSearch", json!({"query":"ListDir"}))]),
+                    1 => json!([call("search-1", "ToolLoad", json!({"names":["ListDir"]}))]),
                     2 => json!([call("list-1", "ListDir", json!({"path":"."}))]),
                     _ => json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]),
                 }
@@ -470,7 +470,7 @@ async fn an_error_response_slower_than_200ms_would_misjudge_the_old_window() {
 }
 
 /// A real compaction exchange replaces the history that carried a successful
-/// ToolSearch, so the restored session cannot treat the summary as an
+/// ToolLoad, so the restored session cannot treat the summary as an
 /// authorization; a fresh search loads the tool again for the next request.
 #[tokio::test]
 async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_it() {
@@ -489,8 +489,8 @@ async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_
                 &deepseek_code_core::db::message_repo::ToolCallRow {
                     id: format!("{assistant}:search-1"),
                     message_id: assistant.clone(),
-                    name: "ToolSearch".to_owned(),
-                    input: Some(json!({"query":"ListDir"}).to_string()),
+                    name: "ToolLoad".to_owned(),
+                    input: Some(json!({"names":["ListDir"]}).to_string()),
                     output: Some(
                         json!({"success":true,"loaded_tools":["ListDir"],"tools":[]}).to_string(),
                     ),

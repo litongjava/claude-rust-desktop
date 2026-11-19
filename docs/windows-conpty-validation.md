@@ -76,7 +76,7 @@ $env:CONPTY_FIXTURE_KEY = 'local-fixture-only'
 
 按顺序输入以下提示，每一步等工具调用结束，截图显示工具名、TaskID、参数和结果。mock 的 TaskGet 等待为 1000 ms，冷启动时可能尚未 READY；可重复输入 `CONPTY get` 轮询同一任务（不写入、不重新启动），正常退出/停止的最终等待为 20000 ms。不要因一次等待超时就认定任务失败。
 
-1. `CONPTY start`：ToolSearch → Bash → TaskGet。必须显示 `backend:conpty`、`CONSOLE_OK`、`SIZE:24:80`、`READY`，以及 `status:running`、`retrieval_status:timeout`。记录 TaskID、返回的 gate PID、工作目录 `shell.pid` 和 `descendant.pid`。`[Console]::IsOutputRedirected`/IsInputRedirected 必须为 false。
+1. `CONPTY start`：ToolLoad → Bash → TaskGet。必须显示 `backend:conpty`、`CONSOLE_OK`、`SIZE:24:80`、`READY`，以及 `status:running`、`retrieval_status:timeout`。记录 TaskID、返回的 gate PID、工作目录 `shell.pid` 和 `descendant.pid`。`[Console]::IsOutputRedirected`/IsInputRedirected 必须为 false。
 2. `CONPTY write`：显示 `echo:manual-input`。下一轮再次输入同提示，`received-lines` 有两条，任务仍运行。文件用 `Get-Content -Encoding UTF8` 查看。
 3. `CONPTY resize`：TaskInput resize `{rows:35,cols:110}` 后写入，TaskGet 必须有 `SIZE:35:110` 和 `echo:after-resize`。截取新尺寸证据。
 4. `CONPTY eof`：拒绝且包含 `No data was written`；`received-lines` 不出现 `MUST_NOT_WRITE`，再 write 仍成功。

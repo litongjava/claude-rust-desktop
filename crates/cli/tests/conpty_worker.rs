@@ -304,8 +304,8 @@ mod windows_tests {
     fn load() -> (&'static str, &'static str, Value) {
         (
             "load",
-            "ToolSearch",
-            json!({"query":"select:TaskInput,TaskGet,TaskStop,TaskUpdate"}),
+            "ToolLoad",
+            json!({"names":["TaskInput","TaskGet","TaskStop","TaskUpdate"]}),
         )
     }
     fn bash(id: &'static str, command: &str) -> (&'static str, &'static str, Value) {

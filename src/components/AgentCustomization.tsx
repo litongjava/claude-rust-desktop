@@ -223,7 +223,7 @@ export function AgentCustomization({ section }: { section: AgentCustomizationSec
                   </label>
                 </div>
                 <p className="mt-1 text-xs text-deepseek-textSecondary">{t('agentSettings.loadingHint')}</p>
-                {tool.name === 'ToolSearch' && !loading.enabled && <p className="mt-1 text-xs text-amber-600">{t('agentSettings.toolSearchDisabledHint')}</p>}
+                {tool.name === 'ToolLoad' && !loading.enabled && <p className="mt-1 text-xs text-amber-600">{t('agentSettings.toolLoadDisabledHint')}</p>}
               </div>
               <button aria-label={t('agentSettings.editToolDescription', { name: tool.name })} className="rounded p-1 hover:bg-deepseek-hover" onClick={() => setEditingTool(editingTool === tool.name ? null : tool.name)}><Pencil size={14} /></button>
             </div>

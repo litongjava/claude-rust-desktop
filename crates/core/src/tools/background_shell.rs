@@ -724,12 +724,12 @@ pub(crate) fn start(
         };
         completion.finish(status, output);
     });
-    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it.")});
+    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it.")});
     if interaction == Interaction::StdinPipe {
         result["interaction"] = json!("pipe");
         result["stdin_available"] = json!(true);
         result["stdin_pipe"] = json!(directory.join("stdin.pipe"));
-        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet with ToolSearch to read output, and TaskStop to stop it. You will be notified when it finishes."));
+        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet (load with ToolLoad, names: [\"TaskGet\"]) to read output, and TaskStop to stop it. You will be notified when it finishes."));
     }
     Ok(result)
 }
@@ -987,11 +987,11 @@ pub(super) async fn run_foreground(
             "timeout_ms":millis,
             "stdout":stdout,
             "stderr":stderr,
-            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolSearch (block:true waits); TaskStop stops it. You will be notified when it finishes.")
+            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolLoad (names: [\"TaskGet\"]), then call TaskGet with block:true to wait; TaskStop stops it. You will be notified when it finishes.")
         }));
     }
     Ok(
-        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it."}),
+        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it."}),
     )
 }
 

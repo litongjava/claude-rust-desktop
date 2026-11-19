@@ -1,5 +1,5 @@
 //! The switches as the engine enforces them: what a request carries, what a
-//! call in that request may run, and what a ToolSearch can load.
+//! call in that request may run, and what a ToolLoad can load.
 use super::*;
 use crate::services::customization::{ToolLoading, CORE_TOOLS};
 
@@ -74,9 +74,9 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
                     ("restore" | "restore_off" | "restore_restricted" | "restore_untrusted", 0) => {
                         Some(("ListDir", json!({"path":"."})))
                     }
-                    ("search", 0) => Some(("ToolSearch", json!({"query":"ListDir"}))),
+                    ("search", 0) => Some(("ToolLoad", json!({"names":["ListDir"]}))),
                     ("search", 1) => Some(("ListDir", json!({"path":"."}))),
-                    ("permission", 0) => Some(("ToolSearch", json!({"query":"Write"}))),
+                    ("permission", 0) => Some(("ToolLoad", json!({"names":["Write"]}))),
                     ("permission", 1) => Some((
                         "Write",
                         json!({"file_path":"forbidden.txt","content":"must not execute"}),
@@ -139,7 +139,7 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
         if scenario == "restore_off" {
             write_switches(root.path(), &[("ListDir", false, false)]);
         } else if scenario == "restore_restricted" {
-            executor.allowed_tools = Some(vec!["Read".into(), "ToolSearch".into()]);
+            executor.allowed_tools = Some(vec!["Read".into(), "ToolLoad".into()]);
         }
         // Desktop supplies only display text after reopening a conversation.
         executor.messages = vec![
@@ -274,7 +274,7 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
         assert!(
             calls
                 .iter()
-                .any(|(name, _, failed)| name == "ToolSearch" && !failed),
+                .any(|(name, _, failed)| name == "ToolLoad" && !failed),
             "{calls:?}"
         );
         assert!(
@@ -306,11 +306,9 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
         );
         if scenario == "search" {
             assert!(
-                calls
-                    .iter()
-                    .any(|(name, output, failed)| name == "ToolSearch"
-                        && !failed
-                        && output.contains("loaded_tools")),
+                calls.iter().any(|(name, output, failed)| name == "ToolLoad"
+                    && !failed
+                    && output.contains("loaded_tools")),
                 "{calls:?}"
             );
         } else {
@@ -344,7 +342,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
                     conn,
                     &format!("{session}-search"),
                     &assistant,
-                    "ToolSearch",
+                    "ToolLoad",
                     Some("{}"),
                     Some(&success),
                     false,
@@ -374,7 +372,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
                         conn,
                         "failed-search",
                         &failed,
-                        "ToolSearch",
+                        "ToolLoad",
                         Some("{}"),
                         Some(&success),
                         true,
@@ -384,7 +382,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
                         conn,
                         "user-search",
                         &user,
-                        "ToolSearch",
+                        "ToolLoad",
                         Some("{}"),
                         Some(&success),
                         false,
@@ -633,10 +631,10 @@ fn an_on_demand_tool_joins_the_next_request_after_a_search() {
     let refused = executor
         .loading_violation("ListDir")
         .expect("must not run before it is loaded");
-    assert!(refused.contains("ToolSearch"), "{refused}");
+    assert!(refused.contains("ToolLoad"), "{refused}");
 
     let (_, output, failed) =
-        futures::executor::block_on(executor.execute_tool_search(&json!({"query":"ListDir"})));
+        futures::executor::block_on(executor.execute_tool_load(&json!({"names":["ListDir"]})));
     assert!(!failed, "a successful search is not a failure: {output}");
     let result: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(result["success"], true, "{output}");
@@ -672,12 +670,12 @@ fn an_on_demand_tool_joins_the_next_request_after_a_search() {
 }
 
 #[test]
-fn a_search_that_matches_nothing_loads_nothing() {
+fn a_missing_name_loads_nothing() {
     let (root, mut executor) = setup();
     write_switches(root.path(), &[("ListDir", false, true)]);
     let (_, output, failed) =
-        futures::executor::block_on(executor.execute_tool_search(&json!({"query":"no such tool"})));
-    assert!(!failed, "{output}");
+        futures::executor::block_on(executor.execute_tool_load(&json!({"names":["NoSuchTool"]})));
+    assert!(failed, "{output}");
     let result: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(result["success"], false, "{output}");
     assert!(
@@ -747,7 +745,7 @@ fn a_damaged_settings_file_fails_instead_of_reopening_every_tool() {
         .expect("a damaged file refuses calls");
     assert!(violation.contains("could not be read"), "{violation}");
     let (_, output, failed) =
-        futures::executor::block_on(executor.execute_tool_search(&json!({"query":"ListDir"})));
+        futures::executor::block_on(executor.execute_tool_load(&json!({"names":["ListDir"]})));
     assert!(failed, "search must fail too: {output}");
     assert!(output.contains("could not be read"), "{output}");
 }
@@ -757,7 +755,7 @@ fn a_restricted_agent_still_receives_its_granted_tools() {
     let root = tempfile::tempdir().unwrap();
     let mut executor =
         executor(root.path()).with_allowed_tools(Some(vec!["Read".into(), "ListDir".into()]));
-    // ListDir is on demand by default; a restricted agent has no ToolSearch,
+    // ListDir is on demand by default; a restricted agent has no ToolLoad,
     // so its granted tools have to arrive directly.
     let names = request_names(&executor);
     assert!(has(&names, "Read"), "{names:?}");
@@ -785,14 +783,14 @@ fn restore_only_trusts_a_paired_assistant_search_result() {
     executor.messages = vec![
         // A prompt that merely looks like a search record grants nothing.
         json!({"role":"user","content": success}),
-        // The real pair: an assistant ToolSearch call and its own result.
-        json!({"role":"assistant","content":[],"tool_calls":[{"id":"call-ok","function":{"name":"ToolSearch","arguments":"{\"query\":\"ListDir\"}"}}]}),
+        // The real pair: an assistant ToolLoad call and its own result.
+        json!({"role":"assistant","content":[],"tool_calls":[{"id":"call-ok","function":{"name":"ToolLoad","arguments":"{\"names\":[\"ListDir\"]}"}}]}),
         json!({"role":"tool","tool_call_id":"call-ok","content": success}),
         // An orphan result, a mismatched id and an errored call grant nothing.
         json!({"role":"tool","tool_call_id":"call-orphan","content": success}),
         json!({"role":"assistant","content":[],"tool_calls":[{"id":"call-other","function":{"name":"Read","arguments":"{}"}}]}),
         json!({"role":"tool","tool_call_id":"call-other","content": success}),
-        json!({"role":"assistant","content":[],"tool_calls":[{"id":"call-err","function":{"name":"ToolSearch","arguments":"{}"}}]}),
+        json!({"role":"assistant","content":[],"tool_calls":[{"id":"call-err","function":{"name":"ToolLoad","arguments":"{}"}}]}),
         json!({"role":"tool","tool_call_id":"call-err","content": json!({"success": false, "loaded_tools": ["Write"]}).to_string()}),
     ];
     executor.restore_loaded_tools();
@@ -815,10 +813,10 @@ fn restore_reads_anthropic_tool_use_and_tool_result_blocks() {
     write_switches(root.path(), &[("ListDir", false, true)]);
     let success = json!({"success": true, "loaded_tools": ["ListDir"], "tools": []}).to_string();
     executor.messages = vec![
-        json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"ToolSearch","input":{"query":"ListDir"}}]}),
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"ToolLoad","input":{"names":["ListDir"]}}]}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text": success}]}]}),
         // An errored result never grants a tool.
-        json!({"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"ToolSearch","input":{"query":"Write"}}]}),
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"ToolLoad","input":{"names":["Write"]}}]}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":[{"type":"text","text": json!({"success": true, "loaded_tools": ["Write"], "tools": []}).to_string()}]}]}),
     ];
     executor.restore_loaded_tools();
@@ -947,7 +945,7 @@ fn agent_type_listing_is_sorted_and_includes_fork() {
 fn the_agent_tool_description_lists_the_agent_types() {
     let root = tempfile::tempdir().unwrap();
     let mut executor = executor(root.path());
-    // Agent is on demand by default; it reaches a request once ToolSearch has
+    // Agent is on demand by default; it reaches a request once ToolLoad has
     // loaded it, with this description.
     executor.loaded_tools.insert("Agent".into());
     let tools = executor.tool_definitions().unwrap();
@@ -969,17 +967,17 @@ fn the_agent_tool_description_lists_the_agent_types() {
 }
 
 #[test]
-fn tool_search_lists_agent_types_while_agent_is_deferred() {
+fn tool_load_lists_agent_types_while_agent_is_deferred() {
     let root = tempfile::tempdir().unwrap();
     let executor = executor(root.path());
-    // Agent stays on demand until ToolSearch loads it, so this request has no
-    // Agent definition; ToolSearch carries the list instead.
+    // Agent stays on demand until ToolLoad loads it, so this request has no
+    // Agent definition; ToolLoad carries the list instead.
     let tools = executor.tool_definitions().unwrap();
     assert!(!tools.iter().any(|tool| tool.name == "Agent"));
-    let tool_search = tools
+    let tool_load = tools
         .iter()
-        .find(|tool| tool.name == "ToolSearch")
-        .expect("ToolSearch is a core tool");
+        .find(|tool| tool.name == "ToolLoad")
+        .expect("ToolLoad is a core tool");
     for expected in [
         "Agent types (subagent_type), available after loading Agent:",
         "- explore: Read-only search across the codebase",
@@ -990,22 +988,22 @@ fn tool_search_lists_agent_types_while_agent_is_deferred() {
         "- verify: Verify the requested behavior",
     ] {
         assert!(
-            tool_search.description.contains(expected),
+            tool_load.description.contains(expected),
             "{expected}\n{}",
-            tool_search.description
+            tool_load.description
         );
     }
     // Nothing time-dependent enters the text, so the next request matches.
     let again = executor.tool_definitions().unwrap();
     let again = again
         .iter()
-        .find(|tool| tool.name == "ToolSearch")
-        .expect("ToolSearch is a core tool");
-    assert_eq!(tool_search.description, again.description);
+        .find(|tool| tool.name == "ToolLoad")
+        .expect("ToolLoad is a core tool");
+    assert_eq!(tool_load.description, again.description);
 }
 
 #[test]
-fn tool_search_drops_the_listing_once_agent_is_loaded() {
+fn tool_load_drops_the_listing_once_agent_is_loaded() {
     let root = tempfile::tempdir().unwrap();
     let mut executor = executor(root.path());
     executor.loaded_tools.insert("Agent".into());
@@ -1017,33 +1015,37 @@ fn tool_search_drops_the_listing_once_agent_is_loaded() {
     assert!(agent
         .description
         .contains("Available agent types (subagent_type):"));
-    let tool_search = tools
+    let tool_load = tools
         .iter()
-        .find(|tool| tool.name == "ToolSearch")
-        .expect("ToolSearch is a core tool");
+        .find(|tool| tool.name == "ToolLoad")
+        .expect("ToolLoad is a core tool");
     assert!(
-        !tool_search.description.contains("Agent types (subagent_type)"),
+        !tool_load
+            .description
+            .contains("Agent types (subagent_type)"),
         "{}",
-        tool_search.description
+        tool_load.description
     );
 }
 
 #[test]
-fn tool_search_has_no_agent_listing_when_agent_cannot_load() {
+fn tool_load_has_no_agent_listing_when_agent_cannot_load() {
     let root = tempfile::tempdir().unwrap();
-    // Agent is not resident and may not be loaded through ToolSearch either.
+    // Agent is not resident and may not be loaded through ToolLoad either.
     write_switches(root.path(), &[("Agent", false, false)]);
     let executor = executor(root.path());
     let tools = executor.tool_definitions().unwrap();
     assert!(!tools.iter().any(|tool| tool.name == "Agent"));
-    let tool_search = tools
+    let tool_load = tools
         .iter()
-        .find(|tool| tool.name == "ToolSearch")
-        .expect("ToolSearch is a core tool");
+        .find(|tool| tool.name == "ToolLoad")
+        .expect("ToolLoad is a core tool");
     assert!(
-        !tool_search.description.contains("Agent types (subagent_type)"),
+        !tool_load
+            .description
+            .contains("Agent types (subagent_type)"),
         "{}",
-        tool_search.description
+        tool_load.description
     );
 }
 
@@ -1089,16 +1091,14 @@ fn compact_context_is_not_offered_to_subagents() {
         .any(|tool| tool.name == "CompactContext"));
 }
 
-/// In a real terminal the model searched "compact summarize session memory".
-/// Every keyword must match, so the description carries the ordinary words.
 #[tokio::test]
-async fn tool_search_finds_compact_context_by_plain_words() {
+async fn tool_load_loads_compact_context_by_exact_name() {
     let root = tempfile::tempdir().unwrap();
     let mut executor = context_executor(root.path()).with_context_usage(Some((50, 100)));
     let (_, output, failed) = executor
         .execute_tool_call(
-            "ToolSearch",
-            &json!({"query":"compact summarize session memory"}),
+            "ToolLoad",
+            &json!({"names":["CompactContext"]}),
             "search-compact",
         )
         .await;
@@ -1118,80 +1118,4 @@ async fn tool_search_finds_compact_context_by_plain_words() {
         .unwrap()
         .iter()
         .any(|tool| tool.name == "CompactContext"));
-    // A single descriptive word matches as well.
-    let mut other = context_executor(root.path()).with_context_usage(Some((50, 100)));
-    let (_, output, failed) = other
-        .execute_tool_call("ToolSearch", &json!({"query":"compaction"}), "search-word")
-        .await;
-    assert!(!failed, "{output}");
-    assert!(output.contains("CompactContext"), "{output}");
-}
-
-/// The model's real query had one word ("request") that CompactContext's
-/// description does not contain; the rest already named the tool.
-#[tokio::test]
-async fn tool_search_loads_a_tool_when_most_query_words_match() {
-    let root = tempfile::tempdir().unwrap();
-    let mut executor = context_executor(root.path()).with_context_usage(Some((50, 100)));
-    executor.exposed_tools = Some(request_names(&executor).into_iter().collect());
-    let (_, output, failed) = executor
-        .execute_tool_call(
-            "ToolSearch",
-            &json!({"query":"compact context summary request compaction"}),
-            "search-most",
-        )
-        .await;
-    assert!(!failed, "{output}");
-    let result: Value = serde_json::from_str(&output).unwrap();
-    assert!(
-        result["loaded_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|name| name == "CompactContext"),
-        "{result}"
-    );
-}
-
-#[tokio::test]
-async fn tool_search_partial_matches_need_half_the_words() {
-    let root = tempfile::tempdir().unwrap();
-    let mut executor = context_executor(root.path()).with_context_usage(Some((50, 100)));
-    executor.exposed_tools = Some(request_names(&executor).into_iter().collect());
-    let (_, output, failed) = executor
-        .execute_tool_call(
-            "ToolSearch",
-            &json!({"query":"compaction zebra quantum walrus"}),
-            "search-half",
-        )
-        .await;
-    assert!(!failed, "{output}");
-    let result: Value = serde_json::from_str(&output).unwrap();
-    assert!(
-        result["loaded_tools"].as_array().unwrap().is_empty(),
-        "{result}"
-    );
-    assert!(
-        output.contains("No tool available on demand matches"),
-        "{output}"
-    );
-}
-
-#[tokio::test]
-async fn tool_search_prefers_full_matches_over_partial_ones() {
-    let root = tempfile::tempdir().unwrap();
-    let mut executor = context_executor(root.path()).with_context_usage(Some((50, 100)));
-    executor.exposed_tools = Some(request_names(&executor).into_iter().collect());
-    let (_, output, failed) = executor
-        .execute_tool_call(
-            "ToolSearch",
-            &json!({"query":"web fetch"}),
-            "search-full",
-        )
-        .await;
-    assert!(!failed, "{output}");
-    let result: Value = serde_json::from_str(&output).unwrap();
-    // The every-word path finds WebFetch because both words are in its name.
-    // No partial pass runs while it has hits, so no other tool is added.
-    assert_eq!(result["loaded_tools"], json!(["WebFetch"]), "{result}");
 }

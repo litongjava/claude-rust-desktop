@@ -1182,17 +1182,7 @@ fn edit_draft(state: &mut State, screen: &mut Frame, key: crossterm::event::KeyE
 }
 
 fn clip(text: &str, width: usize) -> String {
-    let mut result = String::new();
-    let mut used = 0;
-    for ch in text.chars().filter(|ch| !ch.is_control()) {
-        let size = ch.width().unwrap_or(0);
-        if used + size > width {
-            break;
-        }
-        used += size;
-        result.push(ch);
-    }
-    result
+    super::input::editor::clipped(text, width)
 }
 fn terminal_text(text: &str) -> String {
     text.replace("\r\n", "\n")
@@ -4731,7 +4721,8 @@ impl TurnDisplay {
                             task,
                         ));
                     } else {
-                        live.finished(id, name, failed, short, Some(full));
+                        let compact = super::tool_view::compact_label(name, label_input);
+                        live.finished(id, &compact, failed, short, Some(full));
                     }
                 } else {
                     live.finished(id, name, failed, short, None);
