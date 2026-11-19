@@ -90,6 +90,8 @@ grep -rn "crossterm::terminal::size\|[^:]terminal::size()" crates/cli/src --incl
 cargo test --locked --no-fail-fast -p deepseek-code-cli --test teams --test session_messages --test session_worker --test worktree_startup
 ```
 
+团队请求附带记忆召回的回归由 `cargo test --locked -p deepseek-code-cli --test teams` 覆盖。夹具用 user 消息首行的完整任务标记识别队员，路由和计数共用该判断。`child_request_marker_survives_appended_context` 覆盖纯文本和附加召回内容的文本及分块消息，也验证 leader 消息在其他角色、后续行或更长首行中提到任务时仍归为 leader。独立 CLI 用例继续验证队员启动、消息唤醒及团队删除。
+
 准入交棒的自动回归在 `--bin dcl` 中（暂停 Tokio 时钟，不依赖墙钟）：`persistent_worker::admission_tests` 覆盖“只有确实已完成的回合才等待”“超过旧 250ms 轮询窗口仍在等待”“宽限到期按未提交拒绝且不释放他人准入、之后的真实释放才准入”“空闲 host 立即准入”。真实协议路径由 `--test session_worker` 的 `turns_submitted_right_after_completion_are_admitted` 覆盖（连续三个回合紧跟完成提交，各只请求一次）。
 
 若出现 `is not loaded. Call ToolSearch`，先确认场景是否需要显式加载工具或增加模型搜索步骤；不要把未执行工具导致的后续空结果误判为 Worker 或消息传递失效。
