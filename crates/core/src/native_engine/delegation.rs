@@ -537,8 +537,9 @@ impl ToolLoopExecutor {
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;
         }
-        entry.executor.messages =
-            sessions.model_history(id, &entry.executor.provider.provider.api_format)?;
+        (entry.executor.messages, entry.executor.context_boundary_id) = sessions
+            .model_history_with_boundary(id, &entry.executor.provider.provider.api_format)?;
+        entry.executor.applied_compaction = entry.executor.context_boundary_id.is_some();
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
@@ -1205,6 +1206,7 @@ impl ToolLoopExecutor {
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
         .with_context_reminders(self.context_reminders.clone())
+        .with_transcript_db(context.db.clone())
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())

@@ -32,6 +32,7 @@ pub use lsp::{
 pub mod agent_messages;
 mod content_compat;
 pub mod coordination;
+pub(crate) mod context_search;
 pub mod cron_jobs;
 mod findings;
 pub mod linux_env;
@@ -147,6 +148,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         // `cron` stays dispatchable for older transcripts; the model sees the reference trio.
         crate::services::goal_proposals::definition(),
         crate::services::compaction_requests::definition(),
+        context_search::definition(),
         ToolDefinition { name: "ToolSearch".into(), description: "Load built-in tools that are not in this request yet. A successful search returns their real definitions with schemas and marks them loaded, so they can be called from the next model request on. Select complete tool names separated by commas or whitespace, e.g. `WebSearch WebFetch` or `WebSearch,WebFetch`; `select:Name1,Name2` (also accepting whitespace) explicitly selects exact names. Otherwise keywords are matched against tool names and descriptions; when no tool matches all of them, a tool matching most of them (one naming the tool) is loaded. Tools that commonly load on demand include listing directories (ListDir), multiple edits (MultiEdit), web access (WebFetch, WebSearch), LSP helpers, subagents (Agent, SendMessage), Workflow, long-term memory, scheduled jobs and desktop control. The runtime tool directory in the system prompt lists every built-in this request can load; only those listed there can be loaded. Searching costs nothing and grants no permission: the tool still goes through the usual approval and scope checks. MCP tools listed as available on demand load the same way.".into(), input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Complete tool names separated by commas or whitespace, or keywords describing what you need"}},"required":["query"]}) },
         ToolDefinition {
             name: "PluginRun".into(),
