@@ -240,6 +240,33 @@ python3 dev-support/deepseek-code/super-agent-20261110/harness-fix/h1_pty_accept
 3. 列表和详情里按 `x` 停止：任务立即从列表消失；停止最后一个后列表自动关闭，不再输出其他内容。
 4. 没有任务时输出 `No background tasks.`。`/tasks completed`、`/tasks show ID`、`/tasks attach ID` 文本命令照常可用。
 
+#### I7. Monitor 自动续期
+
+```bash
+cargo test --locked -p deepseek-code-core --lib tools::monitor::tests::
+cargo test --locked -p deepseek-code-core --lib task_cleanup
+cargo test --locked -p deepseek-code-core --lib native_engine::tool_loop::tool_loading_tests::monitor_is_deferred_and_loadable
+cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_once_and_announced idle_session_wakes_for_a_monitor_event
+```
+
+1. 省略 `max_runtime_ms` 时，脚本仍在运行也会在首个 `timeout_ms` 到期后结束，最终事件为 `expired`。`max_runtime_ms` 必须是大于 `timeout_ms` 且不超过 86400000 的整数。
+2. 启动会输出 PID 并等待本地文件的脚本，收到 `renewed` 后用 `TaskGet` 确认同一任务仍为 `running`。创建文件后，第二条输出的 PID 与首条相同，随后仅收到一个 `exited`。
+3. 在收到首次续期通知后调用同一任务的 `TaskStop`，确认任务变为 `cancelled`，最终事件为 `stopped`。
+4. 设置 2 秒间隔和 5 秒总上限。用命名管道让本地脚本等待放行，确认首条输出已写入事件后再推进暂停的 Tokio 时钟。验证两个续期边界以及最后一个间隔缩短至总上限。将时钟保持在上限，用 Linux pidfd 单独确认进程退出，再检查最终任务记录和 `expired` 事件。短间隔一分钟内只发一条 `renewed` 通知，重复收取事件应为空。
+5. 在真实终端用本地模型 mock 通过 `ToolSearch` 加载 `Monitor`，核对请求中的新 schema。让脚本保持运行直到收到续期通知，确认终端显示该通知，模型恰好收到一条新的续期消息。让脚本退出，再检查模型没有收到重复续期通知。
+6. Linux 子代理用本地模型 mock 加载并启动可续期的 Monitor。先等待续期并获取脚本和后代进程的 pidfd，再分别放行子代理正常返回和取消父执行 future。两种情况下任务都进入 `cancelled`，只产生一条 `stopped`，两个 pidfd 都确认原进程已退出，`waitid` 确认直接子进程已回收。正常返回还向父会话报告已停止的任务。
+7. 省略总上限时，在当前线程的 Tokio 运行时第一次调度 Monitor 前把时钟推进 60 秒。它仍有完整的 30 秒间隔，观察期内继续运行。计时器赢得 select 时仍直接走原有的 `expired` 分支。
+8. 子代理的 Monitor 续期后，通过其会话的普通 `TaskUpdate` 尝试完成或删除任务、清除 `metadata.monitor`、改写 `metadata.log_dir`，四项均应被拒绝。说明和普通 metadata 仍可修改。放行子代理返回，确认脚本和后代都退出、直接子进程已回收、任务为 `cancelled` 且仅一条 `stopped`。普通 `TaskCreate` 和 `TaskUpdate` 也不能伪造 Monitor 标记。
+9. 遍历 Monitor 的任务状态表，分别使用普通 TaskUpdate 和进程所有者接口验证所有允许与禁止的状态写入。对三个终态分别测试再次启动、改写结果、重复停止、同态写入和删除；拒绝时同一请求中的说明修改也不能落盘。删除后不能复活原 ID。
+10. 在隔离数据目录用普通文件阻止创建日志目录，另一次用不存在的命令模拟启动失败。两次均应能读到 failed 记录并删除。运行时在首次调度前退出也应使记录进入终态。
+11. 子代理清理测试先等待脚本发布 PID，再查询已提交的任务库。用四个测试线程并行重复运行正常返回及 TaskUpdate 后返回的用例 20 次。
+12. 锁住 SQLite 的 running 提交时，带总上限的脚本不能提前启动。发布成功后以启动脚本时的单调时钟计时；阻止 running 写入时进程的 pre_exec 标记应为空。
+13. 脚本正常退出时保持 SQLite 写锁，确认只收到一次 exited。锁在 10 秒重试窗口内释放时，直接查询数据库应看到 completed 和退出结果；锁保持到写入方重试结束时，原记录应保持 running。再次读取和收取事件后仍应看到原记录。
+14. 子代理的 Monitor 续期后将真实任务行置为历史状态 in_progress。放行子代理返回，验证父代理确认停止，shell 与后代均退出，且只有一个 stopped 事件。
+15. 在上述写锁下归档日志目录，TaskGet 的 4 字节限制和截断标志应与当时已提交的 output 一致。用 1.5 秒后释放的写锁验证普通 TaskUpdate 的备注仍能写入且退出结果保留备注。另一次只将数据库改为只读后释放写锁，确认 TaskGet 和 TaskList 均可读取记录。
+16. Monitor 正常退出后，用写锁挡住第一次终态写入，确保 TaskUpdate 已提交再放行重试。对比编辑回执、TaskGet、TaskList 与 SQLite：状态应为 completed，说明保留，updatedAt 取成功写入时的时间，不能早于已存时间（包括带时区偏移和纳秒的时间）。若编辑还设置了 output，终态摘要里的 task_output 应逐字保留该字符串，包括空串。
+17. 重试合并 TaskUpdate 的 output 时，对照回执、TaskGet、TaskList 和 SQLite，逐字节核对内嵌 NUL、首尾控制字符、Unicode、转义文本及超过 1 MiB 的字符串。用预置的 JSON 行验证孤立代理项转义的原文，带 NUL 后缀的状态或时间戳不能按前缀匹配。通知的 subject 会过滤控制字符，但应保留 NUL 之后的正文。
+
 ### G. 长期记忆
 
 1. `dcl memory add`、`list`、`list 关键词`、`update`、`delete` 输出 JSON；ID 不存在时报错。
@@ -457,6 +484,8 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 ### L. 超长历史的摘要分段、每段恢复与分层合并
 
 全部使用本地模拟接口和临时数据库，不发真实请求。
+
+- `cargo test --locked -p deepseek-code-cli --test compaction_summary_stream`：通过本地 OpenCode Go Chat 接口续接超阈值会话。角色帧和正文帧被合并为一个流元素时，摘要按 SSE 帧顺序解码，正文中的 JSON 字面文本原样写入边界，续接主请求只发送一次。若单个提供方帧内含两个 JSON 值，首个分段请求失败，保留原历史和解析位置，不重发、不写入边界、不发送主请求。
 
 1. `cargo test --locked -p deepseek-code-core --test compaction_status_regressions`（3 项）：指令开销的 `unknown_parts` 不为 0 时估算不得标为完整；与压缩边界同一毫秒、但没有记录该边界的旧请求不得成为当前用量；旧分支复制了祖先边界且没有计数键时，次数为“未知（旧历史）”、可证明的自身次数为 0，不显示精确的祖先累计值。
 2. `cargo test --locked -p deepseek-code-core --test compaction_boundary_provenance`（6 项，均覆盖 OpenAI 与 Anthropic）：先按当前历史读取消息与压缩边界，再由另一入口提交新的压缩，随后用旧消息发出真实 HTTP 请求。断言服务端正文是旧上下文、不含新摘要，且每个请求快照记录的 `contextBoundary` 都不是新边界；没有可信来源的主机消息记录为未知边界。把执行器改回“发送时查询数据库最新边界”后这 4 项全部失败，证明它们确实覆盖该缺陷。
@@ -760,6 +789,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `crates/cli/tests/conpty_worker.rs`、`crates/cli/tests/fixtures/conpty-console.ps1`：见“Windows ConPTY”中的并发启动与进程树清理场景。Linux 仅检查此测试目标可以编译。
 - `memory.rs`、`display_commands.rs`、`crates/core/src/memory`：G
 - `services/customization.rs`、`prompt/`、`native_engine/tool_loop.rs`：H，以及 SDK 测试
+- `tools/context_search.rs`、`db/context_search_repo.rs`、`db/context_search_index.rs` 与 ContextSearch 的工具注册：H、L 和下文“压缩后检索当前会话（ContextSearch）”。
 - `crates/core/src/skills/discovery.rs`、`crates/core/src/native_engine/engine_core.rs` 的技能列表、`crates/core/src/native_engine/skill_tool.rs`：N
 - `crates/core/src/skills/mod.rs` 的 bundled 安装、`bundled.rs`、`bundled_resources.rs`、`bundled_manifest.rs`、`skill_creator.rs`、`skills/bundled/`：O（安装与 `ensure_installed` 的旧占位迁移见 N、O 两节）
 - `crates/core/src/skills/bundled.rs` 的 task-template 注册或 `skills/bundled/task-template.md`：O2
@@ -813,6 +843,8 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
   权限：同一工具按操作分类，读操作在 Plan 模式允许、写操作被拒绝；Ask/AcceptEdits 需确认，Bypass 允许；`--disallowed-tools GitHub` 等 deny 规则仍然生效，且"已加载"不构成授权。真实 CLI 用例 `crates/cli/tests/github_tool.rs` 用 PATH 上的假 `gh` 验证：ToolLoad 前请求中没有该工具、加载后 schema 正确、一次读经由正常执行器返回规范化 JSON、Pre/PostToolUse 各触发一次且 `tool_use_id` 与持久的 `tool_calls` 行一致（相互独立的 occurrence id，不是模型给的 id）、Plan 模式与 deny 规则下写操作被拒绝且假 `gh` 从未被启动。
   **明确限制**：全部验证使用本地假 `gh`，未对真实 GitHub 执行任何创建/评论/合并；Windows 与 macOS 上的 `gh` 探测和 CLI 用例未运行（假 `gh` fixture 是 Unix shell 脚本，CLI 用例整体 `#![cfg(unix)]`）；取消/超时只证明自有进程被终止，不证明远端请求是否已被接受，因此写操作一律报 `unknown` 而不是推测结果。
 - `tools/mod.rs` 的 shell 启动、`services/tool_hooks.rs`、`mcp/mod.rs` 的 stdio 启动：`worker_environment`，并按 E4 复核后台与分离命令
+- `tools/monitor.rs`、`tools/monitor_completion.rs`、`tools/mod.rs` 的 Monitor 生命周期、终态写入重试、schema 与分发：I7（含本地脚本和真实终端中的模型通知）
+- `tools/background_shell.rs` 的会话停止扫描、`tools/tasks.rs` 的 Monitor 字段保护与 `native_engine/delegation_task_cleanup_tests.rs`：I7 的子代理清理用例和“子代理结束时停止其后台 shell 任务”。
 - `tools/external_agents.rs`：P
 - `crates/cli/src/signals.rs`、`crates/cli/src/main.rs` 的信号处理：Q，以及 B（运行中排队与撤回）、E3（`Esc` 中断当前一轮）
 - `crates/cli/src/session.rs`、`worker_frontend.rs`、`sdk.rs`、`compaction.rs` 的取消分支：Q，以及 L 的取消场景和 SDK 测试
@@ -1104,6 +1136,18 @@ ToolScript 保持按需加载。Router 可以加载它来组合允许的工具�
 5. `cargo test --locked -p deepseek-code-cli --test standalone a_queued_request_compacts_before_the_next_prompt_with_the_keep_text`：真实 CLI + 本地 mock，排队的请求在下一提示前发送摘要请求并带上 `keep` 文本，之后的历史从新边界开始且请求行已被删除。
 6. `cargo test --locked -p deepseek-code-cli --test standalone manual_compact_clears_a_queued_request`：手动 `/compact` 成功后清除排队请求。
 7. 真实终端：在历史超过窗口 30% 的会话里，让模型完成任务并请求压缩；下一条提示时确认显示 `Compacting the conversation as the model requested…`，且摘要保留 `keep` 中列出的待办、决定和路径。工具默认按需加载，先经 ToolLoad 加载 `CompactContext`；SDK、`--print` 和子代理中不应出现该工具。回合实际在会话 Worker 里执行（`input` 为 `None`），有主判定必须同时接受 Worker 控制目录；远端/SDK 宿主不得据此启用。
+
+### 压缩后检索当前会话（ContextSearch）
+
+默认通过 `ToolLoad` 加载，从下一次模型请求起可调用。工具目录在新会话中也可供发现，续接说明只在应用了持久压缩边界后出现。搜索只读当前会话已保存的用户及助手文本和工具结果。允许使用该工具的子代理和队友读取各自的会话。可用 `role`、`tool_name`、`range`（`all`、`before`、`after`）和本会话的 `boundary_id` 过滤。省略边界时，第一次请求选择最近一次压缩边界并随游标保留。结果按时间线从新到旧排列，提供消息 ID、已记录的回合 ID、时间戳以及工具调用 ID。
+
+1. `cargo test --locked -p deepseek-code-core --lib context_search -- --nocapture` 验证两次压缩之间的过滤、父会话与实时 Agent、TeamSpawn 队友及续接的隔离、越过行数与字节预算、跨文本窗口的 UTF-8 匹配、结构化结果投影、以及长匹配与结果上限。过滤器也覆盖无存储、关闭工具、未加载和权限拒绝。
+2. `cargo test --locked -p deepseek-code-cli --test standalone context_search_recovers` 使用真实 `dcl --print` 与 SDK stream-json 分别连接本地 mock。先通过 Read 保存唯一值，再用 `sessions compact` 提交省略该值的摘要，最后重启并恢复。核对两次搜索前的模型请求没有该值，ToolLoad 加载后才发出 ContextSearch 的 schema，必需的值来自真实搜索结果，且消息 ID、回合 ID、时间戳和工具调用 ID 与 SQLite 记录一致。
+3. `cargo test --locked -p deepseek-code-core --test native_compaction context_search_hint_requires_persisted_compaction_without_host_provenance` 检查 Desktop 形状的请求。伪造的边界元数据不会带来续接提示，省略元数据但成功应用已保存边界的请求会收到提示。合并回归见 H、L 以及“模型请求压缩（CompactContext）”。Desktop 检查使用 `cargo check --locked -p deepseek-code-desktop --all-targets`。实际界面场景见 `desktop-regression-tests.md` 的 D3。
+4. `cargo test --locked -p deepseek-code-core --lib context_search_cold_reads -- --nocapture` 在冷 SQLite 连接测量跳过四条 32 MiB 记录、以及从深游标继续检索时的读取量。
+5. `cargo test --locked -p deepseek-code-cli --test standalone context_search_resume_preserves_legacy_ties` 由真实 CLI 升级已有数据库。对相同排序值，按插入行号判定摘要前后的记录，检查发给模型的历史、两次搜索结果和消息引用。
+
+每页最多检查 25,000 个消息和工具元数据行。24 MiB 的读取预算包含文本、索引和元数据页，每个文本窗口最多 8 MiB。大文本按可独立读取的 64 KiB 分块存储，小型原始记录可直接读取。收到 `next_cursor` 时，用原查询和过滤条件继续，即使本页没有命中也应如此。普通文本可以继续读同一来源的后续内容。需要完整投影的过大或无效结构化结果计入 `skipped_structured_sources`。最多返回 10 条结果及 12 KiB 的 JSON。`has_more` 表示本页还有已发现但未返回的命中，`scan_truncated` 表示扫描因预算停止或有结构化来源被跳过。`excerpt_truncated` 表示摘录省略了来源的一部分，`match_truncated` 表示匹配本身超过 384 字节。
 
 ## Super Agent Watcher 核心与安全续接（阶段 6 第一部分）
 
