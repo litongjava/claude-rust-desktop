@@ -754,6 +754,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolSearch 与私有 worker �
 - `status_commands.rs`、`services/context_usage.rs`：`status_commands_tests`、`compaction_status_regressions` 与 L 的 `status-manual`（按边界与配置匹配用量、部分估算、压缩后估算、次数持久化）
 - `session_commands.rs`：L（自动压缩完成输出与次数）；模型请求压缩（`services/compaction_requests.rs`、`prepare_turn` 开头的取用）另见“模型请求压缩（CompactContext）”
 - `worker_frontend.rs`、`background_commands.rs`：B、D、E3、E4、F
+- `crates/cli/tests/conpty_worker.rs`、`crates/cli/tests/fixtures/conpty-console.ps1`：见“Windows ConPTY”中的并发启动与进程树清理场景。Linux 仅检查此测试目标可以编译。
 - `memory.rs`、`display_commands.rs`、`crates/core/src/memory`：G
 - `services/customization.rs`、`prompt/`、`native_engine/tool_loop.rs`：H，以及 SDK 测试
 - `crates/core/src/skills/discovery.rs`、`crates/core/src/native_engine/engine_core.rs` 的技能列表、`crates/core/src/native_engine/skill_tool.rs`：N
@@ -1123,6 +1124,8 @@ Windows 测试编译回归（Codex 04）：core 的 `--lib <filter>` 仍会编�
 - Windows `eof:true` 本轮明确不支持，data+eof 整次拒绝且不写；Ctrl+Z/Ctrl+D 可通过 data 显式发送，由应用解释，不能当通用 EOF。同步匿名管道写由精确线程句柄 CancelSynchronousIo 取消并 join；错误时 `bytes_written_lower_bound:true,outcome:"unknown"` 不承诺不存在未报告的部分写入，不能自动重放。
 - `conpty_worker` 使用本地 mock + 真实持久 worker，Windows 检查控制台、回显、resize、跨轮、TaskGet timeout、Job Object 子孙清理、外 session 与同 session 外进程输入拒绝、plan、EOF/非法参数无效果、正常退出、初始化失败、Git Bash 默认 shell、SQLite 独立调用 ID。`CONPTY_ID`/`CONPTY_TREE`/`CONPTY_CLEANUP` 用固定进程句柄记录身份，清理断言先于测试失败兜底清理。
 - 退出码 259 的真实 CLI 用例先等待 PowerShell 输出 `EXIT_259_READY`，固定 gate 的进程句柄并确认尚未退出，再通过 TaskInput 释放真实 `exit 259`；随后仍用原 20 秒 TaskGet 上限断言 `failed`、精确退出码 259、清理完成及同一句柄已退出。不能把冷启动尚未完成时的 `running` 当成 STILL_ACTIVE 误判的证据，也不能延长退出等待或放宽终态断言。
+- 并发启动（I14）。在 `windows-latest` 多次运行完整的 `cargo test --locked -p deepseek-code-cli --test conpty_worker -- --nocapture`，保持 `RUST_TEST_THREADS=4`。resize/stop、EOF/正常退出、owner 强杀和退出码 259 四项均请求 `shell:pwsh`，检查实际 worker 返回的 `shell_path` 指向 `pwsh.exe`，并在接受就绪标记前读到该进程报告的 PowerShell 主版本至少为 7。三个共享夹具用例应在原 30 秒窗口内通过 TaskGet 收到 `READY`，并在发送输入或结束 owner 前确认 gate、shell 和后代的固定句柄均存活。主 PowerShell 保持连接真实控制台，安静的后代通过 `Process.Start` 创建且不连接该控制台，仍随原 Job Object 清理。检查窗口尺寸、回显、拒绝无效输入、退出码和精确进程清理的原有断言。Linux 可运行同一目标检查编译，预期执行 0 项。
+- 本地 Windows 和托管 CI 使用同一先决条件。预检复用产品的 `pwsh` 解析规则。未解析到 `pwsh.exe` 时，这四项测试会在启动 worker 前明确失败，显示解析结果并提示在 `%ProgramFiles%\PowerShell\7` 安装 PowerShell 7 或更新版本。仅添加到 PATH 的安装可能被内置 Windows PowerShell 覆盖。若解析器选中了 PATH 中的 `pwsh.exe`，仍须通过主版本检查。将用例的请求改回 `powershell` 应由 worker 的实际路径断言拒绝。产品继续按原规则回退，手工验证夹具仍可使用 Windows PowerShell 5.1。
 - Windows core 另测 Job Object terminate/最后句柄关闭、过期 gate 拒绝、同步写阻塞时超时与取消、DSR 分片、环境/argv/cwd。`job_member_fixture` 是子进程夹具，普通套件调用不启动子进程；子进程重复输出不增加独立用例数量。
 
 平台结果以对应提交的 Actions 日志为准，未运行项必须单列；Desktop 实际 UI、真实 Windows Terminal 仍需人工验证。Windows owner 强杀后的日志尾部/SQLite 终态 reconcile 尚未移植；TaskGet 保留 unresponsive 与已捕获日志，不虚构 completed 或 cleanup_complete。人工步骤见 [Windows ConPTY 人工验证](./windows-conpty-validation.md)，使用同次检出的仓库夹具与本地 mock。
