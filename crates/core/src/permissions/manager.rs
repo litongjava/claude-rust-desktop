@@ -651,7 +651,7 @@ impl PermissionManager {
                 | "TaskGet"
                 | "TaskList"
                 | "TaskOutput"
-                | "ToolSearch"
+                | "ToolLoad"
                 | "ProposeGoal"
                 | "CompactContext"
                 | "EnterPlanMode"

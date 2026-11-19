@@ -880,7 +880,7 @@ fn reconcile_git(task: &TaskRecord, pending: &[PendingTool]) -> Result<Value> {
     ensure!(
         pending
             .iter()
-            .all(|tool| matches!(tool.name.as_str(), "Read" | "Glob" | "Grep" | "ToolSearch")),
+            .all(|tool| matches!(tool.name.as_str(), "Read" | "Glob" | "Grep" | "ToolLoad")),
         "Unfinished side-effect tool has unknown outcome; Git observations: {}",
         json!(observed)
     );

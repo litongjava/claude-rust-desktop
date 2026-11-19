@@ -1,7 +1,7 @@
 //! Real CLI + local model mock + a fake `gh` on PATH.
 //!
 //! Covers the executor wiring that unit tests cannot: the `GitHub` built-in is
-//! discoverable only through ToolSearch, a read runs through the normal tool
+//! discoverable only through ToolLoad, a read runs through the normal tool
 //! pipeline against a fake binary, hooks and durable tool-call rows carry their
 //! own invocation identity, and a mutation is blocked by Plan mode or a deny
 //! rule without ever starting `gh`. No call reaches GitHub.
@@ -169,15 +169,15 @@ fn scripted(state: &Fixture, body: &Value) -> Vec<Value> {
                 !names.iter().any(|name| name == "GitHub"),
                 "GitHub must start on demand: {names:?}"
             );
-            assert!(names.iter().any(|name| name == "ToolSearch"));
-            calls_frame(&[("search-1", "ToolSearch", json!({"query":"select:GitHub"}))])
+            assert!(names.iter().any(|name| name == "ToolLoad"));
+            calls_frame(&[("search-1", "ToolLoad", json!({"names":["GitHub"]}))])
         }
         // Discovery finished: assert the schema contract, then act on the
         // scenario. Loading the tool is not authorization to write.
         1 => {
-            assert_eq!(results[0].0, "ToolSearch", "{results:?}");
+            assert_eq!(results[0].0, "ToolLoad", "{results:?}");
             let search: Value = serde_json::from_str(&results[0].1).unwrap_or_else(|error| {
-                panic!("ToolSearch result is not JSON ({error}): {}", results[0].1)
+                panic!("ToolLoad result is not JSON ({error}): {}", results[0].1)
             });
             assert_eq!(search["success"], true, "{search}");
             let loaded: Vec<&str> = search["loaded_tools"]
