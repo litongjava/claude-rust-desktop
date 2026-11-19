@@ -12,6 +12,9 @@ use std::{
     },
 };
 
+const ALPHA_PROMPT: &str = "alpha work";
+const BETA_PROMPT: &str = "beta work";
+
 struct Fixture {
     requests: Mutex<Vec<Value>>,
     parent_calls: AtomicUsize,
@@ -24,9 +27,45 @@ fn text(value: &Value) -> String {
             .iter()
             .filter_map(|block| block["text"].as_str())
             .collect::<Vec<_>>()
-            .join(""),
+            .join("\n"),
         _ => String::new(),
     }
+}
+
+fn is_child_request(request: &Value) -> bool {
+    // The task is the first line of its user message. Recall can append context.
+    request["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "user"
+                && matches!(
+                    text(message).lines().next(),
+                    Some(ALPHA_PROMPT | BETA_PROMPT)
+                )
+        })
+    })
+}
+
+#[test]
+fn child_request_marker_survives_appended_context() {
+    let reminder = "<system-reminder>\nRetrieved for possible relevance\n</system-reminder>";
+    for content in [
+        json!(ALPHA_PROMPT),
+        json!(format!("{BETA_PROMPT}\n\n{reminder}")),
+        json!([
+            {"type":"text","text":ALPHA_PROMPT},
+            {"type":"text","text":reminder}
+        ]),
+    ] {
+        let request = json!({"messages":[{"role":"user","content":content}]});
+        assert!(is_child_request(&request), "{request}");
+    }
+
+    let leader_request = json!({"messages":[
+        {"role":"user","content":format!("start a team\n\n{ALPHA_PROMPT}")},
+        {"role":"assistant","content":ALPHA_PROMPT},
+        {"role":"user","content":format!("{BETA_PROMPT} update")}
+    ]});
+    assert!(!is_child_request(&leader_request), "{leader_request}");
 }
 
 fn stream(tools: Vec<(&str, &str, Value)>) -> String {
@@ -48,15 +87,7 @@ async fn respond(
     Json(body): Json<Value>,
 ) -> impl axum::response::IntoResponse {
     fixture.requests.lock().unwrap().push(body.clone());
-    // System prompts arrive as ordinary message text here, so identify child
-    // sessions by their exact task prompt instead of the first message.
-    let child = body["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
-            let text = text(message);
-            text == "alpha work" || text == "beta work"
-        })
-    });
-    let tools = if child {
+    let tools = if is_child_request(&body) {
         Vec::new()
     } else {
         match fixture.parent_calls.fetch_add(1, Ordering::SeqCst) {
@@ -69,8 +100,8 @@ async fn respond(
                 "spawn",
                 "TeamSpawn",
                 json!({"team_name":"cli-team","members":[
-                    {"name":"alpha","prompt":"alpha work"},
-                    {"name":"beta","prompt":"beta work"}
+                    {"name":"alpha","prompt":ALPHA_PROMPT},
+                    {"name":"beta","prompt":BETA_PROMPT}
                 ]}),
             )],
             2 => vec![(
@@ -159,17 +190,9 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
     assert!(joined.contains("TeamSpawn"));
     assert!(joined.contains("TeamDelete"));
     assert!(joined.contains("SendMessage"));
-    // Children are independent sessions, not the leader's request.
     let children = requests
         .iter()
-        .filter(|request| {
-            request["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    let text = text(message);
-                    text == "alpha work" || text == "beta work"
-                })
-            })
-        })
+        .filter(|request| is_child_request(request))
         .count();
     let tail = requests
         .iter()
