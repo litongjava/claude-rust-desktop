@@ -9,10 +9,24 @@ mod windows_tests {
     use serde_json::{json, Value};
     use std::{
         collections::{BTreeMap, VecDeque},
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+
+    const POWERSHELL_MAJOR_PREFIX: &str = "CONPTY_POWERSHELL_MAJOR:";
+    const POWERSHELL_INSTALL_HINT: &str =
+        "Install PowerShell 7 or newer under %ProgramFiles%\\PowerShell\\7. A PATH-only install can be shadowed by Windows PowerShell.";
+
+    fn assert_pwsh_executable(source: &str, path: Option<&str>) {
+        let name = path
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str());
+        assert!(
+            name.is_some_and(|name| name.eq_ignore_ascii_case("pwsh.exe")),
+            "{source} resolved shell_path {path:?}; the ConPTY fixture requires PowerShell 7 or newer (pwsh.exe). {POWERSHELL_INSTALL_HINT}"
+        );
+    }
 
     #[derive(Default)]
     struct Model {
@@ -92,16 +106,9 @@ mod windows_tests {
             self.0.iter().map(|(pid, _)| *pid).collect()
         }
         fn exited(&self, pid: u32) -> bool {
-            use std::os::windows::io::AsRawHandle;
-            let handle = &self
-                .0
-                .iter()
-                .find(|(p, _)| *p == pid)
-                .expect("untracked PID")
-                .1;
-            unsafe { process_handles::WaitForSingleObject(handle.as_raw_handle(), 0) == 0 }
+            self.wait_for_exit(pid, 0)
         }
-        fn terminate(&self, pid: u32) {
+        fn wait_for_exit(&self, pid: u32, millis: u32) -> bool {
             use std::os::windows::io::AsRawHandle;
             let handle = &self
                 .0
@@ -109,32 +116,65 @@ mod windows_tests {
                 .find(|(p, _)| *p == pid)
                 .expect("untracked PID")
                 .1;
-            assert_ne!(
-                unsafe { process_handles::TerminateProcess(handle.as_raw_handle(), 1) },
-                0
-            );
+            unsafe { process_handles::WaitForSingleObject(handle.as_raw_handle(), millis) == 0 }
+        }
+        fn terminate(&self, pid: u32) -> std::io::Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            let handle = &self
+                .0
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .expect("untracked PID")
+                .1;
+            let terminated =
+                unsafe { process_handles::TerminateProcess(handle.as_raw_handle(), 1) };
+            if terminated == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
     impl Drop for ExactCleanup {
         fn drop(&mut self) {
+            let mut still_running = Vec::new();
             for pid in self.pids() {
                 if !self.exited(pid) {
-                    self.terminate(pid);
+                    let termination = self.terminate(pid);
+                    // Closing the owner's job can already be terminating this gate.
+                    let exited = self.wait_for_exit(pid, 5000);
+                    eprintln!(
+                        "CONPTY_FALLBACK_CLEANUP pid={pid} exited={exited} termination={termination:?}"
+                    );
+                    if !exited {
+                        still_running.push(pid);
+                    }
                 }
+            }
+            if !std::thread::panicking() {
+                assert!(
+                    still_running.is_empty(),
+                    "fixture cleanup left pinned processes alive: {still_running:?}"
+                );
             }
         }
     }
     struct Harness {
+        cleanup: ExactCleanup,
         _temp: tempfile::TempDir,
         data: PathBuf,
         workspace: PathBuf,
         host: worker::Worker,
         endpoint: String,
         model: Fixture,
-        cleanup: ExactCleanup,
         sequence: usize,
     }
     impl Harness {
+        async fn new_powershell() -> Self {
+            let path = deepseek_code_core::tools::find_shell("pwsh");
+            assert_pwsh_executable("PowerShell prerequisite", path.as_deref());
+            Self::new().await
+        }
+
         async fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path().join("data");
@@ -266,8 +306,7 @@ mod windows_tests {
             println!("CONPTY_TOOL {id} {value}");
             value
         }
-        fn track(&mut self, id: &str) -> (String, u32) {
-            let result = self.result(id);
+        fn track(&mut self, result: &Value) -> (String, u32) {
             let task = result["task_id"].as_str().unwrap().to_owned();
             let pid = result["terminal_pid"].as_u64().unwrap() as u32;
             self.cleanup.add(pid);
@@ -309,10 +348,20 @@ mod windows_tests {
         )
     }
     fn bash(id: &'static str, command: &str) -> (&'static str, &'static str, Value) {
+        // The runner's PowerShell 7 avoids the variable Windows PowerShell
+        // startup that can consume the entire fixture readiness deadline.
         (
             id,
             "Bash",
-            json!({"command":command,"shell":"powershell","interaction":"pty","run_in_background":true}),
+            json!({"command":command,"shell":"pwsh","interaction":"pty","run_in_background":true}),
+        )
+    }
+    fn powershell_start(command: &str) -> (&'static str, &'static str, Value) {
+        bash(
+            "start",
+            &format!(
+                "[Console]::WriteLine('{POWERSHELL_MAJOR_PREFIX}' + $PSVersionTable.PSVersion.Major); {command}"
+            ),
         )
     }
     fn input(id: &'static str, data: &str) -> (&'static str, &'static str, Value) {
@@ -344,19 +393,59 @@ mod windows_tests {
     }
     impl Harness {
         async fn read_until(&mut self, expected: &str) -> Value {
+            self.read_until_inspecting(expected, |_| {}).await
+        }
+        async fn read_until_inspecting(
+            &mut self,
+            expected: &str,
+            mut inspect: impl FnMut(&str),
+        ) -> Value {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 self.turn("bypass", vec![get("poll")]).await;
                 let value = self.result("poll");
-                if value["stdout"].as_str().unwrap_or("").contains(expected) {
+                let stdout = value["stdout"].as_str().unwrap_or("");
+                inspect(stdout);
+                if stdout.contains(expected) {
                     return value;
                 }
                 assert!(Instant::now() < deadline, "missing {expected}: {value}");
             }
         }
+        async fn powershell_ready(&mut self, expected: &str) -> (String, u32) {
+            let start = self.result("start");
+            let terminal = self.track(&start);
+            let path = start["shell_path"].as_str();
+            assert_pwsh_executable("Worker", path);
+            let mut major_verified = false;
+            self.read_until_inspecting(expected, |stdout| {
+                if major_verified {
+                    return;
+                }
+                // A ConPTY read can end in the middle of the version line.
+                let major = stdout.split_inclusive('\n').find_map(|line| {
+                    line.strip_suffix('\n')?
+                        .split_once(POWERSHELL_MAJOR_PREFIX)
+                        .map(|(_, major)| major.trim())
+                });
+                if let Some(major) = major {
+                    assert!(
+                        major.parse::<u32>().is_ok_and(|version| version >= 7),
+                        "Worker resolved shell_path {path:?} and reported PowerShell major version {major:?}. The ConPTY fixture requires version 7 or newer. {POWERSHELL_INSTALL_HINT}"
+                    );
+                    println!("CONPTY_POWERSHELL task={} path={path:?} major={major}", terminal.0);
+                    major_verified = true;
+                }
+            })
+            .await;
+            assert!(
+                major_verified,
+                "Worker resolved shell_path {path:?} but emitted no PowerShell major version before {expected}. {POWERSHELL_INSTALL_HINT}"
+            );
+            terminal
+        }
         async fn ready(&mut self) -> (String, Vec<u32>) {
-            self.read_until("READY").await;
-            let (task, gate) = self.track("start");
+            let (task, gate) = self.powershell_ready("READY").await;
             let mut pids = vec![gate];
             for file in ["shell.pid", "descendant.pid"] {
                 let pid = std::fs::read_to_string(self.workspace.join(file))
@@ -365,6 +454,12 @@ mod windows_tests {
                     .unwrap();
                 self.cleanup.add(pid);
                 pids.push(pid);
+            }
+            for &pid in &pids {
+                assert!(
+                    !self.cleanup.exited(pid),
+                    "fixture PID {pid} exited before READY"
+                );
             }
             println!(
                 "CONPTY_TREE task={task} gate={} shell={} descendant={}",
@@ -378,9 +473,9 @@ mod windows_tests {
     }
     #[tokio::test]
     async fn model_conpty_console_write_resize_resume_timeout_stop_tree_and_records() {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_powershell().await;
         fixture(&h);
-        h.turn("bypass", vec![load(), bash("start", "& .\\fixture.ps1")])
+        h.turn("bypass", vec![load(), powershell_start("& .\\fixture.ps1")])
             .await;
         let (task, pids) = h.ready().await;
         let cross_process = deepseek_code_core::tools::tasks::execute_for_session(
@@ -478,9 +573,9 @@ mod windows_tests {
 
     #[tokio::test]
     async fn model_conpty_eof_and_invalid_input_have_no_effect_then_normal_exit() {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_powershell().await;
         fixture(&h);
-        h.turn("bypass", vec![load(), bash("start", "& .\\fixture.ps1")])
+        h.turn("bypass", vec![load(), powershell_start("& .\\fixture.ps1")])
             .await;
         let (_, pids) = h.ready().await;
         h.turn(
@@ -554,13 +649,13 @@ mod windows_tests {
 
     #[tokio::test]
     async fn model_conpty_owner_hard_exit_kills_gate_shell_and_descendant() {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_powershell().await;
         fixture(&h);
-        h.turn("bypass", vec![load(), bash("start", "& .\\fixture.ps1")])
+        h.turn("bypass", vec![load(), powershell_start("& .\\fixture.ps1")])
             .await;
         let (_, pids) = h.ready().await;
         let engine = h.host.child_pid.unwrap();
-        h.cleanup.terminate(engine);
+        h.cleanup.terminate(engine).unwrap();
         h.wait_exited(engine).await;
         // Only the exact engine is killed above. These exits must be kernel Job
         // Object cleanup, before the fixture's fallback Drop can touch any PID.
@@ -573,13 +668,12 @@ mod windows_tests {
 
     #[tokio::test]
     async fn model_conpty_exit_code_259_is_failed_not_permanently_running() {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_powershell().await;
         h.turn(
             "bypass",
             vec![
                 load(),
-                bash(
-                    "start",
+                powershell_start(
                     "[Console]::WriteLine('EXIT_259_READY'); [void][Console]::ReadLine(); exit 259",
                 ),
             ],
@@ -588,8 +682,7 @@ mod windows_tests {
         // Cold PowerShell startup is not the exit-code regression. Establish
         // that the real program is running before releasing its exit, then
         // retain the same bounded TaskGet and exact terminal assertions.
-        h.read_until("EXIT_259_READY").await;
-        let (_, gate) = h.track("start");
+        let (_, gate) = h.powershell_ready("EXIT_259_READY").await;
         assert!(!h.cleanup.exited(gate));
         h.turn("bypass", vec![input("exit", "exit-259\r"), final_get()])
             .await;
@@ -658,8 +751,9 @@ mod windows_tests {
         // Windows default resolves Git Bash through the normal shell settings.
         h.turn("bypass",vec![load(),("start","Bash",json!({"command":"printf 'BASH_READY\\n'; read -r line; printf 'bash:%s\\n' \"$line\"; pwd","interaction":"pty","run_in_background":true}))]).await;
         h.read_until("BASH_READY").await;
-        let (_, pid) = h.track("start");
-        assert!(h.result("start")["shell_path"]
+        let start = h.result("start");
+        let (_, pid) = h.track(&start);
+        assert!(start["shell_path"]
             .as_str()
             .unwrap()
             .to_lowercase()
