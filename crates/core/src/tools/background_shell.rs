@@ -1044,9 +1044,9 @@ fn lock_progress(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Requests a stop for every running managed shell of `session`. A task that
-/// finished between the listing and the request is left as it is; one failed
-/// request never prevents the requests and results of the others.
+/// Requests a stop for every running managed shell or monitor of `session`.
+/// A task that finished between the listing and the request keeps its final status.
+/// Each stop is requested independently.
 ///
 /// The listing is only a starting point: the deadline and the abandoned flag
 /// are checked before every stop, because this may run on a blocking thread
@@ -1062,7 +1062,13 @@ fn request_session_stops(
     let session = uuid::Uuid::parse_str(session)?.to_string();
     let listing = super::tasks::execute_for_session("TaskList", json!({}), root, &session)?;
     for task in listing["tasks"].as_array().into_iter().flatten() {
-        if task["metadata"]["managed_shell"] != true || task["status"] != "running" {
+        let metadata = &task["metadata"];
+        let active = if metadata["monitor"] == true {
+            super::monitor::is_active_status(&task["status"])
+        } else {
+            metadata["managed_shell"] == true && task["status"] == "running"
+        };
+        if !active {
             continue;
         }
         let Some(id) = task["id"].as_str() else {
@@ -1089,7 +1095,10 @@ fn request_session_stops(
             }
             // Nothing this call can stop: the task ended before the request.
             Ok(_) => {}
-            Err(error) => progress.outcome.failed.push((subject, format!("{error:#}"))),
+            Err(error) => progress
+                .outcome
+                .failed
+                .push((subject, format!("{error:#}"))),
         }
     }
     Ok(())
@@ -1180,9 +1189,9 @@ fn ordered(mut outcome: SessionStop) -> SessionStop {
 /// the same TaskStop path.
 ///
 /// A delegated child runs in its own conversation, so when it ends nothing
-/// would read or stop the background shells it left behind. Only managed shell
-/// tasks (metadata `managed_shell`, which includes PTY shells) are handled
-/// here; finished tasks keep their final record.
+/// would read or stop the background shells and monitors it left behind.
+/// Managed shells (including PTY shells) and monitors are handled here.
+/// Finished tasks keep their final record.
 ///
 /// `confirm` waits up to [`STOP_CONFIRM_TIMEOUT`] in total for the requested
 /// tasks' final status. With a blocking sleep it must not run on the runtime the
@@ -1360,6 +1369,12 @@ pub(super) fn control(
         return Ok(None);
     }
     anyhow::ensure!(policy.is_none_or(|(block, _)| !block), "Blocking TaskGet requires the asynchronous task entry point; synchronous callers must set block:false");
+    if monitor && name == "TaskStop" && !super::monitor::is_active_status(&task["status"]) {
+        return Ok(Some(json!({
+            "task_id":id,"status":task["status"],"cancellation_requested":false,
+            "message":"Monitor already finished."
+        })));
+    }
     let id = uuid::Uuid::parse_str(id)?.to_string();
     let session = uuid::Uuid::parse_str(session)?;
     let directory = directory(root, &session.to_string(), &task)?;

@@ -58,6 +58,7 @@ pub mod file_change;
 pub(crate) mod github;
 pub(crate) mod image_generation;
 pub mod monitor;
+mod monitor_completion;
 pub(crate) mod output_page;
 pub(crate) mod path_scope;
 pub(crate) mod provider_search;
@@ -228,13 +229,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Monitor".to_string(),
-            description: "Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor stops after timeout_ms (default 1800000 = 30 min, max 3600000); you are notified when it exits, expires or is stopped, and can start it again. More than 30 events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.".to_string(),
+            description: "Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor expires after timeout_ms (default 30 min, max 60 min). Set max_runtime_ms to keep watching the same live script for another timeout_ms at each deadline, up to that total runtime. A renewal can send one notification, with at most one renewal notice per minute. You are notified when the monitor exits, expires or is stopped. More than 30 output events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "description": "The shell script to run in the background", "type": "string" },
                     "description": { "description": "Short description shown in notifications", "type": "string" },
-                    "timeout_ms": { "description": "How long the monitor runs, in milliseconds", "type": "integer", "minimum": 1000, "maximum": 3600000, "default": 1800000 },
+                    "timeout_ms": { "description": "Length of one watch interval, in milliseconds", "type": "integer", "minimum": 1000, "maximum": monitor::MAX_TIMEOUT.as_millis() as u64, "default": monitor::DEFAULT_TIMEOUT.as_millis() as u64 },
+                    "max_runtime_ms": { "description": "Optional total watch time in milliseconds. Must exceed timeout_ms and is capped at 24 hours. Providing it enables auto-renewal while the script is alive.", "type": "integer", "minimum": 1001, "maximum": monitor::MAX_RUNTIME.as_millis() as u64 },
                     "shell": { "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh, wsl (explicit configured WSL distribution; default: shell.toolDefault, otherwise bash)", "type": "string" }
                 },
                 "required": ["command", "description"],
@@ -1124,13 +1126,24 @@ fn monitor_input(mut input: serde_json::Value) -> Result<serde_json::Value> {
     if input.get("detach").and_then(serde_json::Value::as_bool) == Some(true) {
         anyhow::bail!("Monitor does not accept detach: it already runs in the background");
     }
+    let max_timeout_ms = monitor::MAX_TIMEOUT.as_millis() as u64;
     let timeout_ms = match input.get("timeout_ms").filter(|value| !value.is_null()) {
         Some(value) => value
             .as_u64()
-            .filter(|ms| (1_000..=3_600_000).contains(ms))
+            .filter(|ms| (1_000..=max_timeout_ms).contains(ms))
             .ok_or_else(|| anyhow!("Monitor timeout_ms must be between 1000 and 3600000"))?,
-        None => 1_800_000,
+        None => monitor::DEFAULT_TIMEOUT.as_millis() as u64,
     };
+    let max_runtime_ms = input.get("max_runtime_ms").filter(|value| !value.is_null());
+    if let Some(value) = max_runtime_ms {
+        let limit = monitor::MAX_RUNTIME.as_millis() as u64;
+        anyhow::ensure!(
+            value
+                .as_u64()
+                .is_some_and(|ms| ms > timeout_ms && ms <= limit),
+            "Monitor max_runtime_ms must be an integer greater than timeout_ms and at most {limit}"
+        );
+    }
     input["run_in_background"] = serde_json::json!(true);
     input["__monitor_timeout_ms"] = serde_json::json!(timeout_ms);
     Ok(input)
@@ -1415,11 +1428,14 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
             .get("__monitor_timeout_ms")
             .and_then(serde_json::Value::as_u64)
         {
-            let mut result = monitor::start(
+            let mut result = monitor::start_with_runtime_limit(
                 cmd,
                 &description,
                 &command,
                 std::time::Duration::from_millis(timeout_ms),
+                input["max_runtime_ms"]
+                    .as_u64()
+                    .map(std::time::Duration::from_millis),
                 wsl_guard,
             )?;
             result["shell_path"] = serde_json::json!(shell);
