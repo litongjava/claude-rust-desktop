@@ -99,11 +99,7 @@ async fn respond(
     } else {
         match next(&fixture.parent_count) {
             0 => text_frames("noted"),
-            1 => tool_call_frame(
-                "call-search",
-                "ToolSearch",
-                &json!({"query":"select:Agent"}),
-            ),
+            1 => tool_call_frame("call-search", "ToolLoad", &json!({"names":["Agent"]})),
             2 => tool_call_frame(
                 "call-fork",
                 "Agent",

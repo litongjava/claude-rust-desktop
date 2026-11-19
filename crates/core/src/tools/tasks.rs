@@ -13,7 +13,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TodoWrite", "Replace the session's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
         // `TaskOutput` is not advertised. Its dispatch alias remains below for
-        // old transcripts and is not discoverable through ToolSearch.
+        // old transcripts and is not discoverable through ToolLoad.
         ("TaskStop", "\n- Stops a running background task by its ID\n- Takes a task_id parameter identifying the task to stop\n- Stops a background shell together with its descendant processes; for other task records it marks the record cancelled\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n",json!({"task_id":{"description":"The ID of the background task to stop.","type":"string"},"shell_id":{"description":"Deprecated: use task_id instead","type":"string"}}),vec![]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
 }
@@ -577,7 +577,7 @@ fn execute_at(name: &str, input: Value, path: &Path) -> Result<Value> {
 fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool) -> Result<Value> {
     // `TaskOutput` was folded into `TaskGet`. Old transcripts may still
     // dispatch it; it goes through the same validation, storage and session
-    // path and is not advertised or loadable through ToolSearch.
+    // path and is not advertised or loadable through ToolLoad.
     let name = if name == "TaskOutput" {
         "TaskGet"
     } else {

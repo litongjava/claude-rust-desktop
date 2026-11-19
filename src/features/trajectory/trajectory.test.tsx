@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { buildTrace, finishProcess, messageSteps, recordText, recordTool, restoreProcessMetadata, toolOutput } from './model';
+import { buildTrace, finishProcess, messageSteps, recordText, recordTool, restoreProcessMetadata, toolDisplayTitle, toolOutput } from './model';
+import AssistantResponse from './AssistantResponse';
 import ToolOutput from './ToolOutput';
 import WorkDetails from './WorkDetails';
 import TrajectoryView from './TrajectoryView';
@@ -69,6 +70,78 @@ describe('Git add output', () => {
 });
 
 describe('ordered process events', () => {
+  it('shows the requested ToolLoad names in the work details and trajectory', () => {
+    const input = { names: ['Read', 'Grep'] };
+    const tool = { id: 'load-1', name: 'ToolLoad', input, status: 'done' };
+    const message = { role: 'assistant', content: '', toolCalls: [tool] };
+    const { rerender } = render(<WorkDetails message={message} index={0} live={false} />);
+    openGroups();
+    expect(screen.getByText('ToolLoad(Read, Grep)')).toBeInTheDocument();
+    expect(buildTrace([message], false).find(record => record.role === 'tool')).toMatchObject({
+      title: 'ToolLoad', displayTitle: 'ToolLoad(Read, Grep)', input,
+    });
+    expect(toolDisplayTitle({ name: 'ToolLoad', input: JSON.stringify({
+      names: ['Read', 'Grep', 'Glob', 'Edit', 'TaskGet', 'ListDir'],
+    }) })).toBe('ToolLoad(Read, Grep, Glob, Edit, TaskGet, …)');
+    rerender(<TrajectoryView messages={[message]} loading={false} focusId={null} />);
+    expect(within(screen.getByLabelText('过程列表')).getByText('ToolLoad(Read, Grep)')).toBeInTheDocument();
+  });
+
+  it('allows ToolLoad metadata and title to occupy separate lines in a narrow trajectory pane', () => {
+    const tool = { id: 'narrow-load', name: 'ToolLoad', input: { names: ['Read', 'Grep'] }, status: 'done' };
+    const message = { role: 'assistant', content: '', toolCalls: [tool] };
+    render(<div style={{ width: '20ch' }}><TrajectoryView messages={[message]} loading={false} focusId={null} /></div>);
+    const list = screen.getByLabelText('过程列表');
+    const row = within(list).getByRole('button', { name: /ToolLoad\(Read, Grep\)/ });
+    expect(list).toHaveClass('[container-type:inline-size]');
+    expect(row).toHaveClass('flex', '[@container_(max-width:_16rem)]:flex-wrap');
+    expect(within(row).getByText(/Turn \d+ · Step \d+/)).toHaveClass('w-24', '[@container_(max-width:_16rem)]:w-auto');
+    expect(within(row).getByText('TOOL CALL')).toHaveClass('w-20', '[@container_(max-width:_16rem)]:w-auto');
+    expect(within(row).getByText('ToolLoad(Read, Grep)')).toHaveClass('flex-1', '[@container_(max-width:_16rem)]:basis-full');
+    fireEvent.click(row);
+    expect(within(screen.getByLabelText('过程详情')).getByText('ToolLoad(Read, Grep)')).toBeInTheDocument();
+  });
+
+  it('filters directional formatting from the ToolLoad title and preserves raw names', () => {
+    const names = ['\u202A\u202B\u202D\u202Eabc\u202C', '\u2066\u2067\u2068עברית\u2069', '\u2068\u2069'];
+    const input = { names };
+    const raw = JSON.stringify(input);
+    const tool = { id: 'load-bidi', name: 'ToolLoad', input, status: 'error' };
+    const title = 'ToolLoad(abc, עברית)';
+    const message = { role: 'assistant', content: '', toolCalls: [tool] };
+    expect(toolDisplayTitle({ name: 'ToolLoad', input: raw })).toBe(title);
+    expect(buildTrace([message], false).find(record => record.role === 'tool')).toMatchObject({
+      displayTitle: title, input,
+    });
+    const { rerender, container } = render(<AssistantResponse blocks={[{ type: 'tool_call', name: tool.name, input }]} />);
+    expect(screen.getByText(title)).toBeInTheDocument();
+    rerender(<AssistantResponse blocks={[{ type: 'tool_call', name: tool.name, input }]} raw />);
+    expect(container.querySelector('pre')?.textContent).toBe(JSON.stringify(input, null, 2));
+    expect(JSON.stringify(input)).toBe(raw);
+  });
+
+  it.each(['界', '✈️', '👩🏽‍💻', 'e\u0301'])('keeps %s graphemes intact in rejected ToolLoad titles', grapheme => {
+    for (const length of [1, 64, 80, 81]) {
+      const input = { names: [grapheme.repeat(length)] };
+      const args = length > 80 ? grapheme.repeat(79) + '…' : input.names[0];
+      expect(toolDisplayTitle({ name: 'ToolLoad', input })).toBe(`ToolLoad(${args})`);
+    }
+    const input = { names: [grapheme.repeat(81)] };
+    const tool = { id: 'load-rejected', name: 'ToolLoad', input, status: 'error' };
+    const message = { role: 'assistant', content: '', toolCalls: [tool] };
+    const title = `ToolLoad(${grapheme.repeat(79)}…)`;
+    const { rerender } = render(<WorkDetails message={message} index={0} live={false} />);
+    openGroups();
+    expect(screen.getByText(title)).toBeInTheDocument();
+    expect(buildTrace([message], false).find(record => record.role === 'tool')).toMatchObject({
+      title: 'ToolLoad', displayTitle: title, input,
+    });
+    rerender(<TrajectoryView messages={[message]} loading={false} focusId={null} />);
+    expect(within(screen.getByLabelText('过程列表')).getByText(title)).toBeInTheDocument();
+    rerender(<AssistantResponse blocks={[{ type: 'tool_call', id: tool.id, name: tool.name, input }]} />);
+    expect(screen.getByText(title)).toBeInTheDocument();
+  });
+
   it('shows task names while running and after results without changing arguments', () => {
     const input = { task_id: 'task-123', block: true };
     const tool = { id: 'task-output', name: 'TaskOutput', displayTitle: '运行检查', input, status: 'running' };

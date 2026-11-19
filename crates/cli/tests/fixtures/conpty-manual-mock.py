@@ -18,7 +18,7 @@ lock = threading.Lock()
 
 
 def actions(prompt):
-    load = ('ToolSearch', {'query': 'select:TaskInput,TaskGet,TaskStop'})
+    load = ('ToolLoad', {'names': ['TaskInput', 'TaskGet', 'TaskStop']})
     read = ('TaskGet', {'task_id': '$task', 'block': True, 'timeout': 1000})
     if 'get' in prompt:
         return [load, read]

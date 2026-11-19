@@ -80,7 +80,39 @@ export function toolCommand(tool: any): string {
   const input = toolInput(tool);
   return rawText(input.command ?? input.cmd ?? input.script ?? input.code ?? tool.input);
 }
+
+const Segmenter = (Intl as typeof Intl & {
+  Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => {
+    segment: (text: string) => Iterable<{ segment: string }>;
+  };
+}).Segmenter;
+const toolNameSegmenter = Segmenter && new Segmenter(undefined, { granularity: 'grapheme' });
+const toolLoadPreviewLimit = 80;
+
+function toolLoadPreview(names: string[]): string {
+  const preview = names.slice(0, 5).join(', ') + (names.length > 5 ? ', …' : '');
+  if (preview.length <= toolLoadPreviewLimit) return preview;
+  if (!toolNameSegmenter) return '…';
+  const graphemes: string[] = [];
+  for (const { segment } of toolNameSegmenter.segment(preview)) {
+    if (graphemes.length === toolLoadPreviewLimit) {
+      graphemes[toolLoadPreviewLimit - 1] = '…';
+      return graphemes.join('');
+    }
+    graphemes.push(segment);
+  }
+  return preview;
+}
+
 export function toolDisplayTitle(tool: any): string {
+  if (tool.name === 'ToolLoad') {
+    const names = toolInput(tool)?.names;
+    const exactNames = Array.isArray(names) ? names
+      .filter((name): name is string => typeof name === 'string')
+      .map(name => name.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').trim())
+      .filter(Boolean) : [];
+    return `ToolLoad(${toolLoadPreview(exactNames)})`;
+  }
   if (!['TaskOutput', 'TaskGet', 'TaskStop'].includes(tool.name)) return tool.name || '';
   let result = tool.result ?? tool.output;
   if (typeof result === 'string') { try { result = JSON.parse(result); } catch { result = null; } }
@@ -310,6 +342,7 @@ export function buildTrace(messages: any[], loading = false): TraceRecord[] {
           const toolId = block.id || `${request.id}:${index}`;
           return [{ id: recordId(i, `tool:${toolId}`), kind: 'tool', toolId, role: 'tool', turn, step: 0,
             title: block.name || 'Tool call', input, requestId: request.id, request,
+            displayTitle: block.name === 'ToolLoad' ? toolDisplayTitle({ name: block.name, input }) : undefined,
             schema: request.tools?.find(tool => tool.name === block.name)?.input_schema,
             status: '未记录结果' }];
         });

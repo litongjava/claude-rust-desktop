@@ -9,7 +9,8 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::{self, Write};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub enum Outcome {
     Closed,
@@ -38,11 +39,7 @@ fn rows(lines: &[Line], width: usize, color: bool) -> Vec<Row> {
     for line in lines {
         let plain = change_view::plain(std::slice::from_ref(line));
         let plain = plain.trim_end_matches('\n');
-        let mut cells = 0;
-        for ch in plain.chars() {
-            cells += ch.width().unwrap_or(0);
-        }
-        if cells <= width {
+        if plain.width() <= width {
             rows.push(Row { styled: change_view::render(line, width, color), plain: plain.to_owned() });
             continue;
         }
@@ -57,14 +54,14 @@ fn rows(lines: &[Line], width: usize, color: bool) -> Vec<Row> {
         .min(width / 2);
         let mut current = String::new();
         let mut used = 0;
-        for ch in plain.chars() {
-            let size = ch.width().unwrap_or(0);
+        for grapheme in plain.graphemes(true) {
+            let size = grapheme.width();
             if used + size > width {
                 rows.push(Row { styled: change_view::render(&change_view::styled(&current, style), width, color), plain: std::mem::take(&mut current) });
                 current = " ".repeat(indent);
                 used = indent;
             }
-            current.push(ch);
+            current.push_str(grapheme);
             used += size;
         }
         rows.push(Row { styled: change_view::render(&change_view::styled(&current, style), width, color), plain: current });
@@ -573,13 +570,7 @@ fn draw(
 }
 
 fn clip(text: &str, width: usize) -> String {
-    let mut used = 0;
-    text.chars()
-        .take_while(|ch| {
-            used += ch.width().unwrap_or(0);
-            used <= width
-        })
-        .collect()
+    super::input::editor::clip_cells(text, width).to_owned()
 }
 
 /// `v`: the plain transcript in $VISUAL, $EDITOR or vi, then back to the pager.

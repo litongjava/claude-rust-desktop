@@ -102,7 +102,7 @@ async fn respond(
     let has = |name: &str| history.iter().any(|call| call == name);
     let framed = if !tools.iter().any(|tool| tool == "TaskInput") {
         vec![
-            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"death-search","type":"function","function":{"name":"ToolSearch","arguments":json!({"query":"select:TaskInput"}).to_string()}}]},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"death-search","type":"function","function":{"name":"ToolLoad","arguments":json!({"names":["TaskInput"]}).to_string()}}]},"finish_reason":null}]}),
             json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
         ]
     } else if !has("Bash") {
