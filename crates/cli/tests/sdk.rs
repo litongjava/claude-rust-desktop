@@ -2502,7 +2502,7 @@ SKILL_SENTINEL",
                 json!({"agents":{"sdk-child":{
                     "description":"SDK_CHILD_DESCRIPTION",
                     "prompt":"SDK_CHILD_PROMPT_SENTINEL",
-                    "skills":["sdk-skill"],
+                    "skills":["sdk-skill", "task-template"],
                     "memory":"user",
                     "effort":"high",
                     "permissionMode":"acceptEdits",
@@ -2523,6 +2523,9 @@ SKILL_SENTINEL",
         for sentinel in [
             "SDK_CHILD_PROMPT_SENTINEL",
             "SKILL_SENTINEL",
+            "# Preloaded skill: task-template",
+            "**Exact change**",
+            "requirement → evidence → unverified",
             "MEMORY_SENTINEL",
             "REMINDER_SENTINEL",
         ] {
