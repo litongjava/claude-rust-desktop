@@ -325,3 +325,194 @@ async fn teammate_idle_hook_receives_identity_and_blocking_feedback_resumes_the_
     assert!(teams::delete(&root, &parent).unwrap().success);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
+    use crate::services::compaction;
+    use axum::Json;
+
+    enable_teams();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let parent = uuid::Uuid::new_v4().to_string();
+    let (executor, context) = executor(temp.path(), &parent, endpoint).await;
+    let mut executor = executor.with_goal_state(context.db.clone());
+    let store = SessionStore::new(context.db.clone());
+    store
+        .append(&parent, "user", "scope-secret-parent")
+        .unwrap();
+    store.append(&parent, "assistant", "parent reply").unwrap();
+    let compact = |session: &str| {
+        let prepared = compaction::prepare(&store.db, session).unwrap();
+        compaction::commit(&store.db, prepared, "Summary omits the marker")
+            .unwrap()
+            .message_id
+    };
+    let parent_boundary = compact(&parent);
+    let foreign = parent_boundary.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            let foreign = foreign.clone();
+            async move {
+                let messages = body["messages"].as_array().unwrap();
+                let (index, label) = messages.iter().enumerate().rev()
+                    .filter(|(_, m)| m["role"] == "user")
+                    .find_map(|(index, m)| {
+                        let text = m["content"].as_str()?;
+                        ["Agent probe", "Team probe", "Resume team"].into_iter()
+                            .find(|label| text.contains(label))
+                            .map(|label| (index, label))
+                    }).expect("child probe prompt");
+                let outputs: Vec<_> = messages[index + 1..].iter()
+                    .filter(|m| m["role"] == "tool")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let loaded = body["tools"].as_array().unwrap().iter()
+                    .any(|tool| tool["function"]["name"] == "ContextSearch");
+                let searches: Vec<_> = outputs.iter().copied()
+                    .filter(|output| !output.contains("\"loaded_tools\""))
+                    .collect();
+                let call = match searches.len() {
+                    0 if !loaded && outputs.is_empty() => Some(("load", "ToolSearch", json!({"query":"select:ContextSearch"}))),
+                    0 => Some(("own", "ContextSearch", json!({"query":"scope-secret-","role":"user"}))),
+                    1 => Some(("foreign", "ContextSearch", json!({"query":"scope-secret-","range":"before","boundary_id":foreign}))),
+                    _ => {
+                        captured.lock().unwrap().push((
+                            label,
+                            searches.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                        ));
+                        None
+                    }
+                };
+                let response = if let Some((id, name, input)) = call {
+                    let id = format!("{}-{id}", label.replace(' ', "-"));
+                    let delta = json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                        "index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}
+                    }]},"finish_reason":null}]});
+                    let end = json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+                    format!("data: {delta}\n\ndata: {end}\n\ndata: [DONE]\n\n")
+                } else {
+                    completion()
+                };
+                ([("content-type", "text/event-stream")], response)
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let agent = executor
+        .execute_delegated(&json!({
+            "prompt":"Agent probe scope-secret-agent","run_in_background":false
+        }))
+        .await
+        .unwrap();
+    let agent_id = agent["session_id"].as_str().unwrap();
+    let root = context.paths.data_dir.as_path();
+    teams::create(
+        root,
+        &parent,
+        "fixture",
+        None,
+        None,
+        None,
+        Path::new(&executor.workspace_cwd),
+    )
+    .unwrap();
+    let team = executor.execute_team_spawn(&json!({
+        "team_name":"fixture","members":[{"name":"alpha","prompt":"Team probe scope-secret-team"}]
+    })).await.unwrap();
+    assert_eq!(team["members"][0]["status"], "completed", "{team}");
+    let team_id = team["members"][0]["session_id"].as_str().unwrap();
+    let boundaries = [compact(agent_id), compact(team_id)];
+    executor
+        .resume_owned_child(
+            team_id,
+            Some("Resume team without the original words"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    for (label, outputs) in seen.iter() {
+        let own: Value = serde_json::from_str(&outputs[0]).unwrap();
+        let hits = own["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{label}: {own}");
+        let marker = if *label == "Agent probe" {
+            "scope-secret-agent"
+        } else {
+            "scope-secret-team"
+        };
+        assert!(
+            hits[0]["excerpt"].as_str().unwrap().contains(marker),
+            "{label}: {own}"
+        );
+        assert!(
+            outputs[1].contains("Unknown compaction boundary in this session"),
+            "{outputs:?}"
+        );
+        if *label == "Resume team" {
+            assert_eq!(own["boundary_id"], boundaries[1]);
+        }
+    }
+    drop(seen);
+
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "ToolSearch",
+            &json!({"query":"select:ContextSearch"}),
+            "load-parent",
+        )
+        .await;
+    assert!(!failed && output.contains("ContextSearch"));
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "ContextSearch",
+            &json!({"query":"scope-secret-","role":"user"}),
+            "parent-own",
+        )
+        .await;
+    assert!(!failed, "{output}");
+    let result: Value = serde_json::from_str(&output).unwrap();
+    let hits = result["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["excerpt"], "scope-secret-parent");
+    for boundary in boundaries {
+        let (_, output, failed) = executor
+            .execute_tool_call(
+                "ContextSearch",
+                &json!({"query":"scope-secret-","range":"before","boundary_id":boundary}),
+                "parent-foreign",
+            )
+            .await;
+        assert!(
+            failed && output.contains("Unknown compaction boundary in this session"),
+            "{output}"
+        );
+    }
+
+    let mut restricted = executor
+        .prepare_delegated_child(
+            &json!({"prompt":"Restricted child","agent_type":"general"}),
+            None,
+            Some(vec!["Read".into()]),
+            None,
+        )
+        .await
+        .unwrap();
+    let (_, output, failed) = restricted
+        .child
+        .execute_tool_call("ContextSearch", &json!({"query":"scope-secret-"}), "denied")
+        .await;
+    assert!(
+        failed && output.contains("not allowed for this agent"),
+        "{output}"
+    );
+    server.abort();
+}

@@ -254,6 +254,7 @@ pub struct ToolLoopExecutor {
     /// with them by the host. Never re-queried while a request is sent: the
     /// stored latest boundary may already describe a different transcript.
     context_boundary_id: Option<String>,
+    applied_compaction: bool,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -313,6 +314,7 @@ pub struct ToolLoopExecutor {
     stop_hook_active: bool,
     stop_hook_blocks: u64,
     goal_db: Option<Arc<crate::db::DbManager>>,
+    transcript_db: Option<Arc<crate::db::DbManager>>,
     skill_shell_active: bool,
     /// Deep-research children read pages as text: their quotes are checked
     /// against the fetched source, not against a model's answer about it.
@@ -558,7 +560,7 @@ impl Drop for PermissionWaiterGuard {
 #[path = "model_tool_output.rs"]
 mod model_output;
 
-fn model_tool_output(tool_name: &str, output: &str) -> String {
+pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
 }
 
@@ -1492,6 +1494,7 @@ impl ToolLoopExecutor {
             provider,
             messages,
             context_boundary_id: None,
+            applied_compaction: false,
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -1539,6 +1542,7 @@ impl ToolLoopExecutor {
             stop_hook_active: false,
             stop_hook_blocks: 0,
             goal_db: None,
+            transcript_db: None,
             skill_shell_active: false,
             raw_web_fetch: false,
             pending_user_skill: None,
@@ -1597,6 +1601,19 @@ impl ToolLoopExecutor {
 
     pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
         self.goal_db = Some(db);
+        // Session-backed tools enter the catalog once storage is bound.
+        self.builtin_names.take();
+        self
+    }
+
+    fn with_transcript_db(mut self, db: Arc<crate::db::DbManager>) -> Self {
+        self.transcript_db = Some(db);
+        self.builtin_names.take();
+        self
+    }
+
+    pub(super) fn with_applied_compaction(mut self, applied: bool) -> Self {
+        self.applied_compaction = applied;
         self
     }
 
@@ -2273,6 +2290,11 @@ impl ToolLoopExecutor {
         let exposed: std::collections::HashSet<String> =
             prepared.iter().map(|tool| tool.name.clone()).collect();
         let mut lines = vec!["# Tool directory".to_string()];
+        let context_search = crate::tools::context_search::NAME;
+        let compacted = self.applied_compaction;
+        if compacted && exposed.contains(context_search) && self.session_search_storage().is_some() {
+            lines.push("After compaction, use ContextSearch to recover exact details omitted from the summary.".into());
+        }
         // Whether discovery is actually callable comes from the definitions
         // sent with this request, not from the user's switches.
         if !exposed.contains("ToolSearch") {
@@ -2283,6 +2305,9 @@ impl ToolLoopExecutor {
             return lines.join("\n");
         }
         let mut tools = self.searchable_tool_catalog(customization, catalog, &exposed);
+        if compacted && tools.iter().any(|tool| tool.name == context_search) {
+            lines.push("After compaction, load ContextSearch with ToolSearch to recover exact details omitted from the summary.".into());
+        }
         tools.sort_by(|a, b| {
             a.name
                 .to_ascii_lowercase()
@@ -2942,6 +2967,7 @@ impl ToolLoopExecutor {
 
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
         self.conv_id = Some(conv_id);
+        self.builtin_names.take();
         self
     }
 
@@ -3274,6 +3300,9 @@ impl ToolLoopExecutor {
     /// policy and before MCP or the user's own tools are added.
     fn builtin_catalog(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
+        if self.session_search_storage().is_none() {
+            tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
+        }
         if !self.goal_proposals_available() {
             tools.retain(|tool| tool.name != "ProposeGoal");
         }
@@ -3510,6 +3539,10 @@ impl ToolLoopExecutor {
             && self.subagent_hook_context.is_none()
             && self.goal_db.is_some()
             && self.conv_id.is_some()
+    }
+
+    fn session_search_storage(&self) -> Option<(&Arc<crate::db::DbManager>, &str)> {
+        self.transcript_db.as_ref().or(self.goal_db.as_ref()).zip(self.conv_id.as_deref())
     }
 
     pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
@@ -3836,6 +3869,7 @@ impl ToolLoopExecutor {
             // The reset transcript was built from this boundary, so later
             // requests must report it rather than any newer stored boundary.
             self.context_boundary_id = Some(boundary_id.clone());
+            self.applied_compaction = true;
             self.stop_hook_active = false;
             let _ = self
                 .event_tx
@@ -4816,6 +4850,27 @@ impl ToolLoopExecutor {
 
         if tool_name == "ToolSearch" {
             return CallStep::Finished(self.execute_tool_search(tool_input).await);
+        }
+
+        if tool_name == crate::tools::context_search::NAME {
+            let result = match self.session_search_storage() {
+                Some((db, session)) => {
+                    let (db, session, input) = (db.clone(), session.to_owned(), tool_input.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::tools::context_search::execute(&db, &session, input)
+                    })
+                    .await
+                    .context("ContextSearch could not finish")
+                    .and_then(|result| result)
+                }
+                None => Err(anyhow!("ContextSearch requires a stored session")),
+            };
+            let failed = result.is_err();
+            return CallStep::Finished((
+                tool_input.clone(),
+                result.unwrap_or_else(|error| format!("Error: {error}")),
+                failed,
+            ));
         }
 
         if tool_name == "Workflow" {
@@ -6049,6 +6104,7 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
                     self.context_boundary_id = Some(boundary_id.clone());
+                    self.applied_compaction = true;
                     conversation_messages = vec![AnthropicMessage {
                         role: "user".into(),
                         content: AnthropicContent::Text(content),
@@ -7000,6 +7056,7 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
                     self.context_boundary_id = Some(boundary_id.clone());
+                    self.applied_compaction = true;
                     conversation_messages = vec![OpenAIMessage {
                         role: "user".into(),
                         content: OpenAIContent::Text(content),

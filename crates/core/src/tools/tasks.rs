@@ -319,7 +319,7 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     )
     .ok()?;
     conn.query_row(
-        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC LIMIT 1",
+        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC, rowid DESC LIMIT 1",
         [&execution],
         |row| row.get(0),
     )

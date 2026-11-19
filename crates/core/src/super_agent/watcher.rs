@@ -803,7 +803,7 @@ impl PendingTool {
 }
 fn pending_tools(host: &Orchestrator, session: &str) -> Result<Vec<PendingTool>> {
     let rows = host.context.db.with_conn(|conn| -> Result<Vec<(String,String,Option<String>)>> {
-        let mut stmt = conn.prepare("SELECT t.id,t.name,t.input FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.output IS NULL ORDER BY m.sort_order,t.sort_order")?;
+        let mut stmt = conn.prepare("SELECT t.id,t.name,t.input FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.output IS NULL ORDER BY m.sort_order,m.rowid,t.sort_order,t.rowid")?;
         let rows = stmt.query_map([session], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })??;

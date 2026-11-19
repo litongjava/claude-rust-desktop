@@ -1,3 +1,5 @@
+mod context_search_index;
+pub(crate) mod context_search_repo;
 pub mod conversation_repo;
 pub mod diff_repo;
 pub mod h5_repo;
@@ -228,6 +230,7 @@ impl DbManager {
 
             let result: Result<()> = (|| {
                 conn.execute_batch(schema::SCHEMA_SQL)?;
+                context_search_index::migrate(conn)?;
                 crate::services::migrate(conn)?;
                 crate::services::input_queue::migrate(conn)?;
                 conversation_repo::migrate_workspace_mode(conn)?;
