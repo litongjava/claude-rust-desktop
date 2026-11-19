@@ -41,17 +41,8 @@ display_height = 1080
 # MemEx (memory extraction service) backend URL.
 memex_backend_url = "http://127.0.0.1:8765"
 
-# Minimum auto-importance score for automatic memory ingestion (0.0–1.0).
-auto_ingest_importance_threshold = 0.5
-
 # Whether the memory subsystem is enabled by default.
 enabled = true
-
-# Whether to automatically search memory before each user turn.
-auto_search = true
-
-# Whether to automatically ingest important facts after each turn.
-auto_ingest = true
 
 [bridge]
 # Internal bridge server port (connects webview ↔ native engine).

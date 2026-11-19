@@ -3920,37 +3920,6 @@ impl ToolLoopExecutor {
             });
         }
 
-        // Like the reference CLI, recalled memories follow the user message
-        // they were recalled for and stay there on later turns; a hook wake or
-        // a second run for the same message recalls nothing new.
-        let recall_target = crate::services::turn_context::for_last(&self.messages, Vec::new());
-        let recalled_before = recall_target.as_ref().is_some_and(|target| {
-            self.turn_context.iter().any(|entry| {
-                entry.key == target.key
-                    && entry.occurrence == target.occurrence
-                    && entry
-                        .blocks
-                        .iter()
-                        .any(|block| block.contains(crate::memory::RECALL_LEAD_IN))
-            })
-        });
-        if let (Some(ctx_mgr), false, false) = (
-            &self.context_manager,
-            self.require_hook_wake,
-            recalled_before,
-        ) {
-            tracing::info!(module = "ToolLoop", "[E4] Injecting memory context...");
-            if let Some(memory_context) = ctx_mgr.before_api_call(&conv_id, &last_user_msg).await {
-                if let Err(error) = self.attach_turn_context(vec![memory_context]) {
-                    tracing::warn!(
-                        module = "ToolLoop",
-                        "Recalled memories were not saved for later turns: {error:#}"
-                    );
-                }
-            }
-        }
-        tracing::info!(module = "ToolLoop", "[E4] Memory injection COMPLETED");
-
         // 模型特定的检查和二次压缩
         tracing::info!(module = "ToolLoop", "[E4.5] Model-specific token check...");
         let model_id = &self.provider.model.id;
@@ -4091,27 +4060,6 @@ impl ToolLoopExecutor {
                     "[E6] API loop COMPLETED, full_text_len={}",
                     full_text.len()
                 );
-                // Persist before announcing completion so the next session can recall this turn.
-                if !matches!(
-                    stop_reason.as_deref(),
-                    Some(
-                        "stream_error"
-                            | "error"
-                            | "interrupted"
-                            | "failed"
-                            | "cancelled"
-                            | "max_iterations"
-                            | "max_tokens"
-                            | "length"
-                            | "incomplete"
-                    )
-                ) {
-                    if let Some(ctx_mgr) = &self.context_manager {
-                        ctx_mgr
-                            .after_response(&conv_id, &last_user_msg, full_text)
-                            .await;
-                    }
-                }
                 let _ = self
                     .event_tx
                     .send(EngineEvent::MessageStop {
