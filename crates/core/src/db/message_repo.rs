@@ -270,7 +270,7 @@ pub fn get_messages_by_conversation(
     conversation_id: &str,
 ) -> Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, conversation_id, role, content, thinking, created_at, is_compact_boundary, sort_order FROM messages WHERE conversation_id = ?1 ORDER BY sort_order ASC"
+        "SELECT id, conversation_id, role, content, thinking, created_at, is_compact_boundary, sort_order FROM messages WHERE conversation_id = ?1 ORDER BY sort_order ASC, rowid ASC"
     )?;
     let rows = stmt.query_map(params![conversation_id], |row| row_to_message(row))?;
     let mut result = Vec::new();
@@ -310,7 +310,7 @@ pub fn delete_messages_from(
 
 pub fn delete_messages_tail(conn: &Connection, conversation_id: &str, count: i64) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "DELETE FROM messages WHERE conversation_id = ?1 AND sort_order >= (SELECT MIN(sort_order) FROM (SELECT sort_order FROM messages WHERE conversation_id = ?1 ORDER BY sort_order DESC LIMIT ?2))"
+        "DELETE FROM messages WHERE conversation_id = ?1 AND sort_order >= (SELECT MIN(sort_order) FROM (SELECT sort_order FROM messages WHERE conversation_id = ?1 ORDER BY sort_order DESC, rowid DESC LIMIT ?2))"
     )?;
     stmt.execute(params![conversation_id, count])?;
     Ok(())
@@ -358,7 +358,7 @@ pub fn tool_call_note(conn: &Connection, tool_call_id: &str) -> Result<Option<St
 
 pub fn get_tool_calls_for_message(conn: &Connection, message_id: &str) -> Result<Vec<ToolCallRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, message_id, name, input, output, is_error, sort_order FROM tool_calls WHERE message_id = ?1 ORDER BY sort_order ASC"
+        "SELECT id, message_id, name, input, output, is_error, sort_order FROM tool_calls WHERE message_id = ?1 ORDER BY sort_order ASC, rowid ASC"
     )?;
     let rows = stmt.query_map(params![message_id], |row| {
         Ok(ToolCallRow {

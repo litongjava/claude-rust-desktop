@@ -654,6 +654,7 @@ impl PermissionManager {
                 | "ToolLoad"
                 | "ProposeGoal"
                 | "CompactContext"
+                | "ContextSearch"
                 | "EnterPlanMode"
                 | "ExitPlanMode"
                 | "brief"
