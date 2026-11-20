@@ -189,6 +189,9 @@ CREATE TABLE child_invocations(attempt_key TEXT PRIMARY KEY, parent_message TEXT
 CREATE TRIGGER remove_occurrence_output AFTER DELETE ON tool_calls BEGIN
  DELETE FROM mcp_tool_outputs WHERE tool_use_id=OLD.id;
 END;
-CREATE TABLE delivery_generations(delivery_id TEXT PRIMARY KEY REFERENCES delivery_receipts(delivery_id), turn_id TEXT UNIQUE);
+CREATE TABLE delivery_generations(
+    delivery_id TEXT PRIMARY KEY REFERENCES delivery_receipts(delivery_id), turn_id TEXT UNIQUE,
+    FOREIGN KEY(delivery_id) REFERENCES messages(id) ON DELETE CASCADE
+);
 CREATE TABLE compaction_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), local_count INTEGER NOT NULL DEFAULT 0);
 INSERT INTO compaction_state(singleton) VALUES(1);

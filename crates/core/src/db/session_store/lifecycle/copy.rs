@@ -200,10 +200,15 @@ impl Copier<'_> {
             }
             for &(col, kind) in links {
                 let old: String = row.get(idx(col)?)?;
-                values[idx(col)?] = Value::Text(
+                // A nested occurrence can arrive ahead of its parent's stream event.
+                // Reserve the missing parent's identity so replay still excludes the child.
+                let new = if table == "tool_call_origins" {
+                    self.assign(kind, &old)?
+                } else {
                     self.mapped(kind, &old)?
-                        .context("Unselected copy reference")?,
-                );
+                        .context("Unselected copy reference")?
+                };
+                values[idx(col)?] = Value::Text(new);
             }
             if let Ok(i) = idx("conversation_id") {
                 values[i] = Value::Text(self.id.into())

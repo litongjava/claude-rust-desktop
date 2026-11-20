@@ -596,3 +596,35 @@ fn projections_only_advance_and_identical_snapshots_leave_both_revisions_alone()
     );
     Ok(())
 }
+
+#[test]
+fn rewind_retires_undispatched_generation_and_fork_keeps_early_nested_origin() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let a = stores.create(A, Default::default())?;
+    a.enqueue("request", &json!("withdrawn"), QueueMode::NextTurn)?;
+    let mut owner = a.delivery_owner()?;
+    let effect = owner.next_queue(QueueMode::NextTurn, None)?.unwrap();
+    a.write(|w| w.rewind_from(&effect.id))?;
+    assert!(owner.begin_generation()?.is_none());
+    assert_eq!(a.read(|r| r.receipt_count())?, 1);
+    drop(owner);
+    a.write(|w| {
+        let m = w.append("assistant", "parent still streaming")?;
+        w.tool(&tool("child", &m, 1), Some(("late-parent", 5)))
+    })?;
+    let fork = a.branch(B, Branch::Full)?;
+    fork.read(|r| {
+        let m = &r.messages()?[0].id;
+        let origins = r.origins(m)?;
+        assert_eq!(origins.len(), 1);
+        assert_ne!(origins[0].1, "late-parent");
+        let history = r
+            .model_history(
+                &deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic,
+            )?
+            .0;
+        assert!(!serde_json::to_string(&history)?.contains(&origins[0].0));
+        Ok(())
+    })
+}
