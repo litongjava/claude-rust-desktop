@@ -689,11 +689,11 @@ fn subprocess() -> Result<()> {
             assert_eq!(r.initial_message()?, Some(first_message()));
             hold()
         })?,
-        "before-seal" | "installed" => {
-            let phase = if mode == "before-seal" {
-                Phase::BeforeSeal
-            } else {
-                Phase::Installed
+        "before-seal" | "sealed-wal" | "installed" => {
+            let phase = match mode.as_str() {
+                "before-seal" => Phase::BeforeSeal,
+                "sealed-wal" => Phase::Sealed,
+                _ => Phase::Installed,
             };
             s.with_fault_hook(move |at| {
                 if at == phase {
@@ -737,7 +737,7 @@ fn simultaneous_processes_bootstrap_and_race_create() {
 
 #[test]
 fn killing_writer_releases_lock_and_replays_only_sealed_work() {
-    for mode in ["before-seal", "installed"] {
+    for mode in ["before-seal", "sealed-wal", "installed"] {
         let tmp = tempdir().unwrap();
         let mut child = Worker::start(tmp.path(), mode);
         wait_file(&tmp.path().join("ready"));
@@ -751,6 +751,15 @@ fn killing_writer_releases_lock_and_replays_only_sealed_work() {
             query::<i64>(&global(tmp.path()), "SELECT count(*) FROM conversations"),
             0
         );
+        if mode == "sealed-wal" {
+            let stage = fs::read_dir(tmp.path().join("sessions/.staging"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert!(fs::metadata(stage.join("session.db-wal")).unwrap().len() > 32);
+        }
         child.kill_and_wait();
         let s = Stores::open_for_test(tmp.path()).unwrap();
         assert_eq!(pending(tmp.path()), 0);

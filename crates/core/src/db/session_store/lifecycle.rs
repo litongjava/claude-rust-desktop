@@ -254,7 +254,7 @@ impl Stores {
         self.step(Phase::StageDirectory)?;
         {
             let _permit = Permits::take(1);
-            layout::initialize(&stage.join("session.db"), SESSION, |tx| {
+            let sealed = layout::initialize(&stage.join("session.db"), SESSION, |tx| {
                 let n = i64::from(options.first_message.is_some());
                 tx.execute(
                     "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,?5,?5,?6,?6,NULL)",
@@ -274,6 +274,7 @@ impl Stores {
                 self.step(Phase::BeforeSeal)
             })?;
             self.step(Phase::Sealed)?;
+            sealed.close().map_err(|(_, e)| e)?;
         }
         self.publish(&op, &meta, &stage)?;
         Ok(SessionDb {

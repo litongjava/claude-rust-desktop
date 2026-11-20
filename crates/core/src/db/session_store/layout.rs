@@ -144,7 +144,7 @@ pub(super) fn initialize(
     path: &Path,
     kind: i32,
     populate: impl FnOnce(&Connection) -> Result<()>,
-) -> Result<()> {
+) -> Result<Connection> {
     File::create_new(path)?;
     let mut conn = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.execute_batch("PRAGMA journal_mode=WAL")?;
@@ -161,7 +161,7 @@ pub(super) fn initialize(
     })?;
     populate(&tx)?;
     tx.commit()?;
-    Ok(())
+    Ok(conn)
 }
 
 pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
