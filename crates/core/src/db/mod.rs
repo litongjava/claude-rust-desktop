@@ -19,6 +19,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Starts a transaction that takes the write lock up front.
 ///
@@ -104,28 +105,53 @@ fn deadline_text(deadline: std::time::Duration) -> String {
     }
 }
 
-/// Retries a write transaction on transient SQLite contention.
+/// Restores a pooled connection's own `busy_timeout` on every exit path.
 ///
-/// The closure runs inside one IMMEDIATE transaction and must be re-runnable:
-/// every retry rolls back and calls it again from the start. Only contention
-/// is retried; any other error returns immediately.
-pub fn write_tx<T>(
+/// `DbManager` lends shared connections. Lowering the timeout for one bounded
+/// poll must not leak into the next borrower, including when the poll unwinds.
+pub(crate) struct BusyTimeoutGuard<'a> {
+    conn: &'a Connection,
+    original_ms: u64,
+}
+
+impl<'a> BusyTimeoutGuard<'a> {
+    fn capture(conn: &'a Connection) -> Result<Self> {
+        let original_ms = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        Ok(Self { conn, original_ms })
+    }
+
+    pub(crate) fn within(conn: &'a Connection, wait: std::time::Duration) -> Result<Self> {
+        let guard = Self::capture(conn)?;
+        conn.busy_timeout(wait)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for BusyTimeoutGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(self.original_ms));
+    }
+}
+
+/// Bound SQLite's lock acquisition and the time between retries by one deadline.
+/// The caller may finish uncontended work after it has acquired the writer.
+fn retry_contention<T>(
     conn: &Connection,
     label: &str,
-    deadline: std::time::Duration,
-    mut f: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T>,
+    deadline: Duration,
+    mut attempt: impl FnMut(Instant) -> Result<T>,
 ) -> Result<T> {
-    let started = std::time::Instant::now();
-    let mut attempts: u32 = 1;
+    let started = Instant::now();
+    let until = started + deadline;
+    let timeout = BusyTimeoutGuard::capture(conn)?;
+    let original = Duration::from_millis(timeout.original_ms);
+    let mut attempts = 0;
     loop {
-        // Opening the transaction can itself hit SQLITE_BUSY, and so can COMMIT.
-        let outcome = (|| -> Result<T> {
-            let tx = write_transaction(conn)?;
-            let value = f(&tx)?;
-            tx.commit()?;
-            Ok(value)
-        })();
-        match outcome {
+        conn.busy_timeout(original.min(until.saturating_duration_since(Instant::now()) / 2))?;
+        attempts += 1;
+        match attempt(until) {
             Ok(value) => {
                 if attempts > 1 {
                     tracing::warn!(
@@ -139,28 +165,76 @@ pub fn write_tx<T>(
                 return Ok(value);
             }
             Err(error) if is_contention(&error) => {
-                let elapsed = started.elapsed();
-                if elapsed >= deadline {
+                let remaining = until.saturating_duration_since(Instant::now());
+                // Leave room for another probe when SQLite returned BUSY immediately.
+                let wait = write_tx_backoff(attempts)
+                    .min((remaining / 2).max(Duration::from_millis(1)))
+                    .min(remaining);
+                if !wait.is_zero() {
+                    tracing::warn!(
+                        module = "db",
+                        label,
+                        attempts,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "write transaction hit database contention; retrying"
+                    );
+                    std::thread::sleep(wait);
+                }
+                if Instant::now() >= until {
                     return Err(error.context(format!(
-                        "{label}: database busy, {attempts} attempts over {}ms",
-                        elapsed.as_millis()
+                        "{label}: database stayed locked by another DeepSeek Code process for {} ({attempts} attempts)",
+                        deadline_text(deadline)
                     )));
                 }
-                let wait = write_tx_backoff(attempts);
-                tracing::warn!(
-                    module = "db",
-                    label,
-                    attempts,
-                    waited_ms = elapsed.as_millis() as u64,
-                    retry_in_ms = wait.as_millis() as u64,
-                    "write transaction hit database contention; retrying"
-                );
-                std::thread::sleep(wait);
-                attempts += 1;
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+// SQLite may wake up and acquire the lock after its last timed sleep.
+fn check_acquisition(until: Instant) -> rusqlite::Result<()> {
+    if Instant::now() >= until {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Each attempt owns one IMMEDIATE transaction. Both the body and commit
+/// must be replayable after rollback on SQLite contention.
+pub fn write_tx<T>(
+    conn: &Connection,
+    label: &str,
+    deadline: Duration,
+    mut f: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    write_tx_with_commit(conn, label, deadline, |tx| {
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    })
+}
+
+/// For callers that must hold their own locks across commit and publication.
+pub(crate) fn write_tx_with_commit<T>(
+    conn: &Connection,
+    label: &str,
+    deadline: Duration,
+    mut finish: impl FnMut(rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    retry_contention(conn, label, deadline, |until| {
+        let tx = write_transaction(conn)?;
+        check_acquisition(until)?;
+        // Once we own the writer, a later BUSY (including COMMIT) must
+        // return to the retry loop. A fresh SQLite wait here could use up
+        // the budget a second time after a long transaction body.
+        conn.busy_timeout(Duration::ZERO)?;
+        finish(tx)
+    })
 }
 
 pub struct DbManager {
@@ -208,25 +282,13 @@ impl DbManager {
             .idle_timeout(Some(std::time::Duration::from_secs(30)))
             .build(manager)?;
         let conn = pool.get()?;
-        // journal_mode can report SQLITE_BUSY immediately during first-open races,
-        // even with busy_timeout. Retry only this idempotent initialization step.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-            ) {
-                Ok(()) => break,
-                Err(rusqlite::Error::SqliteFailure(error, _))
-                    if matches!(
-                        error.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
+        // SQLite requires journal mode changes outside a transaction.
+        retry_contention(&conn, "enabling WAL", STARTUP_WRITE_DEADLINE, |until| {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+            check_acquisition(until)?;
+            Ok(())
+        })?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
         Ok(Self {
             pool,
             data_dir: path
@@ -249,8 +311,6 @@ impl DbManager {
     /// after rolling back a contended attempt.
     fn init_with_deadline(&self, deadline: std::time::Duration) -> Result<()> {
         self.with_conn(|conn| -> Result<()> {
-            // A single attempt must not outlive the deadline that bounds all attempts.
-            conn.busy_timeout(deadline.min(std::time::Duration::from_secs(5)))?;
             write_tx(conn, "schema init", deadline, |tx| {
                 tx.execute_batch(schema::SCHEMA_SQL)?;
                 context_search_index::migrate(tx)?;
@@ -342,16 +402,6 @@ impl DbManager {
                 }
 
                 Ok(())
-            })
-            .map_err(|error| {
-                if is_contention(&error) {
-                    error.context(format!(
-                        "database stayed locked by another DeepSeek Code process for {}",
-                        deadline_text(deadline)
-                    ))
-                } else {
-                    error
-                }
             })
         })?
     }
@@ -613,6 +663,100 @@ mod write_tx_tests {
         assert!(elapsed < Duration::from_secs(5), "returned after {elapsed:?}");
         release.send(()).unwrap();
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn commit_contention_uses_only_the_remaining_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reader.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("CREATE TABLE items(x)").unwrap();
+        let reader = Connection::open(&path).unwrap();
+        // In DELETE mode a reader permits BEGIN IMMEDIATE but blocks COMMIT.
+        reader.execute_batch("BEGIN; SELECT * FROM items").unwrap();
+        let slow_write = |tx: &rusqlite::Transaction<'_>| -> Result<()> {
+            tx.execute("INSERT INTO items VALUES(1)", [])?;
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        };
+        let budget = Duration::from_millis(100);
+        writer.busy_timeout(Duration::from_secs(4)).unwrap();
+        let started = Instant::now();
+        let error = write_tx(&writer, "commit probe", budget, slow_write).unwrap_err();
+        assert!(is_contention(&error));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        reader.execute_batch("ROLLBACK").unwrap();
+        // A long transaction body can finish normally when COMMIT is uncontended.
+        write_tx(&writer, "commit probe", budget, slow_write).unwrap();
+        assert_eq!(
+            writer
+                .query_row("SELECT count(*) FROM items", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writer_release_on_either_side_of_deadline_restores_busy_timeout() {
+        let (_temp, db, path) = fixture();
+        let deadline = Duration::from_millis(800);
+        for (delay, should_succeed) in [(700, true), (900, false)] {
+            db.with_conn(|conn| {
+                conn.busy_timeout(Duration::from_millis(2345)).unwrap();
+                let (holder, release) = hold_write_lock(path.clone());
+                let releaser =
+                    test_support::release_after(release, holder, Duration::from_millis(delay));
+                let result = write_tx(conn, "deadline edge", deadline, |tx| {
+                    tx.execute("INSERT INTO items VALUES(1)", [])?;
+                    Ok(())
+                });
+                releaser.join().unwrap();
+                let timeout: u64 = conn
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(timeout, 2345);
+                if should_succeed {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(sqlite_extended_code(&error), Some(5));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("locked by another DeepSeek Code process"),
+                        "{error:#}"
+                    );
+                }
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            db.with_conn(
+                |conn| conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, u32>(0))
+            )
+            .unwrap()
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn first_open_waits_for_writer_in_default_journal_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cold.sqlite");
+        let journal = |conn: &Connection| {
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        };
+        assert_eq!(
+            journal(&Connection::open(&path).unwrap()).unwrap(),
+            "delete"
+        );
+        let (holder, release) = hold_write_lock(path.clone());
+        let releaser = test_support::release_after(release, holder, Duration::from_secs(6));
+        let db = DbManager::new(path).unwrap();
+        db.init().unwrap();
+        assert_eq!(db.with_conn(journal).unwrap().unwrap(), "wal");
+        releaser.join().unwrap();
     }
 
     #[test]

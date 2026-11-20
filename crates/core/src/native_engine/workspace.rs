@@ -212,7 +212,24 @@ pub fn resolve_workspace(
     ensure!(directory.starts_with(&root) && directory != root, "Conversation workspace is outside the application workspace directory");
     if private_owner.is_some() { ensure!(directory == expected, "Private workspace owner path is redirected"); }
     if conversation.is_some() {
-        conn.execute("UPDATE conversations SET workspace_path = ?1 WHERE id = ?2", params![directory.to_string_lossy(), id])?;
+        let persist = |connection: &Connection| -> Result<()> {
+            connection.execute(
+                "UPDATE conversations SET workspace_path = ?1 WHERE id = ?2",
+                params![directory.to_string_lossy(), id],
+            )?;
+            Ok(())
+        };
+        if conn.is_autocommit() {
+            crate::db::write_tx(
+                conn,
+                "private session workspace",
+                crate::db::STARTUP_WRITE_DEADLINE,
+                |tx| persist(tx),
+            )
+            .context("Saving private session workspace")?;
+        } else {
+            persist(conn)?;
+        }
     }
     Ok((directory, None))
 }
@@ -228,6 +245,49 @@ mod tests {
         conversation_repo::insert_conversation(&conn, "session", None, None, None, Some("."), None, false, false, false, "now", "now", 0).unwrap();
         conversation_repo::set_workspace_mode(&conn, "session", mode).unwrap();
         (conn, tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn projectless_code_resume_waits_for_another_writer() {
+        use crate::{
+            db::test_support,
+            runtime::{RuntimePaths, SessionStore, DATABASE_FILE},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
+                    [&id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join(DATABASE_FILE));
+        let releaser =
+            test_support::release_after(release, holder, std::time::Duration::from_secs(6));
+        let private = store
+            .workspace(&id, &paths.data_dir.join("workspaces"))
+            .unwrap();
+        releaser.join().unwrap();
+        assert_eq!(
+            private,
+            paths
+                .data_dir
+                .join("workspaces")
+                .join(&id)
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            store.resume(&id).unwrap().workspace_path.as_deref(),
+            private.to_str()
+        );
     }
 
     #[test]

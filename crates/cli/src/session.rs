@@ -4929,3 +4929,7 @@ mod request_usage_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "startup_contention_tests.rs"]
+mod startup_contention_tests;
