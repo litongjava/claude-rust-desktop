@@ -426,7 +426,9 @@ impl ToolLoopExecutor {
                     },
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
                         self.sync_parent_permission_mode();
-                        if !local_fetch && self.permission_manager.as_ref().is_some_and(|manager| manager.get_mode() == crate::permissions::PermissionMode::BypassPermissions) {
+                        // Bypass grants this call like any other, including a
+                        // local WebFetch after the mode changed mid-prompt.
+                        if self.permission_manager.as_ref().is_some_and(|manager| manager.get_mode() == crate::permissions::PermissionMode::BypassPermissions) {
                             granted_by_mode = true;
                             break Ok(PermissionResponse::Allow { updated_input: None, commit: None, note: None });
                         }

@@ -258,7 +258,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebFetch".to_string(),
-            description: "Read a web page and answer prompt with the session's model. http(s) only; public http is upgraded to https, and localhost or private addresses need approval. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page. A successful download is reused for fifteen minutes.".to_string(),
+            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1705,10 +1705,7 @@ fn model_fetch_input(mut input: serde_json::Value) -> Result<serde_json::Value> 
     let url = input["url"]
         .as_str()
         .ok_or_else(|| anyhow!("url required"))?;
-    input["url"] = serde_json::json!(web::model_url(
-        url,
-        cfg!(test) || path_scope::approved_local_fetch(url)
-    )?);
+    input["url"] = serde_json::json!(web::model_url(url, path_scope::approved_local_fetch(url))?);
     Ok(input)
 }
 fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> {
