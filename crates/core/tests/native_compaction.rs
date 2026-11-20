@@ -608,11 +608,23 @@ async fn context_search_hint_requires_persisted_compaction_without_host_provenan
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     let hint = "After compaction, load ContextSearch with ToolLoad";
-    let fresh = seen[0]["instructions"].as_str().unwrap();
-    assert!(fresh.contains("- `ContextSearch`"), "{fresh}");
+    let fresh_system = seen[0]["instructions"].as_str().unwrap();
+    assert!(!fresh_system.contains("Tools you can load with ToolLoad"), "{fresh_system}");
+    let fresh = seen[0]["input"].to_string();
+    assert!(fresh.contains("Tools you can load with ToolLoad"), "{fresh}");
+    assert!(fresh.contains("- ContextSearch:"), "{fresh}");
     assert!(!fresh.contains(hint), "{fresh}");
-    let compacted = seen[1]["instructions"].as_str().unwrap();
-    assert!(compacted.contains(hint), "{compacted}");
+    assert!(
+        fresh.find("Tools you can load with ToolLoad").unwrap()
+            < fresh.find("Today's date is").unwrap(),
+        "the loadable tools reminder opens before the date: {fresh}"
+    );
+    let compacted_system = seen[1]["instructions"].as_str().unwrap();
+    assert!(!compacted_system.contains(hint), "{compacted_system}");
+    let compacted = seen[1]["input"].to_string();
+    // The frozen first message still carries the same list after compaction.
+    assert!(compacted.contains("- ContextSearch:"), "{compacted}");
+    assert!(!compacted.contains(hint), "{compacted}");
     assert!(seen[1]["input"]
         .to_string()
         .contains("Host continuation summary"));

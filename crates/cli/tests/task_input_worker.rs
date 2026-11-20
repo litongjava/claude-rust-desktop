@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/user_message.rs"]
+mod user_message;
+
 const READY: Duration = Duration::from_secs(30);
 
 fn tool_names(body: &Value) -> Vec<String> {
@@ -65,8 +68,8 @@ fn last_user_text(body: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|message| message["role"] == "user" && message["content"].is_string())
-        .filter_map(|message| message["content"].as_str().map(str::to_owned))
+        .filter(|message| message["role"] == "user")
+        .map(|message| user_message::user_text(&message["content"]))
         .next_back()
         .unwrap_or_default()
 }

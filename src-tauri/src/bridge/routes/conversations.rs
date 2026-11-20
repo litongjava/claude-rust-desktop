@@ -315,7 +315,13 @@ async fn conversation_delete(Path(id): Path<String>, State(state): State<AppStat
         })
     }).await;
     match result {
-        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })),
+        Ok(Ok(Ok(()))) => {
+            deepseek_code_core::prompt::forget_session_files(
+                state.data_dir.as_ref(),
+                &id_for_error,
+            );
+            Json(serde_json::json!({ "ok": true }))
+        }
         Err(e) => {
             tracing::error!(module = "Conversations", "Failed to delete conversation {}: {}", id_for_error, e);
             Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))

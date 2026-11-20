@@ -71,26 +71,33 @@ pub fn render(instructions: &[Instruction]) -> String {
 /// cached separately. The preamble leads the first non-empty block; an empty
 /// group produces no block.
 pub fn reminders(instructions: &[Instruction]) -> Vec<String> {
+    let (user, project) = reminder_parts(instructions);
+    [user, project].into_iter().flatten().collect()
+}
+
+/// The same two blocks separately, each None when its group is empty, so a
+/// caller can place session context between them.
+pub fn reminder_parts(instructions: &[Instruction]) -> (Option<String>, Option<String>) {
     let (user, project): (Vec<_>, Vec<_>) = instructions
         .iter()
         .partition(|item| item.scope == Scope::User);
-    [user, project]
-        .into_iter()
-        .filter(|group| !group.is_empty())
-        .enumerate()
-        .map(|(index, group)| {
-            let body = group
-                .iter()
-                .map(|item| line(item))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if index == 0 {
-                format!("<system-reminder>\n{PREAMBLE}\n\n{body}\n</system-reminder>")
-            } else {
-                format!("<system-reminder>\n{body}\n</system-reminder>")
-            }
-        })
-        .collect()
+    let render = |group: &[&Instruction], preamble: bool| {
+        let body = group
+            .iter()
+            .map(|item| line(item))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if preamble {
+            format!("<system-reminder>\n{PREAMBLE}\n\n{body}\n</system-reminder>")
+        } else {
+            format!("<system-reminder>\n{body}\n</system-reminder>")
+        }
+    };
+    let user_empty = user.is_empty();
+    (
+        (!user_empty).then(|| render(&user, true)),
+        (!project.is_empty()).then(|| render(&project, user_empty)),
+    )
 }
 
 /// Project instructions only, rendered; see [`load_all`] for user instructions too.
