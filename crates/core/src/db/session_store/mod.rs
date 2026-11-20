@@ -208,6 +208,8 @@ impl SessionDb {
         )?;
         body(&mut conn)
     }
+    /// Use the supplied transaction for the duration of the callback. Nested
+    /// store calls that need lifecycle access return an error on this thread.
     pub fn read<T>(&self, body: impl FnOnce(&SessionRead<'_>) -> Result<T>) -> Result<T> {
         let _locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
@@ -216,7 +218,8 @@ impl SessionDb {
             layout::callback(|| body(&SessionRead(&tx)))
         })
     }
-    /// The closure may run again after SQLite contention rolls back its transaction.
+    /// The closure follows the same re-entry rules as `read` and may run again
+    /// after SQLite contention rolls back its transaction.
     pub fn write<T>(&self, mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
         let start = Instant::now();
         let _locks = self.stores.key_lock(&self.key, false, false)?;
