@@ -1262,6 +1262,54 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
 }
 
 #[test]
+fn round2_typed_history_must_be_readable_before_publish_and_on_open() -> Result<()> {
+    for change in [
+        "UPDATE message_user_content SET content_json=CAST(content_json AS BLOB)",
+        "UPDATE message_user_content SET message_id=NULL",
+        "UPDATE message_user_content SET content_json='1e400'",
+        "UPDATE messages SET thinking=x'80'",
+        "UPDATE manifest SET updated_at=x'80'",
+    ] {
+        for staged in [true, false] {
+            let root = tempdir()?;
+            let s = Stores::open_for_test(root.path())?;
+            let path = if staged {
+                assert!(stop_at(&s, Phase::Sealed).create(ID, first()).is_err());
+                fs::read_dir(root.path().join("sessions/.staging"))?
+                    .next()
+                    .unwrap()?
+                    .path()
+                    .join("session.db")
+            } else {
+                s.create(ID, first())?;
+                shard(root.path())
+            };
+            Connection::open(path)?.execute_batch(change)?;
+            if staged {
+                drop(s);
+                let reopened = Stores::open_for_test(root.path())?;
+                assert!(reopened.global().conversation(ID)?.is_none(), "{change}");
+                assert_eq!(pending(root.path()), 0);
+                assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+            } else {
+                assert!(s.open_session(ID).is_err(), "{change}");
+            }
+        }
+    }
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let deep = (0..150).fold(serde_json::Value::Null, |v, _| {
+        serde_json::Value::Array(vec![v])
+    });
+    let mut options = first();
+    options.first_message.as_mut().unwrap().typed = Some(deep);
+    assert!(s.create(ID, options).is_err());
+    assert!(s.global().conversation(ID)?.is_none());
+    assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+    Ok(())
+}
+
+#[test]
 fn round2_pending_shard_path_damage_is_local_to_create_and_delete() -> Result<()> {
     for deleting in [false, true] {
         let root = tempdir()?;

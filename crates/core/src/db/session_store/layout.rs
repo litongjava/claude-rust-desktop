@@ -191,14 +191,36 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
         }
     }
     if kind == SESSION {
-        let seal: String = conn.query_row(
-            "SELECT sealed_operation FROM manifest WHERE singleton=1",
+        let (seal, count): (String, i64) = conn.query_row(
+            "SELECT singleton,store_uuid,id,incarnation,sealed_operation,created_at,updated_at,
+                    message_count,content_revision,last_turn_status FROM manifest WHERE singleton=1",
             [],
-            |r| r.get(0),
+            |row| {
+                for field in ["store_uuid", "id", "incarnation", "created_at", "updated_at"] {
+                    row.get::<_, String>(field)?;
+                }
+                row.get::<_, i64>("singleton")?;
+                row.get::<_, i64>("content_revision")?;
+                row.get::<_, Option<String>>("last_turn_status")?;
+                Ok((row.get("sealed_operation")?, row.get("message_count")?))
+            },
         )?;
         if !canonical_uuid(&seal) {
             return Err(InvalidFormat("Invalid session seal".into()).into());
         }
+        let first = super::SessionRead(conn)
+            .initial_message()
+            .context("decoding initial message")?;
+        ensure!(
+            count >= 0 && first.is_some() == (count > 0),
+            "Initial message differs from manifest"
+        );
+        let detached: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_user_content WHERE message_id IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(!detached, "Typed content has no message ID");
     }
     Ok(())
 }

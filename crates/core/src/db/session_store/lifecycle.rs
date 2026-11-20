@@ -494,18 +494,24 @@ impl Stores {
                 (SELECT substr(content,1,80) FROM messages WHERE sort_order=0),
                 coalesce((SELECT length(CAST(content AS BLOB)) FROM messages WHERE sort_order=0),0) FROM manifest",
                 [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-            let history_ok: bool = c.query_row("SELECT
+            let history_ok: bool = c.query_row(
+                "SELECT
                 m.message_count IN (0,1) AND m.content_revision=m.message_count
                 AND m.message_count=(SELECT count(*) FROM messages)
                 AND NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id IS NOT m.id
                     OR role IS NOT 'user' OR sort_order IS NOT 0 OR typeof(content)<>'text'
                     OR created_at IS NOT m.created_at)
                 AND NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)
-                AND NOT EXISTS(SELECT 1 FROM message_user_content WHERE NOT json_valid(content_json))
                 AND (?1 IS NULL OR m.message_count=?1)
-                AND (?2 IS NULL OR (SELECT count(*) FROM message_user_content)=?2)
+                AND (?2 IS NULL OR EXISTS(SELECT 1 FROM messages JOIN message_user_content
+                    ON message_id=messages.id WHERE sort_order=0)=?2)
                 FROM manifest m WHERE singleton=1",
-                params![meta.initial_shape.map(|v|v.0),meta.initial_shape.map(|v|v.1)],|r|r.get(0))?;
+                params![
+                    meta.initial_shape.map(|v| v.0),
+                    meta.initial_shape.map(|v| v.1)
+                ],
+                |r| r.get(0),
+            )?;
             if !history_ok {
                 return Err(layout::InvalidFormat(
                     "Initial history differs from sealed projection".into(),

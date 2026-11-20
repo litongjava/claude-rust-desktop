@@ -142,7 +142,7 @@ pub struct MessageRow {
     pub sort_order: i64,
 }
 
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+pub(super) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
         conversation_id: row.get(1)?,

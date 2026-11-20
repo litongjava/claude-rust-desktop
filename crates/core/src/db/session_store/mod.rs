@@ -265,10 +265,19 @@ impl SessionRead<'_> {
         let pair = self
             .0
             .query_row(
-                "SELECT m.content,t.content_json FROM messages m LEFT JOIN message_user_content t
-             ON t.message_id=m.id WHERE m.sort_order=0",
+                "SELECT m.id,m.conversation_id,m.role,m.content,m.thinking,m.created_at,
+                        m.is_compact_boundary,m.sort_order,t.message_id,t.content_json
+                 FROM messages m LEFT JOIN message_user_content t ON t.message_id=m.id
+                 WHERE m.sort_order=0",
                 [],
-                |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?)),
+                |row| {
+                    let message = crate::db::message_repo::row_to_message(row)?;
+                    let json = match row.get::<_, Option<String>>(8)? {
+                        Some(_) => Some(row.get::<_, String>(9)?),
+                        None => None,
+                    };
+                    Ok((message.content, json))
+                },
             )
             .optional()?;
         pair.map(|(text, json)| {
