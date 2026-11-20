@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(super) struct InvalidFormat(String);
+pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
