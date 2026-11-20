@@ -1,9 +1,10 @@
 //! Installed built-in skill asset directories.
 //!
-//! Components that ship extra references or scripts (dataviz, skill-creator)
-//! are installed under `<data>/skills/bundled/<name>/`. Invocation points at
-//! that directory, and the Read tool serves registered asset names from it even
-//! when it sits outside the workspace.
+//! Every installed built-in skill that ships something besides its `SKILL.md`
+//! (references, scripts, fonts, license and notice files) is installed under
+//! `<data>/skills/bundled/<name>/`. Invocation points at that directory, and the
+//! Read tool serves registered asset names from it even when it sits outside
+//! the workspace.
 use anyhow::{ensure, Context, Result};
 use std::{
     collections::HashMap,
@@ -29,8 +30,13 @@ pub struct Resources {
     bundles: Mutex<HashMap<String, Arc<Bundle>>>,
 }
 
+/// Any bundled skill whose installed tree has a file besides `SKILL.md` gets
+/// the resource treatment. The manifest is the only source; there is no
+/// per-name list, so a newly bundled asset directory is covered automatically.
 pub fn supports(name: &str) -> bool {
-    matches!(name, "dataviz" | "skill-creator")
+    manifest::FILES
+        .iter()
+        .any(|(skill, relative, _)| *skill == name && *relative != "SKILL.md")
 }
 
 /// Whether `relative` is one of the files installed for `name`.
@@ -83,10 +89,10 @@ impl Resources {
         drop(registry);
         bundles.insert(name.into(), bundle);
         drop(bundles);
-        let provenance = if name == "skill-creator" {
-            "Bundled skill-creator embedded in DeepSeek Code; no network or prior install is required. Adapted from OpenAI Codex's skill-creator under the Apache-2.0 license; see NOTICE.md and license.txt in the base directory."
+        let provenance = if registered(name, "NOTICE.md") {
+            "Bundled skill embedded in DeepSeek Code; no network or prior install is required. See NOTICE.md in the base directory for provenance and license terms; the upstream material is Apache-2.0."
         } else {
-            "Bundled dataviz guidance written for DeepSeek Code; no third-party documentation is required."
+            "Bundled skill embedded in DeepSeek Code; no network or prior install is required."
         };
         Ok(format!(
         "Base directory for this skill: {}\n\n{} Resolve resource paths against the base directory. Use Read for referenced documents. Execute scripts only through normal Bash permissions; invocation itself executes no scripts. After restarting a worker, invoke this skill again to obtain its current resource directory.\n\n{instructions}\n\nCurrent workspace: {}\n\n## User Request\n\n{arguments}",
@@ -438,5 +444,93 @@ mod tests {
         drop(resources);
         assert!(read(&example).is_none());
         assert!(example.exists());
+    }
+
+    #[test]
+    fn resource_handling_covers_every_skill_with_extra_installed_files() {
+        use std::collections::BTreeSet;
+        let names_with_extras: BTreeSet<&str> = FILES
+            .iter()
+            .filter(|(_, relative, _)| *relative != "SKILL.md")
+            .map(|(name, _, _)| *name)
+            .collect();
+        for (name, _, _) in FILES {
+            assert_eq!(supports(name), names_with_extras.contains(name), "{name}");
+        }
+        for name in ["dataviz", "skill-creator", "pdf", "webapp-testing"] {
+            assert!(supports(name), "{name}");
+        }
+        for name in ["code-review", "task-template", "not-a-bundled-skill"] {
+            assert!(!supports(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn imported_skills_resolve_relative_scripts_and_refuse_paths_outside_their_directory() {
+        let (_temp, bundled) = installed();
+        let workspace = tempfile::tempdir().unwrap();
+        let resources = Resources::default();
+        for (name, relative) in [
+            ("pdf", "scripts/fill_fillable_fields.py"),
+            ("webapp-testing", "scripts/with_server.py"),
+        ] {
+            let directory = bundled.join(name);
+            let prompt = resources
+                .prepare(name, "", workspace.path(), &directory)
+                .unwrap();
+            assert!(
+                prompt.contains(&format!(
+                    "Base directory for this skill: {}",
+                    directory.display()
+                )),
+                "{name}"
+            );
+            assert!(
+                prompt.contains("Resolve resource paths against the base directory."),
+                "{name}"
+            );
+            assert!(prompt.contains("NOTICE.md"), "{name}");
+
+            // The model resolves a relative path from SKILL.md against the base.
+            let resolved = directory.join(relative);
+            assert_eq!(
+                read(&resolved).unwrap().as_slice(),
+                embedded(name, relative),
+                "{name}/{relative}"
+            );
+            let response = crate::tools::execute_tool(
+                "Read",
+                serde_json::json!({"file_path": resolved, "limit": 2}),
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+            assert!(
+                response["content"].as_str().unwrap().contains("1\t"),
+                "{name}"
+            );
+
+            // Nothing outside this skill's installed directory is served.
+            assert!(read(&bundled.join("dataviz/SKILL.md")).is_none(), "{name}");
+            assert!(
+                read(&directory.join("../code-review/SKILL.md")).is_none(),
+                "{name}"
+            );
+            assert!(
+                read(Path::new(relative)).is_none(),
+                "{name}: relative input"
+            );
+            assert!(
+                read(&workspace.path().join("outside.txt")).is_none(),
+                "{name}: path outside the data directory"
+            );
+            let unregistered = directory.join("user-notes.md");
+            std::fs::write(&unregistered, "not part of the installed skill").unwrap();
+            assert!(
+                read(&unregistered).is_none(),
+                "{name}: unregistered sibling"
+            );
+            std::fs::remove_file(&unregistered).unwrap();
+        }
+        assert!(read(&bundled.join("pdf/LICENSE.txt")).is_some());
     }
 }

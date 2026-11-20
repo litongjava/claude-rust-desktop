@@ -548,6 +548,27 @@ mod tests {
     }
 
     #[test]
+    fn imported_binary_font_assets_install_byte_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("skills/bundled");
+        install(&bundled).unwrap();
+
+        let relative = "canvas-fonts/InstrumentSerif-Regular.ttf";
+        let expected = embedded("canvas-design", relative);
+        assert!(
+            std::str::from_utf8(expected).is_err(),
+            "the font fixture must be binary"
+        );
+        let installed = bundled.join("canvas-design").join(relative);
+        assert_eq!(std::fs::read(&installed).unwrap(), expected);
+        let record = read_record(&bundled.join(RECORD_FILE));
+        assert_eq!(
+            record.files[&record_key("canvas-design", relative)],
+            sha256(expected)
+        );
+    }
+
+    #[test]
     fn pre_existing_user_file_without_a_record_is_kept() {
         let temp = tempfile::tempdir().unwrap();
         let bundled = temp.path().join("skills/bundled");

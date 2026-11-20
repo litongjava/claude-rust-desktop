@@ -1249,11 +1249,13 @@ mod tests {
             let text = std::fs::read_to_string(&command.path).unwrap();
             let (metadata, body) = frontmatter(&text).unwrap();
             assert_eq!(metadata["name"].as_str(), Some(name), "{name}");
-            assert_eq!(
-                metadata["description"].as_str(),
-                Some(command.description.as_str()),
-                "{name}"
-            );
+            let description = metadata["description"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(description, command.description, "{name}");
             assert_eq!(body, command.content, "{name}");
             assert_eq!(
                 command.user_invocable,
@@ -1271,6 +1273,81 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Skills imported from anthropics/skills as Apache-2.0 third-party files.
+    const IMPORTED_SKILLS: [&str; 13] = [
+        "algorithmic-art",
+        "canvas-design",
+        "claude-api",
+        "docx",
+        "frontend-design",
+        "internal-comms",
+        "mcp-builder",
+        "pdf",
+        "pptx",
+        "slack-gif-creator",
+        "theme-factory",
+        "webapp-testing",
+        "xlsx",
+    ];
+
+    #[test]
+    fn imported_third_party_skills_install_and_discover_with_license_and_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        for name in IMPORTED_SKILLS {
+            let directory = data.join("skills/bundled").join(name);
+            let skill_file = directory.join("SKILL.md");
+            let text = std::fs::read_to_string(&skill_file).unwrap();
+            let (metadata, body) = frontmatter(&text).unwrap();
+            assert_eq!(
+                metadata["license"].as_str(),
+                Some("Complete terms in LICENSE.txt"),
+                "{name}"
+            );
+            let command = found
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from discovery: {:?}", found.keys()));
+            assert_eq!(command.path, skill_file, "{name}");
+            let description = metadata["description"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(command.description, description, "{name}");
+            assert_eq!(body, command.content, "{name}");
+            assert!(command.user_invocable, "{name}");
+            assert!(!command.disable_model_invocation, "{name}");
+            assert!(directory.join("LICENSE.txt").is_file(), "{name}");
+            assert!(directory.join("NOTICE.md").is_file(), "{name}");
+        }
+    }
+
+    #[test]
+    fn license_frontmatter_key_parses_with_default_invocation_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("licensed/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: licensed\ndescription: Licensed fixture\nlicense: Complete terms in LICENSE.txt\n---\nBody",
+        )
+        .unwrap();
+        let command = parse_bundled_definition(&path, "licensed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.description, "Licensed fixture");
+        assert!(command.user_invocable);
+        assert!(!command.disable_model_invocation);
     }
 
     #[test]
