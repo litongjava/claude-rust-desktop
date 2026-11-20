@@ -179,3 +179,124 @@ async fn resume_race_returns_an_error_and_keeps_the_source_handle() {
         Some(137)
     );
 }
+
+#[tokio::test]
+async fn rejected_launch_drops_its_prompt_before_dispatch_in_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().into()).unwrap();
+    let mut winner = Session::open(&cli(&[]), &paths, selection(137), None)
+        .await
+        .unwrap();
+    let mut launch = cli(&[
+        "--resume",
+        &winner.id,
+        "--model",
+        "test-model",
+        "for the rejected selection",
+    ]);
+    launch.observed_generation = Some(winner.binding_state().generation);
+    winner.switch(&paths, selection(4096)).await.unwrap();
+    let loser = Session::open(&launch, &paths, selection(256), Some(&winner.id))
+        .await
+        .unwrap();
+    for single in [false, true] {
+        let mut prompt = launch.prompt.clone().unwrap();
+        let admission = loser.admit_launch_prompt(&mut prompt, single);
+        assert!(prompt.is_empty());
+        if single {
+            assert!(admission
+                .unwrap_err()
+                .to_string()
+                .contains("prompt was not sent"));
+        } else {
+            admission.unwrap();
+            assert_eq!(
+                loser.launch_provider().await.unwrap().model.max_tokens,
+                Some(4096)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().into()).unwrap();
+    let mut winner = Session::open(&cli(&[]), &paths, selection(137), None)
+        .await
+        .unwrap();
+    let mut picker = Session::open(&cli(&[]), &paths, selection(137), Some(&winner.id))
+        .await
+        .unwrap();
+    winner.switch(&paths, selection(4096)).await.unwrap();
+    let key = format!("cli.session.{}", winner.id);
+    let settings = r#"{"effort":"high","autocompact_percent":70,"extra":true}"#;
+    winner
+        .store
+        .db
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
+                (&key, settings),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let value = || {
+        winner
+            .store
+            .db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT value FROM peripheral_settings WHERE key=?1",
+                    [&key],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    assert!(picker
+        .switch_with_effort(&paths, Some(selection(256)), Some(Some("low")))
+        .await
+        .is_err());
+    assert_eq!(value(), settings);
+    let version = picker.binding_state().generation;
+    winner
+        .store
+        .db
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER reject_effort BEFORE UPDATE ON peripheral_settings
+        WHEN NEW.key LIKE 'cli.session.%' BEGIN SELECT RAISE(ABORT,'effort write rejected'); END;",
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert!(picker
+        .switch_with_effort(&paths, Some(selection(256)), Some(Some("low")))
+        .await
+        .is_err());
+    assert_eq!(
+        binding_store::observe(&winner.store.db, &winner.id)
+            .unwrap()
+            .generation,
+        version
+    );
+    assert_eq!(value(), settings);
+    winner
+        .store
+        .db
+        .with_conn(|c| c.execute_batch("DROP TRIGGER reject_effort"))
+        .unwrap()
+        .unwrap();
+    picker
+        .switch_with_effort(&paths, Some(selection(256)), Some(Some("low")))
+        .await
+        .unwrap();
+    let updated: serde_json::Value = serde_json::from_str(&value()).unwrap();
+    assert_eq!(
+        updated,
+        json!({"effort":"low","autocompact_percent":70,"extra":true})
+    );
+}

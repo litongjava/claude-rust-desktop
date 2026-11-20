@@ -20,6 +20,10 @@ pub fn schema(c: &Connection) -> Result<()> {
         target_provider TEXT, target_model TEXT);
         CREATE TABLE IF NOT EXISTS cli_binding_failures(
         session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, requested TEXT NOT NULL, restored TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS cli_binding_reservations(
+        session_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, generation INTEGER NOT NULL,
+        requester TEXT NOT NULL, effort TEXT, requested TEXT NOT NULL, restored TEXT,
+        PRIMARY KEY(session_id,generation));
         CREATE TABLE IF NOT EXISTS cli_binding_revisions(
         session_id TEXT NOT NULL, generation INTEGER NOT NULL, previous INTEGER NOT NULL,
         digest TEXT NOT NULL, options TEXT NOT NULL, PRIMARY KEY(session_id,generation));",
@@ -57,8 +61,6 @@ pub fn observe(db: &DbManager, id: &str) -> Result<Observed> {
     })?
 }
 
-/// Store selector IDs only. Every attached terminal (including a reconnect)
-/// can report the outcome, even after the retirement helper has exited.
 pub fn activation_failure(db: &DbManager, id: &str) -> Result<Option<(u64, String, String)>> {
     use rusqlite::OptionalExtension;
     Ok(db.with_conn(|c| {
@@ -69,6 +71,54 @@ pub fn activation_failure(db: &DbManager, id: &str) -> Result<Option<(u64, Strin
         )
         .optional()
     })??)
+}
+
+/// Prefer this frontend's queued rollback over the latest public notice
+/// displayed to reconnecting terminals. Another writer can supersede only the latter.
+pub fn frontend_failure(
+    c: &Connection,
+    id: &str,
+    requester: &str,
+) -> Result<Option<(u64, String, String, bool)>> {
+    use rusqlite::OptionalExtension;
+    Ok(c.query_row("SELECT generation,requested,restored,1 AS addressed FROM cli_binding_reservations
+        WHERE session_id=?1 AND requester=?2 AND restored IS NOT NULL
+        UNION ALL SELECT generation,requested,restored,0 FROM cli_binding_failures WHERE session_id=?1
+        ORDER BY addressed DESC,generation LIMIT 1", (id,requester),
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+}
+
+pub fn acknowledge(c: &Connection, id: &str, requester: &str, generation: u64) -> Result<()> {
+    c.execute(
+        "DELETE FROM cli_binding_reservations WHERE session_id=?1 AND requester=?2
+        AND generation=?3 AND restored IS NOT NULL",
+        (id, requester, generation),
+    )?;
+    Ok(())
+}
+
+/// Retiring the frontend drops its private delivery address. A reserved
+/// picker edit still belongs to the worker and must finish activation.
+pub fn release_requester(c: &Connection, requester: &str) -> Result<()> {
+    if !c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cli_binding_reservations WHERE requester=?1)",
+        [requester],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let tx = crate::db::write_transaction(c)?;
+    tx.execute(
+        "UPDATE cli_binding_reservations SET requester='' WHERE requester=?1
+        AND effort IS NOT NULL AND restored IS NULL",
+        [requester],
+    )?;
+    tx.execute(
+        "DELETE FROM cli_binding_reservations WHERE requester=?1",
+        [requester],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn digest(value: &serde_json::Value) -> Result<String> {
@@ -147,10 +197,50 @@ pub fn publish(
     state: &BindingSnapshot,
     legacy: Option<(&str, Option<u32>)>,
 ) -> Result<Write> {
+    publish_choice(c, id, expected, state, legacy, "", None)
+}
+
+/// The inner option represents the picker's model-default effort. An absent
+/// outer option leaves the settings untouched, including for non-picker writes.
+pub fn publish_choice(
+    c: &Connection,
+    id: &str,
+    expected: u64,
+    state: &BindingSnapshot,
+    legacy: Option<(&str, Option<u32>)>,
+    requester: &str,
+    picker_effort: Option<Option<&str>>,
+) -> Result<Write> {
     let tx = crate::db::write_transaction(c)?;
-    let result = publish_in(&tx, id, expected, state, legacy)?;
+    let mut result = publish_in(&tx, id, expected, state, legacy)?;
+    match result {
+        Write::Published(generation) if legacy.is_some() => {
+            tx.execute("INSERT INTO cli_binding_reservations(session_id,generation,requester,effort,requested)
+                VALUES(?1,?2,?3,?4,?5)", (id,generation,requester,picker_effort.map(|e| e.unwrap_or("default")),
+                format!("{}::{}",state.provider_id,state.model)))?;
+        }
+        Write::Unchanged if picker_effort.is_some() && read(&tx, id)?.pending.is_some() => {
+            result = Write::Conflict;
+        }
+        Write::Unchanged | Write::Published(_) => {
+            if let Some(effort) = picker_effort {
+                apply_effort(&tx, id, effort)?;
+            }
+        }
+        Write::Conflict => {}
+    }
     tx.commit()?;
     Ok(result)
+}
+
+fn apply_effort(c: &Connection, id: &str, effort: Option<&str>) -> Result<()> {
+    let changed = c.execute(
+        "INSERT INTO peripheral_settings(key,value) VALUES(?1,json_object('effort',?2))
+        ON CONFLICT(key) DO UPDATE SET value=json_set(peripheral_settings.value,'$.effort',?2)",
+        (format!("cli.session.{id}"), effort),
+    )?;
+    anyhow::ensure!(changed == 1, "Model picker effort was not saved");
+    Ok(())
 }
 
 fn publish_in(
@@ -274,6 +364,22 @@ pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result
             (id, worker, expected),
         )?;
         anyhow::ensure!(cleared == 1, "Activated reservation was not cleared");
+        use rusqlite::OptionalExtension;
+        let effort: Option<String> = tx
+            .query_row(
+                "SELECT effort FROM cli_binding_reservations
+            WHERE session_id=?1 AND generation=?2 AND effort IS NOT NULL",
+                (id, expected),
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(effort) = effort {
+            apply_effort(&tx, id, (effort != "default").then_some(effort.as_str()))?;
+        }
+        tx.execute(
+            "DELETE FROM cli_binding_reservations WHERE session_id=?1 AND generation=?2",
+            (id, expected),
+        )?;
         tx.commit()?;
         Ok(())
     })();
@@ -289,6 +395,11 @@ pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result
             (SELECT previous FROM cli_binding_revisions r WHERE r.session_id=g.session_id AND r.generation=g.generation),MAX(g.generation-1,0)),
             pending=NULL,legacy_pid=NULL,(target_provider,target_model)=(SELECT provider,model FROM conversations WHERE id=?1)
             WHERE session_id=?1 AND pending=?2 AND generation=?3",(id,worker,expected))?;
+        tx.execute("UPDATE cli_binding_reservations SET effort=NULL,
+            restored=(SELECT restored FROM cli_binding_failures WHERE session_id=?1 AND generation=?2)
+            WHERE session_id=?1 AND generation=?2 AND EXISTS
+            (SELECT 1 FROM cli_binding_failures WHERE session_id=?1 AND generation=?2)", (id,expected))?;
+        tx.execute("DELETE FROM cli_binding_reservations WHERE session_id=?1 AND generation=?2 AND requester=''",(id,expected))?;
         tx.commit()?;
         return Err(error);
     }
@@ -306,7 +417,7 @@ mod tests {
             "CREATE TABLE conversations(id TEXT PRIMARY KEY,provider TEXT,model TEXT);
             INSERT INTO conversations VALUES('session','a','m');
             CREATE TABLE execution_turns(conversation_id TEXT);
-            CREATE TABLE peripheral_settings(key TEXT,value TEXT);",
+            CREATE TABLE peripheral_settings(key TEXT PRIMARY KEY,value TEXT);",
         )
         .unwrap();
         schema(&c).unwrap();
@@ -422,6 +533,95 @@ mod tests {
             (active.generation, active.provider.as_str(), active.pending),
             (1, "b", None)
         );
+    }
+
+    #[test]
+    fn pending_picker_applies_effort_only_at_activation_even_after_requester_exit() {
+        let c = database();
+        publish_choice(
+            &c,
+            "session",
+            0,
+            &snapshot("b"),
+            Some(("worker", Some(7))),
+            "picker",
+            Some(Some("low")),
+        )
+        .unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM peripheral_settings", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        release_requester(&c, "picker").unwrap();
+        activate(&c, "session", "worker", 1).unwrap();
+        let effort: String = c
+            .query_row(
+                "SELECT json_extract(value,'$.effort') FROM peripheral_settings
+            WHERE key='cli.session.session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(effort, "low");
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM cli_binding_reservations", [], |r| r
+                .get::<_, u32>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn requester_receives_rollback_once_after_a_newer_selection() {
+        let c = database();
+        let b = snapshot("b");
+        assert_eq!(
+            publish_choice(
+                &c,
+                "session",
+                0,
+                &b,
+                Some(("worker", Some(7))),
+                "chooser",
+                Some(Some("low"))
+            )
+            .unwrap(),
+            Write::Published(1)
+        );
+        c.execute_batch(
+            "CREATE TRIGGER reject BEFORE UPDATE OF model ON conversations
+            BEGIN SELECT RAISE(ABORT,'rejected activation'); END;",
+        )
+        .unwrap();
+        assert!(activate(&c, "session", "worker", 1).is_err());
+        c.execute_batch("DROP TRIGGER reject").unwrap();
+        assert_eq!(
+            publish(&c, "session", 0, &snapshot("c"), None).unwrap(),
+            Write::Published(2)
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM peripheral_settings WHERE key='cli.session.session'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(frontend_failure(&c, "session", "peer").unwrap().is_none());
+        acknowledge(&c, "session", "peer", 1).unwrap();
+        assert_eq!(
+            frontend_failure(&c, "session", "chooser").unwrap(),
+            Some((1, "b::m".into(), "a::m".into(), true))
+        );
+        acknowledge(&c, "session", "chooser", 1).unwrap();
+        assert!(frontend_failure(&c, "session", "chooser")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

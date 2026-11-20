@@ -211,12 +211,6 @@ pub(crate) fn autocompact_label(session: &Session) -> Result<String> {
     })
 }
 
-pub(crate) fn set_session_effort(session: &Session, effort: Option<String>) -> Result<()> {
-    let mut settings = load(&session.store.db, &session.id)?;
-    settings.effort = effort;
-    save(&session.store.db, &session.id, &settings)
-}
-
 fn parse_effort(argument: &str) -> Result<Option<String>> {
     ensure!(
         ["default", "off", "low", "medium", "high", "xhigh", "max"].contains(&argument),

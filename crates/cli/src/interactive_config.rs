@@ -1444,13 +1444,16 @@ pub async fn handle(
                     }
                     Picked::Entry(index) => {
                         let chosen = (efforts[effort] != "default").then(|| efforts[effort].to_owned());
-                        if chosen != current_effort {
-                            crate::session_commands::set_session_effort(session, chosen.clone())?;
-                            command_eprintln!("Session effort: {}", chosen.as_deref().unwrap_or("default"));
+                        let effort_change = (chosen != current_effort).then_some(chosen.as_deref());
+                        let change_model = models[index].id != session.binding_state().model;
+                        if change_model || effort_change.is_some() {
+                            let selection = change_model.then(|| select(paths, &provider.id, &models[index].id)).transpose()?;
+                            session.switch_with_effort(paths, selection, effort_change).await?;
                         }
-                        if models[index].id != session.binding_state().model {
-                            let selection = select(paths, &provider.id, &models[index].id)?;
-                            session.switch(paths, selection).await?;
+                        if let Some(level) = effort_change {
+                            command_eprintln!("Session effort: {}", level.unwrap_or("default"));
+                        }
+                        if change_model {
                             config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
                             status(session);
                             command_eprintln!("Conversation history preserved. Use /test to verify connectivity.");

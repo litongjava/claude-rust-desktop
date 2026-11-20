@@ -274,6 +274,8 @@ pub async fn commit(
     id: &str,
     expected: u64,
     state: &mut BindingSnapshot,
+    requester: &str,
+    picker_effort: Option<Option<&str>>,
 ) -> Result<bool> {
     let worker = if uuid::Uuid::parse_str(id).is_ok() {
         session_worker::current(root, id)?
@@ -296,7 +298,9 @@ pub async fn commit(
     };
     let pending = live.as_ref().filter(|_| legacy).map(|w| w.id.as_str());
     let reserved = pending.map(|id| (id, live.as_ref().and_then(|w| w.child_pid)));
-    let change = db.with_conn(|c| binding_store::publish(c, id, expected, state, reserved))??;
+    let change = db.with_conn(|c| {
+        binding_store::publish_choice(c, id, expected, state, reserved, requester, picker_effort)
+    })??;
     match change {
         Write::Published(generation) => state.generation = generation,
         Write::Unchanged => {

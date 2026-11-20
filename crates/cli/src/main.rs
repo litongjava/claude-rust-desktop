@@ -976,6 +976,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
     // Set by /restart; the replacement starts after this session is closed.
     let mut restart_launch = None;
     let result = async {
+        session.admit_launch_prompt(&mut prompt, single)?;
         // Applied inside the cleanup scope so a startup failure reaches teardown
         // and publishes no incarnation.
         startup_options::apply(cli, &mut session).await?;
@@ -1073,7 +1074,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if let Err(error) = remote.command("", &paths, &session, &mut input).await { command_eprintln!("Remote Control: {error:#}"); }
         }
         let mut last_config_error = String::new();
-        let mut reported_binding_failure = None;
+        let mut reported_binding_failures = std::collections::HashMap::new();
         // Read-only view of a turn a direct print/json owner still executes.
         let mut execution_observer = observe::Observer::default();
         terminal::tips::start_session(&paths.data_dir);
@@ -1220,16 +1221,21 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
-                    if let Some((generation, requested, restored)) = binding_store::activation_failure(&session.store.db, &session.id)? {
-                        let notice = (session.id.clone(), generation);
-                        if reported_binding_failure.as_ref() != Some(&notice) {
+                    let failure = session.store.db.with_conn(|c|
+                        binding_store::frontend_failure(c, &session.id, &session.binding_requester))??;
+                    if let Some((generation, requested, restored, needs_ack)) = failure {
+                        let seen = reported_binding_failures.entry(session.id.clone()).or_insert(0);
+                        if generation > *seen {
                             let reader = input.as_ref().expect("interactive reader");
                             reader.notice(format!("Provider switch to {requested} did not apply: activation failed. Restored {restored}."));
                             match session.refresh_binding().await {
                                 Ok(()) => reader.set_effort(Some(session_commands::model_label(&session).await)),
                                 Err(error) => reader.notice(format!("Could not refresh the restored binding: {error:#}")),
                             }
-                            reported_binding_failure = Some(notice);
+                            *seen = generation;
+                        }
+                        if needs_ack {
+                            session.store.db.with_conn(|c| binding_store::acknowledge(c,&session.id,&session.binding_requester,generation))??;
                         }
                     }
                     // While a resumed session is owned elsewhere, show the public

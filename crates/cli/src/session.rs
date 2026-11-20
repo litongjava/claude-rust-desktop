@@ -56,6 +56,8 @@ fn settle_abandoned_turns(
 }
 
 pub struct Session {
+    pub(crate) binding_requester: String,
+    launch_binding_rejected: bool,
     pub(crate) binding: deepseek_code_core::native_engine::session_binding::ActiveBinding,
     /// Restored sessions wait for explicit input before allowing idle model work.
     waiting_for_continue: std::sync::atomic::AtomicBool,
@@ -513,9 +515,20 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn admit_launch_prompt(&self, prompt: &mut String, single: bool) -> Result<()> {
+        if self.launch_binding_rejected {
+            prompt.clear();
+            let message = "Session binding changed before admission; using the current binding. The requested change did not apply (stale generation or pending switch). The launch prompt was not sent.";
+            anyhow::ensure!(!single, "{message}");
+            eprintln!("{message}");
+        }
+        Ok(())
+    }
+
     async fn publish_selection(
         &mut self,
         mut next: deepseek_code_core::native_engine::session_binding::BindingSnapshot,
+        picker_effort: Option<Option<&str>>,
     ) -> Result<()> {
         let expected = self.binding_state().generation;
         if !crate::worker_binding::commit(
@@ -524,6 +537,8 @@ impl Session {
             &self.id,
             expected,
             &mut next,
+            &self.binding_requester,
+            picker_effort,
         )
         .await?
         {
@@ -567,7 +582,7 @@ impl Session {
             .find(|m| m.id == selected.id)
             .context("Selected model missing")?
             .fast = enabled;
-        self.publish_selection(next).await
+        self.publish_selection(next, None).await
     }
 
     pub async fn reload_plugins(&self) -> Result<()> {
@@ -808,6 +823,8 @@ impl Session {
                 selected_mode,
             )?;
         }
+        let binding_requester = uuid::Uuid::new_v4().to_string();
+        let mut launch_binding_rejected = false;
         let mut took_launch_selection = false;
         let binding = match host_binding {
             Some(binding) => binding.clone(),
@@ -855,13 +872,11 @@ impl Session {
                             &id,
                             expected,
                             &mut snapshot,
+                            &binding_requester,
+                            None,
                         )
                         .await?;
-                        if !took_launch_selection {
-                            eprintln!(
-                                "Session binding changed before admission; using the current binding. The requested change did not apply (stale generation or pending switch)."
-                            );
-                        }
+                        launch_binding_rejected = !took_launch_selection;
                     }
                 }
                 let binding =
@@ -903,6 +918,8 @@ impl Session {
         let binding = binding.initialized()?;
         let startup_provider=took_launch_selection.then(|| crate::config::StartupProvider::new(&binding.snapshot().provider_id,cli));
         Ok(Self {
+            binding_requester,
+            launch_binding_rejected,
             waiting_for_continue: std::sync::atomic::AtomicBool::new(resumed_id.is_some()),
             binding,
             idle_launch: None,
@@ -939,11 +956,19 @@ impl Session {
     }
 
     pub async fn switch(&mut self, paths: &RuntimePaths, selection: Selection) -> Result<()> {
+        self.switch_with_effort(paths, Some(selection), None).await
+    }
+
+    pub(crate) async fn switch_with_effort(&mut self, paths: &RuntimePaths, selection: Option<Selection>,
+        effort: Option<Option<&str>>) -> Result<()> {
+        let Some(selection) = selection else {
+            return self.publish_selection((*self.binding_state()).clone(), effort).await;
+        };
         let mut state = crate::worker_binding::snapshot(paths, selection, false)?;
         let selected = state.active()?;
         let frontend = self.coordination_mode == crate::local_coordination::RegistrationMode::Automatic;
         if frontend {
-            self.publish_selection(state).await?;
+            self.publish_selection(state, effort).await?;
         } else {
             state.generation = self.binding.read().map_or(0, |s| s.generation);
             self.binding.install(state)?;
@@ -1390,6 +1415,10 @@ impl Session {
     }
 
     pub async fn close(&self) -> Result<()> {
+        if let Err(error) = self.store.db.with_conn(|c|
+            crate::binding_store::release_requester(c, &self.binding_requester)).and_then(|r| r) {
+            eprintln!("Could not release binding notice: {error:#}");
+        }
         deepseek_code_core::services::async_hooks::cancel_shared(&self.paths.data_dir, &self.id)
             .await;
         self.engine.cancel_turn(&self.id).await;
