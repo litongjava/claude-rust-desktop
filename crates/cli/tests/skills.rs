@@ -868,10 +868,10 @@ async fn disabled_builtins_are_absent_from_the_model_listing_but_stay_listed_wit
         .split_once("Available skills")
         .expect("model skill listing")
         .1;
-    assert!(listing.contains("\"name\":\"skill-creator\""), "{listing}");
+    assert!(listing.contains("- skill-creator:"), "{listing}");
     for name in ["task-template", "docx", "pdf", "commit"] {
         assert!(
-            !listing.contains(&format!("\"name\":\"{name}\"")),
+            !listing.contains(&format!("- {name}:")),
             "{name} must not reach the model listing: {listing}"
         );
     }

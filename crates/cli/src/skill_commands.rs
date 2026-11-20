@@ -643,13 +643,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_command_reports_user_only_default_for_translation_skills() {
+    async fn state_command_reports_builtin_translation_skills_off_by_default() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
 
-        // No states file yet: the bundled translation skills are user-only.
+        // No states file yet: bundled built-in skills are off by default.
+        let shown = state_command(&paths, &workspace, Some("translate-zh-en"), None)
+            .await
+            .unwrap();
+        assert_eq!(shown, "translate-zh-en  off");
+
+        // An explicit user choice is still reported as chosen.
+        state_command(
+            &paths,
+            &workspace,
+            Some("translate-zh-en"),
+            Some("user-only"),
+        )
+        .await
+        .unwrap();
         let shown = state_command(&paths, &workspace, Some("translate-zh-en"), None)
             .await
             .unwrap();
