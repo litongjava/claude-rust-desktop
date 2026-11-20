@@ -131,14 +131,21 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
         {
             return output.into();
         }
+        let requested_shell = fields
+            .remove("shell")
+            .and_then(|shell| shell.as_str().map(str::to_owned));
+        // A zero exit code is the normal case; only a failure needs naming.
+        let mut exit_shown = false;
         if let Some(code) = fields.remove("exit_code") {
-            parts.push(format!("Exit code: {code}"));
+            if code.as_i64().is_some_and(|code| code != 0) {
+                parts.push(format!("Exit code: {code}"));
+                exit_shown = true;
+            }
         }
-        if fields.get("success") == Some(&Value::Bool(false)) && parts.is_empty() {
+        if fields.get("success") == Some(&Value::Bool(false)) && !exit_shown {
             parts.push("Command failed".into());
         }
         fields.remove("success");
-        fields.remove("shell");
         for (key, label) in [
             ("timed_out", "Command timed out"),
             ("is_error", "Tool reported an error"),
@@ -153,6 +160,20 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
         ] {
             if fields.remove(key) == Some(Value::Bool(true)) {
                 parts.push(label.into());
+            }
+        }
+        // A pipeline closed early is not a failure; say so in words instead of
+        // leaving a raw flag for the model to decode.
+        if fields.remove("pipeline_sigpipe") == Some(Value::Bool(true)) {
+            parts.push("Output ended early: a later command in the pipeline closed it".into());
+        }
+        // The executable that ran is only news when it is not the one asked
+        // for; a matching shell needs no line at all.
+        if let Some(Value::String(path)) = fields.remove("shell_path") {
+            if let Some(requested) = requested_shell.as_deref() {
+                if !shell_matches(requested, &path) {
+                    parts.push(format!("Shell: {path} (requested {requested})"));
+                }
             }
         }
         if let Some(error) = fields.remove("error") {
@@ -174,6 +195,7 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
             })
             .count()
             .max(1);
+        let mut stdout_body = None;
         for (key, label) in [("stdout", "Output"), ("stderr", "Stderr")] {
             if let Some(Value::String(text)) = fields.remove(key) {
                 if !text.is_empty() {
@@ -181,8 +203,24 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
                         || text.clone(),
                         |budget| crate::performance::head_tail_preview(&text, budget / streams),
                     );
+                    if key == "stdout" {
+                        stdout_body = Some(text.clone());
+                    }
                     bodies.push(format!("{label}:\n{text}"));
                 }
+            }
+        }
+        // Without a status line or a second stream, the `Output:` label adds
+        // nothing: the body is simply the command's output.
+        if prefix.is_empty() && parts.is_empty() && fields.is_empty() {
+            if bodies.len() == 1 {
+                if let Some(text) = stdout_body {
+                    return format!("{text}{suffix}");
+                }
+            } else if bodies.is_empty() {
+                // A successful command with nothing to say must still read as
+                // finished rather than as an unfinished task.
+                return format!("(Completed with no output){suffix}");
             }
         }
     }
@@ -192,6 +230,29 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
     }
     parts.extend(bodies);
     format!("{prefix}{}{suffix}", parts.join("\n"))
+}
+
+/// The executable name a shell path or request resolves to. Both separators
+/// are accepted because a stored result can be replayed on another platform.
+fn shell_stem(value: &str) -> String {
+    let name = value
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(value);
+    let name = if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe")
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    name.to_ascii_lowercase()
+}
+
+/// Whether the shell that actually ran is the one that was requested. The
+/// names are compared as executable stems, so `powershell.exe` matches a
+/// request for `powershell` while `pwsh` stays distinct.
+fn shell_matches(requested: &str, shell_path: &str) -> bool {
+    shell_stem(requested) == shell_stem(shell_path)
 }
 
 #[cfg(test)]
@@ -235,10 +296,7 @@ mod tests {
     #[test]
     fn model_tool_output_preserves_payload_errors_and_hook_suffix() {
         let raw = json!({"stdout":"{\"user_json\": 1}\n", "stderr":"", "exit_code":0,"success":true,"shell":"bash","stdout_truncated":false,"stderr_truncated":false}).to_string();
-        assert_eq!(
-            render("Bash", &raw, None),
-            "Exit code: 0\nOutput:\n{\"user_json\": 1}\n"
-        );
+        assert_eq!(render("Bash", &raw, None), "{\"user_json\": 1}\n");
         assert_eq!(render("mcp__fixture__Bash", &raw, None), raw);
         let error = format!(
             "Error: {}\nPostToolUseFailure context: inspect dependency",
@@ -264,6 +322,88 @@ mod tests {
         assert!(rendered.contains("more lines remain"));
         assert!(rendered.contains("missing name"));
         assert!(rendered.ends_with("   51\tcode"));
+    }
+
+    #[test]
+    fn model_tool_output_shows_only_output_and_required_status() {
+        // A lone stdout body needs neither its label nor an exit-code line.
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","pipeline_sigpipe":false,"stdout_truncated":false,"stderr_truncated":false}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok\n");
+        // Two streams keep their labels so the model can tell them apart.
+        let raw = json!({"stdout":"out","stderr":"err","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Output:\nout\nStderr:\nerr");
+        let raw = json!({"stdout":"","stderr":"err\n","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Stderr:\nerr\n");
+        // A status line keeps the label even for a lone stdout body.
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"stdout_truncated":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Stdout is incomplete (capture or tool limit)\nOutput:\nok\n"
+        );
+        // A silent success must not read as an unfinished task.
+        let raw = json!({"stdout":"","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","pipeline_sigpipe":false,"stdout_truncated":false,"stderr_truncated":false}).to_string();
+        assert_eq!(render("Bash", &raw, None), "(Completed with no output)");
+        // A failure still names its non-zero code.
+        let raw = json!({"stdout":"","stderr":"boom\n","exit_code":2,"success":false,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Exit code: 2\nStderr:\nboom\n");
+        // A failure without a code keeps the existing line.
+        let raw = json!({"stderr":"denied\n","success":false,"shell":"bash"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Command failed\nStderr:\ndenied\n"
+        );
+    }
+
+    #[test]
+    fn model_tool_output_explains_a_pipeline_cut_short() {
+        let raw = json!({"stdout":"first\n","stderr":"","exit_code":0,"success":true,"pipeline_sigpipe":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        let rendered = render("Bash", &raw, None);
+        assert_eq!(
+            rendered,
+            "Output ended early: a later command in the pipeline closed it\nOutput:\nfirst\n"
+        );
+        assert!(!rendered.contains("pipeline_sigpipe"), "{rendered}");
+        assert!(!rendered.contains("Metadata:"), "{rendered}");
+        // A normal success never mentions the flag.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"pipeline_sigpipe":false,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+    }
+
+    #[test]
+    fn model_tool_output_names_only_a_fallback_shell() {
+        // The running executable matches the request, so its path stays hidden.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"pwsh","shell_path":"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+        // Windows PowerShell is not a request for pwsh.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"pwsh","shell_path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Shell: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe (requested pwsh)\nOutput:\nok"
+        );
+        // Case and the .exe suffix do not make powershell a fallback.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"PowerShell","shell_path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.EXE"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+    }
+
+    #[test]
+    fn model_tool_output_keeps_unknown_fields_in_metadata() {
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","task_id":"task-1","note":"kept"}).to_string();
+        let rendered = render("Bash", &raw, None);
+        assert!(rendered.starts_with("Metadata: {"), "{rendered}");
+        assert!(rendered.contains("\"note\":\"kept\""), "{rendered}");
+        assert!(rendered.contains("\"task_id\":\"task-1\""), "{rendered}");
+        assert!(rendered.ends_with("Output:\nok\n"), "{rendered}");
+        assert!(!rendered.contains("shell_path"), "{rendered}");
+        assert!(!rendered.contains("exit_code"), "{rendered}");
+    }
+
+    #[test]
+    fn model_tool_output_leaves_task_results_alone() {
+        // TaskGet/TaskOutput snapshots keep their structured shape here; the
+        // managed-shell payload inside them is rendered by the task layer.
+        let snapshot = json!({"task_id":"task-1","status":"completed","stdout":"done\n","stderr":"","result":"{\"exit_code\":0,\"shell_path\":\"/bin/bash\"}"}).to_string();
+        assert_eq!(render("TaskGet", &snapshot, None), snapshot);
+        assert_eq!(render("TaskOutput", &snapshot, None), snapshot);
     }
 
     fn executor(root: &std::path::Path) -> ToolLoopExecutor {

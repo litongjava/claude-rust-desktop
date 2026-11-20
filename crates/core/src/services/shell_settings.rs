@@ -2,7 +2,20 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+/// Bumped whenever shell settings are saved, so cached tool descriptions can
+/// be rebuilt without watching the settings file.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current settings generation; stable until [`save`] succeeds.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -75,6 +88,7 @@ pub fn save(root: &Path, settings: &ShellSettings) -> Result<()> {
     file.write_all(&serde_json::to_vec_pretty(&value)?)?;
     file.as_file().sync_all()?;
     file.persist(root.join("settings.json"))?;
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -325,7 +339,9 @@ mod tests {
             r#"{"hooks":{"sentinel":true},"sandbox":{"enabled":true}}"#,
         )
         .unwrap();
+        let before = generation();
         set(root.path(), "toolDefault", "pwsh").unwrap();
+        assert!(generation() > before);
         assert_eq!(load(root.path()).unwrap().tool_default, "pwsh");
         assert_eq!(document(root.path()).unwrap()["hooks"]["sentinel"], true);
         let original = std::fs::read(&file).unwrap();
