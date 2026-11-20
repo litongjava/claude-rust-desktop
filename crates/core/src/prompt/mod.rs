@@ -553,13 +553,31 @@ mod tests {
         assert!(!prompt.contains("deepseek-code is available as a CLI in the terminal"));
         assert_eq!(prompt.matches("<memory_guidance>").count(), 1);
         assert!(!prompt.contains("Reply with OK only"));
-        assert!(prompt.contains("-Encoding UTF8"));
-        assert!(prompt.contains("never formatted tables"));
         for mode in ["chat", "work", "study", "cowork", "unknown"] {
             let profile = super::PromptProfile::from_workspace_mode(mode);
             let desktop = super::compose_system_prompt(None, profile);
             assert!(!desktop.contains("<code_behavior>"));
             assert!(desktop.contains("<memory_guidance>"));
+        }
+    }
+
+    #[test]
+    fn code_prompt_has_execution_rules_without_duplicated_tool_text() {
+        let prompt = super::compose_system_prompt(None, super::PromptProfile::Code);
+        assert_eq!(prompt.matches("# Execution and verification").count(), 1);
+        assert!(prompt.contains("In a non-interactive run (no user to reply)"));
+        assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
+        for removed in [
+            "historical name of the shell tool",
+            "Bash timeout is in milliseconds",
+            "AskUserQuestion is for a decision",
+            "exhaustive survey",
+            "Cowork",
+            "Recalled entries",
+            "never formatted tables",
+            "Shell commands initially start",
+        ] {
+            assert!(!prompt.contains(removed), "unexpected text: {removed}");
         }
     }
 
