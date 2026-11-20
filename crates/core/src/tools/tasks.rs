@@ -224,25 +224,29 @@ pub async fn execute_for_session_async(
                 // likewise reads the current snapshot without waiting.
                 let page = super::output_page::PageRequest::parse(&input)?;
                 let (root, id) = (root.to_owned(), id.to_owned());
-                let snapshot = tokio::task::spawn_blocking(move || match page {
-                    super::output_page::PageRequest::Disabled => job_snapshot(&root, &id),
-                    page => job_page(&root, &id, &page),
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    super::bash_process::capture_sync(|| match page {
+                        super::output_page::PageRequest::Disabled => job_snapshot(&root, &id),
+                        page => job_page(&root, &id, &page),
+                    })
                 });
                 let snapshot = if block {
                     let read_deadline = deadline
                         .max(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
                     match tokio::time::timeout_at(read_deadline, snapshot).await {
-                        Ok(result) => Some(result??),
+                        Ok(result) => Some(result?),
                         Err(_) => {
                             timed_out = true;
                             None
                         }
                     }
                 } else {
-                    Some(snapshot.await??)
+                    Some(snapshot.await?)
                 };
                 let (status, mut value) = match snapshot {
-                    Some(value) => {
+                    Some((result, metadata)) => {
+                        let value = result?;
+                        super::bash_process::replace_metadata(metadata);
                         let status = value["status"].as_str().unwrap_or_default().to_owned();
                         (status, value)
                     }
@@ -279,7 +283,8 @@ pub async fn execute_for_session_async(
 fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
     use crate::services::background_sessions;
     let job = background_sessions::get(root, id)?;
-    let (stdout, stderr) = background_sessions::output(root, id)?;
+    let ((stdout, event_size), (stderr, err_size)) =
+        background_sessions::output_snapshot(root, id)?;
     let mut stdout = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -291,9 +296,19 @@ fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let mut from_tail = event_size.from_tail;
     if let Some(report) = job_report(root, &job) {
         stdout = report;
+        from_tail = false;
     }
+    // stdout is a UTF-8 projection of event payloads (or a stored report).
+    // JSONL record metadata is not part of that stream.
+    let out_size = crate::performance::command_output::SnapshotSize {
+        read: stdout.len(),
+        from_tail,
+        ..Default::default()
+    };
+    super::bash_process::publish_snapshot([out_size, err_size], [stdout.len(), stderr.len()]);
     let id = job.id.clone();
     Ok(
         json!({"id":id,"task_id":job.id,"subject":job.title,"status":job.status,"stdout":stdout,"stderr":stderr,"exit_code":job.exit_code,"error":job.error}),
@@ -405,6 +420,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
         let stdout = bounded_head(&report, *max_bytes);
         let remaining = max_bytes.saturating_sub(stdout.text.len() as u64);
         let stderr = output_page::read_stream_page(stderr_stream.as_mut(), err, remaining, done)?;
+        super::bash_process::publish_page(&stdout, &stderr, || value["exit_code"].as_i64());
         let truncated = stdout.truncated || stderr.truncated;
         value["stdout"] = json!(stdout.text);
         value["stderr"] = json!(stderr.text);
@@ -436,6 +452,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
     )
     .with_out_skip(stdout.skip)
     .with_out_join(stdout.joined);
+    super::bash_process::publish_page(&stdout, &stderr, || value["exit_code"].as_i64());
     let truncated = stdout.truncated || stderr.truncated;
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
@@ -1853,6 +1870,40 @@ mod tests {
             insert_assistant(root, session, "report-1", report, 1);
         }
         id
+    }
+
+    #[tokio::test]
+    async fn job_task_get_keeps_raw_sizes_across_the_blocking_page_read() {
+        use crate::tools::bash_process::{with_capture, CommandMetadata};
+
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = job_fixture_with(root.path(), &session, "running", None, &[], None);
+        let directory = crate::services::background_sessions::directory(root.path(), &id).unwrap();
+        for size in [11_999, 12_000] {
+            let mut bytes = vec![b'x'; size];
+            bytes[0] = 0xff;
+            std::fs::write(directory.join("stderr.log"), bytes).unwrap();
+            let (value, metadata) = with_capture(execute_for_session_async(
+                "TaskGet",
+                json!({"task_id":id,"max_output_bytes":16_000,"block":false}),
+                root.path(),
+                &session,
+            ))
+            .await;
+            let value = value.unwrap();
+            let text = value["stderr"].as_str().unwrap();
+            assert_eq!(text.len(), size + 2);
+            let Some(CommandMetadata::Page { bytes, widths, .. }) = metadata else {
+                panic!("missing page metrics for {size} bytes")
+            };
+            assert_eq!(bytes, [0, size]);
+            assert_eq!(widths[1].raw_bytes(text.len()), size);
+            assert_eq!(
+                crate::performance::command_output::qualifies(bytes, false),
+                size >= 12_000
+            );
+        }
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ pub(crate) mod apply_patch_apply;
 pub(crate) mod apply_patch_fs;
 pub(crate) mod apply_patch_tool;
 pub mod background_shell;
-mod bash_process;
+pub(crate) mod bash_process;
 #[cfg(windows)]
 mod conpty;
 pub mod file_change;

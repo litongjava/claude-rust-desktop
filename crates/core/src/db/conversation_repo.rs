@@ -50,9 +50,28 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
         super::turn_repo::copy_message_turn(&transaction, &message.id, &new_message_id, &new_id)?;
         let mut tool_ids = std::collections::HashMap::new();
         for tool in message_repo::get_tool_calls_for_message(&transaction, &message.id)? {
-            let new_tool_id = uuid::Uuid::new_v4().to_string();
-            message_repo::insert_tool_call(&transaction, &new_tool_id, &new_message_id, &tool.name,
-                tool.input.as_deref(), tool.output.as_deref(), tool.is_error, tool.sort_order)?;
+            // Shell result metadata is private sidecar data.
+            // Its unique occurrence suffix identifies them in every branch.
+            let new_tool_id = tool
+                .id
+                .rsplit(':')
+                .next()
+                .filter(|id| {
+                    matches!(tool.name.as_str(), "Bash" | "PowerShell" | "TaskGet" | "TaskOutput")
+                        && id.starts_with("inv-")
+                })
+                .map(|id| format!("{new_message_id}:{id}"))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            message_repo::insert_tool_call(
+                &transaction,
+                &new_tool_id,
+                &new_message_id,
+                &tool.name,
+                tool.input.as_deref(),
+                tool.output.as_deref(),
+                tool.is_error,
+                tool.sort_order,
+            )?;
             transaction.execute("INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) SELECT ?1,?2,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs WHERE conversation_id=?3 AND tool_use_id=?4", params![new_id,new_tool_id,source_id,tool.id])?;
             transaction.execute("INSERT INTO tool_call_notes (tool_call_id, note) SELECT ?1, note FROM tool_call_notes WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;
             transaction.execute("INSERT INTO tool_queued_inputs (tool_call_id, inputs_json) SELECT ?1, inputs_json FROM tool_queued_inputs WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;

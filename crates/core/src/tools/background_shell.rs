@@ -783,7 +783,8 @@ pub fn request_background(root: &Path, session: &str) -> Result<()> {
 }
 
 /// Aborts a foreground call's process when the turn drops it.
-struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<Value>>>);
+type ForegroundResult = Result<(Value, Option<super::bash_process::ShellCapture>)>;
+struct AbortOnDrop(Option<tokio::task::JoinHandle<ForegroundResult>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
@@ -892,7 +893,14 @@ pub(super) async fn run_foreground(
         // A managed call carries no timeout inside the capture: the poll loop
         // below hands the process to the model as a background task, so a
         // foreground timeout never kills what the command has already achieved.
-        super::bash_process::run_logged(&mut command, None, &shell_name, Some(logs), None).await
+        super::bash_process::run_logged_with_capture(
+            &mut command,
+            None,
+            &shell_name,
+            Some(logs),
+            None,
+        )
+        .await
     })));
     let reason = loop {
         let handle = running.0.as_mut().context("Shell task missing")?;
@@ -900,7 +908,9 @@ pub(super) async fn run_foreground(
             result = handle => {
                 running.0 = None;
                 let _ = std::fs::remove_dir_all(&directory);
-                return result.context("Shell task stopped")?;
+                let (value, capture) = result.context("Shell task stopped")??;
+                super::bash_process::publish_capture(capture);
+                return Ok(value);
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 let requested = std::fs::metadata(&signal)
@@ -960,7 +970,7 @@ pub(super) async fn run_foreground(
             }
         };
         let output = match result {
-            Ok(Ok(output)) => output,
+            Ok(Ok((output, _))) => output,
             Ok(Err(error)) => json!({"is_error":true,"error":format!("{error:#}")}),
             Err(error) => json!({"is_error":true,"error":format!("{error}")}),
         };
@@ -1393,7 +1403,12 @@ pub(super) fn control(
                 json!({"task_id":id,"status":status,"cancellation_requested":true,"message":"Monitor stop requested; you will get a final 'stopped' notification."}),
             ));
         }
-        let stdout = read_tail(&directory.join("stdout.log"), 64 * 1024)?;
+        let (stdout, size) = crate::performance::command_output::SnapshotSize::read_log(
+            &directory.join("stdout.log"),
+            64 * 1024,
+            true,
+        )?;
+        super::bash_process::publish_snapshot([size, Default::default()], [stdout.len(), 0]);
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
             .map(|file| {
@@ -1428,22 +1443,16 @@ pub(super) fn control(
         }
         return Ok(Some(value));
     }
-    let read = |name| -> Result<String> {
-        use std::io::Read;
-        match std::fs::File::open(directory.join(name)) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(1024 * 1024).read_to_end(&mut bytes)?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(error) => Err(error.into()),
-        }
+    let read = |name| {
+        crate::performance::command_output::SnapshotSize::read_log(
+            &directory.join(name),
+            1024 * 1024,
+            false,
+        )
     };
-    // TaskGet keeps the stored task fields (description, owner, metadata,
-    // dependencies, output) and adds the live status and bounded logs.
-    let stdout = read("stdout.log")?;
-    let stderr = read("stderr.log")?;
+    let (stdout, out_size) = read("stdout.log")?;
+    let (stderr, err_size) = read("stderr.log")?;
+    super::bash_process::publish_snapshot([out_size, err_size], [stdout.len(), stderr.len()]);
     let mut snapshot = task;
     snapshot["task_id"] = json!(id);
     snapshot["status"] = status.clone();
@@ -1741,6 +1750,16 @@ fn page_task_get(
     let mut value = task;
     value["task_id"] = json!(id);
     value["status"] = status.clone();
+    super::bash_process::publish_page(&stdout, &stderr, || {
+        [&value["result"], &value["output"]]
+            .into_iter()
+            .filter(|_| done)
+            .find_map(|result| {
+                result["exit_code"].as_i64().or_else(|| {
+                    serde_json::from_str::<Value>(result.as_str()?).ok()?["exit_code"].as_i64()
+                })
+            })
+    });
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
     // Page mode exposes only the page; the stored text is never repeated.
@@ -1831,22 +1850,25 @@ pub(super) async fn control_async(
             snapshot_input.clone(),
             name.clone(),
         );
-        let snapshot = tokio::task::spawn_blocking(move || control(&name, &input, &root, &session));
-        let snapshot = if wait && managed_directory {
+        let snapshot = tokio::task::spawn_blocking(move || {
+            super::bash_process::capture_sync(|| control(&name, &input, &root, &session))
+        });
+        let (snapshot, metadata) = if wait && managed_directory {
             match tokio::time::timeout_at(deadline, snapshot).await {
-                Ok(result) => result??,
+                Ok(result) => result?,
                 Err(_) => {
                     last["retrieval_status"] = json!("timeout");
                     return Ok(Some(last));
                 }
             }
         } else {
-            snapshot.await??
+            snapshot.await?
         };
-        let Some(mut value) = snapshot else {
+        let Some(mut value) = snapshot? else {
             return Ok(None);
         };
         value["block"] = json!(block);
+        super::bash_process::replace_metadata(metadata);
         if terminal(&value["status"]) || !wait {
             return Ok(Some(value));
         }
@@ -5877,11 +5899,7 @@ mod foreground_output_tests {
     fn output_tracks_appends_and_excludes_other_sessions_and_background_tasks() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let path = root
-            .path()
-            .join("shell-tasks")
-            .join(&session)
-            .join("fg-test");
+        let path = root.path().join("shell-tasks").join(&session).join("fg-test");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("foreground-active"), b"running").unwrap();
         std::fs::write(path.join("stdout.log"), b"first").unwrap();
@@ -5908,7 +5926,11 @@ mod foreground_output_tests {
     fn an_unreadable_stream_is_skipped_by_foreground_output() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let path = root.path().join("shell-tasks").join(&session).join("fg-test");
+        let path = root
+            .path()
+            .join("shell-tasks")
+            .join(&session)
+            .join("fg-test");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("foreground-active"), b"running").unwrap();
         std::fs::write(path.join("command.txt"), b"fixture").unwrap();

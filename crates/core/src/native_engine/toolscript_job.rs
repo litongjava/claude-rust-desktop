@@ -711,6 +711,7 @@ fn snapshot(directory: &Path, id: &str, input: &Value, block: bool) -> Result<Va
             )?;
         }
         let page = output_page::read_stream_page(stream.as_mut(), offset, max_bytes, done)?;
+        crate::tools::bash_process::publish_page(&page, &Default::default(), || None);
         let next = Cursor::new(
             id,
             "toolscript",
@@ -730,7 +731,13 @@ fn snapshot(directory: &Path, id: &str, input: &Value, block: bool) -> Result<Va
         return Ok(value);
     }
 
-    let (stdout, truncated) = read_bounded(&directory.join("output.log"), SNAPSHOT_LIMIT)?;
+    let (stdout, size) = crate::performance::command_output::SnapshotSize::read_log(
+        &directory.join("output.log"),
+        SNAPSHOT_LIMIT,
+        false,
+    )?;
+    let truncated = size.omitted > 0;
+    crate::tools::bash_process::publish_snapshot([size, Default::default()], [stdout.len(), 0]);
     value["stdout"] = json!(stdout);
     value["stderr"] = json!("");
     value["output_truncated"] = json!(truncated);

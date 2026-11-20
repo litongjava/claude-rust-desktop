@@ -1,5 +1,17 @@
 //! Model-only rendering. Stored results, hooks and UI events keep their original data.
+use crate::performance::{
+    preview_with_ranges, retain_tool_output_with_ranges, PreviewRanges, LONG_COMMAND_OUTPUT_BYTES,
+    MODEL_TOOL_OUTPUT_BYTES,
+};
+use crate::tools::bash_process::CommandMetadata;
 use serde_json::Value;
+use std::{ops::Range, path::Path};
+
+const DIGEST_BUDGET: usize = 2048;
+const MIN_JSON_DIGEST_ROOM: usize = 256;
+
+#[path = "command_output_summary.rs"]
+mod command_output_summary;
 
 impl super::ToolLoopExecutor {
     /// Called by both provider builders, after typed MCP/image restoration.
@@ -22,7 +34,11 @@ impl super::ToolLoopExecutor {
                         .and_then(|id| names.get(id)),
                     message["content"].as_str(),
                 ) {
-                    message["content"] = Value::String(self.preview_tool_output(name, text));
+                    message["content"] = Value::String(self.preview_tool_output_for_id(
+                        name,
+                        text,
+                        message["tool_call_id"].as_str(),
+                    ));
                 }
             } else if let Some(blocks) = message["content"].as_array_mut() {
                 for block in blocks {
@@ -36,7 +52,15 @@ impl super::ToolLoopExecutor {
                         if let Some(name) =
                             block["tool_use_id"].as_str().and_then(|id| names.get(id))
                         {
-                            self.retain_content(name, &mut block["content"]);
+                            if let Some(text) = block["content"].as_str() {
+                                block["content"] = Value::String(self.preview_tool_output_for_id(
+                                    name,
+                                    text,
+                                    block["tool_use_id"].as_str(),
+                                ));
+                            } else {
+                                self.retain_content(name, &mut block["content"]);
+                            }
                         }
                     }
                 }
@@ -66,6 +90,20 @@ impl super::ToolLoopExecutor {
 }
 
 pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> String {
+    render_with_spans(name, output, body_budget, &mut [None, None])
+}
+
+struct BodySpan {
+    start: usize,
+    ranges: PreviewRanges,
+}
+
+fn render_with_spans(
+    name: &str,
+    output: &str,
+    body_budget: Option<usize>,
+    spans: &mut [Option<BodySpan>; 2],
+) -> String {
     if !matches!(
         name,
         "Bash" | "Read" | "Write" | "Edit" | "MultiEdit" | "ApplyPatch"
@@ -102,6 +140,7 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
     }
     let mut parts = Vec::new();
     let mut bodies = Vec::new();
+    let mut span_parts = Vec::new();
     if name == "Read" {
         let Some(content) = fields
             .get("content")
@@ -131,6 +170,7 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
         {
             return output.into();
         }
+        fields.remove("output_capture");
         if let Some(code) = fields.remove("exit_code") {
             parts.push(format!("Exit code: {code}"));
         }
@@ -174,13 +214,15 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
             })
             .count()
             .max(1);
-        for (key, label) in [("stdout", "Output"), ("stderr", "Stderr")] {
+        for (index, (key, label)) in [("stdout", "Output"), ("stderr", "Stderr")]
+            .into_iter()
+            .enumerate()
+        {
             if let Some(Value::String(text)) = fields.remove(key) {
                 if !text.is_empty() {
-                    let text = body_budget.map_or_else(
-                        || text.clone(),
-                        |budget| crate::performance::head_tail_preview(&text, budget / streams),
-                    );
+                    let budget = body_budget.map_or(text.len(), |budget| budget / streams);
+                    let (text, ranges) = preview_with_ranges(&text, budget);
+                    span_parts.push((index, label.len() + 2, ranges));
                     bodies.push(format!("{label}:\n{text}"));
                 }
             }
@@ -190,14 +232,437 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
     if !fields.is_empty() {
         parts.push(format!("Metadata: {}", Value::Object(fields)));
     }
+    let mut offset = prefix.len() + parts.iter().map(|part| part.len() + 1).sum::<usize>();
+    for ((index, label_len, ranges), body) in span_parts.into_iter().zip(&bodies) {
+        spans[index] = Some(BodySpan {
+            start: offset + label_len,
+            ranges,
+        });
+        offset += body.len() + 1;
+    }
     parts.extend(bodies);
     format!("{prefix}{}{suffix}", parts.join("\n"))
+}
+
+pub(super) fn is_shell_result(name: &str) -> bool {
+    matches!(name, "Bash" | "PowerShell" | "TaskGet" | "TaskOutput")
+}
+
+pub(super) fn metadata_path(root: &Path, id: &str) -> std::path::PathBuf {
+    // Transcript row ids prefix the occurrence with the assistant message id.
+    let id = id.rsplit(':').next().unwrap_or(id);
+    let digest = ring::digest::digest(&ring::digest::SHA256, id.as_bytes());
+    let key: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    root.join("tool-output-metadata")
+        .join(format!("{key}.json"))
+}
+
+pub(super) fn save_metadata(
+    root: &Path,
+    id: &str,
+    capture: &CommandMetadata,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = metadata_path(root, id);
+    let dir = root.join("tool-output-metadata");
+    std::fs::create_dir_all(&dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(&serde_json::to_vec(capture)?)?;
+    file.persist(path)?;
+    Ok(())
+}
+
+pub(super) fn command_preview(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    metadata: Option<&CommandMetadata>,
+    enabled: bool,
+) -> String {
+    command_preview_with_room(name, raw, root, metadata, enabled, MIN_JSON_DIGEST_ROOM)
+}
+
+fn command_preview_with_room(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    metadata: Option<&CommandMetadata>,
+    enabled: bool,
+    json_room: usize,
+) -> String {
+    use command_output_summary::{CommandOutput, Stream};
+
+    let bash = name == "Bash";
+    let (capture, page_exit, page_bytes) = match metadata {
+        Some(CommandMetadata::Shell(capture)) => (Some(capture), None, None),
+        Some(CommandMetadata::PageExit(exit)) => (None, Some(*exit), None),
+        Some(CommandMetadata::Page {
+            exit,
+            bytes,
+            widths,
+        }) => (None, *exit, Some((bytes, widths))),
+        Some(CommandMetadata::Snapshot(_)) | None => (None, None, None),
+    };
+    let cleaned = render(name, raw, None);
+    let mut spans = [None, None];
+    let draft = if bash && root.is_some() {
+        render_with_spans(name, raw, Some(LONG_COMMAND_OUTPUT_BYTES), &mut spans)
+    } else {
+        if bash {
+            render_with_spans(name, raw, None, &mut spans);
+        }
+        cleaned.clone()
+    };
+    let retain = |limit| match root {
+        Some(root) => retain_tool_output_with_ranges(root, &cleaned, &draft, limit),
+        None => (draft.clone(), Some(PreviewRanges::whole(draft.len()))),
+    };
+    let (mut base, mut retained) = retain(MODEL_TOOL_OUTPUT_BYTES);
+    if !enabled {
+        return base;
+    }
+    let task = matches!(name, "TaskGet" | "TaskOutput");
+    let json = raw.strip_prefix("Error: ").unwrap_or(raw);
+    let mut input = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+    let Some(Ok(value @ Value::Object(_))) = input.next() else {
+        return base;
+    };
+    if !bash && value.get("model_output_summary").is_some() {
+        return base;
+    }
+    let json_end = raw.len() - json.len() + input.byte_offset();
+    let nested = if task {
+        value["result"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    } else {
+        None
+    };
+    let command = nested
+        .as_ref()
+        .or(value["result"]
+            .as_object()
+            .filter(|_| task)
+            .map(|_| &value["result"]))
+        .unwrap_or(&value);
+    let legacy_capture = &command["output_capture"];
+    let strings = |key: &str| value[key].as_str().unwrap_or("");
+    let (stdout, stderr) = (strings("stdout"), strings("stderr"));
+    let streams = if task && stdout.is_empty() && stderr.is_empty() {
+        [("output", strings("output")), ("stderr", stderr)]
+    } else {
+        [("stdout", stdout), ("stderr", stderr)]
+    };
+    let page = value["output_mode"] == "page";
+    let page_end = value["next_cursor"]
+        .as_str()
+        .filter(|_| page)
+        .and_then(|cursor| crate::tools::output_page::Cursor::decode(cursor).ok());
+    let state = value["status"]
+        .as_str()
+        .or_else(|| (value["timed_out"] == true).then_some("timed out"));
+    let mut streams = streams.map(|(key, text)| {
+        let index = usize::from(key == "stderr");
+        let snapshot = match metadata {
+            Some(CommandMetadata::Snapshot(streams)) => Some(&streams[index]),
+            _ => None,
+        };
+        let stats = capture.and_then(|capture| match key {
+            "stdout" => Some(&capture.stdout),
+            "stderr" => Some(&capture.stderr),
+            _ => None,
+        });
+        // Snapshot/page text belongs to this log read. Stored command totals
+        // may describe a different or more complete result.
+        let legacy = |field: &str| {
+            if snapshot.is_some() || page {
+                return None;
+            }
+            usize::try_from(legacy_capture[key][field].as_u64()?).ok()
+        };
+        let flagged = match key {
+            "stdout" => value["stdout_truncated"] == true,
+            "stderr" => value["stderr_truncated"] == true,
+            _ => false,
+        };
+        let bytes = snapshot
+            .filter(|s| !s.from_tail || s.omitted > 0)
+            .map(|s| s.read.saturating_add(s.omitted))
+            .or_else(|| stats.map(|s| s.bytes))
+            .or_else(|| legacy("bytes"));
+        let lines = stats.map(|s| s.lines).or_else(|| legacy("lines"));
+        let capture_elided = stats
+            .map(|s| s.capture_elided_bytes)
+            .or_else(|| {
+                snapshot
+                    .filter(|s| !s.from_tail || s.omitted > 0)
+                    .map(|s| s.omitted)
+            })
+            .or_else(|| legacy("capture_elided_bytes"));
+        let tool_elided = stats
+            .map(|s| s.tool_elided_text_bytes)
+            .or_else(|| legacy("tool_elided_text_bytes"));
+        let source_ranges = stats.map(|s| s.ranges.clone()).filter(|ranges| {
+            ranges
+                .iter()
+                .all(|r| r.start <= r.end && text.get(r.clone()).is_some())
+        });
+        let offset = page_end.as_ref().map(|end| {
+            if key == "stderr" {
+                end.err()
+            } else {
+                end.out()
+            }
+        });
+        let partial = snapshot.is_some_and(|s| s.omitted > 0 || s.from_tail)
+            || page
+            || flagged
+            || (task && value["output_truncated"] == true)
+            || bytes.is_some_and(|n| n > text.len())
+            || state.is_some_and(|state| {
+                matches!(state, "running" | "pending" | "starting" | "timed out")
+            })
+            || value["backgrounded"] == true;
+        (
+            key,
+            Stream {
+                text,
+                excerpts: stats.and_then(|s| s.excerpts.clone()),
+                relative: flagged && source_ranges.is_none()
+                    || snapshot.is_some_and(|s| s.from_tail),
+                window_bytes: page_bytes
+                    .map(|(bytes, _)| bytes[index])
+                    .or_else(|| snapshot.map(|s| s.read)),
+                bytes,
+                lines: lines.or_else(|| {
+                    (!partial || snapshot.is_some_and(|s| !s.from_tail && s.omitted == 0)).then(
+                        || {
+                            crate::performance::command_output::ByteLines::measure(text.as_bytes())
+                                .lines()
+                        },
+                    )
+                }),
+                partial,
+                capture_elided,
+                tool_elided,
+                first_lines: stats.map(|s| s.first_lines.clone()).unwrap_or_default(),
+                widths: stats
+                    .map(|s| &s.widths)
+                    .or_else(|| snapshot.map(|s| &s.widths))
+                    .or_else(|| page_bytes.map(|(_, w)| &w[usize::from(key == "stderr")]))
+                    .cloned()
+                    .unwrap_or_default(),
+                source_ranges,
+                visible: None,
+                page_continuation: page
+                    && (offset
+                        != page_bytes
+                            .map(|(bytes, _)| bytes[usize::from(key == "stderr")] as u64)
+                            .or_else(|| u64::try_from(text.len()).ok())
+                        || page_bytes.is_none() && !value["output_gap"].is_null()),
+            },
+        )
+    });
+    // A shell's authoritative source length is measured before replacement.
+    // Text-only backends supply UTF-8 stream values as their source.
+    let bytes = page_bytes.map(|(bytes, _)| *bytes).unwrap_or_else(|| {
+        streams.each_ref().map(|(_, stream)| {
+            stream.window_bytes.or(stream.bytes).unwrap_or_else(|| {
+                // A legacy Bash transcript may lack raw capture metadata. A
+                // replacement could represent just one byte; qualify only
+                // when even the lower bound reaches the threshold.
+                if bash
+                    || (task && value["metadata"]["managed_shell"] == true)
+                    || value["output_gap"]["reason"] == "invalid_utf8"
+                {
+                    stream.text.len() - 2 * stream.text.matches('�').count()
+                } else {
+                    stream.text.len()
+                }
+            })
+        })
+    });
+    let truncated =
+        !task && (value["stdout_truncated"] == true || value["stderr_truncated"] == true);
+    if !crate::performance::command_output::qualifies(bytes, truncated) {
+        return base;
+    }
+
+    // Preserve complete result JSON whenever it leaves room for the digest's
+    // status and counts. Otherwise use the same preview and spill as large results.
+    let keep_json = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES - json_room;
+    if !keep_json && root.is_some() && base.len() > MODEL_TOOL_OUTPUT_BYTES - DIGEST_BUDGET {
+        (base, retained) = retain(MODEL_TOOL_OUTPUT_BYTES - DIGEST_BUDGET);
+    }
+    let json_result = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
+    let outer = retained.unwrap_or_else(|| {
+        if bash {
+            // Without a spill, the retained result is the full cleaned output.
+            render_with_spans(name, raw, None, &mut spans);
+        }
+        PreviewRanges::whole(cleaned.len())
+    });
+    let serialized_elided = if bash || json_result {
+        0
+    } else {
+        cleaned.len().saturating_sub(outer.kept())
+    };
+    // RawValue borrows the original JSON spelling, including escaped keys and
+    // strings. Serialized byte cuts must be projected before counting lines.
+    let json_fields = (serialized_elided > 0)
+        .then(|| {
+            serde_json::from_str::<std::collections::HashMap<String, &serde_json::value::RawValue>>(
+                &raw[raw.len() - json.len()..json_end],
+            )
+            .ok()
+        })
+        .flatten();
+    for ((key, stream), span) in streams.iter_mut().zip(spans) {
+        let all = [0..stream.text.len()];
+        let sources = stream.source_ranges.as_deref().unwrap_or(&all);
+        if json_result {
+            stream.visible = Some(sources.to_vec());
+        } else if let Some(span) = span {
+            stream.visible = Some(visible_ranges(sources, &span, &outer));
+        } else if let Some(field) = json_fields.as_ref().and_then(|fields| fields.get(*key)) {
+            let encoded = field.get();
+            if encoded.starts_with('"') {
+                let start = encoded.as_ptr() as usize - raw.as_ptr() as usize;
+                stream.visible = Some(visible_json_string(stream.text, encoded, start, &outer));
+            }
+        }
+    }
+
+    let summary = command_output_summary::summarize(&CommandOutput {
+        streams,
+        exit: value["exit_code"]
+            .as_i64()
+            .or_else(|| command["exit_code"].as_i64())
+            .or(page_exit),
+        duration_ms: capture
+            .map(|s| s.duration_ms)
+            .or_else(|| legacy_capture["duration_ms"].as_u64())
+            .or_else(|| value["duration_ms"].as_u64())
+            .or_else(|| {
+                value["finished_ms"]
+                    .as_u64()?
+                    .checked_sub(value["started_ms"].as_u64()?)
+            }),
+        page,
+        log_snapshot: matches!(metadata, Some(CommandMetadata::Snapshot(_))),
+        serialized_elided,
+    });
+    let available = MODEL_TOOL_OUTPUT_BYTES
+        .saturating_sub(base.len())
+        .min(DIGEST_BUDGET);
+    let encode = |text: &str| {
+        if json_result {
+            format!(
+                ",\"model_output_summary\":{}",
+                serde_json::to_string(text).expect("string serialization")
+            )
+        } else {
+            format!("\n\n{text}")
+        }
+    };
+    // Only spill an otherwise complete JSON preview when its actual summary
+    // needs the space. Recompute visibility against the new excerpt.
+    if json_result
+        && root.is_some()
+        && json_room < DIGEST_BUDGET
+        && encode(&summary).len() > available
+    {
+        return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
+    }
+    // Whole digest lines are atomic, including under JSON escaping.
+    let mut end = 0;
+    for (line_end, _) in summary
+        .match_indices('\n')
+        .chain(std::iter::once((summary.len(), "")))
+    {
+        if encode(&summary[..line_end]).len() > available {
+            break;
+        }
+        end = line_end;
+    }
+    if end > "Command output summary".len() {
+        if json_result {
+            base.insert_str(json_end - 1, &encode(&summary[..end]));
+        } else {
+            base.push_str(&encode(&summary[..end]));
+        }
+    }
+    base
+}
+
+/// Map complete visible JSON string scalars back to the decoded stream.
+fn visible_json_string(
+    text: &str,
+    encoded: &str,
+    start: usize,
+    outer: &PreviewRanges,
+) -> Vec<Range<usize>> {
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    let mut pos = 1; // opening quote
+    for (offset, ch) in text.char_indices() {
+        let width = match encoded.as_bytes().get(pos..) {
+            Some([b'\\', b'u', ..]) if ch.len_utf8() == 4 => 12, // surrogate pair
+            Some([b'\\', b'u', ..]) => 6,
+            Some([b'\\', ..]) => 2,
+            _ => ch.len_utf8(),
+        };
+        let end = pos + width;
+        if [&outer.head, &outer.tail]
+            .iter()
+            .any(|r| r.start <= start + pos && start + end <= r.end)
+        {
+            if let Some(last) = spans.last_mut().filter(|r| r.end == offset) {
+                last.end += ch.len_utf8();
+            } else {
+                spans.push(offset..offset + ch.len_utf8());
+            }
+        }
+        pos = end;
+    }
+    spans
+}
+
+fn visible_ranges(
+    sources: &[Range<usize>],
+    span: &BodySpan,
+    outer: &PreviewRanges,
+) -> Vec<Range<usize>> {
+    let mut visible = Vec::new();
+    for (inner, offset) in span.ranges.parts() {
+        let start = span.start + offset;
+        for (kept, _) in outer.parts() {
+            for source in sources {
+                let from = inner
+                    .start
+                    .max(source.start)
+                    .max(inner.start + kept.start.saturating_sub(start));
+                let to = inner
+                    .end
+                    .min(source.end)
+                    .min(inner.start + kept.end.saturating_sub(start));
+                if from < to {
+                    visible.push(from..to);
+                }
+            }
+        }
+    }
+    visible
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;
+    use crate::tools::bash_process::ShellCapture;
 
     #[test]
     fn apply_patch_keeps_paths_and_counts_but_not_per_file_diffs() {
@@ -266,6 +731,279 @@ mod tests {
         assert!(rendered.ends_with("   51\tcode"));
     }
 
+    #[test]
+    fn model_tool_output_short_or_disabled_shell_output_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = executor(temp.path());
+        let stdout = include_str!("test_summary_fixtures/vitest-pass.stdout");
+        let raw = format!(
+            "{}\nHook context: preserve this",
+            json!({"stdout":stdout, "stderr":"diagnostic", "exit_code":0})
+        );
+        let original = render("Bash", &raw, None);
+        assert_eq!(engine.retained_tool_output("Bash", &raw), original);
+        assert_eq!(engine.retained_tool_output("mcp__fixture__Bash", &raw), raw);
+        let hook_only = format!("{}\n{stdout}", json!({"stdout":"hello", "exit_code":0}));
+        assert_eq!(
+            engine.retained_tool_output("Bash", &hook_only),
+            render("Bash", &hook_only, None)
+        );
+        let raw = json!({"stdout":"line\n".repeat(3000), "exit_code":0}).to_string();
+        let original = render("Bash", &raw, None);
+        assert_eq!(command_preview("Bash", &raw, None, None, false), original);
+    }
+
+    #[test]
+    fn model_tool_output_short_literal_capture_marker_is_exact() {
+        let stdout = "... (capture truncated; middle omitted) ...\n";
+        assert_eq!(stdout.len(), 44);
+        let raw = json!({"stdout":stdout,"stderr":"","stdout_truncated":false,"stderr_truncated":false,"success":true,"exit_code":0,"shell":"bash"}).to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let expected = format!("Exit code: 0\nOutput:\n{stdout}");
+        assert_eq!(
+            command_preview("Bash", &raw, Some(temp.path()), None, true),
+            expected
+        );
+        assert_eq!(
+            command_preview("Bash", &raw, Some(temp.path()), None, false),
+            expected
+        );
+    }
+
+    #[test]
+    fn model_tool_output_reviewed_capture_counts_exclude_markers_and_keep_excerpts_unique() {
+        for large in [false, true] {
+            let (stdout, capture) = crate::tools::bash_process::review_capture(large);
+            let raw = json!({"stdout":stdout,"stderr":"","stdout_truncated":true,"exit_code":0})
+                .to_string();
+            let temp = tempfile::tempdir().unwrap();
+            let metadata = CommandMetadata::Shell(capture);
+            let result = command_preview("Bash", &raw, Some(temp.path()), Some(&metadata), true);
+            let CommandMetadata::Shell(capture) = metadata else {
+                unreachable!()
+            };
+            let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
+            if large {
+                let stream = &capture.stdout;
+                assert_eq!((stream.bytes, stream.lines), (52_428_888, 819_204));
+                let (_, stdout) = body.split_once("Output:\n").unwrap();
+                let (stdout, _) = stdout.rsplit_once("\nSaved tool result (").unwrap();
+                let (head, clipped) = stdout.split_once("\n... (output truncated; ").unwrap();
+                let (_, tail) = clipped.split_once(" bytes before preview) ...\n").unwrap();
+                let shown = head.len() + tail.len();
+                let lines = head.lines().count() + tail.lines().count();
+                assert!(summary.contains(&format!("stdout {shown} text bytes, {lines} lines shown of 52428888 source bytes / 819204 lines")), "{summary}");
+                let tool_text = stream.ranges.iter().map(Range::len).sum::<usize>();
+                assert!(
+                    summary.contains(&format!(
+                        "Model preview omitted {} text bytes",
+                        tool_text - shown
+                    )),
+                    "{summary}"
+                );
+                assert_eq!(
+                    result.matches("warning: final fixture").count(),
+                    1,
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains(r#"Notable stdout L409602 | "error: midpoint sentinel""#),
+                    "{summary}"
+                );
+            } else {
+                assert!(body.ends_with("Output:\n..."), "{body}");
+                assert!(
+                    summary.contains(
+                        "stdout 0 text bytes, 0 lines shown of 50 source bytes / 1 lines"
+                    ),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("50 text bytes omitted by tool preview"),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("small payload that the configured limit truncates"),
+                    "{summary}"
+                );
+            }
+            assert!(result.len() <= MODEL_TOOL_OUTPUT_BYTES);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_tool_output_desktop_runtime_uses_selected_data_dir_for_opt_out() {
+        use crate::native_engine::{engine_core::ChatRequest, provider_manager::ProviderManager};
+        use crate::runtime;
+        use axum::{routing::post, Json, Router};
+
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = runtime::SessionStore::new(runtime.open_database().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut requests) = mpsc::channel(4);
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let tx = tx.clone();
+            async move {
+                tx.send(body).await.unwrap();
+                ([("content-type", "text/event-stream")], concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ))
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let resolved = executor(&workspace).provider;
+        let mut provider = resolved.provider;
+        provider.models = vec![resolved.model];
+        provider.base_url = base;
+        let providers =
+            ProviderManager::in_memory(vec![provider], runtime.data_dir.join("providers.json"));
+        // The Desktop Bridge builds its NativeEngine with this same data-root path.
+        let engine = runtime::create_engine(
+            &runtime,
+            store.db.clone(),
+            Arc::new(Mutex::new(providers)),
+            runtime::default_permissions(),
+            Arc::new(crate::cache::FileCache::new()),
+        );
+        for enabled in [true, false] {
+            if !enabled {
+                crate::config::command_output::set(&runtime.data_dir, false).unwrap();
+            }
+            let id = store.create(&workspace, "fixture", "fixture").unwrap();
+            let raw = json!({"stdout": "test line\n".repeat(1400), "exit_code":0}).to_string();
+            let request: ChatRequest = serde_json::from_value(json!({
+                "conversation_id": id, "provider_id": "fixture", "model": "fixture",
+                "workspace_path": workspace,
+                "messages": [
+                    {"role":"user","content":"run"},
+                    {"role":"assistant","content":"","tool_calls":[
+                        {"id":"fixture-shell","type":"function","function":{"name":"Bash","arguments":"{}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"fixture-shell","content":raw},
+                    {"role":"user","content":"continue"}
+                ]
+            })).unwrap();
+            let mut events = engine.send_message(request).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        EngineEvent::MessageStop { .. } => break,
+                        EngineEvent::Error(message) => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            engine.finish_turn(&id).await;
+            let request = requests.recv().await.unwrap();
+            let rendered = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                rendered.contains("Command output summary"),
+                enabled,
+                "{rendered}"
+            );
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn model_tool_output_long_powershell_and_taskget_keep_their_json_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = executor(temp.path());
+        for name in ["PowerShell", "TaskGet"] {
+            let raw = json!({
+                "stdout":format!("{}\nlast line", "x".repeat(12_300)),
+                "stderr":"warning: retrying\nerror: stopped",
+                "exit_code":3,
+                "duration_ms":129,
+                "next_cursor":"fixture"
+            });
+            let rendered = engine.retained_tool_output(name, &raw.to_string());
+            assert_eq!(engine.retained_tool_output(name, &rendered), rendered);
+            let mut value: Value = serde_json::from_str(&rendered).unwrap();
+            let summary = value
+                .as_object_mut()
+                .unwrap()
+                .remove("model_output_summary")
+                .unwrap();
+            assert_eq!(value, raw);
+            let summary = summary.as_str().unwrap();
+            assert!(
+                summary.contains("Exit status 3 | elapsed 129 ms"),
+                "{summary}"
+            );
+            assert!(
+                summary.contains("Notable stderr L2 (in preview)"),
+                "{summary}"
+            );
+            assert!(!summary.contains("warning: retrying"), "{summary}");
+            assert!(!summary.contains("last line"), "{summary}");
+        }
+
+        let short_page = json!({"stdout":"tiny","output_mode":"page","output_truncated":true,"next_cursor":"fixture"}).to_string();
+        assert_eq!(
+            engine.retained_tool_output("TaskGet", &short_page),
+            short_page
+        );
+    }
+
+    #[test]
+    fn model_tool_output_spilled_taskget_keeps_preview_and_uses_nested_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = executor(temp.path());
+        let raw = json!({
+            "stdout":"line\n".repeat(6000),
+            "stderr":"error: failed",
+            "status":"failed",
+            "result":json!({"exit_code":7,"output_capture":{"duration_ms":314}}).to_string(),
+        })
+        .to_string();
+        let rendered = engine.retained_tool_output("TaskGet", &raw);
+        assert!(rendered.len() <= MODEL_TOOL_OUTPUT_BYTES);
+        let (preview, summary) = rendered.split_once("\n\nCommand output summary").unwrap();
+        let (_, file) = preview.rsplit_once("): ").unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+        assert!(summary.contains("serialized result bytes"), "{summary}");
+        assert!(
+            summary.contains("Exit status 7 | elapsed 314 ms"),
+            "{summary}"
+        );
+        assert!(summary.contains("Model preview omitted"), "{summary}");
+    }
+
+    #[test]
+    fn model_tool_output_near_capacity_spills_to_make_room_for_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = executor(temp.path());
+        let raw = json!({"stdout":"x".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
+            .to_string();
+        assert!(
+            raw.len() <= MODEL_TOOL_OUTPUT_BYTES
+                && raw.len() > MODEL_TOOL_OUTPUT_BYTES - MIN_JSON_DIGEST_ROOM
+        );
+        let rendered = engine.retained_tool_output("TaskGet", &raw);
+        assert!(rendered.len() <= MODEL_TOOL_OUTPUT_BYTES);
+        assert!(rendered.contains("Exit status 0"), "{rendered}");
+        let (preview, _) = rendered.split_once("\n\nCommand output summary").unwrap();
+        let (_, path) = preview.rsplit_once("): ").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
     fn executor(root: &std::path::Path) -> ToolLoopExecutor {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let provider = ResolvedProvider {
@@ -292,16 +1030,39 @@ mod tests {
         let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
         let id = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&id, "assistant", "").unwrap();
+        let stdout = format!(
+            "START\n{}\nTEST SUMMARY\n{}",
+            "中🙂".repeat(30_000),
+            include_str!("test_summary_fixtures/vitest-pass.stdout")
+        );
         let raw = format!(
             "Error: {}\nHook context: keep this",
-            json!({"stdout":format!("START\n{}\nTEST SUMMARY", "中🙂".repeat(30_000)),"stderr":"FINAL ERROR","exit_code":7,"success":false})
+            json!({"stdout":stdout,"stderr":"FINAL ERROR","exit_code":7,"success":false})
         );
+        let occurrence = "inv-fixture-occurrence";
+        let row_id = format!("{assistant}:{occurrence}");
+        let stream = |text: &str| crate::tools::bash_process::StreamCapture {
+            bytes: text.len(),
+            lines: text.lines().count(),
+            first_lines: vec![0],
+            excerpts: None,
+            widths: Default::default(),
+            capture_elided_bytes: 0,
+            tool_elided_text_bytes: 0,
+            ranges: std::iter::once(0..text.len()).collect(),
+        };
+        let capture = ShellCapture {
+            duration_ms: 314,
+            stdout: stream(&stdout),
+            stderr: stream("FINAL ERROR"),
+        };
+        save_metadata(temp.path(), occurrence, &CommandMetadata::Shell(capture)).unwrap();
         store
             .db
             .with_conn(|conn| {
                 crate::db::message_repo::insert_tool_call(
                     conn,
-                    "call",
+                    &row_id,
                     &assistant,
                     "Bash",
                     Some("{}"),
@@ -313,7 +1074,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut engine = executor(temp.path());
-        let fresh = engine.retained_tool_output("Bash", &raw);
+        let fresh = engine.retained_tool_output_for_id("Bash", &raw, Some(occurrence));
         assert!(fresh.len() <= 16_000);
         for expected in [
             "Exit code: 7",
@@ -322,9 +1083,15 @@ mod tests {
             "FINAL ERROR",
             "Hook context: keep this",
             "Saved tool result",
+            "Command output summary",
+            "elapsed 314 ms",
         ] {
             assert!(fresh.contains(expected), "missing {expected}");
         }
+        assert!(
+            !fresh.contains("Test summary"),
+            "nonzero exit with a pass-only footer"
+        );
         let fork = store.fork(&id).unwrap();
         for session in [&id, &fork] {
             for format in [ApiFormat::OpenAI, ApiFormat::Anthropic] {
@@ -351,6 +1118,16 @@ mod tests {
                 .unwrap()
                 .count(),
             1
+        );
+        let spill = std::fs::read_dir(temp.path().join("tool-outputs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read_to_string(spill).unwrap(),
+            render("Bash", &raw, None)
         );
         let stored = store
             .db
@@ -390,7 +1167,13 @@ mod tests {
                 (
                     "shell",
                     "Bash",
-                    json!({"command":"node -e \"process.stdout.write('START'+ 'x'.repeat(200000)+'TEST SUMMARY');process.stderr.write('FINAL ERROR');process.exitCode=7\""}),
+                    json!({"command":concat!(
+                        "node -e \"process.stdout.write('START'+ 'x'.repeat(200000)+'TEST SUMMARY\\n",
+                        "    Running tests/fail.rs (target/debug/deps/fail-abc)\\n\\nrunning 1 test\\n",
+                        "test failing_case ... FAILED\\n",
+                        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n",
+                        "');process.stderr.write('FINAL ERROR');process.exitCode=7\"",
+                    )}),
                 ),
                 ("read", "Read", json!({"file_path":source})),
             ];
@@ -480,7 +1263,27 @@ mod tests {
                 );
             }
             assert!(outputs[0].len() <= 16_000);
+            assert!(
+                !outputs[0].contains("Test summary") && outputs[0].contains("Notable stdout L5"),
+                "{format}: {}",
+                outputs[0]
+            );
+            for expected in [
+                "Exit status 7 | elapsed ",
+                "Model preview omitted ",
+                "source bytes / 6 lines",
+            ] {
+                assert!(
+                    outputs[0].contains(expected),
+                    "{format} missing {expected}: {}",
+                    outputs[0]
+                );
+            }
             assert_eq!(outputs[1], "     1\tsource line");
         }
     }
 }
+
+#[cfg(test)]
+#[path = "command_output_invariants.rs"]
+mod invariants;
