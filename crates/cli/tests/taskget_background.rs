@@ -14,6 +14,9 @@ mod tool_loading;
 
 #[derive(Clone, Default)]
 struct Fixture {
+    long_output: bool,
+    foreground: bool,
+    raw_size: Option<usize>,
     requests: Arc<Mutex<Vec<Value>>>,
     bash_result: Arc<Mutex<Option<Value>>>,
     taskget_result: Arc<Mutex<Option<Value>>>,
@@ -59,6 +62,10 @@ fn text_frames(text: &str) -> Vec<Value> {
     ]
 }
 
+const REVIEW_PAGE_LINE: &str =
+    "not test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
+const REVIEW_PAGE_COMMAND: &str = r#"node -e "process.stdout.write('not test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'+(String.fromCharCode(34).repeat(59)+'\n').repeat(250))""#;
+
 async fn respond(
     State(fixture): State<Fixture>,
     Json(body): Json<Value>,
@@ -68,6 +75,10 @@ async fn respond(
         requests.push(body.clone());
         requests.len() - 1
     };
+    if fixture.foreground && body["stream"] != true {
+        return Json(json!({"id":"fixture-compact","object":"chat.completion","created":0,"model":"fixture-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Preserved the shell output."},"finish_reason":"stop"}]})).into_response();
+    }
     assert_eq!(body["stream"], true);
     let tools = tool_names(&body);
     assert!(
@@ -82,7 +93,7 @@ async fn respond(
             "TaskGet must start on demand: {tools:?}"
         );
     }
-    if index >= 2 {
+    if index >= 2 && !fixture.foreground {
         assert!(
             tools.contains(&"TaskGet".to_owned()),
             "TaskGet missing after ToolLoad: {tools:?}"
@@ -93,11 +104,18 @@ async fn respond(
             "call-bash",
             "Bash",
             &json!({
-                "command": "node -e \"setTimeout(()=>{console.log('bg-line');process.exit(0)},200)\"",
+                "command": if fixture.foreground {
+                    "node -e \"console.log('i6-start');console.log('x'.repeat(7500));console.log('error: hidden in the model preview');console.log('x'.repeat(7500));console.log('warning: duplicated tail')\""
+                } else if fixture.long_output {
+                    REVIEW_PAGE_COMMAND
+                } else {
+                    "node -e \"setTimeout(()=>{console.log('bg-line');process.exit(0)},200)\""
+                },
                 "description": "Print a delayed background line",
-                "run_in_background": true
+                "run_in_background": !fixture.foreground
             }),
         ),
+        _ if fixture.foreground && index >= 1 => text_frames("foreground output observed"),
         1 => {
             let result = last_tool_result(&body)
                 .unwrap_or_else(|| panic!("Bash result missing in request {body}"));
@@ -112,12 +130,30 @@ async fn respond(
             let loaded = last_tool_result(&body)
                 .unwrap_or_else(|| panic!("ToolLoad result missing in request {body}"));
             assert_eq!(loaded["loaded_tools"], json!(["TaskGet"]), "{loaded}");
-            let started = fixture.bash_result.lock().unwrap().clone().expect("Bash result");
+            let started = fixture
+                .bash_result
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("Bash result");
             let task_id = started["task_id"].as_str().expect("Bash task_id");
+            let mut args = json!({"task_id":task_id,"block":true,"timeout":5000});
+            if fixture.long_output {
+                args["max_output_bytes"] = json!(4);
+            }
+            tool_call_frame("call-taskget", "TaskGet", &args)
+        }
+        3 if fixture.long_output => {
+            let first = last_tool_result(&body).expect("first TaskGet result");
+            assert_eq!(first["stdout"], "not ");
+            assert!(first.get("exit_code").is_none());
+            assert!(first.get("model_output_summary").is_none());
             tool_call_frame(
-                "call-taskget",
+                "call-taskget-continued",
                 "TaskGet",
-                &json!({"task_id":task_id,"block":true,"timeout":5000}),
+                &json!({
+                    "task_id": first["task_id"], "cursor": first["next_cursor"], "max_output_bytes": 14000
+                }),
             )
         }
         3 => {
@@ -138,10 +174,45 @@ async fn respond(
 
 #[tokio::test]
 async fn cli_background_bash_then_task_get_returns_output_and_exposes_no_task_output() {
+    run_background_shell(false, OptOut::None, false).await;
+}
+
+#[tokio::test]
+async fn cli_long_task_get_page_appends_summary_with_original_streams_and_cursor() {
+    run_background_shell(true, OptOut::None, false).await;
+}
+
+#[tokio::test]
+async fn sdk_command_output_opt_out_config_set_disables_provider_summary() {
+    run_background_shell(true, OptOut::ConfigSet, false).await;
+}
+
+#[tokio::test]
+async fn cli_foreground_shell_summary_stays_out_of_sdk_events_and_transcript() {
+    run_background_shell(false, OptOut::None, true).await;
+}
+
+#[tokio::test]
+async fn cli_command_output_opt_out_honors_environment_and_data_dir_selection() {
+    run_background_shell(true, OptOut::Environment, false).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptOut {
+    None,
+    ConfigSet,
+    Environment,
+}
+
+async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bool) {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let fixture = Fixture::default();
+    let fixture = Fixture {
+        long_output,
+        foreground,
+        ..Fixture::default()
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
@@ -164,9 +235,31 @@ async fn cli_background_bash_then_task_get_returns_output_and_exposes_no_task_ou
     let mut cmd = Command::new(
         std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dcl").into()),
     );
-    cmd.args(["--print", "--output-format", "stream-json", "--data-dir"])
-        .arg(&data)
-        .arg("--path")
+    if opt_out == OptOut::ConfigSet {
+        let result = Command::new(env!("CARGO_BIN_EXE_dcl"))
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["config", "set", "summarize_long_command_output", "false"])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let file: Value =
+            serde_json::from_slice(&std::fs::read(data.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(file["summarize_long_command_output"], false);
+        cmd.args(["--input-format", "stream-json"]);
+    }
+    cmd.current_dir(root.path());
+    cmd.args(["--print", "--output-format", "stream-json"]);
+    if opt_out != OptOut::Environment {
+        cmd.arg("--data-dir").arg(&data);
+    }
+    cmd.arg("--path")
         .arg(root.path())
         .args([
             "--provider",
@@ -186,11 +279,14 @@ async fn cli_background_bash_then_task_get_returns_output_and_exposes_no_task_ou
             cmd.env_remove(key);
         }
     }
+    if opt_out == OptOut::Environment {
+        cmd.env("DEEPSEEK_CODE_DATA_DIR", &data)
+            .env("DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT", "false");
+    }
     let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
         .await
         .unwrap()
         .unwrap();
-    server.abort();
     assert!(
         output.status.success(),
         "{}",
@@ -207,8 +303,106 @@ async fn cli_background_bash_then_task_get_returns_output_and_exposes_no_task_ou
         .collect();
     assert_eq!(results.len(), 1, "{events:?}");
     assert_eq!(results[0]["is_error"], false, "{}", results[0]);
-    assert_eq!(fixture.requests.lock().unwrap().len(), 4);
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        if foreground {
+            2
+        } else if long_output {
+            5
+        } else {
+            4
+        }
+    );
+    if foreground {
+        let summary = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(summary.contains("Omitted output:"), "{summary}");
+        assert!(!summary.contains("Elapsed:"), "{summary}");
+        assert_eq!(summary.matches("warning: duplicated tail").count(), 1);
+        assert!(
+            summary.contains(r#"stdout L3 | "error: hidden in the model preview""#),
+            "{summary}"
+        );
+        assert!(summary.len() <= 16_000);
+        let public_events = String::from_utf8_lossy(&output.stdout);
+        assert!(public_events.contains("warning: duplicated tail"));
+        assert!(!public_events.contains("output_capture"));
+        assert!(!public_events.contains("Omitted output:"));
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap();
+        let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let raw = store
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT output FROM tool_calls WHERE name='Bash'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(raw.contains("warning: duplicated tail"));
+        assert!(!raw.contains("output_capture"));
+        assert!(!raw.contains("Omitted output:"));
+        let summary = summary.to_owned();
+        drop(requests);
+        for prompt in ["Replay the fixture", "/compact Keep the fixture command"] {
+            let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
+            resume
+                .current_dir(root.path())
+                .args(["--print", "--output-format", "stream-json", "--data-dir"])
+                .arg(&data)
+                .arg("--path")
+                .arg(root.path())
+                .args([
+                    "--provider",
+                    "fixture",
+                    "--model",
+                    "fixture-model",
+                    "--resume",
+                    &id,
+                    prompt,
+                ])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        server.abort();
+        let requests = fixture.requests.lock().unwrap();
+        let replay = requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(replay, summary);
+        let compact = &requests[3..];
+        assert!(!compact.is_empty());
+        let compact = serde_json::to_string(compact).unwrap();
+        assert!(compact.contains("warning: duplicated tail"), "{compact}");
+        assert!(!compact.contains("output_capture"));
+        assert!(!compact.contains("Omitted output:"));
+        return;
+    }
 
+    server.abort();
     let started = fixture
         .bash_result
         .lock()
@@ -220,21 +414,55 @@ async fn cli_background_bash_then_task_get_returns_output_and_exposes_no_task_ou
     assert!(started["stdout_file"].as_str().is_some());
     assert!(started["stderr_file"].as_str().is_some());
 
-    let retrieved = fixture
-        .taskget_result
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("TaskGet result");
+    let retrieved: Value = if long_output {
+        // The JSON-escaped page exceeds the model budget. Its public tool
+        // event retains the complete page and cursor.
+        let public = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "tool_result" && e["name"] == "TaskGet")
+            .unwrap();
+        serde_json::from_str(public["output"].as_str().unwrap()).unwrap()
+    } else {
+        fixture
+            .taskget_result
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("TaskGet result")
+    };
     assert_eq!(retrieved["status"], "completed", "{retrieved}");
     assert_eq!(retrieved["retrieval_status"], "success", "{retrieved}");
-    assert!(
-        retrieved["stdout"]
+    if long_output {
+        let exact = format!(
+            "{REVIEW_PAGE_LINE}\n{}",
+            format!("{}\n", "\"".repeat(59)).repeat(250)
+        );
+        assert_eq!(retrieved["stdout"], &exact[4..14004]);
+        assert_eq!(retrieved["stderr"], "");
+        assert_eq!(retrieved["output_mode"], "page");
+        assert_eq!(retrieved["has_more"], true);
+        assert!(retrieved.get("exit_code").is_none());
+        assert!(retrieved["next_cursor"].is_string());
+        let rendered = requests[4]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
             .as_str()
-            .unwrap_or_default()
-            .contains("bg-line"),
-        "TaskGet did not return the background output: {retrieved}"
-    );
+            .unwrap();
+        assert!(rendered.len() <= 16_000, "{}", rendered.len());
+        assert_eq!(
+            rendered.contains("Omitted output:"),
+            opt_out == OptOut::None
+        );
+        assert!(retrieved.get("model_output_summary").is_none());
+    } else {
+        assert_eq!(retrieved["stdout"], "bg-line\n");
+        assert!(retrieved.get("model_output_summary").is_none());
+    }
 }
 
 /// Drives the model through successive bounded TaskGet pages of one background
@@ -254,15 +482,33 @@ async fn respond_paged(
         "TaskGet missing: {tools:?}"
     );
     let frames = if index == 0 {
+        let command = fixture.raw_size.map_or_else(
+            || "node -e \"process.stdout.write('alpha\\nbeta\\n');process.stderr.write('err\\n');setTimeout(()=>process.exit(0),150)\"".to_owned(),
+            |size| format!("node -e \"process.stdout.write(Buffer.concat([Buffer.alloc({},113),Buffer.from([255,10])]))\"", size - 2));
         tool_call_frame(
             "call-bash",
             "Bash",
-            &json!({
-                "command": "node -e \"process.stdout.write('alpha\\nbeta\\n');process.stderr.write('err\\n');setTimeout(()=>process.exit(0),150)\"",
-                "description": "Print two stdout lines and one stderr line",
-                "run_in_background": true
-            }),
+            &json!({"command":command,"run_in_background":true}),
         )
+    } else if fixture.raw_size.is_some() {
+        if index == 1 {
+            let started = last_tool_result(&body).expect("background Bash result");
+            *fixture.bash_result.lock().unwrap() = Some(started.clone());
+            tool_call_frame(
+                "snapshot",
+                "TaskGet",
+                &json!({"task_id":started["task_id"],"block":true,"timeout":5000}),
+            )
+        } else if index == 2 {
+            let started = fixture.bash_result.lock().unwrap().clone().unwrap();
+            tool_call_frame(
+                "page",
+                "TaskGet",
+                &json!({"task_id":started["task_id"],"block":true,"timeout":5000,"max_output_bytes":13000}),
+            )
+        } else {
+            text_frames("paired reads complete")
+        }
     } else {
         let result = last_tool_result(&body)
             .unwrap_or_else(|| panic!("tool result missing in request {body}"));
@@ -295,11 +541,25 @@ async fn respond_paged(
 
 #[tokio::test]
 async fn cli_task_get_pages_a_background_shell_to_its_exit_status() {
+    paged_run(None).await;
+}
+
+#[tokio::test]
+async fn cli_task_get_snapshot_and_page_share_the_raw_bash_threshold() {
+    for size in [11_999, 12_000] {
+        paged_run(Some(size)).await;
+    }
+}
+
+async fn paged_run(raw_size: Option<usize>) {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     tool_loading::enable(&data, &["TaskGet"]);
-    let fixture = Fixture::default();
+    let fixture = Fixture {
+        raw_size,
+        ..Fixture::default()
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
@@ -373,6 +633,34 @@ async fn cli_task_get_pages_a_background_shell_to_its_exit_status() {
     assert_eq!(started["status"], "running", "{started}");
     assert!(started["task_id"].as_str().is_some());
 
+    if let Some(size) = raw_size {
+        let values: Vec<Value> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_result" && e["name"] == "TaskGet")
+            .map(|e| serde_json::from_str(e["output"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["task_id"], values[1]["task_id"]);
+        assert_eq!(values[0]["stdout"], values[1]["stdout"]);
+        assert_eq!(values[0]["stdout"].as_str().unwrap().len(), size + 2);
+        let requests = fixture.requests.lock().unwrap();
+        for request in &requests[2..=3] {
+            let content = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(
+                !content.contains("Omitted output:") && !content.contains("model_output_summary"),
+                "complete page or aliased snapshot"
+            );
+        }
+        return;
+    }
     let pages = fixture.pages.lock().unwrap().clone();
     assert!(pages.len() > 1, "expected several pages: {pages:?}");
     let mut stdout = String::new();

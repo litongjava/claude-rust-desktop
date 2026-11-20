@@ -53,7 +53,7 @@ impl Default for WslSettings {
     }
 }
 
-fn document(root: &Path) -> Result<Value> {
+pub(crate) fn document(root: &Path) -> Result<Value> {
     let path = root.join("settings.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -83,9 +83,13 @@ pub fn save(root: &Path, settings: &ShellSettings) -> Result<()> {
     }
     let mut value = document(root)?;
     value["shell"] = serde_json::to_value(settings)?;
+    save_document(root, &value)
+}
+
+pub(crate) fn save_document(root: &Path, value: &Value) -> Result<()> {
     std::fs::create_dir_all(root)?;
     let mut file = tempfile::NamedTempFile::new_in(root)?;
-    file.write_all(&serde_json::to_vec_pretty(&value)?)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.as_file().sync_all()?;
     file.persist(root.join("settings.json"))?;
     GENERATION.fetch_add(1, Ordering::AcqRel);
