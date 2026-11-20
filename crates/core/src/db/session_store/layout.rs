@@ -147,7 +147,10 @@ pub(super) fn initialize(
 ) -> Result<()> {
     File::create_new(path)?;
     let mut conn = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL")?;
+    if kind == SESSION {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.pragma_update(None, "application_id", kind)?;
     tx.pragma_update(None, "user_version", schema_version(kind))?;
@@ -164,7 +167,9 @@ pub(super) fn initialize(
 pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
     let conn = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     verify(&conn, kind)?;
-    conn.execute_batch("PRAGMA synchronous=FULL")?;
+    if kind == SESSION {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
     let busy: i32 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     ensure!(busy == 0, "checkpoint blocked for {}", path.display());
     conn.close().map_err(|(_, e)| e)?;

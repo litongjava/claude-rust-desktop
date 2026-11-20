@@ -205,3 +205,61 @@ impl SessionWrite<'_> {
             .pragma_query_value(None, "synchronous", |r| r.get(0))?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pragmas(conn: &Connection) -> Result<(i32, String, i32, i32)> {
+        Ok(conn.query_row(
+            "SELECT synchronous,journal_mode,foreign_keys,timeout FROM
+            pragma_synchronous,pragma_journal_mode,pragma_foreign_keys,pragma_busy_timeout",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?)
+    }
+
+    #[test]
+    fn durability_and_busy_policy_follow_the_transaction_role() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let s = Stores::open_for_test(tmp.path())?;
+        for publication in [true, false, true] {
+            s.global()
+                .write("inspect pragma", "test", publication, |tx| {
+                    assert_eq!(
+                        pragmas(tx)?,
+                        (if publication { 2 } else { 1 }, "wal".into(), 1, 5000)
+                    );
+                    Ok(())
+                })?;
+        }
+        let _permit = Permits::take(1);
+        layout::initialize(&tmp.path().join("stage.db"), SESSION, |tx| {
+            assert_eq!(pragmas(tx)?, (2, "wal".into(), 1, 5000));
+            Ok(())
+        })?;
+        drop(_permit);
+        s.create("test", CreateOptions::default())?.write(|tx| {
+            assert_eq!(pragmas(tx.0)?, (1, "wal".into(), 1, 5000));
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_key_locks_are_unique_and_in_storage_key_order() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("session-locks");
+        std::fs::create_dir(&path)?;
+        let locks = lock_keys(tmp.path(), vec!["b", "a", "b"], true)?;
+        assert_eq!(locks.len(), 2);
+        for (file, name) in locks.iter().zip(["a", "b"]) {
+            assert_eq!(
+                file.metadata()?.ino(),
+                std::fs::metadata(path.join(name))?.ino()
+            );
+        }
+        Ok(())
+    }
+}
