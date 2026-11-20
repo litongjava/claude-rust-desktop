@@ -202,6 +202,7 @@ pub(super) async fn start_chat(
                 messages: messages.clone(),
                 model: if model.is_empty() { "claude-sonnet-4-6".to_string() } else { model.clone() },
                 system_prompt: req.system_prompt.clone(),
+                standalone_frontend: false,
                 max_tokens: req.max_tokens,
                 workspace_path: req.workspace_path.clone(),
                 temperature: req.temperature,

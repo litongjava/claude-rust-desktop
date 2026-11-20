@@ -34,7 +34,7 @@ pub fn execute(input: Value, cwd: &str) -> Result<Value> {
         .as_str()
         .ok_or_else(|| anyhow!("file_path required"))?;
     if let Some(bytes) = crate::skills::bundled_resources::read(Path::new(file_path)) {
-        return text(std::str::from_utf8(bytes)?, &input);
+        return text(std::str::from_utf8(&bytes)?, &input);
     }
     let path = if super::screenshot_file::readable(Path::new(file_path)) {
         Path::new(file_path)
