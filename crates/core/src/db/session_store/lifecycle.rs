@@ -1,6 +1,4 @@
-use super::layout::{
-    self, canonical_uuid, durable_move, lock_keys, storage_key, sync_dir, Permits, SESSION,
-};
+use super::layout::{self, canonical_uuid, durable_move, storage_key, sync_dir, Permits, SESSION};
 use super::{verify_manifest, SessionDb, Stores};
 use crate::db::project_repo;
 use anyhow::{bail, ensure, Context, Result};
@@ -150,7 +148,7 @@ impl Project {
     }
 }
 
-struct Intent {
+pub(super) struct Intent {
     operation: String,
     store: String,
     id: String,
@@ -213,7 +211,7 @@ impl Intent {
 impl Stores {
     pub fn create(&self, id: &str, options: CreateOptions) -> Result<SessionDb> {
         let key = storage_key(id)?;
-        let _locks = lock_keys(&self.root.path, vec![&key], true)?;
+        let _locks = self.key_lock(&key, true, true)?;
         self.recover_key(&key)?;
         self.global().read(|conn| {
             let fenced: bool = conn.query_row(
@@ -308,7 +306,7 @@ impl Stores {
         })
     }
 
-    fn pending(&self, key: &str) -> Result<Option<Intent>> {
+    pub(super) fn pending(&self, key: &str) -> Result<Option<Intent>> {
         self.global().read(|c| {
             Ok(c.query_row(
                 "SELECT operation,store_uuid,id,storage_key,incarnation,kind,metadata
@@ -330,7 +328,7 @@ impl Stores {
         })
     }
 
-    fn recover_key(&self, key: &str) -> Result<()> {
+    pub(super) fn recover_key(&self, key: &str) -> Result<()> {
         let Some(op) = self.pending(key)? else {
             return Ok(());
         };
@@ -568,7 +566,7 @@ impl Stores {
         })?;
         for key in keys {
             ensure!(layout::is_storage_key(&key), "Invalid journal storage key");
-            let _locks = lock_keys(&self.root.path, vec![&key], true)?;
+            let _locks = self.key_lock(&key, true, false)?;
             if let Err(error) = self.recover_key(&key) {
                 // Quarantined operations are terminal. Windows sharing errors
                 // stay journaled and can be retried independently of other IDs.
@@ -581,7 +579,7 @@ impl Stores {
     }
 
     fn quarantine_orphans(&self) -> Result<()> {
-        let _sweep = lock_keys(&self.root.path, vec![".orphan-sweep"], true)?;
+        let _sweep = layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
         for entry in fs::read_dir(self.sessions().join(".staging"))? {
             let entry = entry?;
             let operation = entry.file_name();
@@ -619,7 +617,7 @@ impl Stores {
             if owned()? {
                 continue;
             }
-            let _locks = lock_keys(&self.root.path, vec![key], true)?;
+            let _locks = self.key_lock(key, true, false)?;
             if entry.path().try_exists()? && !owned()? {
                 durable_move(
                     &entry.path(),
@@ -661,7 +659,7 @@ fn sharing_violation(e: &anyhow::Error) -> bool {
 impl SessionDb {
     pub fn delete(&self) -> Result<()> {
         let s = &self.stores;
-        let _locks = lock_keys(&s.root.path, vec![&self.key], true)?;
+        let _locks = s.key_lock(&self.key, true, false)?;
         self.check_directory()?;
         self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
         let op = Intent::new(s, &self.id, &self.key, self.incarnation.clone(), "delete");

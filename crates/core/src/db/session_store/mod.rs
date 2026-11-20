@@ -31,7 +31,12 @@ pub struct Stores {
 impl Stores {
     #[doc(hidden)]
     pub fn open_for_test(path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(path)?;
+        layout::allow_entry()?;
+        // The caller owns the durability of this data root and its ancestry.
+        ensure!(
+            path.is_dir(),
+            "Session store requires an existing data root"
+        );
         let path = path.canonicalize()?;
         let root = {
             let mut roots = ROOTS.lock().unwrap();
@@ -40,15 +45,20 @@ impl Stores {
                 root
             } else {
                 let uuid = layout::open_root(&path)?;
-                let root = Arc::new(Root {
-                    global: GlobalDb::new(&path, uuid)?,
-                    path: path.clone(),
+                let mut global = GlobalDb::new(&path, uuid)?;
+                let root = Arc::new_cyclic(|weak| {
+                    global.root = weak.clone();
+                    Root {
+                        global,
+                        path: path.clone(),
+                    }
                 });
                 roots.insert(path, Arc::downgrade(&root));
                 root
             }
         };
         let stores = Self { root, fault: None };
+        drop(stores.namespace(false)?);
         stores.reconcile()?;
         Ok(stores)
     }
@@ -74,9 +84,76 @@ impl Stores {
     fn sessions(&self) -> PathBuf {
         self.root.path.join("sessions")
     }
+    fn namespace(&self, exclusive: bool) -> Result<std::fs::File> {
+        let dir = self.root.path.join("session-locks");
+        let guard = layout::lock_existing(&dir.join(".directory"), exclusive)?;
+        ensure!(
+            std::fs::read_to_string(dir.join(".initialized"))? == self.global().uuid,
+            "Lifecycle namespace identity changed"
+        );
+        Ok(guard)
+    }
+
+    fn has_directory_state(&self, key: &str) -> Result<bool> {
+        self.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1
+            UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?1)",
+                [key],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    // All key holders retain shared namespace access until their connection closes.
+    // A new name can therefore only be allocated after all old inodes are idle.
+    fn key_lock(&self, key: &str, exclusive: bool, allocate: bool) -> Result<Vec<std::fs::File>> {
+        let dir = self.root.path.join("session-locks");
+        let path = dir.join(key);
+        let mut namespace = self.namespace(false)?;
+        if !path.try_exists()? {
+            ensure!(
+                !self.has_directory_state(key)?,
+                "Missing lock for registered session"
+            );
+            if !allocate {
+                return Ok(vec![namespace]);
+            }
+            drop(namespace);
+            namespace = self.namespace(true)?;
+            if !path.try_exists()? {
+                ensure!(
+                    !self.has_directory_state(key)?,
+                    "Missing lock for registered session"
+                );
+                std::fs::File::create_new(&path)?.sync_all()?;
+            }
+            drop(namespace);
+            namespace = self.namespace(false)?;
+        }
+        // Repeat the barrier on retry if allocation succeeded but fsync failed.
+        if allocate {
+            layout::sync_dir(&dir)?;
+        }
+        let mut guards = lock_keys(&dir, vec![key], exclusive)?;
+        guards.push(namespace);
+        Ok(guards)
+    }
+
+    fn resolved_key(&self, key: &str) -> Result<Vec<std::fs::File>> {
+        let shared = self.key_lock(key, false, false)?;
+        if self.pending(key)?.is_none() {
+            return Ok(shared);
+        }
+        drop(shared);
+        let exclusive = self.key_lock(key, true, false)?;
+        self.recover_key(key)?;
+        Ok(exclusive)
+    }
+
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
         let key = storage_key(id)?;
-        let _locks = lock_keys(&self.root.path, vec![&key], false)?;
+        let _locks = self.resolved_key(&key)?;
         let incarnation = self
             .global()
             .incarnation(id, &key)?
@@ -132,27 +209,27 @@ impl SessionDb {
         body(&mut conn)
     }
     pub fn read<T>(&self, body: impl FnOnce(&SessionRead<'_>) -> Result<T>) -> Result<T> {
-        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], false)?;
+        let _locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
         self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
-            body(&SessionRead(&tx))
+            layout::callback(|| body(&SessionRead(&tx)))
         })
     }
     /// The closure may run again after SQLite contention rolls back its transaction.
     pub fn write<T>(&self, mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
         let start = Instant::now();
-        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], false)?;
+        let _locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
         self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
             crate::db::write_tx(c, "session write", WRITE_DEADLINE, |tx| {
-                body(&SessionWrite(tx))
+                layout::callback(|| body(&SessionWrite(tx)))
             })
         })
         .map_err(|e| crate::db::write_boundary_context("session write", &self.id, start, e))
     }
     pub fn set_archived(&self, archived: bool) -> Result<()> {
-        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], true)?;
+        let _locks = self.stores.key_lock(&self.key, true, false)?;
         self.check_directory()?;
         self.stores
             .global()
@@ -256,7 +333,10 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("session-locks");
         std::fs::create_dir(&path)?;
-        let locks = lock_keys(tmp.path(), vec!["b", "a", "b"], true)?;
+        for name in ["a", "b"] {
+            std::fs::File::create_new(path.join(name))?;
+        }
+        let locks = lock_keys(&path, vec!["b", "a", "b"], true)?;
         assert_eq!(locks.len(), 2);
         for (file, name) in locks.iter().zip(["a", "b"]) {
             assert_eq!(

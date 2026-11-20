@@ -40,27 +40,50 @@ pub(super) fn is_storage_key(key: &str) -> bool {
         })
 }
 
-// Lock files are permanent. Unlinking one would allow a second, independent lock.
-pub(super) fn lock_keys(root: &Path, mut keys: Vec<&str>, exclusive: bool) -> Result<Vec<File>> {
+thread_local! { static IN_SESSION_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+pub(super) fn allow_entry() -> Result<()> {
+    ensure!(
+        !IN_SESSION_CALLBACK.get(),
+        "Cannot enter a store operation from a session transaction callback"
+    );
+    Ok(())
+}
+
+pub(super) fn callback<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IN_SESSION_CALLBACK.set(false);
+        }
+    }
+    allow_entry()?;
+    IN_SESSION_CALLBACK.set(true);
+    let _reset = Reset;
+    body()
+}
+
+pub(super) fn lock_existing(path: &Path, exclusive: bool) -> Result<File> {
+    allow_entry()?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Opening lifecycle lock {}", path.display()))?;
+    if exclusive {
+        file.lock()
+    } else {
+        file.lock_shared()
+    }
+    .with_context(|| format!("Acquiring lifecycle lock {}", path.display()))?;
+    Ok(file)
+}
+
+pub(super) fn lock_keys(dir: &Path, mut keys: Vec<&str>, exclusive: bool) -> Result<Vec<File>> {
     keys.sort_unstable();
     keys.dedup();
     keys.into_iter()
-        .map(|key| {
-            let path = root.join("session-locks").join(key);
-            let file = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-            if exclusive {
-                file.lock()
-            } else {
-                file.lock_shared()
-            }
-            .with_context(|| format!("acquiring lifecycle lock {}", path.display()))?;
-            Ok(file)
-        })
+        .map(|key| lock_existing(&dir.join(key), exclusive))
         .collect()
 }
 
@@ -223,43 +246,119 @@ pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
 }
 
 pub(super) fn open_root(root: &Path) -> Result<String> {
-    fs::create_dir_all(root.join("session-locks"))?;
-    let locks = lock_keys(root, vec![".directory"], true)?;
     let path = root.join("global.db");
-    let marker = root.join("session-locks/.initialized");
-    if !path.try_exists()? {
-        ensure!(
-            !marker.try_exists()?,
-            "Global directory database is missing"
-        );
-        // A fresh G is built privately too. A crash cannot expose empty SQLite
-        // pages as an initialized directory. Only this reserved bootstrap path is retried.
-        let bootstrap = root.join(".global-staging");
-        if bootstrap.try_exists()? {
-            fs::remove_dir_all(&bootstrap)?;
+    let stage = root.join(".global-staging");
+    let locks = root.join("session-locks");
+    let marker = locks.join(".initialized");
+    if !path.try_exists()? || stage.try_exists()? {
+        // This lock lives outside the removable namespace. Established v1 roots
+        // do not need it unless finishing their own interrupted bootstrap.
+        let bootstrap = root.join(".session-bootstrap");
+        let may_start = !path.try_exists()? && !marker.try_exists()?;
+        let guard = File::options()
+            .read(true)
+            .write(true)
+            .create(may_start)
+            .truncate(false)
+            .open(&bootstrap)?;
+        guard.lock()?;
+        if !path.try_exists()? {
+            ensure!(
+                !marker.try_exists()?,
+                "Global directory database is missing"
+            );
+            if stage.try_exists()? {
+                // Only files owned by an interrupted bootstrap may be discarded.
+                for name in [
+                    "global.db",
+                    "global.db-wal",
+                    "global.db-shm",
+                    "global.db-journal",
+                    "store-uuid",
+                ] {
+                    let file = stage.join(name);
+                    if file.try_exists()? {
+                        fs::remove_file(file)?;
+                    }
+                }
+            } else {
+                ensure!(
+                    !locks.try_exists()? && !root.join("sessions/.staging").try_exists()?,
+                    "Missing global database for existing session layout"
+                );
+                fs::create_dir(&stage)?;
+                sync_dir(root)?;
+            }
+            fs::create_dir_all(&locks)?;
+            for name in [".directory", ".orphan-sweep"] {
+                File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(locks.join(name))?
+                    .sync_all()?;
+            }
+            sync_dir(&locks)?;
+            for name in [
+                "sessions/.staging",
+                "sessions/.trash",
+                "sessions/.quarantine",
+            ] {
+                fs::create_dir_all(root.join(name))?;
+            }
+            sync_dir(&root.join("sessions"))?;
+            let staged = stage.join("global.db");
+            let uuid = Uuid::new_v4().to_string();
+            initialize(&staged, GLOBAL, |tx| {
+                tx.execute("INSERT INTO store_identity VALUES(1, ?1)", [&uuid])?;
+                Ok(())
+            })?;
+            checkpoint(&staged, GLOBAL)?;
+            let ticket = stage.join("store-uuid");
+            fs::write(&ticket, &uuid)?;
+            File::options().write(true).open(ticket)?.sync_all()?;
+            sync_dir(&stage)?;
+            sync_dir(root)?;
+            rename(&staged, &path)?;
         }
-        fs::create_dir(&bootstrap)?;
-        for name in [
-            "sessions/.staging",
-            "sessions/.trash",
-            "sessions/.quarantine",
-        ] {
-            fs::create_dir_all(root.join(name))?;
+        if stage.try_exists()? {
+            // Replay both sides of the move, even when global.db already exists.
+            sync_dir(root)?;
+            sync_dir(&stage)?;
+            let uuid = read_global_uuid(&path)?;
+            if !marker.try_exists()? {
+                ensure!(
+                    fs::read_to_string(stage.join("store-uuid"))? == uuid,
+                    "Bootstrap identity changed"
+                );
+                let temp = locks.join(".initialized.new");
+                fs::write(&temp, &uuid)?;
+                File::options().write(true).open(&temp)?.sync_all()?;
+                durable_move(&temp, &marker)?;
+            }
+            ensure!(
+                fs::read_to_string(&marker)? == uuid,
+                "Global store UUID changed"
+            );
+            sync_dir(&locks)?;
+            let ticket = stage.join("store-uuid");
+            if ticket.try_exists()? {
+                fs::remove_file(ticket)?;
+            }
+            fs::remove_dir(stage)?;
+            sync_dir(root)?;
         }
-        sync_dir(&root.join("sessions"))?;
-        let staged = bootstrap.join("global.db");
-        initialize(&staged, GLOBAL, |tx| {
-            tx.execute(
-                "INSERT INTO store_identity VALUES(1, ?1)",
-                [Uuid::new_v4().to_string()],
-            )?;
-            Ok(())
-        })?;
-        checkpoint(&staged, GLOBAL)?;
-        durable_move(&staged, &path)?;
-        fs::remove_dir(bootstrap)?;
     }
-    let conn = open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let uuid = read_global_uuid(&path)?;
+    ensure!(
+        fs::read_to_string(&marker)? == uuid,
+        "Global store UUID changed"
+    );
+    Ok(uuid)
+}
+
+fn read_global_uuid(path: &Path) -> Result<String> {
+    let conn = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     verify(&conn, GLOBAL)?;
     integrity(&conn)?;
     let store: String = conn.query_row(
@@ -268,18 +367,6 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
         |r| r.get(0),
     )?;
     ensure!(canonical_uuid(&store), "Invalid store UUID");
-    if marker.try_exists()? {
-        ensure!(
-            fs::read_to_string(&marker)? == store,
-            "Global store UUID changed"
-        );
-    } else {
-        let temp = marker.with_extension("new");
-        fs::write(&temp, store.as_bytes())?;
-        File::options().write(true).open(&temp)?.sync_all()?;
-        durable_move(&temp, &marker)?;
-    }
-    drop(locks);
     Ok(store)
 }
 

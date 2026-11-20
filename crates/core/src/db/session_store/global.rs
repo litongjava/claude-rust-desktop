@@ -3,6 +3,7 @@ use anyhow::{ensure, Result};
 use r2d2::{ManageConnection, Pool};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use std::path::{Path, PathBuf};
+use std::sync::Weak;
 use std::time::Instant;
 
 // One pool budget for all access modes. A slot closes its old descriptor
@@ -24,6 +25,9 @@ impl ManageConnection for Slots {
 }
 
 pub struct GlobalDb {
+    pub(super) root: Weak<super::Root>,
+    #[cfg(unix)]
+    identity: (u64, u64),
     path: PathBuf,
     pub(super) uuid: String,
     pool: Pool<Slots>,
@@ -32,6 +36,9 @@ pub struct GlobalDb {
 impl GlobalDb {
     pub(super) fn new(root: &Path, uuid: String) -> Result<Self> {
         Ok(Self {
+            root: Weak::new(),
+            #[cfg(unix)]
+            identity: file_identity(&root.join("global.db"))?,
             path: root.join("global.db"),
             uuid,
             pool: Pool::builder().max_size(4).min_idle(Some(0)).build(Slots)?,
@@ -44,7 +51,25 @@ impl GlobalDb {
         body: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         let mut slot = self.pool.get()?;
-        ensure!(self.path.is_file(), "Global database is missing");
+        #[cfg(unix)]
+        ensure!(
+            file_identity(&self.path)? == self.identity,
+            "Global database was replaced"
+        );
+        // Without a portable inode, discard the cached descriptor and check
+        // the UUID on a fresh open of the current pathname.
+        #[cfg(not(unix))]
+        {
+            *slot = None;
+        }
+        ensure!(
+            std::fs::read_to_string(
+                self.path
+                    .with_file_name("session-locks")
+                    .join(".initialized")
+            )? == self.uuid,
+            "Global store UUID changed"
+        );
         if slot.as_ref().map(|(mode, _)| *mode) != Some(flags) {
             *slot = None;
             *slot = Some((flags, layout::open(&self.path, flags)?));
@@ -98,7 +123,11 @@ impl GlobalDb {
         id: &str,
     ) -> Result<Option<crate::db::conversation_repo::ConversationRow>> {
         let key = layout::storage_key(id)?;
-        let _locks = layout::lock_keys(self.path.parent().unwrap(), vec![&key], false)?;
+        let stores = super::Stores {
+            root: self.root.upgrade().expect("global belongs to a live root"),
+            fault: None,
+        };
+        let _locks = stores.resolved_key(&key)?;
         self.read(|conn| crate::db::conversation_repo::get_conversation(conn, id))
     }
 
@@ -109,4 +138,12 @@ impl GlobalDb {
     pub fn store_uuid(&self) -> &str {
         &self.uuid
     }
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(metadata.is_file(), "Global database must be a regular file");
+    Ok((metadata.dev(), metadata.ino()))
 }
