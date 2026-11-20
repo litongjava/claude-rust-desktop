@@ -148,7 +148,14 @@ pub async fn run_from_env() -> Result<bool> {
         service::directory(&worker).canonicalize()? == dir.canonicalize()?,
         "Invalid session host directory"
     );
+    // Bind first: a failed listener leaves no registry row behind. One Executor
+    // host guard then covers this process from before any Session exists until
+    // teardown; the per-turn Session never registers a second row.
     let mut listener = service::Listener::bind(&worker)?;
+    let mut coordination = crate::local_coordination::register_worker(&worker)
+        .await
+        .unwrap_or(None);
+    let mut coordination_active = false;
     let session = Arc::new(tokio::sync::Mutex::new(None::<Session>));
     let mode_target: ModeTarget = Arc::new(std::sync::Mutex::new(None));
     let status_target: StatusTarget = Arc::new(std::sync::Mutex::new(None));
@@ -162,136 +169,174 @@ pub async fn run_from_env() -> Result<bool> {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut owner_pid = supervisor_pid.or(worker.supervisor_pid);
     let mut orphaned_since = None::<Instant>;
-    loop {
-        tokio::select! {
-            _=tick.tick()=>{
-                if let Some(pid) = service::read_worker(&dir).ok().and_then(|owner| owner.supervisor_pid) { owner_pid = Some(pid); }
-                // Without its supervisor no one can report this host's work, and its
-                // lifetime lock blocks recovery. Allow time to cancel, then release it.
-                if owner_pid.is_some_and(service::process_exited) {
-                    fatal.store(true,Ordering::Release);
-                    if orphaned_since.get_or_insert_with(Instant::now).elapsed() > ORPHAN_GRACE {
-                        std::process::exit(1);
+    let serve_result: Result<()> = async {
+        loop {
+            tokio::select! {
+                _=tick.tick()=>{
+                    if let Some(pid) = service::read_worker(&dir).ok().and_then(|owner| owner.supervisor_pid) { owner_pid = Some(pid); }
+                    // Without its supervisor no one can report this host's work, and its
+                    // lifetime lock blocks recovery. Allow time to cancel, then release it.
+                    if owner_pid.is_some_and(service::process_exited) {
+                        fatal.store(true,Ordering::Release);
+                        if orphaned_since.get_or_insert_with(Instant::now).elapsed() > ORPHAN_GRACE {
+                            std::process::exit(1);
+                        }
                     }
-                }
-                if service::read_worker(&dir).map_or(true, |owner| owner.status == "stopped" || chrono::Utc::now().timestamp_millis().max(0) as u64 > owner.heartbeat_ms.saturating_add(10_000)) {
-                    fatal.store(true,Ordering::Release);
-                    if let Ok(owner)=service::read_worker(&dir) { if let Some(id)=owner.active_job { let _=jobs::cancel(&worker.root,&id); } }
-                }
-                let turn_active = active.load(Ordering::Acquire);
-                let shell_active = deepseek_code_core::tools::background_shell::has_active();
-                if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
-                if (turn_active && !idle_child_active.load(Ordering::Acquire)) || shell_active {idle=Instant::now();}
-                if !turn_active && !fatal.load(Ordering::Acquire) {
-                    if let Err(error) = child::start_pending(&worker, &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
-                        eprintln!("Owned child wake unavailable: {error:#}");
+                    if service::read_worker(&dir).map_or(true, |owner| owner.status == "stopped" || chrono::Utc::now().timestamp_millis().max(0) as u64 > owner.heartbeat_ms.saturating_add(10_000)) {
+                        fatal.store(true,Ordering::Release);
+                        if let Ok(owner)=service::read_worker(&dir) { if let Some(id)=owner.active_job { let _=jobs::cancel(&worker.root,&id); } }
                     }
-                }
-            },
-            stream=listener.accept()=>{
-                let stream=stream?;
-                let parsed=tokio::time::timeout(Duration::from_secs(5),service::read_request(stream)).await;
-                let Ok(Ok((stream,request)))=parsed else{continue};
-                if matches!(&request,Request::Submit{..}|Request::Shutdown) {
-                        // The supervisor publishes a turn's completion before this
-                        // host releases admission, so a caller reacting to that
-                        // publication may be early rather than wrong. Wait for the
-                        // actual release of a turn proven finished; a running turn
-                        // is refused at once.
-                        let current=current_turn.lock().unwrap_or_else(|e|e.into_inner()).clone();
-                        let admission=await_admission(&active,current.as_deref(),&admission_released,|id|jobs::get(&worker.root,id).is_ok_and(|job|job.finished_ms.is_some()),ADMISSION_GRACE).await;
-                        // A submission that outlives the grace is not queued and not
-                        // replayed: it is answered as unsubmitted, exactly as any
-                        // other refusal, and the turn keeps its admission.
-                        if admission==Admission::Expired && matches!(&request,Request::Submit{..}) {
-                            let _=service::reply(stream,&Reply::error("Session worker is busy; prompt was not submitted")).await;continue;
-                        }
-                }
-                match request {
-                    Request::BashSession { revoke } => {
-                        let manager = bash_target.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        if revoke { if let Some(manager) = &manager { manager.set_bash_session_allowed(&worker.session_id, false); } }
-                        let mut response = Reply::ok(None);
-                        response.permission_session_id = Some(worker.session_id.clone());
-                        response.bash_session = Some(manager.is_some_and(|manager| manager.bash_session_allowed(&worker.session_id)));
-                        let _ = service::reply(stream, &response).await;
-                    },
-                    Request::EditSession { revoke } => {
-                        let manager = bash_target.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        if revoke { if let Some(manager) = &manager { manager.set_edit_session_allowed(&worker.session_id, false); } }
-                        let mut response = Reply::ok(None);
-                        response.permission_session_id = Some(worker.session_id.clone());
-                        response.edit_session = Some(manager.is_some_and(|manager| manager.edit_session_allowed(&worker.session_id)));
-                        let _ = service::reply(stream, &response).await;
-                    },
-                    Request::RuntimeStatus => {
-                        let source = status_target.lock().unwrap_or_else(|error|error.into_inner()).clone().unwrap_or_else(||deepseek_code_core::services::runtime_status::RuntimeSource {
-                            mcp: Arc::new(deepseek_code_core::mcp::McpServerManager::new(worker.root.join("mcp-servers.json"))),
-                            mcp_ready: Arc::new(tokio::sync::OnceCell::new()), workspace: worker.workspace.clone(), data_dir:worker.root.clone(),
-                        });
-                        let response = match tokio::time::timeout(Duration::from_secs(1), source.snapshot()).await {
-                            Ok(snapshot) => { let mut response=Reply::ok(None); response.runtime_status=Some(snapshot); response },
-                            Err(_) => Reply::error("Runtime status inspection timed out"),
-                        };
-                        let _ = service::reply(stream, &response).await;
-                    },
-                    Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
-                    Request::SetPermissionMode { job_id, mode } => {
-                        let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
-                        let reply = match result { Ok(session_id) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_session_id=Some(session_id); reply }, Err(error) => Reply::error(error) };
-                        let _ = service::reply(stream, &reply).await;
-                    },
-                    Request::GetPermissionMode { job_id } => {
-                        let result = current_live_mode(&worker, &mode_target, &job_id);
-                        let reply = match result { Ok(mut reply) => { reply.job_id=Some(job_id); reply }, Err(error)=>Reply::error(error) };
-                        let _ = service::reply(stream, &reply).await;
-                    },
-                    Request::Shutdown=>{
-                        if active.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker has an active turn; cancel or detach it explicitly")).await;}
-                        else if deepseek_code_core::tools::background_shell::has_active() {let _=service::reply(stream,&Reply::error("Session worker owns running background shell tasks; stop them explicitly before shutdown")).await;}
-                        else {let _=service::reply(stream,&Reply::ok(None)).await;break;}
-                    },
-                    Request::Submit{id,prompt,arguments,environment}=>{
-                        if fatal.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker is shutting down; prompt was not submitted")).await;continue;}
-                        if active.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
-                            let _=service::reply(stream,&Reply::error("Session worker is busy; prompt was not submitted")).await;continue;
-                        }
-                        *current_turn.lock().unwrap_or_else(|e|e.into_inner())=Some(id.clone());
-                        if let Err(error)=service::begin_job(&worker,&id,&prompt) {
-                            *current_turn.lock().unwrap_or_else(|e|e.into_inner())=None;
-                            active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
-                        }
-                        let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();let status_target=status_target.clone();let bash_target=bash_target.clone();let current_turn=current_turn.clone();let admission_released=admission_released.clone();
-                        tokio::spawn(async move {
-                            let task_worker=worker.clone();let task_id=turn_id.clone();let task_mode_target=mode_target.clone();
-                            let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target,status_target,bash_target).await}).await;
-                            let error=match result {Ok(result)=>result.err().map(|error|format!("{error:#}")),Err(error)=>{fatal.store(true,Ordering::Release);Some(format!("Session turn panicked: {error}"))}};
-                            if let Some(error)=&error {let _=service::emit_event(&serde_json::json!({"type":"error","error":error}));}
-                            if service::finish_job(&worker,&turn_id,error).await.is_err() {fatal.store(true,Ordering::Release);}
-                            *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = None;
-                            service::set_event_sink(None);
-                            std::env::remove_var(jobs::CONTROL_ENV);
-                            active.store(false,Ordering::Release);
-                            admission_released.notify_one();
-                            // Clear this turn's identity only while it still names
-                            // this turn. Admission is already open here, so a newer
-                            // submission can have replaced the identity in between;
-                            // that record must survive this cleanup.
-                            {
-                                let mut current=current_turn.lock().unwrap_or_else(|e|e.into_inner());
-                                if current.as_deref()==Some(&turn_id) { *current=None; }
+                    let turn_active = active.load(Ordering::Acquire);
+                    // Idle and active are the only activity values a host publishes.
+                    if turn_active != coordination_active {
+                        if let Some(guard) = coordination.as_ref() {
+                            guard.set_activity(if turn_active {
+                                deepseek_code_core::services::local_coordination::Activity::Active
+                            } else {
+                                deepseek_code_core::services::local_coordination::Activity::Idle
+                            });
+                            // A child-initiated idle->active wake refreshes the same row.
+                            if turn_active {
+                                guard.request_workspace_refresh(worker.workspace.clone());
                             }
-                        });
-                        // A lost acknowledgement never causes replay: the job ID is durable.
-                        let _=service::reply(stream,&Reply::ok(Some(id))).await;
-                        idle=Instant::now();
-                    },
+                        }
+                        coordination_active = turn_active;
+                    }
+                    let shell_active = deepseek_code_core::tools::background_shell::has_active();
+                    if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
+                    if (turn_active && !idle_child_active.load(Ordering::Acquire)) || shell_active {idle=Instant::now();}
+                    if !turn_active && !fatal.load(Ordering::Acquire) {
+                        if let Err(error) = child::start_pending(&worker, &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
+                            eprintln!("Owned child wake unavailable: {error:#}");
+                        }
+                    }
+                },
+                stream=listener.accept()=>{
+                    let stream=stream?;
+                    let parsed=tokio::time::timeout(Duration::from_secs(5),service::read_request(stream)).await;
+                    let Ok(Ok((stream,request)))=parsed else{continue};
+                    if matches!(&request,Request::Submit{..}|Request::Shutdown) {
+                            // The supervisor publishes a turn's completion before this
+                            // host releases admission, so a caller reacting to that
+                            // publication may be early rather than wrong. Wait for the
+                            // actual release of a turn proven finished; a running turn
+                            // is refused at once.
+                            let current=current_turn.lock().unwrap_or_else(|e|e.into_inner()).clone();
+                            let admission=await_admission(&active,current.as_deref(),&admission_released,|id|jobs::get(&worker.root,id).is_ok_and(|job|job.finished_ms.is_some()),ADMISSION_GRACE).await;
+                            // A submission that outlives the grace is not queued and not
+                            // replayed: it is answered as unsubmitted, exactly as any
+                            // other refusal, and the turn keeps its admission.
+                            if admission==Admission::Expired && matches!(&request,Request::Submit{..}) {
+                                let _=service::reply(stream,&Reply::error("Session worker is busy; prompt was not submitted")).await;continue;
+                            }
+                    }
+                    match request {
+                        Request::BashSession { revoke } => {
+                            let manager = bash_target.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if revoke { if let Some(manager) = &manager { manager.set_bash_session_allowed(&worker.session_id, false); } }
+                            let mut response = Reply::ok(None);
+                            response.permission_session_id = Some(worker.session_id.clone());
+                            response.bash_session = Some(manager.is_some_and(|manager| manager.bash_session_allowed(&worker.session_id)));
+                            let _ = service::reply(stream, &response).await;
+                        },
+                        Request::EditSession { revoke } => {
+                            let manager = bash_target.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if revoke { if let Some(manager) = &manager { manager.set_edit_session_allowed(&worker.session_id, false); } }
+                            let mut response = Reply::ok(None);
+                            response.permission_session_id = Some(worker.session_id.clone());
+                            response.edit_session = Some(manager.is_some_and(|manager| manager.edit_session_allowed(&worker.session_id)));
+                            let _ = service::reply(stream, &response).await;
+                        },
+                        Request::RuntimeStatus => {
+                            let source = status_target.lock().unwrap_or_else(|error|error.into_inner()).clone().unwrap_or_else(||deepseek_code_core::services::runtime_status::RuntimeSource {
+                                mcp: Arc::new(deepseek_code_core::mcp::McpServerManager::new(worker.root.join("mcp-servers.json"))),
+                                mcp_ready: Arc::new(tokio::sync::OnceCell::new()), workspace: worker.workspace.clone(), data_dir:worker.root.clone(),
+                            });
+                            let response = match tokio::time::timeout(Duration::from_secs(1), source.snapshot()).await {
+                                Ok(snapshot) => { let mut response=Reply::ok(None); response.runtime_status=Some(snapshot); response },
+                                Err(_) => Reply::error("Runtime status inspection timed out"),
+                            };
+                            let _ = service::reply(stream, &response).await;
+                        },
+                        Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
+                        Request::SetPermissionMode { job_id, mode } => {
+                            let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
+                            let reply = match result { Ok(session_id) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_session_id=Some(session_id); reply }, Err(error) => Reply::error(error) };
+                            let _ = service::reply(stream, &reply).await;
+                        },
+                        Request::GetPermissionMode { job_id } => {
+                            let result = current_live_mode(&worker, &mode_target, &job_id);
+                            let reply = match result { Ok(mut reply) => { reply.job_id=Some(job_id); reply }, Err(error)=>Reply::error(error) };
+                            let _ = service::reply(stream, &reply).await;
+                        },
+                        Request::Shutdown=>{
+                            if active.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker has an active turn; cancel or detach it explicitly")).await;}
+                            else if deepseek_code_core::tools::background_shell::has_active() {let _=service::reply(stream,&Reply::error("Session worker owns running background shell tasks; stop them explicitly before shutdown")).await;}
+                            else {let _=service::reply(stream,&Reply::ok(None)).await;break;}
+                        },
+                        Request::Submit{id,prompt,arguments,environment}=>{
+                            if fatal.load(Ordering::Acquire) {let _=service::reply(stream,&Reply::error("Session worker is shutting down; prompt was not submitted")).await;continue;}
+                            if active.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
+                                let _=service::reply(stream,&Reply::error("Session worker is busy; prompt was not submitted")).await;continue;
+                            }
+                            *current_turn.lock().unwrap_or_else(|e|e.into_inner())=Some(id.clone());
+                            if let Err(error)=service::begin_job(&worker,&id,&prompt) {
+                                *current_turn.lock().unwrap_or_else(|e|e.into_inner())=None;
+                                active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
+                            }
+                            // Admission succeeded: the same workspace path may now be on
+                            // another branch, so the host asks its registry worker to
+                            // re-observe before the turn runs. No second row is created.
+                            if let Some(guard) = coordination.as_ref() {
+                                guard.request_workspace_refresh(worker.workspace.clone());
+                                guard.set_activity(deepseek_code_core::services::local_coordination::Activity::Active);
+                            }
+                            coordination_active = true;
+                            let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();let status_target=status_target.clone();let bash_target=bash_target.clone();let current_turn=current_turn.clone();let admission_released=admission_released.clone();
+                            tokio::spawn(async move {
+                                let task_worker=worker.clone();let task_id=turn_id.clone();let task_mode_target=mode_target.clone();
+                                let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target,status_target,bash_target).await}).await;
+                                let error=match result {Ok(result)=>result.err().map(|error|format!("{error:#}")),Err(error)=>{fatal.store(true,Ordering::Release);Some(format!("Session turn panicked: {error}"))}};
+                                if let Some(error)=&error {let _=service::emit_event(&serde_json::json!({"type":"error","error":error}));}
+                                if service::finish_job(&worker,&turn_id,error).await.is_err() {fatal.store(true,Ordering::Release);}
+                                *mode_target.lock().unwrap_or_else(|e|e.into_inner()) = None;
+                                service::set_event_sink(None);
+                                std::env::remove_var(jobs::CONTROL_ENV);
+                                active.store(false,Ordering::Release);
+                                admission_released.notify_one();
+                                // Clear this turn's identity only while it still names
+                                // this turn. Admission is already open here, so a newer
+                                // submission can have replaced the identity in between;
+                                // that record must survive this cleanup.
+                                {
+                                    let mut current=current_turn.lock().unwrap_or_else(|e|e.into_inner());
+                                    if current.as_deref()==Some(&turn_id) { *current=None; }
+                                }
+                            });
+                            // A lost acknowledgement never causes replay: the job ID is durable.
+                            let _=service::reply(stream,&Reply::ok(Some(id))).await;
+                            idle=Instant::now();
+                        },
+                    }
                 }
             }
         }
+        Ok(())
     }
-    if let Some(session) = session.lock().await.take() {
-        session.close().await?;
+    .await;
+    // Session shutdown is attempted first, but the host's own incarnation is
+    // closed even when that shutdown reports an error or no Session existed.
+    let shutdown = match session.lock().await.take() {
+        Some(session) => Some(session.close().await),
+        None => None,
+    };
+    if let Some(mut guard) = coordination.take() {
+        let _ = guard.close().await;
+    }
+    // A serving failure is reported before the session's own shutdown result.
+    serve_result?;
+    if let Some(shutdown) = shutdown {
+        shutdown?;
     }
     Ok(true)
 }
@@ -388,7 +433,16 @@ async fn execute(
             })
             .await?;
     } else {
-        *current = Some(Session::open(&cli, &paths, selection, Some(&worker.session_id)).await?);
+        *current = Some(
+            Session::open_with_registration(
+                &cli,
+                &paths,
+                selection,
+                Some(&worker.session_id),
+                crate::local_coordination::RegistrationMode::HostOwned,
+            )
+            .await?,
+        );
     }
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
     let session = current.as_ref().unwrap();

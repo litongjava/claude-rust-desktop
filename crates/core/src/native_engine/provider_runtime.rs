@@ -23,14 +23,31 @@ static CATALOG: LazyLock<Value> = LazyLock::new(|| {
 });
 /// A provider entry of the embedded catalog shared with Desktop.
 pub fn catalog_entry(id: &str) -> Option<&'static Value> {
-    CATALOG["providers"].as_array()?.iter().find(|entry| entry["id"] == id)
+    CATALOG["providers"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["id"] == id)
 }
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 
-pub(crate) fn compaction_request(provider: &ResolvedProvider, messages: Vec<OpenAIMessage>, instructions: &str) -> Result<Value> {
-    let body = messages::request("openai-responses", provider, &Value::Null, messages, Some(instructions), vec![], 0)?;
-    Ok(serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]}))
+pub(crate) fn compaction_request(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    instructions: &str,
+) -> Result<Value> {
+    let body = messages::request(
+        "openai-responses",
+        provider,
+        &Value::Null,
+        messages,
+        Some(instructions),
+        vec![],
+        0,
+    )?;
+    Ok(
+        serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]}),
+    )
 }
 
 pub(super) fn metadata(provider: &ResolvedProvider) -> Result<(&'static Value, &'static Value)> {
@@ -70,6 +87,53 @@ fn resolved_base<'a>(configured: &'a str, entry: &'a Value, model: &'a Value) ->
     base.trim_end_matches('/')
 }
 
+/// The catalog protocol and the API the shared transport dials for it. The
+/// Chat alias (`mistral-conversations`) is the same normalized protocol.
+fn resolved_transport(provider: &ResolvedProvider) -> Result<(&'static str, &'static str)> {
+    let (_, model) = metadata(provider)?;
+    let protocol = provider
+        .model
+        .api
+        .as_deref()
+        .or_else(|| model["api"].as_str())
+        .context("Select a catalog model or specify its protocol")?;
+    match protocol {
+        "mistral-conversations" => Ok(("mistral-conversations", "openai-completions")),
+        "azure-openai-responses" => Ok(("azure-openai-responses", "openai-responses")),
+        "openai-codex-responses" => Ok(("openai-codex-responses", "openai-responses")),
+        "google-vertex" => Ok(("google-vertex", "google-generative-ai")),
+        "bedrock-converse-stream" => Ok(("bedrock-converse-stream", "bedrock-converse-stream")),
+        "openai-completions" => Ok(("openai-completions", "openai-completions")),
+        "anthropic-messages" => Ok(("anthropic-messages", "anthropic-messages")),
+        "openai-responses" => Ok(("openai-responses", "openai-responses")),
+        "google-generative-ai" => Ok(("google-generative-ai", "google-generative-ai")),
+        _ => bail!("Built-in protocol '{protocol}' is not implemented by the native Rust transport; no fallback protocol or Node process was used"),
+    }
+}
+
+/// Whether this provider's model stream uses the shared Chat Completions
+/// transport that post-content timeout recovery can stage. The answer reuses
+/// the sender's route/protocol resolution, so the two cannot disagree.
+pub(crate) fn chat_completions_eligible(provider: &ResolvedProvider) -> bool {
+    if provider.provider.builtin_id.is_none() {
+        // The direct client always dials Chat Completions when the OpenAI loop
+        // selects it.
+        return matches!(
+            provider.provider.api_format,
+            super::provider_manager::ApiFormat::OpenAI
+        );
+    }
+    resolved_transport(provider).is_ok_and(|(_, api)| api == "openai-completions")
+}
+
+/// Whether the transport serializes user text as Responses `input_text` parts.
+/// Direct (non-catalog) providers always dial Chat Completions, whose
+/// compatible servers may reject content arrays.
+pub(crate) fn responses_api(provider: &ResolvedProvider) -> bool {
+    provider.provider.builtin_id.is_some()
+        && resolved_transport(provider).is_ok_and(|(_, api)| api == "openai-responses")
+}
+
 pub async fn stream(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
@@ -88,7 +152,16 @@ pub async fn stream_with_schema(
     max_tokens: u32,
     response_schema: Option<&Value>,
 ) -> Result<ProviderStream> {
-    stream_with_schema_observed(provider, messages, system, tools, max_tokens, response_schema, None).await
+    stream_with_schema_observed(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        None,
+    )
+    .await
 }
 
 pub async fn stream_with_schema_observed(
@@ -123,21 +196,129 @@ pub async fn stream_with_options(
     context_capture: Option<&super::request_context::ContextCapture>,
     options: &super::request_options::RequestOptions,
 ) -> Result<ProviderStream> {
-    let (entry, model) = metadata(provider)?;
-    let protocol = provider
-        .model
-        .api
-        .as_deref()
-        .or_else(|| model["api"].as_str())
-        .context("Select a catalog model or specify its protocol")?;
-    let api = match protocol {
-        "mistral-conversations" => "openai-completions",
-        "azure-openai-responses" | "openai-codex-responses" => "openai-responses",
-        "google-vertex" => "google-generative-ai",
-        "bedrock-converse-stream" => protocol,
-        "openai-completions" | "anthropic-messages" | "openai-responses" | "google-generative-ai" => protocol,
-        _ => bail!("Built-in protocol '{protocol}' is not implemented by the native Rust transport; no fallback protocol or Node process was used"),
+    Ok(stream_with_options_counted(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        context_capture,
+        options,
+    )
+    .await?
+    .0)
+}
+
+/// Same transport, but a protocol that shares one retry budget with its body
+/// also returns the HTTP attempts it really made.
+pub async fn stream_with_options_counted(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    // A model stream is bounded per read, not in total; a malformed or zero
+    // configuration fails here before any request is built.
+    let client = super::model_http::streaming_client(super::model_http::Redirect::None)?;
+    stream_with_options_client(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        context_capture,
+        options,
+        client,
+    )
+    .await
+}
+
+/// Internal entry that supplies the attempt budget to the shared Chat
+/// transport. A single-post budget uses a client with no redirects and no
+/// internal retries, so one authorized replacement really is one POST.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_with_options_counted_budget(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let client = if budget.is_single_post() {
+        super::model_http::single_post_client()?
+    } else {
+        super::model_http::streaming_client(super::model_http::Redirect::None)?
     };
+    stream_with_options_client_budget(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        context_capture,
+        options,
+        client,
+        budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_with_options_client(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    // A standalone caller must see a malformed configuration as an error, and
+    // the budget getter must not run before that check.
+    crate::config::OrchestrationConfig::init_global()?;
+    stream_with_options_client_budget(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        context_capture,
+        options,
+        client,
+        crate::performance::AttemptBudget::configured(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_with_options_client_budget(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let (entry, model) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
     let key = credential(provider, entry["id"].as_str().unwrap_or_default());
     let configured = provider.provider.base_url.trim_end_matches('/');
     let region = if protocol == "bedrock-converse-stream" {
@@ -290,18 +471,42 @@ pub async fn stream_with_options(
     };
     let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
     let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
-    if let Some(schema) = response_schema.filter(|_| !crate::structured_output::provider_enforces_schema(&provider.provider.base_url)) {
+    // Responses endpoints route requests to a prompt cache by this key, so the
+    // same conversation keeps reusing one cached prefix.
+    if api == "openai-responses" {
+        if let Some(key) = super::request_identity::prompt_cache_key() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+    }
+    if let Some(schema) = response_schema.filter(|_| {
+        !crate::structured_output::provider_enforces_schema(&provider.provider.base_url)
+    }) {
         match api {
-            "openai-completions" => crate::structured_output::append_openai_instruction(&mut body, schema),
-            "anthropic-messages" => crate::structured_output::append_anthropic_instruction(&mut body, schema),
-            _ => bail!("Provider protocol '{protocol}' cannot enforce a JSON schema for this endpoint"),
+            "openai-completions" => {
+                crate::structured_output::append_openai_instruction(&mut body, schema)
+            }
+            "anthropic-messages" => {
+                crate::structured_output::append_anthropic_instruction(&mut body, schema)
+            }
+            _ => bail!(
+                "Provider protocol '{protocol}' cannot enforce a JSON schema for this endpoint"
+            ),
         }
     } else if let Some(schema) = response_schema {
         match api {
-            "openai-completions" => body["response_format"] = serde_json::json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}}),
-            "openai-responses" => body["text"]["format"] = serde_json::json!({"type":"json_schema","name":"structured_response","strict":true,"schema":schema}),
-            "anthropic-messages" => body["output_config"]["format"] = serde_json::json!({"type":"json_schema","schema":schema}),
-            _ => bail!("Strict JSON Schema output is not implemented for provider protocol '{protocol}'"),
+            "openai-completions" => {
+                body["response_format"] = serde_json::json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}})
+            }
+            "openai-responses" => {
+                body["text"]["format"] = serde_json::json!({"type":"json_schema","name":"structured_response","strict":true,"schema":schema})
+            }
+            "anthropic-messages" => {
+                body["output_config"]["format"] =
+                    serde_json::json!({"type":"json_schema","schema":schema})
+            }
+            _ => bail!(
+                "Strict JSON Schema output is not implemented for provider protocol '{protocol}'"
+            ),
         }
     }
     if protocol == "openai-codex-responses" {
@@ -344,21 +549,34 @@ pub async fn stream_with_options(
             body["prompt_mode"] = serde_json::json!("reasoning");
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
     let google_token =
         if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
-            Some(cloud_auth::google_token(&client).await?)
+            // A credential exchange is a buffered request, so it keeps the
+            // total-deadline policy even though the model body is idle-bounded.
+            let buffered = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            Some(cloud_auth::google_token(&buffered).await?)
         } else {
             None
         };
     if api == "anthropic-messages" {
-        crate::services::anthropic_auth::apply_fast(&mut body, provider.model.fast, &provider.model.id, &provider.provider.base_url)?;
+        crate::services::anthropic_auth::apply_fast(
+            &mut body,
+            provider.model.fast,
+            &provider.model.id,
+            &provider.provider.base_url,
+        )?;
     } else {
-        anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&key), "Anthropic OAuth credentials require the Anthropic messages API");
-        anyhow::ensure!(!provider.model.fast, "Fast mode requires the Anthropic messages API");
+        anyhow::ensure!(
+            !crate::services::anthropic_auth::is_oauth_marker(&key),
+            "Anthropic OAuth credentials require the Anthropic messages API"
+        );
+        anyhow::ensure!(
+            !provider.model.fast,
+            "Fast mode requires the Anthropic messages API"
+        );
     }
     let encoded_body = serde_json::to_string(&body)?;
     let account = if protocol == "openai-codex-responses" {
@@ -367,89 +585,135 @@ pub async fn stream_with_options(
         None
     };
     let harness_headers = options.headers(provider)?;
-    let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
-    let response = retry_with_backoff(|| async {
-        let mut request = client
-            .post(&url)
-            .headers(identity.headers())
-            .headers(harness_headers.clone())
-            .header("content-type", "application/json")
-            .body(encoded_body.clone());
-        if entry["id"] == "github-copilot" {
-            request = request
-                .header("X-Initiator", initiator)
-                .header("Openai-Intent", "conversation-edits");
-            if vision {
-                request = request.header("Copilot-Vision-Request", "true");
-            }
-        }
-        if protocol == "azure-openai-responses" {
-            request = request.header("api-key", &key);
-        }
-        if let Some(account) = &account {
-            request = request
-                .header("chatgpt-account-id", account)
-                .header("OpenAI-Beta", "responses=experimental");
-        }
-        match api {
-            "anthropic-messages" => {
-                request = request.header("anthropic-version", "2023-06-01");
-                if crate::services::anthropic_auth::is_oauth_marker(&key) || provider.model.fast {
-                    request = crate::services::anthropic_auth::authorize(request, &key, &provider.provider.base_url, provider.model.fast).await?;
-                } else if entry["id"] == "github-copilot" || key.starts_with("sk-ant-oat") {
-                    request = request.bearer_auth(&key);
-                } else if entry["id"] != "cloudflare-ai-gateway" {
-                    request = request.header("x-api-key", &key);
+    let identity = super::request_identity::RequestIdentity::new(
+        context_capture,
+        super::request_identity::is_opencode(provider),
+    );
+    let api = api.to_owned();
+    let opened = {
+        let client = client.clone();
+        let url = url.clone();
+        let harness_headers = harness_headers.clone();
+        let encoded_body = encoded_body.clone();
+        let body = body.clone();
+        let key = key.clone();
+        let account = account.clone();
+        let protocol = protocol.to_owned();
+        let provider = provider.clone();
+        let options = options.clone();
+        let capture = context_capture.cloned();
+        let google_token = google_token.clone();
+        let api_owned = api.clone();
+        move |identity: &super::request_identity::RequestIdentity| -> super::stream_retry::OpenFuture {
+            let client = client.clone();
+            let url = url.clone();
+            let harness_headers = harness_headers.clone();
+            let encoded_body = encoded_body.clone();
+            let body = body.clone();
+            let key = key.clone();
+            let account = account.clone();
+            let identity_headers = identity.headers();
+            let provider = provider.clone();
+            let options = options.clone();
+            let capture = capture.clone();
+            let google_token = google_token.clone();
+            let api = api_owned.clone();
+            let protocol = protocol.clone();
+            let region = region.clone();
+            Box::pin(async move {
+                let mut request = client
+                    .post(&url)
+                    .headers(identity_headers)
+                    .headers(harness_headers)
+                    .header("content-type", "application/json")
+                    .body(encoded_body.clone());
+                if entry["id"] == "github-copilot" {
+                    request = request
+                        .header("X-Initiator", initiator)
+                        .header("Openai-Intent", "conversation-edits");
+                    if vision {
+                        request = request.header("Copilot-Vision-Request", "true");
+                    }
                 }
-            }
-            "google-generative-ai" => {
-                if let Some(token) = &google_token {
-                    request = request.bearer_auth(token);
-                } else {
-                    request = request.header("x-goog-api-key", &key);
+                if protocol == "azure-openai-responses" {
+                    request = request.header("api-key", &key);
                 }
-            }
-            "bedrock-converse-stream" => {
-                if key.is_empty() {
-                    request =
-                        request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body)?);
-                } else {
-                    request = request.bearer_auth(&key);
+                if let Some(account) = &account {
+                    request = request
+                        .header("chatgpt-account-id", account)
+                        .header("OpenAI-Beta", "responses=experimental");
                 }
-            }
-            _ => {
-                if !key.is_empty()
-                    && protocol != "azure-openai-responses"
-                    && entry["id"] != "cloudflare-ai-gateway"
-                {
-                    request = request.bearer_auth(&key);
+                match api.as_str() {
+                    "anthropic-messages" => {
+                        request = request.header("anthropic-version", "2023-06-01");
+                        if crate::services::anthropic_auth::is_oauth_marker(&key) || provider.model.fast {
+                            request = crate::services::anthropic_auth::authorize(request, &key, &provider.provider.base_url, provider.model.fast).await?;
+                        } else if entry["id"] == "github-copilot" || key.starts_with("sk-ant-oat") {
+                            request = request.bearer_auth(&key);
+                        } else if entry["id"] != "cloudflare-ai-gateway" {
+                            request = request.header("x-api-key", &key);
+                        }
+                    }
+                    "google-generative-ai" => {
+                        if let Some(token) = &google_token {
+                            request = request.bearer_auth(token);
+                        } else {
+                            request = request.header("x-goog-api-key", &key);
+                        }
+                    }
+                    "bedrock-converse-stream" => {
+                        if key.is_empty() {
+                            request =
+                                request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body)?);
+                        } else {
+                            request = request.bearer_auth(&key);
+                        }
+                    }
+                    _ => {
+                        if !key.is_empty()
+                            && protocol != "azure-openai-responses"
+                            && entry["id"] != "cloudflare-ai-gateway"
+                        {
+                            request = request.bearer_auth(&key);
+                        }
+                    }
                 }
-            }
+                if entry["id"] == "cloudflare-ai-gateway" {
+                    request = request.header("cf-aig-authorization", format!("Bearer {key}"));
+                }
+                if let Some(capture) = &capture {
+                    capture
+                        .record(&api, &body, provider.model.context_window, max_tokens)
+                        .await;
+                }
+                checked_response(
+                    super::request_recording::send(
+                        request,
+                        &options.clone().observed(capture.as_ref()),
+                        &provider,
+                        &api,
+                        true,
+                    )
+                    .await?,
+                )
+                .await
+            })
         }
-        if entry["id"] == "cloudflare-ai-gateway" {
-            request = request.header("cf-aig-authorization", format!("Bearer {key}"));
-        }
-        if let Some(capture) = context_capture {
-            capture
-                .record(api, &body, provider.model.context_window, max_tokens)
-                .await;
-        }
-        checked_response(
-            super::request_recording::send(
-                request,
-                &options.clone().observed(context_capture),
-                provider,
-                api,
-                true,
-            )
-            .await?,
-        )
-        .await
+    };
+    if api == "openai-completions" {
+        // A fallible initialization keeps a malformed configuration an error
+        // instead of caching its defaults for the rest of the process.
+        crate::config::OrchestrationConfig::init_global()?;
+        return super::stream_retry::attempts_with_budget(identity, opened, chat_decoder, budget)
+            .await;
+    }
+    let response = retry_with_backoff(|| {
+        let response = opened(&identity);
+        async move { response.await }
     })
     .await?;
-    let api = api.to_string();
     let mut bytes = response.bytes_stream();
-    Ok(Box::pin(async_stream::try_stream! {
+    let stream: ProviderStream = Box::pin(async_stream::try_stream! {
         let mut pending = Vec::new();
         let mut state = events::State::default();
         while let Some(part) = bytes.next().await {
@@ -473,7 +737,92 @@ pub async fn stream_with_options(
         if !state.finished { Err(anyhow::anyhow!("Provider stream ended before completion"))?; }
         if let Some(chunk)=state.complete(&api) {yield format!("data: {}\n\n",chunk);}
         yield "data: [DONE]\n\n".to_string();
-    }))
+    });
+    Ok((stream, crate::performance::AttemptCounter::default()))
+}
+
+/// Decode one Chat Completions response. Parser state is rebuilt for every
+/// attempt, and a clean EOF after a wholly empty prelude is left to the shared
+/// prelude gate so it can reopen the request. Raw provider data closes that
+/// window immediately: an unfinished frame, a terminal marker, content of any
+/// kind, an opaque part, unknown data or a provider error.
+pub(super) fn chat_decoder(response: reqwest::Response) -> super::stream_retry::DecodedStream {
+    Box::pin(async_stream::try_stream! {
+        let api = "openai-completions";
+        let mut bytes = response.bytes_stream();
+        let mut pending = Vec::new();
+        let mut state = events::State::default();
+        // Closed as soon as a second attempt could duplicate received data.
+        let mut barrier = false;
+        // The raw provider terminal marker, independent of a JSON finish reason.
+        let mut terminal = false;
+        while let Some(part) = bytes.next().await {
+            let part = match part {
+                Ok(part) => part,
+                Err(error) => {
+                    // A read failure is retryable only while nothing received so
+                    // far would be duplicated by a new request.
+                    let failure = if barrier || !pending.iter().all(u8::is_ascii_whitespace) {
+                        anyhow::Error::new(super::stream_retry::NoReplay::with_terminal_marker(
+                            error, terminal,
+                        ))
+                    } else {
+                        anyhow::Error::new(error)
+                    };
+                    Err::<bytes::Bytes, _>(failure)?
+                }
+            };
+            pending.extend_from_slice(&part);
+            if pending.len() > 16 * 1024 * 1024 { Err(anyhow::anyhow!("Provider SSE frame exceeds 16 MiB"))?; }
+            while let Some((end, separator)) = frame_end(&pending) {
+                let frame = String::from_utf8(pending[..end].to_vec()).context("Provider returned invalid UTF-8")?;
+                pending.drain(..end + separator);
+                let data = frame.lines().filter_map(|line| line.strip_prefix("data:").map(|v| v.strip_prefix(' ').unwrap_or(v))).collect::<Vec<_>>().join("\n");
+                if data.is_empty() { continue; }
+                if data == "[DONE]" {
+                    // Latch the terminal marker before the next body read.
+                    state.finished = true;
+                    barrier = true;
+                    terminal = true;
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&data).context("Invalid provider SSE JSON")?;
+                if let Some(error) = chat_error(&value) {
+                    // Remote text is reduced here, before any diagnostic exists.
+                    let failure = crate::performance::RequestFailure::remote_event(error, None, None, barrier);
+                    Err(anyhow::Error::new(failure))?;
+                }
+                // Raw eligibility is decided before normalization can drop data.
+                if !super::stream_retry::empty_prelude_value(&value) { barrier = true; }
+                for chunk in state.convert(api, value)? {
+                    yield format!("data: {}\n\n", chunk);
+                }
+                // A finish_reason is as terminal as a raw [DONE] marker.
+                if state.finished { barrier = true; }
+            }
+        }
+        if !pending.iter().all(u8::is_ascii_whitespace) { Err(anyhow::anyhow!("Provider stream ended inside an SSE frame"))?; }
+        if !state.finished {
+            if barrier {
+                Err(anyhow::anyhow!("Provider stream ended before completion"))?;
+            }
+        } else {
+            if let Some(chunk)=state.complete(api) {yield format!("data: {}\n\n",chunk);}
+            yield "data: [DONE]\n\n".to_string();
+        }
+    })
+}
+
+/// The Chat provider error forms `events::State::convert` rejects. The nested
+/// payload is used when present; a top-level error event is its own payload.
+/// The provider's error payload, whichever shape the event uses: a non-null
+/// nested `error` member, or a top-level `{"type":"error"}` event. Shared with
+/// the trace so a direct Chat error vetoes recovery like a built-in one.
+pub(super) fn chat_error(value: &Value) -> Option<&Value> {
+    if !value["error"].is_null() {
+        return Some(&value["error"]);
+    }
+    (value["type"] == "error").then_some(value)
 }
 
 /// Observe binary completion without exposing the decoded/normalized stream to

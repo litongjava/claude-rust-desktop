@@ -65,7 +65,8 @@ impl Transcript {
             tool_view::titled(tool_view::expanded_block(name, input, output, failed, None, None), name, title, failed),
             Some(number),
         );
-        let (id, rows) = self.history.tool_block(name, failed, short, full);
+        let compact = tool_view::compact_label(name, input);
+        let (id, rows) = self.history.tool_block(&compact, failed, short, full);
         self.history.bind_copy(
             id,
             tool_view::copy_command(name, input),

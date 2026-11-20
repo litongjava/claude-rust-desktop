@@ -7,18 +7,20 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
+#[cfg(target_os = "linux")]
+use crate::services::local_coordination::process_identity::{
+    pidfd_exited, LinuxIdentity as OwnerIdentity,
+};
+#[cfg(all(target_os = "linux", test))]
+use crate::services::local_coordination::process_identity::{
+    process_start_time, read_boot_id, PID_MAX_LIMIT,
+};
 #[path = "shell_notifications.rs"]
 mod notifications;
 pub use notifications::{
     collect_completed, collect_finished, notification_summary, Finished, NOTIFICATION_START,
 };
 tokio::task_local! { pub(super) static CONTEXT: Option<(PathBuf, String)>; }
-tokio::task_local! {
-    /// Whether these tool calls belong to a delegated child session. A child's
-    /// background tasks are never reported after it returns, so its foreground
-    /// timeout keeps terminating the command instead of promoting it.
-    pub(super) static DELEGATED: bool;
-}
 
 /// A shell task's log directory: its task ID, or the directory of a
 /// foreground call that was moved to the background.
@@ -101,144 +103,6 @@ pub(crate) enum OwnerState {
     LegacyPid(u32),
     /// The identity is missing, malformed or unreadable, so it proves nothing.
     Unreadable(String),
-}
-
-/// The identity of the engine process that owns a shell task.
-///
-/// A bare PID is not an identity: the PID space is reused, so "a process with
-/// this PID exists" can become true again after the owner dies. The boot ID
-/// isolates reboots, where `/proc` start times restart from a different origin,
-/// and the start time distinguishes two processes that held the same PID in one
-/// boot. This is written into the lease file itself before it is published, so
-/// a reader never sees a held lease without an identity that belongs to it.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OwnerIdentity {
-    pid: u32,
-    boot: String,
-    start: u64,
-}
-
-#[cfg(target_os = "linux")]
-impl OwnerIdentity {
-    /// The identity of this process: the engine that is about to own the shell.
-    fn current() -> Result<Self> {
-        let pid = std::process::id();
-        Ok(Self {
-            pid,
-            boot: read_boot_id().context("Reading the machine boot identity")?,
-            start: process_start_time(pid)
-                .with_context(|| format!("Reading the creation identity of PID {pid}"))?,
-        })
-    }
-
-    fn encode(&self) -> String {
-        format!("dcl-owner-v1 {} {} {}\n", self.pid, self.boot, self.start)
-    }
-
-    /// Parses a recorded identity. Anything that is not exactly one complete,
-    /// well-formed record yields `None`: a partial or foreign line must never be
-    /// read as "some process owns this".
-    fn parse(text: &str) -> Option<Self> {
-        // Exactly one record: trailing non-empty content means this file is not
-        // the record this build wrote, so it must not be read as an identity.
-        let mut lines = text.lines();
-        let first = lines.next()?;
-        if lines.any(|line| !line.trim().is_empty()) {
-            return None;
-        }
-        let mut fields = first.split_whitespace();
-        if fields.next()? != "dcl-owner-v1" {
-            return None;
-        }
-        let pid = fields.next()?.parse::<u32>().ok()?;
-        let boot = fields.next()?.to_owned();
-        let start = fields.next()?.parse::<u64>().ok()?;
-        if fields.next().is_some() || boot.is_empty() {
-            return None;
-        }
-        // PID 0 is the kernel's idle task and can never own a shell; anything
-        // above the kernel's `PID_MAX_LIMIT` is not a PID this system can issue.
-        if !valid_pid(pid) {
-            return None;
-        }
-        Some(Self { pid, boot, start })
-    }
-
-    /// Whether the process with this PID is, right now, the very process this
-    /// identity was recorded for.
-    ///
-    /// `Ok(false)` is a definite mismatch (the process is gone, was reaped, or
-    /// the PID now names a different process). `Err` means the identity could
-    /// not be checked, which never authorizes a write.
-    fn matches_current_process(&self) -> std::io::Result<bool> {
-        if read_boot_id()? != self.boot {
-            return Ok(false);
-        }
-        match process_start_time(self.pid) {
-            Ok(start) => Ok(start == self.start),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-/// Linux `PID_MAX_LIMIT`: the largest PID the kernel can ever allocate.
-#[cfg(target_os = "linux")]
-const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
-
-/// A PID that can name a real process: never 0 (the idle task), never above the
-/// kernel's allocatable range.
-#[cfg(target_os = "linux")]
-fn valid_pid(pid: u32) -> bool {
-    pid > 0 && pid <= PID_MAX_LIMIT
-}
-
-#[cfg(target_os = "linux")]
-fn read_boot_id() -> std::io::Result<String> {
-    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-        .trim()
-        .to_owned())
-}
-
-/// Field 22 of `/proc/<pid>/stat`: the process creation time in clock ticks.
-///
-/// The command name is parenthesized and may itself contain spaces or
-/// parentheses, so the fixed fields are taken after the last `)`.
-#[cfg(target_os = "linux")]
-fn process_start_time(pid: u32) -> std::io::Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("the creation field of PID {pid} is unreadable"),
-            )
-        })
-}
-
-/// Whether a pinned process descriptor reports that its process has exited. A
-/// zombie counts as exited: nothing can consume stdin any more.
-#[cfg(target_os = "linux")]
-fn pidfd_exited(pidfd: &rustix::fd::OwnedFd) -> std::io::Result<bool> {
-    let mut fds = [rustix::event::PollFd::new(
-        pidfd,
-        rustix::event::PollFlags::IN,
-    )];
-    let timeout = rustix::event::Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    loop {
-        match rustix::event::poll(&mut fds, Some(&timeout)) {
-            Ok(0) => return Ok(false),
-            Ok(_) => return Ok(true),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 impl OwnerState {
@@ -588,12 +452,6 @@ pub async fn scope<F: Future>(context: Option<(PathBuf, String)>, future: F) -> 
     CONTEXT.scope(context, future).await
 }
 
-/// Marks the tool calls of a delegated child so a foreground timeout there keeps
-/// the historical kill instead of promoting a task nobody would report.
-pub async fn delegated_scope<F: Future>(delegated: bool, future: F) -> F::Output {
-    DELEGATED.scope(delegated, future).await
-}
-
 pub(super) fn session_environment() -> Result<Option<String>> {
     match CONTEXT.try_with(Clone::clone).ok().flatten() {
         Some((root, session)) => crate::services::session_environment::script(&root, &session),
@@ -866,12 +724,12 @@ pub(crate) fn start(
         };
         completion.finish(status, output);
     });
-    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it.")});
+    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it.")});
     if interaction == Interaction::StdinPipe {
         result["interaction"] = json!("pipe");
         result["stdin_available"] = json!(true);
         result["stdin_pipe"] = json!(directory.join("stdin.pipe"));
-        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet with ToolSearch to read output, and TaskStop to stop it. You will be notified when it finishes."));
+        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet (load with ToolLoad, names: [\"TaskGet\"]) to read output, and TaskStop to stop it. You will be notified when it finishes."));
     }
     Ok(result)
 }
@@ -1011,9 +869,9 @@ pub(super) async fn run_foreground(
         let _guard = guard;
         return super::bash_process::run(&mut command, timeout, shell).await;
     };
-    // A delegated child's background tasks are never reported to the parent, so
-    // its foreground calls keep the historical kill-at-timeout behavior.
-    let delegated = DELEGATED.try_with(|delegated| *delegated).unwrap_or(false);
+    // A delegated child's background tasks are reported and stopped by the
+    // delegation owner that started it, so this path is the same for every
+    // managed session.
     let session_directory = root.join("shell-tasks").join(id.to_string());
     let log_dir = format!("fg-{}", uuid::Uuid::new_v4());
     let directory = session_directory.join(&log_dir);
@@ -1034,11 +892,7 @@ pub(super) async fn run_foreground(
         // A managed call carries no timeout inside the capture: the poll loop
         // below hands the process to the model as a background task, so a
         // foreground timeout never kills what the command has already achieved.
-        // A delegated child keeps the old capture timeout instead, because no
-        // one would be told about a task it left running.
-        let capture_timeout = delegated.then_some(timeout);
-        super::bash_process::run_logged(&mut command, capture_timeout, &shell_name, Some(logs), None)
-            .await
+        super::bash_process::run_logged(&mut command, None, &shell_name, Some(logs), None).await
     })));
     let reason = loop {
         let handle = running.0.as_mut().context("Shell task missing")?;
@@ -1055,7 +909,7 @@ pub(super) async fn run_foreground(
                 if requested {
                     break Reason::UserRequest;
                 }
-                if !delegated && started_at.elapsed() >= timeout {
+                if started_at.elapsed() >= timeout {
                     break Reason::Timeout;
                 }
             }
@@ -1133,12 +987,352 @@ pub(super) async fn run_foreground(
             "timeout_ms":millis,
             "stdout":stdout,
             "stderr":stderr,
-            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolSearch (block:true waits); TaskStop stops it. You will be notified when it finishes.")
+            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolLoad (names: [\"TaskGet\"]), then call TaskGet with block:true to wait; TaskStop stops it. You will be notified when it finishes.")
         }));
     }
     Ok(
-        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it."}),
+        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it."}),
     )
+}
+
+/// The outcome of stopping the managed shells one session left running.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionStop {
+    /// Subjects whose final status is `cancelled`.
+    pub stopped: Vec<String>,
+    /// Subjects whose stop was requested but that had not ended yet when the
+    /// bounded wait ran out.
+    pub requested: Vec<String>,
+    /// Subject and error text of tasks whose stop could not even be requested.
+    pub failed: Vec<(String, String)>,
+    /// Why the session's tasks could not be listed or checked at all. Empty
+    /// lists can otherwise mean either "nothing needed stopping" or "nothing
+    /// could be read".
+    pub scan_error: Option<String>,
+}
+
+/// How long the end of a subagent waits for requested stops to be confirmed.
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const STOP_CONFIRM_POLL: Duration = Duration::from_millis(50);
+
+/// Reported when the request phase stopped before it looked at every task.
+const REQUEST_INCOMPLETE: &str = "timed out after 5 seconds before every task was checked";
+
+/// A stop that was requested and still has to be confirmed by its owner.
+#[derive(Clone)]
+struct PendingStop {
+    id: String,
+    subject: String,
+}
+
+/// What a running request job has done so far, shared with its caller so an
+/// expired job can be told to stop and its caller can keep partial results.
+#[derive(Default)]
+struct RequestProgress {
+    /// The caller gave up: send no further stop, whatever the listing says.
+    abandoned: bool,
+    pending: Vec<PendingStop>,
+    outcome: SessionStop,
+}
+
+/// Locks the progress without letting a previous panic hide its contents.
+fn lock_progress(
+    progress: &std::sync::Mutex<RequestProgress>,
+) -> std::sync::MutexGuard<'_, RequestProgress> {
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Requests a stop for every running managed shell or monitor of `session`.
+/// A task that finished between the listing and the request keeps its final status.
+/// Each stop is requested independently.
+///
+/// The listing is only a starting point: the deadline and the abandoned flag
+/// are checked before every stop, because this may run on a blocking thread
+/// after its caller gave up, and the session can already belong to a resumed
+/// child then. The mutex is only held to read the flag and record a result,
+/// never across a blocking read.
+fn request_session_stops(
+    root: &Path,
+    session: &str,
+    progress: &std::sync::Mutex<RequestProgress>,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    let session = uuid::Uuid::parse_str(session)?.to_string();
+    let listing = super::tasks::execute_for_session("TaskList", json!({}), root, &session)?;
+    for task in listing["tasks"].as_array().into_iter().flatten() {
+        let metadata = &task["metadata"];
+        let active = if metadata["monitor"] == true {
+            super::monitor::is_active_status(&task["status"])
+        } else {
+            metadata["managed_shell"] == true && task["status"] == "running"
+        };
+        if !active {
+            continue;
+        }
+        let Some(id) = task["id"].as_str() else {
+            continue;
+        };
+        let subject = task["subject"].as_str().unwrap_or(id).to_owned();
+        {
+            let mut progress = lock_progress(progress);
+            if progress.abandoned
+                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                progress.abandoned = true;
+                return Ok(());
+            }
+        }
+        let requested = control("TaskStop", &json!({"task_id":id}), root, &session);
+        let mut progress = lock_progress(progress);
+        match requested {
+            Ok(Some(result)) if result["cancellation_requested"] == true => {
+                progress.pending.push(PendingStop {
+                    id: id.to_owned(),
+                    subject,
+                })
+            }
+            // Nothing this call can stop: the task ended before the request.
+            Ok(_) => {}
+            Err(error) => progress
+                .outcome
+                .failed
+                .push((subject, format!("{error:#}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Takes the request results recorded so far, leaving the progress empty. The
+/// flag says whether the request phase stopped before checking every task, so a
+/// caller that joins normally still reports an incomplete check.
+fn take_progress(
+    progress: &std::sync::Mutex<RequestProgress>,
+) -> (Vec<PendingStop>, SessionStop, bool) {
+    let mut progress = lock_progress(progress);
+    (
+        std::mem::take(&mut progress.pending),
+        std::mem::take(&mut progress.outcome),
+        progress.abandoned,
+    )
+}
+
+/// The effective status of one stored task, without reading its output.
+///
+/// Confirming a stop only needs this. Reading the logs here would let an
+/// unrelated log error hide a status that is already terminal.
+fn task_status_only(root: &Path, session: &str, id: &str) -> Result<String> {
+    let task = super::tasks::read_for_session(id, root, session)?;
+    task_status(root, session, &task)
+}
+
+/// Moves each requested task to `stopped` once its final status is recorded as
+/// `cancelled`, and drops the ones that finished on their own. A status that
+/// could not be read is reported as a failure, so it is not silently shown as
+/// still running. Everything unresolved is returned to be checked again.
+///
+/// `deadline` bounds the whole scan: the reads block on the task database, so
+/// the caller cannot check the clock between tasks.
+fn confirm_pending(
+    root: &Path,
+    session: &str,
+    pending: Vec<PendingStop>,
+    outcome: &mut SessionStop,
+    deadline: Option<std::time::Instant>,
+) -> Vec<PendingStop> {
+    let mut still = Vec::new();
+    let mut remaining = pending.into_iter();
+    while let Some(pending) = remaining.next() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            still.push(pending);
+            still.extend(remaining);
+            break;
+        }
+        match task_status_only(root, session, &pending.id) {
+            Ok(status) if status == "cancelled" => outcome.stopped.push(pending.subject),
+            // A shell that completed or failed on its own ended by itself, not
+            // because of this stop, so it is not reported.
+            Ok(status) if matches!(status.as_str(), "completed" | "failed" | "deleted") => {}
+            Ok(_) => still.push(pending),
+            Err(error) => outcome.failed.push((pending.subject, format!("{error:#}"))),
+        }
+    }
+    still
+}
+
+/// Adds one scan's findings to the running outcome.
+fn merge(outcome: &mut SessionStop, delta: SessionStop) {
+    outcome.stopped.extend(delta.stopped);
+    outcome.requested.extend(delta.requested);
+    outcome.failed.extend(delta.failed);
+}
+
+/// Reports the stops that never reached a terminal status.
+fn finish_stops(pending: Vec<PendingStop>, mut outcome: SessionStop) -> SessionStop {
+    outcome
+        .requested
+        .extend(pending.into_iter().map(|pending| pending.subject));
+    ordered(outcome)
+}
+
+/// A stable report order, so the same set of tasks always reads the same way
+/// regardless of which shell owner happened to finish first.
+fn ordered(mut outcome: SessionStop) -> SessionStop {
+    outcome.stopped.sort();
+    outcome.requested.sort();
+    outcome.failed.sort_by(|left, right| left.0.cmp(&right.0));
+    outcome
+}
+
+/// Stops every managed shell task of `session` that is still running, through
+/// the same TaskStop path.
+///
+/// A delegated child runs in its own conversation, so when it ends nothing
+/// would read or stop the background shells and monitors it left behind.
+/// Managed shells (including PTY shells) and monitors are handled here.
+/// Finished tasks keep their final record.
+///
+/// `confirm` waits up to [`STOP_CONFIRM_TIMEOUT`] in total for the requested
+/// tasks' final status. With a blocking sleep it must not run on the runtime the
+/// shell owners need; use [`stop_running_session_tasks_async`] there.
+pub fn stop_running_session_tasks(
+    root: &Path,
+    session: &str,
+    confirm: bool,
+) -> Result<SessionStop> {
+    let deadline = std::time::Instant::now() + STOP_CONFIRM_TIMEOUT;
+    let progress = std::sync::Mutex::new(RequestProgress::default());
+    request_session_stops(root, session, &progress, confirm.then_some(deadline))?;
+    let (mut pending, mut outcome, abandoned) = take_progress(&progress);
+    if !confirm {
+        return Ok(finish_stops(pending, outcome));
+    }
+    // The request phase can see the deadline itself and stop early; confirming
+    // then would hide the tasks it never looked at.
+    if abandoned {
+        let mut outcome = finish_stops(pending, outcome);
+        outcome.scan_error = Some(REQUEST_INCOMPLETE.to_owned());
+        return Ok(ordered(outcome));
+    }
+    loop {
+        pending = confirm_pending(root, session, pending, &mut outcome, Some(deadline));
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(STOP_CONFIRM_POLL);
+    }
+    Ok(finish_stops(pending, outcome))
+}
+
+/// [`stop_running_session_tasks`] that keeps the caller's runtime free while it
+/// waits, so the shell owners can record the final status.
+///
+/// One deadline covers the request phase and every confirmation scan together,
+/// and each blocking read runs on the blocking pool: the task database may hold
+/// a reader or writer for its whole busy timeout.
+pub async fn stop_running_session_tasks_async(
+    root: &Path,
+    session: &str,
+) -> Result<SessionStop> {
+    let (root_path, session_id) = (root.to_owned(), session.to_owned());
+    stop_with_request(
+        root,
+        session,
+        STOP_CONFIRM_TIMEOUT,
+        move |progress, deadline| {
+            request_session_stops(&root_path, &session_id, progress, Some(deadline))
+        },
+    )
+    .await
+}
+
+/// The async stop with an injected request phase, so the handoff between the
+/// blocking job and this caller can be tested with a short budget.
+async fn stop_with_request<F>(
+    root: &Path,
+    session: &str,
+    budget: Duration,
+    request: F,
+) -> Result<SessionStop>
+where
+    F: FnOnce(&std::sync::Mutex<RequestProgress>, std::time::Instant) -> Result<()> + Send + 'static,
+{
+    let deadline = std::time::Instant::now() + budget;
+    let async_deadline = tokio::time::Instant::from_std(deadline);
+    // A timeout only drops the join handle: the blocking job keeps running.
+    // The shared flag is how it learns that it must not start another stop.
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(RequestProgress::default()));
+    let job = {
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || request(&progress, deadline))
+    };
+    let (mut pending, mut outcome) = match tokio::time::timeout_at(async_deadline, job).await {
+        Ok(result) => {
+            result??;
+            let (pending, outcome, abandoned) = take_progress(&progress);
+            // The job's own deadline check can stop it before every task, and
+            // its ready result may win the race against the elapsed timer.
+            if abandoned {
+                let mut outcome = finish_stops(pending, outcome);
+                outcome.scan_error = Some(REQUEST_INCOMPLETE.to_owned());
+                return Ok(ordered(outcome));
+            }
+            (pending, outcome)
+        }
+        Err(_) => {
+            // Report what the job already requested instead of discarding it,
+            // and keep the job from sending another stop.
+            let (pending, outcome) = {
+                let mut progress = lock_progress(&progress);
+                progress.abandoned = true;
+                (
+                    std::mem::take(&mut progress.pending),
+                    std::mem::take(&mut progress.outcome),
+                )
+            };
+            let mut outcome = finish_stops(pending, outcome);
+            outcome.scan_error = Some(REQUEST_INCOMPLETE.to_owned());
+            return Ok(outcome);
+        }
+    };
+    loop {
+        if pending.is_empty() {
+            return Ok(ordered(outcome));
+        }
+        let scan = {
+            let (root, session) = (root.to_owned(), session.to_owned());
+            let remaining = pending.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut delta = SessionStop::default();
+                let still = confirm_pending(&root, &session, remaining, &mut delta, Some(deadline));
+                (still, delta)
+            })
+        };
+        match tokio::time::timeout_at(async_deadline, scan).await {
+            Ok(Ok((still, delta))) => {
+                merge(&mut outcome, delta);
+                pending = still;
+            }
+            Ok(Err(error)) => {
+                // The scan itself could not run; keep the requests visible as
+                // unconfirmed and say why they were not checked.
+                let mut outcome = finish_stops(pending, outcome);
+                outcome.scan_error = Some(format!("confirmation scan failed: {error}"));
+                return Ok(ordered(outcome));
+            }
+            // The deadline is the expected bound, not a scan failure.
+            Err(_) => return Ok(finish_stops(pending, outcome)),
+        }
+        if pending.is_empty() {
+            return Ok(ordered(outcome));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= async_deadline {
+            return Ok(finish_stops(pending, outcome));
+        }
+        tokio::time::sleep_until((now + STOP_CONFIRM_POLL).min(async_deadline)).await;
+    }
 }
 
 pub(super) fn control(
@@ -1175,6 +1369,12 @@ pub(super) fn control(
         return Ok(None);
     }
     anyhow::ensure!(policy.is_none_or(|(block, _)| !block), "Blocking TaskGet requires the asynchronous task entry point; synchronous callers must set block:false");
+    if monitor && name == "TaskStop" && !super::monitor::is_active_status(&task["status"]) {
+        return Ok(Some(json!({
+            "task_id":id,"status":task["status"],"cancellation_requested":false,
+            "message":"Monitor already finished."
+        })));
+    }
     let id = uuid::Uuid::parse_str(id)?.to_string();
     let session = uuid::Uuid::parse_str(session)?;
     let directory = directory(root, &session.to_string(), &task)?;
@@ -1680,9 +1880,13 @@ pub(super) async fn control_async(
 mod tests {
     use super::*;
     fn waiting_fixture(root: &Path, session: &str) -> String {
+        running_fixture(root, session, "waiting fixture")
+    }
+
+    fn running_fixture(root: &Path, session: &str, subject: &str) -> String {
         let task = super::super::tasks::execute_for_shell_owner(
             "TaskCreate",
-            json!({"subject":"waiting fixture","metadata":{"managed_shell":true}}),
+            json!({"subject":subject,"metadata":{"managed_shell":true}}),
             root,
             session,
         )
@@ -2738,36 +2942,394 @@ setInterval(() => {}, 10000);
         assert!(result.get("task_id").is_none(), "{result}");
     }
 
-    /// A delegated child keeps the historical timeout: the process is terminated
-    /// instead of becoming a task of a session nobody reports on.
-    #[tokio::test]
-    async fn a_delegated_foreground_call_is_still_terminated_at_its_timeout() {
-        crate::config::OrchestrationConfig::init_global().unwrap();
+    /// End-of-subagent cleanup stops only this session's running managed
+    /// shells: a finished record and another session's task are left alone.
+    #[test]
+    fn stop_running_session_tasks_stops_only_its_own_running_shells() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let mut command = Command::new("node");
-        command
-            .arg("-e")
-            .arg("console.log('waiting');setInterval(()=>{},1000)");
-        let result = scope(
-            Some((root.path().into(), session.clone())),
-            delegated_scope(
-                true,
-                run_foreground(
-                    command,
-                    Duration::from_millis(800),
-                    "node",
-                    "delegated",
-                    "node delegated",
-                    None,
-                ),
-            ),
+        let other = uuid::Uuid::new_v4().to_string();
+        let running = waiting_fixture(root.path(), &session);
+        let finished = super::super::tasks::execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"finished shell","metadata":{"managed_shell":true}}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        let finished = finished["id"].as_str().unwrap().to_owned();
+        for status in ["running", "completed"] {
+            super::super::tasks::execute_for_shell_owner(
+                "TaskUpdate",
+                json!({"id":finished,"status":status}),
+                root.path(),
+                &session,
+            )
+            .unwrap();
+        }
+        let foreign = waiting_fixture(root.path(), &other);
+        let outcome = stop_running_session_tasks(root.path(), &session, false).unwrap();
+        assert_eq!(outcome.requested, vec!["waiting fixture"]);
+        assert!(outcome.stopped.is_empty(), "{outcome:?}");
+        assert!(outcome.failed.is_empty(), "{outcome:?}");
+        let session_dir = root.path().join("shell-tasks").join(&session);
+        assert!(session_dir.join(&running).join("cancel").exists());
+        assert!(!session_dir.join(&finished).join("cancel").exists());
+        assert!(!root
+            .path()
+            .join("shell-tasks")
+            .join(&other)
+            .join(&foreign)
+            .join("cancel")
+            .exists());
+        assert_eq!(snapshot(root.path(), &session, &finished)["status"], "completed");
+        assert_eq!(snapshot(root.path(), &other, &foreign)["status"], "running");
+        // Leave no running fixture behind.
+        assert_eq!(
+            stop_running_session_tasks(root.path(), &other, false)
+                .unwrap()
+                .requested,
+            vec!["waiting fixture"]
+        );
+    }
+
+    /// A stop the fixture owner confirms, once it sees the request, by recording
+    /// the final status a real shell owner would write.
+    fn confirm_task_when_requested(
+        root: &Path,
+        session: &str,
+        id: &str,
+        status: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        let cancel = root.join("shell-tasks").join(session).join(id).join("cancel");
+        let (root, session, id) = (root.to_owned(), session.to_owned(), id.to_owned());
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            while !cancel.exists() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "no cancel request for {id}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            super::super::tasks::execute_for_shell_owner(
+                "TaskUpdate",
+                json!({"id":id,"status":status}),
+                &root,
+                &session,
+            )
+            .unwrap();
+        })
+    }
+
+    /// One failed stop must not skip the tasks listed after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_stop_does_not_skip_the_other_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let a = running_fixture(root.path(), &session, "A");
+        let b = running_fixture(root.path(), &session, "B");
+        let c = running_fixture(root.path(), &session, "C");
+        // A directory occupies B's cancel path, so writing the marker fails.
+        std::fs::create_dir_all(root.path().join("shell-tasks").join(&session).join(&b).join("cancel"))
+            .unwrap();
+        let a_driver = confirm_task_when_requested(root.path(), &session, &a, "cancelled");
+        let c_driver = confirm_task_when_requested(root.path(), &session, &c, "cancelled");
+
+        let outcome = stop_running_session_tasks_async(root.path(), &session)
+            .await
+            .unwrap();
+        assert_eq!(outcome.stopped, vec!["A", "C"], "{outcome:?}");
+        assert!(outcome.requested.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.failed[0].0, "B", "{outcome:?}");
+        assert!(!outcome.failed[0].1.is_empty(), "{outcome:?}");
+        a_driver.await.unwrap();
+        c_driver.await.unwrap();
+    }
+
+    /// A shell that finishes on its own while the stop is being confirmed ended
+    /// by itself and must not be reported as stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_that_ends_by_itself_is_not_reported_as_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = running_fixture(root.path(), &session, "finishes by itself");
+        // The owner records the command's own result instead of the cancellation.
+        let driver = confirm_task_when_requested(root.path(), &session, &id, "completed");
+
+        let outcome = stop_running_session_tasks_async(root.path(), &session)
+            .await
+            .unwrap();
+        assert!(outcome.stopped.is_empty(), "{outcome:?}");
+        assert!(outcome.requested.is_empty(), "{outcome:?}");
+        assert!(outcome.failed.is_empty(), "{outcome:?}");
+        driver.await.unwrap();
+        assert_eq!(snapshot(root.path(), &session, &id)["status"], "completed");
+    }
+
+    /// The whole stop shares one 5 s budget, and its blocking reads must not
+    /// hold the runtime: a busy task database is the worst case for both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirmation_respects_one_deadline_with_a_locked_task_database() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        running_fixture(root.path(), &session, "locked database shell");
+        // Another connection holds the session's task database exclusively, so
+        // every read inside the cleanup waits for the five-second busy timeout.
+        let lock = rusqlite::Connection::open(
+            root.path().join("tasks").join(format!("{session}.sqlite3")),
+        )
+        .unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // Establish a baseline, so the counter proves the runtime kept running
+        // during the cleanup rather than before it.
+        let warmed = std::time::Instant::now();
+        while ticks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(warmed.elapsed() < Duration::from_secs(2), "the ticker never ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let baseline = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let outcome = stop_running_session_tasks_async(root.path(), &session).await;
+        let elapsed = started.elapsed();
+        let advanced = ticks.load(std::sync::atomic::Ordering::SeqCst) - baseline;
+        lock.execute_batch("ROLLBACK").unwrap();
+        ticker.abort();
+        assert!(elapsed < Duration::from_secs(6), "the stop took {elapsed:?}");
+        assert!(
+            advanced > 0,
+            "the runtime thread was blocked for {elapsed:?} (no tick during the stop)"
+        );
+        // The blocked read fails after its five-second busy timeout, which is
+        // the same budget the caller has: only those two outcomes are expected.
+        match outcome {
+            Ok(outcome) => {
+                let error = outcome
+                    .scan_error
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("expected a timeout report: {outcome:?}"));
+                assert!(error.contains("timed out"), "{outcome:?}");
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("locked") || text.contains("busy"),
+                    "unexpected error: {text}"
+                );
+            }
+        }
+    }
+
+    /// Asserts that no stop was requested for any of `ids`.
+    fn assert_no_stop(
+        root: &Path,
+        session: &str,
+        progress: &std::sync::Mutex<RequestProgress>,
+        ids: &[&str],
+    ) {
+        let progress = progress.lock().unwrap();
+        assert!(progress.pending.is_empty(), "pending tasks were recorded");
+        assert!(progress.outcome.stopped.is_empty(), "a task was stopped");
+        assert!(progress.outcome.failed.is_empty(), "a stop failed");
+        for id in ids {
+            assert_eq!(
+                task_status_only(root, session, id).unwrap(),
+                "running",
+                "task {id} was touched"
+            );
+            assert!(
+                !root
+                    .join("shell-tasks")
+                    .join(session)
+                    .join(id)
+                    .join("cancel")
+                    .exists(),
+                "a stop was sent for {id}"
+            );
+        }
+    }
+
+    /// An abandoned request job must not act on a listing it obtained late: by
+    /// then the session can belong to a resumed child with new tasks.
+    #[test]
+    fn an_abandoned_request_sends_no_further_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let a = running_fixture(root.path(), &session, "A");
+        let b = running_fixture(root.path(), &session, "B");
+        let progress = std::sync::Mutex::new(RequestProgress {
+            abandoned: true,
+            ..RequestProgress::default()
+        });
+        request_session_stops(root.path(), &session, &progress, None).unwrap();
+        assert_no_stop(root.path(), &session, &progress, &[&a, &b]);
+    }
+
+    /// The same for a job whose deadline passed while it waited for a thread.
+    #[test]
+    fn an_expired_deadline_sends_no_further_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let a = running_fixture(root.path(), &session, "A");
+        let b = running_fixture(root.path(), &session, "B");
+        let progress = std::sync::Mutex::new(RequestProgress::default());
+        request_session_stops(
+            root.path(),
+            &session,
+            &progress,
+            Some(std::time::Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap();
+        assert_no_stop(root.path(), &session, &progress, &[&a, &b]);
+        assert!(progress.lock().unwrap().abandoned);
+    }
+
+    /// A request phase that noticed the deadline itself and joined in time must
+    /// still be reported as incomplete, with the progress it did publish.
+    #[tokio::test]
+    async fn a_request_that_stopped_itself_is_reported_as_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let outcome = stop_with_request(
+            root.path(),
+            &session,
+            Duration::from_millis(300),
+            |progress, _deadline| {
+                let mut progress = progress.lock().unwrap();
+                progress.pending.push(PendingStop {
+                    id: "a".into(),
+                    subject: "A".into(),
+                });
+                progress.outcome.failed.push(("B".into(), "boom".into()));
+                progress.abandoned = true;
+                Ok(())
+            },
         )
         .await
         .unwrap();
-        assert_eq!(result["timed_out"], true, "{result}");
-        assert!(result.get("task_id").is_none(), "{result}");
-        assert!(result.get("timed_out_to_background").is_none(), "{result}");
+        assert_eq!(outcome.scan_error.as_deref(), Some(REQUEST_INCOMPLETE), "{outcome:?}");
+        assert_eq!(outcome.requested, vec!["A"], "{outcome:?}");
+        assert_eq!(
+            outcome.failed,
+            vec![("B".to_owned(), "boom".to_owned())],
+            "{outcome:?}"
+        );
+        assert!(outcome.stopped.is_empty(), "{outcome:?}");
+
+        // The same when the request phase had not published anything yet: an
+        // empty result must not look like a fully checked session.
+        let empty = stop_with_request(
+            root.path(),
+            &session,
+            Duration::from_millis(300),
+            |progress, _deadline| {
+                progress.lock().unwrap().abandoned = true;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            empty.scan_error.as_deref(),
+            Some(REQUEST_INCOMPLETE),
+            "{empty:?}"
+        );
+        assert!(empty.stopped.is_empty(), "{empty:?}");
+        assert!(empty.requested.is_empty(), "{empty:?}");
+        assert!(empty.failed.is_empty(), "{empty:?}");
+    }
+
+    /// The caller's timeout must keep what the request job published and keep
+    /// the job from starting another stop once it is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_request_keeps_its_partial_results_and_stops_no_more() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let sent_after_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = sent_after_release.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            stop_with_request(
+                root.path(),
+                &session,
+                Duration::from_millis(300),
+                move |progress, _deadline| {
+                    {
+                        let mut progress = progress.lock().unwrap();
+                        progress.pending.push(PendingStop {
+                            id: "a".into(),
+                            subject: "A".into(),
+                        });
+                        progress.outcome.failed.push(("B".into(), "boom".into()));
+                    }
+                    // Hold the job past the budget, as a stop in flight does.
+                    let _ = release_rx.recv();
+                    let mut progress = progress.lock().unwrap();
+                    if !progress.abandoned {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        progress.pending.push(PendingStop {
+                            id: "c".into(),
+                            subject: "C".into(),
+                        });
+                    }
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("the stop must return within its budget")
+        .unwrap();
+        assert_eq!(outcome.scan_error.as_deref(), Some(REQUEST_INCOMPLETE), "{outcome:?}");
+        assert_eq!(outcome.requested, vec!["A"], "{outcome:?}");
+        assert_eq!(
+            outcome.failed,
+            vec![("B".to_owned(), "boom".to_owned())],
+            "{outcome:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !sent_after_release.load(std::sync::atomic::Ordering::SeqCst),
+            "the abandoned job started another stop"
+        );
+    }
+
+    /// An unreadable log must not hide a status that is already terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_log_does_not_hide_a_cancelled_status() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = running_fixture(root.path(), &session, "unreadable log");
+        // Opening a directory succeeds but reading it fails, so a snapshot that
+        // loads the log would fail while the stored status says cancelled.
+        let log = root
+            .path()
+            .join("shell-tasks")
+            .join(&session)
+            .join(&id)
+            .join("stdout.log");
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let driver = confirm_task_when_requested(root.path(), &session, &id, "cancelled");
+
+        let outcome = stop_running_session_tasks_async(root.path(), &session)
+            .await
+            .unwrap();
+        assert_eq!(outcome.stopped, vec!["unreadable log"], "{outcome:?}");
+        assert!(outcome.requested.is_empty(), "{outcome:?}");
+        assert!(outcome.failed.is_empty(), "{outcome:?}");
+        driver.await.unwrap();
     }
 
     /// The handoff JSON must keep its task ID even when a log cannot be read:
@@ -3996,26 +4558,33 @@ setInterval(() => {}, 10000);
             pipe.session.clone(),
             pipe.id.clone(),
         );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let waiting = std::thread::spawn(move || {
-            super::super::shell_input::execute(
+            let mut entered_tx = Some(entered_tx);
+            super::super::shell_input::capacity_barrier::install(Box::new(move |_| {
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.recv();
+                }
+            }));
+            let result = super::super::shell_input::execute(
                 &json!({"task_id":id,"data":"p".repeat(8 * 1024),"timeout":60000}),
                 &root,
                 &session,
-            )
-            .unwrap()
-        });
-        // Readiness: the blocked call holds the per-task stdin lock while the
-        // pipe has no room (proved by the fill timeouts above).
-        let deadline = std::time::Instant::now() + READINESS_DEADLINE;
-        while !lock_is_held(&pipe.directory) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the blocked write never took the task stdin lock"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            super::super::shell_input::capacity_barrier::clear();
+            result.unwrap()
+        });
+        // The lock can be held before the writer rechecks the owner. Wait for
+        // the actual full-pipe write before releasing the lease.
+        tokio::time::timeout(READINESS_DEADLINE, entered_rx)
+            .await
+            .expect("the write never reached the pipe-capacity wait")
+            .expect("the writer exited before waiting for pipe capacity");
         pipe.lose_owner();
         let started = std::time::Instant::now();
+        resume_tx.send(()).unwrap();
         let outcome = waiting.join().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),

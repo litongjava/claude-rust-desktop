@@ -41,24 +41,20 @@ display_height = 1080
 # MemEx (memory extraction service) backend URL.
 memex_backend_url = "http://127.0.0.1:8765"
 
-# Minimum auto-importance score for automatic memory ingestion (0.0–1.0).
-auto_ingest_importance_threshold = 0.5
-
 # Whether the memory subsystem is enabled by default.
 enabled = true
-
-# Whether to automatically search memory before each user turn.
-auto_search = true
-
-# Whether to automatically ingest important facts after each turn.
-auto_ingest = true
 
 [bridge]
 # Internal bridge server port (connects webview ↔ native engine).
 port = 30085
 
 [http]
-# Request timeout for LLM API calls (seconds).
+# Model streaming idle timeout in seconds. Must be positive.
+# A stream has no total deadline: this bounds each read instead, so a long
+# answer stays connected while bytes keep arriving. It covers waiting for the
+# response headers and silence in the response body, including SSE comments,
+# split event frames and split UTF-8 sequences. Buffered model requests keep a
+# fixed 300-second total deadline of their own.
 request_timeout_secs = 300
 
 # Maximum retries for transient HTTP errors (429, 5xx).
@@ -66,6 +62,16 @@ max_retries = 7
 
 # Base backoff in milliseconds (2, 4, 8, 16, 32, 64, 128 seconds).
 retry_base_backoff_ms = 2000
+
+# Opt-in: replay one model step that stalls after text, reasoning or tool
+# arguments arrived but before the stream completed. Only the current
+# uncommitted step is discarded and reissued, at most once per turn. The
+# replay waits one backoff, emits a visible notice, and never follows a
+# terminal marker, a provider error or a spent retry budget. While enabled,
+# a step's text and thinking appear when it completes instead of live.
+# Trailing `false` keeps today's behaviour: partial output is retained and
+# the turn fails.
+post_content_timeout_recovery = false
 
 [logging]
 # Log level: trace, debug, info, warn, error.

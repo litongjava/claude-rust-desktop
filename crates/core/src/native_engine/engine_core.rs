@@ -926,7 +926,7 @@ impl QueryEngine {
                 .map(std::sync::Arc::new)
             }
         };
-        crate::services::compaction::apply_boundary(
+        let applied_compaction = crate::services::compaction::apply_persisted_boundary(
             &self.db_manager,
             &request.conversation_id,
             &mut request.messages,
@@ -1031,7 +1031,6 @@ impl QueryEngine {
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
-            &request.model,
             prompt_profile,
             Some(&workspace),
             &customization.system_prompt,
@@ -1127,13 +1126,20 @@ impl QueryEngine {
                 turn_blocks.push((content, Some(skill)));
             }
         }
-        let available_skills = discovered_skills.values().filter(|skill| skill.model_invocable()).map(|skill| if skill.listing_name_only {
-            serde_json::json!({"name":skill.name,"context":skill.context})
-        } else {
-            serde_json::json!({"name":skill.name,"description":skill.description,"context":skill.context})
-        }).collect::<Vec<_>>();
+        let available_skills = discovered_skills
+            .values()
+            .filter(|skill| skill.model_invocable())
+            .map(|skill| {
+                skill_listing_line(
+                    &skill.name,
+                    &skill.description,
+                    skill.context.as_deref(),
+                    skill.listing_name_only,
+                )
+            })
+            .collect::<Vec<_>>();
         if !available_skills.is_empty() {
-            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool. {}\n", serde_json::to_string(&available_skills)?));
+            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.\n{}\n", available_skills.join("\n")));
         }
         crate::tools::configure_lsp_servers(
             &workspace_path,
@@ -1228,7 +1234,7 @@ impl QueryEngine {
         })
         .await??;
         // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminder(&instructions)
+        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
             .into_iter()
             .chain(
                 git_snapshot
@@ -1256,23 +1262,16 @@ impl QueryEngine {
                 .iter()
                 .map(|f| f.path.as_str())
                 .collect::<Vec<_>>();
-            let mut context = format!(
-                "\nProject: {}\nProject source folders (the first is the working directory):\n{}",
-                project.name,
-                serde_json::to_string(&folders)?
-            );
+            let system = request.system_prompt.get_or_insert_with(String::new);
+            crate::prompt::add_project_to_environment(system, &project.name, &folders);
             if let Some(instructions) = project
                 .instructions
                 .as_deref()
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
             {
-                context.push_str(&format!("\nProject instructions:\n{instructions}"));
+                system.push_str(&format!("\nProject instructions:\n{instructions}"));
             }
-            request
-                .system_prompt
-                .get_or_insert_with(String::new)
-                .push_str(&context);
         }
         let team_context = crate::services::team::model_context(&plugin_context, &workspace)?;
         request
@@ -1469,6 +1468,7 @@ impl QueryEngine {
         .with_hooks(hooks)
         .with_goal_state(self.db_manager.clone())
         .with_context_boundary(request.context_boundary)
+        .with_applied_compaction(applied_compaction)
         .with_allowed_tools(agent.as_ref().and_then(|d| d.tools.clone()))
         .with_read_only_shell(agent.as_ref().is_some_and(|d| d.read_only_shell))
         .with_prompt_profile(prompt_profile)
@@ -2264,6 +2264,21 @@ mod executor_lifetime_tests;
 
 pub type NativeEngine = QueryEngine;
 
+/// One model-facing line of the available-skills list. Whitespace in the free
+/// text collapses to single spaces so a multi-line description stays one line.
+fn skill_listing_line(name: &str, description: &str, context: Option<&str>, name_only: bool) -> String {
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut line = if name_only {
+        format!("- {name}")
+    } else {
+        format!("- {name}: {}", one_line(description))
+    };
+    if let Some(context) = context {
+        line.push_str(&format!(" (context: {})", one_line(context)));
+    }
+    line
+}
+
 fn validate_model_input(
     model: &crate::native_engine::provider_manager::ModelConfig,
     messages: &[Value],
@@ -2285,6 +2300,24 @@ fn validate_model_input(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod skill_listing_tests {
+    #[test]
+    fn skills_are_listed_as_text_lines_with_context() {
+        assert_eq!(super::skill_listing_line("deploy", "Ship it", None, false), "- deploy: Ship it");
+        assert_eq!(super::skill_listing_line("deploy", "Ship it", Some("fork"), false), "- deploy: Ship it (context: fork)");
+        assert_eq!(super::skill_listing_line("hidden", "Long text", None, true), "- hidden");
+        assert_eq!(super::skill_listing_line("hidden", "Long text", Some("fork"), true), "- hidden (context: fork)");
+        // A multi-line description must not split the list entry.
+        assert_eq!(super::skill_listing_line("deploy", "Ship\nit  fast", Some("fork\n mode"), false), "- deploy: Ship it fast (context: fork mode)");
+        let listing = ["deploy", "hidden"]
+            .map(|name| super::skill_listing_line(name, "Ship it", Some("fork"), name == "hidden"))
+            .join("\n");
+        println!("skills sample:\n{listing}");
+        assert_eq!(listing, "- deploy: Ship it (context: fork)\n- hidden (context: fork)");
+    }
 }
 
 #[cfg(test)]

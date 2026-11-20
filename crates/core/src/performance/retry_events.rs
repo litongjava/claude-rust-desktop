@@ -78,3 +78,30 @@ pub async fn emit(
         let _ = sender.send(EngineEvent::RequestAttempt(event)).await;
     }
 }
+
+/// The user-visible message shown before the single post-content replacement.
+pub fn post_content_notice() -> String {
+    "模型输出在内容之后中断，已丢弃本步未提交的部分输出，将重试一次该步骤，可取消。".to_owned()
+}
+
+/// One non-terminal notice before the replacement POST.
+///
+/// It takes the stalled request's own ID rather than a retry budget's, so the
+/// abandoned snapshot and the notice agree, and it emits no terminal result:
+/// the step continues under the same logical response start.
+pub async fn emit_post_content_retry(
+    sender: mpsc::Sender<EngineEvent>,
+    request_id: &str,
+    attempts: u32,
+    failure: Value,
+    wait: Duration,
+) {
+    let event = json!({"type":"request_attempt", "requestId":request_id,
+        "timestampMs":chrono::Utc::now().timestamp_millis(), "attempts":attempts,
+        "retries":attempts.saturating_sub(1), "maxAttempts":attempts,
+        "outcome":"post_content_retry", "failure":failure, "elapsedMs":null,
+        "waitMs":wait.as_millis() as u64, "retryAfter":false,
+        "message": post_content_notice()});
+    tracing::info!(event = %event, "Model request attempt");
+    let _ = sender.send(EngineEvent::RequestAttempt(event)).await;
+}

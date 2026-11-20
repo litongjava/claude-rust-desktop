@@ -408,6 +408,11 @@ async fn observe(
         display.hook_progress(&id, Some(&message));
         local_hook_ids.push(id);
     }
+    // The count is captured before the first poll, so a Ctrl-C that arrives
+    // while a tick or an event is being handled still cancels the worker. The
+    // loop keeps watching after cancelling, so the branch rearms.
+    let mut interrupt = crate::signals::interrupt_scope();
+    let mut termination_handled = false;
     loop {
         tokio::select! {
             hooks = local_hooks.changed() => {
@@ -734,8 +739,13 @@ async fn observe(
                 side=None;
                 match answer { Ok(answer)=>display.notice(&format!("Side answer:\n{answer}")), Err(error)=>display.notice(&format!("Side question failed: {error:#}")) }
             },
-            _ = crate::signals::interrupted() => {
+            _ = interrupt.interrupted(), if !termination_handled => {
                 if !cancelled { cancel_job(session, id)?; cancelled = true; display.set_activity("Cancelling worker"); }
+                // A termination stays signalled; after cancelling once, keep
+                // observing without selecting it again, or the loop would spin
+                // until the worker ends.
+                termination_handled = crate::signals::terminating();
+                interrupt.rearm();
             },
         }
     }
@@ -1589,5 +1599,344 @@ mod failure_tests {
         assert!(already_presented(&anyhow::Error::new(PresentedFailure(
             safe
         ))));
+    }
+
+    // --- A real signal delivered to the observer --------------------------
+    //
+    // Signals are process-wide and this binary runs its tests in one process,
+    // so the observer under test runs in a child process: the ignored helper
+    // below, started by both signal tests. The parent only watches the `cancel`
+    // file, which `observe` writes when its signal branch actually runs.
+
+    #[cfg(target_os = "linux")]
+    const OBSERVER_HELPER_DIR: &str = "DCL_OBSERVER_HELPER_DIR";
+    #[cfg(target_os = "linux")]
+    const OBSERVER_NOTICE_PREFIX: &[u8] = b"OBSERVER-NOTICE-";
+
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+        fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    #[cfg(target_os = "linux")]
+    const F_SETPIPE_SZ: std::ffi::c_int = 1031;
+    #[cfg(target_os = "linux")]
+    const F_GETPIPE_SZ: std::ffi::c_int = 1032;
+    #[cfg(target_os = "linux")]
+    const SIGINT: std::ffi::c_int = 2;
+    #[cfg(target_os = "linux")]
+    const SIGTERM: std::ffi::c_int = 15;
+
+    /// Runs the real observer against a `running` job whose output already
+    /// holds one very large notice, so printing it blocks inside the tick
+    /// branch instead of returning to the select.
+    ///
+    /// Only a helper for the two signal tests below; without
+    /// `DCL_OBSERVER_HELPER_DIR` it does nothing, so running ignored tests
+    /// normally cannot signal this process.
+    #[cfg(target_os = "linux")]
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observer_signal_helper() {
+        use clap::Parser;
+        let Some(dir) = std::env::var_os(OBSERVER_HELPER_DIR) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // The real listeners, in this process only: the parent signals this pid.
+        crate::signals::install().unwrap();
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(dir.join("data")).unwrap();
+        let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let parent = store.create(&dir, "fixture", "fixture").unwrap();
+        let mut provider = deepseek_code_core::runtime::provider_from_config(
+            &crate::config::provider_template("fixture"),
+        );
+        provider.id = "fixture".into();
+        let cli = Cli::try_parse_from(["dcl"]).unwrap();
+        let session = Session::open(
+            &cli,
+            &paths,
+            crate::config::Selection {
+                providers: vec![provider],
+                model: "fixture".into(),
+                provider_id: "fixture".into(),
+            },
+            Some(&parent),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = paths.data_dir.join("background-tasks").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let job = jobs::Job {
+            id: id.clone(),
+            foreground: true,
+            parent_session_id: parent.clone(),
+            session_id: parent,
+            title: "observer signal".into(),
+            status: "running".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            started_ms: 1,
+            // Ahead of now: `jobs::get` turns a job whose heartbeat is 10 s old
+            // into "unresponsive", which would end observation early.
+            heartbeat_ms: chrono::Utc::now().timestamp_millis() as u64 + 600_000,
+            finished_ms: None,
+            exit_code: None,
+            error: None,
+            launched: true,
+        };
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        let notice = serde_json::json!({
+            "type": "notice",
+            "message": format!("{}{}", "OBSERVER-NOTICE-", "N".repeat(200_000)),
+        });
+        std::fs::write(directory.join("output.jsonl"), format!("{notice}\n")).unwrap();
+        std::fs::write(dir.join("job-id"), &id).unwrap();
+        std::fs::write(
+            dir.join("data-dir"),
+            paths.data_dir.display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            attach(&cli, &session, &id, &mut None),
+        )
+        .await;
+        println!("observer helper finished: {result:?}");
+    }
+
+    /// The helper child. Killing and waiting in `Drop` covers every early
+    /// return and panic of the two tests below.
+    #[cfg(target_os = "linux")]
+    struct HelperChild(Option<std::process::Child>);
+
+    #[cfg(target_os = "linux")]
+    impl HelperChild {
+        fn spawn(dir: &std::path::Path) -> Self {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker_frontend::failure_tests::observer_signal_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(OBSERVER_HELPER_DIR, dir)
+                .env_remove("DEEPSEEK_CODE_DATA_DIR")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            Self(Some(child))
+        }
+
+        fn child(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HelperChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal_wait_for_path(path: &std::path::Path, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        path.exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal_wait_exit(
+        child: &mut std::process::Child,
+        secs: u64,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    /// Ends observation: `observe` returns once the job is no longer running.
+    #[cfg(target_os = "linux")]
+    fn signal_finish_job(directory: &std::path::Path) {
+        let path = directory.join("state.json");
+        let mut job: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        job["status"] = serde_json::json!("cancelled");
+        job["finished_ms"] = serde_json::json!(chrono::Utc::now().timestamp_millis() as u64);
+        std::fs::write(&path, serde_json::to_vec(&job).unwrap()).unwrap();
+    }
+
+    /// utime + stime of a pid, in clock ticks: fields 14 and 15 of
+    /// `/proc/<pid>/stat`, which follow the parenthesized command name.
+    #[cfg(target_os = "linux")]
+    fn signal_cpu_ticks(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<&str> = stat
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    }
+
+    /// Waits until the helper has written `ready` and returns its job.
+    #[cfg(target_os = "linux")]
+    fn signal_helper_job(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        assert!(
+            signal_wait_for_path(&dir.join("ready"), 20),
+            "the observer helper never became ready"
+        );
+        let id = std::fs::read_to_string(dir.join("job-id")).unwrap();
+        let data = std::path::PathBuf::from(std::fs::read_to_string(dir.join("data-dir")).unwrap());
+        (id, data)
+    }
+
+    /// A Ctrl-C delivered while the observer is printing inside a tick (not
+    /// polling the select) must still cancel the job. The parent shrinks the
+    /// stderr pipe to 4 KiB and stops reading at the notice prefix, so the
+    /// helper is blocked in that write when the signal arrives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sigint_during_a_tick_cancels_the_worker() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let mut helper = HelperChild::spawn(dir.path());
+        let pid = helper.child().id();
+        let mut stderr = helper.child().stderr.take().unwrap();
+        let fd = stderr.as_raw_fd();
+        // SAFETY: fcntl with an integer size is the documented ABI for this
+        // command, and `fd` is the pipe read end this test still holds.
+        let set = unsafe { fcntl(fd, F_SETPIPE_SZ, 4096 as std::ffi::c_int) };
+        assert!(
+            set > 0,
+            "F_SETPIPE_SZ failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: as above, with no extra argument for the getter.
+        let capacity = unsafe { fcntl(fd, F_GETPIPE_SZ) };
+        assert!(
+            capacity > 0 && capacity < 200_000,
+            "the stderr pipe holds {capacity} bytes, not a small buffer"
+        );
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 512];
+            let mut paused = false;
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if paused => {}
+                    Ok(n) => {
+                        seen.extend_from_slice(&buffer[..n]);
+                        if seen
+                            .windows(OBSERVER_NOTICE_PREFIX.len())
+                            .any(|window| window == OBSERVER_NOTICE_PREFIX)
+                        {
+                            paused = true;
+                            let _ = blocked_tx.send(());
+                            let _ = release_rx.recv();
+                        }
+                    }
+                }
+            }
+        });
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the observer never blocked on the notice write");
+        let (id, data) = signal_helper_job(dir.path());
+        // Other runtime workers publish the signal while the observer is
+        // blocked in the synchronous write.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: sending a signal to the child this test started.
+        assert_eq!(unsafe { kill(pid as std::ffi::c_int, SIGINT) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = release_tx.send(());
+        let cancel = data.join("background-tasks").join(&id).join("cancel");
+        assert!(
+            signal_wait_for_path(&cancel, 10),
+            "a Ctrl-C received during a tick was lost: no {}",
+            cancel.display()
+        );
+        signal_finish_job(cancel.parent().unwrap());
+        assert!(
+            signal_wait_exit(helper.child(), 15).is_some(),
+            "the observer helper did not exit after the job ended"
+        );
+        let _ = reader.join();
+    }
+
+    /// SIGTERM stays signalled, so a branch that keeps re-selecting it would
+    /// spin until the worker ends. After cancelling once the observer must
+    /// idle: the process's CPU time barely moves over a second.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_termination_does_not_make_the_observer_spin() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let mut helper = HelperChild::spawn(dir.path());
+        let pid = helper.child().id();
+        let mut stderr = helper.child().stderr.take().unwrap();
+        let drain = std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stderr.read_to_end(&mut sink);
+            sink
+        });
+        let (id, data) = signal_helper_job(dir.path());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // SAFETY: sending a signal to the child this test started.
+        assert_eq!(unsafe { kill(pid as std::ffi::c_int, SIGTERM) }, 0);
+        let cancel = data.join("background-tasks").join(&id).join("cancel");
+        assert!(
+            signal_wait_for_path(&cancel, 10),
+            "SIGTERM did not cancel the worker: no {}",
+            cancel.display()
+        );
+        assert!(
+            helper.child().try_wait().unwrap().is_none(),
+            "the observer helper exited before the job ended"
+        );
+        let before = signal_cpu_ticks(pid);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let after = signal_cpu_ticks(pid);
+        let used = after.saturating_sub(before);
+        assert!(
+            used < 30,
+            "the observer used {used} CPU ticks in one second ({before} -> {after}); it is spinning after the termination"
+        );
+        signal_finish_job(cancel.parent().unwrap());
+        assert!(
+            signal_wait_exit(helper.child(), 15).is_some(),
+            "the observer helper did not exit after the job ended"
+        );
+        let _ = drain.join();
     }
 }

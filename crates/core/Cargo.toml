@@ -6,7 +6,7 @@ description = "Shared model, tool, session and persistence engine for CLI and De
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 jsonschema = { version = "0.33", default-features = false }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls", "blocking"], default-features = false }
@@ -34,7 +34,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 dirs = "5"
-rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 base64 = "0.22"

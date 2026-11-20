@@ -30,10 +30,13 @@ pub async fn finish_background(
     let mut cursor = 0;
     let mut result = None;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    // Captured before the first poll, so a signal during a tick's work is seen
+    // by the next wait. Both branches bail out, so neither rearms.
+    let mut interrupt = crate::signals::interrupt_scope();
     let outcome: anyhow::Result<()> = async {
         loop {
             tokio::select! {
-                _ = crate::signals::interrupted() => {
+                _ = interrupt.interrupted() => {
                     background_sessions::cancel(&session.paths.data_dir, &job.id)?;
                     anyhow::bail!("Skill task interrupted; cancellation requested");
                 },
@@ -58,7 +61,7 @@ pub async fn finish_background(
                         let answering=async { let answer=if let Some(answer)=background_sessions::worker_answer(&session.paths.data_dir,&session.id,&question.request_id,&question.kind,&message).await? {answer}
                             else if let Some(input)=terminal.as_mut() { input.read_answer(&message).await?.ok_or_else(||anyhow::anyhow!("Skill task input closed"))? }
                             else { anyhow::bail!("Skill task requires permission or input; use an interactive session or explicitly configure the permission mode"); }; Ok::<_,anyhow::Error>(answer) };
-                        let answer=tokio::select! { answer=answering=>answer?, _=crate::signals::interrupted()=>anyhow::bail!("Skill task interrupted while waiting for permission") };
+                        let answer=tokio::select! { answer=answering=>answer?, _=interrupt.interrupted()=>anyhow::bail!("Skill task interrupted while waiting for permission") };
                         background_sessions::answer_question(&session.paths.data_dir,&job.id,&session.id,&question.request_id,&answer)?;
                     }
                     if drained && !matches!(state.status.as_str(),"starting"|"running") {

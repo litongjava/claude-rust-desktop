@@ -491,11 +491,18 @@ fn proxy_env(port: &str) -> Vec<(String, String)> {
 /// on a local port, carry each connection to the proxy's socket, and run the
 /// command with the proxy variables set. Returns None for any other argv.
 pub fn run_bridge_from_args() -> Option<i32> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) != Some("__sandbox-bridge") {
+    let mut args = std::env::args_os().skip(1);
+    // The role is compared as an OS string and before anything is decoded:
+    // ordinary startup must never read unrelated native arguments as UTF-8.
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("__sandbox-bridge")) {
         return None;
     }
-    Some(bridge(&args[2..]).unwrap_or_else(|error| {
+    let bridge_args = args
+        .map(std::ffi::OsString::into_string)
+        .collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|_| anyhow::anyhow!("sandbox bridge arguments must be UTF-8"))
+        .and_then(|args| bridge(&args));
+    Some(bridge_args.unwrap_or_else(|error| {
         eprintln!("sandbox bridge: {error:#}");
         126
     }))

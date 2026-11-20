@@ -60,14 +60,8 @@ pub struct ComputerUseConfig {
 pub struct MemoryConfig {
     #[serde(default = "default_memex_url")]
     pub memex_backend_url: String,
-    #[serde(default = "default_importance_threshold")]
-    pub auto_ingest_importance_threshold: f64,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_search: bool,
-    #[serde(default = "default_true")]
-    pub auto_ingest: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +78,13 @@ pub struct HttpConfig {
     pub max_retries: u32,
     #[serde(default = "default_retry_base_backoff_ms")]
     pub retry_base_backoff_ms: u64,
+    /// Opt-in: replay one model step that stalled after content arrived.
+    ///
+    /// Defaults to `false`, which keeps the visible partial output and the
+    /// failed turn. Enabled, the uncommitted step is discarded and issued once
+    /// more; nothing is replayed after a terminal marker or a complete stream.
+    #[serde(default)]
+    pub post_content_timeout_recovery: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,7 +112,6 @@ fn default_bash_timeout_secs() -> u64 { 120 }
 fn default_display_width() -> u32 { 1920 }
 fn default_display_height() -> u32 { 1080 }
 fn default_memex_url() -> String { "http://127.0.0.1:8765".to_string() }
-fn default_importance_threshold() -> f64 { 0.5 }
 fn default_true() -> bool { true }
 fn default_bridge_port() -> u16 { 30085 }
 fn default_request_timeout_secs() -> u64 { 300 }
@@ -135,10 +135,7 @@ impl Default for OrchestrationConfig {
             },
             memory: MemoryConfig {
                 memex_backend_url: default_memex_url(),
-                auto_ingest_importance_threshold: default_importance_threshold(),
                 enabled: true,
-                auto_search: true,
-                auto_ingest: true,
             },
             bridge: BridgeConfig {
                 port: default_bridge_port(),
@@ -147,6 +144,7 @@ impl Default for OrchestrationConfig {
                 request_timeout_secs: default_request_timeout_secs(),
                 max_retries: default_max_retries(),
                 retry_base_backoff_ms: default_retry_base_backoff_ms(),
+                post_content_timeout_recovery: false,
             },
             logging: LoggingConfig {
                 level: default_log_level(),
@@ -216,6 +214,8 @@ impl OrchestrationConfig {
     pub fn max_retries() -> u32 { Self::get().http.max_retries }
     pub fn retry_base_backoff_ms() -> u64 { Self::get().http.retry_base_backoff_ms }
     pub fn request_timeout_secs() -> u64 { Self::get().http.request_timeout_secs }
+    /// Read once per turn; a stalled post-content step is replayed only when set.
+    pub fn post_content_timeout_recovery() -> bool { Self::get().http.post_content_timeout_recovery }
     pub fn bridge_port() -> u16 { Self::get().bridge.port }
     pub fn memex_backend_url() -> &'static str { &Self::get().memory.memex_backend_url }
 }
@@ -393,6 +393,34 @@ mod tests {
     }
 
     #[test]
+    fn post_content_timeout_recovery_defaults_to_false() {
+        // Built-in defaults never enable a replay of a stalled model step.
+        assert!(
+            !OrchestrationConfig::default()
+                .http
+                .post_content_timeout_recovery
+        );
+        let document = |http: &str| {
+            format!(
+                "[tool_loop]\n[tools]\n[memory]\n[bridge]\n[http]\n{http}[logging]\n[telemetry]\n"
+            )
+        };
+        // An older valid file that predates the setting keeps the opt-out.
+        let older: OrchestrationConfig = toml::from_str(&document("")).unwrap();
+        assert!(!older.http.post_content_timeout_recovery);
+        let off: OrchestrationConfig = toml::from_str(&document(
+            "request_timeout_secs = 30\npost_content_timeout_recovery = false\n",
+        ))
+        .unwrap();
+        assert!(!off.http.post_content_timeout_recovery);
+        let on: OrchestrationConfig = toml::from_str(&document(
+            "request_timeout_secs = 30\npost_content_timeout_recovery = true\n",
+        ))
+        .unwrap();
+        assert!(on.http.post_content_timeout_recovery);
+    }
+
+    #[test]
     fn global_config_loads_on_first_use_without_explicit_init() {
         // Accessors used by the engine must not panic in embedders that skip init_global().
         assert!(OrchestrationConfig::default_max_tokens() > 0);
@@ -419,10 +447,7 @@ mod tests {
 
         // MemoryConfig
         assert_eq!(config.memory.memex_backend_url, "http://127.0.0.1:8765");
-        assert!((config.memory.auto_ingest_importance_threshold - 0.5).abs() < f64::EPSILON);
         assert!(config.memory.enabled);
-        assert!(config.memory.auto_search);
-        assert!(config.memory.auto_ingest);
 
         // BridgeConfig
         assert_eq!(config.bridge.port, 30085);

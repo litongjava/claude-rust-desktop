@@ -31,7 +31,8 @@
 | `performance/{error_classifier,retry_policy,rate_limiter,prompt_cache,smart_router,tool_persistence}.rs` | `native_engine/`、`cache/`、`metrics/`、`db/` | 仍待逐项审计；现有工具轨迹/模型请求存储已有测试，旧智能路由/限流/重试策略尚未等价验收 |
 | `i18n/{loader,locales,translator}.rs` | `src/hooks/useI18n.ts`、`src/locales/` | 桌面语言切换已有覆盖；旧语言范围、CLI 文案、复数/日期/方向行为仍待审计 |
 | `tools/advanced/{agent,delegation,worker,team,send_message,escalation}.rs` | `tools/`、`multiagent/`、`agent_bus/`、worker | 仍待逐项参数和权限/生命周期映射 |
-| `tools/advanced/{bash,powershell,worktree,web_tools,notebook,lsp,tool_search}.rs` | `tools/`、`worktree/`、`ide/`、`research/` | 仍待审计；已共享 Bash 的取消生命周期，不能据此宣称其余等价 |
+| `tools/advanced/{bash,powershell,worktree,web_tools,notebook,lsp}.rs` | `tools/`、`worktree/`、`ide/`、`research/` | 仍待审计；已共享 Bash 的取消生命周期，不能据此宣称其余等价 |
+| 旧 CLI 的按需工具发现入口（历史文件 `tools/advanced/tool_search.rs`） | 当前 `ToolLoad` 的[工具定义](../crates/core/src/tools/mod.rs)和[按需加载逻辑](../crates/core/src/native_engine/tool_loop.rs) | 当前实现按精确名称加载工具定义；行为映射仍待审计 |
 | `tools/advanced/{task_tools,todo_write,cron,skill,mcp_tools,mcp_bridge,config,brief,ask_question,permission_tools,plan_mode}.rs` | `task/`、`scheduler/`、`skills/`、`mcp/`、`ask_user/`、`permissions/` | 仍待逐项协议、参数、持久化和交互核查 |
 | `advanced/{ssh,remote,project_init}.rs` | 项目与共享工具 | 仍待审计 |
 | `gui/`（会话、设置、主题、高亮、侧栏、工具轨迹） | React 当前产品、SQLite 会话、既有前端测试 | 基础产品已有对应形态；独有操作待逐项核查，不重新构建 egui |

@@ -48,7 +48,7 @@ use crate::prompt::{code::adapt_tools, PromptProfile};
 use crate::streaming::sse_parser::{
     consume_sse_payloads, merge_tool_args, recover_malformed_tool_input,
 };
-use crate::tools::get_tool_definitions;
+use crate::tools::{get_tool_definitions, tool_load_names, TOOL_LOAD_NAME};
 use anyhow::{anyhow, Context as _, Result};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -214,28 +214,6 @@ pub enum EngineEvent {
     },
 }
 
-/// Lowercase words of a tool name, splitting CamelCase and separators
-/// (`CompactContext` -> "compact context"), so ToolSearch's speculative
-/// keyword pass can require that a query word actually names the tool.
-fn tool_name_words(name: &str) -> String {
-    let mut words = String::new();
-    let mut previous_lower = false;
-    for ch in name.chars() {
-        if !ch.is_alphanumeric() {
-            words.push(' ');
-            previous_lower = false;
-        } else if ch.is_uppercase() && previous_lower {
-            words.push(' ');
-            words.push(ch.to_ascii_lowercase());
-            previous_lower = false;
-        } else {
-            words.push(ch.to_ascii_lowercase());
-            previous_lower = ch.is_lowercase() || ch.is_ascii_digit();
-        }
-    }
-    words
-}
-
 pub struct ToolLoopExecutor {
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
@@ -254,6 +232,7 @@ pub struct ToolLoopExecutor {
     /// with them by the host. Never re-queried while a request is sent: the
     /// stored latest boundary may already describe a different transcript.
     context_boundary_id: Option<String>,
+    applied_compaction: bool,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -270,9 +249,6 @@ pub struct ToolLoopExecutor {
     mcp_read_only_tools: std::collections::HashSet<String>,
     /// Per-server MCP states, read again at the start of every turn.
     mcp_states: std::collections::BTreeMap<String, McpState>,
-    /// The on-demand MCP listing this executor appended to the system prompt,
-    /// so a repeated setup replaces it instead of adding a second copy.
-    on_demand_prompt: Option<String>,
     streaming_tool_args: HashMap<String, StreamingToolCall>,
     conv_id: Option<String>,
     /// The assistant message that owns this turn's tool rows, when the host
@@ -314,6 +290,7 @@ pub struct ToolLoopExecutor {
     stop_hook_active: bool,
     stop_hook_blocks: u64,
     goal_db: Option<Arc<crate::db::DbManager>>,
+    transcript_db: Option<Arc<crate::db::DbManager>>,
     skill_shell_active: bool,
     /// Deep-research children read pages as text: their quotes are checked
     /// against the fetched source, not against a model's answer about it.
@@ -333,7 +310,7 @@ pub struct ToolLoopExecutor {
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
-    /// Built-in tools the model loaded with ToolSearch in this session.
+    /// Built-in tools the model loaded with ToolLoad in this session.
     loaded_tools: std::collections::BTreeSet<String>,
     /// The names of the request the model is answering, or `None` before the
     /// first one, so a tool loaded in a batch is callable only from the next.
@@ -451,7 +428,7 @@ fn tool_batches(calls: &[PendingToolCall]) -> Vec<&[PendingToolCall]> {
 /// description is used, cut at 160 characters; nothing time-dependent enters the
 /// text, so an unchanged set of definitions produces the same request bytes.
 /// Agent carries it as "Available agent types"; while Agent is deferred,
-/// ToolSearch carries it so the model can learn the types before loading it.
+/// ToolLoad carries it so the model can learn the types before loading it.
 fn agent_type_listing(
     definitions: &[crate::services::agents::Definition],
     heading: &str,
@@ -490,39 +467,6 @@ fn max_tool_concurrency() -> usize {
         .unwrap_or(10)
 }
 
-/// The system-prompt block that lists every MCP tool whose server is on demand,
-/// loaded or not, so the prompt prefix stays stable after a load. `None` when
-/// no such tool is available.
-fn on_demand_listing(
-    tools: &[crate::tools::ToolDefinition],
-    states: &std::collections::BTreeMap<String, McpState>,
-) -> Option<String> {
-    let mut lines = Vec::new();
-    for tool in tools {
-        let Some(server) = crate::mcp::states::server_of(&tool.name) else {
-            continue;
-        };
-        if crate::mcp::states::effective(states, server) != McpState::OnDemand {
-            continue;
-        }
-        lines.push(format!(
-            "- {}: {}",
-            tool.name,
-            crate::mcp::states::description_summary(&tool.description)
-        ));
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    let mut block =
-        String::from("MCP tools available on demand (load with ToolSearch before calling):");
-    for line in lines {
-        block.push('\n');
-        block.push_str(&line);
-    }
-    Some(block)
-}
-
 enum CallStep {
     /// The call ended during its checks, or was a tool that runs inside them.
     Finished((Value, String, bool)),
@@ -559,7 +503,7 @@ impl Drop for PermissionWaiterGuard {
 #[path = "model_tool_output.rs"]
 mod model_output;
 
-fn model_tool_output(tool_name: &str, output: &str) -> String {
+pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
 }
 
@@ -572,6 +516,51 @@ fn merge_tool_call_name(name: &mut String, delta: &str) {
         return;
     }
     name.push_str(delta);
+}
+
+/// Record one visible fragment of the current attempt.
+///
+/// With staging on, an attempt's text and thinking are held in order — adjacent
+/// fragments of the same kind coalesce — until the step is committed. With it
+/// off, the fragment reaches the host immediately, as it always has.
+async fn emit_or_stage(
+    sender: &tokio::sync::mpsc::Sender<EngineEvent>,
+    staged: &mut Vec<(bool, String)>,
+    thinking: bool,
+    text: &str,
+    staging: bool,
+) {
+    if !staging {
+        let event = if thinking {
+            EngineEvent::Thinking(text.to_owned())
+        } else {
+            EngineEvent::Text(text.to_owned())
+        };
+        let _ = sender.send(event).await;
+        return;
+    }
+    match staged.last_mut() {
+        Some((kind, held)) if *kind == thinking => held.push_str(text),
+        _ => staged.push((thinking, text.to_owned())),
+    }
+}
+
+/// Emit an attempt's staged fragments in order, exactly once, and return the
+/// committed assistant text so the caller can append it to the turn's output.
+async fn flush_staged(
+    sender: &tokio::sync::mpsc::Sender<EngineEvent>,
+    staged: &mut Vec<(bool, String)>,
+) -> String {
+    let mut committed = String::new();
+    for (thinking, text) in std::mem::take(staged) {
+        if thinking {
+            let _ = sender.send(EngineEvent::Thinking(text)).await;
+        } else {
+            committed.push_str(&text);
+            let _ = sender.send(EngineEvent::Text(text)).await;
+        }
+    }
+    committed
 }
 
 fn compact_tool_output(tool_name: &str, output: &str) -> String {
@@ -1448,6 +1437,7 @@ impl ToolLoopExecutor {
             provider,
             messages,
             context_boundary_id: None,
+            applied_compaction: false,
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -1462,7 +1452,6 @@ impl ToolLoopExecutor {
             mcp_tools: Vec::new(),
             mcp_read_only_tools: std::collections::HashSet::new(),
             mcp_states: Default::default(),
-            on_demand_prompt: None,
             streaming_tool_args: HashMap::new(),
             conv_id: None,
             parent_message_id: None,
@@ -1496,6 +1485,7 @@ impl ToolLoopExecutor {
             stop_hook_active: false,
             stop_hook_blocks: 0,
             goal_db: None,
+            transcript_db: None,
             skill_shell_active: false,
             raw_web_fetch: false,
             pending_user_skill: None,
@@ -1554,6 +1544,19 @@ impl ToolLoopExecutor {
 
     pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
         self.goal_db = Some(db);
+        // Session-backed tools enter the catalog once storage is bound.
+        self.builtin_names.take();
+        self
+    }
+
+    fn with_transcript_db(mut self, db: Arc<crate::db::DbManager>) -> Self {
+        self.transcript_db = Some(db);
+        self.builtin_names.take();
+        self
+    }
+
+    pub(super) fn with_applied_compaction(mut self, applied: bool) -> Self {
+        self.applied_compaction = applied;
         self
     }
 
@@ -1835,7 +1838,7 @@ impl ToolLoopExecutor {
                 json!({
                     "task_id": start.id,
                     "status": "running",
-                    "message": "ToolScript is running in the background. To read its paged output, load TaskGet with ToolSearch (block:true waits); TaskStop stops it.",
+                    "message": "ToolScript is running in the background. To read its paged output, load TaskGet with ToolLoad (names: [\"TaskGet\"]), then call TaskGet with block:true to wait; TaskStop stops it.",
                 })
                 .to_string(),
                 false,
@@ -1869,7 +1872,7 @@ impl ToolLoopExecutor {
                     json!({
                         "task_id": start.id,
                         "status": state.status,
-                        "message": "ToolScript is still running. To read its paged output, load TaskGet with ToolSearch; TaskStop stops it.",
+                        "message": "ToolScript is still running. To read its paged output, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it.",
                     })
                     .to_string(),
                     false,
@@ -1882,7 +1885,7 @@ impl ToolLoopExecutor {
     /// Whether a call only reads, so it may run alongside neighbouring calls.
     fn is_concurrency_safe(&self, name: &str, input: &Value) -> bool {
         match name {
-            "Read" | "Glob" | "Grep" | "ListDir" | "WebFetch" | "WebSearch" | "ToolSearch" => true,
+            "Read" | "Glob" | "Grep" | "ListDir" | "WebFetch" | "WebSearch" | "ToolLoad" => true,
             "Bash" => {
                 !self.skill_shell_active
                     && input["run_in_background"] != true
@@ -1895,8 +1898,8 @@ impl ToolLoopExecutor {
         }
     }
 
-    /// A successful ToolSearch keeps a tool loaded for the rest of the session.
-    /// Only the result of an actual assistant ToolSearch call counts, when that
+    /// A successful ToolLoad keeps a tool loaded for the rest of the session.
+    /// Only the result of an actual assistant ToolLoad call counts, when that
     /// result belongs to that same call: one ordered pass binds each call id
     /// once, so a prompt, a summary, a non-assistant tool_use, an orphan
     /// result, a result before its call, a repeated call id or a second result
@@ -1906,7 +1909,7 @@ impl ToolLoopExecutor {
         #[derive(Clone, Copy)]
         enum Call {
             /// Registered by an assistant call, waiting for its own result.
-            /// The flag is whether that call was ToolSearch.
+            /// The flag is whether that call was ToolLoad.
             Pending(bool),
             /// Its result was already read, so the id may not come back.
             Consumed,
@@ -1943,7 +1946,7 @@ impl ToolLoopExecutor {
                             register(
                                 &mut calls,
                                 id,
-                                call["function"]["name"].as_str() == Some("ToolSearch"),
+                                call["function"]["name"].as_str() == Some("ToolLoad"),
                             );
                         }
                     }
@@ -1953,7 +1956,7 @@ impl ToolLoopExecutor {
                                 register(
                                     &mut calls,
                                     id,
-                                    block["name"].as_str() == Some("ToolSearch"),
+                                    block["name"].as_str() == Some("ToolLoad"),
                                 );
                             }
                         }
@@ -2022,7 +2025,7 @@ impl ToolLoopExecutor {
                 let mut query = conn.prepare(
                     "SELECT t.output FROM tool_calls t JOIN messages m ON m.id=t.message_id
                  WHERE m.conversation_id=?1 AND m.role='assistant'
-                   AND t.name='ToolSearch' AND t.is_error=0 AND t.output IS NOT NULL
+                   AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
                    AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
                        WHERE conversation_id=?1 AND is_compact_boundary=1), -1)",
                 )?;
@@ -2041,7 +2044,7 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
-    /// Reads a stored ToolSearch result. Only the structured marker of a
+    /// Reads a stored ToolLoad result. Only the structured marker of a
     /// successful search is accepted.
     fn absorb_loaded(text: &str, loaded: &mut std::collections::BTreeSet<String>) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -2101,7 +2104,18 @@ impl ToolLoopExecutor {
                     McpState::Off => return Some(format!("{name} is turned off.")),
                     McpState::OnDemand if !self.loaded_tools.contains(name) => {
                         return Some(format!(
-                            "{name} is not loaded; load it with ToolSearch first."
+                            "{name} is not loaded; pass its exact name in the ToolLoad names array first."
+                        ))
+                    }
+                    McpState::OnDemand
+                        if !customization.is_disabled(name)
+                            && self
+                                .exposed_tools
+                                .as_ref()
+                                .is_some_and(|tools| !tools.contains(name)) =>
+                    {
+                        return Some(format!(
+                            "{name} becomes callable from the next model request."
                         ))
                     }
                     McpState::User | McpState::OnDemand => {}
@@ -2143,7 +2157,7 @@ impl ToolLoopExecutor {
             format!("{canonical} becomes callable from the next model request.")
         } else {
             format!(
-                "{canonical} is not loaded. Call ToolSearch for it and use it in the next request."
+                "{canonical} is not loaded. Pass its exact name in the ToolLoad names array and use it in the next request."
             )
         })
     }
@@ -2155,70 +2169,77 @@ impl ToolLoopExecutor {
             .is_none_or(|names| names.iter().any(|granted| granted == name))
     }
 
-    /// The single eligibility rule for ToolSearch discovery. The runtime tool
-    /// directory and the search itself both use it, with the same per-request
-    /// snapshot, so the names the model is told about and the names it can load
-    /// cannot disagree within one request.
-    fn tool_is_searchable(
+    /// Both the request directory and ToolLoad use the same eligibility rule.
+    fn tool_is_loadable(
         &self,
         tool: &crate::tools::ToolDefinition,
         customization: &crate::services::customization::Customization,
         exposed: &std::collections::HashSet<String>,
     ) -> bool {
-        // An MCP tool is on demand only when its server is; a built-in
-        // follows its own switches. Both the directory and the search use
-        // this rule, so they cannot disagree.
+        // Built-ins follow their own switches. MCP tools follow the server and
+        // the legacy disabled list.
         let on_demand = match crate::mcp::states::server_of(&tool.name) {
             Some(server) => {
-                crate::mcp::states::effective(&self.mcp_states, server) == McpState::OnDemand
+                !customization.is_disabled(&tool.name)
+                    && crate::mcp::states::effective(&self.mcp_states, server) == McpState::OnDemand
             }
             None => {
                 let loading = customization.loading(&tool.name);
                 loading.on_demand && !loading.enabled
             }
         };
-        on_demand && !exposed.contains(&tool.name) && self.tool_is_allowed(&tool.name)
+        on_demand
+            && !exposed.contains(&tool.name)
+            && !self.loaded_tools.contains(&tool.name)
+            && self.tool_is_allowed(&tool.name)
     }
 
-    /// Why an explicitly named tool was not loaded, in the order the checks run.
+    fn tool_is_available_to_call(
+        &self,
+        name: &str,
+        customization: &crate::services::customization::Customization,
+        exposed: &std::collections::HashSet<String>,
+    ) -> bool {
+        if !self.tool_is_allowed(name) {
+            return false;
+        }
+        let in_request = self.exposed_tools.is_none() || exposed.contains(name);
+        if let Some(server) = crate::mcp::states::server_of(name) {
+            return !customization.is_disabled(name)
+                && match crate::mcp::states::effective(&self.mcp_states, server) {
+                    McpState::User => in_request,
+                    McpState::OnDemand => self.loaded_tools.contains(name),
+                    McpState::Off | McpState::UserOnly => false,
+                };
+        }
+        let loading = customization.loading(name);
+        (loading.enabled && in_request) || (loading.on_demand && self.loaded_tools.contains(name))
+    }
+
     fn unavailable_reason(
         &self,
-        tool: &crate::tools::ToolDefinition,
+        name: &str,
         customization: &crate::services::customization::Customization,
-        exposed: &std::collections::HashSet<String>,
     ) -> &'static str {
-        let loading = customization.loading(&tool.name);
-        if exposed.contains(&tool.name) {
-            "already available in this request"
-        } else if !self.tool_is_allowed(&tool.name) {
+        if !self.tool_is_allowed(name) {
             "not allowed for this agent"
-        } else if crate::mcp::states::server_of(&tool.name).is_some_and(|server| {
-            crate::mcp::states::effective(&self.mcp_states, server) != McpState::OnDemand
-        }) {
-            "its MCP server is not set to on-demand"
-        } else if !loading.on_demand {
-            "disabled by tool settings"
-        } else if loading.enabled {
-            "already resident in every request"
+        } else if let Some(server) = crate::mcp::states::server_of(name) {
+            if customization.is_disabled(name) {
+                "disabled by tool settings"
+            } else if crate::mcp::states::effective(&self.mcp_states, server) != McpState::OnDemand
+            {
+                "its MCP server is not set to on-demand"
+            } else {
+                "not loadable in this request"
+            }
         } else {
-            "not loadable in this request"
+            let loading = customization.loading(name);
+            if !loading.enabled && !loading.on_demand {
+                "disabled by tool settings"
+            } else {
+                "not loadable in this request"
+            }
         }
-    }
-
-    /// The catalog entries this request can still load: built-ins only, after
-    /// the same gating the request itself uses. The catalog already applies the
-    /// depth, agent and external-program availability rules.
-    fn searchable_tool_catalog(
-        &self,
-        customization: &crate::services::customization::Customization,
-        catalog: &[crate::tools::ToolDefinition],
-        exposed: &std::collections::HashSet<String>,
-    ) -> Vec<crate::tools::ToolDefinition> {
-        catalog
-            .iter()
-            .filter(|tool| self.tool_is_searchable(tool, customization, exposed))
-            .cloned()
-            .collect()
     }
 
     /// The directory the model reads for one request. It is built from the same
@@ -2233,39 +2254,69 @@ impl ToolLoopExecutor {
         let exposed: std::collections::HashSet<String> =
             prepared.iter().map(|tool| tool.name.clone()).collect();
         let mut lines = vec!["# Tool directory".to_string()];
+        let context_search = crate::tools::context_search::NAME;
+        let compacted = self.applied_compaction;
+        if compacted && exposed.contains(context_search) && self.session_search_storage().is_some() {
+            lines.push("After compaction, use ContextSearch to recover exact details omitted from the summary.".into());
+        }
         // Whether discovery is actually callable comes from the definitions
         // sent with this request, not from the user's switches.
-        if !exposed.contains("ToolSearch") {
+        if !exposed.contains(TOOL_LOAD_NAME) {
             lines.push(
-                "ToolSearch is not available in this request, so no built-in tools can be loaded through it."
+                "ToolLoad is not available in this request, so no tools can be loaded through it."
                     .to_string(),
             );
             return lines.join("\n");
         }
-        let mut tools = self.searchable_tool_catalog(customization, catalog, &exposed);
+        let mut tools: Vec<_> = catalog
+            .iter()
+            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
+            .collect();
+        if compacted && tools.iter().any(|tool| tool.name == context_search) {
+            lines.push("After compaction, load ContextSearch with ToolLoad to recover exact details omitted from the summary.".into());
+        }
         tools.sort_by(|a, b| {
             a.name
                 .to_ascii_lowercase()
                 .cmp(&b.name.to_ascii_lowercase())
                 .then_with(|| a.name.cmp(&b.name))
         });
-        if tools.is_empty() {
+        if let Some(first) = tools.first() {
+            let example = json!({"names":[&first.name]});
+            lines.push(format!(
+                "Among built-ins, ToolLoad can load only the names listed below. Pass exact, case-sensitive names in the `names` array, e.g. {example}."
+            ));
+            lines.extend(tools.into_iter().map(|tool| {
+                format!(
+                    "- `{}`: {}",
+                    tool.name,
+                    one_sentence_purpose(&tool.description)
+                )
+            }));
+        } else {
             lines.push(
-                "No built-in tools are available for ToolSearch to load in this request."
-                    .to_string(),
+                "No built-in tools are available for ToolLoad to load in this request.".to_owned(),
             );
-            return lines.join("\n");
         }
-        lines.push(
-            "ToolSearch can load only the built-in tools listed here, and only those not already supplied in the current request. Pass complete names separated by commas or spaces; a tool not listed here cannot be loaded this way.".to_string(),
-        );
-        lines.extend(tools.into_iter().map(|tool| {
-            format!(
-                "- `{}`: {}",
-                tool.name,
-                one_sentence_purpose(&tool.description)
-            )
-        }));
+
+        let mcp_tools: Vec<_> = self
+            .mcp_tools
+            .iter()
+            .filter(|tool| crate::mcp::states::server_of(&tool.name).is_some())
+            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
+            .cloned()
+            .collect();
+        if !mcp_tools.is_empty() {
+            lines.push(String::new());
+            lines.push("MCP tools available on demand (pass exact names in the ToolLoad `names` array before calling):".to_owned());
+            lines.extend(customization.described(mcp_tools).iter().map(|tool| {
+                format!(
+                    "- {}: {}",
+                    tool.name,
+                    crate::mcp::states::description_summary(&tool.description)
+                )
+            }));
+        }
         lines.join("\n")
     }
 
@@ -2282,19 +2333,12 @@ impl ToolLoopExecutor {
         })
     }
 
-    /// ToolSearch loads real definitions instead of only printing them: the
-    /// tools in the result can be called from the next request on. Matching and
-    /// the returned schemas use the same description overrides as the request.
-    async fn execute_tool_search(&mut self, tool_input: &Value) -> (Value, String, bool) {
-        let query = tool_input["query"]
-            .as_str()
-            .map(str::trim)
-            .unwrap_or_default();
-        if query.is_empty() {
-            let result = json!({"success":false,"loaded_tools":[],"tools":[],
-                "content":"ToolSearch needs a query: a tool name or a few keywords."});
-            return (tool_input.clone(), result.to_string(), false);
-        }
+    /// Validate the full list before granting any definitions to the next request.
+    async fn execute_tool_load(&mut self, tool_input: &Value) -> (Value, String, bool) {
+        let names = match tool_load_names(tool_input) {
+            Ok(names) => names,
+            Err(error) => return (tool_input.clone(), error.to_string(), true),
+        };
         let customization = match self.customization() {
             Ok(customization) => customization,
             Err(error) => {
@@ -2305,258 +2349,71 @@ impl ToolLoopExecutor {
                 )
             }
         };
-        // Searchable tools: the built-ins under their loading switches, and MCP
-        // tools whose server is on demand. Off and user-only servers never
-        // appear here.
-        let mut searchable = self.builtin_catalog();
-        searchable.extend(
-            self.mcp_tools
-                .iter()
-                .filter(|tool| {
-                    crate::mcp::states::server_of(&tool.name).is_some_and(|server| {
-                        crate::mcp::states::effective(&self.mcp_states, server)
-                            == McpState::OnDemand
-                    })
-                })
-                .cloned(),
-        );
-        let catalog = customization.described(searchable);
-        let exposed = self
-            .exposed_tools
-            .clone()
-            .unwrap_or_else(|| self.loaded_tools.iter().cloned().collect());
-        let needle = query.to_lowercase();
-        // Complete tool names separated by commas or whitespace select tools.
-        // Other queries retain keyword matching, so "web fetch" finds WebFetch.
-        let normalize = |text: &str| text.to_lowercase().replace(['_', '-'], " ");
-        // Keep the spelling the model sent so a report names it back exactly.
-        let body = if needle.starts_with("select:") {
-            query.split_once(':').map_or(query, |(_, rest)| rest)
-        } else {
-            query
-        };
-        let selections: Vec<String> = body
-            .split(|ch: char| ch.is_whitespace() || ch == ',')
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let names_a_tool =
-            |token: &str| catalog.iter().any(|tool| tool.name.eq_ignore_ascii_case(token));
-        // A `select:` prefix, a list where every token names a tool, or a
-        // comma-separated list naming at least one tool is an explicit
-        // enumeration: every requested name is loaded or reported, never
-        // silently dropped.
-        let explicit = needle.starts_with("select:")
-            || (!selections.is_empty()
-                && (selections.iter().all(|token| names_a_tool(token))
-                    || (query.contains(',') && selections.iter().any(|token| names_a_tool(token)))));
-        if explicit {
-            return self.load_selected_tools(
-                tool_input,
-                query,
-                &selections,
-                &catalog,
-                &customization,
-                &exposed,
-            );
-        }
-        let keywords: Vec<String> = normalize(&needle)
-            .split(|ch: char| ch.is_whitespace() || ch == ',')
-            .filter(|word| !word.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let candidates: Vec<&crate::tools::ToolDefinition> = catalog
-            .iter()
-            .filter(|tool| self.tool_is_searchable(tool, &customization, &exposed))
-            .collect();
-        let mut hits: Vec<(u8, crate::tools::ToolDefinition)> = candidates
-            .iter()
-            .filter_map(|tool| {
-                let name = tool.name.to_lowercase();
-                let spaced_name = normalize(&tool.name);
-                let description = normalize(&tool.description);
-                let score = if name == needle || spaced_name == normalize(&needle) {
-                    0
-                } else if name.contains(&needle) {
-                    1
-                } else if tool.description.to_lowercase().contains(&needle) {
-                    2
-                } else if !keywords.is_empty()
-                    && keywords
-                        .iter()
-                        .all(|word| spaced_name.contains(word.as_str()))
-                {
-                    3
-                } else if !keywords.is_empty()
-                    && keywords.iter().all(|word| {
-                        spaced_name.contains(word.as_str()) || description.contains(word.as_str())
-                    })
-                {
-                    4
-                } else {
-                    return None;
-                };
-                Some((score, (*tool).clone()))
-            })
-            .collect();
-        // Stable, so tools of equal rank keep the catalog order.
-        hits.sort_by_key(|(score, _)| *score);
-        // Keyword discovery stays bounded; an explicit selection does not.
-        let limited = hits.len() > 5;
-        // Models phrase queries in natural language, so one unrelated word must
-        // not hide a tool every other keyword names ("compact context summary
-        // request compaction"). Only when no tool matched every word, accept
-        // tools matching at least half of them. Whole words only, and one must
-        // name the tool: otherwise everyday prose ("no such tool") reaches the
-        // threshold through unrelated descriptions.
-        let loaded: Vec<crate::tools::ToolDefinition> =
-            if hits.is_empty() && keywords.len() >= 2 {
-                let unique: Vec<&str> = keywords
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let threshold = 2.max(unique.len().div_ceil(2));
-                let has_word = |text: &str, word: &str| {
-                    text.split(|ch: char| !ch.is_alphanumeric())
-                        .any(|candidate| candidate == word)
-                };
-                let mut partial: Vec<(usize, &crate::tools::ToolDefinition)> = candidates
-                    .iter()
-                    .filter_map(|tool| {
-                        let name = tool_name_words(&tool.name);
-                        let text = format!("{} {}", name, normalize(&tool.description));
-                        let matched: Vec<&str> = unique
-                            .iter()
-                            .copied()
-                            .filter(|word| has_word(&text, word))
-                            .collect();
-                        (matched.len() >= threshold
-                            && matched.iter().any(|word| has_word(&name, word)))
-                        .then_some((matched.len(), *tool))
-                    })
-                    .collect();
-                // Most matching words first; equal counts keep catalog order.
-                partial.sort_by(|a, b| b.0.cmp(&a.0));
-                partial
-                    .into_iter()
-                    .take(3)
-                    .map(|(_, tool)| (*tool).clone())
-                    .collect()
-            } else {
-                hits.into_iter().take(5).map(|(_, tool)| tool).collect()
-            };
-        if loaded.is_empty() {
-            // A whitespace-separated list can mix eligible names with unknown
-            // or removed ones; keyword matching then finds nothing because one
-            // token matches no tool. When a token is exactly a current catalog
-            // name, treat the query as an explicit list so the valid tools load
-            // and the rest are reported. Matching case-sensitively keeps
-            // natural-language queries such as "read file" on the keyword path.
-            let names_a_catalog_tool_exactly = selections
-                .iter()
-                .any(|token| catalog.iter().any(|tool| tool.name == token.as_str()));
-            if names_a_catalog_tool_exactly {
-                return self.load_selected_tools(
-                    tool_input,
-                    query,
-                    &selections,
-                    &catalog,
-                    &customization,
-                    &exposed,
-                );
+        let mut catalog = self.builtin_catalog();
+        catalog.extend(self.mcp_tools.iter().cloned());
+        let catalog = customization.described(catalog);
+        let exposed = self.exposed_tools.clone().unwrap_or_default();
+        let mut loaded = Vec::new();
+        let mut already_available = Vec::new();
+        let mut unknown = Vec::new();
+        let mut unavailable = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in names.into_iter().filter(|name| seen.insert(*name)) {
+            match catalog.iter().find(|tool| tool.name == name) {
+                None => unknown.push(name),
+                Some(tool) if self.tool_is_loadable(tool, &customization, &exposed) => {
+                    loaded.push(tool);
+                }
+                Some(_) if self.tool_is_available_to_call(name, &customization, &exposed) => {
+                    already_available.push(name);
+                }
+                Some(_) => unavailable.push((name, self.unavailable_reason(name, &customization))),
             }
-            let already = catalog
-                .iter()
-                .any(|tool| tool.name.to_lowercase() == needle && exposed.contains(&tool.name));
-            let content = if already {
-                format!("{query} is already available in this request.")
-            } else {
-                format!("No tool available on demand matches \"{query}\". Search with a tool name or other keywords.")
-            };
-            let result = json!({"success":false,"loaded_tools":[],"tools":[],"content":content});
-            return (tool_input.clone(), result.to_string(), false);
         }
-        for tool in &loaded {
-            self.loaded_tools.insert(tool.name.clone());
+        if !unknown.is_empty() || !unavailable.is_empty() {
+            let mut errors = Vec::new();
+            if !unknown.is_empty() {
+                errors.push(format!("Unknown tools: {}.", unknown.join(", ")));
+            }
+            if !unavailable.is_empty() {
+                let details = unavailable
+                    .iter()
+                    .map(|(name, reason)| format!("{name} ({reason})"))
+                    .collect::<Vec<_>>();
+                errors.push(format!("Unavailable tools: {}.", details.join(", ")));
+            }
+            let result = json!({
+                "success": false,
+                "loaded_tools": [],
+                "tools": [],
+                "unknown": unknown,
+                "unavailable": unavailable.iter().map(|(name, reason)| json!({"name": name, "reason": reason})).collect::<Vec<_>>(),
+                "content": errors.join(" "),
+            });
+            return (tool_input.clone(), result.to_string(), true);
         }
+        self.loaded_tools
+            .extend(loaded.iter().map(|tool| tool.name.clone()));
         let names: Vec<&str> = loaded.iter().map(|tool| tool.name.as_str()).collect();
-        let mut content = format!("Loaded {}. These tools can be called after this result; a call in the same batch runs before they load.", names.join(", "));
-        if limited {
-            content.push_str(
-                " Showing the 5 best matches; name the remaining tools explicitly to load them.",
-            );
+        let mut content = Vec::new();
+        if !names.is_empty() {
+            content.push(format!(
+                "Loaded {}. Call these tools starting with the next model request.",
+                names.join(", ")
+            ));
+        }
+        if !already_available.is_empty() {
+            content.push(format!(
+                "Already available: {}.",
+                already_available.join(", ")
+            ));
         }
         let result = json!({
             "success": true,
             "loaded_tools": names,
+            "already_available": already_available,
             "tools": loaded,
-            "content": content,
-        });
-        (tool_input.clone(), result.to_string(), false)
-    }
-
-    /// Loads every explicitly named tool that is currently eligible. Names are
-    /// deduplicated case-insensitively and kept in request order; unknown,
-    /// disabled and denied names are reported instead of being dropped.
-    fn load_selected_tools(
-        &mut self,
-        tool_input: &Value,
-        query: &str,
-        selections: &[String],
-        catalog: &[crate::tools::ToolDefinition],
-        customization: &crate::services::customization::Customization,
-        exposed: &std::collections::HashSet<String>,
-    ) -> (Value, String, bool) {
-        let mut loaded: Vec<crate::tools::ToolDefinition> = Vec::new();
-        let mut unknown: Vec<String> = Vec::new();
-        let mut unavailable: Vec<Value> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for token in selections {
-            if !seen.insert(token.to_lowercase()) {
-                continue;
-            }
-            match catalog
-                .iter()
-                .find(|tool| tool.name.eq_ignore_ascii_case(token))
-            {
-                None => unknown.push(token.clone()),
-                Some(tool) if self.tool_is_searchable(tool, customization, exposed) => {
-                    loaded.push(tool.clone())
-                }
-                Some(tool) => unavailable.push(json!({
-                    "name": tool.name,
-                    "reason": self.unavailable_reason(tool, customization, exposed),
-                })),
-            }
-        }
-        for tool in &loaded {
-            self.loaded_tools.insert(tool.name.clone());
-        }
-        let names: Vec<&str> = loaded.iter().map(|tool| tool.name.as_str()).collect();
-        let mut content = if names.is_empty() {
-            format!("No requested tool could be loaded for \"{query}\".")
-        } else {
-            format!("Loaded {}. These tools can be called after this result; a call in the same batch runs before they load.", names.join(", "))
-        };
-        if !unknown.is_empty() {
-            content.push_str(&format!(" Unknown tools, not loaded: {}.", unknown.join(", ")));
-        }
-        for entry in &unavailable {
-            content.push_str(&format!(
-                " {} was not loaded: {}.",
-                entry["name"].as_str().unwrap_or_default(),
-                entry["reason"].as_str().unwrap_or_default()
-            ));
-        }
-        let result = json!({
-            "success": !names.is_empty(),
-            "loaded_tools": names,
-            "tools": loaded,
-            "unknown": unknown,
-            "unavailable": unavailable,
-            "content": content,
+            "content": content.join(" "),
         });
         (tool_input.clone(), result.to_string(), false)
     }
@@ -2902,6 +2759,7 @@ impl ToolLoopExecutor {
 
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
         self.conv_id = Some(conv_id);
+        self.builtin_names.take();
         self
     }
 
@@ -3289,6 +3147,9 @@ impl ToolLoopExecutor {
         if !self.remote_memory_enabled() {
             tools.retain(|tool| !matches!(tool.name.as_str(), "memory_search" | "memory_ingest"));
         }
+        if self.session_search_storage().is_none() {
+            tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
+        }
         if !self.goal_proposals_available() {
             tools.retain(|tool| tool.name != "ProposeGoal");
         }
@@ -3359,7 +3220,7 @@ impl ToolLoopExecutor {
     fn restricted_without_discovery(&self) -> bool {
         self.allowed_tools
             .as_ref()
-            .is_some_and(|names| !names.iter().any(|name| name == "ToolSearch"))
+            .is_some_and(|names| !names.iter().any(|name| name == "ToolLoad"))
     }
 
     /// Builds the tool list and the system prompt for one request from a single
@@ -3437,7 +3298,7 @@ impl ToolLoopExecutor {
         // A legacy entry outside the built-in catalog keeps its old "off"
         // meaning; built-ins are already handled by the switches above. An MCP
         // tool follows its server's state: resident only for `user`, and for
-        // `on-demand` once ToolSearch loaded it.
+        // `on-demand` once ToolLoad loaded it.
         tools.extend(
             self.mcp_tools
                 .iter()
@@ -3482,20 +3343,20 @@ impl ToolLoopExecutor {
         }
         // Agent is deferred by default, so a model that wants to pick a type
         // cannot see the list. While Agent is absent from this request but the
-        // model could still load it, ToolSearch carries the same list. Once
+        // model could still load it, ToolLoad carries the same list. Once
         // Agent is in the request (resident or loaded) only Agent carries it.
         let agent_loadable = self.builtin_names().contains("Agent")
             && customization.loading("Agent").on_demand
             && allowed("Agent");
         if agent_loadable
             && !tools.iter().any(|tool| tool.name == "Agent")
-            && tools.iter().any(|tool| tool.name == "ToolSearch")
+            && tools.iter().any(|tool| tool.name == "ToolLoad")
         {
             if let Some(listing) = self
                 .agent_type_listing("Agent types (subagent_type), available after loading Agent:")
             {
                 for tool in &mut tools {
-                    if tool.name == "ToolSearch" {
+                    if tool.name == "ToolLoad" {
                         tool.description.push_str(&listing);
                     }
                 }
@@ -3557,6 +3418,10 @@ impl ToolLoopExecutor {
             && self.subagent_hook_context.is_none()
             && self.goal_db.is_some()
             && self.conv_id.is_some()
+    }
+
+    fn session_search_storage(&self) -> Option<(&Arc<crate::db::DbManager>, &str)> {
+        self.transcript_db.as_ref().or(self.goal_db.as_ref()).zip(self.conv_id.as_deref())
     }
 
     pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
@@ -3893,6 +3758,7 @@ impl ToolLoopExecutor {
             // The reset transcript was built from this boundary, so later
             // requests must report it rather than any newer stored boundary.
             self.context_boundary_id = Some(boundary_id.clone());
+            self.applied_compaction = true;
             self.stop_hook_active = false;
             let _ = self
                 .event_tx
@@ -3979,9 +3845,6 @@ impl ToolLoopExecutor {
         // settings still decide whether it may come back.
         self.restore_loaded_tools();
         self.restore_persisted_loaded_tools()?;
-        // After the restore, so tools loaded in earlier turns are not listed
-        // as if they still had to be searched.
-        self.refresh_on_demand_listing();
         self.exposed_tools = None;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
@@ -4022,12 +3885,9 @@ impl ToolLoopExecutor {
                 self.event_tx.clone(),
                 crate::tools::background_shell::scope(
                     context,
-                    crate::tools::background_shell::delegated_scope(
-                        self.delegation_depth > 0,
-                        crate::tools::path_scope::with_permissions(
-                            self.permission_manager.clone(),
-                            crate::tools::path_scope::scope(directories, self.execute_scoped()),
-                        ),
+                    crate::tools::path_scope::with_permissions(
+                        self.permission_manager.clone(),
+                        crate::tools::path_scope::scope(directories, self.execute_scoped()),
                     ),
                 ),
             ))
@@ -4123,27 +3983,6 @@ impl ToolLoopExecutor {
             self.mcp_read_only_tools = read_only;
         }
         Ok(())
-    }
-
-    /// Keeps the system prompt's on-demand MCP listing in step with this turn:
-    /// the block appended earlier is replaced, so a setup that runs twice
-    /// never lists the same tool twice.
-    fn refresh_on_demand_listing(&mut self) {
-        if let Some(previous) = self.on_demand_prompt.take() {
-            if let Some(prompt) = self.system_prompt.as_mut() {
-                if let Some(index) = prompt.find(previous.as_str()) {
-                    prompt.replace_range(index..index + previous.len(), "");
-                }
-            }
-        }
-        let Some(block) = on_demand_listing(&self.mcp_tools, &self.mcp_states) else {
-            return;
-        };
-        let block = format!("\n{block}\n");
-        self.system_prompt
-            .get_or_insert_with(String::new)
-            .push_str(&block);
-        self.on_demand_prompt = Some(block);
     }
 
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
@@ -4251,25 +4090,7 @@ impl ToolLoopExecutor {
                 }
             }
         }
-        if let (Some(ctx_mgr), false, false) = (
-            self.context_manager
-                .as_ref()
-                .filter(|_| self.remote_memory_enabled()),
-            self.require_hook_wake,
-            recalled_before,
-        ) {
-            tracing::info!(module = "ToolLoop", "[E4] Injecting memory context...");
-            if let Some(memory_context) = ctx_mgr.before_api_call(&conv_id, &last_user_msg).await {
-                if let Err(error) = self.attach_turn_context(vec![memory_context]) {
-                    tracing::warn!(
-                        module = "ToolLoop",
-                        "Recalled memories were not saved for later turns: {error:#}"
-                    );
-                }
-            }
-        }
         tracing::info!(module = "ToolLoop", "[E4] Memory injection COMPLETED");
-
         // 模型特定的检查和二次压缩
         tracing::info!(module = "ToolLoop", "[E4.5] Model-specific token check...");
         let model_id = &self.provider.model.id;
@@ -4410,31 +4231,6 @@ impl ToolLoopExecutor {
                     "[E6] API loop COMPLETED, full_text_len={}",
                     full_text.len()
                 );
-                // Persist before announcing completion so the next session can recall this turn.
-                if !matches!(
-                    stop_reason.as_deref(),
-                    Some(
-                        "stream_error"
-                            | "error"
-                            | "interrupted"
-                            | "failed"
-                            | "cancelled"
-                            | "max_iterations"
-                            | "max_tokens"
-                            | "length"
-                            | "incomplete"
-                    )
-                ) {
-                    if let Some(ctx_mgr) = self
-                        .context_manager
-                        .as_ref()
-                        .filter(|_| self.remote_memory_enabled())
-                    {
-                        ctx_mgr
-                            .after_response(&conv_id, &last_user_msg, full_text)
-                            .await;
-                    }
-                }
                 let _ = self
                     .event_tx
                     .send(EngineEvent::MessageStop {
@@ -4907,8 +4703,29 @@ impl ToolLoopExecutor {
             );
         }
 
-        if tool_name == "ToolSearch" {
-            return CallStep::Finished(self.execute_tool_search(tool_input).await);
+        if tool_name == TOOL_LOAD_NAME {
+            return CallStep::Finished(self.execute_tool_load(tool_input).await);
+        }
+
+        if tool_name == crate::tools::context_search::NAME {
+            let result = match self.session_search_storage() {
+                Some((db, session)) => {
+                    let (db, session, input) = (db.clone(), session.to_owned(), tool_input.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::tools::context_search::execute(&db, &session, input)
+                    })
+                    .await
+                    .context("ContextSearch could not finish")
+                    .and_then(|result| result)
+                }
+                None => Err(anyhow!("ContextSearch requires a stored session")),
+            };
+            let failed = result.is_err();
+            return CallStep::Finished((
+                tool_input.clone(),
+                result.unwrap_or_else(|error| format!("Error: {error}")),
+                failed,
+            ));
         }
 
         if tool_name == "Workflow" {
@@ -6161,6 +5978,7 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
                     self.context_boundary_id = Some(boundary_id.clone());
+                    self.applied_compaction = true;
                     conversation_messages = vec![AnthropicMessage {
                         role: "user".into(),
                         content: AnthropicContent::Text(content),
@@ -6269,6 +6087,22 @@ impl ToolLoopExecutor {
         let model_id = self.provider.model.id.clone();
         let api_key_len = self.provider.provider.api_key.len();
         let mut output_recoveries = 0;
+
+        // Read once per turn. The opt-in replay covers the Chat Completions
+        // transport only, and both the built-in and direct routes resolve
+        // through it; other protocols keep their existing behaviour.
+        let post_content_recovery =
+            crate::config::OrchestrationConfig::post_content_timeout_recovery()
+                && super::provider_runtime::chat_completions_eligible(&self.provider);
+        // The budget getter caches built-in defaults after a parse error, so a
+        // fallible load runs first while the feature is enabled.
+        let recovery_limit = if post_content_recovery {
+            crate::config::OrchestrationConfig::init_global()?;
+            Some(crate::performance::AttemptBudget::configured().max())
+        } else {
+            None
+        };
+        let mut recovery_used = false;
 
         let mut after_tool_results = false;
         for iteration in 0usize.. {
@@ -6425,85 +6259,9 @@ impl ToolLoopExecutor {
                 system_prompt,
             } = self.prepare_request(serde_json::to_vec(&conversation_messages)?.len())?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
-            self.streaming_tool_args.clear();
-            let mut request_trace = RequestTrace::new(json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "number": iteration + 1,
-                "startedAt": chrono::Utc::now().timestamp_millis(),
-                "model": self.provider.model.id,
-                "providerId": self.provider.provider.id,
-                "providerName": self.provider.provider.name,
-                "apiFormat": self.provider.provider.api_format,
-                "maxOutputTokens": self.max_tokens,
-                "contextWindow": self.provider.model.context_window.map(|n| n as usize).unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id)),
-                "reservedForCompletion": (self.max_tokens as u64) * 2,
-                "effort": self.provider.model.effort,
-                "systemPrompt": system_prompt.as_deref(),
-                "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
-                "tools": tools,
-                "contextBoundary": self.context_boundary(),
-                "source": "native_engine"
-            }));
-            let _ = self
-                .event_tx
-                .send(EngineEvent::RequestSnapshot(request_trace.started()))
-                .await;
-            // Real HTTP attempts observed by the send layer, so a clean
-            // end-of-stream still reports a count instead of "unknown".
-            let http_attempts: crate::performance::AttemptCounter;
-            let context_capture = request_trace.capture_context(self.event_tx.clone());
-            let stream = self
-                .openai_client
-                .send_message_stream_counted(
-                    &self.provider,
-                    conversation_messages.clone(),
-                    system_prompt.as_deref(),
-                    tools.clone(),
-                    self.max_tokens,
-                    Some(&context_capture),
-                )
-                .await;
-
-            let mut stream = match stream {
-                Ok((s, attempts)) => {
-                    tracing::info!(module = "OpenAILoop", "Stream created successfully");
-                    http_attempts = attempts;
-                    s
-                }
-                Err(e) => {
-                    // Keep the typed cause for classification; only sanitized
-                    // text reaches events, snapshots and session records.
-                    let diagnostic = crate::performance::request_diagnostic(&e);
-                    tracing::error!(
-                        module = "OpenAILoop",
-                        "Stream creation FAILED: {}",
-                        diagnostic
-                    );
-                    let mut snapshot = request_trace.finish("error", Some(&diagnostic));
-                    if let Some(failure) = crate::performance::find_failure(&e) {
-                        snapshot["failure"] = failure.as_json();
-                    }
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::RequestSnapshot(snapshot))
-                        .await;
-                    let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
-                    return Err(e.context("API request failed"));
-                }
-            };
-
-            // One start per logical response, announced once the provider has
-            // accepted the request. Compatible providers repeat
-            // "role":"assistant" in every chunk; those are deltas of the same
-            // response. A request that fails before any response is not a
-            // round, and send-layer retries do not create a second start.
-            let _ = self
-                .event_tx
-                .send(EngineEvent::MessageStart {
-                    model: self.provider.model.id.clone(),
-                })
-                .await;
-            let mut sse_buffer = String::new();
+            // One attempt of this model step. A stalled attempt that is replaced
+            // must leave nothing behind, so the parser state belongs to the
+            // attempt and is only committed here once it succeeds.
             let mut has_tool_calls = false;
             let mut assistant_content: Option<OpenAIContent> = None;
             let mut assistant_reasoning: Option<String> = None;
@@ -6511,233 +6269,490 @@ impl ToolLoopExecutor {
             let mut assistant_tool_calls: Vec<crate::native_engine::openai_client::OpenAIToolCall> =
                 Vec::new();
             let mut openai_tool_args: HashMap<usize, (String, String, String)> = HashMap::new();
-
-            loop {
-                let chunk_result = match stream.next().await {
-                    Some(chunk) => chunk,
-                    None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
-                    None => break,
-                };
-                if self.event_tx.is_closed() {
-                    drop(stream);
-                    break;
+            // Ordered text/thinking of this attempt, held while staging is on.
+            let mut staged: Vec<(bool, String)> = Vec::new();
+            // Set when this attempt is the single authorized replacement.
+            let mut replaces_request_id: Option<String> = None;
+            'attempt: loop {
+                // A pending replacement never opens for a consumer that has
+                // already gone away.
+                if replaces_request_id.is_some() && self.event_tx.is_closed() {
+                    staged.clear();
+                    openai_tool_args.clear();
+                    return Ok((full_text, Some("interrupted".to_string())));
                 }
-                let chunk = match chunk_result {
-                    Ok(c) => c,
+                has_tool_calls = false;
+                assistant_content = None;
+                assistant_reasoning = None;
+                assistant_provider_content = None;
+                assistant_tool_calls.clear();
+                openai_tool_args.clear();
+                staged.clear();
+                // The pre-C loop kept one stop reason for the whole turn; only
+                // the staging path needs a fresh one per attempt.
+                if post_content_recovery {
+                    stop_reason = None;
+                }
+                self.streaming_tool_args.clear();
+                let mut snapshot = json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "number": iteration + 1,
+                    "startedAt": chrono::Utc::now().timestamp_millis(),
+                    "model": self.provider.model.id,
+                    "providerId": self.provider.provider.id,
+                    "providerName": self.provider.provider.name,
+                    "apiFormat": self.provider.provider.api_format,
+                    "maxOutputTokens": self.max_tokens,
+                    "contextWindow": self.provider.model.context_window.map(|n| n as usize).unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id)),
+                    "reservedForCompletion": (self.max_tokens as u64) * 2,
+                    "effort": self.provider.model.effort,
+                    "systemPrompt": system_prompt.as_deref(),
+                    "systemMessages": conversation_messages.iter().filter(|m| m.role == "system").collect::<Vec<_>>(),
+                    "tools": tools,
+                    "contextBoundary": self.context_boundary(),
+                    "source": "native_engine",
+                });
+                // Only a replacement names the attempt it replaces, so an
+                // initial request keeps the pre-C snapshot shape exactly.
+                if let Some(replaced) = &replaces_request_id {
+                    snapshot["replacesRequestId"] = json!(replaced);
+                }
+                let mut request_trace = RequestTrace::new(snapshot);
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::RequestSnapshot(request_trace.started()))
+                    .await;
+                // Real HTTP attempts observed by the send layer, so a clean
+                // end-of-stream still reports a count instead of "unknown".
+                let http_attempts: crate::performance::AttemptCounter;
+                let context_capture = request_trace.capture_context(self.event_tx.clone());
+                // The replacement is one authorized POST through a client without
+                // redirects or internal retries; the first leg keeps the ordinary
+                // budgeted entry point.
+                let stream = match replaces_request_id.is_some() {
+                    false => {
+                        self.openai_client
+                            .send_message_stream_counted(
+                                &self.provider,
+                                conversation_messages.clone(),
+                                system_prompt.as_deref(),
+                                tools.clone(),
+                                self.max_tokens,
+                                Some(&context_capture),
+                            )
+                            .await
+                    }
+                    // An already closed receiver must not poll the opener at all.
+                    true => {
+                        tokio::select! {
+                            biased;
+                            _ = self.event_tx.closed() => {
+                                staged.clear();
+                                openai_tool_args.clear();
+                                return Ok((full_text, Some("interrupted".to_string())));
+                            }
+                            opened = self.openai_client.send_message_stream_counted_budget(
+                                &self.provider,
+                                conversation_messages.clone(),
+                                system_prompt.as_deref(),
+                                tools.clone(),
+                                self.max_tokens,
+                                Some(&context_capture),
+                                crate::performance::AttemptBudget::single_attempt(),
+                            ) => opened,
+                        }
+                    }
+                };
+
+                let mut stream = match stream {
+                    Ok((s, attempts)) => {
+                        tracing::info!(module = "OpenAILoop", "Stream created successfully");
+                        http_attempts = attempts;
+                        s
+                    }
                     Err(e) => {
-                        // No replay after exposed content; keep partial output and
-                        // report the stage, attempts and sanitized cause.
-                        let failure = crate::performance::RequestFailure::stream(
-                            &e,
-                            http_attempts.attempts(),
-                            http_attempts.status(),
-                            !full_text.is_empty()
-                                || assistant_content.is_some()
-                                || !assistant_tool_calls.is_empty(),
-                        );
-                        let diagnostic = failure.diagnostic();
+                        // Keep the typed cause for classification; only sanitized
+                        // text reaches events, snapshots and session records.
+                        let diagnostic = crate::performance::request_diagnostic(&e);
                         tracing::error!(
                             module = "OpenAILoop",
-                            "Stream chunk error: {}",
+                            "Stream creation FAILED: {}",
                             diagnostic
                         );
                         let mut snapshot = request_trace.finish("error", Some(&diagnostic));
-                        snapshot["failure"] = failure.as_json();
+                        if let Some(failure) = crate::performance::find_failure(&e) {
+                            snapshot["failure"] = failure.as_json();
+                        }
                         let _ = self
                             .event_tx
                             .send(EngineEvent::RequestSnapshot(snapshot))
                             .await;
                         let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
-                        let _ = self
-                            .event_tx
-                            .send(EngineEvent::MessageStop {
-                                full_text: full_text.clone(),
-                                stop_reason: Some("stream_error".to_string()),
-                            })
-                            .await;
-                        drop(stream);
-                        return Ok((full_text, Some("stream_error".to_string())));
+                        return Err(e.context("API request failed"));
                     }
                 };
 
-                sse_buffer.push_str(&chunk);
-                let consumed = consume_sse_payloads(&sse_buffer);
-                sse_buffer = consumed.remainder;
+                // One start per logical response, announced once the provider has
+                // accepted the request. Compatible providers repeat
+                // "role":"assistant" in every chunk; those are deltas of the same
+                // response. A request that fails before any response is not a
+                // round, and send-layer retries do not create a second start. A
+                // recovered step keeps the start its abandoned attempt announced.
+                if replaces_request_id.is_none() {
+                    let _ = self
+                        .event_tx
+                        .send(EngineEvent::MessageStart {
+                            model: self.provider.model.id.clone(),
+                        })
+                        .await;
+                }
+                let mut sse_buffer = String::new();
+                let replacing = replaces_request_id.is_some();
 
-                for payload in &consumed.payloads {
-                    if payload == "[DONE]" {
-                        request_trace.mark_completed();
-                        continue;
+                loop {
+                    // The replacement is abandoned the moment its consumer goes
+                    // away; the ordinary read path keeps its existing shape.
+                    let chunk_result = if replacing {
+                        tokio::select! {
+                            biased;
+                            _ = self.event_tx.closed() => {
+                                staged.clear();
+                                openai_tool_args.clear();
+                                return Ok((full_text, Some("interrupted".to_string())));
+                            }
+                            chunk = stream.next() => match chunk {
+                                Some(chunk) => chunk,
+                                None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                                None => break,
+                            },
+                        }
+                    } else {
+                        match stream.next().await {
+                            Some(chunk) => chunk,
+                            None if !sse_buffer.is_empty() => Ok("\n\n".to_string()),
+                            None => break,
+                        }
+                    };
+                    if self.event_tx.is_closed() {
+                        drop(stream);
+                        break;
                     }
-
-                    let event: Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let chunk = match chunk_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // No replay after exposed content by default; keep partial
+                            // output and report the stage, attempts and sanitized cause.
+                            let failure = crate::performance::RequestFailure::stream(
+                                &e,
+                                http_attempts.attempts(),
+                                http_attempts.status(),
+                                request_trace.first_content_observed(),
+                            );
+                            let diagnostic = failure.diagnostic();
+                            // A replay needs a real mid-body stall: transient, typed
+                            // body timeout, content already produced, no terminal
+                            // signal, an unspent application budget and a live
+                            // consumer. Anything else is final.
+                            let recoverable = !recovery_used
+                                && !self.event_tx.is_closed()
+                                && failure.class() == crate::performance::ErrorClass::Transient
+                                && failure.is_stream_body_timeout()
+                                && request_trace.openai_recovery_content_observed()
+                                && failure.terminal_marker_observed() != Some(true)
+                                && !request_trace.post_content_recovery_blocked()
+                                && http_attempts
+                                    .attempts()
+                                    .zip(recovery_limit)
+                                    .is_some_and(|(used, limit)| used < limit);
+                            tracing::error!(
+                                module = "OpenAILoop",
+                                "Stream chunk error: {}",
+                                diagnostic
+                            );
+                            if recoverable {
+                                let request_id = request_trace.started()["id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                let attempts = http_attempts.attempts().unwrap_or(1);
+                                // The abandoned attempt keeps its own diagnostic
+                                // blocks but owns no terminal result.
+                                let mut abandoned =
+                                    request_trace.finish("error", Some(&diagnostic));
+                                abandoned["failure"] = failure.as_json();
+                                abandoned["abandonedForRecovery"] = json!(true);
+                                let _ = self
+                                    .event_tx
+                                    .send(EngineEvent::RequestSnapshot(abandoned))
+                                    .await;
+                                drop(stream);
+                                let delay = crate::performance::retry_events::delay(attempts, None);
+                                crate::performance::retry_events::emit_post_content_retry(
+                                    self.event_tx.clone(),
+                                    &request_id,
+                                    attempts,
+                                    failure.as_json(),
+                                    delay,
+                                )
+                                .await;
+                                // The same cancellable backoff, with closure
+                                // prioritised: a consumer that goes away here
+                                // issues no replacement POST.
+                                tokio::select! {
+                                    biased;
+                                    _ = self.event_tx.closed() => {
+                                        staged.clear();
+                                        openai_tool_args.clear();
+                                        return Ok((full_text, Some("interrupted".to_string())));
+                                    }
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                // `closed()` can become ready together with the
+                                // timer, so the outcome is rechecked before the
+                                // replacement is opened.
+                                if self.event_tx.is_closed() {
+                                    staged.clear();
+                                    openai_tool_args.clear();
+                                    return Ok((full_text, Some("interrupted".to_string())));
+                                }
+                                recovery_used = true;
+                                replaces_request_id = Some(request_id);
+                                continue 'attempt;
+                            }
+                            // Final failure: commit only this attempt's staged output.
+                            if !self.event_tx.is_closed() {
+                                full_text
+                                    .push_str(&flush_staged(&self.event_tx, &mut staged).await);
+                            } else {
+                                staged.clear();
+                            }
+                            let mut snapshot = request_trace.finish("error", Some(&diagnostic));
+                            snapshot["failure"] = failure.as_json();
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::RequestSnapshot(snapshot))
+                                .await;
+                            let _ = self.event_tx.send(EngineEvent::Error(diagnostic)).await;
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::MessageStop {
+                                    full_text: full_text.clone(),
+                                    stop_reason: Some("stream_error".to_string()),
+                                })
+                                .await;
+                            drop(stream);
+                            return Ok((full_text, Some("stream_error".to_string())));
+                        }
                     };
 
-                    request_trace.observe_openai(&event);
-                    if let Some(content) = event.get("provider_content") {
-                        assistant_provider_content = Some(content.clone());
-                    }
-                    // Usage-only final chunks have no choices and must still be recorded.
-                    if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
-                        let _ = self
-                            .event_tx
-                            .send(EngineEvent::RequestSnapshot(request_trace.started()))
-                            .await;
-                        if let Some(tokens) = usage.get("prompt_tokens").and_then(|v| v.as_f64()) {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
-                        }
-                        if let Some(tokens) =
-                            usage.get("completion_tokens").and_then(|v| v.as_f64())
-                        {
-                            crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
-                        }
-                        let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
-                    }
-                    let choices = match event.get("choices").and_then(|c| c.as_array()) {
-                        Some(c) => c,
-                        None => continue,
-                    };
+                    sse_buffer.push_str(&chunk);
+                    let consumed = consume_sse_payloads(&sse_buffer);
+                    sse_buffer = consumed.remainder;
 
-                    for choice in choices {
-                        let delta = match choice.get("delta") {
-                            Some(d) => d,
+                    for payload in &consumed.payloads {
+                        if payload == "[DONE]" {
+                            request_trace.mark_completed();
+                            continue;
+                        }
+
+                        let event: Value = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        request_trace.observe_openai(&event);
+                        if let Some(content) = event.get("provider_content") {
+                            assistant_provider_content = Some(content.clone());
+                        }
+                        // Usage-only final chunks have no choices and must still be recorded.
+                        if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
+                            let _ = self
+                                .event_tx
+                                .send(EngineEvent::RequestSnapshot(request_trace.started()))
+                                .await;
+                            if let Some(tokens) =
+                                usage.get("prompt_tokens").and_then(|v| v.as_f64())
+                            {
+                                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+                            }
+                            if let Some(tokens) =
+                                usage.get("completion_tokens").and_then(|v| v.as_f64())
+                            {
+                                crate::metrics::TOKENS_CONSUMED.inc_by(tokens);
+                            }
+                            let _ = self.event_tx.send(EngineEvent::Usage(usage.clone())).await;
+                        }
+                        let choices = match event.get("choices").and_then(|c| c.as_array()) {
+                            Some(c) => c,
                             None => continue,
                         };
 
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            if !content.is_empty() {
-                                full_text.push_str(content);
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::Text(content.to_string()))
+                        for choice in choices {
+                            let delta = match choice.get("delta") {
+                                Some(d) => d,
+                                None => continue,
+                            };
+
+                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                if !content.is_empty() {
+                                    // Staged output is committed only when the step
+                                    // succeeds, so an abandoned attempt leaves no text.
+                                    if !post_content_recovery {
+                                        full_text.push_str(content);
+                                    }
+                                    emit_or_stage(
+                                        &self.event_tx,
+                                        &mut staged,
+                                        false,
+                                        content,
+                                        post_content_recovery,
+                                    )
                                     .await;
-                                match &assistant_content {
-                                    None => {
-                                        assistant_content =
-                                            Some(OpenAIContent::Text(content.to_string()));
-                                    }
-                                    Some(OpenAIContent::Text(existing)) => {
-                                        assistant_content = Some(OpenAIContent::Text(format!(
-                                            "{}{}",
-                                            existing, content
-                                        )));
-                                    }
-                                    Some(OpenAIContent::Multi(_)) => {}
-                                }
-                            }
-                        }
-
-                        if let Some(reasoning) =
-                            delta.get("reasoning_content").and_then(|r| r.as_str())
-                        {
-                            if !reasoning.is_empty() {
-                                match &mut assistant_reasoning {
-                                    None => assistant_reasoning = Some(reasoning.to_string()),
-                                    Some(r) => r.push_str(reasoning),
-                                }
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::Thinking(reasoning.to_string()))
-                                    .await;
-                            }
-                        }
-
-                        if let Some(tool_calls_arr) =
-                            delta.get("tool_calls").and_then(|tc| tc.as_array())
-                        {
-                            has_tool_calls = true;
-                            for tc_delta in tool_calls_arr {
-                                let index =
-                                    tc_delta.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
-                                        as usize;
-
-                                let entry = openai_tool_args.entry(index).or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                });
-
-                                if let Some(id) = tc_delta.get("id").and_then(|i| i.as_str()) {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(func) = tc_delta.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        merge_tool_call_name(&mut entry.1, name);
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
-                                    {
-                                        entry.2.push_str(args);
+                                    match &assistant_content {
+                                        None => {
+                                            assistant_content =
+                                                Some(OpenAIContent::Text(content.to_string()));
+                                        }
+                                        Some(OpenAIContent::Text(existing)) => {
+                                            assistant_content = Some(OpenAIContent::Text(format!(
+                                                "{}{}",
+                                                existing, content
+                                            )));
+                                        }
+                                        Some(OpenAIContent::Multi(_)) => {}
                                     }
                                 }
                             }
-                        }
 
-                        if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                            if finish != "tool_calls" {
-                                stop_reason = Some(finish.to_string());
-                                let _ = self
-                                    .event_tx
-                                    .send(EngineEvent::MessageDelta {
-                                        stop_reason: Some(finish.to_string()),
-                                    })
+                            if let Some(reasoning) =
+                                delta.get("reasoning_content").and_then(|r| r.as_str())
+                            {
+                                if !reasoning.is_empty() {
+                                    match &mut assistant_reasoning {
+                                        None => assistant_reasoning = Some(reasoning.to_string()),
+                                        Some(r) => r.push_str(reasoning),
+                                    }
+                                    emit_or_stage(
+                                        &self.event_tx,
+                                        &mut staged,
+                                        true,
+                                        reasoning,
+                                        post_content_recovery,
+                                    )
                                     .await;
+                                }
+                            }
+
+                            if let Some(tool_calls_arr) =
+                                delta.get("tool_calls").and_then(|tc| tc.as_array())
+                            {
+                                has_tool_calls = true;
+                                for tc_delta in tool_calls_arr {
+                                    let index =
+                                        tc_delta.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
+
+                                    let entry =
+                                        openai_tool_args.entry(index).or_insert_with(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
+
+                                    if let Some(id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                        entry.0 = id.to_string();
+                                    }
+                                    if let Some(func) = tc_delta.get("function") {
+                                        if let Some(name) =
+                                            func.get("name").and_then(|n| n.as_str())
+                                        {
+                                            merge_tool_call_name(&mut entry.1, name);
+                                        }
+                                        if let Some(args) =
+                                            func.get("arguments").and_then(|a| a.as_str())
+                                        {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(finish) =
+                                choice.get("finish_reason").and_then(|f| f.as_str())
+                            {
+                                if finish != "tool_calls" {
+                                    stop_reason = Some(finish.to_string());
+                                    let _ = self
+                                        .event_tx
+                                        .send(EngineEvent::MessageDelta {
+                                            stop_reason: Some(finish.to_string()),
+                                        })
+                                        .await;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let interrupted = self.event_tx.is_closed();
-            let mut snapshot = request_trace.finish_observed(
+                let interrupted = self.event_tx.is_closed();
+                // Commit this attempt's staged text once, before any tool can run or
+                // the step finishes. An explicit cancellation discards it instead.
                 if interrupted {
-                    "interrupted"
+                    staged.clear();
                 } else {
-                    "completed"
-                },
-                None,
-                http_attempts.attempts(),
-                http_attempts.status(),
-            );
-            // A stream that stopped without a completion marker is a stream
-            // failure. The send layer knows the real HTTP attempt count.
-            let stream_failure =
-                (!interrupted && snapshot["status"] == "stream_error").then(|| {
-                    crate::performance::RequestFailure::stream_incomplete(
-                        http_attempts.attempts(),
-                        http_attempts.status(),
-                        !full_text.is_empty()
-                            || assistant_content.is_some()
-                            || !assistant_tool_calls.is_empty(),
-                    )
-                });
-            if let Some(failure) = &stream_failure {
-                snapshot["failure"] = failure.as_json();
-                snapshot["error"] = json!(failure.diagnostic());
-            }
-            let response_status = snapshot["status"]
-                .as_str()
-                .unwrap_or("interrupted")
-                .to_string();
-            let response_error = snapshot["error"]
-                .as_str()
-                .unwrap_or("Model response ended before completion")
-                .to_string();
-            let _ = self
-                .event_tx
-                .send(EngineEvent::RequestSnapshot(snapshot))
-                .await;
-            // A response cut off by the output limit is "incomplete" in the
-            // trace; continue it below instead of ending the turn.
-            let continue_cut_off = response_status == "incomplete"
-                && stop_reason.as_deref() == Some("length")
-                && output_recoveries < MAX_OUTPUT_RECOVERIES
-                && self
-                    .max_tool_iterations
-                    .is_none_or(|limit| iteration + 1 < limit);
-            if response_status != "completed" && !continue_cut_off {
-                let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
-                return Ok((full_text, Some(response_status)));
+                    full_text.push_str(&flush_staged(&self.event_tx, &mut staged).await);
+                }
+                // The observation is per response: reasoning, tool deltas and an
+                // adapter's content-start marker all count, while turn-wide text
+                // and already assembled tool calls do not.
+                let content_observed = request_trace.first_content_observed();
+                let mut snapshot = request_trace.finish_observed(
+                    if interrupted {
+                        "interrupted"
+                    } else {
+                        "completed"
+                    },
+                    None,
+                    http_attempts.attempts(),
+                    http_attempts.status(),
+                );
+                // A stream that stopped without a completion marker is a stream
+                // failure. The send layer knows the real HTTP attempt count.
+                let stream_failure =
+                    (!interrupted && snapshot["status"] == "stream_error").then(|| {
+                        crate::performance::RequestFailure::stream_incomplete(
+                            http_attempts.attempts(),
+                            http_attempts.status(),
+                            content_observed,
+                        )
+                    });
+                if let Some(failure) = &stream_failure {
+                    snapshot["failure"] = failure.as_json();
+                    snapshot["error"] = json!(failure.diagnostic());
+                }
+                let response_status = snapshot["status"]
+                    .as_str()
+                    .unwrap_or("interrupted")
+                    .to_string();
+                let response_error = snapshot["error"]
+                    .as_str()
+                    .unwrap_or("Model response ended before completion")
+                    .to_string();
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::RequestSnapshot(snapshot))
+                    .await;
+                // A response cut off by the output limit is "incomplete" in the
+                // trace; continue it below instead of ending the turn.
+                let continue_cut_off = response_status == "incomplete"
+                    && stop_reason.as_deref() == Some("length")
+                    && output_recoveries < MAX_OUTPUT_RECOVERIES
+                    && self
+                        .max_tool_iterations
+                        .is_none_or(|limit| iteration + 1 < limit);
+                if response_status != "completed" && !continue_cut_off {
+                    let _ = self.event_tx.send(EngineEvent::Error(response_error)).await;
+                    return Ok((full_text, Some(response_status)));
+                }
+                break 'attempt;
             }
             if stop_reason.as_deref() == Some("length")
                 && output_recoveries < MAX_OUTPUT_RECOVERIES
@@ -6915,6 +6930,7 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
                     self.context_boundary_id = Some(boundary_id.clone());
+                    self.applied_compaction = true;
                     conversation_messages = vec![OpenAIMessage {
                         role: "user".into(),
                         content: OpenAIContent::Text(content),
@@ -7119,6 +7135,10 @@ impl ToolLoopExecutor {
 
     fn build_openai_messages(&self) -> Result<Vec<OpenAIMessage>> {
         let additions = self.message_additions();
+        // Responses accepts content arrays for user messages, so the stable
+        // instruction blocks stay separate for caching. Chat Completions keeps
+        // one string because several compatible servers reject arrays there.
+        let separate_parts = super::provider_runtime::responses_api(&self.provider);
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.prepare_history_tool_outputs(&mut messages);
         Ok(messages
@@ -7163,9 +7183,26 @@ impl ToolLoopExecutor {
                 let openai_content = if before.is_empty() && after.is_empty() {
                     openai_content
                 } else {
-                    // Plain-string content stays a string: some compatible servers
-                    // accept only strings for user messages.
                     match openai_content {
+                        // Responses keeps each instruction block, the user's text
+                        // and each turn-context block as its own part.
+                        OpenAIContent::Text(text) if separate_parts => {
+                            let part = |text: &String| {
+                                crate::native_engine::openai_client::OpenAIContentPart::Text {
+                                    text: text.clone(),
+                                }
+                            };
+                            OpenAIContent::Multi(
+                                before
+                                    .iter()
+                                    .map(part)
+                                    .chain([part(&text)])
+                                    .chain(after.iter().map(part))
+                                    .collect(),
+                            )
+                        }
+                        // Plain-string content stays a string: some compatible
+                        // servers accept only strings for user messages.
                         OpenAIContent::Text(text) => OpenAIContent::Text(
                             before
                                 .iter()

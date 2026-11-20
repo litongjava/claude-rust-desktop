@@ -18,8 +18,6 @@ export interface MemoryStats {
 export interface MemoryConfig {
   enabled: boolean;
   backend_url: string;
-  auto_ingest: boolean;
-  auto_search: boolean;
   search_top_k: number;
   compression_threshold_tokens: number;
   min_importance_threshold: number;

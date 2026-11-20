@@ -30,6 +30,13 @@ pub struct Cli {
     /// Data directory shared with Desktop; defaults to ~/.deepseek-code.
     #[arg(long, env = "DEEPSEEK_CODE_DATA_DIR", global = true)]
     pub data_dir: Option<PathBuf>,
+    /// Local coordination root; the environment is read separately so the
+    /// explicit-over-environment precedence stays testable.
+    ///
+    /// Kept as an OS string: a native path need not be valid UTF-8, and the
+    /// resolver never converts it to text.
+    #[arg(long, global = true, value_parser = clap::value_parser!(std::ffi::OsString))]
+    pub coordination_dir: Option<std::ffi::OsString>,
     /// Exact model ID, legacy alias, or provider::model.
     #[arg(short, long, env = "CLAUDE_MODEL", global = true)]
     pub model: Option<String>,
@@ -824,6 +831,11 @@ pub enum SkillsCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommands {
+    /// Inspect the live local coordination registry without starting a session.
+    Live {
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop an idle persistent worker without opening its session.
     ShutdownWorker {
         id: String,

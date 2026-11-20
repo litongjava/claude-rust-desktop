@@ -1,11 +1,17 @@
 use super::*;
 use crate::native_engine::{
     anthropic_client::AnthropicClient, openai_client::OpenAIClient,
-    provider_manager::ResolvedProvider, request_identity::TurnIdentity,
+    provider_manager::ResolvedProvider, request_identity::RequestIdentity,
+    request_identity::TurnIdentity,
 };
 use axum::{body::Body, http::HeaderMap, routing::post, Json, Router};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 #[path = "../../tests/support/manual_clock.rs"]
 mod manual_clock;
@@ -218,4 +224,206 @@ async fn content_tools_completion_errors_and_unknown_data_are_never_replayed() {
     assert!(error.is_some());
     assert_eq!(requests.lock().unwrap().len(), 1);
     server.abort();
+}
+
+const CHAT_HEADERS: &[u8] =
+    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+const CHAT_TEXT: &str =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
+const CHAT_DONE: &str = "data: [DONE]\n\n";
+const CHAT_TIMEOUT_EVENT: &str = "data: {\"error\":{\"type\":\"timeout\",\"message\":\"request timed out for https://user:fixture-secret@example.test/v1?api_key=fixture-secret\"}}\n\n";
+
+/// Raw loopback response. `stall` keeps the body open until the client's idle
+/// read deadline fires; otherwise the connection closes cleanly.
+async fn scripted_body(
+    prefix: Vec<u8>,
+    stall: bool,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let total = count.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            total.fetch_add(1, Ordering::SeqCst);
+            let prefix = prefix.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                if socket.write_all(&prefix).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                if stall {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                } else {
+                    let _ = socket.shutdown().await;
+                }
+            });
+        }
+    });
+    (base, count, server)
+}
+
+fn chat_opener(
+    base: String,
+    client: reqwest::Client,
+) -> impl FnMut(&RequestIdentity) -> OpenFuture + Send + 'static {
+    move |identity: &RequestIdentity| {
+        let client = client.clone();
+        let url = format!("{base}/chat/completions");
+        let headers = identity.headers();
+        Box::pin(async move {
+            Ok(client
+                .post(url)
+                .headers(headers)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await?)
+        })
+    }
+}
+
+fn idle_client() -> reqwest::Client {
+    super::super::model_http::streaming_client_with_idle(
+        Duration::from_millis(250),
+        super::super::model_http::Redirect::None,
+    )
+    .unwrap()
+}
+
+/// One body case: open the response, read until it fails, assert one POST.
+async fn body_failure(prefix: Vec<u8>, stall: bool) -> (String, anyhow::Error) {
+    let (base, count, server) = scripted_body(prefix, stall).await;
+    let (mut stream, _) = attempts_with_budget(
+        RequestIdentity::new(None, false),
+        chat_opener(base, idle_client()),
+        super::super::provider_runtime::chat_decoder,
+        AttemptBudget::new(2),
+    )
+    .await
+    .expect("the body cases open a response");
+    let mut text = String::new();
+    let mut error = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => text.push_str(&chunk),
+            Err(failure) => {
+                error = Some(failure);
+                break;
+            }
+        }
+    }
+    server.abort();
+    assert_eq!(count.load(Ordering::SeqCst), 1, "one physical POST");
+    (text, error.expect("the body stops before completion"))
+}
+
+#[tokio::test]
+async fn typed_stream_body_timeout_survives_the_retry_layer() {
+    use crate::performance::{find_failure, ErrorClass, RequestStage};
+
+    // Text, then a stalled body: the typed body-timeout fact survives.
+    let mut prefix = CHAT_HEADERS.to_vec();
+    prefix.extend_from_slice(CHAT_TEXT.as_bytes());
+    let (text, error) = body_failure(prefix, true).await;
+    assert_eq!(text, CHAT_TEXT);
+    let failure = find_failure(&error).expect("structured failure");
+    assert!(failure.is_stream_body_timeout(), "{}", failure.diagnostic());
+    assert_eq!(failure.stage(), RequestStage::Stream);
+    assert_eq!(failure.class(), ErrorClass::Transient);
+    assert_eq!(failure.attempts(), Some(1));
+    assert_eq!(failure.status(), Some(200));
+    assert_eq!(failure.terminal_marker_observed(), Some(false));
+
+    // Text and the raw terminal marker, then a stalled body: both facts.
+    let mut prefix = CHAT_HEADERS.to_vec();
+    prefix.extend_from_slice(CHAT_TEXT.as_bytes());
+    prefix.extend_from_slice(CHAT_DONE.as_bytes());
+    let (_, error) = body_failure(prefix, true).await;
+    let failure = find_failure(&error).unwrap();
+    assert!(failure.is_stream_body_timeout(), "{}", failure.diagnostic());
+    assert_eq!(failure.terminal_marker_observed(), Some(true));
+
+    // Early EOF after content: not a timeout and no terminal marker.
+    let mut prefix = CHAT_HEADERS.to_vec();
+    prefix.extend_from_slice(CHAT_TEXT.as_bytes());
+    let (_, error) = body_failure(prefix, false).await;
+    let failure = find_failure(&error).unwrap();
+    assert!(!failure.is_stream_body_timeout());
+    assert_ne!(failure.terminal_marker_observed(), Some(true));
+
+    // A provider timeout-shaped SSE error stays remote data, reduced and
+    // sanitized, and never becomes the typed transport fact.
+    let mut prefix = CHAT_HEADERS.to_vec();
+    prefix.extend_from_slice(CHAT_TIMEOUT_EVENT.as_bytes());
+    let (_, error) = body_failure(prefix, false).await;
+    let failure = find_failure(&error).unwrap();
+    assert!(!failure.is_stream_body_timeout());
+    assert_eq!(failure.terminal_marker_observed(), Some(false));
+    let json = failure.as_json();
+    let keys: std::collections::BTreeSet<_> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "stage",
+            "class",
+            "http",
+            "attempts",
+            "retries",
+            "contentStarted",
+            "cause",
+            "serverRequestId"
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(json["stage"], "stream");
+    assert_eq!(json["http"], 200);
+    assert_eq!(json["attempts"], 1);
+    assert_eq!(json["contentStarted"], false);
+    assert!(
+        !failure.cause().contains("fixture-secret") && !failure.cause().contains("user:"),
+        "{}",
+        failure.cause()
+    );
+
+    // A timeout before headers is a send failure and carries no typed fact.
+    let (base, count, server) = scripted_body(Vec::new(), true).await;
+    let error = match attempts_with_budget(
+        RequestIdentity::new(None, false),
+        chat_opener(base, idle_client()),
+        super::super::provider_runtime::chat_decoder,
+        AttemptBudget::new(1),
+    )
+    .await
+    {
+        Ok(_) => panic!("a header wait times out"),
+        Err(error) => error,
+    };
+    server.abort();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let failure = find_failure(&error).unwrap();
+    assert!(!failure.is_stream_body_timeout());
+    assert_eq!(failure.stage(), RequestStage::Send);
+    assert_eq!(failure.attempts(), Some(1));
+    assert_eq!(failure.status(), None);
 }

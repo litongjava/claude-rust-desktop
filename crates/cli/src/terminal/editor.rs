@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Default)]
@@ -400,14 +401,25 @@ fn menu_page(heights: &[usize], selected: usize, budget: usize) -> (usize, usize
 }
 
 pub(crate) fn clipped(text: &str, width: usize) -> String {
-    let mut used = 0;
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take_while(|c| {
-            used += c.width().unwrap_or(0);
-            used <= width
-        })
-        .collect()
+    let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+    clip_cells(&printable, width).to_owned()
+}
+
+/// A prefix ending at a grapheme boundary, measured in terminal cells.
+pub(in crate::terminal) fn clip_cells(text: &str, width: usize) -> &str {
+    if text.width() <= width {
+        return text;
+    }
+    let mut cells = 0;
+    let mut end = 0;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        cells += grapheme.width();
+        if cells > width {
+            break;
+        }
+        end = start + grapheme.len();
+    }
+    &text[..end]
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextStyle {
@@ -448,34 +460,31 @@ pub(crate) struct PanelFrame {
 }
 /// Display untrusted tool output as text, never terminal escape instructions.
 fn wrap_detail(text: &str, width: usize) -> Vec<String> {
+    let text: String = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ")
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == '\n')
+        .collect();
     let mut lines = vec![String::new()];
     let mut cells = 0;
-    for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
-        if ch == '\n' {
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
             lines.push(String::new());
             cells = 0;
             continue;
         }
-        if ch.is_control() && ch != '\t' {
+        let size = grapheme.width();
+        if size > width {
             continue;
         }
-        let value = if ch == '\t' {
-            "    ".to_string()
-        } else {
-            ch.to_string()
-        };
-        for visible in value.chars() {
-            let size = visible.width().unwrap_or(0);
-            if size > width {
-                continue;
-            }
-            if cells + size > width {
-                lines.push(String::new());
-                cells = 0;
-            }
-            lines.last_mut().unwrap().push(visible);
-            cells += size;
+        if cells + size > width {
+            lines.push(String::new());
+            cells = 0;
         }
+        lines.last_mut().unwrap().push_str(grapheme);
+        cells += size;
     }
     lines
 }

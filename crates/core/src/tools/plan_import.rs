@@ -3,7 +3,7 @@
 //! `TaskList`.
 //!
 //! This is deliberately **not** a model-facing tool: nothing in the tool
-//! definitions, ToolSearch catalog, prompts or permission rules changes, and
+//! definitions, ToolLoad catalog, prompts or permission rules changes, and
 //! no import happens on startup, listing, reading or resume. A caller (today
 //! only tests; later an explicit maintenance command) passes the data
 //! directory, the canonical workspace, the target session and exactly one

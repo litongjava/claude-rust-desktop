@@ -306,7 +306,7 @@ pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationRow>> {
 fn with_session_title(conn: &Connection, mut row: ConversationRow) -> Result<ConversationRow> {
     if row.title.as_deref().is_some_and(|title| title.eq_ignore_ascii_case("CLI session")) {
         let prompt: Option<String> = conn.query_row(
-            "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY sort_order LIMIT 1",
+            "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY sort_order, rowid LIMIT 1",
             [&row.id], |message| message.get(0),
         ).optional()?;
         if let Some(prompt) = prompt {

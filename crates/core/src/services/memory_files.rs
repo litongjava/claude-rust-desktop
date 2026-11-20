@@ -375,7 +375,10 @@ impl FileMemory {
             ));
         }
         block.push_str("</project_memory>\n");
-        if !self.config().auto_search || query.trim().is_empty() {
+        // The old automatic-recall switch was removed together with remote
+        // auto-memory; file recall is part of the active file-memory path and
+        // only needs a query to rank against.
+        if query.trim().is_empty() {
             return Ok((block, None));
         }
         let mut ranked = snapshot

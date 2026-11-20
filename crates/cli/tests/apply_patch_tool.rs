@@ -490,9 +490,9 @@ async fn a_hook_rewritten_patch_still_obeys_path_scope() {
 }
 
 #[tokio::test]
-async fn tool_search_discovers_apply_patch_once_and_it_runs_after_loading() {
+async fn tool_load_discovers_apply_patch_once_and_it_runs_after_loading() {
     let env = start(vec![
-        ("ToolSearch", json!({"query": "ApplyPatch"})),
+        ("ToolLoad", json!({"names":["ApplyPatch"]})),
         ("ApplyPatch", json!({"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n*** End Patch"})),
     ])
     .await;
@@ -526,7 +526,7 @@ async fn tool_search_discovers_apply_patch_once_and_it_runs_after_loading() {
     let events = stdout_events(&output);
     let search = events
         .iter()
-        .find(|event| event["type"] == "tool_result" && event["name"] == "ToolSearch")
+        .find(|event| event["type"] == "tool_result" && event["name"] == "ToolLoad")
         .expect("search result");
     let value = tool_json(&search["output"]);
     assert_eq!(value["success"], true, "{value}");

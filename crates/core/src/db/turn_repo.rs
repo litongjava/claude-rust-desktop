@@ -155,7 +155,7 @@ pub fn get_turn(conn: &Connection, turn_id: &str) -> rusqlite::Result<Option<Tur
 /// Assistant segments published for one turn, oldest first.
 pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT m.id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE t.turn_id=?1 ORDER BY m.sort_order ASC",
+        "SELECT m.id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE t.turn_id=?1 ORDER BY m.sort_order ASC, m.rowid ASC",
     )?;
     let rows = stmt.query_map([turn_id], |row| row.get(0))?;
     rows.collect()

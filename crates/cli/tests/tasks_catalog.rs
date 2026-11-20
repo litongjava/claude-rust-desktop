@@ -1,5 +1,5 @@
 //! Real CLI + local model mock: the four task built-ins are discoverable only
-//! through ToolSearch (comma and whitespace selectors) and then usable, while
+//! through ToolLoad (exact name arrays) and then usable, while
 //! the retired `plan_mode` and `TaskOutput` never appear in a request.
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
@@ -141,7 +141,7 @@ fn provider_config(base: &str) -> Value {
     }])
 }
 
-/// The four task tools are on demand, so only ToolSearch can expose them.
+/// The four task tools are on demand, so only ToolLoad can expose them.
 fn write_customization(data: &std::path::Path) {
     let switch = json!({"enabled":false,"on_demand":true});
     let customization = json!({"tool_loading":{
@@ -246,21 +246,21 @@ fn scripted_response(body: &Value) -> Vec<Value> {
                     "{name} must start on demand: {names:?}"
                 );
             }
-            assert!(names.iter().any(|tool| tool == "ToolSearch"));
+            assert!(names.iter().any(|tool| tool == "ToolLoad"));
             calls_frame(&[
                 (
-                    "search-comma",
-                    "ToolSearch",
-                    json!({"query":"TaskCreate,TaskUpdate"}),
+                    "load-mutations",
+                    "ToolLoad",
+                    json!({"names":["TaskCreate","TaskUpdate"]}),
                 ),
                 (
-                    "search-space",
-                    "ToolSearch",
-                    json!({"query":"TaskGet TaskList"}),
+                    "load-reads",
+                    "ToolLoad",
+                    json!({"names":["TaskGet","TaskList"]}),
                 ),
             ])
         }
-        // Both searches finished: every task tool is now in the request.
+        // Both loads finished: every task tool is now in the request.
         2 => {
             assert_task_schemas(body);
             for (index, expected) in [

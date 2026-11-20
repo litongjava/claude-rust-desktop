@@ -621,6 +621,13 @@ impl AttemptCounter {
             .store(status, std::sync::atomic::Ordering::Release);
     }
 
+    /// Forget the previous response before a new attempt opens, so a failed
+    /// reconnect never inherits an older HTTP status.
+    pub fn clear_status(&self) {
+        self.status
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn status(&self) -> Option<u16> {
         match self.status.load(std::sync::atomic::Ordering::Acquire) {
             0 => None,
@@ -950,7 +957,7 @@ mod tests {
     }
     #[test]
     fn cache_marks_static_system_blocks_and_the_last_user_block() {
-        let system = crate::prompt::compose_system_prompt(Some("rule"), "m", crate::prompt::PromptProfile::Code);
+        let system = crate::prompt::compose_system_prompt(Some("rule"), crate::prompt::PromptProfile::Code);
         let mut body = serde_json::json!({"system":system,"messages":[
             {"role":"user","content":"first"},
             {"role":"assistant","content":[{"type":"text","text":"ok"}]},
@@ -964,7 +971,7 @@ mod tests {
         assert!(body["messages"][2]["content"][1].get("cache_control").is_none());
 
         // The per-session tail moves after the first user message where accepted.
-        let composed = crate::prompt::compose_system_prompt_in(None, "m", crate::prompt::PromptProfile::Code, Some(std::path::Path::new("/w")));
+        let composed = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code, Some(std::path::Path::new("/w")));
         let (fixed, tail) = crate::prompt::split_tail(&composed).unwrap();
         assert!(tail.starts_with("# Environment") && tail.contains("Primary working directory: /w") && !fixed.contains("Primary working directory"));
         let mut moved = serde_json::json!({"system":composed,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});

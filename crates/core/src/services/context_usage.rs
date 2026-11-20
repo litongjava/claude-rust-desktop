@@ -83,7 +83,7 @@ pub fn latest_boundary(db: &DbManager, session: &str) -> Result<Option<Boundary>
         use rusqlite::OptionalExtension;
         let row: Option<(String, String)> = conn
             .query_row(
-                "SELECT id, created_at FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC LIMIT 1",
+                "SELECT id, created_at FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1",
                 [session],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -123,7 +123,7 @@ fn matching_request(
 ) -> Result<Option<LastRequest>> {
     let snapshot = db.with_conn(|conn| -> Result<Option<Value>> {
         let mut statement = conn.prepare(
-            "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC",
+            "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC, m.rowid DESC",
         )?;
         let mut rows = statement.query([session])?;
         while let Some(row) = rows.next()? {

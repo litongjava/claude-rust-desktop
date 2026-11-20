@@ -5,12 +5,13 @@ use super::{EngineEvent, ToolLoopExecutor};
 use crate::{
     runtime::{RuntimePaths, SessionStore},
     services::{agents, EnvironmentCredentials, ServiceContext},
-    tools::ToolDefinition,
+    tools::{background_shell::SessionStop, ToolDefinition},
 };
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -536,8 +537,9 @@ impl ToolLoopExecutor {
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;
         }
-        entry.executor.messages =
-            sessions.model_history(id, &entry.executor.provider.provider.api_format)?;
+        (entry.executor.messages, entry.executor.context_boundary_id) = sessions
+            .model_history_with_boundary(id, &entry.executor.provider.provider.api_format)?;
+        entry.executor.applied_compaction = entry.executor.context_boundary_id.is_some();
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
@@ -1204,6 +1206,7 @@ impl ToolLoopExecutor {
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
         .with_context_reminders(self.context_reminders.clone())
+        .with_transcript_db(context.db.clone())
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())
@@ -1496,32 +1499,67 @@ impl ToolLoopExecutor {
             let collect_web_evidence = child.response_schema.is_some();
             let mut transcript =
                 child_transcript::ChildTranscript::new(state, receiver, collect_web_evidence)?;
+            // The tool loop scopes the child's shells and monitors to the
+            // data root, the parent directory of the search config path.
+            let cleanup_root = self
+                .search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf);
+            let child_id = id.clone();
             // Boxing alone still polls the child on the parent's deep tool-call stack.
             // JoinSet schedules it independently and aborts it if this owner is dropped.
             let mut execution = tokio::task::JoinSet::new();
             execution.spawn(async move {
+                // The cleanup guard lives inside the child's own task. An abort
+                // therefore drops it only after this future stopped publishing
+                // tasks, so work started late cannot slip past the sweep.
+                let mut cleanup = ChildSessionTasks::new(cleanup_root, child_id);
                 let result = child.execute().await;
-                (child, result)
+                let stop = cleanup.stop().await;
+                (child, result, stop)
             });
-            let (mut child, result) = {
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(event) = transcript.receiver.recv() => {
-                            transcript.process(event).await?;
-                        }
-                        result = execution.join_next() => {
-                            break result.context("Child execution task missing")?
-                                .context("Child execution task failed")?;
-                        }
+            let joined = loop {
+                tokio::select! {
+                    biased;
+                    Some(event) = transcript.receiver.recv() => {
+                        // The child is still running and is dropped with this
+                        // future, so its guard only requests the stops: say so
+                        // instead of claiming they already happened.
+                        transcript
+                            .process(event)
+                            .await
+                            .map_err(|error| annotate(error, BACKGROUND_TASKS_REQUESTED))?;
+                    }
+                    result = execution.join_next() => {
+                        break result.context("Child execution task missing")?;
                     }
                 }
             };
+            let (mut child, result, stop) = match joined {
+                Ok(value) => value,
+                Err(error) => {
+                    // The guard in the dropped child task requested the stops,
+                    // but its outcome cannot be read here.
+                    anyhow::bail!(
+                        "Child execution task failed: {error}\n{}",
+                        BACKGROUND_TASKS_REQUESTED
+                    )
+                }
+            };
+            let summary = stop_summary(&stop);
             // Completion (including errors) can queue events in the final execute poll.
-            transcript.drain().await?;
+            if let Err(error) = transcript.drain().await {
+                return Err(annotate(error, &summary));
+            }
             match result {
-                Ok((text, reason)) => {
-                    transcript.finish_text(&text)?;
+                Ok((mut text, reason)) => {
+                    text = with_summary(text, &summary);
+                    // The cleanup already ran, so its summary must survive a
+                    // failure to persist the final text as well.
+                    transcript
+                        .finish_text(&text)
+                        .map_err(|error| annotate(error, &summary))?;
                     transcript.state.value["preview"] = json!(text
                         .chars()
                         .rev()
@@ -1550,11 +1588,20 @@ impl ToolLoopExecutor {
                         .event_tx
                         .send(transcript.state.progress(status, None))
                         .await;
-                    ensure!(
-                        !failed,
-                        "Child session {id} did not complete: {}",
-                        reason.unwrap_or_default()
-                    );
+                    // A failed or cancelled child returns an error, so the
+                    // cleanup summary must travel with the message as well.
+                    if failed {
+                        anyhow::bail!(
+                            "{}",
+                            with_summary(
+                                format!(
+                                    "Child session {id} did not complete: {}",
+                                    reason.unwrap_or_default()
+                                ),
+                                &summary
+                            )
+                        );
+                    }
                     if !collect_web_evidence {
                         // Retain configuration/capabilities, not the last turn's transcript or handles.
                         child.messages.clear();
@@ -1608,12 +1655,149 @@ impl ToolLoopExecutor {
                         .event_tx
                         .send(transcript.state.progress("failed", None))
                         .await;
-                    Err(error)
+                    Err(annotate(error, &summary))
                 }
             }
         })
     }
 }
+
+/// Reported when the cleanup ran but its outcome could not be read (a panic).
+const BACKGROUND_TASKS_REQUESTED: &str = "Background tasks of the subagent were asked to stop.";
+
+/// Appends the cleanup summary to a message, on its own line.
+fn with_summary(message: impl std::fmt::Display, summary: &str) -> String {
+    if summary.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}\n{summary}")
+    }
+}
+
+/// Appends the cleanup summary to an error, keeping the typed error when there
+/// is nothing to add.
+fn annotate(error: anyhow::Error, summary: &str) -> anyhow::Error {
+    if summary.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!("{error:#}\n{summary}")
+    }
+}
+
+/// One line per non-empty list of the cleanup outcome, for the parent.
+fn stop_summary(stop: &SessionStop) -> String {
+    let mut lines = Vec::new();
+    if !stop.stopped.is_empty() {
+        lines.push(format!(
+            "Stopped {} background task(s) the subagent left running: {}.",
+            stop.stopped.len(),
+            stop.stopped.join(", ")
+        ));
+    }
+    if !stop.requested.is_empty() {
+        lines.push(format!(
+            "Requested a stop of {} background task(s); the stop was not confirmed within 5 seconds: {}.",
+            stop.requested.len(),
+            stop.requested.join(", ")
+        ));
+    }
+    if !stop.failed.is_empty() {
+        let failures = stop
+            .failed
+            .iter()
+            .map(|(subject, error)| format!("{subject} ({error})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "Could not stop {} background task(s): {failures}.",
+            stop.failed.len()
+        ));
+    }
+    if let Some(error) = &stop.scan_error {
+        lines.push(format!(
+            "Could not check the subagent's background tasks: {error}."
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Stops the managed shells and monitors a delegated child left running.
+///
+/// It lives inside the child's own execution task: a normal end waits for the
+/// final status of every requested stop, while an abort or panic only requests
+/// them, because acting on a request needs the shell owner's runtime thread.
+struct ChildSessionTasks {
+    root: Option<PathBuf>,
+    session: String,
+    outcome: Option<SessionStop>,
+}
+impl ChildSessionTasks {
+    fn new(root: Option<PathBuf>, session: String) -> Self {
+        Self {
+            root,
+            session,
+            outcome: None,
+        }
+    }
+    /// The normal path: request the stops and wait (bounded) for confirmation.
+    async fn stop(&mut self) -> SessionStop {
+        let outcome = match self.root.as_deref() {
+            Some(root) => {
+                crate::tools::background_shell::stop_running_session_tasks_async(
+                    root,
+                    &self.session,
+                )
+                .await
+                .unwrap_or_else(|error| self.scan_failure(&error))
+            }
+            // Without a data root the tool loop gives `background_shell` no
+            // session either, so the child could not start an owned task.
+            None => SessionStop::default(),
+        };
+        self.outcome = Some(outcome.clone());
+        outcome
+    }
+    /// The abort/panic fallback: request only, never wait for the owner.
+    fn request(&mut self) -> &SessionStop {
+        if self.outcome.is_none() {
+            let outcome = match self.root.as_deref() {
+                Some(root) => crate::tools::background_shell::stop_running_session_tasks(
+                    root,
+                    &self.session,
+                    false,
+                )
+                .unwrap_or_else(|error| self.scan_failure(&error)),
+                None => SessionStop::default(),
+            };
+            self.outcome = Some(outcome);
+        }
+        self.outcome
+            .as_ref()
+            .expect("the cleanup outcome was stored above")
+    }
+    /// A failed scan is reported, not turned into "nothing to stop".
+    fn scan_failure(&self, error: &anyhow::Error) -> SessionStop {
+        tracing::warn!(
+            "Could not stop the background tasks of subagent {}: {error:#}",
+            self.session
+        );
+        SessionStop {
+            scan_error: Some(format!("{error:#}")),
+            ..SessionStop::default()
+        }
+    }
+}
+impl Drop for ChildSessionTasks {
+    fn drop(&mut self) {
+        // The child may have been cancelled or panicked; nothing remains to
+        // await this stop, so it is requested synchronously.
+        let _ = self.request();
+    }
+}
+
+#[cfg(test)]
+#[path = "delegation_task_cleanup_tests.rs"]
+mod task_cleanup_tests;
 
 #[cfg(test)]
 #[path = "delegation_workspace_tests.rs"]
