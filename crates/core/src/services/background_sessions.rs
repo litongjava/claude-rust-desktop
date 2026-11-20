@@ -1049,21 +1049,21 @@ fn read_worker_failure(dir: &Path) -> Option<String> {
 }
 
 pub fn output(root: &Path, id: &str) -> Result<(String, String)> {
+    let ((stdout, _), (stderr, _)) = output_snapshot(root, id)?;
+    Ok((stdout, stderr))
+}
+
+type LogSnapshot = (String, crate::performance::command_output::SnapshotSize);
+
+pub(crate) fn output_snapshot(root: &Path, id: &str) -> Result<(LogSnapshot, LogSnapshot)> {
     let dir = directory(root, id)?;
     read_job(&dir)?;
-    let read = |name: &str| -> Result<String> {
-        let path = dir.join(name);
-        if !path.exists() {
-            return Ok(String::new());
-        }
-        let mut file = fs::File::open(path)?;
-        let size = file.metadata()?.len();
-        // Read a bounded tail even when a tool produces very large output.
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(size.saturating_sub(256 * 1024)))?;
-        let mut bytes = Vec::new();
-        file.take(256 * 1024).read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let read = |name| {
+        crate::performance::command_output::SnapshotSize::read_log(
+            &dir.join(name),
+            256 * 1024,
+            true,
+        )
     };
     Ok((read("output.jsonl")?, read("stderr.log")?))
 }

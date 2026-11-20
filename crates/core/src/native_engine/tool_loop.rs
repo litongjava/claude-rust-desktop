@@ -1820,7 +1820,10 @@ impl ToolLoopExecutor {
         for (call, prepared) in calls.iter().zip(&prepared) {
             pending.push(match &prepared.step {
                 CallStep::Builtin(input, approved) => Box::pin(async {
-                    Some(self.run_builtin(&call.name, input, &cwd, *approved).await)
+                    Some(
+                        self.run_builtin(&call.name, input, &call.id, &cwd, *approved)
+                            .await,
+                    )
                 }),
                 CallStep::Finished(_) => Box::pin(async { None }),
             });
@@ -1856,7 +1859,7 @@ impl ToolLoopExecutor {
         approved: bool,
     ) -> (Value, String, bool) {
         let cwd = self.get_workspace_cwd().to_owned();
-        let result = self.run_builtin(name, input, &cwd, approved).await;
+        let result = self.run_builtin(name, input, id, &cwd, approved).await;
         let (output, failed) = self.finish_builtin(name, input, id, result);
         (input.clone(), output, failed)
     }
@@ -2699,30 +2702,63 @@ impl ToolLoopExecutor {
         }
     }
 
+    #[cfg(test)]
     fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
+        self.retained_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn retained_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
         self.record_tool_usage(tool_name);
-        self.preview_tool_output(tool_name, output)
+        self.preview_tool_output_for_id(tool_name, output, id)
     }
 
     fn preview_tool_output(&self, tool_name: &str, output: &str) -> String {
-        let original = output;
+        self.preview_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn summary_enabled(&self, root: Option<&std::path::Path>) -> bool {
+        crate::config::command_output::enabled(root, std::path::Path::new(self.get_workspace_cwd()))
+    }
+
+    fn preview_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
+        let root = self.search_config_path.as_deref().and_then(|p| p.parent());
+        if model_output::is_shell_result(tool_name) {
+            let enabled = self.summary_enabled(root);
+            let metadata = if enabled {
+                root.zip(id)
+                    .and_then(|(root, id)| {
+                        std::fs::read(model_output::metadata_path(root, id)).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            } else {
+                None
+            };
+            return model_output::command_preview(
+                tool_name,
+                output,
+                root,
+                metadata.as_ref(),
+                enabled,
+            );
+        }
         let cleaned = model_tool_output(tool_name, output);
-        let output = cleaned.as_str();
-        // Read already selects the requested line range. This is the fresh
-        // result sent to the model, not a summary of old conversation history.
-        // Spilling it would also truncate any subsequent Read of the spill file.
-        if tool_name == "Read" {
-            return output.to_string();
-        }
-        let preview = if tool_name == "Bash" {
-            model_output::render(tool_name, original, Some(12_000))
+        // Read already selects the requested line range.
+        if let Some(root) = root.filter(|_| tool_name != "Read") {
+            let preview = compact_tool_output(tool_name, &cleaned);
+            crate::performance::retain_tool_output(root, &cleaned, &preview)
         } else {
-            compact_tool_output(tool_name, output)
-        };
-        if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
-            return crate::performance::retain_tool_output(root, output, &preview);
+            cleaned
         }
-        output.to_string()
     }
 
     fn finish_mcp_output(
@@ -2877,10 +2913,47 @@ impl ToolLoopExecutor {
         self
     }
 
+    async fn run_builtin(
+        &self,
+        tool_name: &str,
+        tool_input: &Value,
+        id: &str,
+        cwd: &str,
+        approved: bool,
+    ) -> Result<Value> {
+        let run = self.run_builtin_inner(tool_name, tool_input, cwd, approved);
+        self.retain_command_metadata(tool_name, id, run).await
+    }
+
+    async fn retain_command_metadata(
+        &self,
+        tool_name: &str,
+        id: &str,
+        run: impl std::future::Future<Output = Result<Value>>,
+    ) -> Result<Value> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        if let Some(root) = root.filter(|root| {
+            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
+        }) {
+            let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
+            if let Some(metadata) = metadata {
+                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
+                    tracing::debug!(%error, "Could not retain shell capture metadata");
+                }
+            }
+            result
+        } else {
+            run.await
+        }
+    }
+
     /// Runs a built-in tool. While a sandboxed command with a domain
     /// allowlist runs, hosts outside the list are put to the user, as in the
     /// reference CLI; "don't ask again" saves a SandboxNetwork(domain:) rule.
-    async fn run_builtin(
+    async fn run_builtin_inner(
         &self,
         tool_name: &str,
         tool_input: &Value,
@@ -4749,7 +4822,10 @@ impl ToolLoopExecutor {
                         }
                     }
                 }
-                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+                let run = crate::tools::tasks::execute_for_session_async(
+                    tool_name, tool_input.clone(), root, session,
+                );
+                self.retain_command_metadata(tool_name, _tool_use_id, run).await
             }.await;
             return CallStep::Finished((
                 tool_input.clone(),
@@ -5833,7 +5909,11 @@ impl ToolLoopExecutor {
                             })
                             .await;
                         let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output(&tc.name, &output_str))
+                            json!(self.retained_tool_output_for_id(
+                                &tc.name,
+                                &output_str,
+                                Some(&tc.id)
+                            ))
                         });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
@@ -6777,9 +6857,9 @@ impl ToolLoopExecutor {
                         if let Some(content) = &mcp {
                             tool_images.extend(content.openai_images(&tc.id));
                         }
-                        let compacted = mcp
-                            .map(|value| value.openai_text())
-                            .unwrap_or_else(|| self.retained_tool_output(&tc.name, &output_str));
+                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
+                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
+                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),
