@@ -461,3 +461,27 @@ fn a_summary_error_leaves_committed_history_available_for_repair() -> Result<()>
     assert_eq!((p.count, p.input_tokens), (1, 1));
     Ok(())
 }
+
+#[test]
+fn replacing_anonymous_snapshot_metrics_preserves_independent_requests() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let a = stores.create(A, Default::default())?;
+    let message = a.write(|w| {
+        let m = w.append("assistant", "result")?;
+        w.normalized_request(&m, &json!({"inputTokens": 11}))?;
+        w.snapshots(&m, &json!([{"inputTokens": 3}, {"inputTokens": 3}]))?;
+        w.normalized_request(&m, &json!({"inputTokens": 7}))?;
+        Ok(m)
+    })?;
+    let fork = a.branch("anonymous-fork", Branch::Full)?;
+    let copied = fork.read(|r| Ok(r.messages()?[0].id.clone()))?;
+    for (session, m) in [(&a, &message), (&fork, &copied)] {
+        let before = stores.global().summary(session.id())?.unwrap();
+        assert_eq!((before.request_count, before.input_tokens), (4, 24));
+        session.write(|w| w.snapshots(m, &json!([{"inputTokens": 2}])))?;
+        let after = stores.global().summary(session.id())?.unwrap();
+        assert_eq!((after.request_count, after.input_tokens), (3, 20));
+    }
+    Ok(())
+}

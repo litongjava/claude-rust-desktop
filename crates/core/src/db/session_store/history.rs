@@ -328,10 +328,9 @@ impl SessionWrite<'_> {
                         )?;
                     }
                 }
-                self.0.execute(
-                    "DELETE FROM model_requests WHERE message_id=?1 AND id IS NULL",
-                    [message],
-                )?;
+                for entry in old.iter().filter(|r| r["id"].as_str().is_none()) {
+                    crate::db::request_repo::remove_anonymous_snapshot(self.0, message, entry)?;
+                }
             }
             messages::save_request_snapshots(self.0, message, requests)?;
         }
