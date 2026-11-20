@@ -404,9 +404,12 @@ pub fn insert_tool_call(
     // Bind the typed MCP sidecar to that durable ID in the same save operation.
     if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
         conn.execute(
-            "INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
+            "INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
              SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs \
-             WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5",
+             WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5
+             ON CONFLICT(conversation_id,tool_use_id) DO UPDATE SET content_json=excluded.content_json,metadata_json=excluded.metadata_json,
+                display_text=excluded.display_text,is_error=excluded.is_error
+             WHERE mcp_tool_outputs.display_text<>excluded.display_text OR mcp_tool_outputs.is_error<>excluded.is_error",
             params![id,message_id,original,output,is_error],
         )?;
     }

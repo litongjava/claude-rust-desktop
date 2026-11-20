@@ -21,7 +21,7 @@ pub struct Projection {
 
 pub(super) fn projection(c: &Connection) -> Result<Projection> {
     Ok(c.query_row("SELECT content_revision,message_count,updated_at,last_turn_status,
-        (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1),
+        (SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1),
         (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
         (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages) FROM manifest WHERE singleton=1", [], |r| {
         Ok(Projection {
@@ -29,18 +29,38 @@ pub(super) fn projection(c: &Connection) -> Result<Projection> {
             count: r.get(1)?,
             activity: r.get(2)?,
             status: r.get(3)?,
-            first_prompt: r.get(4)?,
+            first_prompt: r.get::<_, Option<String>>(4)?.as_deref().and_then(crate::db::conversation_repo::prompt_title),
             latest_prompt: r.get(5)?,
             transcript_bytes: r.get(6)?,
         })
     })?)
 }
 
+// Compare instants including offsets and sub-millisecond precision. Keep the
+// original representation of the winning timestamp (including imported text).
+fn latest_activity<'a>(existing: &'a str, incoming: &'a str) -> &'a str {
+    if chrono::DateTime::parse_from_rfc3339(existing).ok()
+        >= chrono::DateTime::parse_from_rfc3339(incoming).ok()
+    {
+        existing
+    } else {
+        incoming
+    }
+}
+
 pub(super) fn advance(c: &Connection) -> Result<()> {
-    c.execute("UPDATE manifest SET updated_at=?1,content_revision=content_revision+1,
+    let existing: String = c.query_row(
+        "SELECT updated_at FROM manifest WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "UPDATE manifest SET updated_at=?1,content_revision=content_revision+1,
         message_count=(SELECT count(*) FROM messages),
         last_turn_status=(SELECT status FROM execution_turns ORDER BY started_at DESC,rowid DESC LIMIT 1)
-        WHERE singleton=1", [chrono::Utc::now().to_rfc3339()])?;
+        WHERE singleton=1",
+        [latest_activity(&existing, &chrono::Utc::now().to_rfc3339())],
+    )?;
     Ok(())
 }
 
@@ -50,22 +70,51 @@ impl GlobalDb {
         self.connection(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
             c.pragma_update(None, "synchronous", "NORMAL")?;
             c.busy_timeout(std::time::Duration::ZERO)?;
-            let result = c.execute(
-                "UPDATE conversations SET content_revision=?1,message_count=?2,updated_at=?3,
+            let result = (|| -> Result<()> {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    c,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let current = tx
+                    .query_row(
+                        "SELECT updated_at,content_revision FROM conversations WHERE id=?1 AND incarnation=?2",
+                        params![id, incarnation],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let Some((existing, revision)) = current else {
+                    return Ok(());
+                };
+                let activity = latest_activity(&existing, &p.activity);
+                if p.revision <= revision {
+                    if activity != existing {
+                        tx.execute(
+                            "UPDATE conversations SET updated_at=?1 WHERE id=?2 AND incarnation=?3",
+                            params![activity, id, incarnation],
+                        )?;
+                    }
+                    tx.commit()?;
+                    return Ok(());
+                }
+                tx.execute(
+                    "UPDATE conversations SET content_revision=?1,message_count=?2,updated_at=?3,
                 last_turn_status=?4,first_prompt=?5,latest_prompt=?6,transcript_bytes=?7
                 WHERE id=?8 AND incarnation=?9 AND content_revision<?1",
-                params![
-                    p.revision,
-                    p.count,
-                    p.activity,
-                    p.status,
-                    p.first_prompt,
-                    p.latest_prompt,
-                    p.transcript_bytes,
-                    id,
-                    incarnation
-                ],
-            );
+                    params![
+                        p.revision,
+                        p.count,
+                        activity,
+                        p.status,
+                        p.first_prompt,
+                        p.latest_prompt,
+                        p.transcript_bytes,
+                        id,
+                        incarnation
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
             c.busy_timeout(std::time::Duration::from_secs(5))?;
             result?;
             Ok(())
@@ -479,16 +528,14 @@ impl SessionWrite<'_> {
         )
     }
     pub fn rewind_from(&self, message: &str) -> Result<()> {
-        let (order, row): (i64, i64) = self.0.query_row(
-            "SELECT sort_order,rowid FROM messages WHERE id=?1",
+        let order: i64 = self.0.query_row(
+            "SELECT sort_order FROM messages WHERE id=?1",
             [message],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
-        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)>=(?1,?2)) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)<(?1,?2))", params![order, row])?;
-        self.0.execute(
-            "DELETE FROM messages WHERE (sort_order,rowid)>=(?1,?2)",
-            params![order, row],
-        )?;
+        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order>=?1) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order<?1)", [order])?;
+        self.0
+            .execute("DELETE FROM messages WHERE sort_order>=?1", [order])?;
         self.2.set(true);
         Ok(())
     }

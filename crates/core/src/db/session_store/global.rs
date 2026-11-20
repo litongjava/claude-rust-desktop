@@ -130,7 +130,28 @@ impl GlobalDb {
         let Some(_locks) = stores.resolved_key(&key)? else {
             return Ok(None);
         };
-        self.read(|conn| crate::db::conversation_repo::get_conversation(conn, id))
+        self.read(|conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let mut row = crate::db::conversation_repo::conversation_metadata(&snapshot, id)?;
+            if let Some(conversation) = row.as_mut().filter(|r| {
+                r.title
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("CLI session"))
+            }) {
+                let prompt: Option<String> = snapshot.query_row(
+                    "SELECT first_prompt FROM conversations WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                if let Some(title) = prompt
+                    .as_deref()
+                    .and_then(crate::db::conversation_repo::prompt_title)
+                {
+                    conversation.title = Some(title);
+                }
+            }
+            Ok(row)
+        })
     }
 
     #[doc(hidden)]

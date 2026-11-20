@@ -307,15 +307,19 @@ pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationRow>> {
     Ok(result)
 }
 
+pub(crate) fn prompt_title(prompt: &str) -> Option<String> {
+    prompt.lines().map(str::trim).find(|line| !line.is_empty())
+        .map(|line| line.chars().take(80).collect())
+}
+
 fn with_session_title(conn: &Connection, mut row: ConversationRow) -> Result<ConversationRow> {
     if row.title.as_deref().is_some_and(|title| title.eq_ignore_ascii_case("CLI session")) {
         let prompt: Option<String> = conn.query_row(
             "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY sort_order, rowid LIMIT 1",
             [&row.id], |message| message.get(0),
         ).optional()?;
-        if let Some(prompt) = prompt {
-            let title = prompt.lines().find(|line| !line.trim().is_empty()).unwrap_or_default().trim();
-            if !title.is_empty() { row.title = Some(title.chars().take(80).collect()); }
+        if let Some(title) = prompt.as_deref().and_then(prompt_title) {
+            row.title = Some(title);
         }
     }
     Ok(row)

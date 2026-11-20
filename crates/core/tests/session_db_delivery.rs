@@ -1098,3 +1098,114 @@ fn review_import_keeps_selected_workspace_across_backup() -> Result<()> {
     assert!(s.open_session(B).is_err());
     Ok(())
 }
+
+#[test]
+fn review_activity_is_monotonic_in_both_stores() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let input = root.path().join("import.json");
+    let future = "2099-01-01T00:00:00Z";
+    fs::write(
+        &input,
+        serde_json::to_vec(
+            &json!({"id":A,"name":"future","created_at":"2000-01-01T00:00:00Z","updated_at":future,"messages":[]}),
+        )?,
+    )?;
+    s.import_json(&input, root.path(), false)?;
+    let a = s.open_session(A)?;
+    let g = global(root.path())?;
+    g.execute(
+        "UPDATE conversations SET updated_at='2100-01-01T00:00:00Z'",
+        [],
+    )?;
+    a.write(|w| w.append("user", "hi"))?;
+    assert_eq!(a.read(|r| r.projection())?.activity, future);
+    assert_eq!(
+        s.global().conversation(A)?.unwrap().updated_at,
+        "2100-01-01T00:00:00Z"
+    );
+    assert_eq!(s.global().conversation(A)?.unwrap().message_count, 1);
+    g.execute(
+        "UPDATE conversations SET content_revision=100, updated_at='2099-01-01T00:30:00+01:00'",
+        [],
+    )?;
+    a.write(|w| w.append("assistant", "later revision"))?;
+    let row = s.global().conversation(A)?.unwrap();
+    assert_eq!(row.updated_at, future);
+    assert_eq!(row.message_count, 1);
+    Ok(())
+}
+
+#[test]
+fn review_directory_displays_clear_and_child_titles() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let a = s.create(A, Default::default())?;
+    for (id, kind) in [("clear", Branch::Clear), ("child", Branch::Child)] {
+        let session = a.branch(id, kind)?;
+        assert_eq!(
+            s.global().conversation(id)?.unwrap().title.as_deref(),
+            Some("CLI session")
+        );
+        let prompt = format!("{}\n  first line\nsecond", " ".repeat(90));
+        session.write(|w| w.append("user", &prompt))?;
+        assert_eq!(
+            s.global().conversation(id)?.unwrap().title.as_deref(),
+            Some("first line")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn review_rewind_removes_whole_tied_group() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let m = a.write(|w| {
+        w.append("user", "first")?;
+        let m = w.append("assistant", "second")?;
+        w.append("user", "last")?;
+        Ok(m)
+    })?;
+    Connection::open(root.path().join("sessions").join(A).join("session.db"))?.execute(
+        "UPDATE messages SET sort_order=CASE WHEN sort_order<2 THEN 8 ELSE 20 END",
+        [],
+    )?;
+    a.write(|w| w.rewind_from(&m))?;
+    assert!(a.read(|r| r.messages())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn review_unchanged_stream_preserves_each_occurrences_mcp_metadata() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let stream = |m: &str| {
+        a.write(|w| {
+            let mut row = tool("provider", m, 0);
+            row.output = Some("same".into());
+            w.stream_tools(m, "reply", &[row], &Default::default())
+        })
+    };
+    let mut messages = Vec::new();
+    for stamp in ["first", "second"] {
+        a.save_mcp(
+            "provider",
+            &json!({"content":[{"type":"text","text":"same"}],"_meta":{"stamp":stamp}}),
+            false,
+        )?;
+        let m = a.write(|w| w.append("assistant", "reply"))?;
+        stream(&m)?;
+        messages.push(m);
+    }
+    stream(&messages[0])?;
+    for (m, stamp) in messages.iter().zip(["first", "second"]) {
+        assert_eq!(
+            a.read(|r| r.mcp(&format!("{m}:provider"), "same"))?
+                .unwrap()
+                .1["_meta"]["stamp"],
+            stamp
+        );
+    }
+    Ok(())
+}
