@@ -272,7 +272,6 @@ async fn all_modes_run_memory_tools_without_automatic_recall_or_saving() {
             let profile = PromptProfile::from_workspace_mode(mode);
             let prompt = crate::prompt::compose_system_prompt(
                 Some("custom project rule"),
-                "code-test",
                 profile,
             );
             let mut executor = ToolLoopExecutor::new(
@@ -410,7 +409,7 @@ async fn context_reminders_open_the_first_user_message() {
             "<system-reminder>\nreminder-marker-rules\n</system-reminder>".to_string(),
             "<system-reminder>\n# gitStatus\n</system-reminder>".to_string(),
         ];
-        let prompt = crate::prompt::compose_system_prompt(None, "code-test", PromptProfile::Code);
+        let prompt = crate::prompt::compose_system_prompt(None, PromptProfile::Code);
         let history = vec![
             json!({"role":"user","content":"hello"}),
             json!({"role":"assistant","content":"hi"}),
