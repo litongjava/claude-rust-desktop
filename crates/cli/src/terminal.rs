@@ -42,8 +42,8 @@ pub fn take_handoff() -> Option<u16> {
 pub fn release_handoff() {
     use std::io::{IsTerminal, Write};
     if let Some(row) = take_handoff() {
-        let mut out = std::io::stderr();
-        if out.is_terminal() {
+        let mut out = crate::terminal_output::stderr();
+        if std::io::stderr().is_terminal() {
             let _ = write!(out, "\x1b[{};1H\x1b[J", row + 1);
             let _ = out.flush();
         }
@@ -66,7 +66,7 @@ pub(crate) fn cursor_position() -> std::io::Result<(u16, u16)> {
             "the cursor position needs the terminal in raw mode",
         ));
     }
-    crossterm::cursor::position()
+    crossterm::cursor::position().map_err(crate::terminal_output::stdout_error)
 }
 
 /// Terminal columns and rows. A pty without a winsize (`script` creates one by
@@ -389,7 +389,7 @@ pub(crate) fn print_recorded(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     release_handoff();
     let mut history = scrollback::Scrollback::take();
-    let mut out = std::io::stderr().lock();
+    let mut out = crate::terminal_output::stderr_locked();
     // A console probe can fail when stderr is redirected; plain lines remain
     // readable, so only the newline choice changes.
     let raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
@@ -413,7 +413,7 @@ pub(crate) fn print_recorded(text: &str) -> std::io::Result<()> {
 /// particular, never let formatting an OSC interleave with the live renderer.
 pub(crate) fn write_clipboard(sequence: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut out = std::io::stderr().lock();
+    let mut out = crate::terminal_output::stderr_locked();
     out.write_all(sequence.as_bytes())?;
     out.flush()
 }

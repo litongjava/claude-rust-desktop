@@ -1249,3 +1249,24 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
         assert_eq!(hits[0]["message_id"], expected);
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn redirected_output_config_confirmation_reports_enospc() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let status = command(&data, root.path())
+        .args(["config", "set", "tools.Read.enabled", "true"])
+        .stderr(full)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.join("customization.json")).unwrap()).unwrap();
+    assert_eq!(saved["tool_loading"]["Read"]["enabled"], true);
+}

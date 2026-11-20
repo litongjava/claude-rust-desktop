@@ -1107,19 +1107,11 @@ fn write_settings(data: &Path, enabled: bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn write_provider(data: &Path, endpoint: &str) {
-    std::fs::write(
-        data.join("providers.json"),
-        serde_json::json!([{
-            "id":"fixture","name":"Fixture","base_url":format!("{endpoint}/v1"),
-            "api_key":"fixture-only","api_format":"openai","enabled":true,
-            "models":[{"id":"fixture-model","name":"Fixture","enabled":true,
-                "supports_vision":false,"supports_web_search":false}]
-        }])
-        .to_string(),
-    )
-    .unwrap();
-}
+#[path = "support/linux_terminal.rs"]
+mod linux_terminal;
+
+#[cfg(target_os = "linux")]
+use linux_terminal::write_provider;
 
 #[cfg(target_os = "linux")]
 fn rows_in(root: &Path) -> Vec<Registration> {
@@ -2909,9 +2901,13 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     impl Drop for ClearGuard<'_> {
         fn drop(&mut self) {
             let _ = std::fs::write(self.release, b"");
-            if matches!(self.child.try_wait(), Ok(None)) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                while let Err(error) = self.child.wait() {
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3111,3 +3107,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     let _ = reader_thread.join();
     server.abort();
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/terminal_hangup.rs"]
+mod terminal_hangup;

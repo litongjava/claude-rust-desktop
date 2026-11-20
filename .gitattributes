@@ -21,3 +21,5 @@ crates/core/src/skills/bundled/skills/pdf/** -whitespace
 crates/core/src/skills/bundled/skills/pptx/** -whitespace
 crates/core/src/skills/bundled/skills/xlsx/** -whitespace
 crates/core/src/skills/bundled/skills/claude-api/** -whitespace
+# Preserve the crates.io README, including upstream trailing spaces.
+vendor/crossterm/README.md text eol=lf whitespace=-blank-at-eol

@@ -53,7 +53,7 @@ pub async fn finish_background(
                                 object.insert("task_id".into(),serde_json::json!(job.id));
                             }
                             command_println!("{}",serde_json::to_string(&event)?);
-                            std::io::stdout().flush()?;
+                            crate::terminal_output::stdout().flush()?;
                         }
                     }
                     if let Some(question)=background_sessions::pending_question(&session.paths.data_dir,&job.id,&session.id)? {
@@ -98,7 +98,7 @@ pub async fn finish_background(
     } else {
         command_println!("{}", serde_json::to_string(&result)?);
     }
-    std::io::stdout().flush()?;
+    crate::terminal_output::stdout().flush()?;
     if let Some(error) = error {
         if cli.output_format != OutputFormat::Text {
             return Err(crate::output::ReportedError(error).into());
