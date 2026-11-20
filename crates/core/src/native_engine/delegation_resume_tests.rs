@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Default)]
 struct Endpoint {
     requests: Mutex<Vec<Value>>,
+    keys: Mutex<Vec<String>>,
     block: AtomicBool,
     json_mode: AtomicBool,
     started: tokio::sync::Notify,
@@ -14,7 +15,8 @@ struct Endpoint {
 }
 async fn endpoint() -> (String, Arc<Endpoint>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(Endpoint::default());
-    let app=Router::new().route("/v1/chat/completions",post(|State(state):State<Arc<Endpoint>>,Json(body):Json<Value>|async move {
+    let app=Router::new().route("/v1/chat/completions",post(|State(state):State<Arc<Endpoint>>,headers:axum::http::HeaderMap,Json(body):Json<Value>|async move {
+        state.keys.lock().unwrap().push(headers["authorization"].to_str().unwrap().into());
         state.requests.lock().unwrap().push(body);
         if state.block.swap(false,Ordering::SeqCst) {state.started.notify_one();state.release.notified().await;}
         ([("content-type","text/event-stream")],format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{"content":if state.json_mode.load(Ordering::Relaxed){"{\"ok\":true}"}else{"child complete"}},"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})))
@@ -314,44 +316,50 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
     server_a.abort();
 }
 #[tokio::test]
-async fn retained_child_rejects_endpoint_or_key_changes_before_resume() {
+async fn retained_child_keeps_its_launch_binding_and_new_children_use_the_owner_selection() {
+    use crate::native_engine::{provider_manager::ProviderManager, session_binding::BindingSnapshot};
     let (_temp, context, _store, parent, cwd) = fixture();
-    let (url, api, server) = endpoint().await;
-    let (other, unused, other_server) = endpoint().await;
-    for rotate_key in [false, true] {
-        let registry: OwnedChildren = Default::default();
-        let first = owner(&context, &parent, &cwd, &url, registry.clone());
-        let child = first
-            .execute_delegated(&json!({"prompt":"original"}))
-            .await
-            .unwrap();
-        let child = child["session_id"].as_str().unwrap();
-        let mut next = owner(
-            &context,
-            &parent,
-            &cwd,
-            if rotate_key { &url } else { &other },
-            registry.clone(),
-        );
-        if rotate_key {
-            next.provider.provider.api_key = "rotated-local-fixture".into();
+    let (a, first, server_a) = endpoint().await;
+    let (b, second, server_b) = endpoint().await;
+    let mut host = owner(&context, &parent, &cwd, &a, Default::default());
+    let manager = ProviderManager::in_memory(Vec::new(), context.paths.data_dir.join("providers.json"));
+    let binding = manager.binding.clone();
+    let snapshot = |generation, url: String, key: &str| {
+        let mut provider = host.provider.provider.clone();
+        provider.models = vec![host.provider.model.clone()];
+        provider.base_url = url;
+        provider.api_key = key.into();
+        BindingSnapshot {
+            generation, provider_id: provider.id.clone(), model: provider.models[0].id.clone(),
+            providers: vec![provider], environment: Default::default(), observation_only: false,
         }
-        let before = api.requests.lock().unwrap().len();
-        let error = next
-            .resume_owned_child(child, Some("after change"), false)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("needs_resume"));
-        assert!(!registry.lock().unwrap().contains_key(child));
-        assert_eq!(api.requests.lock().unwrap().len(), before);
-        assert!(unused.requests.lock().unwrap().is_empty());
-    }
-    server.abort();
-    other_server.abort();
+    };
+    let old = snapshot(1, a, "local-first");
+    let next = snapshot(2, b, "local-second");
+    binding.install(old).unwrap();
+    host.provider = binding.resolve(None).unwrap();
+    host.provider_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
+    let child = host.execute_delegated(&json!({"prompt":"create first child"})).await.unwrap();
+    binding.install(next).unwrap();
+    host.provider = binding.resolve(None).unwrap();
+    let resumed = host.execute_delegated(&json!({"resume":child["session_id"],"prompt":"resume on first"})).await.unwrap();
+    assert_eq!(resumed["session_id"], child["session_id"]);
+    host.execute_delegated(&json!({"prompt":"create second child"})).await.unwrap();
+    assert_eq!(*first.keys.lock().unwrap(), ["Bearer local-first", "Bearer local-first"]);
+    assert_eq!(*second.keys.lock().unwrap(), ["Bearer local-second"]);
+    // A retained transport does not grant a stale owner a new admission.
+    context.db.with_conn(crate::native_engine::session_binding::store::schema).unwrap().unwrap();
+    binding.track(&context.db, &parent);
+    let error = host.resume_owned_child(child["session_id"].as_str().unwrap(), Some("stale owner"), false)
+        .await.unwrap_err();
+    assert!(error.to_string().contains("Provider binding changed"));
+    assert_eq!(first.keys.lock().unwrap().len(), 2);
+    server_a.abort();
+    server_b.abort();
 }
 
 #[tokio::test]
-async fn retained_child_rejects_native_model_transport_change_at_same_base_url() {
+async fn retained_child_keeps_native_model_transport_after_owner_switch() {
     let (_temp, context, _store, parent, cwd) = fixture();
     let (url, api, server) = endpoint().await;
     let registry: OwnedChildren = Default::default();
@@ -361,11 +369,11 @@ async fn retained_child_rejects_native_model_transport_change_at_same_base_url()
     let child = first.execute_delegated(&json!({"prompt":"original"})).await.unwrap();
     first.provider.model.id = "responses-model".into();
     first.provider.model.api = Some("openai-responses".into());
-    let error = first.resume_owned_child(child["session_id"].as_str().unwrap(), Some("changed native route"), false)
-        .await.unwrap_err();
-    assert!(error.to_string().contains("needs_resume"));
-    assert!(registry.lock().unwrap().is_empty());
-    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    first.resume_owned_child(child["session_id"].as_str().unwrap(), Some("keep native route"), false)
+        .await.unwrap();
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["model"], "fixture");
     server.abort();
 }
 

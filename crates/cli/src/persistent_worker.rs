@@ -310,7 +310,6 @@ pub async fn run_from_env() -> Result<bool> {
                             let incoming = environment.iter().find(|(k,_)| k == crate::worker_binding::SNAPSHOT_ENV);
                             let accepted = match incoming {
                                 Some((_,data)) => serde_json::from_str(data).map_err(anyhow::Error::from).and_then(|state| { let paths = RuntimePaths::new(worker.root.clone())?; crate::worker_binding::validate_worker_snapshot(&paths, &worker.session_id, &state)?; binding.install(state) }),
-                                None if binding.read().is_some() => Err(anyhow::anyhow!("This session requires a generation-aware frontend")),
                                 None => Ok(()),
                             };
                             if let Err(error) = accepted {
@@ -409,8 +408,7 @@ async fn execute(
     ] {
         std::env::remove_var(name);
     }
-    let snapshot = binding.read();
-    if let Some(state) = &snapshot { crate::worker_binding::install_public(state); }
+    let stamped = environment.iter().any(|(name, _)| name == crate::worker_binding::SNAPSHOT_ENV);
     for (name, value) in environment {
         if name == crate::worker_binding::SNAPSHOT_ENV {
             continue;
@@ -434,17 +432,23 @@ async fn execute(
         "Worker request must resume its own session without a subcommand"
     );
     let paths = RuntimePaths::new(worker.root.clone())?;
-    let mut selection = match &snapshot {
-        Some(state) => crate::config::Selection { providers: state.providers.clone(), model: state.model.clone(), provider_id: state.provider_id.clone() },
-        None => crate::config::select(&cli, &paths, cli.model.as_deref(), cli.provider.as_deref())?,
-    };
-    if let Some(session) = current.as_mut() {
-        if snapshot.is_none() {
+    if !stamped {
+        let db = paths.open_database()?;
+        let observed = crate::worker_binding::observe_worker(&paths, &db, &worker.session_id, Some(&binding), || {
+            let mut selection = crate::config::select(&cli, &paths, cli.model.as_deref(), cli.provider.as_deref())?;
             selection.apply_worker_model_snapshot(false)?;
-            session.switch(&paths, selection).await?;
-        } else {
-            session.use_worker_binding(&binding).await?;
+            crate::worker_binding::snapshot(&paths, selection, true)
+        }).await?;
+        if observed.generation != 0 {
+            cli.discard_binding_options();
         }
+        binding.track(&db, &worker.session_id);
+        binding.restore(observed)?;
+    }
+    let snapshot = binding.read().context("Missing worker binding")?;
+    crate::worker_binding::install_public(&snapshot);
+    if let Some(session) = current.as_mut() {
+        session.use_worker_binding(&binding).await?;
         // Each job carries its own launch permissions.
         session.bypass_available = cli.allow_dangerously_skip_permissions;
         session.full_access = cli.full_access;
@@ -473,10 +477,14 @@ async fn execute(
             Session::open_with_registration(
                 &cli,
                 &paths,
-                selection,
+                crate::config::Selection {
+                    providers: snapshot.providers.clone(),
+                    model: snapshot.model.clone(),
+                    provider_id: snapshot.provider_id.clone(),
+                },
                 Some(&worker.session_id),
                 crate::local_coordination::RegistrationMode::HostOwned,
-                snapshot.as_ref().map(|_| &binding),
+                Some(&binding),
             )
             .await?,
         );
@@ -491,7 +499,11 @@ async fn execute(
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(session.runtime_status_source());
     let current_provider = session.selected_provider().await?;
-    let identity = snapshot.as_ref().map(|s| format!("generation:{}", s.generation)).unwrap_or_else(|| crate::worker_binding::identity(&current_provider));
+    let identity = if stamped || snapshot.generation != 0 {
+        format!("generation:{}", snapshot.generation)
+    } else {
+        crate::worker_binding::identity(&current_provider)
+    };
     *mode_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModeControl {
         job_id: id.into(),
         session_id: session.id.clone(),

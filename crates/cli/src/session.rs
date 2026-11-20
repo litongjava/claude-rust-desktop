@@ -483,11 +483,9 @@ impl Session {
     }
 
     pub(crate) async fn use_worker_binding(&mut self, binding: &deepseek_code_core::native_engine::session_binding::SessionBinding) -> Result<()> {
-        let state = binding.read().context("Missing worker binding")?;
         binding.track(&self.store.db, &self.id);
         self.binding = binding.initialized()?;
         self.providers.lock().await.binding = binding.clone();
-        self.engine.invalidate_child_bindings(&*self.providers.lock().await, Some((&self.id, &state.active()?)));
         Ok(())
     }
 
@@ -865,7 +863,9 @@ impl Session {
                             && admitted.model == snapshot.model,
                         "One-shot admission no longer owns this binding"
                     );
-                } else if mode == crate::local_coordination::RegistrationMode::Automatic {
+                } else if internal_worker || mode == crate::local_coordination::RegistrationMode::HostOwned {
+                    snapshot = crate::worker_binding::observe_worker(paths, &store.db, &id, None, || Ok(snapshot)).await?;
+                } else {
                     if cli.observes_binding(resumed_id.is_some()) {
                         snapshot = crate::worker_binding::observe(paths, &store.db, &id, snapshot).await?;
                         if cli.binding_generation.is_some_and(|generation| generation != snapshot.generation) {
@@ -976,7 +976,6 @@ impl Session {
             return self.publish_selection((*self.binding_state()).clone(), effort).await;
         };
         let mut state = crate::worker_binding::snapshot(paths, selection, false)?;
-        let selected = state.active()?;
         let frontend = self.coordination_mode == crate::local_coordination::RegistrationMode::Automatic;
         if frontend {
             self.publish_selection(state, effort).await?;
@@ -984,7 +983,6 @@ impl Session {
             state.generation = self.binding.read().map_or(0, |s| s.generation);
             self.binding.install(state)?;
         }
-        self.engine.invalidate_child_bindings(&*self.providers.lock().await, Some((&self.id, &selected)));
         self.has_saved_providers |= paths.data_dir.join("config.json").is_file() || paths.data_dir.join("providers.json").is_file();
         self.startup_provider = None;
         self.auto_route = false;
@@ -1179,14 +1177,13 @@ impl Session {
         self.end_hooks("other").await;
         let admission = async {
             let state = crate::worker_binding::observe(paths, &self.store.db, id, candidate).await?;
-            let resolved = state.active()?;
             let target = self.prepare_resumed_binding(id, state)?;
             deepseek_code_core::services::session_permission_mode::set(
                 &self.store.db, id, &self.permissions, mode,
             )?;
-            Ok::<_, anyhow::Error>((resolved, target))
+            Ok::<_, anyhow::Error>(target)
         }.await;
-        let (resolved, target) = match admission {
+        let target = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
                 if lifecycle_owned { self.finish_committed_start_hooks("resume").await; }
@@ -1199,7 +1196,6 @@ impl Session {
             self.binding = target;
             self.has_saved_providers |= reload_catalog;
             if changing_provider || self.id != id { self.startup_provider = None; }
-            self.engine.invalidate_child_bindings(&manager, Some((id, &resolved)));
         }
         self.workspace = workspace;
         self.auto_route = false;

@@ -1527,9 +1527,7 @@ impl QueryEngine {
                 model,
                 resolved.as_ref().map(|p| &p.provider.id)
             );
-            let selected = resolved.ok_or_else(|| anyhow!("No provider found for model: {}", model))?;
-            self.invalidate_child_bindings(&pm, Some((&conv_id, &selected)));
-            selected
+            resolved.ok_or_else(|| anyhow!("No provider found for model: {}", model))?
         };
 
         let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(500);
@@ -2166,15 +2164,16 @@ impl QueryEngine {
             .insert(session.to_owned(), agents);
     }
 
+    /// Only a change to the shared catalog can revoke an independently retained child.
     pub fn invalidate_child_bindings(
         &self,
         manager: &ProviderManager,
-        owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
+        _owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
     ) {
         self.owned_children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, child| child.binding_is_current(manager, owner));
+            .retain(|_, child| child.binding_is_current(manager));
     }
 
     pub fn clear_runtime_agents(&self, session: &str) {

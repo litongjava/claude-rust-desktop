@@ -160,6 +160,50 @@ pub async fn observe(
     if let Some(state) = resident(paths, id, &row).await? {
         return Ok(state);
     }
+    restore_observed(paths, row, local)
+}
+
+/// An unstamped job observes the latest revision without publishing. Sessions
+/// predating binding revisions still take their transport from the job itself.
+pub(crate) async fn observe_worker(
+    paths: &RuntimePaths,
+    db: &DbManager,
+    id: &str,
+    host: Option<&deepseek_code_core::native_engine::session_binding::SessionBinding>,
+    local: impl FnOnce() -> Result<BindingSnapshot>,
+) -> Result<BindingSnapshot> {
+    let row = binding_store::observe(db, id)?;
+    ensure!(
+        row.pending.is_none(),
+        "Provider switch pending; use /continue to observe the legacy job"
+    );
+    if row.generation == 0 && row.digest.is_none() {
+        let mut local = local()?;
+        local.generation = row.generation;
+        return Ok(local);
+    }
+    if let Some(host) = host {
+        if let Some(state) = host.read() {
+            if !state.observation_only && matches_revision(&row, &state)? {
+                return Ok((*state).clone());
+            }
+        }
+    } else if let Some(state) = resident(paths, id, &row).await? {
+        return Ok(state);
+    }
+    let local = local().or_else(|error| {
+        let saved = crate::interactive_config::select(paths, &row.provider, &row.model)
+            .map_err(|_| error)?;
+        snapshot(paths, saved, false)
+    })?;
+    restore_observed(paths, row, local)
+}
+
+fn restore_observed(
+    paths: &RuntimePaths,
+    row: Observed,
+    mut local: BindingSnapshot,
+) -> Result<BindingSnapshot> {
     local.generation = row.generation;
     if local.provider_id == row.provider
         && local.model == row.model

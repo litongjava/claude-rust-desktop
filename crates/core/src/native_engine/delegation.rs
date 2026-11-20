@@ -32,23 +32,13 @@ impl OwnedChild {
     pub(in crate::native_engine) fn binding_is_current(
         &self,
         manager: &crate::native_engine::provider_manager::ProviderManager,
-        owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
     ) -> bool {
-        if let Some((id, provider)) = owner {
-            if id == self.parent && !self.owner_provider.same_binding(provider) {
-                return false;
-            }
-        }
-        [&self.owner_provider, &self.executor.provider]
-            .iter()
-            .all(|held| {
-                manager
-                    .resolve_selected(&held.provider.id, &held.model.id)
-                    .is_some_and(|live| {
-                        held.provider.same_transport(&live.provider)
-                            && held.model.api == live.model.api
-                    })
-            })
+        // Session bindings are per owner. A retained child owns its launch
+        // snapshot. A shared provider catalog can still revoke the child itself.
+        let held = &self.executor.provider;
+        manager.binding.read().is_some() || manager
+            .resolve_selected(&held.provider.id, &held.model.id)
+            .is_some_and(|live| held.same_binding(&live) && held.model.api == live.model.api)
     }
 
     pub(in crate::native_engine) fn permission_target(
@@ -512,6 +502,9 @@ impl ToolLoopExecutor {
             !crate::services::session_messages::receiver_active(root, id)?,
             "Child already has an active receiver"
         );
+        // The owner must still be admitted to dispatch a continuation, even
+        // though the retained child uses its own launch-time transport.
+        self.provider.current()?;
         let policy = self.child_owner_policy();
         let mut entry = {
             let manager = match &self.provider_manager {
@@ -522,10 +515,9 @@ impl ToolLoopExecutor {
                 .owned_children
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if registry.get(id).is_some_and(|entry| entry.parent == parent && (
-                !entry.owner_provider.same_binding(&self.provider)
-                || manager.as_ref().is_some_and(|catalog| !entry.binding_is_current(catalog, None))
-            )) {
+            if registry.get(id).is_some_and(|entry| entry.parent == parent &&
+                manager.as_ref().is_some_and(|catalog| !entry.binding_is_current(catalog))
+            ) {
                 registry.remove(id);
             }
             let retained = registry
@@ -1508,6 +1500,12 @@ impl ToolLoopExecutor {
         policy: Value,
     ) -> futures::future::BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
+            // The initial turn follows live rebindings until it completes. Keep
+            // the exact launch selection and account for later, independent resumes.
+            let launch_provider = child.provider.clone();
+            let launch_model = child.model_selector.clone();
+            let launch_state = launch_provider.binding_snapshot();
+            launch_provider.ensure_current()?;
             let binding = owned_binding(
                 &context,
                 self.conv_id.as_deref().context("Child owner unavailable")?,
@@ -1639,6 +1637,21 @@ impl ToolLoopExecutor {
                         );
                     }
                     if !collect_web_evidence {
+                        if let Some(state) = launch_state {
+                            let mut state = (*state).clone();
+                            state.provider_id = launch_provider.provider.id.clone();
+                            state.model = launch_provider.model.id.clone();
+                            let manager = crate::native_engine::provider_manager::ProviderManager::in_memory(
+                                Vec::new(), context.paths.data_dir.join("providers.json"),
+                            );
+                            manager.binding.install(state)?;
+                            let mut retained = launch_provider;
+                            retained.provider.lease = manager.binding.resolve(None)
+                                .context("Missing retained child provider")?.provider.lease;
+                            child.provider = retained;
+                            child.model_selector = launch_model;
+                            child.provider_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
+                        }
                         // Retain configuration/capabilities, not the last turn's transcript or handles.
                         child.messages.clear();
                         child.messages.shrink_to_fit();

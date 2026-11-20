@@ -300,3 +300,46 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
         json!({"effort":"low","autocompact_percent":70,"extra":true})
     );
 }
+
+#[tokio::test]
+async fn unstamped_worker_adopts_the_authoritative_revision_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().into()).unwrap();
+    let mut owner = Session::open(&cli(&[]), &paths, selection(137), None)
+        .await
+        .unwrap();
+    owner.switch(&paths, selection(4096)).await.unwrap();
+    let worker = Session::open_with_registration(
+        &cli(&["--resume", &owner.id]),
+        &paths,
+        selection(128),
+        Some(&owner.id),
+        crate::local_coordination::RegistrationMode::HostOwned,
+        None,
+    )
+    .await
+    .unwrap();
+    let private = crate::worker_binding::observe_worker(
+        &paths,
+        &owner.store.db,
+        &owner.id,
+        Some(&owner.binding),
+        || anyhow::bail!("No launch credentials available"),
+    )
+    .await
+    .unwrap();
+    assert!(!private.observation_only);
+    assert_eq!(private.active().unwrap().model.max_tokens, Some(4096));
+    assert_eq!(owner.binding_state().generation, 2);
+    assert_eq!(worker.binding_state().generation, 2);
+    assert_eq!(
+        worker.launch_provider().await.unwrap().model.max_tokens,
+        Some(4096)
+    );
+    assert_eq!(
+        binding_store::observe(&owner.store.db, &owner.id)
+            .unwrap()
+            .generation,
+        2
+    );
+}
