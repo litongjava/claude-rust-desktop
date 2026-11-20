@@ -26,6 +26,7 @@ pub enum Phase {
     DeleteIntent,
     TrashRenamed,
     Trashed,
+    BeforeTrashRemoval,
     Removed,
     Retired,
 }
@@ -146,6 +147,18 @@ impl Project {
             }
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+enum QuarantineSource {
+    Stage,
+    Live,
+    Trash,
+}
+#[derive(Serialize, Deserialize)]
+struct Quarantine {
+    source: QuarantineSource,
+    reason: String,
 }
 
 pub(super) struct Intent {
@@ -336,8 +349,21 @@ impl Stores {
         let stage = op.stage(self);
         let live = op.live(self);
         let dir = if stage.try_exists()? { &stage } else { &live };
+        if let Some(meta) = op.metadata.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(meta)?;
+            if let Some(disposition) = value.get("quarantine") {
+                let disposition: Quarantine = serde_json::from_value(disposition.clone())?;
+                return self.finish_quarantine(&op, &disposition);
+            }
+        }
         let recovered_quarantine = self.sessions().join(".quarantine").join(&op.operation);
         if recovered_quarantine.try_exists()? {
+            // A pre-fix interrupted move has no saved source. Cover each
+            // possible source directory before acknowledging the visible name.
+            sync_dir(recovered_quarantine.parent().unwrap())?;
+            sync_dir(&self.sessions())?;
+            sync_dir(&self.sessions().join(".staging"))?;
+            sync_dir(&self.sessions().join(".trash"))?;
             return self.record_quarantine(&op, "interrupted quarantine");
         }
         if op.kind == "delete" {
@@ -372,6 +398,9 @@ impl Stores {
             true
         };
         if unsealed {
+            if dir == &live && live.try_exists()? {
+                return self.quarantine(&op, &live, "Missing or unsealed installed database");
+            }
             // Only discard our private, unsealed stage. Never remove a final
             // directory on the strength of a create intent.
             if stage.try_exists()? {
@@ -396,16 +425,43 @@ impl Stores {
     }
 
     fn quarantine(&self, op: &Intent, dir: &Path, reason: &str) -> Result<()> {
+        let source = if dir == op.stage(self) {
+            QuarantineSource::Stage
+        } else if dir == op.live(self) {
+            QuarantineSource::Live
+        } else {
+            QuarantineSource::Trash
+        };
+        let disposition = Quarantine {
+            source,
+            reason: reason.into(),
+        };
+        self.global().write("journal quarantine", &op.id, true, |tx| {
+            tx.execute("UPDATE lifecycle SET metadata=json_set(COALESCE(metadata,'{}'),'$.quarantine',json(?1)) WHERE operation=?2",
+                params![serde_json::to_string(&disposition)?,op.operation])?;
+            Ok(())
+        })?;
+        self.finish_quarantine(op, &disposition)
+    }
+
+    fn finish_quarantine(&self, op: &Intent, disposition: &Quarantine) -> Result<()> {
+        let source = match disposition.source {
+            QuarantineSource::Stage => op.stage(self),
+            QuarantineSource::Live => op.live(self),
+            QuarantineSource::Trash => self.sessions().join(".trash").join(&op.incarnation),
+        };
         let dest = self.sessions().join(".quarantine").join(&op.operation);
-        if dir.try_exists()? {
-            durable_move(dir, &dest)?;
+        if !dest.try_exists()? {
+            layout::rename(&source, &dest)?;
         }
-        self.record_quarantine(op, reason)
+        sync_dir(dest.parent().unwrap())?;
+        sync_dir(source.parent().unwrap())?;
+        self.record_quarantine(op, &disposition.reason)
     }
 
     fn record_quarantine(&self, op: &Intent, reason: &str) -> Result<()> {
         self.global()
-            .write("quarantine create", &op.id, true, |tx| {
+            .write("record quarantine", &op.id, true, |tx| {
                 tx.execute(
                     "UPDATE lifecycle SET quarantine_reason=?1 WHERE operation=?2",
                     [reason, &op.operation],
@@ -517,7 +573,16 @@ impl Stores {
         let live = op.live(self);
         let trash = self.sessions().join(".trash").join(&op.incarnation);
         let dir = if live.try_exists()? { &live } else { &trash };
-        if dir.try_exists()? {
+        // Once the verified trash is released for unlink, a crash can leave
+        // only some of its files. That authorization never applies to live.
+        let cleanup_authorized = op
+            .metadata
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()?
+            .and_then(|value| value["cleanup_authorized"].as_bool())
+            == Some(true);
+        if (dir == &live || !cleanup_authorized) && dir.try_exists()? {
             let verify = || -> Result<()> {
                 let path = dir.join("session.db");
                 if !path.try_exists()? {
@@ -549,6 +614,14 @@ impl Stores {
         sync_dir(trash.parent().unwrap())?;
         self.step(Phase::Trashed)?;
         if trash.try_exists()? {
+            if !cleanup_authorized {
+                self.global().write("authorize trash cleanup", &op.id, true, |tx| {
+                    tx.execute("UPDATE lifecycle SET metadata=json_set(COALESCE(metadata,'{}'),'$.cleanup_authorized',json('true')) WHERE operation=?1",
+                        [&op.operation])?;
+                    Ok(())
+                })?;
+            }
+            self.step(Phase::BeforeTrashRemoval)?;
             fs::remove_dir_all(&trash)?;
         }
         sync_dir(trash.parent().unwrap())?;
@@ -633,6 +706,19 @@ impl Stores {
 }
 
 fn damaged_shard(error: &anyhow::Error) -> bool {
+    if let Some(rusqlite::Error::SqliteFailure(_, Some(message))) = error.downcast_ref() {
+        if [
+            "no such table:",
+            "no such column:",
+            "foreign key mismatch",
+            "malformed database schema",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+        {
+            return true;
+        }
+    }
     error.is::<layout::InvalidFormat>()
         || matches!(
             error.downcast_ref::<rusqlite::Error>(),
