@@ -1080,6 +1080,20 @@ fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
     );
     let sessions = root.path().join("sessions");
     let legacy_key = "aaaaaaaa-1111-2222-3333-000000000000";
+    let quarantine = sessions.join(".quarantine");
+    let unrelated = quarantine.join(".orphan-inspection");
+    let foreign_scratch = quarantine.join(".orphan-inspection-foreign");
+    let mixed = quarantine.join(".orphan-inspection-mixed");
+    let interrupted = quarantine.join(".orphan-inspection-interrupted");
+    for dir in [&unrelated, &foreign_scratch, &mixed, &interrupted] {
+        fs::create_dir(dir)?;
+    }
+    fs::write(unrelated.join("sentinel"), b"original")?;
+    fs::write(foreign_scratch.join("store-uuid"), legacy_key)?;
+    fs::write(mixed.join("store-uuid"), stores.global().store_uuid())?;
+    fs::write(mixed.join("sentinel"), b"original")?;
+    fs::write(interrupted.join("store-uuid"), stores.global().store_uuid())?;
+    fs::write(interrupted.join("session.db"), b"partial copy")?;
     let paths = [
         sessions.join(legacy_key),
         sessions.join(".staging").join(legacy_key),
@@ -1109,7 +1123,14 @@ fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
             "orphan inspection created sidecars"
         );
     }
-    assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+    assert_eq!(fs::read(unrelated.join("sentinel"))?, b"original");
+    assert_eq!(
+        fs::read(foreign_scratch.join("store-uuid"))?,
+        legacy_key.as_bytes()
+    );
+    assert_eq!(fs::read(mixed.join("sentinel"))?, b"original");
+    assert!(!interrupted.exists());
+    assert_eq!(count(root.path(), "sessions/.quarantine"), 4);
     Ok(())
 }
 

@@ -684,18 +684,22 @@ impl Stores {
                 let meta = fs::symlink_metadata(&wal)?;
                 ensure!(meta.is_file(), "not a regular WAL");
                 if meta.len() > 0 {
-                    let scratch = self.sessions().join(".quarantine/.orphan-inspection");
-                    fs::create_dir(&scratch)?;
-                    let result = (|| -> Result<()> {
-                        let copy = scratch.join("session.db");
-                        fs::copy(&path, &copy)?;
-                        fs::copy(wal, scratch.join("session.db-wal"))?;
-                        let conn = layout::open(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                        layout::verify(&conn, SESSION)?;
-                        identity(&conn)
-                    })();
-                    fs::remove_dir_all(scratch)?;
-                    return result;
+                    let scratch = tempfile::Builder::new()
+                        .prefix(INSPECTION_PREFIX)
+                        .tempdir_in(self.sessions().join(".quarantine"))?;
+                    let owner = scratch.path().join("store-uuid");
+                    fs::write(&owner, &self.global().uuid)?;
+                    fs::File::options().write(true).open(owner)?.sync_all()?;
+                    sync_dir(scratch.path())?;
+                    let copy = scratch.path().join("session.db");
+                    fs::copy(&path, &copy)?;
+                    fs::copy(wal, scratch.path().join("session.db-wal"))?;
+                    let conn = layout::open(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                    layout::verify(&conn, SESSION)?;
+                    identity(&conn)?;
+                    drop(conn);
+                    scratch.close()?;
+                    return Ok(());
                 }
             }
             // An immutable probe never creates sidecars in a foreign directory.
@@ -732,15 +736,29 @@ impl Stores {
     fn quarantine_orphans(&self) -> Result<()> {
         let _sweep =
             layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
+        let quarantine = self.sessions().join(".quarantine");
         // The sweep lock also serializes cleanup after a killed WAL inspection.
-        let scratch = self.sessions().join(".quarantine/.orphan-inspection");
-        if scratch.try_exists()? {
-            fs::remove_dir_all(scratch)?;
+        let mut has_quarantine = false;
+        for entry in fs::read_dir(&quarantine)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(INSPECTION_PREFIX)
+            {
+                if entry.file_type()?.is_dir()
+                    && owned_inspection(&entry.path(), &self.global().uuid)?
+                {
+                    fs::remove_dir_all(entry.path())?;
+                    continue;
+                }
+                tracing::warn!(path = %entry.path().display(), "Leaving unverified inspection directory in place");
+            }
+            has_quarantine = true;
         }
         // Unjournaled orphans have no G intent to drive replay after rename.
         // A surviving destination can come from either the live or staging parent.
-        let quarantine = self.sessions().join(".quarantine");
-        if fs::read_dir(&quarantine)?.next().transpose()?.is_some() {
+        if has_quarantine {
             sync_dir(&quarantine)?;
             sync_dir(&self.sessions())?;
             sync_dir(&self.sessions().join(".staging"))?;
@@ -791,6 +809,29 @@ impl Stores {
         }
         Ok(())
     }
+}
+
+const INSPECTION_PREFIX: &str = ".orphan-inspection-";
+
+fn owned_inspection(dir: &Path, store: &str) -> Result<bool> {
+    let marker = dir.join("store-uuid");
+    if !fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file() && m.len() == store.len() as u64)
+        || !fs::read(marker).is_ok_and(|contents| contents == store.as_bytes())
+    {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || !matches!(
+                entry.file_name().to_str(),
+                Some("store-uuid" | "session.db" | "session.db-wal" | "session.db-shm")
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn damaged_shard(error: &anyhow::Error) -> bool {
