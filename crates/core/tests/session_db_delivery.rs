@@ -645,3 +645,53 @@ fn private_child_never_resumes_in_a_reused_parents_workspace() -> Result<()> {
     assert!(grandchild.workspace().is_err());
     Ok(())
 }
+
+#[test]
+fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result<()> {
+    let root = tempdir()?;
+    let store = uuid::Uuid::new_v4().to_string();
+    let inc = uuid::Uuid::new_v4().to_string();
+    let seal = uuid::Uuid::new_v4().to_string();
+    let sessions = root.path().join("sessions");
+    for dir in [".staging", ".trash", ".quarantine", A] {
+        fs::create_dir_all(sessions.join(dir))?
+    }
+    let locks = root.path().join("session-locks");
+    fs::create_dir(&locks)?;
+    for name in [".directory", ".orphan-sweep", A] {
+        fs::write(locks.join(name), [])?
+    }
+    // Accepted P1's final bootstrap ticket, left after renaming G and before
+    // publishing the namespace marker.
+    fs::write(root.path().join(".session-bootstrap"), [])?;
+    let staged = root.path().join(".global-staging");
+    fs::create_dir(&staged)?;
+    fs::write(staged.join("store-uuid"), &store)?;
+    {
+        let g = Connection::open(root.path().join("global.db"))?;
+        g.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA application_id=0x44434c47; PRAGMA user_version=1",
+        )?;
+        g.execute_batch(include_str!("../src/db/session_store/global.sql"))?;
+        g.execute("INSERT INTO store_identity VALUES(1,?1)", [&store])?;
+        g.execute("INSERT INTO conversations(id,storage_key,incarnation,workspace_mode,created_at,updated_at,message_count,content_revision,transcript_bytes) VALUES(?1,?1,?2,'chat','now','now',1,1,3)",[A,&inc])?;
+        let s = Connection::open(sessions.join(A).join("session.db"))?;
+        s.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA application_id=0x44434c53; PRAGMA user_version=1",
+        )?;
+        s.execute_batch(include_str!("../src/db/session_store/session.sql"))?;
+        s.execute(
+            "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,'now','now',1,1,NULL)",
+            [&store, A, &inc, &seal],
+        )?;
+        s.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES('m',?1,'user','old','now',0)",[A])?;
+    }
+    let stores = Stores::open_for_test(root.path())?;
+    let a = stores.open_session(A)?;
+    assert_eq!(a.address().incarnation, inc);
+    assert_eq!(a.read(|r| r.messages())?[0].content, "old");
+    a.save_mcp("new", &wire(), false)?;
+    assert_eq!(a.read(|r| r.projection())?.revision, 2);
+    assert_eq!(fs::read_to_string(locks.join(".initialized"))?, store);
+    Ok(())
+}

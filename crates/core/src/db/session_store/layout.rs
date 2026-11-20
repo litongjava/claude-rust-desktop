@@ -210,7 +210,7 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
             ("conversation_worktree_backends", "conversation_id backend metadata"),
             ("conversation_worktrees", "conversation_id project_id source_path repo_path path branch"),
             ("legacy_session_imports", "id digest project_id incarnation"),
-("import_members","storage_key batch operation digest abort_reason"),
+            ("import_members", "storage_key batch operation digest abort_reason"),
             ("session_inbox", "id sender recipient project_source payload size created_at state generation read blocked_reason committed_at"),
             ("session_inbox_consumers", "session_id generation"),
             ("session_inbox_operations", "sender operation_id message_id"),
@@ -221,16 +221,16 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
         &[
             ("attachments", "id message_id file_name file_type mime_type file_size source"),
             ("code_diffs", "id conversation_id message_id file_path original_content modified_content diff_text status applied_at created_at"),
-            ("delivery_generations","delivery_id turn_id"),
-("child_invocations","attempt_key parent_message child_incarnation invocation"),
-("delivery_receipts", "delivery_id digest effect_id kind"),
+            ("delivery_generations", "delivery_id turn_id"),
+            ("child_invocations", "attempt_key parent_message child_incarnation invocation"),
+            ("delivery_receipts", "delivery_id digest effect_id kind"),
             ("execution_turns", "id conversation_id source_turn_id started_at ended_at elapsed_ms status"),
             ("mcp_tool_outputs", "conversation_id tool_use_id content_json metadata_json display_text is_error"),
             ("message_trajectory", "message_id requests_json"),
             ("message_turns", "message_id turn_id"),
             ("model_requests", "id message_id conversation_id request_number provider_id model response_model api_format status started_at_ms first_token_at_ms ended_at_ms total_duration_ms ttft_ms generation_ms throughput_tokens_per_second input_tokens output_tokens reasoning_tokens content_tokens total_tokens cache_read_tokens cache_write_tokens max_output_tokens effort finish_reason response_id timing_source error response_blocks_json usage_json"),
             ("native_boundaries", "message_id value"),
-            ("compaction_state","singleton local_count"),
+            ("compaction_state", "singleton local_count"),
             ("permission_approvals", "id conversation_id message_id tool_name action risk_level status user_decision decision_reason created_at decided_at"),
             ("request_blobs", "hash body"),
             ("session_agents", "conversation_id definition"),
@@ -424,7 +424,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             // Replay both sides of the move, even when global.db already exists.
             sync_dir(root)?;
             sync_dir(&stage)?;
-            let uuid = read_global_uuid(&path)?;
+            let uuid = read_global_uuid(&path, is_v1(&path, GLOBAL)?)?;
             if !marker.try_exists()? {
                 ensure!(
                     fs::read_to_string(stage.join("store-uuid"))? == uuid,
@@ -465,7 +465,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             upgrade(&path, GLOBAL)?;
         }
     }
-    let uuid = read_global_uuid(&path)?;
+    let uuid = read_global_uuid(&path, false)?;
     ensure!(
         fs::read_to_string(&marker)? == uuid,
         "Global store UUID changed"
@@ -473,9 +473,9 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
     Ok(uuid)
 }
 
-fn read_global_uuid(path: &Path) -> Result<String> {
+fn read_global_uuid(path: &Path, bootstrap_v1: bool) -> Result<String> {
     let conn = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    verify(&conn, GLOBAL)?;
+    verify_version(&conn, GLOBAL, if bootstrap_v1 { 1 } else { GLOBAL_VERSION })?;
     integrity(&conn)?;
     let store: String = conn.query_row(
         "SELECT store_uuid FROM store_identity WHERE singleton=1",
