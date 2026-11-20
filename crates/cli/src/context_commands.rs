@@ -128,8 +128,17 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
     let system = deepseek_code_core::prompt::compose_system_prompt_in(None, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
     let mut history = session.store.model_history(&session.id, &deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic)?;
     // The engine puts instructions at the start of the first user message.
-    if let Some(reminder) = deepseek_code_core::project_instructions::load_all(Some(&session.paths.data_dir), &session.workspace).ok().and_then(|all| deepseek_code_core::project_instructions::reminder(&all)) {
-        history.insert(0, serde_json::json!({"role": "user", "content": reminder}));
+    let reminders = deepseek_code_core::project_instructions::load_all(
+        Some(&session.paths.data_dir),
+        &session.workspace,
+    )
+    .map(|all| deepseek_code_core::project_instructions::reminders(&all))
+    .unwrap_or_default();
+    if !reminders.is_empty() {
+        history.insert(
+            0,
+            serde_json::json!({"role": "user", "content": reminders.join("\n\n")}),
+        );
     }
     let body = serde_json::json!({"system": system, "messages": history, "tools": deepseek_code_core::tools::get_tool_definitions(), "max_tokens": 0});
     let window = window.and_then(|window| u32::try_from(window).ok());

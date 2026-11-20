@@ -6972,6 +6972,10 @@ impl ToolLoopExecutor {
 
     fn build_openai_messages(&self) -> Result<Vec<OpenAIMessage>> {
         let additions = self.message_additions();
+        // Responses accepts content arrays for user messages, so the stable
+        // instruction blocks stay separate for caching. Chat Completions keeps
+        // one string because several compatible servers reject arrays there.
+        let separate_parts = super::provider_runtime::responses_api(&self.provider);
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.prepare_history_tool_outputs(&mut messages);
         Ok(messages
@@ -7016,9 +7020,26 @@ impl ToolLoopExecutor {
                 let openai_content = if before.is_empty() && after.is_empty() {
                     openai_content
                 } else {
-                    // Plain-string content stays a string: some compatible servers
-                    // accept only strings for user messages.
                     match openai_content {
+                        // Responses keeps each instruction block, the user's text
+                        // and each turn-context block as its own part.
+                        OpenAIContent::Text(text) if separate_parts => {
+                            let part = |text: &String| {
+                                crate::native_engine::openai_client::OpenAIContentPart::Text {
+                                    text: text.clone(),
+                                }
+                            };
+                            OpenAIContent::Multi(
+                                before
+                                    .iter()
+                                    .map(part)
+                                    .chain([part(&text)])
+                                    .chain(after.iter().map(part))
+                                    .collect(),
+                            )
+                        }
+                        // Plain-string content stays a string: some compatible
+                        // servers accept only strings for user messages.
                         OpenAIContent::Text(text) => OpenAIContent::Text(
                             before
                                 .iter()
