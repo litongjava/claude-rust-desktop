@@ -1032,7 +1032,7 @@ async fn compact_context_is_offered_in_a_worker_terminal_session() {
                     // request that may use CompactContext.
                     let (delta, reason) = if step == 0 {
                         (
-                            json!({"tool_calls":[{"index":0,"id":"search-compact","type":"function","function":{"name":"ToolSearch","arguments":json!({"query":"compact summarize session memory"}).to_string()}}]}),
+                            json!({"tool_calls":[{"index":0,"id":"search-compact","type":"function","function":{"name":"ToolLoad","arguments":json!({"names":["CompactContext"]}).to_string()}}]}),
                             "tool_calls",
                         )
                     } else {

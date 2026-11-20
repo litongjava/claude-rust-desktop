@@ -571,8 +571,9 @@ impl ToolLoopExecutor {
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;
         }
-        entry.executor.messages =
-            sessions.model_history(id, &entry.executor.provider.provider.api_format)?;
+        (entry.executor.messages, entry.executor.context_boundary_id) = sessions
+            .model_history_with_boundary(id, &entry.executor.provider.provider.api_format)?;
+        entry.executor.applied_compaction = entry.executor.context_boundary_id.is_some();
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
@@ -1244,6 +1245,7 @@ impl ToolLoopExecutor {
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
         .with_context_reminders(self.context_reminders.clone())
+        .with_transcript_db(context.db.clone())
         .with_conv_id(id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())
@@ -1533,9 +1535,8 @@ impl ToolLoopExecutor {
             let collect_web_evidence = child.response_schema.is_some();
             let mut transcript =
                 child_transcript::ChildTranscript::new(state, receiver, collect_web_evidence)?;
-            // The child's managed shells use the same data root the tool loop
-            // scopes `background_shell` with: the parent directory of the search
-            // config path.
+            // The tool loop scopes the child's shells and monitors to the
+            // data root, the parent directory of the search config path.
             let cleanup_root = self
                 .search_config_path
                 .as_deref()
@@ -1548,7 +1549,7 @@ impl ToolLoopExecutor {
             execution.spawn(async move {
                 // The cleanup guard lives inside the child's own task. An abort
                 // therefore drops it only after this future stopped publishing
-                // tasks, so a shell started late cannot slip past the sweep.
+                // tasks, so work started late cannot slip past the sweep.
                 let mut cleanup = ChildSessionTasks::new(cleanup_root, child_id);
                 let result = child.execute().await;
                 let stop = cleanup.stop().await;
@@ -1758,7 +1759,7 @@ fn stop_summary(stop: &SessionStop) -> String {
     lines.join("\n")
 }
 
-/// Stops the managed shell tasks a delegated child left running when it ends.
+/// Stops the managed shells and monitors a delegated child left running.
 ///
 /// It lives inside the child's own execution task: a normal end waits for the
 /// final status of every requested stop, while an abort or panic only requests
@@ -1788,7 +1789,7 @@ impl ChildSessionTasks {
                 .unwrap_or_else(|error| self.scan_failure(&error))
             }
             // Without a data root the tool loop gives `background_shell` no
-            // session either, so the child could not start a managed shell.
+            // session either, so the child could not start an owned task.
             None => SessionStop::default(),
         };
         self.outcome = Some(outcome.clone());
@@ -1815,7 +1816,7 @@ impl ChildSessionTasks {
     /// A failed scan is reported, not turned into "nothing to stop".
     fn scan_failure(&self, error: &anyhow::Error) -> SessionStop {
         tracing::warn!(
-            "Could not stop the background shell tasks of subagent {}: {error:#}",
+            "Could not stop the background tasks of subagent {}: {error:#}",
             self.session
         );
         SessionStop {

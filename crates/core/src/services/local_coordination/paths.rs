@@ -1219,7 +1219,7 @@ mod tests {
     fn coordination_paths_ignore_data_dir() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path().join("home");
-        let cwd_a = temp.path().join("cwd-a");
+        let cwd_a = temp.path().join("nested/cwd-a");
         let cwd_b = temp.path().join("cwd-b");
         for dir in [&home, &cwd_a, &cwd_b] {
             fs::create_dir_all(dir)?;
@@ -1318,9 +1318,16 @@ mod tests {
             CoordinationPaths::resolve(None, Some(OsStr::new("")), Some(&home), &cwd_a).is_err()
         );
         assert!(CoordinationPaths::resolve(None, None, None, &cwd_a).is_err());
+        let mut above_root = PathBuf::new();
+        for _ in 0..=cwd_a
+            .components()
+            .filter(|part| matches!(part, Component::Normal(_)))
+            .count()
+        {
+            above_root.push("..");
+        }
         assert!(
-            CoordinationPaths::resolve(None, Some(OsStr::new("../../../..")), None, &cwd_a)
-                .is_err()
+            CoordinationPaths::resolve(None, Some(above_root.as_os_str()), None, &cwd_a).is_err()
         );
         Ok(())
     }

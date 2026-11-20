@@ -1,6 +1,6 @@
 use crate::native_engine::provider_manager::ResolvedProvider;
 use crate::tools::ToolDefinition;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -251,31 +251,54 @@ impl OpenAIClient {
             let mut usage = None;
             let mut finish = None;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                let data = chunk.trim().strip_prefix("data: ").unwrap_or("");
-                if data == "[DONE]" { continue; }
-                let value: Value = serde_json::from_str(data)?;
-                let choice = &value["choices"][0];
-                if let Some(part) = choice["delta"]["content"].as_str() { text.push_str(part); }
-                if let Some(part) = choice["delta"]["reasoning_content"].as_str() { thinking.push_str(part); }
-                if let Some(items) = choice["delta"]["tool_calls"].as_array() {
-                    for item in items {
-                        let index = item["index"].as_u64().unwrap_or_default() as usize;
-                        let call = calls.entry(index).or_insert_with(|| json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
-                        if let Some(id) = item["id"].as_str() { call["id"] = json!(id); }
-                        for field in ["name", "arguments"] {
-                            if let Some(delta) = item["function"][field].as_str() {
-                                call["function"][field] = json!(format!("{}{}", call["function"][field].as_str().unwrap_or_default(), delta));
+                // The stream retry gate can release several complete normalized frames together.
+                let frames = crate::streaming::sse_parser::consume_sse_payloads(&chunk?);
+                anyhow::ensure!(
+                    frames.remainder.trim().is_empty(),
+                    "Incomplete normalized provider SSE frame"
+                );
+                for data in frames.payloads {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(&data)
+                        .context("Invalid normalized provider SSE JSON")?;
+                    let choice = &value["choices"][0];
+                    if let Some(part) = choice["delta"]["content"].as_str() {
+                        text.push_str(part);
+                    }
+                    if let Some(part) = choice["delta"]["reasoning_content"].as_str() {
+                        thinking.push_str(part);
+                    }
+                    if let Some(items) = choice["delta"]["tool_calls"].as_array() {
+                        for item in items {
+                            let index = item["index"].as_u64().unwrap_or_default() as usize;
+                            let call = calls.entry(index).or_insert_with(|| json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
+                            if let Some(id) = item["id"].as_str() {
+                                call["id"] = json!(id);
+                            }
+                            for field in ["name", "arguments"] {
+                                if let Some(delta) = item["function"][field].as_str() {
+                                    call["function"][field] = json!(format!(
+                                        "{}{}",
+                                        call["function"][field].as_str().unwrap_or_default(),
+                                        delta
+                                    ));
+                                }
                             }
                         }
                     }
-                }
-                if let Some(reason) = choice["finish_reason"].as_str() { finish = Some(reason.to_string()); }
-                if value.get("provider_content").is_some() { native = Some(value["provider_content"].clone()); }
-                // Streaming providers may omit usage or send null until final accounting.
-                // Keep the last reported usage when a later chunk has no accounting.
-                if let Some(reported) = value.get("usage").filter(|usage| !usage.is_null()) {
-                    usage = Some(serde_json::from_value(reported.clone())?);
+                    if let Some(reason) = choice["finish_reason"].as_str() {
+                        finish = Some(reason.to_string());
+                    }
+                    if value.get("provider_content").is_some() {
+                        native = Some(value["provider_content"].clone());
+                    }
+                    // Streaming providers may omit usage or send null until final accounting.
+                    // Keep the last reported usage when a later chunk has no accounting.
+                    if let Some(reported) = value.get("usage").filter(|usage| !usage.is_null()) {
+                        usage = Some(serde_json::from_value(reported.clone())?);
+                    }
                 }
             }
             return Ok(OpenAIResponse { id: uuid::Uuid::new_v4().to_string(), object: "chat.completion".into(), created: 0, model: provider.model.id.clone(),

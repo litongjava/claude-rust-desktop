@@ -559,6 +559,46 @@ async fn data_dir_skill_is_listed_for_the_model_and_invoked_with_an_empty_claude
 }
 
 #[test]
+fn skills_list_and_help_expose_the_embedded_task_template() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
+            .current_dir(temp.path())
+            .args(["--data-dir", data.to_str().unwrap(), "skills"])
+            .args(args)
+            .env_remove("DEEPSEEK_CODE_DATA_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let skills: Vec<Value> = serde_json::from_str(&run(&["list"])).unwrap();
+    let matching: Vec<_> = skills
+        .iter()
+        .filter(|skill| skill["name"] == "task-template")
+        .collect();
+    assert_eq!(matching.len(), 1);
+    let skill = matching[0];
+    assert_eq!(skill["source"], "bundled");
+    assert_eq!(skill["enabled"], true);
+    assert_eq!(skill["files"][0]["name"], "SKILL.md");
+    let help = run(&["help", "task-template"]);
+    assert_eq!(
+        help.trim_end(),
+        skill["content"].as_str().unwrap().trim_end()
+    );
+    assert!(help.contains("name: task-template"));
+    assert!(help.contains("requirement → evidence → unverified"));
+    assert!(!data.join("skills/bundled/task-template").exists());
+}
+
+#[test]
 fn skills_list_migrates_the_pristine_placeholder_and_lists_one_skill_creator() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");

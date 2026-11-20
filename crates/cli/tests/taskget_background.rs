@@ -75,7 +75,7 @@ async fn respond(
         "TaskOutput is still advertised: {tools:?}"
     );
     // TaskGet is deferred: absent from the default request, loaded by the
-    // ToolSearch call at step 1, and carried from step 2 on.
+    // ToolLoad call at step 1, and carried from step 2 on.
     if index == 0 {
         assert!(
             !tools.contains(&"TaskGet".to_owned()),
@@ -85,7 +85,7 @@ async fn respond(
     if index >= 2 {
         assert!(
             tools.contains(&"TaskGet".to_owned()),
-            "TaskGet missing after ToolSearch: {tools:?}"
+            "TaskGet missing after ToolLoad: {tools:?}"
         );
     }
     let frames = match index {
@@ -106,15 +106,11 @@ async fn respond(
                 result["task_id"].as_str().is_some(),
                 "Bash task_id missing: {result}"
             );
-            tool_call_frame(
-                "call-search",
-                "ToolSearch",
-                &json!({"query":"select:TaskGet"}),
-            )
+            tool_call_frame("call-search", "ToolLoad", &json!({"names":["TaskGet"]}))
         }
         2 => {
             let loaded = last_tool_result(&body)
-                .unwrap_or_else(|| panic!("ToolSearch result missing in request {body}"));
+                .unwrap_or_else(|| panic!("ToolLoad result missing in request {body}"));
             assert_eq!(loaded["loaded_tools"], json!(["TaskGet"]), "{loaded}");
             let started = fixture.bash_result.lock().unwrap().clone().expect("Bash result");
             let task_id = started["task_id"].as_str().expect("Bash task_id");

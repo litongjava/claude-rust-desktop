@@ -18,6 +18,9 @@ mod search;
 pub mod tasks;
 pub mod toolscript;
 
+pub const TOOL_LOAD_NAME: &str = "ToolLoad";
+const MAX_TOOL_LOAD_NAMES: usize = 64;
+
 /// Whether a plugin language server declaration is usable by the LSP tool.
 pub fn lsp_config_is_valid(server: &serde_json::Value) -> bool {
     lsp::validate_configuration(server).is_ok()
@@ -32,6 +35,7 @@ pub use lsp::{
 pub mod agent_messages;
 mod content_compat;
 pub mod coordination;
+pub(crate) mod context_search;
 pub mod cron_jobs;
 mod findings;
 pub mod linux_env;
@@ -55,6 +59,7 @@ pub mod file_change;
 pub(crate) mod github;
 pub(crate) mod image_generation;
 pub mod monitor;
+mod monitor_completion;
 pub(crate) mod output_page;
 pub(crate) mod path_scope;
 pub(crate) mod provider_search;
@@ -69,6 +74,7 @@ pub(crate) mod pty_supervisor;
 pub(crate) mod pty_transport;
 mod shell_discovery;
 pub(crate) mod shell_input;
+mod shell_tool_description;
 mod web;
 pub use provider_search::search as search_provider;
 
@@ -136,6 +142,7 @@ pub struct ToolDefinition {
 }
 
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
+    let bash_tool = shell_tool_description::bash_tool();
     let mut defs = vec![
         image_generation::definition(),
         ToolDefinition { name: "Skill".into(), description: "Invoke a skill.\n\nA skill is a packaged set of instructions the user or project has set up for a particular kind of task (deploy steps, a review checklist, a repo-specific workflow). Available skills are listed in the system prompt with one-line descriptions. When the task at hand is one a listed skill covers, call this tool first — the skill's instructions load into the turn for you to follow in place of your default approach; skills with context:fork instead run in an isolated child conversation and return the finished result. Users may also ask for one by name (`/<name>`, or \"slash command\"); that's a request to invoke it.\n\n- `skill`: exact name from the listing, no leading slash. Plugin skills use `plugin:skill`.\n- `args`: optional arguments to pass through.\n\nOnly names from the listing (or that the user typed explicitly) are valid. Built-in CLI commands (`/help`, `/clear`, …) aren't skills. Do not read a skill file to bypass this tool: dynamic shell context and fork isolation run through it.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"The name of a skill from the available-skills list. Do not guess names.","type":"string"},"args":{"description":"Optional arguments for the skill","type":"string"}},"required":["skill"],"additionalProperties":false}) },
@@ -147,7 +154,25 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         // `cron` stays dispatchable for older transcripts; the model sees the reference trio.
         crate::services::goal_proposals::definition(),
         crate::services::compaction_requests::definition(),
-        ToolDefinition { name: "ToolSearch".into(), description: "Load built-in tools that are not in this request yet. A successful search returns their real definitions with schemas and marks them loaded, so they can be called from the next model request on. Select complete tool names separated by commas or whitespace, e.g. `WebSearch WebFetch` or `WebSearch,WebFetch`; `select:Name1,Name2` (also accepting whitespace) explicitly selects exact names. Otherwise keywords are matched against tool names and descriptions; when no tool matches all of them, a tool matching most of them (one naming the tool) is loaded. Tools that commonly load on demand include listing directories (ListDir), multiple edits (MultiEdit), web access (WebFetch, WebSearch), LSP helpers, subagents (Agent, SendMessage), Workflow, long-term memory, scheduled jobs and desktop control. The runtime tool directory in the system prompt lists every built-in this request can load; only those listed there can be loaded. Searching costs nothing and grants no permission: the tool still goes through the usual approval and scope checks. MCP tools listed as available on demand load the same way.".into(), input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Complete tool names separated by commas or whitespace, or keywords describing what you need"}},"required":["query"]}) },
+        context_search::definition(),
+        ToolDefinition {
+            name: TOOL_LOAD_NAME.into(),
+            description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the system prompt and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "description": "Exact names of deferred tools to load, in order",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": MAX_TOOL_LOAD_NAMES
+                    }
+                },
+                "required": ["names"],
+                "additionalProperties": false
+            }),
+        },
         ToolDefinition {
             name: "PluginRun".into(),
             description: "Execute an installed, enabled plugin command with OS user permissions. Requires execution approval.".into(),
@@ -185,9 +210,9 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Bash".to_string(),
-            description: "Executes a shell command and returns its output.\n\nThe shell defaults to shell.toolDefault in settings.json (bash / Git Bash on Windows when unset): use Unix shell syntax there — `/dev/null` not `NUL`, forward slashes, `$VAR` not `%VAR%` or `$env:VAR`. Pass `shell` (powershell, pwsh, cmd, sh, zsh, fish, wsl) to use another shell's syntax; PowerShell input/output is UTF-8.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolSearch and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
+            description: format!("Executes a shell command and returns its output.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolLoad (names: [\"TaskGet\"]) and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
 - When a call finishes it cleans up the command's whole process tree, including children the command started. A service that must outlive the call (a local server, a daemon) needs `detach: true`, which starts it outside that tree and returns its pid and log files.
-- With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. `pipeline_sigpipe: true` means the output was only cut short by a reader such as `head`.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.".to_string(),
+- With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. When a later command such as `head` closes the pipe early, the result says the output ended early.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.{}", bash_tool.description_suffix()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -200,7 +225,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "cols": { "description": "Initial PTY columns (pty only).", "type": "integer", "minimum": 1, "maximum": 1000, "default": 80 },
                     "detach": { "description": "Start an unmanaged service that must outlive this call, such as a local server or daemon. The command is not waited for and is not added to the process tree that a normal call cleans up, so it keeps running after this call, using `detach` with `run_in_background` or `timeout` is an error. Use it only when the process must survive; otherwise run the command normally or use `run_in_background`.", "type": "boolean" },
                     "dangerouslyDisableSandbox": { "description": "Set this to true to dangerously override sandbox mode and run commands without sandboxing.", "type": "boolean" },
-                    "shell": { "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh, wsl (explicit configured WSL distribution; default: shell.toolDefault, otherwise bash)", "type": "string" }
+                    "shell": { "description": bash_tool.shell_parameter(), "type": "string" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -208,14 +233,15 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Monitor".to_string(),
-            description: "Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor stops after timeout_ms (default 1800000 = 30 min, max 3600000); you are notified when it exits, expires or is stopped, and can start it again. More than 30 events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.".to_string(),
+            description: format!("Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor expires after timeout_ms (default 30 min, max 60 min). Set max_runtime_ms to keep watching the same live script for another timeout_ms at each deadline, up to that total runtime. A renewal can send one notification, with at most one renewal notice per minute. You are notified when the monitor exits, expires or is stopped. More than 30 output events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.{}", bash_tool.description_suffix()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "description": "The shell script to run in the background", "type": "string" },
                     "description": { "description": "Short description shown in notifications", "type": "string" },
-                    "timeout_ms": { "description": "How long the monitor runs, in milliseconds", "type": "integer", "minimum": 1000, "maximum": 3600000, "default": 1800000 },
-                    "shell": { "description": "Shell to use: bash, zsh, fish, sh, cmd, powershell, pwsh, wsl (explicit configured WSL distribution; default: shell.toolDefault, otherwise bash)", "type": "string" }
+                    "timeout_ms": { "description": "Length of one watch interval, in milliseconds", "type": "integer", "minimum": 1000, "maximum": monitor::MAX_TIMEOUT.as_millis() as u64, "default": monitor::DEFAULT_TIMEOUT.as_millis() as u64 },
+                    "max_runtime_ms": { "description": "Optional total watch time in milliseconds. Must exceed timeout_ms and is capped at 24 hours. Providing it enables auto-renewal while the script is alive.", "type": "integer", "minimum": 1001, "maximum": monitor::MAX_RUNTIME.as_millis() as u64 },
+                    "shell": { "description": bash_tool.shell_parameter(), "type": "string" }
                 },
                 "required": ["command", "description"],
                 "additionalProperties": false
@@ -440,7 +466,7 @@ macro_rules! tool_dispatch {
             "plan_mode" => Err(anyhow::anyhow!("Unknown tool: plan_mode")),
             "cron" => scheduled::execute($input, $cwd),
             "Config" | "brief" | "SyntheticOutput" => content_compat::execute($name, &$input, $cwd),
-            "ToolSearch" => tool_search($input),
+            TOOL_LOAD_NAME => tool_load($input),
             "ReportFindings" => findings::execute(&$input),
             "TaskCreate" | "TaskGet" | "TaskList" | "TaskUpdate" | "TaskOutput" | "TaskStop" | "TaskInput" | "TodoWrite" | "TodoRead" => tasks::execute($name, $input, $cwd),
             "Read" => read::execute($input, $cwd),
@@ -527,26 +553,51 @@ pub async fn execute_tool_async(
     )
 }
 
-/// The host-level fallback: it only lists definitions and has no session, so it
-/// cannot load anything. `success` stays false so a stored result can never be
-/// read back as a load.
-fn tool_search(input: serde_json::Value) -> Result<serde_json::Value> {
-    let query = input["query"]
-        .as_str()
-        .ok_or_else(|| anyhow!("query is required"))?
-        .to_lowercase();
-    let tools: Vec<_> = get_tool_definitions()
-        .into_iter()
-        .filter(|tool| {
-            tool.name.to_lowercase().contains(&query)
-                || tool.description.to_lowercase().contains(&query)
+pub(crate) fn tool_load_names(input: &serde_json::Value) -> Result<Vec<&str>> {
+    let names = input
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("names"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow!("ToolLoad requires an object with a names array of exact tool names.")
+        })?;
+    anyhow::ensure!(
+        (1..=MAX_TOOL_LOAD_NAMES).contains(&names.len()),
+        "ToolLoad requires between 1 and {MAX_TOOL_LOAD_NAMES} names."
+    );
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow!("ToolLoad name {} must be a non-empty string.", index + 1))
         })
-        .collect();
+        .collect()
+}
+
+/// The host-level fallback resolves definitions without marking them loaded.
+/// Only the session engine can grant a definition to its next request.
+fn tool_load(input: serde_json::Value) -> Result<serde_json::Value> {
+    let names = tool_load_names(&input)?;
+    let catalog = get_tool_definitions();
+    let mut tools = Vec::new();
+    let mut unknown = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in names.into_iter().filter(|name| seen.insert(*name)) {
+        match catalog.iter().find(|tool| tool.name == name) {
+            Some(tool) => tools.push(tool),
+            None => unknown.push(name),
+        }
+    }
+    anyhow::ensure!(unknown.is_empty(), "Unknown tools: {}.", unknown.join(", "));
     Ok(serde_json::json!({
         "success": false,
         "loaded_tools": [],
         "tools": tools,
-        "content": "This host entry only lists definitions; a session loads tools through its own engine.",
+        "content": "A session is required to load definitions into a model request.",
     }))
 }
 
@@ -1079,13 +1130,24 @@ fn monitor_input(mut input: serde_json::Value) -> Result<serde_json::Value> {
     if input.get("detach").and_then(serde_json::Value::as_bool) == Some(true) {
         anyhow::bail!("Monitor does not accept detach: it already runs in the background");
     }
+    let max_timeout_ms = monitor::MAX_TIMEOUT.as_millis() as u64;
     let timeout_ms = match input.get("timeout_ms").filter(|value| !value.is_null()) {
         Some(value) => value
             .as_u64()
-            .filter(|ms| (1_000..=3_600_000).contains(ms))
+            .filter(|ms| (1_000..=max_timeout_ms).contains(ms))
             .ok_or_else(|| anyhow!("Monitor timeout_ms must be between 1000 and 3600000"))?,
-        None => 1_800_000,
+        None => monitor::DEFAULT_TIMEOUT.as_millis() as u64,
     };
+    let max_runtime_ms = input.get("max_runtime_ms").filter(|value| !value.is_null());
+    if let Some(value) = max_runtime_ms {
+        let limit = monitor::MAX_RUNTIME.as_millis() as u64;
+        anyhow::ensure!(
+            value
+                .as_u64()
+                .is_some_and(|ms| ms > timeout_ms && ms <= limit),
+            "Monitor max_runtime_ms must be an integer greater than timeout_ms and at most {limit}"
+        );
+    }
     input["run_in_background"] = serde_json::json!(true);
     input["__monitor_timeout_ms"] = serde_json::json!(timeout_ms);
     Ok(input)
@@ -1163,6 +1225,22 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     let flag = resolved.command_flag.to_string();
 
     let actual_shell = shell_type;
+    // The result names the request next to the executable that actually ran, so
+    // the model renderer can report a silent fallback (for example pwsh being
+    // served by powershell.exe) without exposing the path on every call.
+    let requested_shell = input["shell"].as_str().map(str::to_owned);
+    // A managed shell records this in the task, so a later TaskGet can compare
+    // it with `shell_path` and report the same fallback.
+    let display_shell = requested_shell.as_deref().unwrap_or(actual_shell);
+    let annotate = |mut result: serde_json::Value| {
+        result["shell_path"] = serde_json::json!(shell);
+        if result.get("shell").is_some() {
+            if let Some(requested) = &requested_shell {
+                result["shell"] = serde_json::json!(requested);
+            }
+        }
+        result
+    };
     if resolved.wsl.is_some()
         && input
             .get("__sandbox")
@@ -1350,9 +1428,8 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         .to_owned();
     #[cfg(any(target_os = "linux", windows))]
     if let Some((rows, cols)) = pty_size {
-        let mut result = pty_bash::start(cmd, rows, cols, &description, &command)?;
-        result["shell_path"] = serde_json::json!(shell);
-        return Ok(result);
+        let result = pty_bash::start(cmd, rows, cols, &description, &command)?;
+        return Ok(annotate(result));
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     let _ = pty_size;
@@ -1360,56 +1437,56 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         let directory = crate::runtime::resolve_default_data_dir()?
             .join("detached-shells")
             .join(uuid::Uuid::new_v4().to_string());
-        let mut result = bash_process::start_detached(cmd, &directory, actual_shell)?;
+        let mut result = bash_process::start_detached(cmd, &directory, display_shell)?;
         std::fs::write(directory.join("command.txt"), command.as_bytes())?;
         result["directory"] = serde_json::json!(directory);
-        result["shell_path"] = serde_json::json!(shell);
-        Ok(result)
+        Ok(annotate(result))
     } else if background {
         if let Some(timeout_ms) = input
             .get("__monitor_timeout_ms")
             .and_then(serde_json::Value::as_u64)
         {
-            let mut result = monitor::start(
+            let result = monitor::start_with_runtime_limit(
                 cmd,
                 &description,
                 &command,
                 std::time::Duration::from_millis(timeout_ms),
+                input["max_runtime_ms"]
+                    .as_u64()
+                    .map(std::time::Duration::from_millis),
                 wsl_guard,
             )?;
-            result["shell_path"] = serde_json::json!(shell);
-            return Ok(result);
+            return Ok(annotate(result));
         }
-        let mut result = background_shell::start(
+        let result = background_shell::start(
             cmd,
             input
                 .get("timeout")
                 .filter(|value| !value.is_null())
                 .map(|_| timeout),
-            actual_shell,
+            display_shell,
             &description,
             &command,
             wsl_guard,
             interaction,
         )?;
-        result["shell_path"] = serde_json::json!(shell);
-        Ok(result)
+        Ok(annotate(result))
     } else {
         // Ctrl+B can move it to the background while it runs.
         let filtered = input.get("__sandbox").filter(|policy| {
             policy["network_rules"].is_object() && input["dangerouslyDisableSandbox"] != true
         });
         let mark = filtered.map(sandbox::blocked_mark);
-        let mut result = background_shell::run_foreground(
+        let result = background_shell::run_foreground(
             cmd,
             timeout,
-            actual_shell,
+            display_shell,
             &description,
             &command,
             wsl_guard,
         )
         .await?;
-        result["shell_path"] = serde_json::json!(shell);
+        let mut result = annotate(result);
         // Name refused hosts: an HTTPS client often reports only a reset.
         if let (Some(policy), Some(mark)) = (filtered, mark) {
             let hosts = sandbox::blocked_since(policy, mark);

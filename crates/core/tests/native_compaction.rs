@@ -114,7 +114,7 @@ async fn fixture(mode: u8) -> Fixture {
             let call = |id: &str, name: &str, arguments: Value| json!({"type":"function_call","id":format!("fc-{id}"),"call_id":id,"name":name,"arguments":arguments.to_string()});
             let output = if mode == 5 {
                 match step {
-                    1 => json!([call("search-1", "ToolSearch", json!({"query":"ListDir"}))]),
+                    1 => json!([call("search-1", "ToolLoad", json!({"names":["ListDir"]}))]),
                     2 => json!([call("list-1", "ListDir", json!({"path":"."}))]),
                     _ => json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]),
                 }
@@ -470,7 +470,7 @@ async fn an_error_response_slower_than_200ms_would_misjudge_the_old_window() {
 }
 
 /// A real compaction exchange replaces the history that carried a successful
-/// ToolSearch, so the restored session cannot treat the summary as an
+/// ToolLoad, so the restored session cannot treat the summary as an
 /// authorization; a fresh search loads the tool again for the next request.
 #[tokio::test]
 async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_it() {
@@ -489,8 +489,8 @@ async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_
                 &deepseek_code_core::db::message_repo::ToolCallRow {
                     id: format!("{assistant}:search-1"),
                     message_id: assistant.clone(),
-                    name: "ToolSearch".to_owned(),
-                    input: Some(json!({"query":"ListDir"}).to_string()),
+                    name: "ToolLoad".to_owned(),
+                    input: Some(json!({"names":["ListDir"]}).to_string()),
                     output: Some(
                         json!({"success":true,"loaded_tools":["ListDir"],"tools":[]}).to_string(),
                     ),
@@ -561,5 +561,60 @@ async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_
         requests[3].to_string().contains("item.txt"),
         "the restored search did not run the tool"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn context_search_hint_requires_persisted_compaction_without_host_provenance() {
+    let Fixture {
+        dir,
+        store,
+        id,
+        engine,
+        seen,
+        server,
+        ..
+    } = fixture(0).await;
+    let send = |boundary: Option<&'static str>| {
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        let request: ChatRequest = serde_json::from_value(json!({
+            "conversation_id":id,"messages":history,"model":"gpt-6-astra",
+            "provider_id":"gateway","workspace_path":dir.path(),"context_boundary":boundary
+        }))
+        .unwrap();
+        let engine = &engine;
+        async move {
+            let mut events = engine.send_message(request).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(event) = events.recv().await {
+                    assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");
+                }
+            })
+            .await
+            .unwrap();
+        }
+    };
+
+    // A provenance field alone cannot make the fresh session compacted.
+    send(Some("unverified-boundary")).await;
+    let prepared = compaction::prepare(&store.db, &id).unwrap();
+    compaction::commit(&store.db, prepared, "Host continuation summary").unwrap();
+    store
+        .append(&id, "user", "Continue from the summary")
+        .unwrap();
+    // Desktop supplies host messages without explicit boundary provenance.
+    send(None).await;
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let hint = "After compaction, load ContextSearch with ToolLoad";
+    let fresh = seen[0]["instructions"].as_str().unwrap();
+    assert!(fresh.contains("- `ContextSearch`"), "{fresh}");
+    assert!(!fresh.contains(hint), "{fresh}");
+    let compacted = seen[1]["instructions"].as_str().unwrap();
+    assert!(compacted.contains(hint), "{compacted}");
+    assert!(seen[1]["input"]
+        .to_string()
+        .contains("Host continuation summary"));
     server.abort();
 }

@@ -3,6 +3,7 @@
 use super::change_view::{self, Line};
 use serde_json::Value;
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 /// Lines of a successful result shown inline before "+N lines".
 const SUMMARY_LINES: usize = 4;
@@ -101,6 +102,28 @@ pub(super) fn is_shell_header(line: &Line) -> bool {
             .any(|span| span.text.starts_with("Bash(") || span.text.starts_with("PowerShell("))
 }
 
+pub(super) const TOOL_LOAD_PREFIX: &str = "ToolLoad(";
+pub(super) const TOOL_LOAD_MIN_WIDTH: usize = TOOL_LOAD_PREFIX.len() + 2;
+
+pub(super) fn is_tool_load_header(line: &Line) -> bool {
+    line.0.first().is_some_and(|span| span.text == "● ")
+        && line
+            .0
+            .iter()
+            .any(|span| span.text.starts_with(TOOL_LOAD_PREFIX))
+}
+
+pub(super) fn fit_tool_load_label(label: &str, width: usize) -> Option<String> {
+    let (args, suffix) = label.strip_prefix(TOOL_LOAD_PREFIX)?.rsplit_once(')')?;
+    if label.width() <= width {
+        return Some(label.to_owned());
+    }
+    let room = width.checked_sub(TOOL_LOAD_MIN_WIDTH + suffix.width())?;
+    let prefix = super::input::editor::clip_cells(args, room);
+    let prefix = prefix.trim_end_matches([' ', ',']);
+    Some(format!("{TOOL_LOAD_PREFIX}{prefix}…){suffix}"))
+}
+
 /// Wrap literal calls without Markdown's whitespace trimming.
 pub(super) fn wrap_call(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
@@ -123,6 +146,9 @@ pub(super) fn wrap_call(text: &str, width: usize) -> Vec<String> {
 
 /// `Bash(ls -la)` for previewable inputs, otherwise the tool name.
 pub fn label(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> String {
+    if name == deepseek_code_core::tools::TOOL_LOAD_NAME {
+        return super::progress::tool_load_label(input, 80);
+    }
     if name == "Skill" {
         if let Some(skill) = input["skill"].as_str().or_else(|| input["name"].as_str()) {
             return format!("Skill({})", printable(skill));
@@ -151,6 +177,13 @@ pub fn label(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> 
         Some(argument) => format!("{name}({argument})"),
         None => preview,
     }
+}
+
+pub(crate) fn compact_label(name: &str, input: &Value) -> String {
+    if name == deepseek_code_core::tools::TOOL_LOAD_NAME {
+        return super::progress::tool_load_label(input, 36);
+    }
+    name.to_owned()
 }
 
 pub fn display_label(name: &str, input: &Value, workspace: Option<&std::path::Path>, title: Option<&str>) -> String {
@@ -1184,6 +1217,27 @@ pub fn thought(text: &str, seconds: Option<u64>) -> (Vec<Line>, Vec<Line>) {
 mod mcp_display_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rejected_tool_load_headers_fit_without_splitting_names() {
+        for grapheme in ["界", "✈️", "👩🏽‍💻", "e\u{301}"] {
+            let name = grapheme.repeat(90);
+            let input = json!({"names": [name]});
+            let lines = numbered(
+                finished("ToolLoad", &input, "Unknown tool name", true, None, None),
+                Some(1),
+            );
+            let header = &lines[0];
+            for width in [1, 8, 16, 17, 20, 32, 64, 80] {
+                let row = change_view::render(header, width, false);
+                assert!(row.width() <= width, "{width}: {row}");
+                if width >= 16 {
+                    let count = (width - 16) / grapheme.width();
+                    assert_eq!(row, format!("● #1 ToolLoad({}…)", grapheme.repeat(count)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn mcp_labels_are_shared_and_details_preserve_input() {

@@ -2,10 +2,41 @@
 //! tool result can show it in full and a second click can fold it again. Only
 //! rows below the clicked block are redrawn; scrollback stays as it was.
 use super::change_view::{self, Line};
+use super::tool_view::{
+    fit_tool_load_label, is_tool_load_header, TOOL_LOAD_MIN_WIDTH, TOOL_LOAD_PREFIX,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
+
+/// Fit the preview arguments before omitting any whole calls from the group.
+fn fit_group_summary(parts: &[(String, usize)], tail: &str, width: usize) -> Option<String> {
+    let columns = parts.iter().map(|(label, _)| label.width()).sum::<usize>()
+        + 2 * parts.len().saturating_sub(1)
+        + tail.width();
+    let mut overflow = columns.saturating_sub(width);
+    let mut labels = Vec::with_capacity(parts.len());
+    for (label, _) in parts {
+        if overflow > 0 {
+            if let Some((_, repeated)) = label
+                .strip_prefix(TOOL_LOAD_PREFIX)
+                .and_then(|s| s.rsplit_once(')'))
+            {
+                let minimum = TOOL_LOAD_MIN_WIDTH + repeated.width();
+                let label_width = label.width();
+                let target = label_width.saturating_sub(overflow).max(minimum);
+                if let Some(shortened) = fit_tool_load_label(label, target) {
+                    overflow = overflow.saturating_sub(label_width.saturating_sub(shortened.width()));
+                    labels.push(shortened);
+                    continue;
+                }
+            }
+        }
+        labels.push(label.clone());
+    }
+    let summary = format!("{}{tail}", labels.join(", "));
+    (summary.width() <= width).then_some(summary)
+}
 
 /// One logged line as written, the screen rows it takes and the tool result
 /// it belongs to.
@@ -480,7 +511,16 @@ impl Scrollback {
         match result {
             Ok(value) => {
                 let status = value["status"].as_str().unwrap_or("unknown");
-                let exit = value["result"]["exit_code"].as_i64().map(|code| format!(" · exit {code}")).unwrap_or_default();
+                // A shell task's result is model-facing text (a failure names its
+                // code); an older structured record still carries `exit_code`.
+                let exit_code = value["result"]["exit_code"].as_i64().or_else(|| {
+                    value["result"]
+                        .as_str()
+                        .and_then(|text| text.lines().next())
+                        .and_then(|line| line.strip_prefix("Exit code: "))
+                        .and_then(|code| code.trim().parse().ok())
+                });
+                let exit = exit_code.map(|code| format!(" · exit {code}")).unwrap_or_default();
                 full.push(change_view::muted(&format!("  Background task {task} · {status}{exit} (click to collapse)")));
                 if matches!(status, "completed" | "failed" | "cancelled") {
                     entry.short.truncate(1);
@@ -750,32 +790,30 @@ impl Scrollback {
         };
         let suffix = format!("{failure}{hint}");
         let available = width.saturating_sub(2 + suffix.width());
-        let mut summary = parts
-            .iter()
-            .map(|(label, _)| label.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if summary.width() > available {
-            for keep in (0..parts.len()).rev() {
-                let omitted: usize = parts[keep..].iter().map(|(_, count)| count).sum();
-                let prefix = parts[..keep]
-                    .iter()
-                    .map(|(label, _)| label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let candidate = format!(
-                    "{prefix}{}+{omitted} calls",
-                    if keep > 0 { ", … " } else { "… " }
-                );
-                if candidate.width() <= available {
-                    summary = candidate;
-                    break;
+        for keep in (0..=parts.len()).rev() {
+            if keep == 0 && parts.len() == 1 && parts[0].0.starts_with(TOOL_LOAD_PREFIX) {
+                let without_hint = width.saturating_sub(2 + failure.width());
+                if let Some(summary) = fit_group_summary(&parts, "", without_hint) {
+                    return format!("  {summary}{failure}");
                 }
+                if let Some(summary) = fit_group_summary(&parts, "", width.saturating_sub(2)) {
+                    return format!("  {summary}");
+                }
+            }
+            let tail = if keep == parts.len() {
+                String::new()
+            } else {
+                let omitted: usize = parts[keep..].iter().map(|(_, count)| count).sum();
+                let separator = if keep > 0 { ", … " } else { "… " };
+                format!("{separator}+{omitted} calls")
+            };
+            if let Some(summary) = fit_group_summary(&parts[..keep], &tail, available) {
+                return format!("  {summary}{suffix}");
             }
         }
         // Preserve failure counts in normal widths; extremely narrow terminals
         // still get one physical line and the same group click target.
-        super::input::editor::clipped(&format!("  {summary}{suffix}"), width)
+        super::input::editor::clipped(&format!("  …{suffix}"), width)
     }
     pub(crate) fn presentation(&self) -> Vec<String> {
         if compact() {
@@ -1025,6 +1063,9 @@ fn collapsed_at_width(lines: &[Line], width: usize) -> Vec<String> {
                 let text = change_view::render(line, usize::MAX, color);
                 return super::tool_view::wrap_call(&text, width);
             }
+            if is_tool_load_header(line) {
+                return vec![change_view::render(line, width, color)];
+            }
             let plain = change_view::plain(std::slice::from_ref(line));
             vec![
                 if unicode_width::UnicodeWidthStr::width(plain.trim_end()) > width {
@@ -1056,6 +1097,9 @@ fn rendered_at_width(lines: &[Line], width: usize) -> Vec<String> {
     lines
         .iter()
         .flat_map(|line| {
+            if is_tool_load_header(line) {
+                return vec![change_view::render(line, width, color)];
+            }
             let text = change_view::render(line, usize::MAX, color);
             if super::tool_view::is_mcp_header(line) {
                 super::tool_view::wrap_call(&text, width)
@@ -1071,32 +1115,11 @@ fn screen_rows(text: &str, columns: usize) -> usize {
     let columns = columns.max(1);
     text.split("\r\n")
         .map(|line| {
-            let mut cells = 0;
-            let mut chars = line.chars();
-            while let Some(ch) = chars.next() {
-                if ch == '\x1b' {
-                    // CSI ends at its final byte, OSC at BEL or ST.
-                    match chars.next() {
-                        Some('[') => {
-                            for ch in chars.by_ref() {
-                                if ('@'..='~').contains(&ch) {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(']') => {
-                            for ch in chars.by_ref() {
-                                if ch == '\x07' || ch == '\\' {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    cells += ch.width().unwrap_or(0);
-                }
-            }
+            let cells = if line.contains('\x1b') {
+                super::tool_view::plain_terminal_text(line).width()
+            } else {
+                line.width()
+            };
             cells.div_ceil(columns).max(1)
         })
         .sum()
@@ -1581,8 +1604,10 @@ mod tests {
     #[test]
     fn compact_named_tools_merge_counts_and_preserve_recorded_failures() {
         let mut history = Scrollback::default();
+        let input = serde_json::json!({"names": ["Read", "Grep"]});
+        let loader = super::super::tool_view::compact_label("ToolLoad", &input);
         for (name, failed) in [
-            ("ToolSearch", false),
+            (loader.as_str(), false),
             ("TaskGet", true),
             ("TaskGet", false),
             ("Agent", true),
@@ -1591,11 +1616,12 @@ mod tests {
         }
         assert_eq!(
             history.compact_layout(120, 0)[0].text,
-            "  ToolSearch, TaskGet ×2, Agent, 2 failed  [click to expand]"
+            "  ToolLoad(Read, Grep), TaskGet ×2, Agent, 2 failed  [click to expand]"
         );
         assert!(!history.compact_layout(120, 0)[0].text.contains("shell"));
-        let narrow = history.compact_layout(55, 0)[0].text.clone();
-        assert!(narrow.width() <= 55, "{narrow}");
+        let narrow = history.compact_layout(56, 0)[0].text.clone();
+        assert!(narrow.width() <= 56, "{narrow}");
+        assert!(narrow.contains("ToolLoad("), "{narrow}");
         assert!(narrow.contains("+3 calls"), "{narrow}");
         assert!(narrow.contains("2 failed"), "{narrow}");
         for width in [1, 8, 20, 40, 80] {
@@ -1614,6 +1640,78 @@ mod tests {
         );
         for width in [1, 8, 30, 50] {
             assert!(history.compact_layout(width, 0)[0].text.width() <= width);
+        }
+    }
+
+    #[test]
+    fn compact_tool_load_keeps_the_label_for_long_requests() {
+        let mut history = Scrollback::default();
+        let input = serde_json::json!({
+            "names": ["mcp__fixture__unusually_long_tool_name", "ListDir", "WebFetch"]
+        });
+        let loader = super::super::tool_view::compact_label("ToolLoad", &input);
+        let block = add_compact_tool(&mut history, &loader, false);
+        for width in [32, 40, 64, 80] {
+            for open in [false, true] {
+                let row = history.group_summary(&[block], width, open);
+                assert!(row.width() <= width, "{row}");
+                assert!(row.starts_with("  ToolLoad("), "{row}");
+                assert!(row.contains("…)"), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_rejected_tool_load_fits_unicode_and_keeps_whole_graphemes() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        for grapheme in ["界", "✈️", "👩🏽‍💻", "e\u{301}"] {
+            let name = grapheme.repeat(12);
+            let input = serde_json::json!({"names": [name]});
+            let view = super::super::tool_view::finished(
+                "ToolLoad",
+                &input,
+                "Unknown or unavailable tool name",
+                true,
+                None,
+                None,
+            );
+            let loader = super::super::tool_view::compact_label("ToolLoad", &input);
+            let mut history = Scrollback::default();
+            let (block, rows) = history.tool_block(&loader, true, view.clone(), view);
+            for row in rows {
+                history.push(row, Some(block));
+            }
+            // A 64-column terminal reserves its last column for autowrap.
+            for width in [1, 8, 13, 14, 23, 32, 63, 64, 80] {
+                for open in [false, true] {
+                    if open {
+                        assert!(history.click_compact_row(0, width, 0));
+                    }
+                    let rows = history.compact_layout(width, 0);
+                    let row = &rows[0].text;
+                    assert!(row.width() <= width, "{width}: {row}");
+                    if width >= 13 {
+                        let (args, rest) = row
+                            .strip_prefix("  ToolLoad(")
+                            .unwrap()
+                            .split_once(')')
+                            .unwrap();
+                        assert!(
+                            args.trim_end_matches('…')
+                                .graphemes(true)
+                                .all(|part| part == grapheme),
+                            "{row}"
+                        );
+                        if width >= 23 {
+                            assert!(rest.starts_with(", 1 failed"), "{row}");
+                        }
+                    }
+                    if open {
+                        assert!(history.click_compact_row(0, width, 0));
+                    }
+                }
+            }
         }
     }
 

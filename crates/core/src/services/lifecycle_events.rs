@@ -183,7 +183,7 @@ pub async fn instructions(
     let boundary_key = format!("{key}:boundary");
     let boundary = context.db.with_conn(|conn| {
         use rusqlite::OptionalExtension;
-        conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC LIMIT 1", [session], |row| row.get::<_, String>(0)).optional()
+        conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1", [session], |row| row.get::<_, String>(0)).optional()
     })??;
     let previous_boundary = context.setting::<Option<String>>(&boundary_key)?.flatten();
     let compact = boundary.is_some() && boundary != previous_boundary;

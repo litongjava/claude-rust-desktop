@@ -1,6 +1,7 @@
 //! Preserve Markdown source and parse complete blocks with CommonMark events.
 //! Only stable blocks enter scrollback; the open block remains a mutable preview.
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const BOLD: (&str, &str) = ("\x1b[1m", "\x1b[22m");
@@ -310,7 +311,6 @@ impl MarkdownStream {
 /// at the end of the row and reopened after `indent` on the next. Words longer
 /// than a row break at the edge, and spaces at a break are dropped.
 pub fn wrap_styled(text: &str, first: &str, indent: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
     let indent_cells = indent.width();
     let width = width.max(indent_cells + 2);
     let mut rows = Vec::new();
@@ -327,27 +327,38 @@ pub fn wrap_styled(text: &str, first: &str, indent: &str, width: usize) -> Vec<S
             row.push_str("\x1b[0m");
         }
     };
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            let mut sequence = String::from(ch);
-            for next in chars.by_ref() {
-                sequence.push(next);
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+    // Segment printable runs independently so an escape's final byte
+    // cannot become part of the next visible grapheme.
+    let mut remaining = text;
+    let mut graphemes = "".graphemes(true);
+    loop {
+        let grapheme = if let Some(grapheme) = graphemes.next() {
+            grapheme
+        } else if let Some(csi) = remaining.strip_prefix("\x1b[") {
+            let end = csi
+                .find(|ch: char| ch.is_ascii_alphabetic())
+                .map_or(remaining.len(), |index| index + 3);
+            let (sequence, rest) = remaining.split_at(end);
             if sequence.ends_with('m') {
-                track_style(&mut open, &sequence);
+                track_style(&mut open, sequence);
             }
-            row.push_str(&sequence);
+            row.push_str(sequence);
+            remaining = rest;
             continue;
-        }
-        let size = ch.width().unwrap_or(0);
+        } else if remaining.is_empty() {
+            break;
+        } else {
+            let end = remaining.find("\x1b[").unwrap_or(remaining.len());
+            let (run, rest) = remaining.split_at(end);
+            graphemes = run.graphemes(true);
+            remaining = rest;
+            continue;
+        };
+        let size = grapheme.width();
         if cells + size > width && row.len() > start {
             // A space at the edge is the break itself; otherwise carry the
             // partial word after the row's last space.
-            let carried = if ch == ' ' { None } else { space.take() };
+            let carried = if grapheme == " " { None } else { space.take() };
             space = None;
             match carried.filter(|(at, _, _)| *at < row.len()) {
                 Some((at, styles, before)) => {
@@ -368,12 +379,12 @@ pub fn wrap_styled(text: &str, first: &str, indent: &str, width: usize) -> Vec<S
                 }
             }
         }
-        if ch == ' ' && row.len() == start && !rows.is_empty() {
+        if grapheme == " " && row.len() == start && !rows.is_empty() {
             continue;
         }
-        row.push(ch);
+        row.push_str(grapheme);
         cells += size;
-        if ch == ' ' {
+        if grapheme == " " {
             space = Some((row.len(), open.clone(), cells));
         }
     }

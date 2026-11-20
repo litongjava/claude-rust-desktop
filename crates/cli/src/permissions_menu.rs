@@ -29,7 +29,7 @@ fn action(tab: usize) -> Option<PermissionAction> {
 fn recently_denied(session: &Session) -> Result<Vec<Entry>> {
     session.store.db.with_conn(|conn| -> Result<Vec<Entry>> {
         let mut statement = conn.prepare(
-            "SELECT t.name, t.input, t.output FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1 AND t.is_error=1 ORDER BY m.sort_order DESC, t.sort_order DESC LIMIT 200",
+            "SELECT t.name, t.input, t.output FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1 AND t.is_error=1 ORDER BY m.sort_order DESC, m.rowid DESC, t.sort_order DESC, t.rowid DESC LIMIT 200",
         )?;
         let rows = statement.query_map([&session.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)))?;
         let mut entries = Vec::new();
