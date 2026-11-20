@@ -857,16 +857,29 @@ async fn disabled_builtins_are_absent_from_the_model_listing_but_stay_listed_wit
         String::from_utf8_lossy(&output.stderr)
     );
     let request = requests.lock().unwrap()[0].clone();
-    let system = request["messages"]
-        .as_array()
-        .unwrap()
+    let messages = request["messages"].as_array().unwrap();
+    let system = messages
         .iter()
         .find(|message| message["role"] == "system")
         .and_then(|message| message["content"].as_str())
         .expect("system message");
-    let listing = system
+    // The listing travels in a reminder joined to the first user message so the
+    // session keeps the skills it started with; it must not return to the
+    // system prompt.
+    assert!(
+        !system.contains("Available skills"),
+        "the skill listing must stay out of the system prompt: {system}"
+    );
+    let first_user = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("first user message");
+    // Serialize the whole message so this works for both a joined string and
+    // per-reminder content parts.
+    let user_text = serde_json::to_string(first_user).unwrap();
+    let listing = user_text
         .split_once("Available skills")
-        .expect("model skill listing")
+        .expect("model skill listing in the first user message")
         .1;
     assert!(listing.contains("- skill-creator:"), "{listing}");
     for name in ["task-template", "docx", "pdf", "commit"] {
