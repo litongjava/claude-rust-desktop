@@ -93,6 +93,19 @@ impl GlobalDb {
             .optional()?)
         })
     }
+    pub fn conversation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::db::conversation_repo::ConversationRow>> {
+        let key = layout::storage_key(id)?;
+        let _locks = layout::lock_keys(self.path.parent().unwrap(), vec![&key], false)?;
+        self.read(|conn| crate::db::conversation_repo::get_conversation(conn, id))
+    }
+
+    #[doc(hidden)]
+    pub fn with_read_for_test<T>(&self, body: impl FnOnce() -> T) -> Result<T> {
+        self.read(|_| Ok(body()))
+    }
     pub fn store_uuid(&self) -> &str {
         &self.uuid
     }

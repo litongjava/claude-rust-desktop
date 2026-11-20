@@ -11,6 +11,8 @@ pub mod permission_repo;
 pub mod project_repo;
 pub mod request_repo;
 pub mod schema;
+#[doc(hidden)]
+pub mod session_store;
 pub mod task_repo;
 pub mod turn_repo;
 

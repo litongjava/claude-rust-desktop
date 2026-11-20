@@ -1,0 +1,207 @@
+//! Session database layout. The sole constructor is an internal integration-test
+//! factory until all production hosts switch together.
+mod global;
+mod layout;
+mod lifecycle;
+pub use global::GlobalDb;
+pub use lifecycle::{CreateOptions, FirstMessage, Phase, ProjectSelection};
+
+use anyhow::{ensure, Context, Result};
+use layout::{lock_keys, storage_key, Permits, SESSION};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Instant;
+
+type Fault = dyn Fn(Phase) -> Result<()> + Send + Sync;
+struct Root {
+    path: PathBuf,
+    global: GlobalDb,
+}
+static ROOTS: LazyLock<Mutex<HashMap<PathBuf, Weak<Root>>>> = LazyLock::new(Default::default);
+
+#[derive(Clone)]
+pub struct Stores {
+    root: Arc<Root>,
+    fault: Option<Arc<Fault>>,
+}
+impl Stores {
+    #[doc(hidden)]
+    pub fn open_for_test(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        let path = path.canonicalize()?;
+        let root = {
+            let mut roots = ROOTS.lock().unwrap();
+            roots.retain(|_, root| root.strong_count() > 0);
+            if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
+                root
+            } else {
+                let uuid = layout::open_root(&path)?;
+                let root = Arc::new(Root {
+                    global: GlobalDb::new(&path, uuid)?,
+                    path: path.clone(),
+                });
+                roots.insert(path, Arc::downgrade(&root));
+                root
+            }
+        };
+        let stores = Self { root, fault: None };
+        stores.reconcile()?;
+        Ok(stores)
+    }
+    #[doc(hidden)]
+    pub fn with_fault_hook(
+        &self,
+        fault: impl Fn(Phase) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            root: self.root.clone(),
+            fault: Some(Arc::new(fault)),
+        }
+    }
+    fn step(&self, phase: Phase) -> Result<()> {
+        if let Some(hook) = &self.fault {
+            hook(phase)?;
+        }
+        Ok(())
+    }
+    pub fn global(&self) -> &GlobalDb {
+        &self.root.global
+    }
+    fn sessions(&self) -> PathBuf {
+        self.root.path.join("sessions")
+    }
+    pub fn open_session(&self, id: &str) -> Result<SessionDb> {
+        let key = storage_key(id)?;
+        let _locks = lock_keys(&self.root.path, vec![&key], false)?;
+        let incarnation = self
+            .global()
+            .incarnation(id, &key)?
+            .context("Session unavailable")?;
+        let handle = SessionDb {
+            stores: self.clone(),
+            id: id.into(),
+            key,
+            incarnation,
+        };
+        handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| layout::integrity(c))?;
+        Ok(handle)
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionDb {
+    stores: Stores,
+    id: String,
+    key: String,
+    incarnation: String,
+}
+
+impl SessionDb {
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+    fn check_directory(&self) -> Result<()> {
+        let current = self.stores.global().incarnation(&self.id, &self.key)?;
+        ensure!(
+            current.as_deref() == Some(&self.incarnation),
+            "Session incarnation is no longer visible"
+        );
+        Ok(())
+    }
+    fn connection_under_lock<T>(
+        &self,
+        mode: OpenFlags,
+        body: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let _permit = Permits::take(1);
+        let mut conn = layout::open(
+            &self.stores.sessions().join(&self.key).join("session.db"),
+            mode,
+        )?;
+        layout::verify(&conn, SESSION)?;
+        verify_manifest(
+            &conn,
+            self.stores.global().store_uuid(),
+            &self.id,
+            &self.incarnation,
+        )?;
+        body(&mut conn)
+    }
+    pub fn read<T>(&self, body: impl FnOnce(&SessionRead<'_>) -> Result<T>) -> Result<T> {
+        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], false)?;
+        self.check_directory()?;
+        self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+            let tx = c.transaction()?;
+            body(&SessionRead(&tx))
+        })
+    }
+    pub fn write<T>(&self, body: impl FnOnce(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
+        let start = Instant::now();
+        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], false)?;
+        self.check_directory()?;
+        self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            let tx = crate::db::write_transaction(c)?;
+            let value = body(&SessionWrite(&tx))?;
+            tx.commit()?;
+            Ok(value)
+        })
+        .map_err(|e| crate::db::write_boundary_context("session write", &self.id, start, e))
+    }
+    pub fn set_archived(&self, archived: bool) -> Result<()> {
+        let _locks = lock_keys(&self.stores.root.path, vec![&self.key], true)?;
+        self.check_directory()?;
+        self.stores
+            .global()
+            .write("archive session", &self.id, false, |tx| {
+                tx.execute(
+                    "UPDATE conversations SET archived=?1,metadata_revision=metadata_revision+1
+                WHERE id=?2 AND incarnation=?3 AND archived<>?1",
+                    rusqlite::params![archived, self.id, self.incarnation],
+                )?;
+                Ok(())
+            })
+    }
+}
+
+fn verify_manifest(c: &Connection, store: &str, id: &str, incarnation: &str) -> Result<()> {
+    let matches: bool = c.query_row(
+        "SELECT store_uuid=?1 AND id=?2 AND incarnation=?3 FROM manifest WHERE singleton=1",
+        [store, id, incarnation],
+        |r| r.get(0),
+    )?;
+    ensure!(matches, "Session identity mismatch");
+    Ok(())
+}
+
+pub struct SessionRead<'a>(&'a Connection);
+impl SessionRead<'_> {
+    pub fn initial_message(&self) -> Result<Option<FirstMessage>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT m.content,t.content_json FROM messages m LEFT JOIN message_user_content t
+            ON t.message_id=m.id WHERE m.sort_order=0",
+                [],
+                |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .map(|(text, json)| -> Result<_> {
+                Ok(FirstMessage {
+                    text,
+                    typed: json.map(|j| serde_json::from_str(&j)).transpose()?,
+                })
+            })
+            .transpose()?)
+    }
+}
+pub struct SessionWrite<'a>(&'a Connection);
+impl SessionWrite<'_> {
+    #[doc(hidden)]
+    pub fn synchronous_for_test(&self) -> Result<i32> {
+        Ok(self
+            .0
+            .pragma_query_value(None, "synchronous", |r| r.get(0))?)
+    }
+}

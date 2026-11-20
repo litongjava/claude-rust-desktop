@@ -1,0 +1,620 @@
+use super::layout::{
+    self, canonical_uuid, durable_move, lock_keys, storage_key, sync_dir, Permits, SESSION,
+};
+use super::{verify_manifest, SessionDb, Stores};
+use crate::db::project_repo;
+use anyhow::{bail, ensure, Context, Result};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Phase {
+    BeforeCreateIntentCommit,
+    CreateIntent,
+    StageDirectory,
+    BeforeSeal,
+    Sealed,
+    Checkpointed,
+    Renamed,
+    Installed,
+    BeforePublishCommit,
+    Published,
+    BeforeDeleteIntentCommit,
+    DeleteIntent,
+    TrashRenamed,
+    Trashed,
+    Removed,
+    Retired,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstMessage {
+    pub text: String,
+    pub typed: Option<serde_json::Value>,
+}
+#[derive(Clone, Debug)]
+pub enum ProjectSelection {
+    Existing(String),
+    Workspace(PathBuf),
+}
+#[derive(Clone, Debug, Default)]
+pub struct CreateOptions {
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub research: bool,
+    pub project: Option<ProjectSelection>,
+    pub first_message: Option<FirstMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Metadata {
+    title: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: String,
+    research: bool,
+    created: String,
+    project: Option<Project>,
+}
+#[derive(Serialize, Deserialize)]
+enum Project {
+    Selected { id: String, folders: Vec<String> },
+    NewWorkspace(String),
+}
+
+impl Project {
+    fn select(conn: &Connection, selection: &ProjectSelection) -> Result<Self> {
+        let id = match selection {
+            ProjectSelection::Existing(id) => id.clone(),
+            ProjectSelection::Workspace(path) => {
+                let folder =
+                    project_repo::normalize_folders(&[path.to_string_lossy().into_owned()])?
+                        .remove(0);
+                match Self::matching(conn, &folder)? {
+                    Some(id) => id,
+                    None => return Ok(Self::NewWorkspace(folder)),
+                }
+            }
+        };
+        let p = project_repo::require_trusted(conn, &id)?;
+        ensure!(!p.is_archived, "Project is archived");
+        Ok(Self::Selected {
+            id,
+            folders: p.folders.into_iter().map(|f| f.path).collect(),
+        })
+    }
+
+    fn matching(c: &Connection, path: &str) -> Result<Option<String>> {
+        Ok(c.query_row(
+            "SELECT p.id FROM projects p JOIN project_folders f ON f.project_id=p.id
+            WHERE p.is_archived=0 AND p.workspace_path=?1 AND f.path=?1 AND f.trusted=1
+            AND (SELECT count(*) FROM project_folders WHERE project_id=p.id)=1
+            ORDER BY p.updated_at DESC,p.id LIMIT 1",
+            [path],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+
+    fn publish(&self, tx: &Connection, now: &str) -> Result<(String, Option<String>)> {
+        match self {
+            Self::Selected { id, folders } => {
+                let p = project_repo::require_trusted(tx, id)?;
+                ensure!(
+                    !p.is_archived && p.folders.iter().map(|f| &f.path).eq(folders),
+                    "Project selection changed"
+                );
+                Ok((id.clone(), p.workspace_path))
+            }
+            Self::NewWorkspace(path) => {
+                ensure!(
+                    project_repo::normalize_folders(std::slice::from_ref(path))?[0] == *path,
+                    "Workspace path changed"
+                );
+                if let Some(id) = Self::matching(tx, path)? {
+                    return Ok((id, Some(path.clone())));
+                }
+                let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_path=?1 AND is_archived=0)",
+                    [path], |r| r.get(0))?;
+                ensure!(!conflict, "Workspace project selection changed");
+                let id = Uuid::new_v4().to_string();
+                let name = Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                project_repo::insert_project(
+                    tx,
+                    &id,
+                    &name,
+                    None,
+                    None,
+                    Some(path),
+                    false,
+                    now,
+                    now,
+                )?;
+                tx.execute("INSERT INTO project_folders VALUES(?1,?2,1,0)", [&id, path])?;
+                Ok((id, Some(path.clone())))
+            }
+        }
+    }
+}
+
+struct Intent {
+    operation: String,
+    store: String,
+    id: String,
+    key: String,
+    incarnation: String,
+    kind: String,
+    metadata: Option<String>,
+}
+impl Intent {
+    fn new(stores: &Stores, id: &str, key: &str, incarnation: String, kind: &str) -> Self {
+        Self {
+            operation: Uuid::new_v4().to_string(),
+            store: stores.global().uuid.clone(),
+            id: id.into(),
+            key: key.into(),
+            incarnation,
+            kind: kind.into(),
+            metadata: None,
+        }
+    }
+    fn insert(&self, tx: &Connection, metadata: Option<&str>) -> Result<()> {
+        tx.execute(
+            "INSERT INTO lifecycle(operation,store_uuid,id,storage_key,incarnation,kind,metadata)
+            VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                self.operation,
+                self.store,
+                self.id,
+                self.key,
+                self.incarnation,
+                self.kind,
+                metadata
+            ],
+        )?;
+        Ok(())
+    }
+    fn stage(&self, stores: &Stores) -> PathBuf {
+        stores.sessions().join(".staging").join(&self.operation)
+    }
+    fn live(&self, stores: &Stores) -> PathBuf {
+        stores.sessions().join(&self.key)
+    }
+    fn finish(&self, tx: &Connection) -> Result<()> {
+        ensure!(tx.execute("DELETE FROM lifecycle WHERE operation=?1 AND store_uuid=?2 AND incarnation=?3 AND quarantine_reason IS NULL",
+            [&self.operation,&self.store,&self.incarnation])? == 1, "Lifecycle intent changed");
+        Ok(())
+    }
+    fn validate(&self, stores: &Stores) -> Result<()> {
+        ensure!(
+            self.store == stores.global().uuid
+                && self.key == storage_key(&self.id)?
+                && canonical_uuid(&self.incarnation)
+                && canonical_uuid(&self.operation),
+            "Invalid lifecycle identity"
+        );
+        Ok(())
+    }
+}
+
+impl Stores {
+    pub fn create(&self, id: &str, options: CreateOptions) -> Result<SessionDb> {
+        let key = storage_key(id)?;
+        let _locks = lock_keys(&self.root.path, vec![&key], true)?;
+        self.recover_key(&key)?;
+        let op = Intent::new(self, id, &key, Uuid::new_v4().to_string(), "create");
+        ensure!(
+            !op.live(self).try_exists()?,
+            "Session directory already exists"
+        );
+        let mode = options.workspace_mode.unwrap_or_else(|| "chat".into());
+        ensure!(
+            matches!(mode.as_str(), "chat" | "work" | "study" | "code"),
+            "Invalid workspace mode"
+        );
+        let created = chrono::Utc::now().to_rfc3339();
+        let meta = self.global().write("create intent", id, true, |tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2)",
+                [id, &key],
+                |r| r.get(0),
+            )?;
+            ensure!(!exists, "Session already exists");
+            let meta = Metadata {
+                title: options.title.clone(),
+                model: options.model.clone(),
+                provider: options.provider.clone(),
+                mode: mode.clone(),
+                research: options.research,
+                created: created.clone(),
+                project: options
+                    .project
+                    .as_ref()
+                    .map(|p| Project::select(tx, p))
+                    .transpose()?,
+            };
+            op.insert(tx, Some(&serde_json::to_string(&meta)?))?;
+            self.step(Phase::BeforeCreateIntentCommit)?;
+            Ok(meta)
+        })?;
+        self.step(Phase::CreateIntent)?;
+        let stage = op.stage(self);
+        fs::create_dir(&stage)?;
+        sync_dir(stage.parent().unwrap())?;
+        self.step(Phase::StageDirectory)?;
+        {
+            let _permit = Permits::take(1);
+            layout::initialize(&stage.join("session.db"), SESSION, |tx| {
+                let n = i64::from(options.first_message.is_some());
+                tx.execute(
+                    "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,?5,?5,?6,?6,NULL)",
+                    params![op.store, id, op.incarnation, op.operation, created, n],
+                )?;
+                if let Some(first) = &options.first_message {
+                    let message = Uuid::new_v4().to_string();
+                    tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
+                        VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
+                    if let Some(typed) = &first.typed {
+                        tx.execute(
+                            "INSERT INTO message_user_content VALUES(?1,?2)",
+                            params![message, serde_json::to_string(typed)?],
+                        )?;
+                    }
+                }
+                self.step(Phase::BeforeSeal)
+            })?;
+            self.step(Phase::Sealed)?;
+        }
+        self.publish(&op, &meta, &stage)?;
+        Ok(SessionDb {
+            stores: self.clone(),
+            id: id.into(),
+            key,
+            incarnation: op.incarnation,
+        })
+    }
+
+    fn pending(&self, key: &str) -> Result<Option<Intent>> {
+        self.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT operation,store_uuid,id,storage_key,incarnation,kind,metadata
+            FROM lifecycle WHERE storage_key=?1 AND quarantine_reason IS NULL",
+                [key],
+                |r| {
+                    Ok(Intent {
+                        operation: r.get(0)?,
+                        store: r.get(1)?,
+                        id: r.get(2)?,
+                        key: r.get(3)?,
+                        incarnation: r.get(4)?,
+                        kind: r.get(5)?,
+                        metadata: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+        })
+    }
+
+    fn recover_key(&self, key: &str) -> Result<()> {
+        let Some(op) = self.pending(key)? else {
+            return Ok(());
+        };
+        op.validate(self)?;
+        if op.kind == "delete" {
+            return self.retire(&op);
+        }
+        ensure!(op.kind == "create", "Unknown intent");
+        let stage = op.stage(self);
+        let live = op.live(self);
+        let dir = if stage.try_exists()? { &stage } else { &live };
+        let recovered_quarantine = self.sessions().join(".quarantine").join(&op.operation);
+        if recovered_quarantine.try_exists()? {
+            return self.record_quarantine(&op, "interrupted quarantine");
+        }
+        let visible = self.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1 OR id=?2)",
+                [&op.key, &op.id],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })?;
+        if visible {
+            if stage.try_exists()? {
+                self.quarantine(&op, &stage, "occupied directory row")?;
+            } else {
+                self.record_quarantine(&op, "occupied directory row")?;
+            }
+            return Ok(());
+        }
+        let db = dir.join("session.db");
+        let unsealed = if db.try_exists()? {
+            match self.unsealed(&db) {
+                Ok(value) => value,
+                Err(e) if damaged_shard(&e) => {
+                    return self.quarantine(&op, dir, "invalid staged database")
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            true
+        };
+        if unsealed {
+            // Only discard our private, unsealed stage. Never remove a final
+            // directory on the strength of a create intent.
+            if stage.try_exists()? {
+                fs::remove_dir_all(&stage)?;
+            }
+            sync_dir(stage.parent().unwrap())?;
+            return self
+                .global()
+                .write("discard unsealed create", &op.id, true, |tx| op.finish(tx));
+        }
+        let meta =
+            serde_json::from_str(op.metadata.as_deref().context("Missing create metadata")?)?;
+        self.publish(&op, &meta, dir)
+    }
+
+    fn unsealed(&self, db: &Path) -> Result<bool> {
+        let _permit = Permits::take(1);
+        let c = layout::open(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Schema, version and seal are installed in a single transaction.
+        // A rolled back first transaction leaves a zero-schema SQLite file.
+        Ok(c.query_row("SELECT application_id=0 AND NOT EXISTS(SELECT 1 FROM sqlite_schema) FROM pragma_application_id",[], |r|r.get(0))?)
+    }
+
+    fn quarantine(&self, op: &Intent, dir: &Path, reason: &str) -> Result<()> {
+        let dest = self.sessions().join(".quarantine").join(&op.operation);
+        if dir.try_exists()? {
+            durable_move(dir, &dest)?;
+        }
+        self.record_quarantine(op, reason)
+    }
+
+    fn record_quarantine(&self, op: &Intent, reason: &str) -> Result<()> {
+        self.global()
+            .write("quarantine create", &op.id, true, |tx| {
+                tx.execute(
+                    "UPDATE lifecycle SET quarantine_reason=?1 WHERE operation=?2",
+                    [reason, &op.operation],
+                )?;
+                Ok(())
+            })
+    }
+
+    fn publish(&self, op: &Intent, meta: &Metadata, dir: &Path) -> Result<()> {
+        let live = op.live(self);
+        let db = dir.join("session.db");
+        let inspect = || -> Result<_> {
+            let _permit = Permits::take(1);
+            let c = layout::open(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            layout::verify(&c, SESSION)?;
+            layout::integrity(&c)?;
+            let matches: bool = c.query_row(
+                "SELECT store_uuid=?1 AND id=?2 AND incarnation=?3 AND sealed_operation=?4
+                FROM manifest WHERE singleton=1",
+                [&op.store, &op.id, &op.incarnation, &op.operation],
+                |r| r.get(0),
+            )?;
+            if !matches {
+                return Err(layout::InvalidFormat("Sealed identity mismatch".into()).into());
+            }
+            let p: (i64,i64,Option<String>,i64) = c.query_row("SELECT message_count,content_revision,
+                (SELECT substr(content,1,80) FROM messages WHERE sort_order=0),
+                coalesce((SELECT length(CAST(content AS BLOB)) FROM messages WHERE sort_order=0),0) FROM manifest",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            drop(c);
+            layout::checkpoint(&db, SESSION)?;
+            Ok(p)
+        };
+        let projection = match inspect() {
+            Ok(p) => p,
+            Err(e) if damaged_shard(&e) => {
+                self.quarantine(op, dir, "invalid sealed database")?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.step(Phase::Checkpointed)?;
+        if dir != live {
+            if live.try_exists()? {
+                self.quarantine(op, dir, "occupied destination")?;
+                bail!("Session destination occupied");
+            }
+            layout::rename(dir, &live)?;
+            self.step(Phase::Renamed)?;
+        }
+        // Also repeat both barriers on replay after the rename.
+        sync_dir(&self.sessions())?;
+        sync_dir(&self.sessions().join(".staging"))?;
+        self.step(Phase::Installed)?;
+        let mut project_conflict = false;
+        let result = self.global().write("publish session", &op.id, true, |tx| {
+            let (project,workspace) = match &meta.project {
+                None => (None,None),
+                Some(p) => {
+                    let (id, path) = p.publish(tx, &meta.created).inspect_err(|e| {
+                        project_conflict = e.downcast_ref::<rusqlite::Error>().is_none();
+                    })?;
+                    (Some(id), path)
+                }
+            };
+            tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
+                workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12,?13,?14,?14,?15)",
+                params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,
+                    meta.created,projection.0,projection.1,projection.2,projection.3])?;
+            op.finish(tx)?;
+            self.step(Phase::BeforePublishCommit)
+        });
+        if let Err(e) = result {
+            // Validation and constraint conflicts are permanent. IO, busy, and
+            // other SQLite errors retain the sealed operation for retry.
+            let sql = e.downcast_ref::<rusqlite::Error>();
+            if project_conflict
+                || sql.and_then(|e| e.sqlite_error_code())
+                    == Some(rusqlite::ErrorCode::ConstraintViolation)
+            {
+                self.quarantine(op, &live, "publication validation failed")?;
+            }
+            return Err(e);
+        }
+        self.step(Phase::Published)
+    }
+
+    fn retire(&self, op: &Intent) -> Result<()> {
+        let live = op.live(self);
+        let trash = self.sessions().join(".trash").join(&op.incarnation);
+        if live.try_exists()? {
+            ensure!(!trash.try_exists()?, "Retired destination occupied");
+            {
+                let _permit = Permits::take(1);
+                let c = layout::open(&live.join("session.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                layout::verify(&c, SESSION)?;
+                verify_manifest(&c, &op.store, &op.id, &op.incarnation)?;
+            }
+            layout::rename(&live, &trash)?;
+            self.step(Phase::TrashRenamed)?;
+        }
+        sync_dir(&self.sessions())?;
+        sync_dir(trash.parent().unwrap())?;
+        self.step(Phase::Trashed)?;
+        if trash.try_exists()? {
+            fs::remove_dir_all(&trash)?;
+        }
+        sync_dir(trash.parent().unwrap())?;
+        self.step(Phase::Removed)?;
+        self.global()
+            .write("finish delete", &op.id, true, |tx| op.finish(tx))?;
+        self.step(Phase::Retired)
+    }
+
+    pub(super) fn reconcile(&self) -> Result<()> {
+        let keys = self.global().read(|c| {
+            let mut q = c.prepare("SELECT storage_key FROM lifecycle WHERE quarantine_reason IS NULL ORDER BY storage_key")?;
+            let rows = q.query_map([],|r|r.get::<_,String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?;
+        for key in keys {
+            ensure!(layout::is_storage_key(&key), "Invalid journal storage key");
+            let _locks = lock_keys(&self.root.path, vec![&key], true)?;
+            if let Err(error) = self.recover_key(&key) {
+                // Quarantined operations are terminal. Windows sharing errors
+                // stay journaled and can be retried independently of other IDs.
+                if self.pending(&key)?.is_some() && !sharing_violation(&error) {
+                    return Err(error);
+                }
+            }
+        }
+        self.quarantine_orphans()
+    }
+
+    fn quarantine_orphans(&self) -> Result<()> {
+        let _sweep = lock_keys(&self.root.path, vec![".orphan-sweep"], true)?;
+        for entry in fs::read_dir(self.sessions().join(".staging"))? {
+            let entry = entry?;
+            let operation = entry.file_name();
+            let Some(operation) = operation.to_str().filter(|s| canonical_uuid(s)) else {
+                continue;
+            };
+            // An operation's UUID is never reused. Its intent must already be durable
+            // before its stage exists, so no live builder can own an unjournaled stage.
+            let known = self.global().read(|c| Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lifecycle WHERE operation=?1 AND quarantine_reason IS NULL)",
+                [operation], |r| r.get::<_, bool>(0))?))?;
+            if !known && entry.path().join("session.db").try_exists()? {
+                durable_move(
+                    &entry.path(),
+                    &self
+                        .sessions()
+                        .join(".quarantine")
+                        .join(Uuid::new_v4().to_string()),
+                )?;
+            }
+        }
+        for entry in fs::read_dir(self.sessions())? {
+            let entry = entry?;
+            let key = entry.file_name();
+            let Some(key) = key.to_str().filter(|k| layout::is_storage_key(k)) else {
+                continue;
+            };
+            if !entry.file_type()?.is_dir() || !entry.path().join("session.db").try_exists()? {
+                continue;
+            }
+            let owned = || {
+                self.global().read(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1
+                UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?1 AND quarantine_reason IS NULL)",[key],|r|r.get::<_,bool>(0))?))
+            };
+            if owned()? {
+                continue;
+            }
+            let _locks = lock_keys(&self.root.path, vec![key], true)?;
+            if entry.path().try_exists()? && !owned()? {
+                durable_move(
+                    &entry.path(),
+                    &self
+                        .sessions()
+                        .join(".quarantine")
+                        .join(Uuid::new_v4().to_string()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn damaged_shard(error: &anyhow::Error) -> bool {
+    error.is::<layout::InvalidFormat>()
+        || matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::QueryReturnedNoRows)
+                | Some(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::DatabaseCorrupt
+                            | rusqlite::ErrorCode::NotADatabase,
+                        ..
+                    },
+                    _
+                ))
+        )
+}
+
+fn sharing_violation(e: &anyhow::Error) -> bool {
+    cfg!(windows)
+        && e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+impl SessionDb {
+    pub fn delete(&self) -> Result<()> {
+        let s = &self.stores;
+        let _locks = lock_keys(&s.root.path, vec![&self.key], true)?;
+        self.check_directory()?;
+        self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
+        let op = Intent::new(s, &self.id, &self.key, self.incarnation.clone(), "delete");
+        s.global().write("retire session", &self.id, true, |tx| {
+            ensure!(
+                tx.execute(
+                    "DELETE FROM conversations WHERE id=?1 AND incarnation=?2",
+                    [&self.id, &self.incarnation]
+                )? == 1,
+                "Stale session handle"
+            );
+            op.insert(tx, None)?;
+            s.step(Phase::BeforeDeleteIntentCommit)
+        })?;
+        s.step(Phase::DeleteIntent)?;
+        s.retire(&op)
+    }
+}

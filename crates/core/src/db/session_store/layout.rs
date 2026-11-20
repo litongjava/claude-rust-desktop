@@ -2,9 +2,13 @@ use anyhow::{ensure, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct InvalidFormat(String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
@@ -70,6 +74,12 @@ pub(super) fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 pub(super) fn durable_move(from: &Path, to: &Path) -> Result<()> {
+    rename(from, to)?;
+    sync_dir(to.parent().unwrap())?;
+    sync_dir(from.parent().unwrap())
+}
+
+pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -91,8 +101,7 @@ pub(super) fn durable_move(from: &Path, to: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     fs::rename(from, to)?;
-    sync_dir(to.parent().unwrap())?;
-    sync_dir(from.parent().unwrap())
+    Ok(())
 }
 
 pub(super) fn open(path: &Path, flags: OpenFlags) -> Result<Connection> {
@@ -111,12 +120,15 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
     let (app, version, journal): (i32, i32, String) = conn.query_row(
         "SELECT application_id,user_version,journal_mode FROM pragma_application_id,pragma_user_version,pragma_journal_mode",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    ensure!(app == kind, "Unexpected SQLite application ID {app}");
-    ensure!(
-        version == schema_version(kind),
-        "Unsupported schema version {version}"
-    );
-    ensure!(journal == "wal", "Expected WAL journal mode");
+    if app != kind {
+        return Err(InvalidFormat(format!("Unexpected SQLite application ID {app}")).into());
+    }
+    if version != schema_version(kind) {
+        return Err(InvalidFormat(format!("Unsupported schema version {version}")).into());
+    }
+    if journal != "wal" {
+        return Err(InvalidFormat("Expected WAL journal mode".into()).into());
+    }
     Ok(())
 }
 
@@ -164,10 +176,9 @@ pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
     sync_dir(path.parent().unwrap())
 }
 
-pub(super) fn open_root(root: &Path) -> Result<(PathBuf, String)> {
+pub(super) fn open_root(root: &Path) -> Result<String> {
     fs::create_dir_all(root.join("session-locks"))?;
-    let root = root.canonicalize()?;
-    let locks = lock_keys(&root, vec![".directory"], true)?;
+    let locks = lock_keys(root, vec![".directory"], true)?;
     let path = root.join("global.db");
     let marker = root.join("session-locks/.initialized");
     if !path.try_exists()? {
@@ -211,12 +222,19 @@ pub(super) fn open_root(root: &Path) -> Result<(PathBuf, String)> {
         |r| r.get(0),
     )?;
     ensure!(canonical_uuid(&store), "Invalid store UUID");
-    if !marker.try_exists()? {
-        File::create_new(&marker)?.sync_all()?;
-        sync_dir(marker.parent().unwrap())?;
+    if marker.try_exists()? {
+        ensure!(
+            fs::read_to_string(&marker)? == store,
+            "Global store UUID changed"
+        );
+    } else {
+        let temp = marker.with_extension("new");
+        fs::write(&temp, store.as_bytes())?;
+        File::options().write(true).open(&temp)?.sync_all()?;
+        durable_move(&temp, &marker)?;
     }
     drop(locks);
-    Ok((root, store))
+    Ok(store)
 }
 
 // S capacity is shared by every root in the process. Future fork writers
@@ -241,6 +259,8 @@ impl Drop for Permits {
 }
 pub(super) fn integrity(conn: &Connection) -> Result<()> {
     let result: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
-    ensure!(result == "ok", "SQLite integrity check failed: {result}");
+    if result != "ok" {
+        return Err(InvalidFormat(format!("SQLite integrity check failed: {result}")).into());
+    }
     Ok(())
 }
