@@ -6,5 +6,20 @@ crates/core/tests/fixtures/*.pdf binary
 # Android preparation runs in Linux/WSL even when checked out on Windows.
 scripts/fetch-android-proot.sh text eol=lf
 src-tauri/gen/android/gradlew text eol=lf
+# These skills are imported unmodified from upstream Apache-2.0 sources, so
+# keep their original whitespace instead of flagging it as a diff error.
+crates/core/src/skills/bundled/skills/algorithmic-art/** -whitespace
+crates/core/src/skills/bundled/skills/canvas-design/** -whitespace
+crates/core/src/skills/bundled/skills/frontend-design/** -whitespace
+crates/core/src/skills/bundled/skills/internal-comms/** -whitespace
+crates/core/src/skills/bundled/skills/mcp-builder/** -whitespace
+crates/core/src/skills/bundled/skills/slack-gif-creator/** -whitespace
+crates/core/src/skills/bundled/skills/theme-factory/** -whitespace
+crates/core/src/skills/bundled/skills/webapp-testing/** -whitespace
+crates/core/src/skills/bundled/skills/docx/** -whitespace
+crates/core/src/skills/bundled/skills/pdf/** -whitespace
+crates/core/src/skills/bundled/skills/pptx/** -whitespace
+crates/core/src/skills/bundled/skills/xlsx/** -whitespace
+crates/core/src/skills/bundled/skills/claude-api/** -whitespace
 # Preserve the crates.io README, including upstream trailing spaces.
 vendor/crossterm/README.md text eol=lf whitespace=-blank-at-eol
