@@ -1,4 +1,4 @@
-use deepseek_code_core::memory::{ContextManager, MemExClient};
+use deepseek_code_core::memory::MemExClient;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -48,12 +48,10 @@ async fn legacy_preview_backup_roundtrip_recall_and_conflict_rollback() {
     conflicting.as_array_mut().unwrap().push(conflict);
     assert!(client.import_archive(conflicting, false).await.is_err());
     assert_eq!(client.stats().await.unwrap().total_memories, 1);
-    let context = ContextManager::new(client.clone());
-    assert!(context
-        .before_api_call("new-session", "PostgreSQL")
-        .await
-        .unwrap()
-        .contains("Project uses PostgreSQL"));
+    let recalled = client.search("PostgreSQL", None).await.unwrap();
+    assert!(recalled
+        .iter()
+        .any(|memory| memory.content.contains("Project uses PostgreSQL")));
     let mut config = client.get_config().await;
     config.backend_url = "http://127.0.0.1:1".into();
     client.update_config(config).await.unwrap();
