@@ -212,7 +212,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             name: "Bash".to_string(),
             description: format!("Executes a shell command and returns its output.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolLoad (names: [\"TaskGet\"]) and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
 - When a call finishes it cleans up the command's whole process tree, including children the command started. A service that must outlive the call (a local server, a daemon) needs `detach: true`, which starts it outside that tree and returns its pid and log files.
-- With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. `pipeline_sigpipe: true` means the output was only cut short by a reader such as `head`.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.{}", bash_tool.description_suffix()),
+- With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. When a later command such as `head` closes the pipe early, the result says the output ended early.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.{}", bash_tool.description_suffix()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1225,6 +1225,22 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     let flag = resolved.command_flag.to_string();
 
     let actual_shell = shell_type;
+    // The result names the request next to the executable that actually ran, so
+    // the model renderer can report a silent fallback (for example pwsh being
+    // served by powershell.exe) without exposing the path on every call.
+    let requested_shell = input["shell"].as_str().map(str::to_owned);
+    // A managed shell records this in the task, so a later TaskGet can compare
+    // it with `shell_path` and report the same fallback.
+    let display_shell = requested_shell.as_deref().unwrap_or(actual_shell);
+    let annotate = |mut result: serde_json::Value| {
+        result["shell_path"] = serde_json::json!(shell);
+        if result.get("shell").is_some() {
+            if let Some(requested) = &requested_shell {
+                result["shell"] = serde_json::json!(requested);
+            }
+        }
+        result
+    };
     if resolved.wsl.is_some()
         && input
             .get("__sandbox")
@@ -1412,9 +1428,8 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         .to_owned();
     #[cfg(any(target_os = "linux", windows))]
     if let Some((rows, cols)) = pty_size {
-        let mut result = pty_bash::start(cmd, rows, cols, &description, &command)?;
-        result["shell_path"] = serde_json::json!(shell);
-        return Ok(result);
+        let result = pty_bash::start(cmd, rows, cols, &description, &command)?;
+        return Ok(annotate(result));
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     let _ = pty_size;
@@ -1422,17 +1437,16 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         let directory = crate::runtime::resolve_default_data_dir()?
             .join("detached-shells")
             .join(uuid::Uuid::new_v4().to_string());
-        let mut result = bash_process::start_detached(cmd, &directory, actual_shell)?;
+        let mut result = bash_process::start_detached(cmd, &directory, display_shell)?;
         std::fs::write(directory.join("command.txt"), command.as_bytes())?;
         result["directory"] = serde_json::json!(directory);
-        result["shell_path"] = serde_json::json!(shell);
-        Ok(result)
+        Ok(annotate(result))
     } else if background {
         if let Some(timeout_ms) = input
             .get("__monitor_timeout_ms")
             .and_then(serde_json::Value::as_u64)
         {
-            let mut result = monitor::start_with_runtime_limit(
+            let result = monitor::start_with_runtime_limit(
                 cmd,
                 &description,
                 &command,
@@ -1442,39 +1456,37 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                     .map(std::time::Duration::from_millis),
                 wsl_guard,
             )?;
-            result["shell_path"] = serde_json::json!(shell);
-            return Ok(result);
+            return Ok(annotate(result));
         }
-        let mut result = background_shell::start(
+        let result = background_shell::start(
             cmd,
             input
                 .get("timeout")
                 .filter(|value| !value.is_null())
                 .map(|_| timeout),
-            actual_shell,
+            display_shell,
             &description,
             &command,
             wsl_guard,
             interaction,
         )?;
-        result["shell_path"] = serde_json::json!(shell);
-        Ok(result)
+        Ok(annotate(result))
     } else {
         // Ctrl+B can move it to the background while it runs.
         let filtered = input.get("__sandbox").filter(|policy| {
             policy["network_rules"].is_object() && input["dangerouslyDisableSandbox"] != true
         });
         let mark = filtered.map(sandbox::blocked_mark);
-        let mut result = background_shell::run_foreground(
+        let result = background_shell::run_foreground(
             cmd,
             timeout,
-            actual_shell,
+            display_shell,
             &description,
             &command,
             wsl_guard,
         )
         .await?;
-        result["shell_path"] = serde_json::json!(shell);
+        let mut result = annotate(result);
         // Name refused hosts: an HTTPS client often reports only a reset.
         if let (Some(policy), Some(mark)) = (filtered, mark) {
             let hosts = sandbox::blocked_since(policy, mark);
