@@ -283,11 +283,9 @@ pub(crate) enum CommandMetadata {
     Snapshot([crate::performance::command_output::SnapshotSize; 2]),
     ShellSnapshot {
         streams: [crate::performance::command_output::SnapshotSize; 2],
-        exit: i64,
     },
     PageExit(i64), // Existing private sidecars.
     Page {
-        exit: Option<i64>,
         bytes: [usize; 2],
         widths: [ReplacementWidths; 2],
     },
@@ -330,25 +328,19 @@ pub(super) fn replace_metadata(metadata: Option<CommandMetadata>) {
 pub(crate) fn publish_snapshot(
     streams: [crate::performance::command_output::SnapshotSize; 2],
     text_sizes: [usize; 2],
-    exit: impl FnOnce() -> Option<i64>,
 ) {
-    replace_metadata(qualifies(text_sizes).then(|| match exit() {
-        Some(exit) => CommandMetadata::ShellSnapshot { streams, exit },
-        None => CommandMetadata::Snapshot(streams),
-    }));
+    replace_metadata(qualifies(text_sizes).then_some(CommandMetadata::Snapshot(streams)));
 }
 
 pub(crate) fn publish_page(
     stdout: &super::output_page::StreamPage,
     stderr: &super::output_page::StreamPage,
-    exit: impl FnOnce() -> Option<i64>,
 ) {
     let streams = [stdout, stderr];
     // Decoded length is an upper bound. Save exact source widths for any
     // candidate, including a page whose replacements crossed the threshold.
     replace_metadata(
         qualifies(streams.map(|s| s.text.len())).then(|| CommandMetadata::Page {
-            exit: exit(),
             bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
             widths: streams.map(|s| s.widths.clone()),
         }),
@@ -388,7 +380,10 @@ pub(super) async fn run_logged_with_capture(
         let status = run.status.expect("a finished capture has a status");
         let code = status.code();
         let cut_short = cut_short_by_reader(shell, code);
-        json!({"exit_code":code.unwrap_or(-1),"success":status.success() || cut_short,"pipeline_sigpipe":cut_short})
+        let mut result =
+            json!({"success":status.success() || cut_short,"pipeline_sigpipe":cut_short});
+        record_status(&mut result, Some(status));
+        result
     };
     let capture = shell_metadata(
         duration_ms,
@@ -430,16 +425,45 @@ pub(super) async fn run_raw(
     stdin: Option<std::fs::File>,
 ) -> Result<Value> {
     let run = run_captured(command, Some(timeout), None, stdin, limit, false).await?;
-    let code = run.status.and_then(|status| status.code());
-    Ok(json!({
+    let mut value = json!({
         "stdout":run.stdout.text(),
         "stderr":run.stderr.text(),
         "stdout_truncated":run.stdout.overflowed(),
         "stderr_truncated":run.stderr.overflowed(),
-        "exit_code":code.unwrap_or(-1),
         "success":run.status.is_some_and(|status| status.success()),
         "timed_out":run.timed_out
-    }))
+    });
+    record_status(&mut value, run.status);
+    Ok(value)
+}
+
+fn record_status(value: &mut Value, status: Option<std::process::ExitStatus>) {
+    let code = status.and_then(|status| status.code());
+    #[cfg(windows)]
+    let code = code.map(|c| c as u32); // Windows process exit codes are DWORDs.
+    value["exit_code"] = json!(code);
+    #[cfg(unix)]
+    if let Some(signal) = status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)) {
+        value["signal"] = json!(signal);
+    }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn model_tool_output_records_exit_code_and_signal_distinctly() {
+    for (script, code, signal) in [
+        ("kill -TERM $$", None, Some(15)),
+        ("exit 143", Some(143), None),
+    ] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let result = run(&mut command, Duration::from_secs(5), "sh")
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"].as_i64(), code);
+        assert_eq!(result["signal"].as_i64(), signal);
+        assert_eq!(result["success"], false);
+    }
 }
 
 /// One bounded capture of a child process.

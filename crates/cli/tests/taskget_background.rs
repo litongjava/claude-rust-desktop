@@ -64,7 +64,7 @@ fn text_frames(text: &str) -> Vec<Value> {
 
 const REVIEW_PAGE_LINE: &str =
     "not test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
-const REVIEW_PAGE_COMMAND: &str = r#"node -e "process.stdout.write('not test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'+('f'.repeat(59)+'\n').repeat(250))""#;
+const REVIEW_PAGE_COMMAND: &str = r#"node -e "process.stdout.write('not test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'+(String.fromCharCode(34).repeat(59)+'\n').repeat(250))""#;
 
 async fn respond(
     State(fixture): State<Fixture>,
@@ -156,7 +156,7 @@ async fn respond(
                 }),
             )
         }
-        3 | 4 => {
+        3 => {
             let result = last_tool_result(&body)
                 .unwrap_or_else(|| panic!("TaskGet result missing in request {body}"));
             *fixture.taskget_result.lock().unwrap() = Some(result.clone());
@@ -323,18 +323,18 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
             .unwrap()["content"]
             .as_str()
             .unwrap();
-        assert!(summary.contains("Command output summary"), "{summary}");
-        assert!(summary.contains("elapsed "), "{summary}");
+        assert!(summary.contains("Omitted output:"), "{summary}");
+        assert!(!summary.contains("Elapsed:"), "{summary}");
         assert_eq!(summary.matches("warning: duplicated tail").count(), 1);
         assert!(
-            summary.contains(r#"Notable stdout L3 | "error: hidden in the model preview""#),
+            summary.contains(r#"stdout L3 | "error: hidden in the model preview""#),
             "{summary}"
         );
         assert!(summary.len() <= 16_000);
         let public_events = String::from_utf8_lossy(&output.stdout);
         assert!(public_events.contains("warning: duplicated tail"));
         assert!(!public_events.contains("output_capture"));
-        assert!(!public_events.contains("Command output summary"));
+        assert!(!public_events.contains("Omitted output:"));
         let paths = deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap();
         let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let raw = store
@@ -350,7 +350,7 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
             .unwrap();
         assert!(raw.contains("warning: duplicated tail"));
         assert!(!raw.contains("output_capture"));
-        assert!(!raw.contains("Command output summary"));
+        assert!(!raw.contains("Omitted output:"));
         let summary = summary.to_owned();
         drop(requests);
         for prompt in ["Replay the fixture", "/compact Keep the fixture command"] {
@@ -398,7 +398,7 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
         let compact = serde_json::to_string(compact).unwrap();
         assert!(compact.contains("warning: duplicated tail"), "{compact}");
         assert!(!compact.contains("output_capture"));
-        assert!(!compact.contains("Command output summary"));
+        assert!(!compact.contains("Omitted output:"));
         return;
     }
 
@@ -414,18 +414,29 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
     assert!(started["stdout_file"].as_str().is_some());
     assert!(started["stderr_file"].as_str().is_some());
 
-    let retrieved = fixture
-        .taskget_result
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("TaskGet result");
+    let retrieved: Value = if long_output {
+        // The JSON-escaped page exceeds the model budget. Its public tool
+        // event retains the complete page and cursor.
+        let public = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "tool_result" && e["name"] == "TaskGet")
+            .unwrap();
+        serde_json::from_str(public["output"].as_str().unwrap()).unwrap()
+    } else {
+        fixture
+            .taskget_result
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("TaskGet result")
+    };
     assert_eq!(retrieved["status"], "completed", "{retrieved}");
     assert_eq!(retrieved["retrieval_status"], "success", "{retrieved}");
     if long_output {
         let exact = format!(
             "{REVIEW_PAGE_LINE}\n{}",
-            format!("{}\n", "f".repeat(59)).repeat(250)
+            format!("{}\n", "\"".repeat(59)).repeat(250)
         );
         assert_eq!(retrieved["stdout"], &exact[4..14004]);
         assert_eq!(retrieved["stderr"], "");
@@ -443,16 +454,11 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
             .as_str()
             .unwrap();
         assert!(rendered.len() <= 16_000, "{}", rendered.len());
-        if opt_out != OptOut::None {
-            assert!(retrieved.get("model_output_summary").is_none());
-        } else {
-            let summary = retrieved["model_output_summary"].as_str().unwrap();
-            assert!(summary.contains("Exit status 0 | output page"), "{summary}");
-            assert!(summary.contains("stdout 14000 text bytes"), "{summary}");
-            assert!(!summary.contains("Scanned diagnostics"), "{summary}");
-            assert!(!summary.contains("1 failed"), "{summary}");
-            assert!(!summary.contains("Test summary"), "{summary}");
-        }
+        assert_eq!(
+            rendered.contains("Omitted output:"),
+            opt_out == OptOut::None
+        );
+        assert!(retrieved.get("model_output_summary").is_none());
     } else {
         assert_eq!(retrieved["stdout"], "bg-line\n");
         assert!(retrieved.get("model_output_summary").is_none());
@@ -648,14 +654,10 @@ async fn paged_run(raw_size: Option<usize>) {
                 .unwrap()["content"]
                 .as_str()
                 .unwrap();
-            assert_eq!(content.contains("Command output summary"), size >= 12_000);
-            if size >= 12_000 {
-                assert!(content.contains("Exit status 0"), "{content}");
-                assert!(
-                    content.contains("12000 source bytes") || content.contains("12000 page bytes"),
-                    "{content}"
-                );
-            }
+            assert!(
+                !content.contains("Omitted output:") && !content.contains("model_output_summary"),
+                "complete page or aliased snapshot"
+            );
         }
         return;
     }

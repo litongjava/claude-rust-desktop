@@ -711,7 +711,7 @@ fn snapshot(directory: &Path, id: &str, input: &Value, block: bool) -> Result<Va
             )?;
         }
         let page = output_page::read_stream_page(stream.as_mut(), offset, max_bytes, done)?;
-        crate::tools::bash_process::publish_page(&page, &Default::default(), || None);
+        crate::tools::bash_process::publish_page(&page, &Default::default());
         let next = Cursor::new(
             id,
             "toolscript",
@@ -740,7 +740,6 @@ fn snapshot(directory: &Path, id: &str, input: &Value, block: bool) -> Result<Va
     crate::tools::bash_process::publish_snapshot(
         [size, Default::default()],
         [stdout.len(), 0],
-        || None,
     );
     value["stdout"] = json!(stdout);
     value["stderr"] = json!("");

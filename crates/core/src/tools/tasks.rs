@@ -311,7 +311,6 @@ fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
     super::bash_process::publish_snapshot(
         [out_size, err_size],
         [stdout.len(), stderr.len()],
-        || None,
     );
     let id = job.id.clone();
     Ok(
@@ -424,7 +423,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
         let stdout = bounded_head(&report, *max_bytes);
         let remaining = max_bytes.saturating_sub(stdout.text.len() as u64);
         let stderr = output_page::read_stream_page(stderr_stream.as_mut(), err, remaining, done)?;
-        super::bash_process::publish_page(&stdout, &stderr, || value["exit_code"].as_i64());
+        super::bash_process::publish_page(&stdout, &stderr);
         let truncated = stdout.truncated || stderr.truncated;
         value["stdout"] = json!(stdout.text);
         value["stderr"] = json!(stderr.text);
@@ -456,7 +455,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
     )
     .with_out_skip(stdout.skip)
     .with_out_join(stdout.joined);
-    super::bash_process::publish_page(&stdout, &stderr, || value["exit_code"].as_i64());
+    super::bash_process::publish_page(&stdout, &stderr);
     let truncated = stdout.truncated || stderr.truncated;
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);

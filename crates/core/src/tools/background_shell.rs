@@ -1426,7 +1426,6 @@ pub(super) fn control(
         super::bash_process::publish_snapshot(
             [size, Default::default()],
             [stdout.len(), 0],
-            || None,
         );
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
@@ -1474,7 +1473,6 @@ pub(super) fn control(
     super::bash_process::publish_snapshot(
         [out_size, err_size],
         [stdout.len(), stderr.len()],
-        || stored_shell_exit(&task, terminal(&status)),
     );
     let mut snapshot = task;
     snapshot["task_id"] = json!(id);
@@ -1513,19 +1511,13 @@ pub(super) fn control(
     Ok(Some(snapshot))
 }
 
-/// Read the actual status before TaskGet renders a managed shell's stored
-/// result. Its rendered stdout may itself look like a JSON command result.
-fn stored_shell_exit(task: &Value, done: bool) -> Option<i64> {
-    if !done || task["metadata"]["interaction"] == "pty" {
-        return None;
-    }
-    [&task["result"], &task["output"]]
-        .into_iter()
-        .find_map(|result| {
-            result["exit_code"].as_i64().or_else(|| {
-                serde_json::from_str::<Value>(result.as_str()?).ok()?["exit_code"].as_i64()
-            })
-        })
+/// The stored outcome is still structured before TaskGet replaces it with
+/// a display string or clears it from a page.
+fn stored_shell_signal(task: &Value) -> Option<i64> {
+    let output = &task["output"];
+    output["signal"].as_i64().or_else(|| {
+        serde_json::from_str::<Value>(output.as_str()?).ok()?["signal"].as_i64()
+    })
 }
 
 /// Reads at most `limit` bytes from the end of a log file.
@@ -1806,7 +1798,12 @@ fn page_task_get(
     let mut value = task;
     value["task_id"] = json!(id);
     value["status"] = status.clone();
-    super::bash_process::publish_page(&stdout, &stderr, || stored_shell_exit(&value, done));
+    super::bash_process::publish_page(&stdout, &stderr);
+    if done && value["metadata"]["interaction"] != "pty" {
+        if let Some(signal) = stored_shell_signal(&value) {
+            value["termination_reason"] = json!(format!("terminated by signal {signal}"));
+        }
+    }
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
     // Page mode exposes only the page; the stored text is never repeated.

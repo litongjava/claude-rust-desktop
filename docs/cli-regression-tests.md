@@ -883,8 +883,9 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 
 - 摘要缺省开启。用 `dcl config set summarize_long_command_output false`（可加全局 `--data-dir`）写入所选数据目录的 `settings.json`，CLI、SDK 和使用同一数据目录的 Desktop 共用此设置。任意来源明确设置 `false` 即关闭，其他位置的 `true` 无法覆盖。JSON 支持顶层或 `tools` 对象内的键，来源为数据目录的 `settings.json`、`config.json`、`customization.json` 及工作区的 `.claude/settings.json`、`.claude/settings.local.json`。TOML 支持 `[tools]`（或顶层）的同名键，读取数据目录的 `config/orchestration.toml` 及工作区和进程目录对应的 `config/orchestration.toml`、`src-tauri/config/orchestration.toml`、`../config/orchestration.toml`。启动时加载的 TOML 变更后可重启；`DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT=false` 同样关闭。
 - Bash（含 PowerShell）和后台 TaskGet 快照、分页合计 stdout/stderr 的原始字节，达到 12,000 字节才附加摘要。工具截断不单独触发摘要。PTY/ConPTY 控制台任务保留原结果。用 11,999 和 12,000 字节的无效 UTF-8 输入跨过门槛，核对真实模型请求中的快照和分页。完整短输出（包括 44 字节的字面占位符）应与关闭摘要时逐字节一致。
-- 核对退出码、已知耗时、每个流的源字节数、行数、预览保留量和各级省略量。后台快照以日志为源，未知的总量应标明；分页的行号相对于当前页，缺少源坐标的摘录使用当前结果内的行号。换行归属上一行，预览两端落在同一行时只计一次。大小统计描述原预览，另附的引文不计入保留量。
-- 摘要最多列出五条去重的标记行，再列含可见文字的首尾摘录。检查 `error`、`fatal:`、`FAILED`、`panicked at`、`Traceback`、`AssertionError`、`npm ERR!`、`BUILD FAILURE`。每段引文最多 112 个 UTF-8 字节。原预览已经包含引文时只给位置；只露出换行或末尾一个字符时仍应引用完整的短诊断。用空白包围仅有的文字，验证 4 KiB 管道扫描窗口和截断缺口两侧的行号与引用。
+- 用同一后台命令的快照和页验证：`seq -f 'row-%04.0f-diagnostic' 0 599` 的 600 行在快照的 `output`、`result`、`stdout` 中有多份，合并可见区间后没有省略项。重复内容跨多个片段时按源坐标去重；字节按原始宽度，整行数只计完全不可见的行。
+- 用 `printf '%012000d' 0; kill -TERM "$$"` 验证 TaskGet 保留信号 15；直接用 `exit 143` 验证正常非零退出。前台失败状态只出现一次。完全可见的流、头尾、已显示的标记行及小于 10 秒的耗时不添加说明。
+- `Omitted output:` 最多附五条带行号的隐藏标记行。生成双流、转义文本和无效 UTF-8，测试 9,999/10,000 毫秒边界、跨截断的源行、已有 spill 路径、无省略时逐字节保持原消息，以及 16,000 字节预算。
 - 回放跨捕获缺口或 stdout/stderr 的真实 libtest 输出、相互矛盾的 pytest/Jest footer。摘要只引用来源可核对的原文，不计算任何测试计数或推断结果。固定种子生成双流、伪 footer、随机内容、无效 UTF-8 和随机截断边界；逐一校验行号、引文、原始字节数、行数和 16,000 字节消息预算。
 - 本地 OpenAI 和 Anthropic mock 覆盖普通调用、后台 TaskGet、恢复/分叉、手动压缩与关闭设置。核对原始事件、SQLite 记录、分页文本和游标；摘要仅出现在模型副本。
 

@@ -21,8 +21,6 @@ pub(crate) struct Line {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Lines {
     pub notable: Vec<Line>,
-    pub head: Option<Line>,
-    pub tail: Option<Line>,
 }
 
 fn blank(c: char) -> bool {
@@ -31,23 +29,10 @@ fn blank(c: char) -> bool {
 
 impl Lines {
     pub fn observe(&mut self, number: usize, raw: &str) {
-        let text = raw.trim_matches(blank);
-        if text.is_empty() {
-            return;
-        }
-        if self.head.is_none() {
-            self.head = Some(Line {
-                number,
-                text: prefix(text).to_owned(),
-            });
-        }
-        let tail = self.tail.get_or_insert_with(|| Line {
-            number,
-            text: String::new(),
-        });
-        tail.number = number;
-        tail.text.clear();
-        tail.text.push_str(suffix(text));
+        self.observe_if(number, raw, |_| true);
+    }
+
+    pub fn observe_if(&mut self, number: usize, raw: &str, include: impl FnOnce(&str) -> bool) {
         if self.notable.len() == MAX_NOTABLE
             || self
                 .notable
@@ -56,6 +41,7 @@ impl Lines {
         {
             return;
         }
+        let text = raw.trim_matches(blank);
         if let Some(marker) = MARKERS.find(text) {
             let start = prefix(text);
             let quote = if marker.end() <= start.len() {
@@ -63,7 +49,7 @@ impl Lines {
             } else {
                 prefix(&text[marker.start()..])
             };
-            if !self.notable.iter().any(|line| line.text == quote) {
+            if include(quote) && !self.notable.iter().any(|line| line.text == quote) {
                 self.notable.push(Line {
                     number,
                     text: quote.to_owned(),
@@ -164,17 +150,6 @@ fn prefix(s: &str) -> &str {
         used += escaped_width(c);
         if used > QUOTE_BYTES {
             return &s[..i];
-        }
-    }
-    s
-}
-
-fn suffix(s: &str) -> &str {
-    let mut used = 0;
-    for (i, c) in s.char_indices().rev() {
-        used += escaped_width(c);
-        if used > QUOTE_BYTES {
-            return &s[i + c.len_utf8()..];
         }
     }
     s

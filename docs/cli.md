@@ -73,7 +73,7 @@ REPL 支持 `/help`、`/status`、`/history`、`/tools`、`/exit`；Ctrl+C 取�
 
 ## 长命令输出
 
-Bash（含 PowerShell）和后台 TaskGet 的 stdout 与 stderr 合计达到 12,000 个原始字节时，模型会收到一份附加摘要。控制台 PTY/ConPTY 任务保留原有结构。摘要列出退出码、已知耗时、各流的大小和省略量，引用带行号的错误标记行和首尾文字。后台快照统计日志，分页统计当前页；无法取得的总量标为未知。完整短输出保持原样。
+Bash（含 PowerShell）与 TaskGet 的 stdout 和 stderr 合计达到 12,000 个原始字节后，模型预览按流列出丢失的字节、整行数，以及最多五条未显示的错误标记行和源行号。快照中多次出现的内容合并计量。耗时达到 10 秒才显示；输出完整且没有需要补充的信息时保留原预览。PTY/ConPTY 控制台保留原有结构。
 
 摘要默认开启。运行 `dcl config set summarize_long_command_output false` 可以关闭，环境变量 `DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT=false` 也可关闭。该选项只影响发送给模型的预览，原始工具事件和保存的命令输出仍可查看。
 

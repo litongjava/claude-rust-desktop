@@ -8,7 +8,6 @@ use serde_json::Value;
 use std::{ops::Range, path::Path};
 
 const DIGEST_BUDGET: usize = 2048;
-const MIN_JSON_DIGEST_ROOM: usize = 256;
 
 #[path = "command_output_summary.rs"]
 mod command_output_summary;
@@ -175,8 +174,19 @@ fn render_with_spans(
             .and_then(|shell| shell.as_str().map(str::to_owned));
         // A zero exit code is the normal case; only a failure needs naming.
         let mut exit_shown = false;
+        if fields.get("exit_code").is_none_or(Value::is_null) {
+            if let Some(signal) = fields
+                .get("signal")
+                .and_then(Value::as_u64)
+                .filter(|s| *s > 0)
+            {
+                parts.push(format!("Command terminated by signal {signal}"));
+                fields.remove("signal");
+                exit_shown = true;
+            }
+        }
         if let Some(code) = fields.remove("exit_code") {
-            if code.as_i64().is_some_and(|code| code != 0) {
+            if !exit_shown && code.as_i64().is_some_and(|code| code != 0 && code != -1) {
                 parts.push(format!("Exit code: {code}"));
                 exit_shown = true;
             }
@@ -319,7 +329,7 @@ pub(super) fn command_preview(
     metadata: Option<&CommandMetadata>,
     enabled: bool,
 ) -> String {
-    command_preview_with_room(name, raw, root, metadata, enabled, MIN_JSON_DIGEST_ROOM)
+    command_preview_with_room(name, raw, root, metadata, enabled, 0)
 }
 
 fn command_preview_with_room(
@@ -328,22 +338,17 @@ fn command_preview_with_room(
     root: Option<&Path>,
     metadata: Option<&CommandMetadata>,
     enabled: bool,
-    json_room: usize,
+    reserved: usize,
 ) -> String {
-    use command_output_summary::{CommandOutput, Stream};
-
+    use command_output_summary::Stream;
     let bash = name == "Bash";
-    let (capture, saved_exit, page_bytes) = match metadata {
-        Some(CommandMetadata::Shell(capture)) => (Some(capture), None, None),
-        Some(CommandMetadata::PageExit(exit) | CommandMetadata::ShellSnapshot { exit, .. }) => {
-            (None, Some(*exit), None)
-        }
-        Some(CommandMetadata::Page {
-            exit,
-            bytes,
-            widths,
-        }) => (None, *exit, Some((bytes, widths))),
-        Some(CommandMetadata::Snapshot(_)) | None => (None, None, None),
+    let capture = match metadata {
+        Some(CommandMetadata::Shell(s)) => Some(s),
+        _ => None,
+    };
+    let page_bytes = match metadata {
+        Some(CommandMetadata::Page { bytes, widths, .. }) => Some((bytes, widths)),
+        _ => None,
     };
     let cleaned = render(name, raw, None);
     let mut spans = [None, None];
@@ -359,7 +364,7 @@ fn command_preview_with_room(
         Some(root) => retain_tool_output_with_ranges(root, &cleaned, &draft, limit),
         None => (draft.clone(), Some(PreviewRanges::whole(draft.len()))),
     };
-    let (mut base, mut retained) = retain(MODEL_TOOL_OUTPUT_BYTES);
+    let (mut base, retained) = retain(MODEL_TOOL_OUTPUT_BYTES - reserved);
     if !enabled {
         return base;
     }
@@ -440,17 +445,6 @@ fn command_preview_with_room(
             .or_else(|| stats.map(|s| s.bytes))
             .or_else(|| legacy("bytes"));
         let lines = stats.map(|s| s.lines).or_else(|| legacy("lines"));
-        let capture_elided = stats
-            .map(|s| s.capture_elided_bytes)
-            .or_else(|| {
-                snapshot
-                    .filter(|s| !s.from_tail || s.omitted > 0)
-                    .map(|s| s.omitted)
-            })
-            .or_else(|| legacy("capture_elided_bytes"));
-        let tool_elided = stats
-            .map(|s| s.tool_elided_text_bytes)
-            .or_else(|| legacy("tool_elided_text_bytes"));
         let source_ranges = stats.map(|s| s.ranges.clone()).filter(|ranges| {
             ranges
                 .iter()
@@ -484,16 +478,12 @@ fn command_preview_with_room(
                     .or_else(|| snapshot.map(|s| s.read)),
                 bytes,
                 lines: lines.or_else(|| {
-                    (!partial || snapshot.is_some_and(|s| !s.from_tail && s.omitted == 0)).then(
-                        || {
+                    (page || !partial || snapshot.is_some_and(|s| !s.from_tail && s.omitted == 0))
+                        .then(|| {
                             crate::performance::command_output::ByteLines::measure(text.as_bytes())
                                 .lines()
-                        },
-                    )
+                        })
                 }),
-                partial,
-                capture_elided,
-                tool_elided,
                 first_lines: stats.map(|s| s.first_lines.clone()).unwrap_or_default(),
                 widths: stats
                     .map(|s| &s.widths)
@@ -502,7 +492,7 @@ fn command_preview_with_room(
                     .cloned()
                     .unwrap_or_default(),
                 source_ranges,
-                visible: None,
+                visible: Vec::new(),
                 page_continuation: page
                     && (offset
                         != page_bytes
@@ -535,12 +525,6 @@ fn command_preview_with_room(
         return base;
     }
 
-    // Preserve complete result JSON whenever it leaves room for the digest's
-    // status and counts. Otherwise use the same preview and spill as large results.
-    let keep_json = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES - json_room;
-    if !keep_json && root.is_some() && base.len() > MODEL_TOOL_OUTPUT_BYTES - DIGEST_BUDGET {
-        (base, retained) = retain(MODEL_TOOL_OUTPUT_BYTES - DIGEST_BUDGET);
-    }
     let json_result = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
     let outer = retained.unwrap_or_else(|| {
         if bash {
@@ -564,44 +548,73 @@ fn command_preview_with_room(
             .ok()
         })
         .flatten();
+    let mut copies = Vec::new();
+    if let Some(fields) = &json_fields {
+        for (key, field) in fields {
+            if let Some(text) = value[key].as_str() {
+                let encoded = field.get();
+                let start = encoded.as_ptr() as usize - raw.as_ptr() as usize;
+                let visible = visible_json_string(text, encoded, start, &outer);
+                if !visible.is_empty() {
+                    copies.push((key.as_str(), text, visible));
+                }
+            }
+        }
+    }
     for ((key, stream), span) in streams.iter_mut().zip(spans) {
         let all = [0..stream.text.len()];
         let sources = stream.source_ranges.as_deref().unwrap_or(&all);
         if json_result {
-            stream.visible = Some(sources.to_vec());
+            stream.visible = sources.to_vec();
         } else if let Some(span) = span {
-            stream.visible = Some(visible_ranges(sources, &span, &outer));
-        } else if let Some(field) = json_fields.as_ref().and_then(|fields| fields.get(*key)) {
-            let encoded = field.get();
-            if encoded.starts_with('"') {
-                let start = encoded.as_ptr() as usize - raw.as_ptr() as usize;
-                stream.visible = Some(visible_json_string(stream.text, encoded, start, &outer));
+            stream.visible = visible_ranges(sources, &span, &outer);
+            copies.push((*key, stream.text, stream.visible.clone()));
+        }
+    }
+    if !json_result {
+        for (name, stream) in &mut streams {
+            if stream.text.is_empty() {
+                continue;
             }
+            for (key, alias, kept) in &copies {
+                if key == name {
+                    stream.visible.extend_from_slice(kept);
+                } else {
+                    let managed = task
+                        && value["metadata"]["managed_shell"] == true
+                        && matches!(*key, "output" | "result");
+                    project_alias(name, stream.text, alias, kept, managed, &mut stream.visible);
+                }
+            }
+            stream.visible.sort_unstable_by_key(|r| r.start);
+            stream.visible.dedup_by(|next, previous| {
+                if next.start > previous.end {
+                    return false;
+                }
+                previous.end = previous.end.max(next.end);
+                true
+            });
         }
     }
 
-    let summary = command_output_summary::summarize(&CommandOutput {
-        streams,
-        exit: value["exit_code"]
-            .as_i64()
-            .or_else(|| command["exit_code"].as_i64())
-            .or(saved_exit),
-        duration_ms: capture
-            .map(|s| s.duration_ms)
-            .or_else(|| legacy_capture["duration_ms"].as_u64())
-            .or_else(|| value["duration_ms"].as_u64())
-            .or_else(|| {
-                value["finished_ms"]
-                    .as_u64()?
-                    .checked_sub(value["started_ms"].as_u64()?)
-            }),
-        page,
-        log_snapshot: matches!(
-            metadata,
-            Some(CommandMetadata::Snapshot(_) | CommandMetadata::ShellSnapshot { .. })
-        ),
-        serialized_elided,
+    let duration_ms = capture
+        .map(|s| s.duration_ms)
+        .or_else(|| legacy_capture["duration_ms"].as_u64())
+        .or_else(|| value["duration_ms"].as_u64())
+        .or_else(|| {
+            value["finished_ms"]
+                .as_u64()?
+                .checked_sub(value["started_ms"].as_u64()?)
+        });
+    // A complete JSON message already exposes an explicit duration field.
+    let duration_ms = duration_ms.filter(|ms| {
+        !(json_result && value["duration_ms"].as_u64() == Some(*ms))
+            && !base.contains(&format!(r#""duration_ms":{ms}"#))
     });
+    let summary = command_output_summary::summarize(&streams, duration_ms, &base);
+    if summary.is_empty() {
+        return base;
+    }
     let available = MODEL_TOOL_OUTPUT_BYTES
         .saturating_sub(base.len())
         .min(DIGEST_BUDGET);
@@ -615,34 +628,82 @@ fn command_preview_with_room(
             format!("\n\n{text}")
         }
     };
-    // Only spill an otherwise complete JSON preview when its actual summary
-    // needs the space. Recompute visibility against the new excerpt.
-    if json_result
-        && root.is_some()
-        && json_room < DIGEST_BUDGET
-        && encode(&summary).len() > available
-    {
+    let appendix = encode(&summary);
+    if appendix.len() > available && root.is_some() && reserved == 0 {
         return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
     }
-    // Whole digest lines are atomic, including under JSON escaping.
-    let mut end = 0;
-    for (line_end, _) in summary
-        .match_indices('\n')
-        .chain(std::iter::once((summary.len(), "")))
-    {
-        if encode(&summary[..line_end]).len() > available {
-            break;
-        }
-        end = line_end;
-    }
-    if end > "Command output summary".len() {
+    if appendix.len() <= available {
         if json_result {
-            base.insert_str(json_end - 1, &encode(&summary[..end]));
+            base.insert_str(json_end - 1, &appendix);
         } else {
-            base.push_str(&encode(&summary[..end]));
+            base.push_str(&appendix);
         }
     }
     base
+}
+
+/// A stored managed result can include status text, labels and the shell's
+/// own head/tail cut. Map only verbatim source spans into stream coordinates.
+fn project_alias(
+    name: &str,
+    stream: &str,
+    alias: &str,
+    kept: &[Range<usize>],
+    managed: bool,
+    out: &mut Vec<Range<usize>>,
+) {
+    let mut project = |at: usize, source: Range<usize>| {
+        for r in kept {
+            let start = r.start.max(at);
+            let end = r.end.min(at + source.len());
+            if start < end {
+                out.push(source.start + (start - at)..source.start + (end - at));
+            }
+        }
+    };
+    if alias.contains(stream) {
+        for (at, _) in alias.match_indices(stream) {
+            project(at, 0..stream.len());
+        }
+        return;
+    }
+    if !managed {
+        return;
+    }
+    let label = if name == "stdout" {
+        "Output:\n"
+    } else {
+        "Stderr:\n"
+    };
+    let body = match alias.split_once(label) {
+        Some((_, s)) => s,
+        None => alias,
+    };
+    let body = if name == "stdout" {
+        body.split_once("\nStderr:\n").map_or(body, |(s, _)| s)
+    } else {
+        body
+    };
+    let at = body.as_ptr() as usize - alias.as_ptr() as usize;
+    // An alias may have been clipped before TaskGet read its log. Its prefix
+    // and suffix have known origins only when the source bytes agree.
+    if let Some((head, cut)) = body.split_once("\n... (") {
+        if let Some((marker, tail)) = cut.split_once(") ...\n") {
+            if marker.starts_with("output truncated; ")
+                || marker == "capture truncated; middle omitted"
+            {
+                if stream.starts_with(head) {
+                    project(at, 0..head.len());
+                }
+                if stream.ends_with(tail) {
+                    project(
+                        at + body.len() - tail.len(),
+                        stream.len() - tail.len()..stream.len(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Map complete visible JSON string scalars back to the decoded stream.
@@ -846,12 +907,12 @@ mod tests {
         );
         let raw = json!({"stdout":stdout,"stderr":"","shell":"bash","shell_path":"/bin/bash","success":true,"exit_code":0,"pipeline_sigpipe":false}).to_string();
         let result = command_preview("Bash", &raw, Some(dir.path()), None, true);
-        let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
+        let (body, summary) = result.split_once("\n\nOmitted output:").unwrap();
         assert!(body.starts_with("error: head\n"));
         assert!(!body.contains("fatal: middle"));
-        assert!(summary.contains("Notable stdout L1 (in preview)"));
-        assert!(summary.contains(r#"Notable stdout L3 | "fatal: middle""#));
-        assert!(summary.contains("Notable stdout L5 (in preview)"));
+        assert!(!summary.contains("error: head"));
+        assert!(summary.contains(r#"stdout L3 | "fatal: middle""#));
+        assert!(!summary.contains("FAILED tail"));
     }
 
     #[test]
@@ -869,27 +930,79 @@ mod tests {
         // A plain managed shell can print JSON with a fabricated exit code.
         task["metadata"]["interaction"] = json!("pipe");
         let raw = task.to_string();
-        let metadata = CommandMetadata::ShellSnapshot {
-            streams: [
-                crate::performance::command_output::SnapshotSize {
-                    read: 12000,
-                    ..Default::default()
-                },
-                Default::default(),
-            ],
-            exit: 0,
-        };
-        for (capture, expected) in [
-            (Some(&metadata), "Exit status 0"),
-            (None, "Exit status unknown"),
-        ] {
-            let rendered = command_preview("TaskGet", &raw, Some(dir.path()), capture, true);
-            let value: Value = serde_json::from_str(&rendered).unwrap();
-            assert_eq!(value["result"], outcome);
-            assert!(value["model_output_summary"]
-                .as_str()
+        assert_eq!(
+            command_preview("TaskGet", &raw, Some(dir.path()), None, true),
+            raw
+        );
+    }
+
+    #[test]
+    fn model_tool_output_counts_source_once_across_snapshot_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [600, 1100] {
+            let stdout = (0..count)
+                .map(|i| format!("row-{i:04}-diagnostic\n"))
+                .collect::<String>();
+            let raw = json!({"status":"completed","metadata":{"managed_shell":true},"stdout":stdout,"stderr":"","output":stdout,"result":stdout}).to_string();
+            let view = command_preview("TaskGet", &raw, Some(dir.path()), None, true);
+            let (body, appendix) = view
+                .split_once("\n\nOmitted output:")
+                .unwrap_or((&view, ""));
+            let (head, tail) = body.split_once("\n... (output truncated; ").unwrap();
+            let tail = tail
+                .split_once(" bytes before preview) ...\n")
                 .unwrap()
-                .contains(expected));
+                .1
+                .split_once("\nSaved tool result")
+                .unwrap()
+                .0;
+            // Independent oracle: locate every ASCII source byte in each
+            // actual JSON field, counting a two-byte LF escape atomically.
+            let mut seen = vec![false; stdout.len()];
+            for field in ["stdout", "result", "output"] {
+                let key = format!(r#""{field}":""#);
+                let mut pos = raw.find(&key).unwrap() + key.len();
+                for (i, ch) in stdout.bytes().enumerate() {
+                    let next = pos + if ch == b'\n' { 2 } else { 1 };
+                    seen[i] |= next <= head.len() || pos >= raw.len() - tail.len();
+                    pos = next;
+                }
+            }
+            let missing = seen.iter().filter(|b| !**b).count();
+            if count == 600 {
+                assert_eq!(missing, 0);
+                assert!(appendix.is_empty());
+            } else {
+                let lines = seen
+                    .chunks_exact(20)
+                    .filter(|line| !line.contains(&true))
+                    .count();
+                assert_eq!(
+                    appendix.trim(),
+                    format!("stdout: {missing} bytes, {lines} whole lines")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_tool_output_elapsed_requires_ten_seconds_and_hidden_information() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = vec![b'x'; 12_000];
+        let (raw, capture) =
+            crate::tools::bash_process::fixture_capture([&stdout, b""], 100_000, 100_000, 0);
+        let mut meta = capture.unwrap();
+        for ms in [9999, 10000] {
+            let CommandMetadata::Shell(ref mut capture) = meta else {
+                unreachable!()
+            };
+            capture.duration_ms = ms;
+            let view = command_preview("Bash", &raw, Some(dir.path()), Some(&meta), true);
+            if ms == 9999 {
+                assert_eq!(view.as_bytes(), stdout);
+            } else {
+                assert_eq!(view, format!("{}\n\nElapsed: 10000 ms", "x".repeat(12_000)));
+            }
         }
     }
 
@@ -909,7 +1022,7 @@ mod tests {
                 assert_eq!(result, render("Bash", &raw, None));
                 continue;
             }
-            let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
+            let (body, summary) = result.split_once("\n\nOmitted output:").unwrap();
             let stream = &capture.stdout;
             assert_eq!((stream.bytes, stream.lines), (52_428_888, 819_204));
             let (_, stdout) = body.split_once("Output:\n").unwrap();
@@ -918,22 +1031,23 @@ mod tests {
             let (_, tail) = clipped.split_once(" bytes before preview) ...\n").unwrap();
             let shown = head.len() + tail.len();
             let lines = head.lines().count() + tail.lines().count();
-            assert!(summary.contains(&format!("stdout {shown} text bytes, {lines} lines shown of 52428888 source bytes / 819204 lines")), "{summary}");
-            let tool_text = stream.ranges.iter().map(Range::len).sum::<usize>();
+            // One invalid source byte became three UTF-8 preview bytes.
             assert!(
                 summary.contains(&format!(
-                    "Model preview omitted {} text bytes",
-                    tool_text - shown
+                    "stdout: {} bytes, {} whole lines",
+                    stream.bytes - (shown - 2),
+                    stream.lines - lines
                 )),
                 "{summary}"
             );
+            assert!(!summary.contains("stderr:"));
             assert_eq!(
                 result.matches("warning: final fixture").count(),
                 1,
                 "{summary}"
             );
             assert!(
-                summary.contains(r#"Notable stdout L409602 | "error: midpoint sentinel""#),
+                summary.contains(r#"stdout L409602 | "error: midpoint sentinel""#),
                 "{summary}"
             );
             assert!(result.len() <= MODEL_TOOL_OUTPUT_BYTES);
@@ -1021,11 +1135,7 @@ mod tests {
                 .unwrap()["content"]
                 .as_str()
                 .unwrap();
-            assert_eq!(
-                rendered.contains("Command output summary"),
-                enabled,
-                "{rendered}"
-            );
+            assert_eq!(rendered.contains("Omitted output:"), enabled, "{rendered}");
         }
         server.abort();
     }
@@ -1044,24 +1154,7 @@ mod tests {
             });
             let rendered = engine.retained_tool_output(name, &raw.to_string());
             assert_eq!(engine.retained_tool_output(name, &rendered), rendered);
-            let mut value: Value = serde_json::from_str(&rendered).unwrap();
-            let summary = value
-                .as_object_mut()
-                .unwrap()
-                .remove("model_output_summary")
-                .unwrap();
-            assert_eq!(value, raw);
-            let summary = summary.as_str().unwrap();
-            assert!(
-                summary.contains("Exit status 3 | elapsed 129 ms"),
-                "{summary}"
-            );
-            assert!(
-                summary.contains("Notable stderr L2 (in preview)"),
-                "{summary}"
-            );
-            assert!(!summary.contains("warning: retrying"), "{summary}");
-            assert!(!summary.contains("last line"), "{summary}");
+            assert_eq!(rendered, raw.to_string());
         }
 
         let short_page = json!({"stdout":"tiny","output_mode":"page","output_truncated":true,"next_cursor":"fixture"}).to_string();
@@ -1084,33 +1177,25 @@ mod tests {
         .to_string();
         let rendered = engine.retained_tool_output("TaskGet", &raw);
         assert!(rendered.len() <= MODEL_TOOL_OUTPUT_BYTES);
-        let (preview, summary) = rendered.split_once("\n\nCommand output summary").unwrap();
+        let (preview, summary) = rendered.split_once("\n\nOmitted output:").unwrap();
         let (_, file) = preview.rsplit_once("): ").unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
-        assert!(summary.contains("serialized result bytes"), "{summary}");
+        assert!(summary.contains("stdout: ") && summary.contains("whole lines"));
         assert!(
-            summary.contains("Exit status 7 | elapsed 314 ms"),
-            "{summary}"
+            !summary.contains("Exit")
+                && !summary.contains("stderr")
+                && !summary.contains("Elapsed")
         );
-        assert!(summary.contains("Model preview omitted"), "{summary}");
     }
 
     #[test]
-    fn model_tool_output_near_capacity_spills_to_make_room_for_summary() {
+    fn model_tool_output_complete_near_capacity_json_stays_intact() {
         let temp = tempfile::tempdir().unwrap();
         let engine = executor(temp.path());
         let raw = json!({"stdout":"x".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
             .to_string();
-        assert!(
-            raw.len() <= MODEL_TOOL_OUTPUT_BYTES
-                && raw.len() > MODEL_TOOL_OUTPUT_BYTES - MIN_JSON_DIGEST_ROOM
-        );
-        let rendered = engine.retained_tool_output("TaskGet", &raw);
-        assert!(rendered.len() <= MODEL_TOOL_OUTPUT_BYTES);
-        assert!(rendered.contains("Exit status 0"), "{rendered}");
-        let (preview, _) = rendered.split_once("\n\nCommand output summary").unwrap();
-        let (_, path) = preview.rsplit_once("): ").unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        assert!(raw.len() < MODEL_TOOL_OUTPUT_BYTES);
+        assert_eq!(engine.retained_tool_output("TaskGet", &raw), raw);
     }
 
     #[test]
@@ -1274,8 +1359,8 @@ mod tests {
             "FINAL ERROR",
             "Hook context: keep this",
             "Saved tool result",
-            "Command output summary",
-            "elapsed 314 ms",
+            "Omitted output:",
+            "stdout: ",
         ] {
             assert!(fresh.contains(expected), "missing {expected}");
         }
@@ -1455,21 +1540,16 @@ mod tests {
             }
             assert!(outputs[0].len() <= 16_000);
             assert!(
-                !outputs[0].contains("Test summary") && outputs[0].contains("Notable stdout L5"),
+                !outputs[0].contains("Test summary") && outputs[0].contains("stdout: "),
                 "{format}: {}",
                 outputs[0]
             );
-            for expected in [
-                "Exit status 7 | elapsed ",
-                "Model preview omitted ",
-                "source bytes / 6 lines",
-            ] {
-                assert!(
-                    outputs[0].contains(expected),
-                    "{format} missing {expected}: {}",
-                    outputs[0]
-                );
-            }
+            let (_, appendix) = outputs[0].split_once("Omitted output:").unwrap();
+            assert!(
+                !appendix.contains("Exit")
+                    && !appendix.contains("Elapsed")
+                    && !appendix.contains("stderr")
+            );
             assert_eq!(outputs[1], "     1\tsource line");
         }
     }

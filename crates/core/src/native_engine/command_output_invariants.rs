@@ -48,9 +48,9 @@ fn reviewer_libtest_examples_keep_authentic_output_and_withhold_competing_totals
         let stdout = format!("{}\n{capture}", "0".repeat(12_100));
         let (result, _) =
             render_capture(temp.path(), [stdout.as_bytes(), b""], 100_000, 100_000, 0);
-        let (body, summary) = result.split_once("Command output summary").unwrap();
+        let (body, summary) = result.split_once("Omitted output:").unwrap();
         assert!(body.contains(capture));
-        assert!(summary.contains("Exit status 0 | elapsed 37 ms"));
+        assert!(!summary.contains("Exit") && !summary.contains("Elapsed"));
         assert!(
             !summary.contains("Test summary") && !summary.contains("failed"),
             "{summary}"
@@ -72,7 +72,9 @@ fn reviewer_one_line_previews_count_each_stream_once_without_repeating_it() {
         let stdout = row(if err == 0 { b'x' } else { b's' }, out);
         let stderr = row(b't', err);
         let (result, _) = render_capture(dir.path(), [&stdout, &stderr], 100_000, 100_000, 0);
-        let (body, summary) = result.split_once("Command output summary").unwrap();
+        let (body, summary) = result
+            .split_once("Omitted output:")
+            .unwrap_or((&result, ""));
         for (name, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
             if bytes.is_empty() {
                 continue;
@@ -85,13 +87,17 @@ fn reviewer_one_line_previews_count_each_stream_once_without_repeating_it() {
                 .map(str::len)
                 .sum::<usize>()
                 + 1;
-            assert!(
-                summary.contains(&format!(
-                    "{name} {shown} text bytes, 1 lines shown of {} source bytes / 1 lines",
-                    bytes.len()
-                )),
-                "{summary}"
-            );
+            if shown == bytes.len() {
+                assert!(!summary.contains(name), "{summary}");
+            } else {
+                assert!(
+                    summary.contains(&format!(
+                        "{name}: {} bytes, 0 whole lines",
+                        bytes.len() - shown
+                    )),
+                    "{summary}"
+                );
+            }
         }
         assert!(!summary.contains("Last "), "{summary}");
     }
@@ -106,15 +112,12 @@ fn reviewer_invalid_utf8_threshold_uses_raw_bytes_including_both_streams() {
     let stdout = [vec![b'x'; 11_971], vec![b'\n']].concat();
     let stderr = b"\x1b[33mwarning: binary \xff\0\x1b[0m\n";
     let (on, _) = render_capture(dir.path(), [&stdout, stderr], 100_000, 100_000, 0);
-    let (_, summary) = on.split_once("Command output summary").unwrap();
-    for expected in [
-        "elapsed 37 ms",
-        "11972 source bytes / 1 lines",
-        "28 source bytes / 1 lines",
-        "stderr 30 text bytes",
-    ] {
-        assert!(summary.contains(expected), "{summary}");
-    }
+    let (_, summary) = on.split_once("Omitted output:").unwrap();
+    assert!(
+        summary.contains("stdout: ")
+            && !summary.contains("stderr:")
+            && !summary.contains("Elapsed")
+    );
 }
 
 #[test]
@@ -204,11 +207,7 @@ fn generated_two_stream_captures_keep_raw_gate_counts_and_unique_excerpt_positio
             assert_eq!(result, base, "seed {seed}");
             continue;
         }
-        let (body, summary) = result.split_once("Command output summary").unwrap();
-        assert!(
-            summary.contains("Exit status 0 | elapsed 37 ms"),
-            "seed {seed}"
-        );
+        let (body, summary) = result.split_once("Omitted output:").unwrap();
         check_factual_summary(
             summary,
             [
@@ -217,15 +216,24 @@ fn generated_two_stream_captures_keep_raw_gate_counts_and_unique_excerpt_positio
             ],
             body,
         );
-        for bytes in &streams {
-            if bytes.is_empty() {
-                continue;
+        for (name, bytes) in ["stdout", "stderr"].into_iter().zip(&streams) {
+            if let Some(row) = summary
+                .lines()
+                .find(|s| s.starts_with(&format!("{name}: ")))
+            {
+                let values: Vec<usize> = row
+                    .split_whitespace()
+                    .filter_map(|w| w.parse().ok())
+                    .collect();
+                assert!(
+                    values[0] > 0 && values[0] <= bytes.len(),
+                    "seed {seed}: {row}"
+                );
+                assert!(
+                    values[1] <= bytes.split_inclusive(|&b| b == b'\n').count(),
+                    "seed {seed}: {row}"
+                );
             }
-            let lines = bytes.split_inclusive(|&b| b == b'\n').count();
-            assert!(
-                summary.contains(&format!("of {} source bytes / {lines} lines", bytes.len())),
-                "seed {seed}: {summary}"
-            );
         }
         assert!(result.len() <= MODEL_TOOL_OUTPUT_BYTES);
     }
@@ -301,9 +309,9 @@ fn spilled_json_excludes_visible_escaped_lines_from_excerpts() {
             .replace("🙂", "\\uD83D\\uDE42")
             .replace("stdout", "std\\u006fut");
     let rendered = command_preview("TaskGet", &raw, Some(dir.path()), None, true);
-    let (_, summary) = rendered.split_once("Command output summary").unwrap();
+    let (_, summary) = rendered.split_once("Omitted output:").unwrap();
     assert!(
-        summary.contains(r#"Notable stdout L3 | "error: hidden""#),
+        summary.contains(r#"stdout L3 | "error: hidden""#),
         "{summary}"
     );
     assert_eq!(rendered.matches("error: hidden").count(), 1);
@@ -316,83 +324,53 @@ fn spilled_json_excludes_visible_escaped_lines_from_excerpts() {
 // Every free-form part of a summary must be a verbatim, located quotation.
 // Numbers occurring inside process output are checked against the source.
 fn check_factual_summary(summary: &str, streams: [&str; 2], body: &str) {
-    static FACT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(concat!(
-            r"^- (?:Exit status (?:-?[0-9]+|unknown)(?: \| elapsed [0-9]+ ms)?(?: \| (?:output page|log snapshot))?",
-            r"|Model preview omitted [0-9]+ (?:text|serialized result) bytes",
-            r"|(?:stdout|stderr) [0-9]+ text bytes(?:, [0-9]+ lines (?:shown|captured)| available before retention)",
-            r"(?: of [0-9]+ (?:source|text|page) bytes(?: / [0-9]+ (?:page )?lines)?)?",
-            r"(?: \| (?:source totals unknown|amount omitted unknown",
-            r"|[0-9]+ source bytes shown, [0-9]+ omitted by model(?:, [0-9]+ omitted by tool)?",
-            r"|[0-9]+ source bytes dropped at capture|[0-9]+ text bytes omitted by tool preview))*)$",
-        )).unwrap()
+    static ROW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(stdout|stderr): [1-9][0-9]* bytes(?:, [0-9]+ whole lines?)?$")
+            .unwrap()
     });
-    let mut notable = HashSet::new();
-    let mut reached_edges = false;
-    let mut count = 0;
-    let mut locations = HashSet::new();
-    let marked = |s: &str| {
-        let lower = s.to_ascii_lowercase();
-        lower.contains("error")
-            || lower.contains("fatal:")
-            || [
-                "FAILED",
-                "panicked at",
-                "Traceback",
-                "npm ERR!",
-                "BUILD FAILURE",
-            ]
-            .iter()
-            .any(|m| s.contains(m))
-    };
-    for line in summary.lines().filter(|s| !s.is_empty()) {
-        if FACT.is_match(line) {
+    let mut quotes = HashSet::new();
+    for row in summary.lines().filter(|r| !r.is_empty()) {
+        if ROW.is_match(row) {
             continue;
         }
-        let mut words = line.strip_prefix("- ").unwrap().splitn(3, ' ');
-        let kind = words.next().unwrap();
-        assert!(matches!(kind, "Notable" | "Head" | "Tail"), "{line}");
-        if kind == "Notable" {
-            assert!(!reached_edges);
-        } else {
-            reached_edges = true;
-        }
-        let name = words.next().unwrap();
-        let stream = match name {
+        let (loc, encoded) = row.split_once(" | ").unwrap();
+        let (name, num) = loc.rsplit_once('L').unwrap();
+        let stream = match name
+            .trim_end()
+            .trim_end_matches("result")
+            .trim_end_matches("page")
+            .trim_end()
+        {
             "stdout" => streams[0],
             "stderr" => streams[1],
-            _ => panic!("{line}"),
+            _ => panic!("{row}"),
         };
-        let rest = words
-            .next()
-            .unwrap()
-            .trim_start_matches("result ")
-            .trim_start_matches("page ");
-        let (number, rendered) = rest.strip_prefix('L').unwrap().split_once(' ').unwrap();
+        let quote: String = serde_json::from_str(encoded).unwrap();
         let original = stream
             .split('\n')
-            .nth(number.parse::<usize>().unwrap() - 1)
+            .nth(num.parse::<usize>().unwrap() - 1)
             .unwrap();
-        assert!(locations.insert((name, number)), "{line}");
-        if kind == "Notable" {
-            count += 1;
-            assert!(marked(original), "{line} / {original:?}");
-        }
-        if rendered == "(in preview)" {
-            assert!(!body.is_empty());
-            continue;
-        }
-        let quote: String = serde_json::from_str(rendered.strip_prefix("| ").unwrap()).unwrap();
         assert!(
-            !quote.trim().is_empty() && rendered.len() <= 116 && original.contains(&quote),
-            "{line} / {original:?}"
+            original.contains(&quote) && encoded.len() <= 114 && !body.contains(&quote),
+            "{row}"
         );
-        if kind == "Notable" {
-            assert!(marked(&quote), "{line}");
-            assert!(notable.insert(quote), "{line}");
-        }
+        assert!(
+            quote.to_ascii_lowercase().contains("error")
+                || [
+                    "fatal:",
+                    "FAILED",
+                    "panicked at",
+                    "Traceback",
+                    "npm ERR!",
+                    "BUILD FAILURE"
+                ]
+                .iter()
+                .any(|m| quote.contains(m)),
+            "{row}"
+        );
+        assert!(quotes.insert(quote));
     }
-    assert!(count <= 5);
+    assert!(quotes.len() <= 5);
 }
 
 #[test]
@@ -419,7 +397,7 @@ fn reviewer_capture_gaps_cross_stream_frames_and_conflicting_reporters_only_quot
             );
             continue;
         }
-        let (body, summary) = result.split_once("Command output summary").unwrap();
+        let (body, summary) = result.split_once("Omitted output:").unwrap();
         check_factual_summary(
             summary,
             [
@@ -428,10 +406,7 @@ fn reviewer_capture_gaps_cross_stream_frames_and_conflicting_reporters_only_quot
             ],
             body,
         );
-        assert!(
-            summary.contains(&format!("Exit status {}", raw["exit_code"])),
-            "{name}"
-        );
+        assert!(!summary.contains("Exit"), "{name}");
     }
 }
 
@@ -449,10 +424,10 @@ fn reviewer_lf_and_one_character_of_an_error_are_insufficient_coverage() {
             "T".repeat(18000 - end - 1)
         );
         let (result, _) = render_capture(dir.path(), [src.as_bytes(), b""], 100_000, 100_000, 7);
-        let (body, summary) = result.split_once("Command output summary").unwrap();
+        let (body, summary) = result.split_once("Omitted output:").unwrap();
         assert!(!body.contains(diagnostic));
         assert!(
-            summary.contains(&format!("- Notable stdout L2 | \"{diagnostic}\"")),
+            summary.contains(&format!("stdout L2 | \"{diagnostic}\"")),
             "{summary}"
         );
     }
@@ -486,13 +461,10 @@ fn generated_fake_footers_and_markers_have_no_synthesized_test_claims() {
                 3000,
                 code,
             );
-            let (body, summary) = result.split_once("Command output summary").unwrap();
-            assert!(summary.contains(&format!("- Exit status {code} | elapsed 37 ms")));
+            let (body, summary) = result.split_once("Omitted output:").unwrap();
+            assert!(!summary.contains("Exit status"));
             check_factual_summary(summary, [&streams[0], &streams[1]], body);
-            assert!(
-                summary.contains("Notable ") && summary.contains(" | \""),
-                "{summary}"
-            );
+            assert!(summary.contains(" | \""), "{summary}");
             assert!(result.len() <= MODEL_TOOL_OUTPUT_BYTES);
         }
     }
@@ -509,23 +481,23 @@ fn visible_text_survives_blank_boundaries_and_a_marker_spanning_capture_windows(
     );
     let src = format!("{src}{}{}", " ".repeat(8000), "\n".repeat(8192));
     let (result, _) = render_capture(dir.path(), [src.as_bytes(), b""], 6000, 4096, 1);
-    let (body, summary) = result.split_once("Command output summary").unwrap();
+    let (body, summary) = result.split_once("Omitted output:").unwrap();
     assert!(!body.contains("sole marker"));
     assert!(
-        summary.contains(r#"Notable stdout L8193 | "error: sole marker""#),
+        summary.contains(r#"stdout L8193 | "error: sole marker""#),
         "{summary}"
     );
     let neutral = src.replace("error: sole marker", "only visible text");
     let (result, _) = render_capture(dir.path(), [neutral.as_bytes(), b""], 6000, 4096, 0);
-    let (_, summary) = result.split_once("Command output summary").unwrap();
+    let (_, summary) = result.split_once("Omitted output:").unwrap();
     assert!(
-        summary.contains("Head stdout L8193") && summary.contains("only visible text"),
+        !summary.contains("Head") && !summary.contains("only visible text"),
         "{summary}"
     );
 }
 
 #[test]
-fn escaped_notable_lines_leave_room_for_both_stream_edges() {
+fn escaped_notable_lines_stay_within_budget_without_repeating_edges() {
     let dir = tempfile::tempdir().unwrap();
     let middle = (0..7)
         .map(|n| format!("error[{n}]{}!", "\x01".repeat(150)))
@@ -545,14 +517,10 @@ fn escaped_notable_lines_leave_room_for_both_stream_edges() {
         1000,
         1,
     );
-    let (body, summary) = result.split_once("Command output summary").unwrap();
+    let (body, summary) = result.split_once("Omitted output:").unwrap();
     check_factual_summary(summary, [&streams[0], &streams[1]], body);
-    assert_eq!(summary.matches("- Notable ").count(), 5);
-    for name in ["stdout", "stderr"] {
-        for edge in ["Head", "Tail"] {
-            assert!(summary.contains(&format!("- {edge} {name}")), "{summary}");
-        }
-    }
+    assert_eq!(summary.matches(" | ").count(), 5);
+    assert!(!summary.contains("Head") && !summary.contains("Tail"));
     assert!(summary.len() <= DIGEST_BUDGET && result.len() <= MODEL_TOOL_OUTPUT_BYTES);
 }
 
@@ -561,10 +529,10 @@ fn binary_replacement_text_survives_blank_capture_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     let stdout = [vec![b'\n'; 8192], vec![0xff; 8192], vec![b'\n'; 8192]].concat();
     let (result, _) = render_capture(dir.path(), [&stdout, b""], 4000, 2000, 0);
-    let (body, summary) = result.split_once("Command output summary").unwrap();
+    let (body, summary) = result.split_once("Omitted output:").unwrap();
     assert!(!body.contains('�'));
     assert!(
-        summary.contains("Head stdout L8193") && summary.contains('�'),
+        summary.contains("stdout: ") && !summary.contains('�'),
         "{summary}"
     );
     check_factual_summary(summary, [&String::from_utf8_lossy(&stdout), ""], body);
