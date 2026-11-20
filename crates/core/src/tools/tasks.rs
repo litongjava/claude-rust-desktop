@@ -14,7 +14,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
         // `TaskOutput` is not advertised. Its dispatch alias remains below for
         // old transcripts and is not discoverable through ToolLoad.
-        ("TaskStop", "\n- Stops a running background task by its ID\n- Takes a task_id parameter identifying the task to stop\n- Stops a background shell together with its descendant processes; for other task records it marks the record cancelled\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n",json!({"task_id":{"description":"The ID of the background task to stop.","type":"string"},"shell_id":{"description":"Deprecated: use task_id instead","type":"string"}}),vec![]),
+        ("TaskStop", "Stop a task by ID. A managed shell, Monitor, Agent, Workflow or ToolScript job gets a cancellation request and stops through its owner; a shell's process tree is terminated with it. Any other task record is marked cancelled without touching a process. Cancellation is requested rather than confirmed, so use TaskGet to see the final status.",json!({"task_id":{"description":"ID of the task to stop, as returned when it started.","type":"string"},"shell_id":{"description":"Old alias for `task_id`; use `task_id`.","type":"string"}}),vec![]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
 }
 
