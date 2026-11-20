@@ -1233,7 +1233,7 @@ async fn run(cli: &Cli) -> Result<()> {
                         idle_notified = true;
                         if let Err(error) = deepseek_code_core::services::lifecycle_events::run(&session.hook_service_context(), &session.workspace, &session.id,
                             deepseek_code_core::services::tool_hooks::HookEvent::Notification,
-                            serde_json::json!({"message":"Claude is waiting for your input","notification_type":"idle_prompt"})).await {
+                            serde_json::json!({"message":"DeepSeek Code is waiting for your input","notification_type":"idle_prompt"})).await {
                             input.as_ref().expect("interactive reader").notice(format!("Notification hook: {error:#}"));
                         }
                     }

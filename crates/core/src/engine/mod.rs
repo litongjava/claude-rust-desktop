@@ -169,7 +169,7 @@ impl EnginePool {
             .stdin(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn Claude engine: {}. Ensure 'bun' is installed and in PATH.", e))?;
+        let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn DeepSeek Code engine: {}. Ensure 'bun' is installed and in PATH.", e))?;
         let pid = child.id();
 
         // Verify the process didn't immediately exit (e.g. binary not found)
@@ -186,7 +186,7 @@ impl EnginePool {
                     String::new()
                 };
                 anyhow::bail!(
-                    "Claude engine process exited immediately with status: {}. stderr: {}",
+                    "DeepSeek Code engine process exited immediately with status: {}. stderr: {}",
                     status,
                     if stderr_output.is_empty() { "(none)" } else { &stderr_output }
                 );
@@ -418,7 +418,7 @@ impl EnginePool {
         }
 
         anyhow::bail!(
-            "Claude engine binary not found. Please ensure Claude Code is installed.\n\
+            "DeepSeek Code engine binary not found. Please ensure DeepSeek Code is installed.\n\
              Searched paths: {:?}",
             candidates
         )
