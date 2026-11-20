@@ -1,5 +1,7 @@
 //! Session database layout. The sole constructor is an internal integration-test
 //! factory until all production hosts switch together.
+mod compaction;
+pub use compaction::{CheckpointKey, CompactionClaim};
 mod delivery;
 mod global;
 mod history;

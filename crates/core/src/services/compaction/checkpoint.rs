@@ -18,6 +18,12 @@ fn digest(value: &serde_json::Value) -> String {
         .collect()
 }
 
+pub(crate) fn config_fingerprint(provider: &ResolvedProvider, system: &str) -> String {
+    digest(
+        &json!({"version":3,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":system}),
+    )
+}
+
 #[derive(Serialize, Deserialize)]
 struct Saved {
     fingerprint: String,
@@ -44,9 +50,7 @@ impl<'a> Checkpoint<'a> {
         // completed request is already identified by its own exact request key.
         // Version 3 separates that request key from the configuration domain so
         // unchanged fragments survive a later turn; earlier layouts are dropped.
-        let fingerprint = digest(
-            &json!({"version":3,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":system}),
-        );
+        let fingerprint = config_fingerprint(provider, system);
         let value: Option<String> = db.with_conn(|conn| {
             conn.query_row(
                 "SELECT value FROM peripheral_settings WHERE key=?1",

@@ -259,7 +259,7 @@ impl From<CommittedCompaction> for CompactionResult {
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, String, usize)> {
+pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows

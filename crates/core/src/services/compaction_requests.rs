@@ -58,6 +58,20 @@ pub fn request(
     used_tokens: u64,
     window: u64,
 ) -> Result<String> {
+    db.with_conn(|conn| -> Result<()> {
+        validate(conn, session, keep, used_tokens, window)?;
+        save(conn, session, keep)
+    })??;
+    Ok("Compaction queued. It runs before the next user message, using your `keep` text as the summary instructions. Continue or finish the current turn normally.".into())
+}
+
+pub(crate) fn validate(
+    conn: &Connection,
+    session: &str,
+    keep: &str,
+    used_tokens: u64,
+    window: u64,
+) -> Result<()> {
     ensure!(
         !keep.trim().is_empty() && keep.chars().count() <= 2000,
         "keep must contain 1 to 2000 characters"
@@ -71,21 +85,19 @@ pub fn request(
         window > 0 && pct >= 30,
         "Compaction not needed: the context is {pct}% of the window (at least 30% is required)."
     );
-    db.with_conn(|conn| -> Result<()> {
-        let rows = message_repo::get_messages_by_conversation(conn, session)?;
-        if let Some(index) = rows.iter().rposition(|row| row.is_compact_boundary) {
-            let after = rows[index + 1..]
-                .iter()
-                .filter(|row| row.role == "user")
-                .count();
-            ensure!(
-                after >= 2,
-                "Compaction not needed: the conversation was compacted recently."
-            );
-        }
-        save(conn, session, keep)
-    })??;
-    Ok("Compaction queued. It runs before the next user message, using your `keep` text as the summary instructions. Continue or finish the current turn normally.".into())
+
+    let rows = message_repo::get_messages_by_conversation(conn, session)?;
+    if let Some(index) = rows.iter().rposition(|row| row.is_compact_boundary) {
+        let after = rows[index + 1..]
+            .iter()
+            .filter(|row| row.role == "user")
+            .count();
+        ensure!(
+            after >= 2,
+            "Compaction not needed: the conversation was compacted recently."
+        );
+    }
+    Ok(())
 }
 
 /// Consume the queued request exactly once. The next turn owns it.
@@ -163,7 +175,9 @@ mod tests {
             "Task: run remaining tests",
         )
         .unwrap();
-        store.append(&id, "user", "First message after compaction").unwrap();
+        store
+            .append(&id, "user", "First message after compaction")
+            .unwrap();
         let error = request(&store.db, &id, "Keep the next task", 50, 100).unwrap_err();
         assert!(error.to_string().contains("compacted recently"), "{error}");
         store

@@ -393,7 +393,7 @@ fn peer_project(c: &Connection, root: &Path, from: &str, to: &str) -> Result<Str
     Ok(project)
 }
 pub struct DeliveryOwner {
-    session: SessionDb,
+    pub(super) session: SessionDb,
     _lease: ExecutionLease,
     _consumer: ExecutionLease,
     _locks: Vec<fs::File>,
