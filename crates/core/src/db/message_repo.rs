@@ -12,15 +12,25 @@ pub fn save_request_snapshots(
     message_id: &str,
     snapshots: &serde_json::Value,
 ) -> Result<()> {
-    let stored = store_trajectory_blobs(conn, snapshots)?;
-    conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
-        params![message_id, serde_json::to_string(&stored)?])?;
+    let stored = save_request_trajectory(conn, message_id, snapshots)?;
     if let Some(requests) = stored.as_array() {
         for request in requests {
             super::request_repo::save_request(conn, message_id, request)?;
         }
     }
     Ok(())
+}
+
+// Forks copy normalized rows separately, including rows without request IDs.
+pub(super) fn save_request_trajectory(
+    conn: &Connection,
+    message_id: &str,
+    snapshots: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let stored = store_trajectory_blobs(conn, snapshots)?;
+    conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
+        params![message_id, serde_json::to_string(&stored)?])?;
+    Ok(stored)
 }
 
 pub fn get_request_snapshots(conn: &Connection, message_id: &str) -> Result<serde_json::Value> {

@@ -262,8 +262,11 @@ impl Copier<'_> {
                 values[idx(col)?] = Value::Text(new);
             }
             if let Some((col, kind)) = identity {
-                values[idx(col)?] =
-                    Value::Text(self.assign(kind, &row.get::<_, String>(idx(col)?)?)?);
+                let i = idx(col)?;
+                // The public snapshot writer also normalizes anonymous request entries.
+                if table != "model_requests" || values[i] != Value::Null {
+                    values[i] = Value::Text(self.assign(kind, &row.get::<_, String>(i)?)?);
+                }
             }
             for &(col, kind) in links {
                 let old: String = row.get(idx(col)?)?;
@@ -402,15 +405,26 @@ impl Copier<'_> {
         for table in ["permission_approvals", "code_diffs", "attachments"] {
             self.rows(table, message, Some(("id", table)), &[])?
         }
-        // Allocate the identities before rewriting links, including forward
-        // retry references between different selected messages.
-        let mut request_ids = self.src.prepare("SELECT message_id,id FROM model_requests UNION ALL
-            SELECT t.message_id,json_extract(j.value,'$.id') FROM message_trajectory t,json_each(t.requests_json) j
-            WHERE json_type(j.value,'$.id')='text'")?;
-        let mut rows = request_ids.query([])?;
+        self.rows("model_requests", message, Some(("id", "request")), &[])?;
+        // Forward retry references may point into a later selected trajectory.
+        // Inspect the JSON only after checking its owning message.
+        let mut source = self
+            .src
+            .prepare("SELECT message_id,requests_json FROM message_trajectory")?;
+        let mut rows = source.query([])?;
         while let Some(row) = rows.next()? {
-            if self.mapped("message", &row.get::<_, String>(0)?)?.is_some() {
-                self.assign("request", &row.get::<_, String>(1)?)?;
+            if self.mapped("message", &row.get::<_, String>(0)?)?.is_none() {
+                continue;
+            }
+            let snapshots: Json = serde_json::from_str(row.get_ref(1)?.as_str()?)?;
+            let items = match &snapshots {
+                Json::Array(items) => items.as_slice(),
+                item => std::slice::from_ref(item),
+            };
+            for item in items {
+                if let Some(id) = item["id"].as_str() {
+                    self.assign("request", id)?;
+                }
             }
         }
         let mut trajectories = self
@@ -422,28 +436,28 @@ impl Copier<'_> {
                 continue;
             };
             let mut requests = message_repo::get_request_snapshots(self.src, &old)?;
-            if let Some(items) = requests.as_array_mut() {
-                for request in items {
-                    if let Some(id) = request["id"].as_str() {
-                        request["id"] = Json::String(self.assign("request", id)?);
-                    }
-                    for (field, kind) in [
-                        ("contextBoundary", "message"),
-                        ("replacesRequestId", "request"),
-                    ] {
-                        if let Some(old) = request[field].as_str() {
-                            request[field] =
-                                self.mapped(kind, old)?.map_or(Json::Null, Json::String);
-                        }
-                    }
-                    if let Some(blocks) = request.get_mut("responseBlocks") {
-                        self.remap_blocks(&old, blocks)?;
+            let items = match &mut requests {
+                Json::Array(items) => items.as_mut_slice(),
+                item => std::slice::from_mut(item),
+            };
+            for request in items {
+                if let Some(id) = request["id"].as_str() {
+                    request["id"] = Json::String(self.assign("request", id)?);
+                }
+                for (field, kind) in [
+                    ("contextBoundary", "message"),
+                    ("replacesRequestId", "request"),
+                ] {
+                    if let Some(old) = request[field].as_str() {
+                        request[field] = self.mapped(kind, old)?.map_or(Json::Null, Json::String);
                     }
                 }
+                if let Some(blocks) = request.get_mut("responseBlocks") {
+                    self.remap_blocks(&old, blocks)?;
+                }
             }
-            message_repo::save_request_snapshots(self.dst, &new, &requests)?;
+            message_repo::save_request_trajectory(self.dst, &new, &requests)?;
         }
-        self.rows("model_requests", message, Some(("id", "request")), &[])?;
         super::super::history::advance(self.dst)?;
         Ok(())
     }

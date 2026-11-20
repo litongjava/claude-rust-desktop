@@ -1257,3 +1257,70 @@ fn round2_delayed_stream_and_transport_replay_keep_occurrence_results() -> Resul
     check(&first, "A")?;
     check(&second, "B")
 }
+
+#[test]
+fn round2_partial_and_full_forks_preserve_snapshot_shapes() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let object = json!({"id":"request-1","status":"completed"});
+    let opaque = json!([true, null, 12, "text", ["nested"], {"unchanged":true}]);
+    let (first, later) = a.write(|w| {
+        let first = w.append("user", "selected")?;
+        let later = w.append("assistant", "later")?;
+        w.snapshots(&later, &object)?;
+        let mixed = w.append("assistant", "mixed")?;
+        w.snapshots(&mixed, &opaque)?;
+        let scalar = w.append("assistant", "scalar")?;
+        w.snapshots(&scalar, &json!("scalar"))?;
+        let retry = w.append("assistant", "retry")?;
+        w.snapshots(
+            &retry,
+            &json!([{"id":"retry","replacesRequestId":"request-1"}]),
+        )?;
+        Ok((first, later))
+    })?;
+    let partial = a.branch(
+        "partial",
+        Branch::Through {
+            message: Some(&first),
+            index: None,
+        },
+    )?;
+    assert_eq!(partial.read(|r| r.messages())?.len(), 1);
+    a.branch(B, Branch::Full)?.read(|r| {
+        let rows = r.messages()?;
+        assert_eq!(rows.len(), 5);
+        let request = r.requests(&rows[1].id)?;
+        let new_id = request["id"].as_str().unwrap();
+        assert_ne!(new_id, "request-1");
+        assert_eq!(request, json!({"id":new_id,"status":"completed"}));
+        assert_eq!(r.requests(&rows[2].id)?, opaque);
+        assert_eq!(r.requests(&rows[3].id)?, "scalar");
+        assert_eq!(r.requests(&rows[4].id)?[0]["replacesRequestId"], new_id);
+        Ok(())
+    })?;
+    let shard =
+        |id: &str| Connection::open(root.path().join("sessions").join(id).join("session.db"));
+    for id in [A, B] {
+        let anonymous: usize = shard(id)?.query_row(
+            "SELECT count(*) FROM model_requests WHERE id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(anonymous, opaque.as_array().unwrap().len());
+    }
+    // A partial branch must never decode a trajectory beyond its boundary.
+    shard(A)?.execute(
+        "UPDATE message_trajectory SET requests_json='{' WHERE message_id=?1",
+        [&later],
+    )?;
+    let prefix = a.branch(
+        "prefix",
+        Branch::Through {
+            message: Some(&first),
+            index: None,
+        },
+    )?;
+    assert_eq!(prefix.read(|r| r.messages())?.len(), 1);
+    Ok(())
+}
