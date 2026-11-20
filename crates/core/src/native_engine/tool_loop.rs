@@ -3892,9 +3892,7 @@ impl ToolLoopExecutor {
         ) else {
             return Ok(());
         };
-        let path = root
-            .join("mcp-tool-snapshots")
-            .join(format!("{session}.json"));
+        let path = crate::session_files::mcp_snapshot_file(root, session);
         let mut saved: std::collections::BTreeMap<String, crate::tools::ToolDefinition> =
             std::fs::read(&path)
                 .ok()

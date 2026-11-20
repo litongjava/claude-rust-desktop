@@ -1262,7 +1262,7 @@ impl QueryEngine {
                             crate::prompt::set_changes(
                                 &first_message_root,
                                 &first_message_session,
-                                "loadable-tools",
+                                crate::session_files::SET_CHANGE_LOADABLE_TOOLS,
                                 &loadable_names,
                             )
                         } else {
@@ -1271,7 +1271,7 @@ impl QueryEngine {
                         let (new_skills, removed_skills) = crate::prompt::set_changes(
                             &first_message_root,
                             &first_message_session,
-                            "skills",
+                            crate::session_files::SET_CHANGE_SKILLS,
                             &available_skill_names,
                         );
                         crate::prompt::changes_reminder(now, gone, new_skills, removed_skills)

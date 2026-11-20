@@ -127,9 +127,7 @@ pub fn loadable_tools_for_session(
     builtin: &[(String, String)],
     mcp: &[(String, String)],
 ) -> Option<String> {
-    let path = root
-        .join("environment")
-        .join(format!("{session}.loadable-tools.json"));
+    let path = crate::session_files::environment_file(root, session, ".loadable-tools.json");
     if let Some(saved) = frozen_reminder(&path) {
         return saved;
     }
@@ -153,7 +151,7 @@ pub fn skills_reminder(lines: &[String]) -> Option<String> {
 /// The skill list frozen on the session's first request, for the same
 /// prefix-stability reason as the environment.
 pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Option<String> {
-    let path = root.join("environment").join(format!("{session}.skills.json"));
+    let path = crate::session_files::environment_file(root, session, ".skills.json");
     if let Some(saved) = frozen_reminder(&path) {
         return saved;
     }
@@ -174,9 +172,7 @@ pub fn set_changes(
     let mut current: Vec<String> = current.to_vec();
     current.sort();
     current.dedup();
-    let path = root
-        .join("environment")
-        .join(format!("{session}.{kind}.names.json"));
+    let path = crate::session_files::set_changes_file(root, session, kind);
     let previous: Option<Vec<String>> = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -328,7 +324,7 @@ pub fn environment_for_session(
     workspace: Option<&Path>,
     project: Option<(&str, &[String])>,
 ) -> String {
-    let path = root.join("environment").join(format!("{session}.txt"));
+    let path = crate::session_files::environment_file(root, session, ".txt");
     if let Ok(saved) = std::fs::read_to_string(&path) {
         if !saved.is_empty() {
             return saved;
@@ -349,7 +345,7 @@ pub fn environment_for_session(
 /// The date reminder frozen on the session's first request, for the same
 /// prefix-stability reason as the environment.
 pub fn date_for_session(root: &Path, session: &str) -> String {
-    let path = root.join("environment").join(format!("{session}.date.txt"));
+    let path = crate::session_files::environment_file(root, session, ".date.txt");
     if let Ok(saved) = std::fs::read_to_string(&path) {
         if !saved.is_empty() {
             return saved;
@@ -376,7 +372,7 @@ pub fn date_change_reminder(root: &Path, session: &str, date: &str, today: &str)
     if reminder_date(date).as_deref() == Some(today) {
         return None;
     }
-    let path = root.join("environment").join(format!("{session}.announced-date"));
+    let path = crate::session_files::environment_file(root, session, ".announced-date");
     if std::fs::read_to_string(&path).ok().as_deref().map(str::trim) == Some(today) {
         return None;
     }
@@ -385,6 +381,81 @@ pub fn date_change_reminder(root: &Path, session: &str, date: &str, today: &str)
     }
     let _ = std::fs::write(&path, today);
     Some(format!("<system-reminder>\nThe date has changed. Today's date is {today}.\n</system-reminder>"))
+}
+
+/// The age after which a per-session frozen file is pruned at engine startup.
+pub const SESSION_FILE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Remove every file the first-message and MCP snapshot features wrote for
+/// `session`. Called after its conversation is deleted; missing files are fine.
+/// A session id is used as a file-name component, so anything that could walk
+/// out of the data directory is rejected before joining.
+pub fn forget_session_files(root: &Path, session: &str) {
+    if !crate::session_files::is_safe_session(session) {
+        return;
+    }
+    for path in crate::session_files::files_for_session(root, session) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    module = "Prompt",
+                    "Failed to remove session file {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+/// Remove per-session frozen files whose modification time is older than
+/// `max_age`. Engine startup runs this off the request path so the first request
+/// is never delayed. Files of a session starting now have a fresh modification
+/// time, so they are kept; only abandoned sessions are pruned.
+pub fn prune_session_files(root: &Path, max_age: std::time::Duration) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
+        return;
+    };
+    let environment_suffixes = crate::session_files::environment_suffixes();
+    prune_session_directory(
+        &root.join(crate::session_files::ENVIRONMENT_DIR),
+        &environment_suffixes,
+        cutoff,
+    );
+    prune_session_directory(
+        &root.join(crate::session_files::MCP_SNAPSHOT_DIR),
+        &[".json".to_owned()],
+        cutoff,
+    );
+}
+
+fn prune_session_directory(dir: &Path, suffixes: &[String], cutoff: std::time::SystemTime) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !suffixes.iter().any(|suffix| name.ends_with(suffix.as_str())) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn environment_section(workspace: Option<&Path>) -> String {
@@ -1194,6 +1265,92 @@ mod tests {
         assert!(date_change_reminder(root.path(), "s", &frozen, "2020-01-03").is_some(), "a newer date is announced");
         assert!(date_change_reminder(root.path(), "s", &date_reminder("2020-01-03"), "2020-01-03").is_none(), "a fresh date needs no reminder");
         assert_eq!(environment_for_session(root.path(), "s", None, None), first, "a date change never rewrites the environment");
+    }
+
+    /// Write every per-session file the two features produce, through the same
+    /// helpers the runtime uses.
+    fn write_session_files(root: &std::path::Path, session: &str) {
+        let workspace = std::path::Path::new("/tmp");
+        environment_for_session(root, session, Some(workspace), None);
+        date_for_session(root, session);
+        date_change_reminder(root, session, &date_reminder("2020-01-01"), "2020-01-02");
+        loadable_tools_for_session(
+            root,
+            session,
+            &[("ListDir".to_owned(), "List a directory.".to_owned())],
+            &[],
+        );
+        skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
+        set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
+        set_changes(root, session, "skills", &["deploy".to_owned()]);
+        let snapshot = crate::session_files::mcp_snapshot_file(root, session);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::fs::write(snapshot, b"{}").unwrap();
+    }
+
+    fn set_modified(path: &std::path::Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn forget_removes_only_that_sessions_files() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "s");
+        write_session_files(root.path(), "other");
+        let forgotten = crate::session_files::files_for_session(root.path(), "s");
+        let kept = crate::session_files::files_for_session(root.path(), "other");
+        for path in &forgotten {
+            assert!(path.exists(), "missing {}", path.display());
+        }
+        forget_session_files(root.path(), "s");
+        for path in &forgotten {
+            assert!(!path.exists(), "still present: {}", path.display());
+        }
+        for path in &kept {
+            assert!(path.exists(), "other session lost {}", path.display());
+        }
+    }
+
+    #[test]
+    fn forget_rejects_session_ids_that_could_escape_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "s");
+        let kept = crate::session_files::files_for_session(root.path(), "s");
+        forget_session_files(root.path(), "../s");
+        forget_session_files(root.path(), "nested/s");
+        forget_session_files(root.path(), r"nested\s");
+        for path in &kept {
+            assert!(path.exists(), "unsafe id removed {}", path.display());
+        }
+    }
+
+    #[test]
+    fn prune_removes_old_files_and_keeps_recent_ones() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "old");
+        write_session_files(root.path(), "recent");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        let recent = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+        for path in crate::session_files::files_for_session(root.path(), "old") {
+            set_modified(&path, old);
+        }
+        for path in crate::session_files::files_for_session(root.path(), "recent") {
+            set_modified(&path, recent);
+        }
+
+        prune_session_files(root.path(), SESSION_FILE_MAX_AGE);
+
+        for path in crate::session_files::files_for_session(root.path(), "old") {
+            assert!(!path.exists(), "old file kept: {}", path.display());
+        }
+        for path in crate::session_files::files_for_session(root.path(), "recent") {
+            assert!(path.exists(), "recent file pruned: {}", path.display());
+        }
     }
 
     #[test]
