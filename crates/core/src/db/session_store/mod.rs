@@ -227,13 +227,16 @@ impl SessionDb {
             &self.stores.sessions().join(&self.key).join("session.db"),
             mode,
         )?;
-        layout::verify(&conn, SESSION)?;
-        verify_manifest(
-            &conn,
-            self.stores.global().store_uuid(),
-            &self.id,
-            &self.incarnation,
-        )?;
+        {
+            let snap = conn.transaction()?;
+            layout::verify(&snap, SESSION)?;
+            verify_manifest(
+                &snap,
+                self.stores.global().store_uuid(),
+                &self.id,
+                &self.incarnation,
+            )?;
+        }
         body(&mut conn)
     }
     /// Use the supplied transaction for the duration of the callback. Nested

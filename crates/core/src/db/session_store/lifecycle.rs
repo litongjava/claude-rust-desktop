@@ -525,11 +525,29 @@ impl Stores {
             })
     }
 
+    fn upgrade_pending(&self, op: &Intent, path: &Path) -> Result<()> {
+        if layout::is_v1(path, SESSION)? {
+            let c = layout::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            verify_manifest(&c, &op.store, &op.id, &op.incarnation)?;
+            if op.kind == "create" {
+                ensure!(
+                    c.query_row("SELECT sealed_operation FROM manifest", [], |r| r
+                        .get::<_, String>(0))?
+                        == op.operation,
+                    "Seal mismatch"
+                );
+            }
+            drop(c);
+            layout::upgrade(path, SESSION)?;
+        }
+        Ok(())
+    }
     fn install(&self, op: &Intent, meta: &Metadata, dir: &Path) -> Result<super::Projection> {
         let live = op.live(self);
         let db = dir.join("session.db");
         let inspect = || -> Result<_> {
             let _permit = Permits::take(1);
+            self.upgrade_pending(op, &db)?;
             let c = layout::open(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             layout::verify(&c, SESSION)?;
             layout::integrity(&c)?;
@@ -696,6 +714,7 @@ impl Stores {
             let verify = || -> Result<()> {
                 let path = dir.join("session.db");
                 let _permit = Permits::take(1);
+                self.upgrade_pending(op, &path)?;
                 let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 layout::verify(&conn, SESSION)?;
                 layout::integrity(&conn)?;
@@ -732,6 +751,7 @@ impl Stores {
     }
 
     pub(super) fn reconcile(&self) -> Result<()> {
+        self.reconcile_batches()?;
         let keys = self.global().read(|c| {
             let mut q = c.prepare("SELECT storage_key FROM lifecycle WHERE quarantine_reason IS NULL ORDER BY storage_key")?;
             let rows = q.query_map([],|r|r.get::<_,String>(0))?;

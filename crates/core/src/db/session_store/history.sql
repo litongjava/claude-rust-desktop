@@ -185,3 +185,8 @@ CREATE TABLE delivery_receipts (
 );
 CREATE TABLE session_agents (conversation_id TEXT PRIMARY KEY REFERENCES manifest(id), definition TEXT NOT NULL);
 CREATE TABLE native_boundaries(message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, value TEXT NOT NULL);
+CREATE TABLE child_invocations(attempt_key TEXT PRIMARY KEY, parent_message TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, child_incarnation TEXT NOT NULL, invocation TEXT NOT NULL);
+CREATE TRIGGER remove_occurrence_output AFTER DELETE ON tool_calls BEGIN
+ DELETE FROM mcp_tool_outputs WHERE tool_use_id=OLD.id;
+END;
+CREATE TABLE delivery_generations(delivery_id TEXT PRIMARY KEY REFERENCES delivery_receipts(delivery_id), turn_id TEXT UNIQUE);

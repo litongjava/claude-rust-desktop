@@ -115,6 +115,30 @@ impl Stores {
             return Ok(guards);
         }
     }
+    pub(super) fn reconcile_batches(&self) -> Result<()> {
+        let batches = self.global().read(|c| {
+            let mut q = c.prepare("SELECT DISTINCT batch FROM import_members")?;
+            let values = q
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(values)
+        })?;
+        for batch in batches {
+            if let Err(e) = self.recover_batch(&batch) {
+                let pending = self.global().read(|c| {
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM import_members WHERE batch=?1)",
+                        [&batch],
+                        |r| r.get::<_, bool>(0),
+                    )?)
+                })?;
+                if pending {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
     fn batch_for(&self, key: &str) -> Result<Option<String>> {
         self.global().read(|c| {
             Ok(c.query_row(
@@ -163,9 +187,16 @@ impl Stores {
             let stage = op.stage(self);
             let live = op.live(self);
             let dir = if stage.try_exists()? { stage } else { live };
-            if self.unsealed(&dir.join("session.db")).unwrap_or(true) {
-                reason = Some("Incomplete import stage".to_owned());
-                break;
+            match self.unsealed(&dir.join("session.db")) {
+                Ok(false) => {}
+                Ok(true) => {
+                    reason = Some("Incomplete import stage".into());
+                    break;
+                }
+                Err(e) => {
+                    reason = Some(format!("Unreadable import stage: {e:#}"));
+                    break;
+                }
             }
             let meta: Metadata =
                 serde_json::from_str(op.metadata.as_deref().context("Missing import metadata")?)?;
@@ -182,15 +213,16 @@ impl Stores {
             self.abort_batch(batch, &members, &reason)?;
             bail!("Import aborted: {reason}")
         }
+        let mut rejected = false;
         self.global().write("publish import batch",batch,true,|tx|{
             for ((op,digest,_),(meta,p)) in members.iter().zip(&ready){
-                self.publish_row(tx,op,meta,p)?;
+                self.publish_row(tx,op,meta,p).inspect_err(|e|rejected=e.downcast_ref::<rusqlite::Error>().is_none())?;
                 tx.execute("INSERT INTO legacy_session_imports SELECT id,?2,project_id FROM conversations WHERE id=?1",[&op.id,digest])?;
             }
             tx.execute("DELETE FROM import_members WHERE batch=?1",[batch])?;
             self.step(Phase::BeforePublishCommit)
         }).or_else(|e|{
-            if e.downcast_ref::<rusqlite::Error>().is_none() && !format!("{e:#}").contains("interrupt") {
+            if rejected {
                 self.abort_batch(batch,&members,&format!("Import publication failed: {e:#}"))?;
             }
             Err(e)

@@ -282,3 +282,144 @@ impl SessionWrite<'_> {
         diff_repo::update_diff_status(self.0, id, status, at)
     }
 }
+
+/// Durable execution addresses carry the saved incarnation across worker restarts.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryAddress {
+    pub store: String,
+    pub session: String,
+    pub incarnation: String,
+}
+impl SessionDb {
+    pub fn address(&self) -> HistoryAddress {
+        HistoryAddress {
+            store: self.stores.global().uuid.clone(),
+            session: self.id.clone(),
+            incarnation: self.incarnation.clone(),
+        }
+    }
+}
+impl super::Stores {
+    pub fn resume_history(&self, address: &HistoryAddress) -> Result<SessionDb> {
+        ensure!(
+            self.global().uuid == address.store,
+            "Execution store changed"
+        );
+        let session = self.open_session(&address.session)?;
+        ensure!(
+            session.incarnation == address.incarnation,
+            "Execution incarnation changed"
+        );
+        Ok(session)
+    }
+}
+#[derive(Debug, PartialEq)]
+pub struct Attachment {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub mime: Option<String>,
+    pub size: Option<i64>,
+    pub source: Option<String>,
+}
+impl SessionRead<'_> {
+    pub fn attachments(&self, message: &str) -> Result<Vec<Attachment>> {
+        let mut q=self.0.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY rowid")?;
+        let rows = q
+            .query_map([message], |r| {
+                Ok(Attachment {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    mime: r.get(3)?,
+                    size: r.get(4)?,
+                    source: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    pub fn tool_note(&self, id: &str) -> Result<Option<String>> {
+        messages::tool_call_note(self.0, id)
+    }
+    pub fn tool_duration(&self, id: &str) -> Result<Option<u64>> {
+        messages::tool_duration(self.0, id)
+    }
+    pub fn child_invocations(
+        &self,
+        message: &str,
+    ) -> Result<Vec<(String, crate::services::subagents::Invocation)>> {
+        let mut q=self.0.prepare("SELECT child_incarnation,invocation FROM child_invocations WHERE parent_message=?1 ORDER BY rowid")?;
+        let mut cursor = q.query([message])?;
+        let mut out = Vec::new();
+        while let Some(r) = cursor.next()? {
+            out.push((r.get(0)?, serde_json::from_str(&r.get::<_, String>(1)?)?));
+        }
+        Ok(out)
+    }
+    pub fn receipt_count(&self) -> Result<i64> {
+        Ok(self
+            .0
+            .query_row("SELECT count(*) FROM delivery_receipts", [], |r| r.get(0))?)
+    }
+    pub fn authority(&self) -> Result<Vec<Value>> {
+        let mut q = self
+            .0
+            .prepare("SELECT content_json FROM session_permission_authority ORDER BY id")?;
+        let mut rows = q.query([])?;
+        let mut v = Vec::new();
+        while let Some(r) = rows.next()? {
+            v.push(serde_json::from_str(&r.get::<_, String>(0)?)?);
+        }
+        Ok(v)
+    }
+    pub fn binding(&self) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row("SELECT definition FROM session_agents", [], |r| r.get(0))
+            .optional()?)
+    }
+}
+impl SessionWrite<'_> {
+    pub fn child_invocation(
+        &self,
+        address: &HistoryAddress,
+        row: &crate::services::subagents::Invocation,
+    ) -> Result<()> {
+        ensure!(
+            row.parent_session_id == self.1
+                && row.child_session_id == address.session
+                && !row.attempt_id.is_empty()
+                && !row.tool_use_id.is_empty(),
+            "Invalid child invocation ownership"
+        );
+        self.0.execute("INSERT INTO child_invocations VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_key) DO UPDATE SET invocation=excluded.invocation WHERE parent_message=excluded.parent_message AND child_incarnation=excluded.child_incarnation",params![row.key(),row.parent_message_id,address.incarnation,serde_json::to_string(row)?])?;
+        Ok(())
+    }
+    pub fn bind_agent(&self, definition: &str) -> Result<()> {
+        self.0.execute("INSERT INTO session_agents VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition",params![self.1,definition])?;
+        Ok(())
+    }
+    pub fn approved_plan(&self, content: &Value) -> Result<()> {
+        permission_authority::record_conn(
+            self.0,
+            self.1,
+            permission_authority::Source::ApprovedPlan,
+            content,
+        )
+    }
+    pub fn rewind_from(&self, message: &str) -> Result<()> {
+        let (order, row): (i64, i64) = self.0.query_row(
+            "SELECT sort_order,rowid FROM messages WHERE id=?1",
+            [message],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)>=(?1,?2)) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)<(?1,?2))",params![order,row])?;
+        self.0.execute(
+            "DELETE FROM messages WHERE (sort_order,rowid)>=(?1,?2)",
+            params![order, row],
+        )?;
+        self.2.set(true);
+        Ok(())
+    }
+}

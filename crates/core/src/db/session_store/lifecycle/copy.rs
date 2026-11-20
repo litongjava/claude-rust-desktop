@@ -30,12 +30,17 @@ impl SessionDb {
                 |r| r.get(0),
             )?;
             if matches!(boundary, Branch::Child) {
-                crate::native_engine::workspace::resolve_workspace(
-                    c,
-                    &s.root.path.join("workspaces"),
-                    &self.id,
-                    None,
-                )?;
+                ensure!(!row.archived, "Archived execution source");
+                if row.project_id.is_none() {
+                    crate::native_engine::workspace::private_workspace_owner(c, &self.id)?;
+                } else {
+                    crate::native_engine::workspace::resolve_workspace(
+                        c,
+                        &s.root.path.join("workspaces"),
+                        &self.id,
+                        None,
+                    )?;
+                }
             }
             Ok((row, revision))
         })?;

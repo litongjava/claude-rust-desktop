@@ -194,6 +194,7 @@ impl SessionDb {
         Ok(DeliveryOwner {
             session: self.clone(),
             _lease: lease,
+            _consumer: ExecutionLease::acquire_inbox(&self.stores.root.path, &self.incarnation)?,
             _locks: locks,
         })
     }
@@ -216,12 +217,13 @@ fn peer_project(c: &Connection, root: &Path, from: &str, to: &str) -> Result<Str
 pub struct DeliveryOwner {
     session: SessionDb,
     _lease: ExecutionLease,
+    _consumer: ExecutionLease,
     _locks: Vec<fs::File>,
 }
 #[derive(Debug, PartialEq)]
 pub struct Handoff {
     pub id: String,
-    pub dispatch: bool,
+    pub applied: bool,
 }
 struct Claim {
     id: String,
@@ -231,6 +233,32 @@ struct Claim {
     revision: i64,
 }
 impl DeliveryOwner {
+    /// Start at most one durable generation per acknowledged user delivery.
+    /// Recovery calls this after polling, including when the previous owner
+    /// died after G ack but before notifying the engine.
+    pub fn begin_generation(&mut self) -> Result<Option<(String, String)>> {
+        let s = &self.session;
+        let ids = s.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+            let mut q = c.prepare(
+                "SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL ORDER BY rowid",
+            )?;
+            let rows = q
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        for id in ids {
+            let ack=s.stores.global().read(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM session_input_queue WHERE session_id=?1 AND delivery_id=?2 AND state='handoff')",[&s.id,&id],|r|r.get::<_,bool>(0))?))?;
+            if ack {
+                return s.write_locked("dispatch delivered generation",|tx|{
+                let turn=tx.start_turn()?;
+                ensure!(tx.0.execute("UPDATE delivery_generations SET turn_id=?2 WHERE delivery_id=?1 AND turn_id IS NULL",[&id,&turn])?==1,"Generation already started");
+                Ok(Some((id.clone(),turn)))
+            });
+            }
+        }
+        Ok(None)
+    }
     pub fn next_queue(&mut self, mode: QueueMode, tool: Option<&str>) -> Result<Option<Handoff>> {
         let s = &self.session;
         let mode = mode_name(mode);
@@ -312,7 +340,10 @@ impl DeliveryOwner {
                     inputs.push(DeliveredInput{text:payload.as_str().map(str::to_owned).unwrap_or_else(||payload.to_string()),content:payload.clone(),origin:"user".into()});
                     input_queue::save_delivered(tx.0,tool,&inputs)?;
                     crate::services::permission_authority::record_conn(tx.0,&s.id,crate::services::permission_authority::Source::User,&payload)?;
-                }else{tx.append_user(&claim.id,&payload)?}
+                }else{
+                    tx.append_user(&claim.id,&payload)?;
+                    tx.0.execute("INSERT INTO delivery_generations(delivery_id) VALUES(?1)",[&claim.id])?;
+                }
                 Ok(())
             })?;
             true
@@ -326,7 +357,7 @@ impl DeliveryOwner {
         s.stores.step(Phase::DeliveryAcknowledged)?;
         Ok(Handoff {
             id: claim.id,
-            dispatch: fresh,
+            applied: fresh,
         })
     }
 }

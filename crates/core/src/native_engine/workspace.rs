@@ -148,7 +148,7 @@ pub fn conversation_project(conn: &Connection, id: &str) -> Result<Option<projec
 }
 
 /// Explicit owned-child bindings are the only exception to one private directory per session.
-fn private_workspace_owner(conn: &Connection, id: &str) -> Result<Option<String>> {
+pub(crate) fn private_workspace_owner(conn: &Connection, id: &str) -> Result<Option<String>> {
     let binding = |id: &str| -> Result<Option<String>> {
         Ok(conn.query_row("SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?1", [id], |row| row.get(0)).optional()?)
     };

@@ -477,6 +477,14 @@ pub struct ExecutionLease {
     owner: u32,
 }
 impl ExecutionLease {
+    pub(crate) fn acquire_inbox(root:&Path,incarnation:&str)->Result<Self>{
+        let path=lock_path(root,incarnation)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        crate::fs::try_lock_briefly(&file).context("Recipient already has a consumer")?;
+        Ok(Self{file,owner:std::process::id()})
+    }
+
     /// Exclusive admission for one session. Every caller - a frontend turn, an
     /// engine without a host and a Desktop private session - competes for the
     /// same lock, so a second top-level turn is rejected before it can start a
