@@ -161,6 +161,250 @@ fn provider(base: &str, format: &str) -> ResolvedProvider {
     }
 }
 
+/// The built-in OpenAI adapter with the Responses protocol, like a Codex-style
+/// endpoint. The base URL already ends in `/responses`.
+fn responses_provider(base: &str) -> ResolvedProvider {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| crate::config::OrchestrationConfig::init_global().unwrap());
+    ResolvedProvider {
+        provider: serde_json::from_value(json!({
+            "id": "responses-test", "name": "responses-test",
+            "base_url": format!("{base}/responses"),
+            "api_key": "local-test-key", "api_format": "openai",
+            "builtin_id": "openai", "models": [], "enabled": true
+        }))
+        .unwrap(),
+        model: serde_json::from_value(json!({
+            "id": "gpt-6-astra", "name": "gpt-6-astra", "api": "openai-responses",
+            "enabled": true, "supports_vision": false, "supports_web_search": false
+        }))
+        .unwrap(),
+    }
+}
+
+fn instructions_reminders(
+    user: Option<&std::path::Path>,
+    project: &std::path::Path,
+) -> Vec<String> {
+    crate::project_instructions::reminders(
+        &crate::project_instructions::load_all(user, project).unwrap(),
+    )
+}
+
+fn responses_text_events(text: &str) -> Vec<Value> {
+    vec![
+        json!({"type":"response.output_text.delta","delta":text}),
+        json!({"type":"response.completed","response":{"id":"r","model":"gpt-6-astra","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}),
+    ]
+}
+
+fn anthropic_text_events(text: &str) -> Vec<Value> {
+    vec![
+        json!({"type":"message_start","message":{"id":"a","model":"code-test","usage":{"input_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        json!({"type":"message_stop"}),
+    ]
+}
+
+fn chat_text_events(text: &str) -> Vec<Value> {
+    vec![
+        json!({"id":"b","model":"code-test","choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ]
+}
+
+/// Run one turn against a local endpoint and return the request body.
+async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Value {
+    use axum::{http::header, routing::post, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (provider, route, events) = match format {
+        "responses" => (
+            responses_provider(&base),
+            "/responses",
+            responses_text_events("done"),
+        ),
+        "anthropic" => (
+            provider(&base, "anthropic"),
+            "/v1/messages",
+            anthropic_text_events("done"),
+        ),
+        _ => (
+            provider(&base, "openai"),
+            "/v1/chat/completions",
+            chat_text_events("done"),
+        ),
+    };
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let requests = captured.clone();
+    let responses = format == "responses";
+    let app = Router::new().route(
+        route,
+        post(move |Json(body): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().await.push(body);
+                let mut stream = events
+                    .into_iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                if !responses {
+                    stream.push_str("data: [DONE]\n\n");
+                }
+                ([(header::CONTENT_TYPE, "text/event-stream")], stream)
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (tx, _rx) = mpsc::channel(128);
+    let temp = tempfile::tempdir().unwrap();
+    let mut executor = ToolLoopExecutor::new(
+        provider,
+        vec![json!({"role":"user","content":"hello"})],
+        Some(crate::prompt::compose_system_prompt(None, PromptProfile::Code)),
+        128,
+        tx,
+        temp.path().to_string_lossy().into(),
+        ReasoningMode::Standard,
+    )
+    .with_prompt_profile(PromptProfile::Code)
+    .with_context_reminders(reminders)
+    .with_conv_id(format!("instructions-{format}"));
+    let (text, _) = tokio::time::timeout(Duration::from_secs(15), executor.execute())
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    assert_eq!(text, "done", "{format}");
+    let captured = captured.lock().await;
+    assert_eq!(captured.len(), 1, "{format}");
+    captured[0].clone()
+}
+
+#[tokio::test]
+async fn instruction_files_become_separate_responses_parts() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("AGENTS.md"), "user marker").unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let reminders = instructions_reminders(Some(user.path()), project.path());
+    assert_eq!(reminders.len(), 2);
+    let body = capture_instruction_request("responses", reminders).await;
+    let first = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("the request carries the user message");
+    let parts = first["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    assert!(
+        parts.iter().all(|part| part["type"] == "input_text"),
+        "{parts:?}"
+    );
+    let text = |index: usize| parts[index]["text"].as_str().unwrap();
+    assert!(text(0).starts_with(&format!(
+        "<system-reminder>\n{}",
+        crate::project_instructions::PREAMBLE
+    )));
+    assert!(text(0).contains("user marker") && !text(0).contains("project marker"));
+    assert!(text(1).starts_with("<system-reminder>\nContents of "));
+    assert!(text(1).contains("project marker"));
+    assert!(text(1).contains("project instructions, checked into the codebase"));
+    assert_eq!(text(2), "hello");
+    let all = parts
+        .iter()
+        .map(|part| part["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(
+        all.matches(crate::project_instructions::PREAMBLE).count(),
+        1
+    );
+    println!(
+        "responses parts: {:?}",
+        (0..3)
+            .map(|index| text(index).chars().take(120).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn project_only_instructions_use_two_responses_parts() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let reminders = instructions_reminders(None, project.path());
+    assert_eq!(reminders.len(), 1);
+    let body = capture_instruction_request("responses", reminders).await;
+    let first = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("the request carries the user message");
+    let parts = first["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert!(
+        parts.iter().all(|part| part["type"] == "input_text"),
+        "{parts:?}"
+    );
+    let first_text = parts[0]["text"].as_str().unwrap();
+    assert!(first_text.starts_with(&format!(
+        "<system-reminder>\n{}",
+        crate::project_instructions::PREAMBLE
+    )));
+    assert!(first_text.contains("project marker"));
+    assert_eq!(parts[1]["text"], "hello");
+}
+
+#[tokio::test]
+async fn instruction_files_become_separate_anthropic_blocks() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("AGENTS.md"), "user marker").unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let reminders = instructions_reminders(Some(user.path()), project.path());
+    assert_eq!(reminders.len(), 2);
+    let body = capture_instruction_request("anthropic", reminders.clone()).await;
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3, "{content:?}");
+    assert_eq!(content[0]["text"], reminders[0].as_str());
+    assert_eq!(content[1]["text"], reminders[1].as_str());
+    assert_eq!(content[2]["text"], "hello");
+}
+
+#[tokio::test]
+async fn chat_completions_join_instruction_blocks() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("AGENTS.md"), "user marker").unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let reminders = instructions_reminders(Some(user.path()), project.path());
+    assert_eq!(reminders.len(), 2);
+    let body = capture_instruction_request("chat", reminders.clone()).await;
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    let content = user["content"].as_str().unwrap();
+    assert_eq!(
+        content,
+        format!("{}\n\n{}\n\nhello", reminders[0], reminders[1])
+    );
+    assert_eq!(
+        content
+            .matches(crate::project_instructions::PREAMBLE)
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn all_modes_preserve_memory_and_settings_in_either_builder_order() {
     let temp = tempfile::tempdir().unwrap();
@@ -272,7 +516,6 @@ async fn all_modes_run_memory_tools_without_automatic_recall_or_saving() {
             let profile = PromptProfile::from_workspace_mode(mode);
             let prompt = crate::prompt::compose_system_prompt(
                 Some("custom project rule"),
-                "code-test",
                 profile,
             );
             let mut executor = ToolLoopExecutor::new(
@@ -410,7 +653,7 @@ async fn context_reminders_open_the_first_user_message() {
             "<system-reminder>\nreminder-marker-rules\n</system-reminder>".to_string(),
             "<system-reminder>\n# gitStatus\n</system-reminder>".to_string(),
         ];
-        let prompt = crate::prompt::compose_system_prompt(None, "code-test", PromptProfile::Code);
+        let prompt = crate::prompt::compose_system_prompt(None, PromptProfile::Code);
         let history = vec![
             json!({"role":"user","content":"hello"}),
             json!({"role":"assistant","content":"hi"}),

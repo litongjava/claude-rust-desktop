@@ -47,19 +47,50 @@ pub struct Instruction {
     pub sha256: String,
 }
 
+fn line(item: &Instruction) -> String {
+    format!(
+        "Contents of {} ({}):\n\n{}",
+        item.path.display(),
+        item.scope.label(),
+        item.content.trim()
+    )
+}
+
 /// Every instruction as the reference CLI lists it, or "" when none exist.
 pub fn render(instructions: &[Instruction]) -> String {
     instructions
         .iter()
-        .map(|item| format!("Contents of {} ({}):\n\n{}", item.path.display(), item.scope.label(), item.content.trim()))
+        .map(line)
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-/// The `<system-reminder>` the reference CLI puts at the start of the first
-/// user message, or None when there are no instructions.
-pub fn reminder(instructions: &[Instruction]) -> Option<String> {
-    (!instructions.is_empty()).then(|| format!("<system-reminder>\n{PREAMBLE}\n\n{}\n</system-reminder>", render(instructions)))
+/// The `<system-reminder>` blocks the reference CLI puts at the start of the
+/// first user message: one for the user's private instructions and one for the
+/// project's checked-in and local instructions, so the stable parts can be
+/// cached separately. The preamble leads the first non-empty block; an empty
+/// group produces no block.
+pub fn reminders(instructions: &[Instruction]) -> Vec<String> {
+    let (user, project): (Vec<_>, Vec<_>) = instructions
+        .iter()
+        .partition(|item| item.scope == Scope::User);
+    [user, project]
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .enumerate()
+        .map(|(index, group)| {
+            let body = group
+                .iter()
+                .map(|item| line(item))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if index == 0 {
+                format!("<system-reminder>\n{PREAMBLE}\n\n{body}\n</system-reminder>")
+            } else {
+                format!("<system-reminder>\n{body}\n</system-reminder>")
+            }
+        })
+        .collect()
 }
 
 /// Project instructions only, rendered; see [`load_all`] for user instructions too.
@@ -369,11 +400,33 @@ mod tests {
             .map(|item| item.scope)
             .collect();
         assert_eq!(scopes, [Scope::User, Scope::Project, Scope::Local]);
-        let reminder = reminder(&all).unwrap();
-        assert!(reminder.starts_with(&format!("<system-reminder>\n{PREAMBLE}\n\nContents of ")));
-        assert!(reminder.contains("CLAUDE.md (user's private global instructions for all projects):\n\nuser marker\n\nContents of "));
-        assert!(reminder.contains("AGENTS.md (project instructions, checked into the codebase):\n\nproject marker\n\n"));
-        assert!(reminder.ends_with("CLAUDE.local.md (user's private project instructions, not checked in):\n\nlocal marker\n</system-reminder>"));
-        assert!(super::reminder(&[]).is_none());
+        let blocks = reminders(&all);
+        // The user's own file and the project's files travel separately so the
+        // stable user-level prefix can be cached on its own.
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].starts_with(&format!("<system-reminder>\n{PREAMBLE}\n\nContents of ")));
+        assert!(blocks[0].contains(
+            "CLAUDE.md (user's private global instructions for all projects):\n\nuser marker"
+        ));
+        assert!(!blocks[0].contains("project marker"));
+        assert_eq!(blocks[0].matches(PREAMBLE).count(), 1);
+        assert!(blocks[1].starts_with("<system-reminder>\nContents of "));
+        assert!(!blocks[1].contains(PREAMBLE));
+        assert!(blocks[1].contains(
+            "AGENTS.md (project instructions, checked into the codebase):\n\nproject marker\n\n"
+        ));
+        assert!(blocks[1].ends_with("CLAUDE.local.md (user's private project instructions, not checked in):\n\nlocal marker\n</system-reminder>"));
+        assert!(super::reminders(&[]).is_empty());
+    }
+
+    #[test]
+    fn project_only_instructions_form_one_block_with_the_preamble() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+        let all = load_all(None, project.path()).unwrap();
+        let blocks = reminders(&all);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].starts_with(&format!("<system-reminder>\n{PREAMBLE}\n\nContents of ")));
+        assert_eq!(blocks[0].matches(PREAMBLE).count(), 1);
     }
 }

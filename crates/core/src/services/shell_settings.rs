@@ -304,6 +304,18 @@ impl ResolvedShell {
     }
 }
 
+/// The program the Bash tool would launch for this data directory; None when
+/// no shell resolves. Shares the executor's settings and resolution.
+pub fn resolve_tool_program_in(root: &Path) -> Option<String> {
+    load(root).ok()?.resolve(None, false).ok().map(|shell| shell.program)
+}
+
+/// The Bash tool's program for this process, from the default data directory
+/// the executor falls back to outside a scoped session.
+pub fn resolved_tool_program() -> Option<String> {
+    resolve_tool_program_in(&crate::runtime::resolve_default_data_dir().ok()?)
+}
+
 pub fn inspect(root: &Path) -> Result<Value> {
     let settings = load(root)?;
     let describe = |terminal| match settings.resolve(None, terminal) {
@@ -340,6 +352,29 @@ mod tests {
         std::fs::write(&file, "{broken").unwrap();
         assert!(set(root.path(), "toolDefault", "bash").is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn tool_program_follows_the_configured_bash_path() {
+        // The executor lets DEEPSEEK_CODE_BASH_PATH override settings; nothing to
+        // assert here when the test environment sets it.
+        if std::env::var_os("DEEPSEEK_CODE_BASH_PATH").is_some() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bash = root.path().join("bash.exe");
+        std::fs::write(&bash, "").unwrap();
+        let settings = ShellSettings {
+            bash_path: Some(bash.to_string_lossy().into()),
+            ..Default::default()
+        };
+        save(root.path(), &settings).unwrap();
+        assert_eq!(
+            resolve_tool_program_in(root.path()),
+            Some(bash.to_string_lossy().into())
+        );
+        std::fs::remove_file(&bash).unwrap();
+        assert_eq!(resolve_tool_program_in(root.path()), None);
     }
 
     #[test]
