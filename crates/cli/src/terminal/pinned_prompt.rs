@@ -24,7 +24,7 @@ impl PinnedPrompt {
         let mut frame = Vec::new();
         self.draw_to(&mut frame, width, height, background)?;
         if frame.is_empty() { return Ok(()); }
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
         out.write_all(&frame)?;
         out.write_all(b"\x1b[?2026l")?;

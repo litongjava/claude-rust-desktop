@@ -20,7 +20,7 @@ struct PluginsScreen;
 impl PluginsScreen {
     fn enter() -> std::io::Result<Self> {
         crossterm::execute!(
-            std::io::stderr(),
+            crate::terminal_output::stderr(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0)
@@ -31,7 +31,7 @@ impl PluginsScreen {
 
 impl Drop for PluginsScreen {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
     }
 }
 
@@ -113,16 +113,16 @@ fn skill_order(a: &SkillRow, b: &SkillRow) -> std::cmp::Ordering {
     ))
 }
 
-/// Where a skill comes from: a plugin ID, the CLI's embedded skills, the
+/// Where a skill comes from: a plugin ID, the installed built-in skills, the
 /// workspace's `.claude` directory, or the user scope.
-fn source_label(name: &str, path: &Path, workspace: &Path) -> String {
+fn source_label(name: &str, path: &Path, workspace: &Path, data_dir: &Path) -> String {
     if name.starts_with("synced:") {
         return "synced".to_owned();
     }
     if let Some((plugin, _)) = name.split_once(':') {
         return plugin.to_owned();
     }
-    if path.parent() == Some(Path::new("__embedded_cli_skills__")) {
+    if deepseek_code_core::skills::discovery::is_bundled_path(path, data_dir) {
         return "built-in".to_owned();
     }
     if path.starts_with(workspace.join(".claude")) {
@@ -135,28 +135,41 @@ fn source_label(name: &str, path: &Path, workspace: &Path) -> String {
 /// must still show them so they can be turned back on.
 pub(crate) async fn load(paths: &RuntimePaths, session: &Session) -> Result<Model> {
     let context = crate::services::context(paths)?;
+    deepseek_code_core::skills::SkillsManager::with_path(paths.data_dir.join("skills"))
+        .ensure_installed()?;
     let mut commands =
         deepseek_code_core::skills::discovery::discover(&paths.data_dir, &session.workspace)?;
     commands.extend(deepseek_code_core::services::plugins::skill_commands(
         &context,
     )?);
     let states = states::load(&paths.data_dir);
+    let bundled = deepseek_code_core::skills::discovery::bundled_dir(&paths.data_dir);
+    let installed =
+        deepseek_code_core::skills::discovery::installed_bundled_skills(&paths.data_dir);
     let usages = skill_usage::skill_usage(&session.store.db, Utc::now())?;
     let mut names: BTreeSet<String> = commands.keys().cloned().collect();
+    names.extend(installed.keys().cloned());
     names.extend(states.keys().cloned());
     let mut skills: Vec<SkillRow> = names
         .into_iter()
         .map(|name| {
-            let state = states::effective(&states, &name);
             let command = commands.get(&name);
+            let is_bundled = command.map_or_else(
+                || installed.contains_key(&name),
+                |command| command.path.starts_with(&bundled),
+            );
+            let state = states::effective_in(&states, &name, is_bundled);
             let listing_tokens = if state == SkillState::Off {
                 0
             } else {
                 command.map_or(0, skill_usage::listing_tokens)
             };
-            let path = command.map_or(Path::new(""), |command| command.path.as_path());
+            let path = command.map_or_else(
+                || installed.get(&name).map_or(Path::new(""), |path| path.as_path()),
+                |command| command.path.as_path(),
+            );
             SkillRow {
-                source: source_label(&name, path, &session.workspace),
+                source: source_label(&name, path, &session.workspace, &paths.data_dir),
                 state,
                 listing_tokens,
                 usage: usages.get(&name).cloned().unwrap_or_default(),
@@ -680,6 +693,14 @@ pub(crate) fn installed_entries(
 /// The Errors tab: unreadable skill files and failed MCP servers.
 async fn error_rows(paths: &RuntimePaths, session: &Session) -> Vec<String> {
     let mut rows = Vec::new();
+    if let Err(error) =
+        deepseek_code_core::skills::SkillsManager::with_path(paths.data_dir.join("skills"))
+            .ensure_installed()
+    {
+        rows.push(format!(
+            "\u{2717} bundled skills \u{2014} install failed: {error}"
+        ));
+    }
     let mut invalid =
         deepseek_code_core::skills::discovery::invalid_skill_files(&paths.data_dir, &session.workspace);
     invalid.sort();
@@ -1156,15 +1177,22 @@ mod tests {
     #[test]
     fn source_labels() {
         let workspace = Path::new("/work/project");
+        let data_dir = Path::new("/data/dcl");
         assert_eq!(
-            source_label("dsb-skills:browser", Path::new("/cache/x.md"), workspace),
+            source_label(
+                "dsb-skills:browser",
+                Path::new("/cache/x.md"),
+                workspace,
+                data_dir
+            ),
             "dsb-skills"
         );
         assert_eq!(
             source_label(
                 "bundled",
-                Path::new("__embedded_cli_skills__/bundled.md"),
-                workspace
+                Path::new("/data/dcl/skills/bundled/bundled/SKILL.md"),
+                workspace,
+                data_dir
             ),
             "built-in"
         );
@@ -1172,7 +1200,8 @@ mod tests {
             source_label(
                 "project",
                 Path::new("/work/project/.claude/skills/p/SKILL.md"),
-                workspace
+                workspace,
+                data_dir
             ),
             "project"
         );
@@ -1180,7 +1209,8 @@ mod tests {
             source_label(
                 "mine",
                 Path::new("/home/u/.claude/skills/m/SKILL.md"),
-                workspace
+                workspace,
+                data_dir
             ),
             "user"
         );
@@ -1409,7 +1439,12 @@ mod tests {
         assert!(!text.contains("synced:1234-abcd"), "{text}");
 
         assert_eq!(
-            source_label(full, Path::new(""), Path::new("/work/project")),
+            source_label(
+                full,
+                Path::new(""),
+                Path::new("/work/project"),
+                Path::new("/data/dcl")
+            ),
             "synced"
         );
 
