@@ -319,6 +319,139 @@ async fn stream_with_options_client_budget(
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
     let (entry, model) = metadata(provider)?;
     let (protocol, api) = resolved_transport(provider)?;
+    let initiator = if messages.last().is_some_and(|m| m.role != "user") {
+        "agent"
+    } else {
+        "user"
+    };
+    let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
+    let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
+    // Responses endpoints route requests to a prompt cache by this key, so the
+    // same conversation keeps reusing one cached prefix.
+    if api == "openai-responses" {
+        if let Some(key) = super::request_identity::prompt_cache_key() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+    }
+    if let Some(schema) = response_schema.filter(|_| {
+        !crate::structured_output::provider_enforces_schema(&provider.provider.base_url)
+    }) {
+        match api {
+            "openai-completions" => {
+                crate::structured_output::append_openai_instruction(&mut body, schema)
+            }
+            "anthropic-messages" => {
+                crate::structured_output::append_anthropic_instruction(&mut body, schema)
+            }
+            _ => bail!(
+                "Provider protocol '{protocol}' cannot enforce a JSON schema for this endpoint"
+            ),
+        }
+    } else if let Some(schema) = response_schema {
+        match api {
+            "openai-completions" => {
+                body["response_format"] = serde_json::json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}})
+            }
+            "openai-responses" => {
+                body["text"]["format"] = serde_json::json!({"type":"json_schema","name":"structured_response","strict":true,"schema":schema})
+            }
+            "anthropic-messages" => {
+                body["output_config"]["format"] =
+                    serde_json::json!({"type":"json_schema","schema":schema})
+            }
+            _ => bail!(
+                "Strict JSON Schema output is not implemented for provider protocol '{protocol}'"
+            ),
+        }
+    }
+    if protocol == "openai-codex-responses" {
+        body.as_object_mut().unwrap().remove("max_output_tokens");
+    }
+    if protocol == "mistral-conversations" {
+        body.as_object_mut().unwrap().remove("stream_options");
+        if let Some(messages) = body["messages"].as_array_mut() {
+            for message in messages {
+                if let Some(reasoning) = message
+                    .as_object_mut()
+                    .and_then(|m| m.remove("reasoning_content"))
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .filter(|s| !s.is_empty())
+                {
+                    let mut parts = vec![
+                        serde_json::json!({"type":"thinking","thinking":[{"type":"text","text":reasoning}]}),
+                    ];
+                    match &message["content"] {
+                        Value::String(text) if !text.is_empty() => {
+                            parts.push(serde_json::json!({"type":"text","text":text}))
+                        }
+                        Value::Array(content) => parts.extend(content.clone()),
+                        _ => {}
+                    }
+                    message["content"] = serde_json::json!(parts);
+                }
+            }
+        }
+        if provider.model.effort.as_deref() == Some("off") {
+            body.as_object_mut().unwrap().remove("reasoning_effort");
+        }
+        if provider.model.effort.as_deref().is_some_and(|e| e != "off")
+            && !matches!(
+                provider.model.id.as_str(),
+                "mistral-small-2603" | "mistral-small-latest" | "mistral-medium-3.5"
+            )
+        {
+            body.as_object_mut().unwrap().remove("reasoning_effort");
+            body["prompt_mode"] = serde_json::json!("reasoning");
+        }
+    }
+    if api == "anthropic-messages" {
+        crate::services::anthropic_auth::apply_fast(
+            &mut body,
+            provider.model.fast,
+            &provider.model.id,
+            &provider.provider.base_url,
+        )?;
+    } else {
+        anyhow::ensure!(
+            !crate::services::anthropic_auth::is_oauth_marker(&credential(
+                provider,
+                entry["id"].as_str().unwrap_or_default()
+            )),
+            "Anthropic OAuth credentials require the Anthropic messages API"
+        );
+        anyhow::ensure!(
+            !provider.model.fast,
+            "Fast mode requires the Anthropic messages API"
+        );
+    }
+    stream_body(
+        provider,
+        body,
+        initiator,
+        vision,
+        max_tokens,
+        context_capture,
+        options,
+        client,
+        budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_body(
+    provider: &ResolvedProvider,
+    body: Value,
+    initiator: &'static str,
+    vision: bool,
+    max_tokens: u32,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let (entry, model) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
     let key = credential(provider, entry["id"].as_str().unwrap_or_default());
     let configured = provider.provider.base_url.trim_end_matches('/');
     let region = if protocol == "bedrock-converse-stream" {
@@ -464,91 +597,6 @@ async fn stream_with_options_client_budget(
             )
         }
     };
-    let initiator = if messages.last().is_some_and(|m| m.role != "user") {
-        "agent"
-    } else {
-        "user"
-    };
-    let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
-    let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
-    // Responses endpoints route requests to a prompt cache by this key, so the
-    // same conversation keeps reusing one cached prefix.
-    if api == "openai-responses" {
-        if let Some(key) = super::request_identity::prompt_cache_key() {
-            body["prompt_cache_key"] = serde_json::json!(key);
-        }
-    }
-    if let Some(schema) = response_schema.filter(|_| {
-        !crate::structured_output::provider_enforces_schema(&provider.provider.base_url)
-    }) {
-        match api {
-            "openai-completions" => {
-                crate::structured_output::append_openai_instruction(&mut body, schema)
-            }
-            "anthropic-messages" => {
-                crate::structured_output::append_anthropic_instruction(&mut body, schema)
-            }
-            _ => bail!(
-                "Provider protocol '{protocol}' cannot enforce a JSON schema for this endpoint"
-            ),
-        }
-    } else if let Some(schema) = response_schema {
-        match api {
-            "openai-completions" => {
-                body["response_format"] = serde_json::json!({"type":"json_schema","json_schema":{"name":"structured_response","strict":true,"schema":schema}})
-            }
-            "openai-responses" => {
-                body["text"]["format"] = serde_json::json!({"type":"json_schema","name":"structured_response","strict":true,"schema":schema})
-            }
-            "anthropic-messages" => {
-                body["output_config"]["format"] =
-                    serde_json::json!({"type":"json_schema","schema":schema})
-            }
-            _ => bail!(
-                "Strict JSON Schema output is not implemented for provider protocol '{protocol}'"
-            ),
-        }
-    }
-    if protocol == "openai-codex-responses" {
-        body.as_object_mut().unwrap().remove("max_output_tokens");
-    }
-    if protocol == "mistral-conversations" {
-        body.as_object_mut().unwrap().remove("stream_options");
-        if let Some(messages) = body["messages"].as_array_mut() {
-            for message in messages {
-                if let Some(reasoning) = message
-                    .as_object_mut()
-                    .and_then(|m| m.remove("reasoning_content"))
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .filter(|s| !s.is_empty())
-                {
-                    let mut parts = vec![
-                        serde_json::json!({"type":"thinking","thinking":[{"type":"text","text":reasoning}]}),
-                    ];
-                    match &message["content"] {
-                        Value::String(text) if !text.is_empty() => {
-                            parts.push(serde_json::json!({"type":"text","text":text}))
-                        }
-                        Value::Array(content) => parts.extend(content.clone()),
-                        _ => {}
-                    }
-                    message["content"] = serde_json::json!(parts);
-                }
-            }
-        }
-        if provider.model.effort.as_deref() == Some("off") {
-            body.as_object_mut().unwrap().remove("reasoning_effort");
-        }
-        if provider.model.effort.as_deref().is_some_and(|e| e != "off")
-            && !matches!(
-                provider.model.id.as_str(),
-                "mistral-small-2603" | "mistral-small-latest" | "mistral-medium-3.5"
-            )
-        {
-            body.as_object_mut().unwrap().remove("reasoning_effort");
-            body["prompt_mode"] = serde_json::json!("reasoning");
-        }
-    }
     let google_token =
         if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
             // A credential exchange is a buffered request, so it keeps the
@@ -561,23 +609,6 @@ async fn stream_with_options_client_budget(
         } else {
             None
         };
-    if api == "anthropic-messages" {
-        crate::services::anthropic_auth::apply_fast(
-            &mut body,
-            provider.model.fast,
-            &provider.model.id,
-            &provider.provider.base_url,
-        )?;
-    } else {
-        anyhow::ensure!(
-            !crate::services::anthropic_auth::is_oauth_marker(&key),
-            "Anthropic OAuth credentials require the Anthropic messages API"
-        );
-        anyhow::ensure!(
-            !provider.model.fast,
-            "Fast mode requires the Anthropic messages API"
-        );
-    }
     let encoded_body = serde_json::to_string(&body)?;
     let account = if protocol == "openai-codex-responses" {
         Some(codex_account(&key)?)
@@ -683,7 +714,7 @@ async fn stream_with_options_client_budget(
                 }
                 if let Some(capture) = &capture {
                     capture
-                        .record(&api, &body, provider.model.context_window, max_tokens)
+                        .record_transport(&api, &body, provider.model.context_window, max_tokens, Some(vision))
                         .await;
                 }
                 checked_response(

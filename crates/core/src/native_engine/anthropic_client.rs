@@ -438,12 +438,6 @@ impl AnthropicClient {
         crate::performance::AttemptCounter,
     )> {
         let base_url = provider.provider.base_url.trim_end_matches('/');
-        let url = if base_url.contains("/v1") {
-            format!("{}/messages", base_url)
-        } else {
-            format!("{}/v1/messages", base_url)
-        };
-
         let mut body = json!({
             "model": provider.model.id,
             "max_tokens": max_tokens,
@@ -475,6 +469,35 @@ impl AnthropicClient {
 
         self.apply_options(&mut body, provider)?;
         crate::performance::apply_conversation_cache(&mut body);
+        if let Some(capture) = context_capture {
+            capture
+                .record(
+                    "anthropic-messages",
+                    &body,
+                    provider.model.context_window,
+                    max_tokens,
+                )
+                .await;
+        }
+        self.stream_body(provider, body, context_capture).await
+    }
+
+    pub(super) async fn stream_body(
+        &self,
+        provider: &ResolvedProvider,
+        body: Value,
+        context_capture: Option<&super::request_context::ContextCapture>,
+    ) -> Result<(
+        super::provider_runtime::ProviderStream,
+        crate::performance::AttemptCounter,
+    )> {
+        let base_url = provider.provider.base_url.trim_end_matches('/');
+        let url = if base_url.contains("/v1") {
+            format!("{}/messages", base_url)
+        } else {
+            format!("{}/v1/messages", base_url)
+        };
+
         let harness_headers = self.request_options.headers(provider)?;
         let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
         let client = self.streaming_client()?;
@@ -490,16 +513,6 @@ impl AnthropicClient {
             provider.model.fast,
         )
         .await?;
-        if let Some(capture) = context_capture {
-            capture
-                .record(
-                    "anthropic-messages",
-                    &body,
-                    provider.model.context_window,
-                    max_tokens,
-                )
-                .await;
-        }
         super::stream_retry::response(
             request,
             identity,

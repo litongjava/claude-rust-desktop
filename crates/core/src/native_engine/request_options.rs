@@ -113,6 +113,9 @@ impl RequestOptions {
 
     pub(crate) fn headers(&self, provider: &ResolvedProvider) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        if self.purpose == "suggestion" {
+            headers.insert("x-dcl-request-kind", HeaderValue::from_static("suggestion"));
+        }
         if is_deepseek(provider) {
             if let Some(session) = &self.session_id {
                 // Never normalize or silently replace an external session ID.

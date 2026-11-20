@@ -35,3 +35,5 @@ pub mod child_session;
 pub(crate) mod mcp_output;
 
 pub mod request_recording;
+
+pub mod suggestion;

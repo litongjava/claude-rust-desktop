@@ -210,6 +210,7 @@ impl ContextUsage {
 /// Per-request capture: never shared across simultaneous child requests.
 #[derive(Clone, Default)]
 pub struct ContextCapture {
+    pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
     pub(super) latest: Arc<Mutex<Option<ContextUsage>>>,
     pub(super) event: Option<(
         tokio::sync::mpsc::Sender<super::tool_loop::EngineEvent>,
@@ -221,6 +222,20 @@ impl ContextCapture {
         self.latest.lock().ok()?.clone()
     }
     pub async fn record(&self, protocol: &str, body: &Value, window: Option<u32>, requested: u32) {
+        self.record_transport(protocol, body, window, requested, None)
+            .await;
+    }
+    pub(super) async fn record_transport(
+        &self,
+        protocol: &str,
+        body: &Value,
+        window: Option<u32>,
+        requested: u32,
+        builtin_vision: Option<bool>,
+    ) {
+        if let Some(capture) = &self.suggestion {
+            capture.record(protocol, body, builtin_vision);
+        }
         let usage = ContextUsage::from_body(protocol, body, window, requested);
         if let Ok(mut current) = self.latest.lock() {
             *current = Some(usage.clone());

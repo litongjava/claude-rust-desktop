@@ -215,6 +215,7 @@ pub enum EngineEvent {
 }
 
 pub struct ToolLoopExecutor {
+    pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
@@ -1531,6 +1532,7 @@ impl ToolLoopExecutor {
             toolscript_hosts: Vec::new(),
             local_goal_frontend: false,
             context_usage: None,
+            suggestion: None,
             auto_history: messages.clone(),
             provider,
             messages,
@@ -5357,7 +5359,8 @@ impl ToolLoopExecutor {
             // Real HTTP attempts observed by the send layer, so a clean
             // end-of-stream still reports a count instead of "unknown".
             let http_attempts: crate::performance::AttemptCounter;
-            let context_capture = request_trace.capture_context(self.event_tx.clone());
+            let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+            context_capture.suggestion = self.suggestion.clone();
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5718,6 +5721,13 @@ impl ToolLoopExecutor {
             if let Some(failure) = &stream_failure {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
+            }
+            if let Some(capture) = &self.suggestion {
+                capture.finish(
+                    &snapshot,
+                    &self.provider,
+                    &self.anthropic_client.request_options,
+                );
             }
             let response_status = snapshot["status"]
                 .as_str()
@@ -6196,7 +6206,8 @@ impl ToolLoopExecutor {
                 // Real HTTP attempts observed by the send layer, so a clean
                 // end-of-stream still reports a count instead of "unknown".
                 let http_attempts: crate::performance::AttemptCounter;
-                let context_capture = request_trace.capture_context(self.event_tx.clone());
+                let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+                context_capture.suggestion = self.suggestion.clone();
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6598,6 +6609,13 @@ impl ToolLoopExecutor {
                 if let Some(failure) = &stream_failure {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
+                }
+                if let Some(capture) = &self.suggestion {
+                    capture.finish(
+                        &snapshot,
+                        &self.provider,
+                        &self.openai_client.request_options,
+                    );
                 }
                 let response_status = snapshot["status"]
                     .as_str()

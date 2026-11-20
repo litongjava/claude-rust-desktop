@@ -60,6 +60,7 @@ pub struct Session {
     waiting_for_continue: std::sync::atomic::AtomicBool,
     /// Runtime-only options of the latest worker turn, retained for internal wakes.
     pub(crate) hook_wake_cli: std::sync::Mutex<Option<Arc<Cli>>>,
+    pub(crate) sdk_suggestion: std::sync::Mutex<Option<crate::prompt_suggestion::Pending>>,
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_interrupt: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) sdk_content: Option<Value>,
@@ -152,6 +153,7 @@ pub(crate) fn recall_queued(
 // Attempt data is published only after optional recovery has settled.
 #[derive(Default)]
 struct TurnCompletion {
+    suggestion: Option<deepseek_code_core::native_engine::suggestion::SuggestionCapture>,
     // Keep the original print failure even if saving the transcript, finishing
     // the turn timer, or publishing the result also fails.
     stdout_failure: Option<crate::terminal_output::StdoutWriteFailed>,
@@ -753,6 +755,7 @@ impl Session {
         Ok(Self {
             waiting_for_continue: std::sync::atomic::AtomicBool::new(resumed_id.is_some()),
             hook_wake_cli: std::sync::Mutex::new(None),
+            sdk_suggestion: Default::default(),
             initial_hook_message: None,
             permissions,
             ide,
@@ -1754,6 +1757,23 @@ impl Session {
             payload["turn"] = json!(record);
             emit_json(&payload)?;
         }
+        if status == deepseek_code_core::db::turn_repo::TurnStatus::Completed {
+            if let Some(pending) = completion.suggestion.take().and_then(|capture| {
+                crate::prompt_suggestion::Pending::new(self, capture, turn.message_id()?)
+            }) {
+                if self.sdk_permissions.is_some() {
+                    *self.sdk_suggestion.lock().unwrap() = Some(pending);
+                } else if input.is_some()
+                    || self.coordination_mode
+                        == crate::local_coordination::RegistrationMode::HostOwned
+                {
+                    tokio::spawn(pending.generate());
+                } else {
+                    // A single-turn foreground worker exits as soon as this returns.
+                    let _ = pending.generate().await;
+                }
+            }
+        }
         if cli.output_format != OutputFormat::Text {
             result.map_err(|error| {
                 if error
@@ -1914,7 +1934,8 @@ impl Session {
         );
         // The model may only ask for a compaction when a local terminal owns the
         // next prompt; SDK and print runs keep the tool unavailable.
-        let context_usage = if self.local_terminal_owns_turn(input)? {
+        let local_terminal = self.local_terminal_owns_turn(input)?;
+        let context_usage = if local_terminal {
             match (
                 self.context_window().await.filter(|window| *window > 0),
                 crate::session_commands::active_history(self),
@@ -1958,6 +1979,15 @@ impl Session {
             top_p: None,
             reasoning_mode: None,
         };
+        if !hook_wake
+            && (self.sdk_overrides.prompt_suggestions
+                || input.is_some()
+                || local_terminal && crate::prompt_suggestion::foreground_worker(self))
+            && crate::prompt_suggestion::enabled(&self.paths.data_dir)
+        {
+            completion.suggestion = Some(Default::default());
+        }
+        let suggestion_capture = completion.suggestion.clone();
         let request = Box::pin(async {
             if hook_wake {
                 match execution_lease {
@@ -1969,18 +1999,9 @@ impl Session {
                     None => self.engine.send_hook_wake(chat_request, false).await,
                 }
             } else {
-                match execution_lease {
-                    Some(lease) => {
-                        self.engine
-                            .send_message_with_lease(chat_request, false, lease)
-                            .await
-                    }
-                    None => {
-                        self.engine
-                            .send_message_with_history(chat_request, false)
-                            .await
-                    }
-                }
+                self.engine
+                    .send_with_suggestion_capture(chat_request, execution_lease, suggestion_capture)
+                    .await
             }
         });
         let worker_cancel =

@@ -1064,8 +1064,6 @@ async fn run(cli: &Cli) -> Result<()> {
         terminal::tips::start_session(&paths.data_dir);
         // Lets other sessions see this one is open while it is idle.
         let mut presence: Option<(String, deepseek_code_core::services::session_messages::PresenceLease)> = None;
-        // History length the last suggestion was generated for.
-        let mut suggested_for = session.store.history(&session.id)?.len();
         terminal::STARTED.get_or_init(std::time::Instant::now);
         terminal::title::start();
         if let Some(speed) = std::fs::read_to_string(paths.data_dir.join("scroll-speed")).ok().and_then(|text| text.trim().parse::<usize>().ok()).filter(|speed| (1..=20).contains(speed)) {
@@ -1109,15 +1107,11 @@ async fn run(cli: &Cli) -> Result<()> {
                     .ok()
                     .map(|lease| (session.id.clone(), lease));
             }
-            if !session.waiting_for_continue() && prompt_suggestion::enabled(&paths.data_dir) {
-                let history = session.store.history(&session.id)?;
-                if history.len() != suggested_for {
-                    suggested_for = history.len();
-                    if let (Some(text), Ok(provider)) = (prompt_suggestion::context(&history), session.selected_provider().await) {
-                        prompt_suggestion::spawn(session.id.clone(), provider, text, input.as_ref().unwrap().suggestion_sender());
-                    }
-                }
-            }
+            let suggestions_enabled = prompt_suggestion::enabled(&paths.data_dir);
+            let reader = input.as_ref().expect("interactive reader");
+            let ghost = suggestions_enabled.then(|| prompt_suggestion::Ghost::load(&session)).flatten();
+            let mut shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+            reader.set_suggestion(ghost);
             skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
             if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
                 command_eprintln!("Keybindings: {error:#}");
@@ -1208,6 +1202,13 @@ async fn run(cli: &Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
+                    if suggestions_enabled {
+                        let ghost = prompt_suggestion::Ghost::load(&session);
+                        if ghost.as_ref().map(|ghost| &ghost.saved) != shown_suggestion.as_ref() {
+                            shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+                            input.as_ref().expect("interactive reader").set_suggestion(ghost);
+                        }
+                    }
                     // While a resumed session is owned elsewhere, show the public
                     // text/tool progress that owner publishes. The observer never
                     // takes the lease, submits input or runs a tool.
