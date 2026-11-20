@@ -3,6 +3,7 @@
 mod delivery;
 mod global;
 mod history;
+mod repair;
 pub use delivery::*;
 pub use history::*;
 mod layout;
@@ -24,6 +25,8 @@ type Fault = dyn Fn(Phase) -> Result<()> + Send + Sync;
 struct Root {
     path: PathBuf,
     global: GlobalDb,
+    repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
+    repair_cursor: Mutex<String>,
 }
 static ROOTS: LazyLock<Mutex<HashMap<PathBuf, Weak<Root>>>> = LazyLock::new(Default::default);
 
@@ -54,6 +57,8 @@ impl Stores {
                     global.root = weak.clone();
                     Root {
                         global,
+                        repair: Default::default(),
+                        repair_cursor: Default::default(),
                         path: path.clone(),
                     }
                 });
@@ -64,6 +69,7 @@ impl Stores {
         let stores = Self { root, fault: None };
         drop(stores.namespace()?);
         stores.reconcile()?;
+        stores.start_projection_repair();
         Ok(stores)
     }
     #[doc(hidden)]
@@ -193,6 +199,7 @@ impl Stores {
         }
         let _locks = locks;
         handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| layout::integrity(c))?;
+        handle.try_project_current();
         Ok(handle)
     }
 }

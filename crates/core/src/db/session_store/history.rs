@@ -17,13 +17,22 @@ pub struct Projection {
     pub first_prompt: Option<String>,
     pub latest_prompt: Option<String>,
     pub transcript_bytes: i64,
+    pub git_branch: Option<String>,
+    pub request_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
 }
 
 pub(super) fn projection(c: &Connection) -> Result<Projection> {
     Ok(c.query_row("SELECT content_revision,message_count,updated_at,last_turn_status,
         (SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1),
         (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
-        (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages) FROM manifest WHERE singleton=1", [], |r| {
+        (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages),
+        (SELECT value FROM peripheral_settings WHERE key='git.branch'), usage.*
+        FROM manifest CROSS JOIN (SELECT count(*),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),
+            coalesce(sum(coalesce(total_tokens,coalesce(input_tokens,0)+coalesce(output_tokens,0))),0) FROM model_requests) usage
+        WHERE singleton=1", [], |r| {
         Ok(Projection {
             revision: r.get(0)?,
             count: r.get(1)?,
@@ -32,6 +41,8 @@ pub(super) fn projection(c: &Connection) -> Result<Projection> {
             first_prompt: r.get::<_, Option<String>>(4)?.as_deref().and_then(crate::db::conversation_repo::prompt_title),
             latest_prompt: r.get(5)?,
             transcript_bytes: r.get(6)?,
+            git_branch: r.get(7)?, request_count: r.get(8)?, input_tokens: r.get(9)?,
+            output_tokens: r.get(10)?, total_tokens: r.get(11)?,
         })
     })?)
 }
@@ -98,7 +109,7 @@ impl GlobalDb {
                 }
                 tx.execute(
                     "UPDATE conversations SET content_revision=?1,message_count=?2,updated_at=?3,
-                last_turn_status=?4,first_prompt=?5,latest_prompt=?6,transcript_bytes=?7
+                last_turn_status=?4,first_prompt=?5,latest_prompt=?6,transcript_bytes=?7, git_branch=?10, request_count=?11,input_tokens=?12,output_tokens=?13,total_tokens=?14
                 WHERE id=?8 AND incarnation=?9 AND content_revision<?1",
                     params![
                         p.revision,
@@ -109,7 +120,7 @@ impl GlobalDb {
                         p.latest_prompt,
                         p.transcript_bytes,
                         id,
-                        incarnation
+                        incarnation, p.git_branch,p.request_count,p.input_tokens,p.output_tokens,p.total_tokens
                     ],
                 )?;
                 tx.commit()?;
@@ -291,7 +302,28 @@ impl SessionWrite<'_> {
         messages::update_message_content(self.0, id, content)
     }
     pub fn snapshots(&self, message: &str, requests: &Value) -> Result<()> {
-        if messages::get_request_snapshots(self.0, message)? != *requests {
+        let previous = messages::get_request_snapshots(self.0, message)?;
+        if previous != *requests {
+            if let Some(old) = previous.as_array() {
+                let retained: std::collections::HashSet<&str> = requests
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r["id"].as_str())
+                    .collect();
+                for id in old.iter().filter_map(|r| r["id"].as_str()) {
+                    if !retained.contains(id) {
+                        self.0.execute(
+                            "DELETE FROM model_requests WHERE message_id=?1 AND id=?2",
+                            [message, id],
+                        )?;
+                    }
+                }
+                self.0.execute(
+                    "DELETE FROM model_requests WHERE message_id=?1 AND id IS NULL",
+                    [message],
+                )?;
+            }
             messages::save_request_snapshots(self.0, message, requests)?;
         }
         Ok(())

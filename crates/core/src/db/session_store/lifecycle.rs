@@ -677,8 +677,8 @@ impl Stores {
             }
         };
         tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
-            workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status])?;
+            workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status,git_branch,request_count,input_tokens,output_tokens,total_tokens)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status,p.git_branch,p.request_count,p.input_tokens,p.output_tokens,p.total_tokens])?;
         if let Some(saved) = &meta.source {
             let source = &saved.id;
             let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2 AND metadata_revision=?3)",params![source,saved.incarnation,saved.revision],|r|r.get(0))?;
