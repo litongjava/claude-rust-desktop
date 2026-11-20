@@ -651,12 +651,71 @@ impl Stores {
         self.quarantine_orphans()
     }
 
+    fn move_proven_orphan(&self, dir: &Path, name: &str, staged: bool) -> Result<()> {
+        let path = dir.join("session.db");
+        let inspect = || -> Result<()> {
+            let _permit = Permits::take(1);
+            ensure!(
+                fs::symlink_metadata(&path)?.is_file(),
+                "not a regular session file"
+            );
+            let identity = |c: &Connection| -> Result<()> {
+                let (store,id,incarnation,seal): (String,String,String,String) = c.query_row(
+                    "SELECT store_uuid,id,incarnation,sealed_operation FROM manifest WHERE singleton=1",
+                    [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+                ensure!(
+                    store == self.global().uuid
+                        && canonical_uuid(&incarnation)
+                        && canonical_uuid(&seal)
+                        && if staged {
+                            seal == name
+                        } else {
+                            storage_key(&id)? == name
+                        },
+                    "orphan identity does not match this store and directory"
+                );
+                Ok(())
+            };
+            // An ordinary read-only WAL open may create sidecars. Establish
+            // ownership from the main file first, leaving foreign files untouched.
+            let mut url = reqwest::Url::from_file_path(&path)
+                .map_err(|_| anyhow::anyhow!("Invalid database path"))?;
+            url.set_query(Some("immutable=1"));
+            let probe = Connection::open_with_flags(
+                url.as_str(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            let app: i32 = probe.pragma_query_value(None, "application_id", |r| r.get(0))?;
+            ensure!(app == SESSION, "unrecognized application ID");
+            identity(&probe)?;
+            drop(probe);
+            let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            layout::verify(&conn, SESSION)?;
+            identity(&conn)
+        };
+        if let Err(error) = inspect() {
+            tracing::warn!(path = %dir.display(), reason = %error, "Leaving unverified session directory in place");
+            return Ok(());
+        }
+        durable_move(
+            dir,
+            &self
+                .sessions()
+                .join(".quarantine")
+                .join(Uuid::new_v4().to_string()),
+        )
+    }
+
     fn quarantine_orphans(&self) -> Result<()> {
-        let _sweep = layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
+        let _sweep =
+            layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
         for entry in fs::read_dir(self.sessions().join(".staging"))? {
             let entry = entry?;
             let operation = entry.file_name();
             let Some(operation) = operation.to_str().filter(|s| canonical_uuid(s)) else {
+                tracing::warn!(path = %entry.path().display(), "Leaving unrecognized staging entry in place");
                 continue;
             };
             // An operation's UUID is never reused. Its intent must already be durable
@@ -664,23 +723,24 @@ impl Stores {
             let known = self.global().read(|c| Ok(c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM lifecycle WHERE operation=?1 AND quarantine_reason IS NULL)",
                 [operation], |r| r.get::<_, bool>(0))?))?;
-            if !known && entry.path().join("session.db").try_exists()? {
-                durable_move(
-                    &entry.path(),
-                    &self
-                        .sessions()
-                        .join(".quarantine")
-                        .join(Uuid::new_v4().to_string()),
-                )?;
+            if !known && entry.file_type()?.is_dir() {
+                self.move_proven_orphan(&entry.path(), operation, true)?;
+            } else if !known {
+                tracing::warn!(path = %entry.path().display(), "Leaving unrelated staging entry in place");
             }
         }
         for entry in fs::read_dir(self.sessions())? {
             let entry = entry?;
             let key = entry.file_name();
+            if matches!(key.to_str(), Some(".staging" | ".trash" | ".quarantine")) {
+                continue;
+            }
             let Some(key) = key.to_str().filter(|k| layout::is_storage_key(k)) else {
+                tracing::warn!(path = %entry.path().display(), "Leaving unrecognized sessions entry in place");
                 continue;
             };
-            if !entry.file_type()?.is_dir() || !entry.path().join("session.db").try_exists()? {
+            if !entry.file_type()?.is_dir() {
+                tracing::warn!(path = %entry.path().display(), "Leaving unrelated sessions entry in place");
                 continue;
             }
             let owned = || {
@@ -692,13 +752,7 @@ impl Stores {
             }
             let _locks = self.key_lock(key, true, false)?;
             if entry.path().try_exists()? && !owned()? {
-                durable_move(
-                    &entry.path(),
-                    &self
-                        .sessions()
-                        .join(".quarantine")
-                        .join(Uuid::new_v4().to_string()),
-                )?;
+                self.move_proven_orphan(&entry.path(), key, false)?;
             }
         }
         Ok(())
