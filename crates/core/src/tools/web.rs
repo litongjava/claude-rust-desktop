@@ -15,7 +15,11 @@ const DEFAULT_CHARS: usize = 12_000;
 const MAX_CHARS: usize = 50_000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; ClaudeDesktop/3.1; WebReader)";
+const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; DeepSeekCode/",
+    env!("CARGO_PKG_VERSION"),
+    "; WebReader)"
+);
 
 fn http_url(url: &str) -> Result<reqwest::Url> {
     let parsed = reqwest::Url::parse(url)?;
@@ -562,6 +566,19 @@ impl SafeError for anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_names_the_product_and_its_version() {
+        assert!(USER_AGENT.contains("DeepSeekCode/"), "{USER_AGENT}");
+        assert!(
+            USER_AGENT.contains(env!("CARGO_PKG_VERSION")),
+            "{USER_AGENT}"
+        );
+        assert!(
+            !USER_AGENT.to_ascii_lowercase().contains("claude"),
+            "{USER_AGENT}"
+        );
+    }
 
     #[test]
     fn readable_page_omits_markup_and_keeps_main_links() {

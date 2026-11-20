@@ -170,7 +170,11 @@ impl GitHubIntegration {
             headers.insert(AUTHORIZATION, val);
         }
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3+json"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("Claude-Desktop-Tauri"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(concat!("DeepSeekCode-Tauri/", env!("CARGO_PKG_VERSION")))
+                .unwrap_or_else(|_| HeaderValue::from_static("DeepSeekCode-Tauri")),
+        );
         headers
     }
 
