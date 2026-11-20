@@ -1472,9 +1472,9 @@ pub(super) fn control(
     // bookkeeping. Status, IDs and paging cursors keep their structured values.
     // A PTY/ConPTY console task instead stores its terminal outcome
     // (`exit_code`, `cleanup_complete`, `final_drain_complete`, ...) as JSON that
-    // callers parse, so its output is left exactly as stored.
-    let console =
-        snapshot["metadata"]["interaction"].as_str() == Some(super::pty_owner::INTERACTION);
+    // callers parse, so its output is left exactly as stored. "pty" covers the
+    // Linux PTY and the Windows ConPTY tasks; macOS has no PTY implementation.
+    let console = snapshot["metadata"]["interaction"].as_str() == Some("pty");
     if !console {
         for key in ["output", "result"] {
             if let Some(text) = snapshot[key].as_str().map(str::to_owned) {
@@ -2046,7 +2046,7 @@ mod tests {
             "TaskCreate",
             json!({"subject":"console","metadata":{
                 "managed_shell":true,
-                "interaction":super::super::pty_owner::INTERACTION
+                "interaction":"pty"
             }}),
             root.path(),
             &session,
