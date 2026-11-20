@@ -266,11 +266,7 @@ async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Va
     let mut executor = ToolLoopExecutor::new(
         provider,
         vec![json!({"role":"user","content":"hello"})],
-        Some(crate::prompt::compose_system_prompt(
-            None,
-            "code-test",
-            PromptProfile::Code,
-        )),
+        Some(crate::prompt::compose_system_prompt(None, PromptProfile::Code)),
         128,
         tx,
         temp.path().to_string_lossy().into(),
