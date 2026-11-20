@@ -216,11 +216,12 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
             "Initial message differs from manifest"
         );
         let detached: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_user_content WHERE message_id IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM message_user_content t
+             WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=t.message_id))",
             [],
             |row| row.get(0),
         )?;
-        ensure!(!detached, "Typed content has no message ID");
+        ensure!(!detached, "Typed content has no matching message");
     }
     Ok(())
 }

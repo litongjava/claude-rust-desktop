@@ -1298,6 +1298,7 @@ fn round2_typed_history_must_be_readable_before_publish_and_on_open() -> Result<
     for change in [
         "UPDATE message_user_content SET content_json=CAST(content_json AS BLOB)",
         "UPDATE message_user_content SET message_id=NULL",
+        "PRAGMA foreign_keys=OFF; UPDATE message_user_content SET message_id=CAST(message_id AS BLOB)",
         "UPDATE message_user_content SET content_json='1e400'",
         "UPDATE messages SET thinking=x'80'",
         "UPDATE manifest SET updated_at=x'80'",
