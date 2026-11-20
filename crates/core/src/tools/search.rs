@@ -13,12 +13,12 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
     vec![
         super::ToolDefinition {
             name: "Glob".into(),
-            description: "Fast file pattern matching. Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". Returns matching file paths sorted by modification time.".into(),
+            description: "Find files by glob pattern. Glob walks the directory (the working directory by default), skips .git and .gitignore matches, and matches the pattern against each file path. Results are file paths ordered newest first and capped at 100; when more match, the result says how to narrow the search.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"description": "The glob pattern to match files against", "type": "string"},
-                    "path": {"description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided.", "type": "string"}
+                    "pattern": {"description": "Glob pattern matched against file paths, such as \"src/**/*.rs\".", "type": "string"},
+                    "path": {"description": "Directory to walk; defaults to the working directory.", "type": "string"}
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -26,25 +26,25 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
         },
         super::ToolDefinition {
             name: "Grep".into(),
-            description: "Content search with ripgrep semantics. Prefer this over `grep`/`rg` via Bash — results integrate with the permission UI and file links.\n\n- Full regex syntax (e.g. \"log.*Error\", \"function\\s+\\w+\"). Ripgrep, not grep — escape literal braces (`interface\\{\\}`).\n- Filter with `glob` (e.g. \"**/*.tsx\") or `type` (e.g. \"js\", \"py\", \"rust\").\n- `output_mode`: \"content\" (matching lines), \"files_with_matches\" (paths only, default), or \"count\".\n- `multiline: true` for patterns that span lines.".into(),
+            description: "Search file contents with a regular expression. Grep walks the path recursively, honors .gitignore, includes hidden files, and skips .git and binary files. output_mode selects the result shape: files_with_matches (default) lists paths, content shows matching lines with optional context, count reports matches per file. head_limit caps the result at 250 entries by default and 0 removes the cap; offset skips entries. Narrow the walk with glob or type; multiline lets a pattern span lines.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"description": "The regular expression pattern to search for in file contents", "type": "string"},
-                    "path": {"description": "File or directory to search in (rg PATH). Defaults to current working directory.", "type": "string"},
-                    "glob": {"description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob", "type": "string"},
-                    "output_mode": {"description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"files_with_matches\".", "type": "string", "enum": ["content", "files_with_matches", "count"]},
-                    "-B": {"description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise.", "type": "number"},
-                    "-A": {"description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise.", "type": "number"},
-                    "-C": {"description": "Alias for context.", "type": "number"},
-                    "context": {"description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise.", "type": "number"},
-                    "-n": {"description": "Show line numbers in output (rg -n). Requires output_mode: \"content\", ignored otherwise. Defaults to true.", "type": "boolean"},
-                    "-i": {"description": "Case insensitive search (rg -i)", "type": "boolean"},
-                    "-o": {"description": "Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: \"content\", ignored otherwise. Defaults to false.", "type": "boolean"},
-                    "type": {"description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.", "type": "string"},
-                    "head_limit": {"description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).", "type": "number"},
-                    "offset": {"description": "Skip first N lines/entries before applying head_limit, equivalent to \"| tail -n +N | head -N\". Works across all output modes. Defaults to 0.", "type": "number"},
-                    "multiline": {"description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.", "type": "boolean"}
+                    "pattern": {"description": "Regular expression to match, using Rust regex syntax.", "type": "string"},
+                    "path": {"description": "File or directory to search; defaults to the working directory.", "type": "string"},
+                    "glob": {"description": "Glob filter for walked paths such as \"*.rs\" or \"src/**\"; separate several with spaces.", "type": "string"},
+                    "output_mode": {"description": "Result shape: \"files_with_matches\" (default), \"content\" or \"count\".", "type": "string", "enum": ["content", "files_with_matches", "count"]},
+                    "-B": {"description": "Context lines before each match; only used with output_mode \"content\".", "type": "number"},
+                    "-A": {"description": "Context lines after each match; only used with output_mode \"content\".", "type": "number"},
+                    "-C": {"description": "Same as context.", "type": "number"},
+                    "context": {"description": "Context lines on both sides of each match; only used with output_mode \"content\".", "type": "number"},
+                    "-n": {"description": "Prefix lines with 1-based line numbers; true by default in content mode.", "type": "boolean"},
+                    "-i": {"description": "Match without regard to case.", "type": "boolean"},
+                    "-o": {"description": "Emit only the matched text, one match per line, in content mode.", "type": "boolean"},
+                    "type": {"description": "File type filter such as \"js\", \"py\" or \"rust\", using the built-in type list.", "type": "string"},
+                    "head_limit": {"description": "Maximum entries to return; defaults to 250, and 0 means unlimited.", "type": "number"},
+                    "offset": {"description": "Entries to skip before head_limit; defaults to 0.", "type": "number"},
+                    "multiline": {"description": "Let . match newlines so a pattern can span lines; off by default.", "type": "boolean"}
                 },
                 "required": ["pattern"],
                 "additionalProperties": false

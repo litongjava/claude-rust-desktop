@@ -3151,7 +3151,6 @@ mod tests {
             "/color",
             "/copy",
             "/model",
-            "/mobile",
             "/memory",
             "/auto-mode-setup",
         ];
@@ -3171,7 +3170,7 @@ mod tests {
         );
         assert_eq!(
             order("/mo"),
-            ["/model", "/mobile", "/auto-mode-setup", "/memory"]
+            ["/model", "/auto-mode-setup", "/memory"]
         );
         assert_eq!(order("/")[..3], ["/auto-mode-setup", "/color", "/compact"]);
         // Scattered letters elsewhere in a long name are no match.

@@ -5,13 +5,13 @@ use std::{io::Write, path::PathBuf};
 pub(super) fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         name: "NotebookEdit".into(),
-        description: "Replaces, inserts, or deletes a single cell in a Jupyter notebook (.ipynb file).\n\nUsage:\n- You must use the Read tool on the notebook in this conversation before editing — this tool will fail otherwise.\n- `notebook_path` must be an absolute path.\n- `cell_id` is the `id` attribute shown in the Read tool's `<cell id=\"...\">` output. It is required for `replace` and `delete`.\n- `edit_mode` defaults to `replace`. Use `insert` to add a new cell after the cell with the given `cell_id` (or at the beginning of the notebook if `cell_id` is omitted) — `cell_type` is required when inserting. Use `delete` to remove the cell.".into(),
+        description: "Edit one cell of a Jupyter notebook. `notebook_path` names the `.ipynb` file, resolved against the working directory when relative, and the file must hold a format-4 notebook. `cell_id` is the cell's `id`, or `cell-N` for the Nth cell when it has no id. `edit_mode: \"replace\"` (the default) replaces that cell's source and clears its stored outputs when the cell is code. `insert` adds a new cell after `cell_id`, or at the top when none is given, and requires `cell_type`. `delete` removes the cell, so `cell_id` is required. The notebook is rewritten atomically under a lock.".into(),
         input_schema: json!({"type":"object","properties":{
-            "notebook_path":{"description":"The absolute path to the Jupyter notebook file to edit (must be absolute, not relative)","type":"string"},
-            "cell_id":{"description":"The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID, or at the beginning if not specified.","type":"string"},
-            "new_source":{"description":"The new source for the cell","type":"string"},
-            "cell_type":{"description":"The type of the cell (code or markdown). If not specified, it defaults to the current cell type. If using edit_mode=insert, this is required.","type":"string","enum":["code","markdown"]},
-            "edit_mode":{"description":"The type of edit to make (replace, insert, delete). Defaults to replace.","type":"string","enum":["replace","insert","delete"]}
+            "notebook_path":{"description":"Path to the notebook to edit; relative paths resolve against the working directory.","type":"string"},
+            "cell_id":{"description":"Cell `id`, or `cell-N` for the Nth cell without an id; anchors an insert and is required for replace and delete.","type":"string"},
+            "new_source":{"description":"New cell source; line breaks in the string are kept, and delete ignores it.","type":"string"},
+            "cell_type":{"description":"`code` or `markdown`; required for insert, while other modes keep the existing type when omitted.","type":"string","enum":["code","markdown"]},
+            "edit_mode":{"description":"`replace`, `insert` or `delete`; defaults to replace.","type":"string","enum":["replace","insert","delete"]}
         },"required":["notebook_path","new_source"],"additionalProperties":false}),
     }
 }

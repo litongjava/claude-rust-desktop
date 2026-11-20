@@ -16,7 +16,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { invokeDesktop as invoke } from '../../platform/native';
-import ClaudeLogo from '../../components/ClaudeLogo';
+import DeepSeekCodeLogo from '../../components/DeepSeekCodeLogo';
 import CodeExecution from '../../components/CodeExecution';
 import SearchProcess from '../../components/SearchProcess';
 import DocumentCreationProcess from '../../components/DocumentCreationProcess';
@@ -360,13 +360,13 @@ const MessageList = React.memo<MessageListProps>(({
               )}
               {loading && idx === messages.length - 1 && !msg.content && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(msg.toolCalls && msg.toolCalls.length > 0) && (
                 <div role="status" className="flex items-center gap-2 ml-1 text-[14px] text-deepseek-textSecondary font-sans">
-                  <span aria-hidden="true" className="shrink-0"><ClaudeLogo breathe style={{ width: '40px', height: '40px' }} /></span>
+                  <span aria-hidden="true" className="shrink-0"><DeepSeekCodeLogo breathe style={{ width: '40px', height: '40px' }} /></span>
                   <span>Working on it...</span>
                 </div>
               )}
               {loading && idx === messages.length - 1 && !msg.isThinking && (msg.content || (msg.searchStatus && msg.content)) && (
                 <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-                  <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
+                  <DeepSeekCodeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
                 </span>
               )}
               {!readingMode && !isCurrentlyStreaming && Boolean(msg.content || msg.thinking || msg.toolCalls?.length) && (
@@ -374,7 +374,7 @@ const MessageList = React.memo<MessageListProps>(({
               )}
               {!readingMode && !loading && idx === messages.length - 1 && msg.content && compactStatus.state === 'compacting' && (
                 <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
-                  <ClaudeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
+                  <DeepSeekCodeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
                   {compactStatus.state === 'compacting' && <CompactingStatus />}
                 </div>
               )}

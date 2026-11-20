@@ -49,7 +49,6 @@ pub mod agent_import;
 pub mod diagnostics;
 pub mod runtime_status;
 pub mod doctor;
-pub mod cli_resources;
 pub mod feedback;
 pub mod statusline;
 pub mod statusline_setup;
