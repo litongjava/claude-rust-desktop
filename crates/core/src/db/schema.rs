@@ -15,6 +15,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count INTEGER DEFAULT 0
 );
 
+-- A model/provider switch invalidates outstanding suggestions even if a later
+-- switch restores the original binding. Unchanged resume writes are harmless.
+CREATE TABLE IF NOT EXISTS conversation_binding_generations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS conversation_binding_changed AFTER UPDATE OF model, provider ON conversations
+WHEN NEW.model IS NOT OLD.model OR NEW.provider IS NOT OLD.provider
+BEGIN
+    INSERT INTO conversation_binding_generations VALUES (NEW.id, 1)
+    ON CONFLICT(conversation_id) DO UPDATE SET generation = generation + 1;
+END;
+
 CREATE TABLE IF NOT EXISTS conversation_private_workspace_bindings (
     child_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     -- Retain an invalid binding after parent deletion: never silently redirect a child.
@@ -65,6 +78,8 @@ CREATE TABLE IF NOT EXISTS execution_turns (
     UNIQUE(conversation_id, source_turn_id),
     CHECK(status <> 'running' OR (ended_at IS NULL AND elapsed_ms IS NULL))
 );
+-- Within a conversation this index also orders turn admissions by SQLite rowid.
+CREATE INDEX IF NOT EXISTS idx_execution_turns_conversation ON execution_turns(conversation_id);
 CREATE TABLE IF NOT EXISTS message_turns (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     turn_id TEXT NOT NULL REFERENCES execution_turns(id) ON DELETE CASCADE

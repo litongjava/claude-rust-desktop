@@ -747,8 +747,19 @@ fn spawn_at(
     }
 }
 
+// Only the supervised CLI can attest that its main work and shutdown succeeded.
+const FOREGROUND_COMPLETION_ENV: &str = "DEEPSEEK_CODE_FOREGROUND_COMPLETION";
+static FOREGROUND_COMPLETION: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
+
 /// Returns true only in the dedicated supervisor process.
 pub fn run_worker_from_env() -> Result<bool> {
+    if let Ok(token) = std::env::var(FOREGROUND_COMPLETION_ENV) {
+        // Consume before any tools or subprocesses can inherit the handoff.
+        std::env::remove_var(FOREGROUND_COMPLETION_ENV);
+        if let Ok(token) = uuid::Uuid::parse_str(&token) {
+            let _ = FOREGROUND_COMPLETION.set(token);
+        }
+    }
     let Some(dir) = std::env::var_os(WORKER_ENV) else {
         return Ok(false);
     };
@@ -780,11 +791,14 @@ fn run_worker(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let mut job = read_job(dir)?;
-    let outcome = supervise(dir, &mut job);
-    if let Err(error) = outcome {
-        job.status = "failed".into();
-        job.error = Some(format!("{error:#}"));
-    }
+    let remaining_child = match supervise(dir, &mut job) {
+        Ok(child) => child,
+        Err(error) => {
+            job.status = "failed".into();
+            job.error = Some(format!("{error:#}"));
+            None
+        }
+    };
     job.heartbeat_ms = now();
     job.finished_ms = Some(now());
     if job.foreground {
@@ -794,17 +808,43 @@ fn run_worker(dir: &Path) -> Result<()> {
             .context("Invalid job root")?;
         SessionClaim::release(root, &job.session_id, &job.id)?;
     }
-    save(&dir.join("state.json"), &job)
+    save(&dir.join("state.json"), &job)?;
+    if let Some(mut child) = remaining_child {
+        // All main work and shutdown succeeded. Reap the optional follow-up
+        // without occupying the foreground slot or changing the published job.
+        child.wait()?;
+    }
+    Ok(())
 }
 
-fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
+/// The foreground CLI calls this only after successful turn and session shutdown.
+pub fn finish_before_suggestion(root: &Path, session: &str) -> Result<()> {
+    let dir = worker_directory(root, session)?.context("Missing foreground worker")?;
+    let job = read_job(&dir)?;
+    ensure!(
+        job.foreground && job.parent_session_id == session && job.session_id == session,
+        "Expected foreground session"
+    );
+    let token = FOREGROUND_COMPLETION
+        .get()
+        .context("Missing foreground completion token")?;
+    fs::write(dir.join(format!("main-finished-{token}")), [])?;
+    Ok(())
+}
+
+fn supervise(dir: &Path, job: &mut Job) -> Result<Option<std::process::Child>> {
     let launch: Launch = serde_json::from_slice(&fs::read(dir.join("launch.json"))?)?;
     job.supervisor_pid = Some(std::process::id());
     if dir.join("cancel").exists() {
         job.status = "cancelled".into();
-        return Ok(());
+        return Ok(None);
     }
     let mut command = Command::new(&launch.executable);
+    let completion = job.foreground.then(|| {
+        let token = uuid::Uuid::new_v4();
+        command.env(FOREGROUND_COMPLETION_ENV, token.to_string());
+        dir.join(format!("main-finished-{token}"))
+    });
     command
         .args(&launch.arguments)
         .current_dir(&launch.cwd)
@@ -880,6 +920,11 @@ fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
             job.status = "cancelled".into();
             break;
         }
+        if cancel_started.is_none() && completion.as_ref().is_some_and(|path| path.exists()) {
+            job.status = "completed".into();
+            job.exit_code = Some(0);
+            return Ok(Some(child));
+        }
         job.heartbeat_ms = now();
         if let Err(error) = save(&dir.join("state.json"), job) {
             let _ = child.kill();
@@ -888,7 +933,7 @@ fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
