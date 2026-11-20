@@ -1,26 +1,5 @@
 use super::*;
 
-/// The memory tools load on demand by default; these tests drive them directly.
-fn memory_tools(dir: &std::path::Path) -> std::path::PathBuf {
-    let customization = crate::services::customization::Customization {
-        tool_loading: ["memory_search", "memory_ingest"]
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_owned(),
-                    crate::services::customization::ToolLoading {
-                        enabled: true,
-                        on_demand: true,
-                    },
-                )
-            })
-            .collect(),
-        ..Default::default()
-    };
-    crate::services::customization::save(dir, &customization, &[]).unwrap();
-    dir.join("config.json")
-}
-
 #[tokio::test]
 async fn fresh_read_retains_requested_source_range_beyond_spill_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -405,205 +384,6 @@ async fn chat_completions_join_instruction_blocks() {
     );
 }
 
-#[tokio::test]
-async fn all_modes_preserve_memory_and_settings_in_either_builder_order() {
-    let temp = tempfile::tempdir().unwrap();
-    let (tx, _rx) = mpsc::channel(16);
-    for mode in ["chat", "work", "study", "code"] {
-        for memory_first in [true, false] {
-            let (client, _remote) = remote_memory(temp.path()).await;
-            let mut config = client.get_config().await;
-            config.search_top_k = 7;
-            client.update_config(config).await.unwrap();
-            let profile = PromptProfile::from_workspace_mode(mode);
-            let executor = ToolLoopExecutor::new(
-                provider("http://127.0.0.1:1", "openai"),
-                vec![],
-                None,
-                128,
-                tx.clone(),
-                temp.path().to_string_lossy().into(),
-                ReasoningMode::Standard,
-            )
-            .with_search_config_path(memory_tools(temp.path()));
-            let mut executor = if memory_first {
-                executor
-                    .with_memex(client.clone())
-                    .with_prompt_profile(profile)
-            } else {
-                executor
-                    .with_prompt_profile(profile)
-                    .with_memex(client.clone())
-            };
-            assert!(executor.memex_client.is_some());
-            assert!(executor.context_manager.is_some());
-            let config = executor.memex_client.as_ref().unwrap().get_config().await;
-            assert_eq!(config.search_top_k, 7);
-            for name in ["memory_ingest", "memory_search"] {
-                let (_, output, is_error) = executor.execute_tool_call(name, &json!({"content":"remember native memory", "query":"native memory", "importance":0.9}), "test").await;
-                assert!(!is_error, "{mode}: {output}");
-                assert!(output.contains(if name == "memory_ingest" {
-                    "ingested"
-                } else {
-                    "remember native memory"
-                }));
-            }
-        }
-    }
-}
-
-/// Real HTTP/SSE requests against a local mock, with no external model credentials.
-/// Exercise the memory tools on both protocols in all four modes, and confirm
-/// that explicit memories produce no automatic recall or saving.
-#[tokio::test]
-async fn all_modes_run_memory_tools_without_automatic_recall_or_saving() {
-    use axum::{http::header, routing::post, Json, Router};
-    for format in ["anthropic", "openai"] {
-        for mode in ["chat", "work", "study", "code"] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-            let requests = captured.clone();
-            let app = Router::new().route(if format == "anthropic" { "/v1/messages" } else { "/v1/chat/completions" }, post(move |Json(body): Json<Value>| {
-            let requests = requests.clone();
-            async move {
-                let mut requests = requests.lock().await;
-                let step = requests.len();
-                let first = step < 2;
-                let tool_name = if step == 0 { "memory_ingest" } else { "memory_search" };
-                let arguments = if step == 0 { json!({"content":"remember toolmemory", "importance":0.9}) } else { json!({"query":"toolmemory"}) }.to_string();
-                requests.push(body);
-                let events = if format == "anthropic" {
-                    if first {
-                        vec![json!({"type":"message_start","message":{"id":"test","model":"code-test","usage":{"input_tokens":20}}}),
-                            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":format!("memory-{step}"),"name":tool_name,"input":{}}}),
-                            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":arguments}}),
-                            json!({"type":"content_block_stop","index":0}),
-                            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),
-                            json!({"type":"message_stop"})]
-                    } else {
-                        vec![json!({"type":"message_start","message":{"id":"test2","model":"code-test","usage":{"input_tokens":20}}}),
-                            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-                            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"verified"}}),
-                            json!({"type":"content_block_stop","index":0}),
-                            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
-                            json!({"type":"message_stop"})]
-                    }
-                } else if first {
-                    vec![json!({"id":"test","model":"code-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("memory-{step}"),"type":"function","function":{"name":tool_name,"arguments":arguments}}]},"finish_reason":null}]}),
-                        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})]
-                } else {
-                    vec![json!({"id":"test2","model":"code-test","choices":[{"index":0,"delta":{"content":"verified"},"finish_reason":null}]}),
-                        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})]
-                };
-                let mut stream = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
-                if format == "openai" { stream.push_str("data: [DONE]\n\n"); }
-                ([(header::CONTENT_TYPE, "text/event-stream")], stream)
-            }
-        }));
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let (tx, mut rx) = mpsc::channel(128);
-            let temp = tempfile::tempdir().unwrap();
-            let (client, _remote) = remote_memory(temp.path()).await;
-            let config = client.get_config().await;
-            assert!(config.enabled);
-            client
-                .ingest("recallmarker existing architecture", Some(0.9), None)
-                .await
-                .unwrap();
-            let profile = PromptProfile::from_workspace_mode(mode);
-            let prompt = crate::prompt::compose_system_prompt(
-                Some("custom project rule"),
-                profile,
-            );
-            let mut executor = ToolLoopExecutor::new(
-                provider(&base, format),
-                vec![json!({"role":"user","content":"recallmarker"})],
-                Some(prompt),
-                128,
-                tx,
-                ".".into(),
-                ReasoningMode::Standard,
-            )
-            .with_prompt_profile(profile)
-            .with_memex(client.clone())
-            .with_conv_id(format!("{mode}-{format}"))
-            .with_search_config_path(memory_tools(temp.path()));
-            let (text, _) = tokio::time::timeout(Duration::from_secs(15), executor.execute())
-                .await
-                .unwrap()
-                .unwrap();
-            server.abort();
-            assert_eq!(text, "verified", "{format}");
-            let requests = captured.lock().await;
-            assert_eq!(requests.len(), 3, "{format} {mode}");
-            let first = &requests[0];
-            let system = if format == "anthropic" {
-                first["system"].to_string()
-            } else {
-                first["messages"][0]["content"].to_string()
-            };
-            assert_eq!(system.contains("# Harness"), mode == "code");
-            assert!(system.contains("custom project rule") && system.contains("<memory_guidance>"));
-            assert!(first["tools"].to_string().contains("memory_ingest"));
-            assert!(first["tools"].to_string().contains("memory_search"));
-            // An explicitly stored memory exists, but it is never recalled.
-            for request in requests.iter() {
-                let messages = request["messages"].to_string();
-                assert!(
-                    !messages.contains(crate::memory::RECALL_LEAD_IN),
-                    "{format} {mode}: {messages}"
-                );
-                assert!(
-                    !messages.contains("recallmarker existing architecture"),
-                    "{format} {mode}: {messages}"
-                );
-            }
-            assert!(requests[1]["messages"].to_string().contains("ingested"));
-            assert!(requests[2]["messages"]
-                .to_string()
-                .contains("search_completed"));
-            assert!(requests[2]["messages"]
-                .to_string()
-                .contains("remember toolmemory"));
-            // The turn is not saved automatically; only the explicit tool call was.
-            let saved = client.search("verified", None).await.unwrap();
-            assert!(
-                saved
-                    .iter()
-                    .all(|item| !item.content.contains("Assistant: verified")),
-                "automatic saving must be gone: {mode} {format}"
-            );
-            assert_eq!(
-                client.stats().await.unwrap().total_memories,
-                2,
-                "{mode} {format}"
-            );
-            let mut completed = Vec::new();
-            while let Ok(event) = rx.try_recv() {
-                if let EngineEvent::ToolUseDone {
-                    tool_name,
-                    is_error,
-                    ..
-                } = event
-                {
-                    if crate::prompt::code::is_memory_tool(&tool_name) {
-                        assert!(!is_error);
-                        completed.push(tool_name);
-                    }
-                }
-            }
-            assert_eq!(
-                completed,
-                vec!["memory_ingest", "memory_search"],
-                "{mode} {format}"
-            );
-        }
-    }
-}
-
 /// Instructions and the Git snapshot open the first user message on both
 /// protocols, stay there for later requests in the turn, and never reach
 /// the executor's own message list.
@@ -753,9 +533,7 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
         axum::serve(listener, app).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
-    let (client, _remote) = remote_memory(temp.path()).await;
-    let mut config = client.get_config().await;
-    client.update_config(config).await.unwrap();
+    let client = crate::memory::MemExClient::with_path(temp.path().join("memory.sqlite3"));
     client
         .ingest("alphamark uses port 7001", Some(0.9), None)
         .await
@@ -777,7 +555,6 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
         vec![stored_recall],
     )
     .unwrap();
-    let config_path = memory_tools(temp.path());
     for turn in 0..2 {
         if turn == 1 {
             history.extend([
@@ -796,10 +573,8 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
             temp.path().to_string_lossy().into(),
             ReasoningMode::Standard,
         )
-        .with_memex(client.clone())
         .with_conv_id("recall-session".into())
-        .with_turn_context(saved)
-        .with_search_config_path(config_path.clone());
+        .with_turn_context(saved);
         tokio::time::timeout(Duration::from_secs(15), executor.execute())
             .await
             .unwrap()
@@ -839,73 +614,4 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
         message
     };
     assert_eq!(strip(&requests[0]["messages"][0]), strip(&last[0]));
-}
-
-// Existing memory protocol assertions now exercise the retained HTTP backend.
-// The server uses an isolated SQLite archive, never the application's own files.
-struct RemoteMemoryGuard(tokio::task::JoinHandle<()>);
-impl Drop for RemoteMemoryGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-async fn remote_memory(root: &std::path::Path) -> (MemExClient, RemoteMemoryGuard) {
-    use axum::{
-        extract::State,
-        routing::{get, post},
-        Json, Router,
-    };
-    let backend = MemExClient::with_path(root.join("remote-fixture.sqlite3"), None);
-    let app =
-        Router::new()
-            .route(
-                "/search",
-                post(
-                    |State(client): State<MemExClient>, Json(input): Json<Value>| async move {
-                        let results = client
-                            .search(
-                                input["query"].as_str().unwrap_or_default(),
-                                input["top_k"].as_u64().map(|v| v as usize),
-                            )
-                            .await
-                            .unwrap();
-                        Json(json!({"total_indexed":results.len(),"results":results}))
-                    },
-                ),
-            )
-            .route(
-                "/ingest",
-                post(
-                    |State(client): State<MemExClient>, Json(input): Json<Value>| async move {
-                        client
-                            .ingest(
-                                input["content"].as_str().unwrap(),
-                                input["importance"].as_f64(),
-                                input
-                                    .get("metadata")
-                                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
-                            )
-                            .await
-                            .unwrap();
-                        Json(json!({"ok":true}))
-                    },
-                ),
-            )
-            .route(
-                "/stats",
-                get(|State(client): State<MemExClient>| async move {
-                    Json(client.stats().await.unwrap())
-                }),
-            )
-            .with_state(backend);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = RemoteMemoryGuard(tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    }));
-    let client = MemExClient::with_path(root.join("memory.sqlite3"), None);
-    let mut config = client.get_config().await;
-    config.backend_url = base;
-    client.update_config(config).await.unwrap();
-    (client, server)
 }

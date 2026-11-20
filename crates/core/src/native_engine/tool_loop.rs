@@ -30,7 +30,7 @@ mod toolscript_bridge_tests;
 use super::mcp_output::McpOutput;
 use crate::mcp::states::McpState;
 use crate::mcp::McpToolRegistry;
-use crate::memory::{ContextManager, MemExClient, TieredCompressor};
+use crate::memory::TieredCompressor;
 use crate::native_engine::anthropic_client::{
     AnthropicClient, AnthropicContent, AnthropicMessage, ContentBlock,
 };
@@ -263,9 +263,7 @@ pub struct ToolLoopExecutor {
     approved_call: Option<tool_approval::ExactApproval>,
     runtime_agents: super::runtime_agents::Catalog,
     permission_manager: Option<Arc<PermissionManager>>,
-    memex_client: Option<MemExClient>,
     file_memory: Option<crate::services::memory_files::FileMemory>,
-    context_manager: Option<ContextManager>,
     prompt_profile: PromptProfile,
     /// `<system-reminder>` blocks placed before the first user message's text
     /// in every request; never saved to the transcript.
@@ -1462,9 +1460,7 @@ impl ToolLoopExecutor {
             approved_call: None,
             runtime_agents: Default::default(),
             permission_manager: None,
-            memex_client: None,
             file_memory: None,
-            context_manager: None,
             prompt_profile: PromptProfile::Desktop,
             context_reminders: Vec::new(),
             turn_context: Vec::new(),
@@ -2069,9 +2065,6 @@ impl ToolLoopExecutor {
     /// the user turns into on-demand loses that exposure even though the older
     /// request still lists it, so it must be searched again.
     fn loading_violation(&self, name: &str) -> Option<String> {
-        if matches!(name, "memory_search" | "memory_ingest") && !self.remote_memory_enabled() {
-            return Some("Memory search/ingest require an enabled remote HTTP backend".into());
-        }
         // A legacy dispatch alias follows the loading policy of the current
         // name it was folded into; otherwise it would bypass disabled and
         // not-loaded checks that only know about TaskGet.
@@ -2846,29 +2839,9 @@ impl ToolLoopExecutor {
         self
     }
 
-    pub fn with_memex(mut self, client: MemExClient) -> Self {
-        let client_arc = Arc::new(client.clone());
-        let config = client.get_config_blocking();
-        self.context_manager = (config.enabled
-            && (config.backend_url.starts_with("https://")
-                || config.backend_url.starts_with("http://")))
-        .then(|| ContextManager::new(client_arc));
-        self.memex_client = Some(client);
-        self
-    }
-
     pub fn with_file_memory(mut self, memory: crate::services::memory_files::FileMemory) -> Self {
         self.file_memory = Some(memory);
         self
-    }
-
-    fn remote_memory_enabled(&self) -> bool {
-        self.memex_client.as_ref().is_some_and(|client| {
-            let config = client.get_config_blocking();
-            config.enabled
-                && (config.backend_url.starts_with("https://")
-                    || config.backend_url.starts_with("http://"))
-        })
     }
 
     fn memory_budget(&self) -> usize {
@@ -3144,9 +3117,6 @@ impl ToolLoopExecutor {
     /// policy and before MCP or the user's own tools are added.
     fn builtin_catalog(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
-        if !self.remote_memory_enabled() {
-            tools.retain(|tool| !matches!(tool.name.as_str(), "memory_search" | "memory_ingest"));
-        }
         if self.session_search_storage().is_none() {
             tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
         }
@@ -3210,7 +3180,6 @@ impl ToolLoopExecutor {
             self.builtin_catalog()
                 .into_iter()
                 .map(|tool| tool.name)
-                .chain(["memory_search".to_owned(), "memory_ingest".to_owned()])
                 .collect()
         })
     }
@@ -4258,13 +4227,6 @@ impl ToolLoopExecutor {
         // must not become a user-confirmable prompt that could authorize it.
         // A pre-tool hook that already allowed this exact call keeps the
         // existing prompt-mode semantics, but not the hard gates above.
-        if matches!(tool_name, "memory_search" | "memory_ingest") && !self.remote_memory_enabled() {
-            return CallStep::Finished((
-                tool_input.clone(),
-                "Memory tools require an enabled remote HTTP backend".into(),
-                true,
-            ));
-        }
         let hook_allowed = self.approved_call.as_ref().is_some_and(|approval| {
             approval.pre_tool_hook
                 && approval.tool == tool_name
@@ -4636,40 +4598,6 @@ impl ToolLoopExecutor {
                 },
                 failed,
             ));
-        }
-
-        if matches!(tool_name, "memory_search" | "memory_ingest") {
-            match self
-                .check_permission_with(tool_name, tool_input, _tool_use_id)
-                .await
-            {
-                PermissionResult::Denied(reason) => {
-                    return CallStep::Finished((
-                        tool_input.clone(),
-                        format!("Permission denied: {reason}"),
-                        true,
-                    ))
-                }
-                PermissionResult::RequiresConfirmation(message) => {
-                    return self
-                        .prepare_after_confirmation_with(
-                            tool_name,
-                            tool_input,
-                            _tool_use_id,
-                            provider_id,
-                            &message,
-                        )
-                        .await
-                }
-                PermissionResult::Granted => {}
-            }
-        }
-        // Route memory_search and memory_ingest directly to MemEx backend
-        if tool_name == "memory_search" {
-            return CallStep::Finished(self.execute_memory_search(tool_input).await);
-        }
-        if tool_name == "memory_ingest" {
-            return CallStep::Finished(self.execute_memory_ingest(tool_input).await);
         }
 
         let permission_result = self
@@ -5206,95 +5134,6 @@ impl ToolLoopExecutor {
                 self.answer_waiters.lock().await.remove(&request_id);
                 Err("User response timed out (300s)".into())
             }
-        }
-    }
-
-    async fn execute_memory_search(&self, tool_input: &Value) -> (Value, String, bool) {
-        let query = tool_input["query"].as_str().unwrap_or("");
-        let top_k = tool_input["top_k"].as_u64().map(|v| v as usize);
-
-        if let Some(ref client) = self.memex_client {
-            match client.search(query, top_k).await {
-                Ok(results) => {
-                    let output = serde_json::json!({
-                        "status": "search_completed",
-                        "query": query,
-                        "results": results,
-                        "count": results.len()
-                    });
-                    (
-                        tool_input.clone(),
-                        serde_json::to_string_pretty(&output).unwrap_or_default(),
-                        false,
-                    )
-                }
-                Err(e) => {
-                    let output = serde_json::json!({
-                        "status": "search_failed",
-                        "query": query,
-                        "error": format!("{}", e)
-                    });
-                    (
-                        tool_input.clone(),
-                        serde_json::to_string_pretty(&output).unwrap_or_default(),
-                        true,
-                    )
-                }
-            }
-        } else {
-            let output = serde_json::json!({
-                "status": "search_unavailable",
-                "query": query,
-                "message": "MemEx backend is not configured. Memory search is unavailable."
-            });
-            (
-                tool_input.clone(),
-                serde_json::to_string_pretty(&output).unwrap_or_default(),
-                false,
-            )
-        }
-    }
-
-    async fn execute_memory_ingest(&self, tool_input: &Value) -> (Value, String, bool) {
-        let content = tool_input["content"].as_str().unwrap_or("");
-        let importance = tool_input["importance"].as_f64();
-
-        if let Some(ref client) = self.memex_client {
-            match client.ingest(content, importance, None).await {
-                Ok(()) => {
-                    let output = serde_json::json!({
-                        "status": "ingested",
-                        "content_length": content.len(),
-                        "importance": importance
-                    });
-                    (
-                        tool_input.clone(),
-                        serde_json::to_string_pretty(&output).unwrap_or_default(),
-                        false,
-                    )
-                }
-                Err(e) => {
-                    let output = serde_json::json!({
-                        "status": "ingest_failed",
-                        "error": format!("{}", e)
-                    });
-                    (
-                        tool_input.clone(),
-                        serde_json::to_string_pretty(&output).unwrap_or_default(),
-                        true,
-                    )
-                }
-            }
-        } else {
-            let output = serde_json::json!({
-                "status": "ingest_unavailable",
-                "message": "MemEx backend is not configured. Memory ingest is unavailable."
-            });
-            (
-                tool_input.clone(),
-                serde_json::to_string_pretty(&output).unwrap_or_default(),
-                false,
-            )
         }
     }
 

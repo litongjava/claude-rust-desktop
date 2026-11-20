@@ -1474,13 +1474,6 @@ impl QueryEngine {
         .with_prompt_profile(prompt_profile)
         .with_context_reminders(context_reminders)
         .with_turn_context(turn_context)
-        .with_memex(crate::memory::MemExClient::with_path(
-            self.workspaces_dir
-                .parent()
-                .unwrap_or(&self.workspaces_dir)
-                .join("memory.sqlite3"),
-            None,
-        ))
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
@@ -1518,10 +1511,9 @@ impl QueryEngine {
 
         let memory_config = crate::memory::MemExClient::with_path(
             plugin_context.paths.data_dir.join("memory.sqlite3"),
-            None,
         )
         .get_config_blocking();
-        if memory_config.enabled && memory_config.backend_url == "local" {
+        if memory_config.enabled {
             executor = executor.with_file_memory(
                 crate::services::memory_files::FileMemory::session(&plugin_context, &conv_id)?,
             );

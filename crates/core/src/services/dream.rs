@@ -45,7 +45,7 @@ pub struct DreamReport {
 }
 
 pub fn client(context: &ServiceContext) -> MemExClient {
-    MemExClient::with_path(context.paths.data_dir.join("memory.sqlite3"), None)
+    MemExClient::with_path(context.paths.data_dir.join("memory.sqlite3"))
 }
 
 pub async fn run(

@@ -154,7 +154,7 @@ async fn test_config_manager_creation() {
 
 #[tokio::test]
 async fn test_memex_client_creation() {
-    let _client = MemExClient::new(None);
+    let _client = MemExClient::new();
     assert!(true);
 }
 

@@ -360,7 +360,7 @@ mod tests {
         for name in CORE_TOOLS {
             assert_eq!(default_loading(name), ToolLoading { enabled: true, on_demand: true }, "{name}");
         }
-        for name in ["ListDir", "MultiEdit", "WebFetch", "Agent", "Workflow", "memory_search", "computer_use", "ProposeGoal"] {
+        for name in ["ListDir", "MultiEdit", "WebFetch", "Agent", "Workflow", "computer_use", "ProposeGoal"] {
             assert!(!is_core_tool(name), "{name}");
             assert_eq!(default_loading(name), ToolLoading { enabled: false, on_demand: true }, "{name}");
         }

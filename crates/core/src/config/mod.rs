@@ -58,8 +58,6 @@ pub struct ComputerUseConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
-    #[serde(default = "default_memex_url")]
-    pub memex_backend_url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -111,7 +109,6 @@ fn default_max_output_bytes() -> usize { 100 * 1024 }
 fn default_bash_timeout_secs() -> u64 { 120 }
 fn default_display_width() -> u32 { 1920 }
 fn default_display_height() -> u32 { 1080 }
-fn default_memex_url() -> String { "http://127.0.0.1:8765".to_string() }
 fn default_true() -> bool { true }
 fn default_bridge_port() -> u16 { 30085 }
 fn default_request_timeout_secs() -> u64 { 300 }
@@ -134,7 +131,6 @@ impl Default for OrchestrationConfig {
                 computer_use: ComputerUseConfig::default(),
             },
             memory: MemoryConfig {
-                memex_backend_url: default_memex_url(),
                 enabled: true,
             },
             bridge: BridgeConfig {
@@ -217,7 +213,6 @@ impl OrchestrationConfig {
     /// Read once per turn; a stalled post-content step is replayed only when set.
     pub fn post_content_timeout_recovery() -> bool { Self::get().http.post_content_timeout_recovery }
     pub fn bridge_port() -> u16 { Self::get().bridge.port }
-    pub fn memex_backend_url() -> &'static str { &Self::get().memory.memex_backend_url }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,7 +441,6 @@ mod tests {
         assert_eq!(config.tools.computer_use.display_height, 1080);
 
         // MemoryConfig
-        assert_eq!(config.memory.memex_backend_url, "http://127.0.0.1:8765");
         assert!(config.memory.enabled);
 
         // BridgeConfig
@@ -463,6 +457,13 @@ mod tests {
 
         // TelemetryConfig
         assert!(config.telemetry.otlp_endpoint.is_empty());
+    }
+
+    #[test]
+    fn old_memory_backend_url_still_loads() {
+        let document = "[tool_loop]\n[tools]\n[memory]\nmemex_backend_url = \"http://127.0.0.1:8765\"\nenabled = false\n[bridge]\n[http]\n[logging]\n[telemetry]\n";
+        let config: OrchestrationConfig = toml::from_str(document).unwrap();
+        assert!(!config.memory.enabled);
     }
 
     #[test]
@@ -494,7 +495,6 @@ mod tests {
                 assert_eq!(config.tool_loop.max_tool_iterations, None);
                 assert_eq!(config.tools.max_output_bytes, 102_400);
                 assert_eq!(config.bridge.port, 30085);
-                assert_eq!(config.memory.memex_backend_url, "http://127.0.0.1:8765");
             }
             Err(e) => {
                 let msg = e.to_string();

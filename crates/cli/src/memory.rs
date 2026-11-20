@@ -27,7 +27,7 @@ fn detail(item: &deepseek_code_core::memory::MemoryItem) -> String {
 /// `/memory` long-term entries: browse and search, then view, edit or delete.
 pub async fn manage(paths: &RuntimePaths) -> Result<()> {
     use crate::terminal::picker::{details, text_input, Entry, Key, Picked, Picker};
-    let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"), None);
+    let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
     let mut selected = 0;
     loop {
         let items = client.search("", Some(LIMIT)).await?;
@@ -70,7 +70,7 @@ pub async fn manage(paths: &RuntimePaths) -> Result<()> {
 }
 
 pub async fn run(cli: &crate::args::Cli, paths: &RuntimePaths, action: &MemoryCommands) -> Result<()> {
-    let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"), None);
+    let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
     match action {
         MemoryCommands::Files {
             session,
@@ -190,7 +190,7 @@ mod tests {
     async fn entries_can_be_added_listed_updated_and_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
-        let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"), None);
+        let client = MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
         let cli = cli();
         run(&cli, &paths, &MemoryCommands::Add { content: "Use PostgreSQL".into(), importance: 0.8 }).await.unwrap();
         let item = client.search("", Some(10)).await.unwrap().remove(0);
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_edits_change_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let client = MemExClient::with_path(dir.path().join("memory.sqlite3"), None);
+        let client = MemExClient::with_path(dir.path().join("memory.sqlite3"));
         client.ingest("keep me", Some(0.7), None).await.unwrap();
         let id = client.search("", Some(1)).await.unwrap().remove(0).id;
         assert!(client.update(&id, "   ", 0.5).await.is_err());

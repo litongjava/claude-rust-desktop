@@ -135,7 +135,6 @@ async fn scenario(protocol: &'static str, plan: bool) {
         .unwrap();
     let legacy = deepseek_code_core::memory::MemExClient::with_path(
         paths.data_dir.join("memory.sqlite3"),
-        None,
     );
     legacy
         .ingest(
@@ -201,6 +200,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
                 "{system}"
             );
             assert!(!request["tools"].to_string().contains("memory_search"));
+            assert!(!request["tools"].to_string().contains("memory_ingest"));
             assert!(!request["messages"]
                 .to_string()
                 .contains("legacy-unassigned-must-not-recall"));

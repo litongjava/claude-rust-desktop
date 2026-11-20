@@ -541,6 +541,17 @@ impl TemplateManager {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn memory_guidance_never_names_retired_remote_tools() {
+        for profile in [super::PromptProfile::Desktop, super::PromptProfile::Code] {
+            let prompt = super::compose_system_prompt(None, profile);
+            assert!(prompt.contains("<memory_guidance>"));
+            for retired in ["memory_search", "memory_ingest", "HTTP", "http://", "https://"] {
+                assert!(!prompt.contains(retired), "{profile:?} contains {retired}");
+            }
+        }
+    }
+
+    #[test]
     fn code_prompt_is_isolated_and_preserves_custom_instructions() {
         let custom = "请保留这段项目指令。\n<identity>My project</identity>";
         let prompt = super::compose_system_prompt(Some(custom), super::PromptProfile::Code);

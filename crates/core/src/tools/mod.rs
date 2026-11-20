@@ -114,25 +114,6 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-// ---- memory tool stubs (dispatched to MemEx at runtime by tool_loop) ----
-
-fn tool_memory_search(input: serde_json::Value) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "stub": true,
-        "message": "memory_search should be intercepted by ToolLoopExecutor",
-        "query": input["query"],
-        "results": []
-    }))
-}
-
-fn tool_memory_ingest(input: serde_json::Value) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "stub": true,
-        "message": "memory_ingest should be intercepted by ToolLoopExecutor",
-        "content": input["content"],
-        "stored": false
-    }))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -399,30 +380,6 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["action_type"]
             }),
         },
-        ToolDefinition {
-            name: "memory_search".to_string(),
-            description: "Remote HTTP memory only (when configured and enabled). Search your persistent memory for relevant information from previous conversations. Use this to recall important context, decisions, or facts from past interactions.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "The search query to find relevant memories" },
-                    "top_k": { "type": "number", "description": "Number of results to return (default: 5)" }
-                },
-                "required": ["query"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_ingest".to_string(),
-            description: "Remote HTTP memory only (when configured and enabled). Store important information in persistent memory for future retrieval. Use this to remember key decisions, architecture, configurations, or any information that should persist across conversations.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "The information to store in memory" },
-                    "importance": { "type": "number", "description": "Importance score 0.0-1.0 (default: auto-estimated)" }
-                },
-                "required": ["content"]
-            }),
-        },
     ];
 
     defs.extend(search::definitions());
@@ -482,8 +439,6 @@ macro_rules! tool_dispatch {
             "ApplyPatch" => apply_patch_tool::execute($input, $cwd),
             "AskUserQuestion" => tool_ask_user_question($input),
             "computer_use" => tool_computer_use($input),
-            "memory_search" => tool_memory_search($input),
-            "memory_ingest" => tool_memory_ingest($input),
             _ if $name.is_empty() => Ok(serde_json::json!({
                 "error": "Tool call has no name; the model returned an incomplete tool call"
             })),
@@ -1905,5 +1860,19 @@ mod directory_edit_regressions {
         .unwrap();
         assert_eq!(passed["success"], true, "{passed}");
         assert_eq!(passed["stdout"].as_str().unwrap().trim(), "a");
+    }
+}
+
+#[cfg(test)]
+mod retired_tool_tests {
+    #[test]
+    fn catalog_excludes_retired_memory_tools() {
+        let names = super::get_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        for retired in ["memory_search", "memory_ingest"] {
+            assert!(!names.iter().any(|name| name == retired), "{retired}: {names:?}");
+        }
     }
 }

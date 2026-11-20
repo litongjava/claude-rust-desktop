@@ -281,6 +281,8 @@ metadata:
 
 ## 10. 远程 MemEx、dream 与 API/UI
 
+更新：远程 MemEx HTTP 后端与 memory_search / memory_ingest 工具已移除；记忆只保留 files（默认）与 disabled 两种模式，本地 SQLite 仅用于迁移、导出和导入。以下 10.1 是历史设计记录。
+
 ### 10.1 远程后端（推荐 D4）
 
 首版保留 opt-in MemEx HTTP，模式明确为 files / memex / sqlite-legacy（回退用）；files 默认。只有 enabled 且明确配置有效 HTTP(S) 后端、模式为 memex 时，内置 memory_search / memory_ingest 才进入运行时目录；仍按原 on-demand 默认，不强制常驻。files/disabled/legacy 模式从 schema、ToolSearch 目录、恢复加载集和执行器全部移除/拒绝。设置页面可保留其配置，但显示“仅远程后端可用”，不能凭 customization override 复活本地工具。

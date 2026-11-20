@@ -288,8 +288,8 @@ impl BridgeServer {
         let orchestrator = Arc::new(Mutex::new(Some(orchestrator)));
         tracing::info!(module = "Bridge", "MultiAgentOrchestrator initialized");
 
-        let memex_client = Arc::new(MemExClient::with_path(data_dir.join("memory.sqlite3"), None));
-        tracing::info!(module = "Bridge", "MemExClient initialized (backend: {})", memex_client.base_url);
+        let memex_client = Arc::new(MemExClient::with_path(data_dir.join("memory.sqlite3")));
+        tracing::info!(module = "Bridge", "MemExClient initialized for the legacy local store");
 
         let api_key = uuid::Uuid::new_v4().to_string();
         // Only the loopback development server reads this file; never expose it to the browser.
@@ -2407,7 +2407,7 @@ async fn workflow_config_set(
 // Memory Handlers
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async fn memory_search_handler(
+async fn legacy_search_handler(
     State(state): State<AppState>,
     Json(req): Json<MemorySearchRequest>,
 ) -> Result<Json<Vec<MemoryItem>>, (StatusCode, Json<serde_json::Value>)> {
@@ -2418,7 +2418,7 @@ async fn memory_search_handler(
     }
 }
 
-async fn memory_ingest_handler(
+async fn legacy_ingest_handler(
     State(state): State<AppState>,
     Json(req): Json<MemoryIngestRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {

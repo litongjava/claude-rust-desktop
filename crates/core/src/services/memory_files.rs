@@ -213,14 +213,12 @@ impl FileMemory {
     }
 
     pub fn active(&self) -> bool {
-        let config = self.config();
-        config.enabled && config.backend_url == "local"
+        self.config().enabled
     }
 
     fn config(&self) -> crate::memory::MemoryConfig {
         crate::memory::MemExClient::with_path(
             self.context.paths.data_dir.join("memory.sqlite3"),
-            None,
         )
         .get_config_blocking()
     }
@@ -228,7 +226,7 @@ impl FileMemory {
     pub fn store(&self, read_only: bool) -> Result<FileMemoryStore> {
         ensure!(
             self.active(),
-            "Local file memory is disabled or the backend changed"
+            "Local file memory is disabled"
         );
         if let Some(id) = &self.session {
             let current = Self::session(&self.context, id)?;

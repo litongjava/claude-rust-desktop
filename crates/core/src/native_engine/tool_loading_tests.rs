@@ -93,7 +93,6 @@ fn the_request_carries_only_the_core_tools_by_default() {
         "WebFetch",
         "WebSearch",
         "computer_use",
-        "memory_search",
         "ContextSearch",
         "Agent",
         "Workflow",
@@ -2725,36 +2724,6 @@ async fn monitor_is_deferred_and_loadable() {
 
     let next: std::collections::HashSet<String> = names(&executor).into_iter().collect();
     assert!(next.contains("Monitor"), "{next:?}");
-}
-
-#[tokio::test]
-async fn file_memory_hides_legacy_tools_even_when_customization_enables_them() {
-    let temp = tempfile::tempdir().unwrap();
-    write_switches(
-        temp.path(),
-        &[("memory_search", true, true), ("memory_ingest", true, true)],
-    );
-    let client = crate::memory::MemExClient::with_path(temp.path().join("memory.sqlite3"), None);
-    let mut executor = executor(temp.path()).with_memex(client.clone());
-    assert!(executor.context_manager.is_none());
-    assert!(!names(&executor).contains(&"memory_search".into()));
-    let (_, output, failed) = executor
-        .execute_tool_call(
-            "memory_ingest",
-            &json!({"content":"must not save"}),
-            "local-memory-denied",
-        )
-        .await;
-    assert!(failed, "{output}");
-    assert_eq!(client.stats().await.unwrap().total_memories, 0);
-    let mut config = client.get_config().await;
-    config.backend_url = "http://127.0.0.1:1".into();
-    client.update_config(config).await.unwrap();
-    assert!(names(&executor).contains(&"memory_search".into()));
-    let mut config = client.get_config().await;
-    config.enabled = false;
-    client.update_config(config).await.unwrap();
-    assert!(!names(&executor).contains(&"memory_search".into()));
 }
 
 #[tokio::test]

@@ -644,7 +644,6 @@ impl PermissionManager {
                 | "Glob"
                 | "WebFetch"
                 | "WebSearch"
-                | "memory_search"
                 | "TodoRead"
                 | "Skill"
                 | "SkillRead"
@@ -665,14 +664,13 @@ impl PermissionManager {
         )
     }
 
-    /// Tools that write only this app's own data (memory store, todo list,
-    /// task list), never project files. Like the reference CLI, which does not
-    /// prompt for its todo and task tools or for writes to its memory
-    /// directory, they run without asking.
+    /// Tools that write only this app's own data (todo list, task list),
+    /// never project files. Like the reference CLI, which does not prompt for
+    /// its todo and task tools, they run without asking.
     fn is_own_state_tool(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "memory_ingest" | "TodoWrite" | "TaskCreate" | "TaskUpdate"
+            "TodoWrite" | "TaskCreate" | "TaskUpdate"
         )
     }
 
@@ -693,7 +691,6 @@ impl PermissionManager {
                 | "SearchReplace"
                 | "GlobReplace"
                 | "Delete"
-                | "memory_ingest"
                 | "SkillCreate"
                 | "SkillUpdate"
                 | "NotebookEdit"
@@ -1981,7 +1978,7 @@ mod policy_tests {
             PermissionMode::DontAsk,
         ] {
             let manager = manager(mode);
-            for tool in ["memory_ingest", "TodoWrite", "TaskCreate", "TaskUpdate"] {
+            for tool in ["TodoWrite", "TaskCreate", "TaskUpdate"] {
                 let decision = manager.evaluate_permission(&context(tool));
                 assert_eq!(
                     decision.result,
@@ -1993,13 +1990,13 @@ mod policy_tests {
             manager.set_session_rules(
                 "session",
                 HashMap::from([
-                    ("memory_ingest".into(), PermissionAction::Confirm),
+                    ("TaskCreate".into(), PermissionAction::Confirm),
                     ("TodoWrite".into(), PermissionAction::Deny),
                 ]),
             );
             assert!(
                 !matches!(
-                    manager.check_permission(&context("memory_ingest")),
+                    manager.check_permission(&context("TaskCreate")),
                     PermissionResult::Granted
                 ),
                 "{mode:?}"
@@ -2018,7 +2015,7 @@ mod policy_tests {
             PermissionResult::RequiresConfirmation(_)
         ));
         assert!(matches!(
-            manager(PermissionMode::PlanMode).check_permission(&context("memory_ingest")),
+            manager(PermissionMode::PlanMode).check_permission(&context("TodoWrite")),
             PermissionResult::Denied(_)
         ));
     }

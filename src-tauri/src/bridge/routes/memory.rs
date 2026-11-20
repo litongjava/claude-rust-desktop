@@ -24,11 +24,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/memory/legacy/import", post(import))
         .route(
             "/api/memory/legacy/search",
-            post(super::super::memory_search_handler),
+            post(super::super::legacy_search_handler),
         )
         .route(
             "/api/memory/legacy/ingest",
-            post(super::super::memory_ingest_handler),
+            post(super::super::legacy_ingest_handler),
         )
         .route(
             "/api/memory/legacy/stats",

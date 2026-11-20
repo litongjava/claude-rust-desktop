@@ -42,7 +42,6 @@ pub fn builtins() -> Vec<Definition> {
             "Bash",
             "WebFetch",
             "WebSearch",
-            "memory_search",
         ]
         .into_iter()
         .map(String::from)
@@ -62,7 +61,6 @@ pub fn builtins() -> Vec<Definition> {
                     "Grep",
                     "WebFetch",
                     "WebSearch",
-                    "memory_search",
                     "AskUserQuestion",
                 ]
                 .into_iter()

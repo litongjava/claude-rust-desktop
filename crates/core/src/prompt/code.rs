@@ -2,10 +2,6 @@
 use super::PromptProfile;
 use crate::tools::ToolDefinition;
 
-pub fn is_memory_tool(name: &str) -> bool {
-    matches!(name, "memory_search" | "memory_ingest")
-}
-
 pub fn adapt_tools(mut tools: Vec<ToolDefinition>, profile: PromptProfile) -> Vec<ToolDefinition> {
     if profile != PromptProfile::Code {
         return tools;
@@ -37,9 +33,6 @@ mod tests {
         let native = crate::tools::get_tool_definitions();
         let adapted = adapt_tools(native.clone(), PromptProfile::Code);
         assert_eq!(adapted.len(), native.len());
-        for name in ["memory_search", "memory_ingest"] {
-            assert!(adapted.iter().any(|tool| tool.name == name));
-        }
         for tool in &adapted {
             let original = native.iter().find(|item| item.name == tool.name).unwrap();
             assert_eq!(tool.input_schema, original.input_schema);
