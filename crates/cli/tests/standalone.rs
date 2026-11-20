@@ -421,11 +421,18 @@ async fn piped_input_stream_json_and_legacy_import_are_scriptable() {
         .collect();
     assert!(events.iter().any(|v| v["type"] == "text"));
     assert_eq!(events.last().unwrap()["type"], "result");
-    assert!(fixture.requests.lock().unwrap()[0]["messages"]
+    let requests = fixture.requests.lock().unwrap();
+    let first_user = requests[0]["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["content"] == "piped 中文"));
+        .find(|m| m["role"] == "user")
+        .and_then(|m| m["content"].as_str())
+        .unwrap();
+    assert!(first_user.ends_with("piped 中文"));
+    assert!(first_user.contains(
+        "<system-reminder>\nThe user is working in the standalone DeepSeek Code terminal frontend."
+    ));
     task.abort();
     let old = temp.path().join("settings.json");
     let original = json!({"model":"deepseek-chat","api":{"base_url":"https://api.deepseek.com","api_key":"legacy-only-secret","max_tokens":4096}}).to_string();
@@ -1230,7 +1237,13 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
         .map(|m| (&m["role"], &m["content"]))
         .collect();
     assert_eq!(wire.len(), 3, "{wire:?}");
-    assert_eq!(wire[0], (&json!("user"), &json!("Stored summary")));
+    // The resumed session's first message keeps the frozen session context
+    // before the compacted summary.
+    assert_eq!(wire[0].0, &json!("user"));
+    let first = wire[0].1.as_str().unwrap();
+    assert!(first.ends_with("Stored summary"), "{first}");
+    assert!(first.contains("<system-reminder>\n# Environment\n"), "{first}");
+    assert!(first.contains("<system-reminder>\nToday's date is "), "{first}");
     assert_eq!(
         wire[1],
         (&json!("assistant"), &json!("legacy-marker retained reply"))

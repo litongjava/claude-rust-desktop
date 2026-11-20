@@ -89,6 +89,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub effort: Option<String>,
     pub system_prompt: Option<String>,
+    /// The standalone terminal is the frontend, so its constant facts travel in
+    /// the first user message as their own reminder.
+    #[serde(default)]
+    pub standalone_frontend: bool,
     pub max_tokens: Option<u32>,
     /// Per-request model/tool-loop budget. None keeps the configured default.
     #[serde(default)]
@@ -1029,10 +1033,10 @@ impl QueryEngine {
         )
         .await?;
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
+        let standalone_frontend = request.standalone_frontend;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
             prompt_profile,
-            Some(&workspace),
             &customization.system_prompt,
         ));
         let snapshot_root = plugin_context.paths.data_dir.clone();
@@ -1043,6 +1047,37 @@ impl QueryEngine {
                 &snapshot_root,
                 &snapshot_session,
                 &snapshot_workspace,
+            )
+        })
+        .await?;
+        // The environment and the date are frozen on the session's first
+        // request so a later date or runtime change cannot rewrite the first
+        // user message.
+        let environment_root = plugin_context.paths.data_dir.clone();
+        let environment_session = conv_id.clone();
+        let environment_workspace = workspace.clone();
+        let environment_project = project.as_ref().map(|project| {
+            (
+                project.name.clone(),
+                project
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let (environment, frozen_date) = tokio::task::spawn_blocking(move || {
+            let project = environment_project
+                .as_ref()
+                .map(|(name, folders)| (name.as_str(), folders.as_slice()));
+            (
+                crate::prompt::environment_for_session(
+                    &environment_root,
+                    &environment_session,
+                    Some(&environment_workspace),
+                    project,
+                ),
+                crate::prompt::date_for_session(&environment_root, &environment_session),
             )
         })
         .await?;
@@ -1212,12 +1247,28 @@ impl QueryEngine {
             &instruction_files,
         )
         .await?;
-        // Like the reference CLI, instructions and the Git snapshot open the first
-        // user message instead of the system prompt, which stays the same across
-        // projects and so shares one cache entry.
+        // Like the reference CLI, instructions, the environment and the Git
+        // snapshot open the first user message instead of the system prompt,
+        // which stays the same across projects and so shares one cache entry.
         let turn_root = plugin_context.paths.data_dir.clone();
         let turn_session = conv_id.clone();
         let turn_messages = request.messages.clone();
+        // The frozen environment keeps the first message stable; a date the
+        // session outlived is announced once, on the message it was attached to.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date_reminder = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| {
+                crate::prompt::date_change_reminder(
+                    &turn_root,
+                    &turn_session,
+                    &frozen_date,
+                    &today,
+                )
+            })
+            .flatten();
         let turn_context = tokio::task::spawn_blocking(move || {
             for (block, skill) in turn_blocks {
                 if let Some(entry) =
@@ -1230,22 +1281,36 @@ impl QueryEngine {
                     )?;
                 }
             }
+            if let Some(reminder) = date_reminder {
+                if let Some(entry) =
+                    crate::services::turn_context::for_last(&turn_messages, vec![reminder])
+                {
+                    crate::services::turn_context::save(&turn_root, &turn_session, &entry)?;
+                }
+            }
             crate::services::turn_context::load(&turn_root, &turn_session)
         })
         .await??;
-        // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
-            .into_iter()
-            .chain(
-                git_snapshot
+        // The first user message opens with the stable session context; skills
+        // whose message a compaction removed follow, as in the reference CLI.
+        let (user_instructions, project_instructions) =
+            crate::project_instructions::reminder_parts(&instructions);
+        let context_reminders = crate::prompt::first_message_reminders(
+            crate::prompt::SessionReminders {
+                user_instructions,
+                environment: Some(environment),
+                project_instructions,
+                standalone_frontend,
+                date: Some(frozen_date),
+                git: git_snapshot
                     .as_deref()
                     .map(crate::services::git_snapshot::reminder),
-            )
-            .chain(crate::services::turn_context::invoked_skills_reminder(
-                &turn_context,
-                &request.messages,
-            ))
-            .collect();
+                skills: crate::services::turn_context::invoked_skills_reminder(
+                    &turn_context,
+                    &request.messages,
+                ),
+            },
+        );
         let allowed_directories = project
             .as_ref()
             .map(|project| {
@@ -1257,13 +1322,7 @@ impl QueryEngine {
             })
             .unwrap_or_default();
         if let Some(project) = project {
-            let folders = project
-                .folders
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>();
             let system = request.system_prompt.get_or_insert_with(String::new);
-            crate::prompt::add_project_to_environment(system, &project.name, &folders);
             if let Some(instructions) = project
                 .instructions
                 .as_deref()

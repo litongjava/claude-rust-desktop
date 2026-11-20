@@ -1808,7 +1808,6 @@ impl Session {
         if let Some(goal) = crate::session_commands::goal_prompt(self)? {
             system.push_str(&goal);
         }
-        system.push_str("\nThe user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
         let cwd = &self.workspace;
         let mut checkpoint = if hook_wake {
             None
@@ -1898,6 +1897,7 @@ impl Session {
             },
             effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
             system_prompt: Some(system),
+            standalone_frontend: true,
             max_tokens: cli.max_tokens,
             max_turns: cli.max_turns.map(|limit| {
                 turn_goal.as_ref().map_or(limit, |g| {

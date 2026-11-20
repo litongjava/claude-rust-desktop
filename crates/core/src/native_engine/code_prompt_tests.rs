@@ -268,7 +268,6 @@ async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Va
         vec![json!({"role":"user","content":"hello"})],
         Some(crate::prompt::compose_system_prompt(
             None,
-            "code-test",
             PromptProfile::Code,
         )),
         128,
@@ -363,6 +362,70 @@ async fn project_only_instructions_use_two_responses_parts() {
     )));
     assert!(first_text.contains("project marker"));
     assert_eq!(parts[1]["text"], "hello");
+}
+
+/// The first user message opens with the stable context in order, and the
+/// environment travels as its own Responses `input_text` part.
+#[tokio::test]
+async fn environment_is_its_own_responses_part_in_first_message_order() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("AGENTS.md"), "user marker").unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let (user_block, project_block) = crate::project_instructions::reminder_parts(
+        &crate::project_instructions::load_all(Some(user.path()), project.path()).unwrap(),
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let mut environment = crate::prompt::environment_reminder(Some(workspace.path()));
+    crate::prompt::add_project_to_environment(
+        &mut environment,
+        "Demo",
+        &[workspace.path().to_str().unwrap()],
+    );
+    let reminders = crate::prompt::first_message_reminders(crate::prompt::SessionReminders {
+        user_instructions: user_block,
+        environment: Some(environment),
+        project_instructions: project_block,
+        standalone_frontend: true,
+        date: Some(crate::prompt::date_reminder("2026-11-19")),
+        git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
+        skills: None,
+    });
+    assert_eq!(reminders.len(), 6);
+    let body = capture_instruction_request("responses", reminders).await;
+    assert!(body["instructions"]
+        .as_str()
+        .is_none_or(|system| !system.contains("# Environment")));
+    let first = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("the request carries the user message");
+    let parts = first["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 7, "{parts:?}");
+    assert!(parts.iter().all(|part| part["type"] == "input_text"), "{parts:?}");
+    let text = |index: usize| parts[index]["text"].as_str().unwrap();
+    assert!(text(0).starts_with("<system-reminder>\n") && text(0).contains("user marker"));
+    assert!(!text(0).contains("project marker"));
+    assert!(text(1).starts_with("<system-reminder>\n# Environment\n"));
+    assert!(text(1).contains(" - Project: Demo\n - Primary working directory: "));
+    assert!(text(1).contains(" - Platform: "));
+    assert!(text(2).starts_with("<system-reminder>\n") && text(2).contains("project marker"));
+    assert_eq!(text(3), crate::prompt::standalone_frontend_reminder());
+    assert_eq!(text(4), crate::prompt::date_reminder("2026-11-19"));
+    assert!(text(5).starts_with("<system-reminder>\n# gitStatus"));
+    assert_eq!(text(6), "hello");
+    for index in 0..6 {
+        assert_eq!(text(index).matches("<system-reminder>").count(), 1, "{index}");
+        assert!(text(index).ends_with("</system-reminder>"), "{index}");
+    }
+    println!(
+        "first message parts: {:?}",
+        (0..7)
+            .map(|index| text(index).chars().take(150).collect::<String>())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

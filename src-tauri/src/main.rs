@@ -301,6 +301,7 @@ fn main() {
                             })],
                             model: "claude-sonnet-4-6".to_string(),
                             system_prompt: None,
+                            standalone_frontend: false,
                             max_tokens: None,
                             workspace_path: None,
                             temperature: None,

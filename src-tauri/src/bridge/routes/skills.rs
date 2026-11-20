@@ -258,6 +258,7 @@ async fn skill_execute(
         model: req.model,
         provider_id: req.provider_id,
         system_prompt: Some(format!("Apply the following skill to the user's task:\n\n{content}")),
+        standalone_frontend: false,
         workspace_path: req.workspace_path,
         effort: None, max_tokens: None, temperature: None, top_p: None, reasoning_mode: None,
         max_turns: None, response_schema: None,
