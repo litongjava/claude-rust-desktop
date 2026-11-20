@@ -250,7 +250,6 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
 async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provider() {
     let (_temp, context, store, parent, cwd) = fixture();
     let (a, api_a, server_a) = endpoint().await;
-    let (b, api_b, server_b) = endpoint().await;
     let registry: OwnedChildren = Default::default();
     let first = owner(&context, &parent, &cwd, &a, registry.clone());
     let result = first
@@ -266,7 +265,7 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         assert!(entry.executor.message_inbox.is_none());
         assert!(entry.executor.execution_lease.is_none());
     }
-    let mut next = owner(&context, &parent, &cwd, &b, registry.clone());
+    let mut next = owner(&context, &parent, &cwd, &a, registry.clone());
     let resumed = next
         .execute_delegated(&json!({"resume":child,"prompt":"explicit continuation"}))
         .await
@@ -289,8 +288,7 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
     let peer = store.fork(&parent).unwrap();
     mail::send(&context, &peer, &child, "BOUNDARY_WAKE_MARKER").unwrap();
     next.execute().await.unwrap();
-    assert_eq!(api_a.requests.lock().unwrap().len(), 4);
-    assert_eq!(api_b.requests.lock().unwrap().len(), 1);
+    assert_eq!(api_a.requests.lock().unwrap().len(), 5);
     let requests = api_a.requests.lock().unwrap();
     assert!(requests[1].to_string().contains("original child"));
     assert!(requests[1].to_string().contains("explicit continuation"));
@@ -314,8 +312,63 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         .unwrap();
     assert_eq!(resumed["status"], "completed");
     server_a.abort();
-    server_b.abort();
 }
+#[tokio::test]
+async fn retained_child_rejects_endpoint_or_key_changes_before_resume() {
+    let (_temp, context, _store, parent, cwd) = fixture();
+    let (url, api, server) = endpoint().await;
+    let (other, unused, other_server) = endpoint().await;
+    for rotate_key in [false, true] {
+        let registry: OwnedChildren = Default::default();
+        let first = owner(&context, &parent, &cwd, &url, registry.clone());
+        let child = first
+            .execute_delegated(&json!({"prompt":"original"}))
+            .await
+            .unwrap();
+        let child = child["session_id"].as_str().unwrap();
+        let mut next = owner(
+            &context,
+            &parent,
+            &cwd,
+            if rotate_key { &url } else { &other },
+            registry.clone(),
+        );
+        if rotate_key {
+            next.provider.provider.api_key = "rotated-local-fixture".into();
+        }
+        let before = api.requests.lock().unwrap().len();
+        let error = next
+            .resume_owned_child(child, Some("after change"), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("needs_resume"));
+        assert!(!registry.lock().unwrap().contains_key(child));
+        assert_eq!(api.requests.lock().unwrap().len(), before);
+        assert!(unused.requests.lock().unwrap().is_empty());
+    }
+    server.abort();
+    other_server.abort();
+}
+
+#[tokio::test]
+async fn retained_child_rejects_native_model_transport_change_at_same_base_url() {
+    let (_temp, context, _store, parent, cwd) = fixture();
+    let (url, api, server) = endpoint().await;
+    let registry: OwnedChildren = Default::default();
+    let mut first = owner(&context, &parent, &cwd, &format!("{url}/v1"), registry.clone());
+    first.provider.provider.builtin_id = Some("openai".into());
+    first.provider.model.api = Some("openai-completions".into());
+    let child = first.execute_delegated(&json!({"prompt":"original"})).await.unwrap();
+    first.provider.model.id = "responses-model".into();
+    first.provider.model.api = Some("openai-responses".into());
+    let error = first.resume_owned_child(child["session_id"].as_str().unwrap(), Some("changed native route"), false)
+        .await.unwrap_err();
+    assert!(error.to_string().contains("needs_resume"));
+    assert!(registry.lock().unwrap().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn resume_cancellation_releases_ownership_and_never_automatically_restarts() {
     let (_temp, context, _store, parent, cwd) = fixture();

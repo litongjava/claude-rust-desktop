@@ -717,7 +717,7 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
     assert!(!marker.exists(),"status must not launch MCP");
     let mut cleanup = Cleanup(vec![host.supervisor_pid.unwrap()]);
     for (prompt, model, tokens) in [
-        ("first turn", "fixture-one", 64),
+        ("first turn", "fixture-one[1m]", 64),
         ("second turn", "fixture-two[1m]", 96),
     ] {
         let id = submit(&host, &endpoint, prompt, model, tokens).await;
@@ -734,6 +734,8 @@ async fn persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_cras
         assert_eq!(std::fs::read_to_string(workspace.join("lifecycle-count")).unwrap(), "start\n");
         assert!(requests[0]["messages"][0]["content"].as_str().unwrap().contains("WORKER_HOOK_CONTEXT"));
         assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["model"], "fixture-one");
+        assert_eq!(requests[0]["max_tokens"], 64);
         assert_eq!(requests[2]["model"], "fixture-two");
         assert_eq!(requests[2]["max_tokens"], 96);
         assert!(requests[2]["messages"].to_string().contains("first turn"));

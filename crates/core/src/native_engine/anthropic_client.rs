@@ -242,6 +242,7 @@ impl AnthropicClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<AnthropicResponse> {
+        let provider = &provider.current()?;
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
             format!("{}/messages", base_url)
@@ -327,6 +328,7 @@ impl AnthropicClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let provider = &provider.current()?;
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
             format!("{}/messages", base_url)
@@ -437,6 +439,7 @@ impl AnthropicClient {
         Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
         crate::performance::AttemptCounter,
     )> {
+        let provider = &provider.current()?;
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
             format!("{}/messages", base_url)

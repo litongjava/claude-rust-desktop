@@ -1,4 +1,5 @@
 //! Cloud credentials are resolved in memory and never passed to child processes.
+use super::super::session_binding::{account_var, account_var_os, BindingSnapshot};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -14,8 +15,8 @@ fn sign(key: &[u8], text: &str) -> Vec<u8> {
         .to_vec()
 }
 
-pub(super) fn aws_headers(url: &str, region: &str, body: &str) -> Result<HeaderMap> {
-    let (access, secret, token) = aws_credentials()?;
+pub(super) fn aws_headers(url: &str, region: &str, body: &str, state: Option<&BindingSnapshot>) -> Result<HeaderMap> {
+    let (access, secret, token) = aws_credentials(state)?;
     let now = chrono::Utc::now();
     aws_sign(
         url,
@@ -96,16 +97,16 @@ fn aws_sign(
     Ok(headers)
 }
 
-fn aws_credentials() -> Result<(String, String, Option<String>)> {
-    let env = |name| std::env::var(name).ok().filter(|s| !s.is_empty());
-    if std::env::var_os("AWS_PROFILE").is_none() {
+fn aws_credentials(state: Option<&BindingSnapshot>) -> Result<(String, String, Option<String>)> {
+    let env = |name| account_var(state, name).ok().filter(|s| !s.is_empty());
+    if account_var_os(state, "AWS_PROFILE").is_none() {
         if let (Some(access), Some(secret)) =
             (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY"))
         {
             return Ok((access, secret, env("AWS_SESSION_TOKEN")));
         }
     }
-    let path = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+    let path = account_var_os(state, "AWS_SHARED_CREDENTIALS_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|p| p.join(".aws/credentials")))
         .context("AWS credentials path unavailable")?;
@@ -131,26 +132,28 @@ fn aws_credentials() -> Result<(String, String, Option<String>)> {
     }
 }
 
-pub(super) async fn google_token(client: &reqwest::Client) -> Result<String> {
-    if let Ok(token) = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN") {
+pub(super) async fn google_token(client: &reqwest::Client, provider: &super::ResolvedProvider) -> Result<String> {
+    let account = provider.binding_snapshot();
+    let state = account.as_deref();
+    if let Ok(token) = account_var(state, "GOOGLE_OAUTH_ACCESS_TOKEN") {
         if !token.is_empty() {
             return Ok(token);
         }
     }
-    let path = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+    let path = account_var_os(state, "GOOGLE_APPLICATION_CREDENTIALS")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             dirs::config_dir().map(|p| p.join("gcloud/application_default_credentials.json"))
         })
         .context("Google ADC credentials path unavailable")?;
     let credentials: Value = serde_json::from_str(&std::fs::read_to_string(path).context("Vertex requires GOOGLE_CLOUD_API_KEY, GOOGLE_OAUTH_ACCESS_TOKEN, or an ADC credentials file")?)?;
-    let response = match credentials["type"].as_str() {
+    let request = match credentials["type"].as_str() {
         Some("authorized_user") => {
             client.post("https://oauth2.googleapis.com/token").form(&[
                 ("grant_type","refresh_token"),("client_id",credentials["client_id"].as_str().context("ADC client ID missing")?),
                 ("client_secret",credentials["client_secret"].as_str().context("ADC client secret missing")?),
                 ("refresh_token",credentials["refresh_token"].as_str().context("ADC refresh token missing")?),
-            ]).send().await?
+            ])
         }
         Some("service_account") => {
             let email = credentials["client_email"].as_str().context("Service account email missing")?;
@@ -166,10 +169,12 @@ pub(super) async fn google_token(client: &reqwest::Client) -> Result<String> {
             let mut signature = vec![0;key.public().modulus_len()];
             key.sign(&ring::signature::RSA_PKCS1_SHA256,&SystemRandom::new(),signing_input.as_bytes(),&mut signature).map_err(|_|anyhow::anyhow!("Service account JWT signing failed"))?;
             let assertion = format!("{signing_input}.{}",b64.encode(signature));
-            client.post("https://oauth2.googleapis.com/token").form(&[("grant_type","urn:ietf:params:oauth:grant-type:jwt-bearer"),("assertion",assertion.as_str())]).send().await?
+            client.post("https://oauth2.googleapis.com/token").form(&[("grant_type","urn:ietf:params:oauth:grant-type:jwt-bearer"),("assertion",assertion.as_str())])
         }
         _=>bail!("Unsupported ADC credential type; native Vertex currently supports service_account and authorized_user credentials"),
     };
+    provider.ensure_current()?;
+    let response = request.send().await?;
     if !response.status().is_success() {
         bail!(
             "Google credential refresh failed with HTTP {}",

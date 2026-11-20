@@ -19,6 +19,7 @@ use std::{
 pub(crate) type OwnedChildren = Arc<Mutex<HashMap<String, OwnedChild>>>;
 pub(crate) struct OwnedChild {
     executor: Box<ToolLoopExecutor>,
+    owner_provider: crate::native_engine::provider_manager::ResolvedProvider,
     pub(in crate::native_engine) parent: String,
     pub(in crate::native_engine) owner_budget: Arc<std::sync::atomic::AtomicUsize>,
     pub(in crate::native_engine) idle_ready: bool,
@@ -28,6 +29,28 @@ pub(crate) struct OwnedChild {
 }
 
 impl OwnedChild {
+    pub(in crate::native_engine) fn binding_is_current(
+        &self,
+        manager: &crate::native_engine::provider_manager::ProviderManager,
+        owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
+    ) -> bool {
+        if let Some((id, provider)) = owner {
+            if id == self.parent && !self.owner_provider.same_binding(provider) {
+                return false;
+            }
+        }
+        [&self.owner_provider, &self.executor.provider]
+            .iter()
+            .all(|held| {
+                manager
+                    .resolve_selected(&held.provider.id, &held.model.id)
+                    .is_some_and(|live| {
+                        held.provider.same_transport(&live.provider)
+                            && held.model.api == live.model.api
+                    })
+            })
+    }
+
     pub(in crate::native_engine) fn permission_target(
         &self,
     ) -> Result<(
@@ -350,7 +373,7 @@ impl ToolLoopExecutor {
             .context("Original child runtime is unavailable; needs_resume")?;
         ensure!(entry.parent == owner, "Child belongs to another owner");
         let mut host = Self::new(
-            entry.executor.provider.clone(),
+            entry.owner_provider.clone(),
             Vec::new(),
             None,
             entry.executor.max_tokens,
@@ -358,6 +381,7 @@ impl ToolLoopExecutor {
             entry.executor.workspace_cwd.clone(),
             entry.executor.reasoning_mode.clone(),
         );
+        host.provider_manager = entry.executor.provider_manager.clone();
         host.conv_id = Some(owner.into());
         host.search_config_path = entry.executor.search_config_path.clone();
         host.child_resumes = entry.owner_budget.clone();
@@ -490,10 +514,20 @@ impl ToolLoopExecutor {
         );
         let policy = self.child_owner_policy();
         let mut entry = {
+            let manager = match &self.provider_manager {
+                Some(manager) => Some(manager.lock().await),
+                None => None,
+            };
             let mut registry = self
                 .owned_children
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if registry.get(id).is_some_and(|entry| entry.parent == parent && (
+                !entry.owner_provider.same_binding(&self.provider)
+                || manager.as_ref().is_some_and(|catalog| !entry.binding_is_current(catalog, None))
+            )) {
+                registry.remove(id);
+            }
             let retained = registry
                 .get(id)
                 .context("Original child configuration is no longer resident; needs_resume")?;
@@ -788,6 +822,7 @@ impl ToolLoopExecutor {
             .unwrap_or("ask");
         Ok(crate::native_engine::child_session::child_cli_arguments(
             &self.provider,
+            &self.model_selector,
             mode,
             root,
         ))
@@ -957,10 +992,13 @@ impl ToolLoopExecutor {
             Some(agent) => agent.definition.clone(),
             None => agents::resolve(&context, agent_type)?,
         };
-        let mut provider = runtime
-            .as_ref()
-            .and_then(|agent| agent.provider.clone())
-            .unwrap_or_else(|| self.provider.clone());
+        let mut provider = match runtime.as_ref().and_then(|agent| agent.provider.as_ref()) {
+            Some(selector) => {
+                let manager = self.provider_manager.as_ref().context("Agent provider manager unavailable")?.lock().await;
+                selector.resolve(&manager)?
+            }
+            None => self.provider.clone(),
+        };
         if let Some(effort) = runtime.as_ref().and_then(|agent| agent.effort.clone()) {
             provider.model.effort = Some(effort);
         }
@@ -1200,6 +1238,7 @@ impl ToolLoopExecutor {
             child_workspace,
             self.reasoning_mode.clone(),
         )
+        .with_provider_manager(self.provider_manager.clone())
         .with_runtime_agents(self.runtime_agents.clone())
         .with_allowed_tools(definition.tools)
         .with_read_only_shell(read_only_shell)
@@ -1633,6 +1672,7 @@ impl ToolLoopExecutor {
                             id.clone(),
                             OwnedChild {
                                 executor: Box::new(child),
+                                owner_provider: self.provider.clone(),
                                 parent: self.conv_id.clone().unwrap_or_default(),
                                 owner_budget: self.child_resumes.clone(),
                                 idle_ready: false,

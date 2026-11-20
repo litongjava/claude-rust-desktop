@@ -124,7 +124,7 @@ fn write_customization(data: &std::path::Path) {
     let switch = || json!({"enabled":true,"on_demand":true});
     let customization = json!({"tool_loading":{
         "TaskCreate":switch(),"TaskGet":switch(),"TaskUpdate":switch(),"TaskList":switch(),
-        "Agent":switch(),"Workflow":switch()
+        "Agent":switch(),"Workflow":switch(),"DeepSeekCode":switch()
     }});
     std::fs::write(data.join("customization.json"), customization.to_string()).unwrap();
 }
@@ -202,6 +202,15 @@ impl Fixture {
 }
 
 async fn run_cli(fixture: &CliFixture, session: &str) -> std::process::Output {
+    run_cli_with_options(fixture, session, "fixture-model", &[]).await
+}
+
+async fn run_cli_with_options(
+    fixture: &CliFixture,
+    session: &str,
+    model: &str,
+    options: &[&str],
+) -> std::process::Output {
     let mut cmd = Command::new(
         std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dcl").into()),
     );
@@ -213,13 +222,14 @@ async fn run_cli(fixture: &CliFixture, session: &str) -> std::process::Output {
             "--provider",
             "fixture",
             "--model",
-            "fixture-model",
+            model,
             "--permission-mode",
             "bypassPermissions",
             "--session-id",
             session,
-            "fixture task",
         ])
+        .args(options)
+        .args(["--", "fixture task"])
         .stdin(Stdio::null())
         .kill_on_drop(true);
     for (key, _) in std::env::vars() {
@@ -268,6 +278,234 @@ const end = Date.now() + 60000
 while (Date.now() < end) {}
 return { ok: true }
 "#;
+
+async fn binding_workflow_response(
+    State(fixture): State<FixtureState>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let fixture = Fixture { state: fixture };
+    fixture.record_request(&body);
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let text = last["content"].as_str().unwrap_or_default();
+    if last["role"] == "user" && text.contains("workflow binding agent") {
+        return stream(text_frames("agent binding observed"));
+    }
+    let results = tool_results(&body);
+    let frames = match results.as_slice() {
+        [] => tool_call_frame(
+            "binding-workflow",
+            "Workflow",
+            &json!({"script": r#"
+export const meta = { name: 'binding' };
+return [
+  await agent('default workflow binding agent'),
+  await agent('bare workflow binding agent', {model: 'fixture-model'}),
+  await agent('qualified workflow binding agent', {model: 'fixture::fixture-model'}),
+  await agent('context workflow binding agent', {model: 'fixture::fixture-model[1M]'}),
+  await agent('override workflow binding agent', {model: 'fixture-child'})
+];
+"#}),
+        ),
+        [started] => tool_call_frame(
+            "binding-wait",
+            "TaskGet",
+            &json!({"task_id":started["task_id"],"block":true,"timeout":10000}),
+        ),
+        [_, completed, ..] => {
+            fixture.store("binding_workflow", completed.clone());
+            text_frames("workflow binding observed")
+        }
+    };
+    stream(frames)
+}
+
+#[tokio::test]
+async fn workflow_agents_use_the_snapshot_only_for_the_selected_model() {
+    check_workflow_model_selection("fixture-model", 211, 4096).await;
+}
+
+#[tokio::test]
+async fn workflow_with_a_virtual_context_keeps_only_matching_snapshots() {
+    check_workflow_model_selection("fixture-model[1m]", 4096, 211).await;
+}
+
+async fn check_workflow_model_selection(parent: &str, bare_budget: u32, context_budget: u32) {
+    let (fixture, state) = start_cli_fixture(post(binding_workflow_response)).await;
+    let session = uuid::Uuid::new_v4().to_string();
+    let output = run_cli_with_options(&fixture, &session, parent, &["--max-tokens", "211"]).await;
+    assert_single_success(&output);
+    let completed = state.slot("binding_workflow");
+    assert_eq!(completed["status"], "completed", "{completed}");
+    let actual: Vec<_> = state
+        .state
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body["messages"].as_array().unwrap().last().unwrap()["role"] == "user")
+        .map(|body| (body["model"].clone(), body["max_tokens"].clone()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (json!("fixture-model"), json!(211)),
+            (json!("fixture-model"), json!(211)),
+            (json!("fixture-model"), json!(bare_budget)),
+            (json!("fixture-model"), json!(bare_budget)),
+            (json!("fixture-model"), json!(context_budget)),
+            (json!("fixture-child"), json!(4096)),
+        ]
+    );
+}
+
+async fn binding_external_response(
+    State(fixture): State<FixtureState>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let fixture = Fixture { state: fixture };
+    fixture.record_request(&body);
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let text = last["content"].as_str().unwrap_or_default();
+    if last["role"] == "user" && text.contains("nested external binding fixture") {
+        return stream(text_frames("external binding observed"));
+    }
+    let results: Vec<Value> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            let content = message["content"].as_str().unwrap_or_default();
+            serde_json::from_str(content).unwrap_or_else(|_| json!({"error":content}))
+        })
+        .collect();
+    let frames = match results.as_slice() {
+        [] => tool_call_frame(
+            "nested-start",
+            "DeepSeekCode",
+            &json!({"prompt":"nested external binding fixture start","model":"fixture-child"}),
+        ),
+        [started] => {
+            fixture.store("nested_start", started.clone());
+            if let Some(session) = started["session_id"].as_str() {
+                tool_call_frame(
+                    "nested-resume",
+                    "DeepSeekCode",
+                    &json!({"prompt":"nested external binding fixture resume","session_id":session}),
+                )
+            } else {
+                text_frames("nested start failed")
+            }
+        }
+        [_, resumed, ..] => {
+            fixture.store("nested_resume", resumed.clone());
+            text_frames("nested resumed")
+        }
+    };
+    stream(frames)
+}
+
+#[tokio::test]
+async fn external_dcl_from_a_background_worker_starts_and_resumes_its_own_session() {
+    use deepseek_code_core::{
+        runtime::{RuntimePaths, SessionStore},
+        services::background_sessions::{self as jobs, Launch},
+    };
+
+    let (fixture, state) = start_cli_fixture(post(binding_external_response)).await;
+    let paths = RuntimePaths::new(fixture.data.clone()).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let parent = store
+        .create(fixture.root.path(), "fixture-model", "fixture")
+        .unwrap();
+    let executable = std::path::PathBuf::from(
+        std::env::var_os("CLAUDE_SDK_TEST_EXE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dcl").into()),
+    );
+    let path = std::env::join_paths(
+        std::iter::once(executable.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .unwrap();
+    let mut arguments = vec!["--data-dir".into(), fixture.data.to_str().unwrap().into()];
+    arguments.extend(
+        [
+            "--resume",
+            &parent,
+            "--provider",
+            "fixture",
+            "--model",
+            "fixture-model",
+            "--permission-mode",
+            "bypass",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--",
+            "call the nested external agent",
+        ]
+        .map(String::from),
+    );
+    let job = jobs::spawn_foreground(
+        &fixture.data,
+        &executable,
+        Launch {
+            executable: executable.clone(),
+            arguments,
+            cwd: fixture.root.path().into(),
+        },
+        &parent,
+        "external agent binding",
+        &[("PATH".into(), path.into_string().unwrap())],
+    )
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            let current = jobs::get(&fixture.data, &job.id).unwrap();
+            if current.finished_ms.is_some() {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    fixture.server.abort();
+    let finished = result.unwrap_or_else(|error| {
+        let _ = jobs::cancel(&fixture.data, &job.id);
+        panic!("external agent job did not finish: {error}");
+    });
+    assert_eq!(finished.status, "completed", "{finished:?}");
+    let started = state.slot("nested_start");
+    let child = started["session_id"].as_str().unwrap_or_else(|| {
+        panic!("external dcl did not establish a child session: {started}");
+    });
+    assert_ne!(child, parent);
+    assert_eq!(started["answer"], "external binding observed");
+    let resumed = state.slot("nested_resume");
+    assert_eq!(resumed["session_id"], child, "{resumed}");
+    assert_eq!(resumed["answer"], "external binding observed");
+    let history = store.history(child).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        2
+    );
+    assert_eq!(
+        store.resume(child).unwrap().model.as_deref(),
+        Some("fixture-child")
+    );
+    let requests = state.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["model"] == "fixture-child")
+            .count(),
+        2
+    );
+}
 
 async fn workflow_respond(
     State(fixture): State<FixtureState>,

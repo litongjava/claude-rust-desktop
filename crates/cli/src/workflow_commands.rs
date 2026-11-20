@@ -149,7 +149,7 @@ pub async fn run(
         &child_id,
         &serde_json::json!(prompt),
     )?;
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let arguments = crate::background_commands::arguments(
         cli,
         paths,

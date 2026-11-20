@@ -380,6 +380,7 @@ pub(crate) async fn search_with_options(
     if query.chars().count() > 2000 {
         bail!("WebSearch query must be at most 2000 characters.");
     }
+    let provider = &provider.current()?;
     let (selected, url) = endpoint(provider)?;
     let (api_key, bearer_only) = credentials(provider)?;
     let client = reqwest::Client::builder()
@@ -407,7 +408,7 @@ pub(crate) async fn search_with_options(
             request = request.header("x-api-key", &api_key);
         }
     }
-    let mut response = crate::native_engine::request_recording::send(request, &options, provider, selected.api_format(), false).await.map_err(|e| if e.is_timeout() {
+    let mut response = crate::native_engine::request_recording::send(request, &options, provider, selected.api_format(), false).await.map_err(|e| if e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {
         anyhow!("Provider WebSearch timed out after 45 seconds.")
     } else { anyhow!("Could not reach the configured provider's native search API. Check its endpoint and connection.") })?;
     if !response.status().is_success() {
@@ -447,6 +448,7 @@ mod tests {
     fn provider(base: &str, strategy: Option<&str>) -> ResolvedProvider {
         ResolvedProvider {
             provider: Provider {
+                lease: None,
                 id: "p".into(),
                 name: "Test provider".into(),
                 base_url: base.into(),

@@ -125,7 +125,7 @@ fn render(request: Option<deepseek_code_core::services::context_usage::LastReque
 /// What the first request would hold: the base system prompt, the project
 /// instructions, the built-in tool definitions and saved history.
 fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core::services::context_usage::LastRequest> {
-    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, &session.model, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
+    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, &session.binding_state().model, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
     let mut history = session.store.model_history(&session.id, &deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic)?;
     // The engine puts instructions at the start of the first user message.
     if let Some(reminder) = deepseek_code_core::project_instructions::load_all(Some(&session.paths.data_dir), &session.workspace).ok().and_then(|all| deepseek_code_core::project_instructions::reminder(&all)) {
@@ -145,8 +145,8 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
         }
     }
     Ok(deepseek_code_core::services::context_usage::LastRequest {
-        model: session.model.clone(),
-        provider: Some(session.provider_id.clone()),
+        model: session.binding_state().model.clone(),
+        provider: Some(session.binding_state().provider_id.clone()),
         started_at_ms: None,
         status: "estimate".into(),
         usage: Some(usage),

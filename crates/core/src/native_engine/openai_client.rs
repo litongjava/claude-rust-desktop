@@ -230,6 +230,7 @@ impl OpenAIClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<OpenAIResponse> {
+        let provider = &provider.current()?;
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
             let mut stream = super::provider_runtime::stream_with_options(
@@ -458,6 +459,7 @@ impl OpenAIClient {
         Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
         crate::performance::AttemptCounter,
     )> {
+        let provider = &provider.current()?;
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
             // The built-in transport returns the HTTP attempts it really made;

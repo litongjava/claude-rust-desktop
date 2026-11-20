@@ -142,7 +142,11 @@ impl ToolLoopExecutor {
         let name = meta_field(&script, "name").unwrap_or_else(|| "workflow".into());
         let description = meta_field(&script, "description").unwrap_or_default();
 
-        let (agent_args, environment) = self.child_cli_launch(&root)?;
+        let (mut agent_args, environment) = self.child_cli_launch(&root)?;
+        agent_args.extend([
+            "--worker-model-snapshot".into(),
+            format!("{}::{}", self.provider.provider.id, self.model_selector),
+        ]);
         let mut arguments = vec![
             "workflow-run".to_owned(),
             "--script".into(),

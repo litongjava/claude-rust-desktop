@@ -405,7 +405,7 @@ fn registration(session: &Session, name: &str) -> Result<Registration> {
         git_repo_url: git(session, &["remote", "get-url", "origin"])
             .map(|url| strip_credentials(&url)),
         title,
-        model: Some(session.model.clone()),
+        model: Some(session.binding_state().model.clone()),
         permission_mode: Some(protocol_mode(session.permission_mode()).to_owned()),
     })
 }

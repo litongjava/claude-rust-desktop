@@ -14,7 +14,8 @@
 
 use super::engine_core::ReasoningMode;
 use super::tool_loop::{EngineEvent, ToolLoopExecutor};
-use crate::native_engine::provider_manager::ProviderManager;
+use super::provider_manager::{ProviderManager, ResolvedProvider};
+use super::session_binding::{BindingSnapshot, SessionBinding};
 use crate::services::tool_history::{self, ToolOrigins};
 use crate::toolscript::Cancellation;
 use anyhow::{anyhow, ensure, Context, Result};
@@ -32,6 +33,9 @@ pub const WORKER_ENV: &str = "DEEPSEEK_CODE_TOOLSCRIPT_JOB";
 pub const WORKER_EXE_ENV: &str = "DEEPSEEK_CODE_TOOLSCRIPT_WORKER_EXE";
 /// Optional runtime credential channel; never written into a job file.
 const CHILD_KEY_ENV: &str = "DEEPSEEK_CODE_CHILD_API_KEY";
+
+/// Private launch input, removed by the owner before executing any script.
+const BINDING_ENV: &str = "DEEPSEEK_CODE_TOOLSCRIPT_BINDING";
 
 /// How long admission may take before the start is reported as failed.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -87,7 +91,7 @@ pub(super) fn save_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Everything the owner needs to run one script. Deliberately contains no
-/// credential: the provider is re-resolved from configuration by the worker.
+/// credential. A session-bound launch hands its owner a separate frozen binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
     pub id: String,
@@ -312,7 +316,18 @@ pub struct StartOutcome {
 /// Admits a job and starts its owner. Returns only after the owner has taken
 /// the lease and published `running`; any failure kills the exact child and
 /// marks the record failed, so no phantom running task is left behind.
-pub async fn start_job(root: &Path, mut spec: JobSpec) -> Result<StartOutcome> {
+pub async fn start_job(root: &Path, spec: JobSpec) -> Result<StartOutcome> {
+    start_bound_job(root, spec, None).await
+}
+
+pub(super) async fn start_bound_job(
+    root: &Path,
+    mut spec: JobSpec,
+    provider: Option<&ResolvedProvider>,
+) -> Result<StartOutcome> {
+    // A job can outlive the submitting session. Freeze only its selected model
+    // and provider. The durable job spec and task record contain no credential.
+    let frozen = provider.map(freeze_launch).transpose()?.flatten();
     let record = crate::tools::tasks::execute_for_session_async(
         "TaskCreate",
         json!({
@@ -379,6 +394,10 @@ pub async fn start_job(root: &Path, mut spec: JobSpec) -> Result<StartOutcome> {
     };
     let mut command = std::process::Command::new(executable);
     crate::services::background_sessions::strip_internal_env(&mut command);
+    command.env_remove(BINDING_ENV);
+    if let Some(frozen) = frozen {
+        command.env(BINDING_ENV, frozen);
+    }
     command
         .env(WORKER_ENV, &directory)
         .stdin(std::process::Stdio::null())
@@ -926,7 +945,9 @@ async fn finalize_failure(directory: &Path, spec: &JobSpec, message: &str) {
 async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> Result<()> {
     let data_dir = PathBuf::from(&spec.data_dir);
     let workspace = PathBuf::from(&spec.workspace);
-    let provider = resolve_provider(&data_dir, spec)?;
+    let frozen = std::env::var_os(BINDING_ENV);
+    std::env::remove_var(BINDING_ENV);
+    let provider = resolve_provider(&data_dir, spec, frozen.as_deref())?;
     let permissions = crate::runtime::default_permissions();
     let db = crate::runtime::RuntimePaths::new(data_dir.clone())?.open_database()?;
     // The durable snapshot is read *before* the first call, never after one
@@ -1340,10 +1361,35 @@ async fn finish(directory: &Path, state: &mut JobState, status: &str) -> Result<
     Ok(())
 }
 
+fn freeze_launch(provider: &ResolvedProvider) -> Result<Option<String>> {
+    let Some(state) = provider.binding_snapshot() else { return Ok(None) };
+    provider.ensure_current()?;
+    let mut selected = provider.provider.clone();
+    selected.lease = None;
+    selected.models = vec![provider.model.clone()];
+    let snapshot = BindingSnapshot {
+        generation: state.generation,
+        observation_only: false,
+        provider_id: selected.id.clone(),
+        model: provider.model.id.clone(),
+        providers: vec![selected],
+        environment: state.environment.clone(),
+    };
+    Ok(Some(serde_json::to_string(&snapshot)?))
+}
+
 fn resolve_provider(
     data_dir: &Path,
     spec: &JobSpec,
-) -> Result<crate::native_engine::provider_manager::ResolvedProvider> {
+    frozen: Option<&std::ffi::OsStr>,
+) -> Result<ResolvedProvider> {
+    if let Some(frozen) = frozen {
+        let state: BindingSnapshot = serde_json::from_str(frozen.to_str().context("Invalid ToolScript launch binding")?)?;
+        ensure!(state.provider_id == spec.provider_id && state.model == spec.model, "ToolScript launch selector changed");
+        let binding = SessionBinding::default();
+        binding.install(state)?;
+        return binding.resolve(None).context("ToolScript launch provider is unavailable");
+    }
     let mut managers = ProviderManager::new(data_dir.join("providers.json"));
     managers.load();
     let mut provider = managers
@@ -1585,6 +1631,34 @@ fn flush_rows(
 #[cfg(test)]
 mod j1_tests {
     use super::*;
+
+    #[test]
+    fn toolscript_binding_is_frozen_at_launch_and_stays_out_of_job_records() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = spec(root.path());
+        let state = |generation: u64| {
+            let mut provider: super::super::provider_manager::Provider = serde_json::from_value(json!({
+                "id":"fixture","name":"fixture","base_url":format!("http://127.0.0.1/{generation}"),
+                "api_key":format!("dummy-{generation}"),"enabled":true,"api_format":"openai",
+                "models":[{"id":"fixture","name":"fixture","enabled":true,"supports_web_search":false,"max_tokens":generation+100}]
+            })).unwrap();
+            provider.models[0].effort = Some("high".into());
+            BindingSnapshot { generation, observation_only:false, provider_id:"fixture".into(), model:"fixture".into(),
+                providers:vec![provider], environment:Default::default() }
+        };
+        let parent = SessionBinding::default();
+        parent.install(state(1)).unwrap();
+        let first = parent.resolve(None).unwrap();
+        let frozen = freeze_launch(&first).unwrap().unwrap();
+        parent.install(state(2)).unwrap();
+        assert!(freeze_launch(&first).is_err());
+        let child = resolve_provider(root.path(), &spec, Some(frozen.as_ref())).unwrap();
+        assert_eq!(child.provider.base_url, "http://127.0.0.1/1");
+        assert_eq!(child.provider.api_key, "dummy-1");
+        assert_eq!(child.model.max_tokens, Some(101));
+        assert_eq!(child.model.effort.as_deref(), Some("high"));
+        assert!(!serde_json::to_string(&spec).unwrap().contains("dummy-1"));
+    }
 
     fn spec(directory: &Path) -> JobSpec {
         JobSpec {

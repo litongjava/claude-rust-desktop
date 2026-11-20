@@ -126,8 +126,8 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
     let db = session.store.db.clone();
     let (id, provider, model) = (
         session.id.clone(),
-        session.provider_id.clone(),
-        session.model.clone(),
+        session.binding_state().provider_id.clone(),
+        session.binding_state().model.clone(),
     );
     let prompt: String = prompt.chars().take(2000).collect();
     tokio::spawn(async move {

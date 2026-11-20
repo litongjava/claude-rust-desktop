@@ -48,6 +48,9 @@ pub struct Cli {
     /// API endpoint for a temporary provider; never saved automatically.
     #[arg(long, env = "API_BASE_URL", global = true)]
     pub base_url: Option<String>,
+    /// Native adapter selected by the managed child's launcher.
+    #[arg(long, hide = true, requires_all = ["provider", "base_url", "api_format"])]
+    pub bound_builtin: Option<String>,
     /// Environment variable containing the API key (avoid secrets in arguments).
     #[arg(long, global = true)]
     pub api_key_env: Option<String>,
@@ -88,6 +91,13 @@ pub struct Cli {
     pub permission_mode: PermissionModeArg,
     #[arg(skip)]
     pub permission_mode_explicit: bool,
+    /// The generation observed by the terminal requesting a process transfer.
+    #[arg(long, hide = true, requires = "resume")]
+    pub binding_generation: Option<u64>,
+    #[arg(skip)]
+    pub observed_generation: Option<u64>,
+    #[arg(skip)]
+    launch_options: Vec<(String, std::ffi::OsString)>,
     /// Session role for Super Agent: agent (default) or router. The role is
     /// independent of the permission mode and is kept on resume.
     #[arg(long, value_enum, global = true)]
@@ -150,6 +160,9 @@ pub struct Cli {
     pub effort: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..), global = true)]
     pub max_tokens: Option<u32>,
+    /// Qualified selection that owns the snapshot supplied by the workflow runner.
+    #[arg(long, hide = true)]
+    pub worker_model_snapshot: Option<String>,
     #[arg(long, global = true)]
     pub system_prompt: Option<String>,
     /// Read a UTF-8 system prompt from a file.
@@ -182,14 +195,89 @@ impl Cli {
         use clap::{CommandFactory, FromArgMatches};
         let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
         // Accept the launcher spelling while retaining clap's subcommand validation.
-        if let Some(index) = args.iter().position(|arg| arg == "--rc") {
+        if let Some(index) = args
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .position(|arg| arg == "--rc")
+        {
             args[index] = "remote-control".into();
         }
-        let matches = Self::command().try_get_matches_from(args)?;
+        let mut command = Self::command();
+        let matches = command.try_get_matches_from_mut(args)?;
         let mut cli = Self::from_arg_matches(&matches)?;
         cli.permission_mode_explicit =
             matches.value_source("permission_mode") == Some(clap::parser::ValueSource::CommandLine);
+        // Let clap identify option values and aliases. A raw argv scan cannot
+        // distinguish a positional prompt from a matching option value, or
+        // reliably handle attached short values and repeated options.
+        for arg in command.get_arguments().filter(|arg| !arg.is_positional()) {
+            let id = arg.get_id().as_str();
+            if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+                continue;
+            }
+            let flag = if let Some(long) = arg.get_long() {
+                format!("--{long}")
+            } else if let Some(short) = arg.get_short() {
+                format!("-{short}")
+            } else {
+                continue;
+            };
+            if matches!(arg.get_action(), clap::ArgAction::SetTrue) {
+                if matches.get_flag(id) {
+                    cli.launch_options.push((id.into(), flag.into()));
+                }
+            } else if let Some(values) = matches.get_raw(id) {
+                for value in values {
+                    let mut option = std::ffi::OsString::from(&flag);
+                    option.push("=");
+                    option.push(value);
+                    cli.launch_options.push((id.into(), option));
+                }
+            }
+        }
         Ok(cli)
+    }
+    pub(crate) fn changes_binding(&self) -> bool {
+        self.launch_options
+            .iter()
+            .any(|(id, _)| id != "binding_generation" && Self::binding_option(id))
+    }
+
+    fn binding_option(id: &str) -> bool {
+        matches!(
+            id,
+            "model"
+                | "provider"
+                | "base_url"
+                | "api_format"
+                | "api_key_env"
+                | "max_tokens"
+                | "effort"
+                | "bound_builtin"
+                | "binding_generation"
+        )
+    }
+
+    pub(crate) fn discard_transfer_binding(&mut self) {
+        self.model = None;
+        self.provider = None;
+        self.base_url = None;
+        self.api_format = None;
+        self.api_key_env = None;
+        self.max_tokens = None;
+        self.effort = None;
+        self.bound_builtin = None;
+        self.binding_generation = None;
+        self.launch_options
+            .retain(|(id, _)| !Self::binding_option(id));
+    }
+
+    pub fn launch_options(&self, omit: &[&str]) -> Vec<std::ffi::OsString> {
+        self.launch_options
+            .iter()
+            .filter(|(id, _)| !omit.contains(&id.as_str()))
+            .map(|(_, option)| option.clone())
+            .collect()
     }
     pub fn parse_with_mode_source() -> Self {
         Self::try_parse_with_mode_source(std::env::args_os()).unwrap_or_else(|error| error.exit())

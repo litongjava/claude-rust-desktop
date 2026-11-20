@@ -869,7 +869,7 @@ async fn run_inner(
 /// Best-effort SDK prompt suggestion after a successful turn.
 async fn emit_prompt_suggestion(session: &Session) -> Result<()> {
     use std::fmt::Write;
-    let history = session.store.model_history(&session.id, &session.api_format)?;
+    let history = session.store.model_history(&session.id, &session.selected_provider().await?.provider.api_format)?;
     let mut transcript = String::new();
     for message in history.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
         let role = message["role"].as_str().unwrap_or("");
@@ -902,8 +902,8 @@ async fn emit_prompt_suggestion(session: &Session) -> Result<()> {
     let suggestion = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         session.engine.generate_text_for_purpose(Some(&session.id), "suggestion",
-            &session.provider_id,
-            &session.model,
+            &session.binding_state().provider_id,
+            &session.binding_state().model,
             "Predict the user's likely next message in this conversation. Reply with only that message, at most 120 characters, without quotes.",
             &transcript,
         ),

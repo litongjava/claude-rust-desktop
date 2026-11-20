@@ -19,7 +19,7 @@ pub async fn tick(session: &Session) -> Result<()> {
     let config = SuperAgentConfig::load(&context)?;
     let provider = session
         .engine
-        .resolved_provider(&session.provider_id, &session.model)
+        .resolved_provider(&session.binding_state().provider_id, &session.binding_state().model)
         .await?;
     let orchestrator = Orchestrator::new(
         context,

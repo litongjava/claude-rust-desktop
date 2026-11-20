@@ -85,7 +85,7 @@ pub(super) fn select_provider(
     config: &PromptHook,
     current: &ResolvedProvider,
 ) -> Result<ResolvedProvider> {
-    let mut provider = current.clone();
+    let mut provider = current.current()?;
     if let Some(model) = &config.model {
         provider.model = provider
             .provider

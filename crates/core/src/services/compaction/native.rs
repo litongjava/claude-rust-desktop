@@ -92,6 +92,7 @@ pub(crate) async fn generate_messages_with_options(
     messages: Vec<OpenAIMessage>,
     instructions: &str,
 ) -> Result<GeneratedSummary> {
+    let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions)?;
     let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
         .context("Native compaction requires a configured gateway URL")?;

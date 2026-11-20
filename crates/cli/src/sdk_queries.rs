@@ -48,7 +48,7 @@ async fn context_usage(session: &Session) -> Result<Value> {
         "maxTokens":max,
         "rawMaxTokens":max,
         "percentage":if max == 0 { 0.0 } else { total as f64 * 100.0 / max as f64 },
-        "model":last.as_ref().map_or(session.model.clone(), |request| request.model.clone()),
+        "model":last.as_ref().map_or(session.binding_state().model.clone(), |request| request.model.clone()),
         "measured":last.is_some(),
     }))
 }
@@ -100,7 +100,7 @@ async fn settings(session: &Session) -> Result<Value> {
     Ok(json!({
         "effective":effective,
         "sources":sources.into_iter().map(|(source, settings)| json!({"source":source,"settings":settings})).collect::<Vec<_>>(),
-        "applied":{"model":session.model,"effort":effort},
+        "applied":{"model":session.binding_state().model,"effort":effort},
     }))
 }
 

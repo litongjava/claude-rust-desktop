@@ -754,6 +754,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolSearch 与私有 worker �
 - `session.rs`：B、D（含 D8–D10）、E；SDK 输入路径另见“第十一轮：SDK 回合内引导”；回合内的执行所有权（含反应式压缩与钩子）按 D8 第 8 条，另跑 `cargo test --locked -p deepseek-code-cli --test live_observation ownership_survives`
 - `db/turn_repo.rs`、`services/session_messages.rs` 的回合状态与执行租约、`observe.rs` 的只读观察：D8–D10，以及 `cargo test --locked -p deepseek-code-cli --test live_observation`、`cargo test --locked -p deepseek-code-core --lib db::turn_repo`、`cargo test --locked -p deepseek-code-cli --bin dcl observe::`；恢复/租约回归另跑 `cargo test --locked -p deepseek-code-cli --test session_worker --test session_messages`；`crates/core/src/native_engine/engine_core.rs`、`tool_loop.rs` 的租约字段类型改动另跑 `cargo test --locked -p deepseek-code-core --lib native_engine::`
 - `services/session_worker*`、`services/background_sessions.rs`：D、E4，以及 `cargo test --locked -p deepseek-code-core --test worker_environment`（普通子进程不继承 worker 的控制变量）
+- `args.rs`、`restart.rs`、`remote_host.rs` 及 `main.rs` 的进程交接，`batch_commands.rs`、`workflow_runner.rs`、`native_engine/script_workflow.rs`、`tools/external_agents.rs` 和 Worker 的模型快照改动：I4。涉及 `session.rs`、`persistent_worker.rs` 时，同时运行 Worker 生命周期与本地协调回归。
 - `tools/coordination.rs`、`native_engine/tool_loop.rs`、`native_engine/plan_tool.rs` 的计划入口退役：`cargo test --locked -p deepseek-code-core --lib native_engine::tool_loading_tests`、`cargo test --locked -p deepseek-code-core --lib native_engine::plan_tool::tests`、`cargo test --locked -p deepseek-code-core --lib tools::coordination::tests`（四个任务内置各一次、`TaskOutput` 与 `plan_mode` 不在目录/请求/搜索中；旧设置启用和旧 ToolSearch 记录都不能恢复 `plan_mode`；直接调用报 Unknown tool 且不创建 `.claude`；`EnterPlanMode`/`ExitPlanMode` 审批与计划边界仍通过）
 - `tools/plan_import.rs`：`cargo test --locked -p deepseek-code-core --lib tools::plan_import`（显式内部导入：真实 legacy SQLite → 会话任务库，状态/结果/反向依赖保留且重开可读；dry run 与缺失/非法源不创建目标；未知状态/重复步骤/悬空/自引用/成环/超限与中途插入失败整体回滚；同源哈希幂等并保留手工编辑；源变化冲突不写；映射任务缺失报冲突；同一 plan UUID 跨 workspace/session 隔离；并发只建一套；current 标记只在同 workspace/session 内更新；`current_plan` 单独变化（记录 body 不变）两个方向都判为冲突且不写入；不相关计划的 current 切换仍是 unchanged；旧版哈希格式报明确冲突且不重建映射行）
 - `crates/cli/tests/tasks_catalog.rs`：`cargo test --locked -p deepseek-code-cli --test tasks_catalog`（真实 CLI + 本地 mock：四个任务工具默认不可见，经逗号和空格两种 ToolSearch 选择后在下一请求出现；核对实际请求 schema，并通过真实任务工具创建根/步骤、设置依赖和输出、列表与读取；持久化行/边/结果与 `TaskGet` 一致，请求中没有 `plan_mode`/`TaskOutput`）
@@ -1354,13 +1355,14 @@ cargo test --locked -p deepseek-code-cli --bin dcl registry_resume_replaces_inca
 - `local_coordination::{RootSelection, CoordinationContext, PreparedCoordination, prepare_startup}`：`prepare_startup` 在 `spawn_blocking` 中读取一次设置；只有 `enabled && registry` 或存在显式 `--coordination-dir` 时才用调用方传入的启动目录（`-C` 之前）解析根，绝不再读 `current_dir`。关闭且无显式覆盖时保持 `Deferred`（完全不做协调根查找）；解析失败保持 `Rejected`。每次尝试最多一条 `Local coordination registry warning/unavailable` 有界提示。`CoordinationContext::child_root` 对 Ready 返回精确原生字节，对 Deferred 返回 None，对 Rejected 返回空原生值（解析器会拒绝空覆盖，因此子进程不会回落到默认根）。只有启动边界调用 `export_child_root` 写入 `DEEPSEEK_CODE_COORDINATION_DIR`。
 - `Session::open_with_registration` 不再注册，只记录 `RegistrationMode`；`activate_coordination(prepared)` 在启动选项（含 `--worktree` 的最终 workspace）与 SessionStart/初始化钩子成功之后发布；`HostOwned` 会话返回而不注册。`replace_coordination` 只在 `Automatic` 且启动决定的 `enabled` 为真时执行，因此“显式根 + 关闭”不会因为根存在就注册。`close_owned()` 先取 `Session::close` 结果，再等待 `close_coordination`，最后返回原结果；正常 teardown、`/restart`、voice 与远程交接都走它或显式 `close_coordination`。
 - `persistent_worker::run_from_env` 先 `Listener::bind` 再 `register_worker`，并把监听循环包进 `let serve_result: Result<()> = async { … Ok(()) }.await`：绑定、accept 或普通循环错误都会汇聚到同一条 teardown，先尝试 Session 关闭，再等待宿主守卫关闭，最后按服务错误、Session 关闭结果的顺序返回。孤儿强制 `process::exit(1)` 与宿主生命周期锁不变。
-- `child_argv_without_coordination` 在解码前用原生字节扫描参数：丢弃分离形式 `--coordination-dir <value>` 与内联形式 `--coordination-dir=…`，保留其余顺序和 `--` 之后的位置参数；剩余参数必须为 UTF-8。`/restart`、交互式远程交接和直接 `RemoteControl::Listen` 都用它过滤原始 argv，子进程只继承导出的原生根。
+- `/restart`、交互式远程交接和直接 `RemoteControl::Listen` 从 Clap 解析结果重建参数，跳过 `--coordination-dir`，子进程继承导出的原生根。工作目录、数据目录等原生参数保持为 OS 字符串，直接启动中 `--` 后的位置参数仍按文本传递。
 
 自动回归：
 
 ```bash
 cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture
-cargo test --locked -p deepseek-code-cli --bin dcl registry_child_argv_uses_exported_native_root_for_handoff -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl registry_child_root_exports_the_native_value -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl restart::tests -- --nocapture
 ```
 
 - `cargo test --locked -p deepseek-code-cli --test local_coordination_registry -- --nocapture`：本轮 18 个验收用例通过，另有 2 个默认忽略的进程夹具（`lc_registry_helper`、`lc_registry_lifecycle_helper`，不算验收）。
@@ -1368,7 +1370,7 @@ cargo test --locked -p deepseek-code-cli --bin dcl registry_child_argv_uses_expo
 - `registry_worktree_startup_publishes_final_workspace_before_first_turn`（Linux）：临时 Git 仓库提交后以空闲 SDK（stdin 保持打开）启动 `--worktree reviewer`；等待真实 `Worktree: ` 公告与一条 Open 注册行，首行 workspace 即链接工作树（不是源 checkout）、`branch_ref` 为 `refs/heads/worktree/reviewer`、`worktree_id` 存在，且模型请求为 0；关闭 stdin 后正常退出，同一行变为 `Closed`。
 - `registry_failed_worktree_startup_publishes_no_row`（Linux）：PATH 中的 Git 包装器只让 `worktree add` 以唯一诊断和退出码 7 失败；真实 CLI 以非零退出并报出该诊断，模型请求为 0，协调根（含 owner 租约）完全不存在，证明发布发生在启动成功之后。
 - `registry_failed_host_bind_publishes_no_row`（Linux）：按真实服务目录写入类型化 `worker.json` 与 `host.lock`，endpoint 指向一个已存在的普通文件；以 `DEEPSEEK_CODE_SESSION_HOST` 启动真实宿主，退出码 1、stderr 报 `Session host failed`，协调根不存在，endpoint 证据字节不变，证明绑定先于注册。
-- `registry_child_argv_uses_exported_native_root_for_handoff`（CLI 单元，Linux）：分离形式的值与内联形式的后缀都是非 UTF-8 原生字节；两者在解码前被移除，其余参数顺序不变，`--` 之后形似该 flag 的位置参数原样保留；过滤结果分别喂给 `remote_host::launch_args`、`remote_host::child_args`、`restart::args` 后，分隔符之前都不再出现原覆盖；Ready 的 child root 等于精确原生绝对字节，Rejected 的空值无法解析成默认根；不做任何进程环境写入。
+- `registry_child_root_exports_the_native_value`（CLI 单元，Linux）：Ready 的 child root 等于精确原生绝对字节，Rejected 的空值无法解析成默认根。 `launch_preserves_native_paths_and_positional_flag_text` 核对非 UTF-8 项目目录保持原生字节，协调根从 argv 剔除，并保留 `--` 后看起来像 flag 的位置参数。两个用例都不修改测试进程环境。
 - `registry_resume_replaces_incarnation`（更新后的 CLI 单元用例）：`Session::open` 后断言没有注册行，再以 `prepare_startup` 的启动输入调用 `activate_coordination`；其后全部原有断言（成功恢复替换、失败恢复保留、workspace 刷新、最终 `Closed`）不变。
 
 未运行/未验证（不得由上述自动化推断）：Linux TTY 交互式交棒（B 排队与撤回、D 中途关闭/`/continue`、E 取消与 Worker 清理）；直接 `RemoteControl::Listen` 与交互式 `/rc` 交棒的真实子进程端到端重启（本轮只验证 argv 过滤与单元级构建器输出）；voice 发送路径的真实音频端到端；`Deferred` 起步后在后续 incarnation 首次开启协调（留待 06c）；跨 `-C` 的 Worker 继承根的真实多进程重启；macOS/Windows 原生路径与非 UTF-8 参数。
@@ -1422,3 +1424,42 @@ cargo test --locked -p deepseek-code-cli --test initial_user_message --test inte
 - `registry_print_with_hook_prompt_publishes_incarnation`（Linux）：同样的 print 设置加 `--output-format json`，同步 SessionStart 命令钩子返回 `{"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"ROUND06_GATE"}}`，标准输入为空、argv 无提示；现有模型门控捕获到 `ROUND06_GATE` 时断言恰好一条 Open 前端行；放行后退出 0、同一会话一个成功 JSON 结果、模型请求恰好一次，且该实例 `Closed`。
 
 未运行/未验证（不得由上述自动化推断）：`resume_saved` 提交后钩子取消的运行时用例（与 clear 共用同一辅助函数，仅有源码级证据）；初始启动钩子取消仍传播错误的运行时用例（仅保留源码中的错误传播调用）；挂起场景下的 `SessionStart hooks cancelled`（后台取消分支）；B/D/E 交互式交棒矩阵；与 main 的集成合并；macOS/Windows PTY 与信号语义；voice 真实音频。
+
+### I4. 子进程启动参数与会话绑定
+
+用隔离数据目录和 loopback mock。验证真实请求内的模型、预算和系统提示词，以及 SQLite 中的会话、目录与权限状态。
+
+```bash
+cargo test --locked --no-fail-fast -p deepseek-code-cli --test skills --test teams --test batch --test taskget_backends --test session_worker --test background_failure_diagnostics --test worktree_startup --test local_coordination_registry
+cargo test --locked -p deepseek-code-cli --bin dcl restart::tests
+cargo test --locked -p deepseek-code-core --test worker_environment
+cargo test --locked -p deepseek-code-core --lib tools::external_agents
+```
+
+- slash skill fork 的系统提示词、追加提示词、shell 展开在实际请求中各出现一次，预算一致；子 ID 独立且不带父历史。模型调用 Skill 和 TeamSpawn 在进程内执行，核对子会话与父会话存储、真实请求和工具限制。
+- `workflow_agents_use_the_snapshot_only_for_the_selected_model` 与 `workflow_with_a_virtual_context_keeps_only_matching_snapshots` 分别从普通模型和 `[1m]` 启动。实际请求中，默认 agent 继承 211 token；裸名和 `provider::model` 与父选择相同时也继承 211。检查大小写不同的虚拟上下文后缀，切换上下文或模型时使用配置的 4096。
+- `external_dcl_from_a_background_worker_starts_and_resumes_its_own_session` 由真实 background supervisor 启动工具调用，验证嵌套 dcl 的首轮和恢复轮落在同一个新会话。父 Worker 的控制目录、模型快照和私有凭据不能变成外部工具的启动绑定。
+- 持久 Worker 的 `persistent_engine_reuses_mcp_refreshes_settings_and_recovers_after_crash_without_replay` 对首次打开及复用的两轮发送不同的 [1m] 模型快照，确认实际模型、预算以及同一个 engine PID。另核对取消和冷重建不会重放。
+- Linux 真实 PTY 使用相邻开发支持目录 `launch-binding-20261119/pty_repro.py`。对构建出的 `target/debug/dcl` 逐一运行 `remote-listen`、`remote-resume`、`handoff`、`restart`、`restart-argv`、`batch`、`markdown-workflow` 和 `background-fork`。命令为 `python3 pty_repro.py --binary /path/to/dcl --out /path/to/evidence SCENARIO`。直接 listen 从相对 `-C` 和相对 `--data-dir` 启动；无 `-C` 的直接 resume 应采用会话的保存目录；handoff 和 restart 检查变更后的模型、权限、标题及原项目和可信目录；restart-argv 使用与系统提示词选项值相同的位置参数。Batch 检查 planner 与五个隔离 unit 的预算、CLI-only deny 导致五次拒绝且无写入；Markdown workflow 和后台 fork 各使用一个新会话及原项目和历史；标题辅助请求单独记数。
+
+- Linux PTY 的 Round 3 回归脚本在相邻开发记录目录的 `round3/launch_pty.py`。使用 `python3 -B review-01-evidence/run_owned.py python3 -B round3/launch_pty.py /absolute/path/to/dcl CASE evidence-dir`。对 `reload`、`keep-overrides`、`discard-overrides`、`switch-provider`、`handoff-keep`、`handoff-discard` 比较两个 loopback 端点的实际协议、凭据来源、模型和预算；检查 `/model` 与 `/permissions` 的活动选择，以及替换进程是否额外导出了磁盘凭据。
+- 对 `remote-long`、`remote-equals`、`remote-short`、`remote-attached`、`remote-short-equals` 检查直接恢复到保存的项目且首屏无横幅和恢复提示；`remote-fresh` 检查全新启动横幅，`remote-continue`、`remote-c` 检查继续最近会话时保留横幅及恢复提示。普通终端的 `remote-long-native` 和 `remote-fresh-native` 在首个输入提示前检查滚动缓冲区清屏序列。
+
+#### I4. 持久 Worker 的提供商绑定
+
+- 在 Linux 原生终端运行开发记录中的 `round4/worker_transfer.py DCL handoff OUT`。先创建输出目录。第一个请求使用临时地址和启动密钥，通过 `/model` 重新选择内置提供商，再运行 `/remote-control listen`。检查两轮来自同一 Worker PID，第二轮只命中保存的地址，鉴权头使用新的夹具密钥。用 `switch`、`key`、`resume`、`restart` 检查直接切换、同端点换密钥、断开后恢复和重启。检查第二轮 hook 的子进程也看不到旧的 `API_BASE_URL`。`cloud-resume` 在回环服务上检查 Worker 使用新前端的 Cloudflare 账户路径。
+- 核心库运行 `provider_cache_rebinds_bare_and_qualified_models_on_update_reload_and_delete`、`retained_child_rejects_endpoint_or_key_changes_before_resume`、`retained_child_rejects_native_model_transport_change_at_same_base_url` 和 `sdk_agent_invocation_rebinds_and_its_retained_executor_rejects_rotation`。覆盖同 ID 的地址或密钥变更、删除提供商、显式与空闲子执行器共享的注册表和 SDK 显式模型选择。已失效的子执行器返回 `needs_resume`，不发送请求。
+- CLI 单元运行 `resume_another_provider_and_sdk_agent_use_current_transport` 和 `worker_cloud_binding_replaces_and_removes_only_adapter_inputs`。集成运行 `--test async_rewake` 与 `--test session_worker owned_child_wakes_without_parent_turn`。前端改变绑定后，即使异步 hook 已完成，在接受新绑定的显式回合前也不能用旧 Worker 发起请求。未切换绑定时仍能唤醒子任务和 hook。
+
+#### I4. 会话提供商绑定代际与旧版 Worker
+
+- 运行 core 单元测试 `generation_changes_refresh_active_and_pinned_consumers_and_reject_late_submits`。每次切换后检查当前选择和显式 SDK 子代理各自的地址、密钥、模型预算，并拒绝过时代际和无效选择。
+- 在 Linux 下使用开发记录 `launch-binding-20261119/round5/verify-wire.sh`。它在独立 HOME、数据目录和回环提供商上生成 `idle`、`mid-turn`、`nested`、`legacy` 和 `failed` 场景，逐次检查 SQLite 代际以及实际 HTTP 地址、模型和 Authorization。旧 Worker 的原回合可以继续；终端必须显示切换待生效，后续新回合必须使用新提供商。失败的模型更新必须保留代际，并允许原绑定继续触发空闲 hook。
+- 同一脚本检查预热 Worker 中的外部 DeepSeekCode、SDK 指定提供商的环境凭据、非 UTF-8 Bedrock 凭据路径、升级前后忙碌 Worker 的重新连接以及失败切换后断开终端的异步唤醒。每个子场景在 subreaper 下运行。
+- 同一代际矩阵还覆盖旧 Worker 退役前尝试提交新提示、观察端退出、显式取消、同一会话的单回合 Worker，以及工具调用往返期间 OpenAI 和 Anthropic 的双向切换。检查后一请求同时保留工具调用 ID 并使用新端点、新鉴权和新模型。
+- 运行 core 单元测试 `binding_wire_preserves_runtime_model_options_without_persisting_them`、`binding_preserves_alias_and_virtual_context_across_generations`、`pending_legacy_generation_rejects_new_turn_and_child_delivery_until_retirement` 和 `toolscript_binding_is_frozen_at_launch_and_stays_out_of_job_records`。ToolScript 的真实 CLI/子进程用例为 `cli_toolscript_repeated_calls_keep_history_across_model_rounds_and_reopen`。
+
+#### I4. 并发终端的绑定写入
+
+- 运行 core 单元测试 `session_binding::store::tests`。检查过期写入被拒绝、相同有效配置不推进代际、只读恢复保留正在退役的 Worker 预约，以及激活失败后原配置仍可用且失败代际永不复用。
+- 开发记录 `launch-binding-20261119/round6/review04.sh` 覆盖过期终端的重启和远程交接、fast 模式、第三个观察终端、旧 Worker 激活故障以及无变更时的空闲唤醒。核对回环端点、模型、测试密钥和 SQLite 状态。配合 `review03.sh`、`lifecycle.sh` 和原版 `cli_creates_spawns_and_disbands_a_team_standalone` 检查进程边界、11 个生命周期场景和成员的首条任务消息。

@@ -4,6 +4,11 @@
 //! `dcl -p` with the parent's provider, model and permission mode. Results
 //! are cached per (prompt, options) so a later run can resume.
 use anyhow::{bail, Context, Result};
+use deepseek_code_core::services::background_sessions::{
+    self, CHILD_API_KEY_ENV, WORKER_MODEL_ENV,
+};
+
+const MODEL_SNAPSHOT_FLAG: &str = "--worker-model-snapshot";
 #[cfg(not(target_os = "android"))]
 use rquickjs::{prelude::{Async, Func}, AsyncContext, AsyncRuntime, CatchResultExt, Promise};
 use serde_json::{json, Value};
@@ -14,7 +19,22 @@ use std::sync::Arc;
 /// worker's control channel, job or model snapshot.
 fn agent_command(executable: &Path, args: &[String], cwd: &Path) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(executable);
-    deepseek_code_core::services::background_sessions::strip_internal_env(&mut process);
+    background_sessions::strip_internal_env(&mut process);
+    process.env_remove(CHILD_API_KEY_ENV);
+    // Re-add only values deliberately selected by this agent's launch.
+    if args.windows(2).any(|pair| pair[0] == MODEL_SNAPSHOT_FLAG) {
+        if let Some(value) = std::env::var_os(WORKER_MODEL_ENV) {
+            process.env(WORKER_MODEL_ENV, value);
+        }
+    }
+    if args
+        .windows(2)
+        .any(|pair| pair == ["--api-key-env", CHILD_API_KEY_ENV])
+    {
+        if let Some(value) = std::env::var_os(CHILD_API_KEY_ENV) {
+            process.env(CHILD_API_KEY_ENV, value);
+        }
+    }
     process
         .args(args)
         .current_dir(cwd)
@@ -130,18 +150,20 @@ impl Runner {
     async fn run_agent(&self, prompt: &str, opts: &Value, label: &str) -> Result<String> {
         let mut args = self.agent_args.clone();
         if let Some(model) = opts["model"].as_str().filter(|m| !m.is_empty()) {
-            match args.iter().position(|arg| arg == "--model") {
-                Some(at) => args[at + 1] = model.to_owned(),
-                None => args.extend(["--model".into(), model.into()]),
+            if let Some(value) = args.iter().position(|arg| arg == "--model")
+                .and_then(|at| args.get_mut(at + 1))
+            {
+                *value = model.to_owned();
+            } else {
+                args.extend(["--model".into(), model.into()]);
             }
         }
-        args.extend(["-p".into(), "--output-format".into(), "json".into()]);
+        let mut command = agent_command(&self.exe, &args, &self.cwd);
+        command.args(["-p", "--output-format", "json"]);
         if !opts["schema"].is_null() {
-            args.extend(["--json-schema".into(), opts["schema"].to_string()]);
+            command.arg("--json-schema").arg(opts["schema"].to_string());
         }
-        args.extend(["--".into(), prompt.into()]);
-        let output = agent_command(&self.exe, &args, &self.cwd)
-            .output().await
+        let output = command.arg("--").arg(prompt).output().await
             .with_context(|| format!("Cannot start agent {label}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result: Value = serde_json::from_str(stdout.trim()).with_context(|| {

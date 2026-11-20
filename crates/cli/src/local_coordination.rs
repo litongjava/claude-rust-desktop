@@ -251,49 +251,6 @@ pub(crate) fn export_child_root(prepared: &PreparedCoordination) {
     }
 }
 
-/// Drop the original coordination override from a relaunch or handoff argv.
-///
-/// The replacement child inherits the exported native root instead, so a
-/// relative launch override cannot be re-anchored at a different directory and
-/// a native value never has to be decoded. Native bytes are inspected before
-/// any conversion; everything after a standalone `--` is positional and kept
-/// verbatim, even when it looks like this flag.
-pub(crate) fn child_argv_without_coordination(
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<Vec<String>> {
-    let mut kept: Vec<std::ffi::OsString> = Vec::new();
-    let mut positional = false;
-    let mut rest = args.into_iter();
-    while let Some(arg) = rest.next() {
-        if positional {
-            kept.push(arg);
-            continue;
-        }
-        if arg == "--" {
-            positional = true;
-            kept.push(arg);
-            continue;
-        }
-        let bytes = arg.as_encoded_bytes();
-        if bytes == b"--coordination-dir" {
-            // The split value belongs to this flag; a missing value is left for
-            // the child's own parser rather than invented here.
-            rest.next();
-            continue;
-        }
-        if bytes.starts_with(b"--coordination-dir=") {
-            continue;
-        }
-        kept.push(arg);
-    }
-    kept.into_iter()
-        .map(|arg| {
-            arg.into_string()
-                .map_err(|_| anyhow!("Child process arguments must be UTF-8"))
-        })
-        .collect()
-}
-
 /// Replace a session's incarnation after a successful resume or clear, using the
 /// root the launch already resolved.
 ///
@@ -683,8 +640,8 @@ pub(crate) fn render_live(snapshot: &RegistrySnapshot, root: &Path) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::ffi::{OsStr, OsString};
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
     fn context(root: RootSelection) -> CoordinationContext {
         CoordinationContext {
@@ -695,65 +652,8 @@ mod tests {
         }
     }
 
-    /// Both coordination-flag forms are removed before decoding, positional text
-    /// after `--` survives, and only the prepared root reaches a child.
     #[test]
-    fn registry_child_argv_uses_exported_native_root_for_handoff() {
-        let argv = vec![
-            OsString::from("--data-dir"),
-            OsString::from("/tmp/data"),
-            OsString::from_vec(b"--coordination-dir".to_vec()),
-            OsString::from_vec(b"/tmp/coord-\xff".to_vec()),
-            OsString::from_vec(b"--coordination-dir=/tmp/coord-\xfe".to_vec()),
-            OsString::from("--permission-mode"),
-            OsString::from("ask"),
-            OsString::from("--"),
-            OsString::from("--coordination-dir=keep-me"),
-            OsString::from("positional"),
-        ];
-        let filtered = child_argv_without_coordination(argv).expect("the remaining args are UTF-8");
-        assert_eq!(
-            filtered,
-            vec![
-                "--data-dir",
-                "/tmp/data",
-                "--permission-mode",
-                "ask",
-                "--",
-                "--coordination-dir=keep-me",
-                "positional",
-            ],
-            "flag order is preserved and only the override is dropped"
-        );
-        let separator = filtered.iter().position(|arg| arg == "--").unwrap();
-        assert!(
-            !filtered[..separator]
-                .iter()
-                .any(|arg| arg == "--coordination-dir" || arg.starts_with("--coordination-dir=")),
-            "no original override survives before the separator"
-        );
-
-        // The existing launcher, handoff and restart builders keep that shape.
-        let workspace = Path::new("/tmp/workspace");
-        let session = "session-id";
-        for args in [
-            crate::remote_host::launch_args(&filtered),
-            crate::remote_host::child_args(&filtered, None, session, workspace),
-            crate::restart::args(&filtered, None, session, workspace),
-        ] {
-            assert!(args.iter().any(|arg| arg == "positional"));
-            let boundary = args
-                .iter()
-                .position(|arg| arg == "--")
-                .unwrap_or(args.len());
-            assert!(
-                !args[..boundary].iter().any(
-                    |arg| arg == "--coordination-dir" || arg.starts_with("--coordination-dir=")
-                ),
-                "a builder must not reintroduce the original override"
-            );
-        }
-
+    fn registry_child_root_exports_the_native_value() {
         // A ready context exports its exact native bytes; a rejected lookup
         // exports an empty value the resolver refuses instead of a default root.
         let root = PathBuf::from(OsStr::from_bytes(b"/tmp/coord-\xff"));

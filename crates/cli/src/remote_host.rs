@@ -95,67 +95,6 @@ impl Listening {
     }
 }
 
-/// Strip only the remote launcher arguments; preserve session and permission flags.
-pub fn launch_args(original: &[String]) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut rest = original.iter();
-    let mut launcher = false;
-    while let Some(arg) = rest.next() {
-        if !launcher && matches!(arg.as_str(), "--rc" | "rc" | "remote-control") {
-            launcher = true;
-            rest.next(); // listen
-            continue;
-        }
-        if matches!(arg.as_str(), "--host" | "--port") { rest.next(); continue; }
-        if arg.starts_with("--host=") || arg.starts_with("--port=") { continue; }
-        args.push(arg.clone());
-    }
-    args
-}
-
-/// Arguments that restart this dcl on the same session: the original ones
-/// without session selection or an initial prompt, plus `--resume ID`.
-pub fn child_args(
-    original: &[String],
-    prompt: Option<&str>,
-    session: &str,
-    workspace: &Path,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut prompt = prompt;
-    let mut rest = original.iter().peekable();
-    while let Some(arg) = rest.next() {
-        let flag = arg.split('=').next().unwrap_or(arg);
-        let inline = arg.contains('=');
-        match flag {
-            "-r" | "--resume" | "--session-id" | "--name" | "-C" | "--path" => {
-                if !inline {
-                    rest.next();
-                }
-            }
-            "-w" | "--worktree" => {
-                if !inline
-                    && rest
-                        .peek()
-                        .is_some_and(|next| !next.starts_with('-') && Some(next.as_str()) != prompt)
-                {
-                    rest.next();
-                }
-            }
-            "-c" | "--continue" | "--fork-session" | "--auto-route" => {}
-            _ if prompt == Some(arg.as_str()) => prompt = None,
-            _ => args.push(arg.clone()),
-        }
-    }
-    args.extend([
-        "-C".into(),
-        workspace.to_string_lossy().into_owned(),
-        "--resume".into(),
-        session.into(),
-    ]);
-    args
-}
-
 /// A terminal query the host answers itself, so the local terminal and the
 /// remote one do not both reply to the child.
 #[derive(Debug, PartialEq)]
@@ -598,24 +537,13 @@ impl Host {
     }
 }
 
-fn resolved_data_args(original: Vec<String>, data_dir: &Path) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut rest = original.into_iter();
-    while let Some(arg) = rest.next() {
-        if arg == "--data-dir" {
-            rest.next();
-        } else if !arg.starts_with("--data-dir=") {
-            args.push(arg);
-        }
-    }
-    args.extend(["--data-dir".into(), data_dir.to_string_lossy().into_owned()]);
-    args
-}
-
 /// Runs the session in a child dcl and relays it until the child exits.
 /// Returns the child's exit code.
-pub async fn run(listening: Listening, args: Vec<String>, workspace: &Path, data_dir: &Path) -> Result<i32> {
-    let args = resolved_data_args(args, data_dir);
+pub async fn run(
+    listening: Listening,
+    launch: crate::restart::Launch,
+    workspace: &Path,
+) -> Result<i32> {
     let local = terminal_size();
     let pty = portable_pty::native_pty_system()
         .openpty(PtySize {
@@ -628,10 +556,15 @@ pub async fn run(listening: Listening, args: Vec<String>, workspace: &Path, data
     let control = TcpListener::bind(("127.0.0.1", 0)).await?;
     let secret = uuid::Uuid::new_v4().simple().to_string();
     let mut command = CommandBuilder::new(std::env::current_exe()?);
-    command.args(&args);
+    command.args(&launch.arguments);
     command.cwd(workspace);
-    if args.iter().any(|arg| arg == "--resume") {
+    if !launch.inherit_api_base_url {
+        command.env_remove("API_BASE_URL");
+    }
+    if launch.resume_terminal {
         command.env(HANDOFF_ENV, "1");
+    } else {
+        command.env_remove(HANDOFF_ENV);
     }
     command.env(
         HOST_ENV,
@@ -806,22 +739,6 @@ pub async fn run(listening: Listening, args: Vec<String>, workspace: &Path, data
 mod tests {
     use super::*;
 
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
-    #[test]
-    fn launcher_keeps_permission_and_workspace_flags() {
-        assert_eq!(launch_args(&strings(&["--rc", "listen", "--port", "30087", "--dangerously-skip-permissions", "-C", "/work"])), strings(&["--dangerously-skip-permissions", "-C", "/work"]));
-    }
-
-    #[test]
-    fn data_root_is_resolved_before_child_changes_directory() {
-        for original in [strings(&["--data-dir", "relative", "--model", "m"]), strings(&["--data-dir=relative", "--model", "m"])] {
-            assert_eq!(resolved_data_args(original, Path::new("/absolute/data")), strings(&["--model", "m", "--data-dir", "/absolute/data"]));
-        }
-    }
-
     #[tokio::test]
     async fn relisten_changes_handshake_generation() {
         let options = Options { host: "127.0.0.1".parse().unwrap(), port: 0 };
@@ -830,59 +747,6 @@ mod tests {
         drop(first);
         let second = Listening::bind(&options).await.unwrap();
         assert_ne!(generation, second.generation);
-    }
-
-    #[test]
-    fn child_resumes_the_session_and_keeps_other_options() {
-        let workspace = Path::new("/work/w");
-        let args = child_args(
-            &strings(&[
-                "--data-dir",
-                "/d",
-                "-c",
-                "--model",
-                "m",
-                "--name",
-                "x",
-                "fix it",
-                "--resume=old",
-                "-C",
-                "/p",
-            ]),
-            Some("fix it"),
-            "s1",
-            workspace,
-        );
-        assert_eq!(
-            args,
-            strings(&[
-                "--data-dir",
-                "/d",
-                "--model",
-                "m",
-                "-C",
-                "/work/w",
-                "--resume",
-                "s1"
-            ])
-        );
-        let args = child_args(
-            &strings(&["-w", "tree", "--base-url", "u"]),
-            None,
-            "s2",
-            workspace,
-        );
-        assert_eq!(
-            args,
-            strings(&["--base-url", "u", "-C", "/work/w", "--resume", "s2"])
-        );
-        let args = child_args(
-            &strings(&["-w", "--session-id", "id"]),
-            None,
-            "s3",
-            workspace,
-        );
-        assert_eq!(args, strings(&["-C", "/work/w", "--resume", "s3"]));
     }
 
     #[test]

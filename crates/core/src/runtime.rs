@@ -120,6 +120,7 @@ impl RuntimePaths {
 /// One mapping for Desktop's saved configuration and the standalone CLI.
 pub fn provider_from_config(p: &ProviderConfig) -> Provider {
     Provider {
+        lease: None,
         id: p.id.clone(),
         name: p.name.clone(),
         base_url: p.base_url.clone(),

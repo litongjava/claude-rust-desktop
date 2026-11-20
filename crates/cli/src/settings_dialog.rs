@@ -135,8 +135,8 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
     let effort = crate::session_commands::session_effort(session)?.unwrap_or_else(|| "default".into());
     let autocompact = crate::session_commands::autocompact_label(session)?;
     let settings: Vec<(&str, &str, String)> = vec![
-        ("model", "Model", session.model.clone()),
-        ("provider", "Provider", session.provider_id.clone()),
+        ("model", "Model", session.binding_state().model.clone()),
+        ("provider", "Provider", session.binding_state().provider_id.clone()),
         ("permissions", "Permission mode", session.permission_mode().to_owned()),
         ("effort", "Effort", effort),
         ("autocompact", "Auto-compact", autocompact),

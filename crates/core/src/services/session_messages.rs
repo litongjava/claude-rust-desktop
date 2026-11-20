@@ -26,7 +26,7 @@ pub struct Message {
     pub read: bool,
     pub blocked_reason: Option<String>,
 }
-fn schema(conn: &Connection) -> Result<()> {
+pub(crate) fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS session_inbox(id TEXT PRIMARY KEY,sender TEXT NOT NULL,recipient TEXT NOT NULL,project_source TEXT NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',read INTEGER NOT NULL DEFAULT 0,notified INTEGER NOT NULL DEFAULT 0,blocked_reason TEXT,consumer_generation TEXT,committed_at TEXT); CREATE INDEX IF NOT EXISTS session_inbox_recipient ON session_inbox(recipient,state); CREATE TABLE IF NOT EXISTS session_inbox_consumers(session_id TEXT PRIMARY KEY,generation TEXT NOT NULL,pid INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS session_inbox_operations(operation_id TEXT PRIMARY KEY,message_id TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,content_hash TEXT NOT NULL,created_at TEXT NOT NULL);")?;
     Ok(())
 }

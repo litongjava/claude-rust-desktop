@@ -99,6 +99,8 @@ mod terminal;
 mod tool_settings;
 mod tools_menu;
 mod voice;
+mod worker_binding;
+use deepseek_code_core::native_engine::session_binding::store as binding_store;
 mod worker_frontend;
 mod workflow_commands;
 mod workflow_runner;
@@ -231,6 +233,11 @@ async fn async_main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
+    match worker_binding::retire_from_env().await {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => (),
+        Err(error) => { eprintln!("Worker retirement failed: {error}"); return std::process::ExitCode::FAILURE; }
+    }
     match Box::pin(persistent_worker::run_from_env()).await {
         Ok(true) => return std::process::ExitCode::SUCCESS,
         Ok(false) => {}
@@ -255,7 +262,7 @@ async fn async_main() -> std::process::ExitCode {
     cli.normalize();
     terminal::configure_accessibility(cli.ax_screen_reader);
     debug_logging::install(cli.verbose);
-    let result = Box::pin(run(&cli)).await;
+    let result = Box::pin(run(&mut cli)).await;
     terminal::release_handoff();
     // A termination signal ends the process nonzero even when the interrupted
     // command or prompt swallowed the turn's cancellation error.
@@ -303,7 +310,7 @@ async fn prompt_turn(
     result
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(Commands::Help { topic, command }) = &cli.command {
         return help::show(topic.as_deref(), command);
     }
@@ -494,11 +501,9 @@ async fn run(cli: &Cli) -> Result<()> {
             // the root prepared from the pre-`-C` launch directory.
             let prepared = local_coordination::prepare_startup(cli, &paths, launch_cwd.as_deref()).await;
             local_coordination::export_child_root(&prepared);
-            let original =
-                local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
-            let args = remote_host::launch_args(&original);
-            let workspace = cli.path.clone().unwrap_or(std::env::current_dir()?);
-            let code = remote_host::run(listening, args, &workspace, &paths.data_dir).await?;
+            let workspace = std::env::current_dir()?;
+            let launch = restart::fresh(cli, &paths.data_dir, &workspace);
+            let code = remote_host::run(listening, launch, &workspace).await?;
             std::process::exit(code);
         }
         Some(Commands::Remote { request, yes }) => {
@@ -871,12 +876,48 @@ async fn run(cli: &Cli) -> Result<()> {
     } else {
         Some(session::terminal_input())
     };
+    // Observe the selector and its version together, before resolving any configuration.
+    let observed = if let Some(saved) = resumed.as_ref() {
+        Some(binding_store::observe(&*paths.open_database()?, &saved.id)?)
+    } else {
+        None
+    };
+    cli.observed_generation = observed.as_ref().map(|row| row.generation);
+    if cli.binding_generation.is_some() && cli.binding_generation != cli.observed_generation {
+        cli.discard_transfer_binding();
+        std::env::remove_var("API_BASE_URL");
+    }
     let selection = config::select(
         cli,
         &paths,
-        resumed.as_ref().and_then(|s| s.model.as_deref()),
-        resumed.as_ref().and_then(|s| s.provider.as_deref()),
+        observed
+            .as_ref()
+            .map(|s| s.model.as_str())
+            .filter(|s| !s.is_empty()),
+        observed
+            .as_ref()
+            .map(|s| s.provider.as_str())
+            .filter(|s| !s.is_empty()),
     );
+    let selection = if selection.is_err() && !cli.changes_binding() {
+        if let (Some(saved), Some(row)) = (&resumed, &observed) {
+            match worker_binding::resident(&paths, &saved.id, row).await? {
+                Some(state) => Ok(config::Selection {
+                    providers: state.providers,
+                    provider_id: state.provider_id,
+                    model: state.model,
+                }),
+                None => selection,
+            }
+        } else {
+            selection
+        }
+    } else {
+        selection
+    };
+
+    // Only a successful startup selection consumed the original provider flags.
+    let startup_selected = selection.is_ok();
     let selection = match selection {
         Ok(selection) => selection,
         Err(error) if !single => {
@@ -895,7 +936,7 @@ async fn run(cli: &Cli) -> Result<()> {
     startup_options::validate(cli, &std::env::current_dir()?)?;
     if !single && !sdk_stream {
         // As in the reference CLI, before project settings and hooks load.
-        let folder = cli.path.clone().unwrap_or(std::env::current_dir()?);
+        let folder = std::env::current_dir()?;
         startup_prompts::confirm(
             &paths.data_dir,
             &folder,
@@ -918,10 +959,11 @@ async fn run(cli: &Cli) -> Result<()> {
         resumed.as_ref().map(|s| s.id.as_str()),
     )
     .await?;
+    if !startup_selected { session.startup_provider=None; }
     resource_sampling::session(&session.id);
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     // Set by /restart; the replacement starts after this session is closed.
-    let mut restart_args: Option<Vec<String>> = None;
+    let mut restart_launch = None;
     let result = async {
         // Applied inside the cleanup scope so a startup failure reaches teardown
         // and publishes no incarnation.
@@ -949,7 +991,7 @@ async fn run(cli: &Cli) -> Result<()> {
         session.activate_coordination(prepared).await;
         if !single {
             if std::env::var_os(remote_host::HANDOFF_ENV).is_none() {
-                let banner = terminal::banner(&session.model, &session.workspace);
+                let banner = terminal::banner(&session.binding_state().model, &session.workspace);
                 eprintln!("{banner}");
                 if resumed.is_none() {
                     let mut history = terminal::scrollback::Scrollback::take();
@@ -1093,7 +1135,7 @@ async fn run(cli: &Cli) -> Result<()> {
             terminal::style::configure(&display.theme, &display.color);
             let mut catalog = skill_commands::catalog(&skills);
             if let Some((_, description)) = catalog.iter_mut().find(|(name, _)| name == "/model") {
-                *description = format!("Set the AI model (currently {} · {})", session.model, session.provider_id);
+                *description = format!("Set the AI model (currently {} · {})", session.binding_state().model, session.binding_state().provider_id);
             }
             input.as_mut().unwrap().set_commands(catalog);
             input
@@ -1447,21 +1489,17 @@ async fn run(cli: &Cli) -> Result<()> {
             if matches!(command, "/remote-control" | "/rc") {
                 if let Err(error) = remote.command(argument, &paths, &session, &mut input).await { command_eprintln!("Error: {error:#}"); }
                 if let Some(listening) = remote.take_handoff() {
+                    let launch = restart::resume(cli, &session)?;
                     // The session continues in a child dcl that local and remote terminals share.
                     drop(presence.take());
                     // The old OS input reader must be gone before the host owns stdin.
                     drop(input.take());
-                    // The child inherits the exported native root, so the original
-                    // override is dropped before any non-UTF-8 value is decoded.
-                    let original =
-                        local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
-                    let args = remote_host::child_args(&original, cli.prompt.as_deref(), &session.id, &session.workspace);
                     // The relay child inherits this session's current native root.
                     local_coordination::export_session_child_root(session.coordination_child_root());
                     // The child resumes the session; this owner is deliberately
                     // handing it off, so its row closes before the transfer.
                     session.close_coordination().await;
-                    let code = remote_host::run(listening, args, &session.workspace, &paths.data_dir).await?;
+                    let code = remote_host::run(listening, launch, &session.workspace).await?;
                     std::process::exit(code);
                 }
                 continue;
@@ -1515,13 +1553,9 @@ async fn run(cli: &Cli) -> Result<()> {
                     command_eprintln!("Usage: /restart");
                     continue;
                 }
-                restart_args = Some(restart::args(
-                    &local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?,
-                    cli.prompt.as_deref(),
-                    &session.id,
-                    &session.workspace,
-                ));
+                let launch = restart::resume(cli, &session)?;
                 session_trust::quit_worker(&session.paths, &session.id).await?;
+                restart_launch = Some(launch);
                 break;
             }
             match line.trim() {
@@ -1572,7 +1606,7 @@ async fn run(cli: &Cli) -> Result<()> {
             "other"
         })
         .await;
-    let resume_hint = restart_args.is_none()
+    let resume_hint = restart_launch.is_none()
         && !single
         && !sdk_stream
         && session
@@ -1587,14 +1621,14 @@ async fn run(cli: &Cli) -> Result<()> {
     if resume_hint {
         eprintln!("\nResume this session with:\ndcl --resume {}", session.id);
     }
-    if let Some(args) = restart_args.take() {
+    if let Some(launch) = restart_launch.take() {
         // The replacement inherits the session's current native root.
         local_coordination::export_session_child_root(session.coordination_child_root());
         // Release the session and its database before the replacement opens it.
         shutdown?;
         drop(session);
         eprintln!("Restarting dcl in this conversation\u{2026}");
-        return restart::relaunch(&args);
+        return restart::relaunch(launch);
     }
     // A completed single turn already wrote its terminal result. Shutdown may
     // still fail, but stdout must not acquire a second result record.

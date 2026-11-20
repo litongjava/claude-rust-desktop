@@ -220,8 +220,9 @@ async fn pick(paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
     let prompt = messages.iter().find(|message| message.id == checkpoint.message_id).map(|message| message.content.clone()).unwrap_or_default();
     if action == "from" || action == "up-to" {
         let part = if action == "from" { compaction::Part::From } else { compaction::Part::UpTo };
+        let state = session.binding_state();
         let (branch, count) = tokio::select! {
-            result = compaction::summarize_part(&session.engine, &session.store.db, &session.id, &checkpoint.message_id, part, &session.provider_id, &session.model) => result?,
+            result = compaction::summarize_part(&session.engine, &session.store.db, &session.id, &checkpoint.message_id, part, &state.provider_id, &state.model) => result?,
             _ = crate::signals::interrupted() => anyhow::bail!("Summary interrupted; the conversation is unchanged"),
         };
         crate::background_commands::copy_settings(session, &branch)?;
@@ -288,7 +289,7 @@ fn ago(created_at: &str) -> String {
 /// Clears the screen and shows the conversation as it now is.
 fn redraw(session: &Session) -> Result<()> {
     eprint!("\x1b[2J\x1b[3J\x1b[H");
-    command_eprintln!("{}", crate::terminal::banner(&session.model, &session.workspace));
+    command_eprintln!("{}", crate::terminal::banner(&session.binding_state().model, &session.workspace));
     let color = std::env::var_os("NO_COLOR").is_none();
     let width = (crate::terminal::size().0 as usize).saturating_sub(1);
     for line in crate::repl::transcript_of(session, &session.id)? {

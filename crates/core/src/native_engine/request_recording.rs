@@ -500,7 +500,8 @@ pub async fn send(
     provider: &ResolvedProvider,
     api: &str,
     streaming: bool,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response> {
+    provider.ensure_current()?;
     let (client, request) = request.build_split();
     let mut request = request?;
     if options.recording.is_some() {
@@ -553,7 +554,7 @@ pub async fn send(
                     false,
                 );
             }
-            return Err(error);
+            return Err(error.into());
         }
     };
     let Some(mut recording) = recording else {

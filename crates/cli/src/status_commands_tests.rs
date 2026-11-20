@@ -227,8 +227,8 @@ async fn a_committed_compaction_replaces_pre_compaction_usage_and_counts_once() 
     let estimate = deepseek_code_core::services::context_usage::estimated_after_compaction(
         &session.store,
         &session.id,
-        &session.model,
-        Some(&session.provider_id),
+        &session.binding_state().model,
+        Some(&session.binding_state().provider_id),
     )
     .unwrap()
     .expect("a post-compaction estimate");
