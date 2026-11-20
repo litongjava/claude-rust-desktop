@@ -450,6 +450,51 @@ async fn auxiliary_generation_search_and_native_compaction_use_explicit_session(
     }
 }
 
+#[tokio::test]
+async fn native_compaction_inside_a_turn_keeps_the_turn_identity() {
+    let requests: Requests = Default::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let p = provider(
+        Some("deepseek"),
+        &format!("http://{}", listener.local_addr().unwrap()),
+        "openai-completions",
+    );
+    let app = Router::new()
+        .fallback(post(capture))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let session = "Compacted-Session";
+    let failed = crate::native_engine::request_identity::TurnIdentity::new(
+        Some(session.into()),
+        None,
+    )
+    .scope(async {
+        crate::services::compaction::native::generate_messages(
+            &p,
+            Some(session),
+            vec![],
+            "summarize",
+        )
+        .await
+        .is_err()
+    })
+    .await;
+    assert!(failed);
+    server.abort();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0];
+    assert_eq!(headers["x-dcl-session-id"], session);
+    assert!(!headers["x-dcl-turn-id"].to_str().unwrap().is_empty());
+    assert_eq!(headers["x-dcl-request-kind"], "compaction");
+    assert_eq!(headers["x-client-request-id"], headers["x-request-id"]);
+    assert_eq!(headers["x-dcl-retry-count"], "0");
+    assert!(!headers["originator"].is_empty());
+    assert!(headers.contains_key("user-agent"));
+    assert_eq!(headers["x-deepseek-harness-session-id"], session);
+    assert_eq!(headers["x-deepseek-harness-compact"], "1");
+}
+
 /// A buffered model request keeps its own total deadline. The streaming idle
 /// setting must neither shorten nor extend it.
 #[tokio::test]
