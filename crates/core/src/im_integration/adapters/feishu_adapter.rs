@@ -625,7 +625,7 @@ impl FeishuAdapter {
         serde_json::to_string(&serde_json::json!({
             "config": { "wide_screen_mode": true },
             "header": {
-                "title": { "tag": "plain_text", "content": "Claude" },
+                "title": { "tag": "plain_text", "content": "DeepSeek Code" },
                 "template": "blue"
             },
             "elements": [
@@ -655,7 +655,7 @@ impl FeishuAdapter {
         let card_json = serde_json::to_string(&serde_json::json!({
             "config": { "wide_screen_mode": true },
             "header": {
-                "title": { "tag": "plain_text", "content": "Claude" },
+                "title": { "tag": "plain_text", "content": "DeepSeek Code" },
                 "template": "blue"
             },
             "elements": [
@@ -837,5 +837,17 @@ impl crate::im_integration::adapters::telegram_adapter::PlatformAdapter for Feis
 
     fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_cards_are_titled_after_the_product() {
+        let card = FeishuAdapter::build_card_json("content");
+        assert!(card.contains(r#""content":"DeepSeek Code""#), "{card}");
+        assert!(!card.contains("Claude"), "{card}");
     }
 }

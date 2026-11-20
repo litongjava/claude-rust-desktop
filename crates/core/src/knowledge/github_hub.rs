@@ -58,7 +58,7 @@ impl GitHubHub {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
-                .user_agent("ClaudeDesktop-GitHubHub/2.0")
+                .user_agent(concat!("DeepSeekCode-GitHubHub/", env!("CARGO_PKG_VERSION")))
                 .build().unwrap_or_default(),
             tokens: Mutex::new(HashMap::new()),
             watched: Mutex::new(Vec::new()),

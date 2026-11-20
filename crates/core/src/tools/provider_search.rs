@@ -389,16 +389,20 @@ pub(crate) async fn search_with_options(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| anyhow!("Could not initialize the provider search HTTP client."))?;
+    let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
+        provider,
+        "web-search",
+        options.session_id.as_deref(),
+        options
+            .recording
+            .as_ref()
+            .and_then(|context| context.parent_session_id.as_deref()),
+        options.model_request_id.as_deref(),
+    );
     let mut request = client
         .post(url)
         .headers(options.headers(provider)?)
-        .header(
-            "x-request-id",
-            options
-                .model_request_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        )
+        .headers(identity.headers())
         .header("accept", "application/json")
         .bearer_auth(&api_key)
         .json(&request_body(selected, query, &provider.model.id));

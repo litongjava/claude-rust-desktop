@@ -309,7 +309,7 @@ fn idle_client() -> reqwest::Client {
 async fn body_failure(prefix: Vec<u8>, stall: bool) -> (String, anyhow::Error) {
     let (base, count, server) = scripted_body(prefix, stall).await;
     let (mut stream, _) = attempts_with_budget(
-        RequestIdentity::new(None, false),
+        RequestIdentity::new(None, false, "main"),
         chat_opener(base, idle_client()),
         super::super::provider_runtime::chat_decoder,
         AttemptBudget::new(2),
@@ -409,7 +409,7 @@ async fn typed_stream_body_timeout_survives_the_retry_layer() {
     // A timeout before headers is a send failure and carries no typed fact.
     let (base, count, server) = scripted_body(Vec::new(), true).await;
     let error = match attempts_with_budget(
-        RequestIdentity::new(None, false),
+        RequestIdentity::new(None, false, "main"),
         chat_opener(base, idle_client()),
         super::super::provider_runtime::chat_decoder,
         AttemptBudget::new(1),

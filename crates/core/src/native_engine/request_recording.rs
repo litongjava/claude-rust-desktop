@@ -191,15 +191,17 @@ impl Drop for Lease {
         let _ = crate::fs::unlock_file(&self._file);
     }
 }
-fn root_lock(root: &Path) -> Result<File> {
+fn open_root_lock(root: &Path) -> Result<File> {
     directory(root)?;
-    let lock = file(&root.join(".lock"), false)?;
+    Ok(file(&root.join(".lock"), false)?)
+}
+fn root_lock(root: &Path) -> Result<File> {
+    let lock = open_root_lock(root)?;
     crate::fs::lock_file(&lock)?;
     Ok(lock)
 }
-fn acquire(root: &Path, session: &str) -> Result<(PathBuf, Lease, File)> {
+fn acquire(root: &Path, session: &str, lock: File) -> Result<(PathBuf, Lease, File)> {
     anyhow::ensure!(valid_component(session), "Invalid recording session ID");
-    let lock = root_lock(root)?;
     // Expiry errors never prevent recording the current request.
     if let Err(error) = maybe_cleanup(root) {
         warn(error);
@@ -294,7 +296,7 @@ struct Attempt {
     ended: bool,
 }
 impl Attempt {
-    fn start(
+    async fn start(
         options: &RequestOptions,
         provider: &ResolvedProvider,
         api: &str,
@@ -305,7 +307,22 @@ impl Attempt {
             return Ok(None);
         };
         let root = context.root.join("request-records");
-        let (dir, lease, lock) = acquire(&root, session)?;
+        let lock = if options.suggestion_guard.is_some() {
+            // Waiting for optional recording must yield to a new turn or timeout.
+            let lock = open_root_lock(&root)?;
+            loop {
+                match crate::fs::try_lock_file(&lock) {
+                    Ok(()) => break lock,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+                }
+            }
+        } else {
+            root_lock(&root)?
+        };
+        let (dir, lease, lock) = acquire(&root, session, lock)?;
         let sequence = next_sequence(&dir, false)?;
         let request_id = request
             .headers()
@@ -534,13 +551,23 @@ pub async fn send(
             }
         }
     }
-    let mut recording = match Attempt::start(options, provider, api, &request, streaming) {
+    let mut recording = match Attempt::start(options, provider, api, &request, streaming).await {
         Ok(recording) => recording,
         Err(error) => {
             warn(error);
             None
         }
     };
+    // Recorder setup may have waited for another process. Check at dispatch on
+    // every attempt, after setup and authentication, including protocol retries.
+    if let Some((guard, deadline)) = &options.suggestion_guard {
+        if std::time::Instant::now() > *deadline || !guard.is_current()? {
+            if let Some(recording) = &mut recording {
+                recording.finish(Some("Suggestion expired before dispatch"), false);
+            }
+            anyhow::bail!("Suggestion expired before dispatch");
+        }
+    }
     let response = match client.execute(request).await {
         Ok(response) => response,
         Err(error) => {
@@ -671,7 +698,8 @@ impl CompactionRecord {
             let (Some(context), Some(session)) = (&options.recording, &options.session_id) else {
                 return Ok(None);
             };
-            let (dir, lease, lock) = acquire(&context.root.join("request-records"), session)?;
+            let root = context.root.join("request-records");
+            let (dir, lease, lock) = acquire(&root, session, root_lock(&root)?)?;
             let sequence = next_sequence(&dir, true)?;
             let path = dir.join(format!("compaction-{sequence:04}.json"));
             let rows = serde_json::from_str::<Value>(transcript).unwrap_or(Value::Null);

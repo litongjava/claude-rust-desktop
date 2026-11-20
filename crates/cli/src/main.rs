@@ -1119,8 +1119,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
         terminal::tips::start_session(&paths.data_dir);
         // Lets other sessions see this one is open while it is idle.
         let mut presence: Option<(String, deepseek_code_core::services::session_messages::PresenceLease)> = None;
-        // History length the last suggestion was generated for.
-        let mut suggested_for = session.store.history(&session.id)?.len();
         terminal::STARTED.get_or_init(std::time::Instant::now);
         terminal::title::start();
         if let Some(speed) = std::fs::read_to_string(paths.data_dir.join("scroll-speed")).ok().and_then(|text| text.trim().parse::<usize>().ok()).filter(|speed| (1..=20).contains(speed)) {
@@ -1164,15 +1162,11 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     .ok()
                     .map(|lease| (session.id.clone(), lease));
             }
-            if !session.waiting_for_continue() && prompt_suggestion::enabled(&paths.data_dir) {
-                let history = session.store.history(&session.id)?;
-                if history.len() != suggested_for {
-                    suggested_for = history.len();
-                    if let (Some(text), Ok(provider)) = (prompt_suggestion::context(&history), session.selected_provider().await) {
-                        prompt_suggestion::spawn(session.id.clone(), provider, text, input.as_ref().unwrap().suggestion_sender());
-                    }
-                }
-            }
+            let suggestions_enabled = prompt_suggestion::enabled(&paths.data_dir);
+            let reader = input.as_ref().expect("interactive reader");
+            let ghost = suggestions_enabled.then(|| prompt_suggestion::Ghost::load(&session)).flatten();
+            let mut shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+            reader.set_suggestion(ghost);
             skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
             if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
                 command_eprintln!("Keybindings: {error:#}");
@@ -1280,6 +1274,13 @@ async fn run(cli: &mut Cli) -> Result<()> {
                             session.store.db.with_conn(|c| binding_store::acknowledge(c,&session.id,&session.binding_requester,generation))??;
                         }
                     }
+                    if suggestions_enabled {
+                        let ghost = prompt_suggestion::Ghost::load(&session);
+                        if ghost.as_ref().map(|ghost| &ghost.saved) != shown_suggestion.as_ref() {
+                            shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+                            input.as_ref().expect("interactive reader").set_suggestion(ghost);
+                        }
+                    }
                     // While a resumed session is owned elsewhere, show the public
                     // text/tool progress that owner publishes. The observer never
                     // takes the lease, submits input or runs a tool.
@@ -1305,7 +1306,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         idle_notified = true;
                         if let Err(error) = deepseek_code_core::services::lifecycle_events::run(&session.hook_service_context(), &session.workspace, &session.id,
                             deepseek_code_core::services::tool_hooks::HookEvent::Notification,
-                            serde_json::json!({"message":"Claude is waiting for your input","notification_type":"idle_prompt"})).await {
+                            serde_json::json!({"message":"DeepSeek Code is waiting for your input","notification_type":"idle_prompt"})).await {
                             input.as_ref().expect("interactive reader").notice(format!("Notification hook: {error:#}"));
                         }
                     }
@@ -1719,6 +1720,17 @@ async fn run(cli: &mut Cli) -> Result<()> {
             return Err(
                 output::ReportedError(format!("Session shutdown failed: {error:#}")).into(),
             );
+        }
+        let pending = session.pending_suggestion.lock().unwrap().take();
+        if let Some(pending) = pending {
+            if deepseek_code_core::services::background_sessions::finish_before_suggestion(
+                &session.paths.data_dir,
+                &session.id,
+            )
+            .is_ok()
+            {
+                let _ = pending.generate().await;
+            }
         }
         return result;
     }

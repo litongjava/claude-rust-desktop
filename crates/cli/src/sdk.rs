@@ -632,6 +632,7 @@ async fn run_inner(
     let mut failed = false;
     let mut started = false;
     let mut answered = Vec::<(String, String)>::new();
+    let mut suggestions = tokio::task::JoinSet::new();
     // Captures the count before the first poll, so a signal received while a
     // frame, a turn or a control reply is being handled still ends the input
     // loop instead of becoming the next wait's baseline.
@@ -665,9 +666,20 @@ async fn run_inner(
                 message.envelope["origin"] = json!({"type":"hook","hookEvent":"SessionStart"});
                 queue.push_front(message);
             }
+            if source == "resume"
+                && session.sdk_overrides.prompt_suggestions
+                && crate::prompt_suggestion::enabled(&session.paths.data_dir)
+            {
+                if let Some(ghost) = crate::prompt_suggestion::Ghost::load(session) {
+                    emit_prompt_suggestion(session, &ghost.saved.text)?;
+                }
+            }
             started = true;
         }
         if let Some(message) = queue.pop_front() {
+            // Dropping the prior set aborts in-flight work and discards any
+            // queued result before this user message can start a new turn.
+            suggestions = tokio::task::JoinSet::new();
             initialization.start_user_turn();
             // Reference SDKs label messages "default" before they learn the session id.
             ensure!(
@@ -684,6 +696,16 @@ async fn run_inner(
                 envelope["session_id"] = json!(session.id);
                 envelope["uuid"] = json!(message_uuid);
                 crate::session::emit_json(&envelope)?;
+            }
+            if !message.initial_hook
+                && session.sdk_overrides.prompt_suggestions
+                && crate::prompt_suggestion::enabled(&session.paths.data_dir)
+            {
+                if let Some(ghost) = crate::prompt_suggestion::Ghost::load(session) {
+                    if ghost.saved.text == message.text {
+                        ghost.accept();
+                    }
+                }
             }
             let mut terminal = None;
             session.sdk_content = message
@@ -824,22 +846,31 @@ async fn run_inner(
             if let Some(id) = crate::sdk_operations::latest_user_message(session, &delivered_rows)? {
                 answered.push((message_uuid, id));
             }
-            if !turn_failed && session.sdk_overrides.prompt_suggestions {
-                if let Err(error) = emit_prompt_suggestion(session).await {
-                    if cli.verbose {
-                        eprintln!("Prompt suggestion skipped: {error:#}");
-                    }
-                }
+            let pending = session.pending_suggestion.lock().unwrap().take();
+            if let Some(pending) = pending.filter(|_| !turn_failed && queue.is_empty()) {
+                suggestions.spawn(pending.generate());
             }
             // Signals the turn handled must not end the session; one that
             // arrived after the turn stopped watching still does.
             signal_scope.rearm_to(handled);
             continue;
         }
-        if eof {
+        if eof && suggestions.is_empty() {
             break;
         }
-        match tokio::select! {frame=frames.recv()=>frame,_=signal_scope.interrupted()=>bail!("SDK input interrupted")}
+        match tokio::select! {
+            biased;
+            _ = signal_scope.interrupted() => bail!("SDK input interrupted"),
+            frame = frames.recv(), if !eof => frame,
+            result = suggestions.join_next(), if !suggestions.is_empty() => {
+                match result {
+                    Some(Ok(Ok(Some(text)))) => emit_prompt_suggestion(session, &text)?,
+                    Some(Ok(Err(error))) if cli.verbose => eprintln!("Prompt suggestion skipped: {error:#}"),
+                    _ => {}
+                }
+                continue;
+            }
+        }
         {
             None => {
                 eof = true;
@@ -866,54 +897,7 @@ async fn run_inner(
     Ok(())
 }
 
-/// Best-effort SDK prompt suggestion after a successful turn.
-async fn emit_prompt_suggestion(session: &Session) -> Result<()> {
-    use std::fmt::Write;
-    let history = session.store.model_history(&session.id, &session.selected_provider().await?.provider.api_format)?;
-    let mut transcript = String::new();
-    for message in history.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-        let role = message["role"].as_str().unwrap_or("");
-        let content = match &message["content"] {
-            Value::String(text) => text.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("
-"),
-            _ => String::new(),
-        };
-        if content.trim().is_empty() {
-            continue;
-        }
-        let _ = write!(
-            transcript,
-            "{role}: {}
-",
-            content.chars().take(2000).collect::<String>()
-        );
-        if transcript.len() > 12_000 {
-            break;
-        }
-    }
-    if transcript.trim().is_empty() {
-        return Ok(());
-    }
-    let suggestion = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        session.engine.generate_text_for_purpose(Some(&session.id), "suggestion",
-            &session.binding_state().provider_id,
-            &session.binding_state().model,
-            "Predict the user's likely next message in this conversation. Reply with only that message, at most 120 characters, without quotes.",
-            &transcript,
-        ),
-    )
-    .await
-    .context("Prompt suggestion timed out")??;
-    let suggestion = suggestion.trim().trim_matches('"').trim();
-    if suggestion.is_empty() || suggestion.len() > 500 {
-        return Ok(());
-    }
+fn emit_prompt_suggestion(session: &Session, suggestion: &str) -> Result<()> {
     crate::session::emit_json(&json!({
         "type":"prompt_suggestion",
         "suggestion":suggestion,

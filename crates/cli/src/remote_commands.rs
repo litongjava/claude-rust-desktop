@@ -392,7 +392,7 @@ fn registration(session: &Session, name: &str) -> Result<Registration> {
             })??
             .and_then(|row| row.title)
             .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| "Claude Code session".into())
+            .unwrap_or_else(|| "DeepSeek Code session".into())
     } else {
         name.trim().to_owned()
     };

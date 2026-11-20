@@ -313,7 +313,7 @@ async fn permission_notification_precedes_fast_hook_denial_exactly_once() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0],
-        json!({"hook_event_name":"Notification","session_id":"notification-session","cwd":dir.path(),"transcript_path":rows[0]["transcript_path"],"notification_type":"permission_prompt","message":"Claude needs your permission to use Write"})
+        json!({"hook_event_name":"Notification","session_id":"notification-session","cwd":dir.path(),"transcript_path":rows[0]["transcript_path"],"notification_type":"permission_prompt","message":"DeepSeek Code needs your permission to use Write"})
     );
     assert!(!dir.path().join("x").exists());
 }
