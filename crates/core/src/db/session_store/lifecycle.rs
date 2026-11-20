@@ -77,9 +77,14 @@ struct Metadata {
     created: String,
     project: Option<Project>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 enum Project {
-    Selected { id: String, folders: Vec<String> },
+    Selected {
+        id: String,
+        folders: Vec<String>,
+        #[serde(default)]
+        workspace: Option<String>,
+    },
     NewWorkspace(String),
 }
 
@@ -100,6 +105,7 @@ impl Project {
         let p = project_repo::require_trusted(conn, &id)?;
         ensure!(!p.is_archived, "Project is archived");
         Ok(Self::Selected {
+            workspace: p.workspace_path,
             id,
             folders: p.folders.into_iter().map(|f| f.path).collect(),
         })
@@ -119,10 +125,18 @@ impl Project {
 
     fn publish(&self, tx: &Connection, now: &str) -> Result<(String, Option<String>)> {
         match self {
-            Self::Selected { id, folders } => {
+            Self::Selected {
+                id,
+                folders,
+                workspace,
+            } => {
                 let p = project_repo::require_trusted(tx, id)?;
                 ensure!(
-                    !p.is_archived && p.folders.iter().map(|f| &f.path).eq(folders),
+                    !p.is_archived
+                        && workspace
+                            .as_ref()
+                            .is_none_or(|w| p.workspace_path.as_ref() == Some(w))
+                        && p.folders.iter().map(|f| &f.path).eq(folders),
                     "Project selection changed"
                 );
                 Ok((id.clone(), p.workspace_path))
@@ -573,6 +587,11 @@ impl Stores {
             }
             let p = super::history::projection(&c)?;
             if meta.copied {
+                let mut messages=c.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages")?;
+                for row in messages.query_map([], crate::db::message_repo::row_to_message)? {
+                    row?;
+                }
+
                 ensure!(
                     p.count
                         == c.query_row("SELECT count(*) FROM messages", [], |r| r

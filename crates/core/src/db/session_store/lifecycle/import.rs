@@ -233,6 +233,14 @@ impl Stores {
         let mut rejected = false;
         self.global()
             .write("publish import batch", batch, true, |tx| {
+                if let Some(Project::NewWorkspace(path)) =
+                    ready.first().and_then(|(meta, _)| meta.project.as_ref())
+                {
+                    if Project::matching(tx, path)?.is_some() {
+                        rejected = true;
+                        bail!("Import project selection changed before publication");
+                    }
+                }
                 for ((op, digest, _), (meta, p)) in members.iter().zip(&ready) {
                     self.publish_row(tx, op, meta, p).inspect_err(|e| {
                         rejected = e.downcast_ref::<rusqlite::Error>().is_none()
@@ -342,7 +350,9 @@ impl Stores {
             backup: None,
         };
         let mut selected = Vec::new();
-        self.global().read(|c| {
+        let plan = self.global().read(|conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let c = &snapshot;
             let selection = if let Some(id) = target_project {
                 let p = project_repo::require_trusted(c, id)?;
                 ensure!(
@@ -392,7 +402,7 @@ impl Stores {
                 result.imported.push(session.id.clone());
                 selected.push((session, digest, options))
             }
-            Ok(())
+            Ok(plan)
         })?;
         if preview || selected.is_empty() {
             return Ok(result);
@@ -430,6 +440,7 @@ impl Stores {
                 let mut members = Vec::new();
                 for (s, digest, options) in &selected {
                     let (op, meta) = self.prepare(tx, &s.id, options, &Seed::Import(s), None)?;
+                    ensure!(meta.project.as_ref() == Some(&plan), "Import project selection changed during backup");
                     op.insert(tx, Some(&serde_json::to_string(&meta)?))?;
                     tx.execute("INSERT INTO import_members(storage_key,batch,operation,digest) VALUES(?1,?2,?3,?4)", params![op.key, batch, op.operation, digest])?;
                     members.push((op, meta));

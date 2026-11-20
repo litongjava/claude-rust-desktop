@@ -964,3 +964,137 @@ fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
     assert_eq!(edit(999, 1), QueueError::NotFound);
     Ok(())
 }
+
+#[test]
+fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let m = a.write(|w| {
+        let first = w.append("assistant", "nested")?;
+        w.tool(&tool("child", &first, 0), Some(("parent", 1)))?;
+        let last = w.append("assistant", "later")?;
+        w.tool(&tool("parent", &last, 0), None)?;
+        w.tool_note("parent", "later note")?;
+        w.tool_duration("parent", 9)?;
+        Ok(first)
+    })?;
+    a.save_mcp("parent", &wire(), false)?;
+    let fork = a.branch(
+        B,
+        Branch::Through {
+            message: Some(&m),
+            index: None,
+        },
+    )?;
+    fork.read(|r| {
+        let m = &r.messages()?[0].id;
+        assert_eq!(r.tools(m)?.len(), 1);
+        assert!(r.origins(m)?.is_empty());
+        Ok(())
+    })?;
+    let db = Connection::open(root.path().join("sessions").join(B).join("session.db"))?;
+    for table in ["tool_call_timings", "tool_call_notes", "mcp_tool_outputs"] {
+        assert_eq!(
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, usize>(0))?,
+            0
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn review_fork_rewrites_retry_and_compaction_references() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    a.write(|w|{
+        let boundary=w.append("assistant","summary")?;
+        w.native_boundary(&boundary,&json!({}))?;
+        let m=w.append("assistant","response")?;
+        w.snapshots(&m,&json!([{"id":"retry","replacesRequestId":"original","contextBoundary":boundary},{"id":"original"}]))
+    })?;
+    a.branch(B, Branch::Full)?.read(|r| {
+        let rows = r.messages()?;
+        let requests = r.requests(&rows[1].id)?;
+        assert_eq!(requests[0]["contextBoundary"], rows[0].id);
+        assert_eq!(requests[0]["replacesRequestId"], requests[1]["id"]);
+        assert_ne!(requests[1]["id"], "original");
+        Ok(())
+    })
+}
+
+#[test]
+fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let a = s.create(A, Default::default())?;
+    a.write(|w| {
+        w.append("user", "first")?;
+        w.append("assistant", "second")
+    })?;
+    let stop = s.with_fault_hook(|p| {
+        ensure!(p != Phase::Sealed, "cut");
+        Ok(())
+    });
+    assert!(stop.open_session(A)?.branch(B, Branch::Full).is_err());
+    let stage = fs::read_dir(root.path().join("sessions/.staging"))?
+        .next()
+        .unwrap()?
+        .path();
+    Connection::open(stage.join("session.db"))?.execute(
+        "UPDATE messages SET thinking=CAST('bad' AS BLOB) WHERE sort_order=1",
+        [],
+    )?;
+    let again = Stores::open_for_test(root.path())?;
+    assert!(again.open_session(B).is_err());
+    assert!(again.global().conversation(B)?.is_none());
+    assert!(fs::read_dir(root.path().join("sessions/.quarantine"))?
+        .next()
+        .is_some());
+    assert_eq!(a.read(|r| r.messages())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn review_import_keeps_selected_workspace_across_backup() -> Result<()> {
+    use deepseek_code_core::db::project_repo;
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let old = tempdir()?;
+    let new = tempdir()?;
+    s.create(A, project(old.path()))?;
+    let id = s.global().conversation(A)?.unwrap().project_id.unwrap();
+    let input = root.path().join("in.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(
+            &json!({"id":B,"name":"import","created_at":"2000-01-01T00:00:00Z","updated_at":"2000-01-01T00:00:00Z","messages":[]}),
+        )?,
+    )?;
+    let mut g = global(root.path())?;
+    let tx = g.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let path = new.path().to_string_lossy().into_owned();
+    project_repo::set_folders(&tx, &id, std::slice::from_ref(&path))?;
+    project_repo::trust_folders(&tx, &id, &[path])?;
+    thread::scope(|scope| -> Result<()> {
+        let job = scope.spawn(|| s.import_json_into_project(&input, old.path(), false, Some(&id)));
+        let start = Instant::now();
+        while !fs::read_dir(root.path().join("backups"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().join("manifest.json").exists())
+        {
+            if start.elapsed() > Duration::from_secs(30) {
+                drop(tx);
+                anyhow::bail!("import did not reach backup")
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        tx.commit()?;
+        assert!(job.join().unwrap().is_err());
+        Ok(())
+    })?;
+    assert!(s.open_session(B).is_err());
+    Ok(())
+}

@@ -174,6 +174,7 @@ struct Copier<'a> {
     src: &'a Connection,
     dst: &'a Connection,
     id: &'a str,
+    keep_unresolved_origins: bool,
 }
 impl Copier<'_> {
     fn mapped(&self, kind: &str, old: &str) -> Result<Option<String>> {
@@ -249,7 +250,7 @@ impl Copier<'_> {
             columns.join(",")
         ))?;
         let mut rows = q.query([])?;
-        while let Some(row) = rows.next()? {
+        'source_rows: while let Some(row) = rows.next()? {
             let mut values = (0..columns.len())
                 .map(|i| row.get::<_, Value>(i))
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -266,13 +267,14 @@ impl Copier<'_> {
             }
             for &(col, kind) in links {
                 let old: String = row.get(idx(col)?)?;
-                // A nested occurrence can arrive ahead of its parent's stream event.
-                // Reserve the missing parent's identity so replay still excludes the child.
-                let new = if table == "tool_call_origins" {
-                    self.assign(kind, &old)?
-                } else {
-                    self.mapped(kind, &old)?
-                        .context("Unselected copy reference")?
+                let new = match self.mapped(kind, &old)? {
+                    Some(id) => id,
+                    // A full in-flight snapshot may precede the parent stream event.
+                    None if table == "tool_call_origins" && self.keep_unresolved_origins => {
+                        self.assign("unresolved_parent", &old)?
+                    }
+                    None if table == "tool_call_origins" => continue 'source_rows,
+                    None => anyhow::bail!("Unselected copy reference"),
                 };
                 values[idx(col)?] = Value::Text(new);
             }
@@ -400,6 +402,17 @@ impl Copier<'_> {
         for table in ["permission_approvals", "code_diffs", "attachments"] {
             self.rows(table, message, Some(("id", table)), &[])?
         }
+        // Allocate the identities before rewriting links, including forward
+        // retry references between different selected messages.
+        let mut request_ids = self.src.prepare("SELECT message_id,id FROM model_requests UNION ALL
+            SELECT t.message_id,json_extract(j.value,'$.id') FROM message_trajectory t,json_each(t.requests_json) j
+            WHERE json_type(j.value,'$.id')='text'")?;
+        let mut rows = request_ids.query([])?;
+        while let Some(row) = rows.next()? {
+            if self.mapped("message", &row.get::<_, String>(0)?)?.is_some() {
+                self.assign("request", &row.get::<_, String>(1)?)?;
+            }
+        }
         let mut trajectories = self
             .src
             .prepare("SELECT message_id FROM message_trajectory ORDER BY rowid")?;
@@ -413,6 +426,15 @@ impl Copier<'_> {
                 for request in items {
                     if let Some(id) = request["id"].as_str() {
                         request["id"] = Json::String(self.assign("request", id)?);
+                    }
+                    for (field, kind) in [
+                        ("contextBoundary", "message"),
+                        ("replacesRequestId", "request"),
+                    ] {
+                        if let Some(old) = request[field].as_str() {
+                            request[field] =
+                                self.mapped(kind, old)?.map_or(Json::Null, Json::String);
+                        }
                     }
                     if let Some(blocks) = request.get_mut("responseBlocks") {
                         self.remap_blocks(&old, blocks)?;
@@ -447,5 +469,11 @@ pub(super) fn copy_snapshot(
         &source.incarnation,
     )?;
     source.stores.step(Phase::ForkSnapshot)?;
-    Copier { src: &tx, dst, id }.run(boundary)
+    Copier {
+        src: &tx,
+        dst,
+        id,
+        keep_unresolved_origins: matches!(boundary, Branch::Full),
+    }
+    .run(boundary)
 }
