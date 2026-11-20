@@ -83,11 +83,13 @@ impl ToolLoopExecutor {
             Arc::new(EnvironmentCredentials),
         )?;
         let mut skills = crate::services::plugins::skill_commands(&context)?;
+        crate::skills::SkillsManager::with_path(root.join("skills")).ensure_installed()?;
         skills.extend(crate::skills::discovery::discover(
             root,
             Path::new(&self.workspace_cwd),
         )?);
         let skill = skills.get(name).context("Unknown skill")?;
+        let bundled = crate::skills::discovery::is_bundled_path(&skill.path, root);
         ensure!(
             skill
                 .context
@@ -103,11 +105,12 @@ impl ToolLoopExecutor {
             self.manual_skill_active || !skill.disable_model_invocation,
             "Skill /{name} is disabled for model invocation; it requires an explicit user command"
         );
-        if skill.path.parent() == Some(Path::new("__embedded_cli_skills__")) {
+        if bundled {
             if let Some(prepared) = crate::skills::code_review::prepare_named(
                 name,
                 Path::new(&self.workspace_cwd),
                 arguments,
+                &skill.content,
             )
             .await
             {
@@ -117,9 +120,7 @@ impl ToolLoopExecutor {
                 );
             }
         }
-        if name == "deep-research"
-            && skill.path == Path::new("__embedded_cli_skills__").join("deep-research")
-        {
+        if bundled && name == "deep-research" {
             ensure!(
                 !arguments.trim().is_empty(),
                 "Usage: /deep-research <specific research question>"
@@ -134,14 +135,14 @@ impl ToolLoopExecutor {
             ensure!(!failed, "Deep research failed: {output}");
             return serde_json::from_str(&output).context("Invalid research result");
         }
-        if name == "doctor" && skill.path.parent() == Some(Path::new("__embedded_cli_skills__")) {
+        if bundled && name == "doctor" {
             // `/doctor prompt-audit [request]`: audit the instruction files loaded into
             // sessions with dcl's model-neutral guide; the target is this session's model.
             if let Some(rest) = arguments.trim_start().strip_prefix("prompt-audit").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
                 let request = rest.trim();
                 let instructions = format!(
                     "{}\n\n## This run\n\nProject directory: {}\nTarget model: {} (the model this session runs on).\nUser request: {}\n",
-                    include_str!("../skills/bundled/doctor-prompt-audit.md"),
+                    include_str!("../skills/doctor-prompt-audit.md"),
                     self.workspace_cwd,
                     self.provider.model.id,
                     if request.is_empty() { "audit the default scope and propose a diff; do not apply edits" } else { request },
@@ -159,12 +160,14 @@ impl ToolLoopExecutor {
                 json!({"skill":name,"path":skill.path,"instructions":crate::services::doctor::attach_snapshot(&instructions, &snapshot),"execution":"inline","shell_context_already_collected":true}),
             );
         }
-        if crate::skills::bundled_resources::supports(name)
-            && skill.path.parent() == Some(Path::new("__embedded_cli_skills__"))
-        {
+        if bundled && crate::skills::bundled_resources::supports(name) {
+            let directory = skill
+                .path
+                .parent()
+                .context("Bundled skill directory unavailable")?;
             let instructions =
                 self.bundled_resources
-                    .prepare(name, arguments, Path::new(&self.workspace_cwd))?;
+                    .prepare(name, arguments, Path::new(&self.workspace_cwd), directory)?;
             return Ok(
                 json!({"skill":name,"path":skill.path,"instructions":instructions,"execution":"inline","shell_context_already_collected":true}),
             );

@@ -66,7 +66,8 @@ async fn resource_reads_keep_explicit_permissions_and_model_api_invocation() {
     )
     .is_err());
     drop(executor);
-    assert!(!path.exists());
+    // Resources live in the installed skill directory, not a temporary tree.
+    assert!(path.exists());
 }
 
 fn doctor_executor(temp: &tempfile::TempDir) -> ToolLoopExecutor {

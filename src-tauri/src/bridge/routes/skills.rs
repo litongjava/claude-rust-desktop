@@ -53,14 +53,16 @@ struct SkillCommandsQuery {
 fn skill_command_entries(
     commands: &BTreeMap<String, SkillCommand>,
     states: &BTreeMap<String, SkillState>,
+    data_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
     let mut entries: Vec<serde_json::Value> = commands
         .values()
         .filter(|command| command.user_invocable)
         .map(|command| {
-            let source = if command.path.parent()
-                == Some(std::path::Path::new("__embedded_cli_skills__"))
-            {
+            let source = if deepseek_code_core::skills::discovery::is_bundled_path(
+                &command.path,
+                data_dir,
+            ) {
                 "built-in".to_owned()
             } else if command.name.contains(':') {
                 command.name.split(':').next().unwrap_or_default().to_owned()
@@ -100,6 +102,7 @@ async fn skills_commands(
         credentials: Arc::new(EnvironmentCredentials),
     };
     // Same merge as a chat turn: plugin skills first, then the shared resolver.
+    SkillsManager::with_path(data_dir.join("skills")).ensure_installed().map_err(skill_error)?;
     let mut commands =
         deepseek_code_core::services::plugins::skill_commands(&context).map_err(skill_error)?;
     commands.extend(
@@ -108,7 +111,7 @@ async fn skills_commands(
     );
     let states = states::load(&data_dir);
     Ok(Json(serde_json::json!({
-        "commands": skill_command_entries(&commands, &states),
+        "commands": skill_command_entries(&commands, &states, &data_dir),
     })))
 }
 
@@ -483,9 +486,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn command(name: &str, embedded: bool, user_invocable: bool) -> SkillCommand {
-        let path = if embedded {
-            Path::new("__embedded_cli_skills__").join(name)
+    fn command(name: &str, bundled: bool, user_invocable: bool, data_dir: &Path) -> SkillCommand {
+        let path = if bundled {
+            data_dir.join("skills/bundled").join(name).join("SKILL.md")
         } else {
             PathBuf::from(format!("/home/user/.claude/skills/{name}/SKILL.md"))
         };
@@ -505,17 +508,18 @@ mod tests {
 
     #[test]
     fn skill_command_entries_report_states() {
+        let data_dir = Path::new("/data/dcl");
         let commands: BTreeMap<String, SkillCommand> = [
-            command("translate-zh-en", true, true),
-            command("simplify", true, true),
-            command("mine", false, true),
-            command("hidden", false, false),
+            command("translate-zh-en", true, true, data_dir),
+            command("simplify", true, true, data_dir),
+            command("mine", false, true, data_dir),
+            command("hidden", false, false, data_dir),
         ]
         .into_iter()
         .map(|command| (command.name.clone(), command))
         .collect();
 
-        let entries = skill_command_entries(&commands, &BTreeMap::new());
+        let entries = skill_command_entries(&commands, &BTreeMap::new(), data_dir);
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries.iter().map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(),
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(by_name("mine")["source"], "user");
 
         let states = BTreeMap::from([("translate-zh-en".to_owned(), SkillState::User)]);
-        let entries = skill_command_entries(&commands, &states);
+        let entries = skill_command_entries(&commands, &states, data_dir);
         let entry = entries
             .iter()
             .find(|entry| entry["name"] == "translate-zh-en")

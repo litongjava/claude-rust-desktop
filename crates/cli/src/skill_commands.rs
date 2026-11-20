@@ -131,6 +131,7 @@ pub async fn prepare_invocation(
     };
     let (name, arguments) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let context = crate::services::context(&session.paths)?;
+    SkillsManager::with_path(session.paths.data_dir.join("skills")).ensure_installed()?;
     let mut commands = deepseek_code_core::services::plugins::skill_commands(&context)?;
     commands.extend(deepseek_code_core::skills::discovery::discover(
         &session.paths.data_dir,
@@ -139,21 +140,28 @@ pub async fn prepare_invocation(
     let Some(skill) = commands.get(name) else {
         return Ok(PreparedInvocation::NotHandled);
     };
-    if skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__")) {
-        if let Some(prepared) = deepseek_code_core::skills::code_review::prepare_named(name, &session.workspace, arguments.trim()).await {
+    let bundled =
+        deepseek_code_core::skills::discovery::is_bundled_path(&skill.path, &session.paths.data_dir);
+    if bundled {
+        if let Some(prepared) = deepseek_code_core::skills::code_review::prepare_named(
+            name,
+            &session.workspace,
+            arguments.trim(),
+            &skill.content,
+        )
+        .await
+        {
             return Ok(PreparedInvocation::Inline(prepared?));
         }
     }
-    if name == "doctor" && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__")) {
+    if name == "doctor" && bundled {
         let instructions = skill.render_template(arguments.trim(), &session.id)?;
         let snapshot = crate::doctor_commands::snapshot(&session.workspace, &session.paths);
         return Ok(PreparedInvocation::Inline(
             deepseek_code_core::services::doctor::attach_snapshot(&instructions, &snapshot),
         ));
     }
-    if deepseek_code_core::skills::bundled_resources::supports(name)
-        && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"))
-    {
+    if deepseek_code_core::skills::bundled_resources::supports(name) && bundled {
         // The engine owns resources so they live in the worker that reads them.
         return Ok(PreparedInvocation::NotHandled);
     }
@@ -388,6 +396,7 @@ pub async fn state_command(
     state: Option<&str>,
 ) -> anyhow::Result<String> {
     use deepseek_code_core::skills::{discovery, states};
+    SkillsManager::with_path(paths.data_dir.join("skills")).ensure_installed()?;
     let stored = states::load(&paths.data_dir);
     let line = |name: &str| {
         let value = states::effective(&stored, name);

@@ -66,22 +66,29 @@ impl SkillCommand {
                 .to_string_lossy()
                 .replace('\\', "/"),
         );
-        if self.path.parent() == Some(Path::new("__embedded_cli_skills__")) {
-            return Ok(format!(
-                "Bundled workflow /{} (embedded instructions; no source file to read)\n\n{}",
-                self.name, text
-            ));
-        }
         Ok(format!("Skill /{} from {}\nResolve referenced files relative to this skill directory: {}\n\n{}", self.name, self.path.display(), self.path.parent().unwrap_or(Path::new(".")).display(), text))
     }
 }
 
+/// Where built-in skills are installed under the data directory.
+pub fn bundled_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("skills").join("bundled")
+}
+
+/// Whether `path` belongs to an installed built-in skill. Hosts use this to
+/// select their built-in handling (target snapshots, diagnostics, resources)
+/// without an in-memory definition table.
+pub fn is_bundled_path(path: &Path, data_dir: &Path) -> bool {
+    path.starts_with(bundled_dir(data_dir))
+}
+
 /// One resolver for the model-visible listing, the `Skill` tool and the CLI
-/// slash list. Precedence, lowest to highest: embedded workflows,
-/// `<data dir>/skills`, `<workspace>/.claude`. The data directory is the only
-/// user scope; the Claude-compatible user directory is not read.
-/// Data-directory names keep the pre-round-01 lowercase slugs (see
-/// [`scan_data_dir`]); the project root keeps its existing spelling.
+/// slash list. Precedence, lowest to highest: installed built-in skills under
+/// `<data dir>/skills/bundled`, other `<data dir>/skills` entries, then
+/// `<workspace>/.claude`. The data directory is the only user scope; the
+/// Claude-compatible user directory is not read. Data-directory names keep the
+/// pre-round-01 lowercase slugs (see [`scan_data_dir`]); built-in and project
+/// names keep their existing spelling.
 pub fn discover(data_dir: &Path, workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
     Ok(discover_runtime_from(data_dir, workspace).0)
 }
@@ -97,8 +104,9 @@ pub fn discover_runtime_from(
     data_dir: &Path,
     workspace: &Path,
 ) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
-    let mut commands = super::bundled::commands();
+    let mut commands = BTreeMap::new();
     let mut invalid = Vec::new();
+    let _ = scan_bundled_dir(&bundled_dir(data_dir), &mut commands, Some(&mut invalid));
     let _ = scan_data_dir(&data_dir.join("skills"), &mut commands, Some(&mut invalid));
     let _ = scan_config_impl(
         &workspace.join(".claude"),
@@ -116,7 +124,7 @@ pub fn discover_runtime_from(
 pub fn discover_available_from(
     workspace: &Path,
 ) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
-    let mut commands = super::bundled::commands();
+    let mut commands = BTreeMap::new();
     let mut invalid = Vec::new();
     let _ = scan_config_impl(
         &workspace.join(".claude"),
@@ -141,7 +149,7 @@ fn log_invalid(invalid: &[PathBuf]) {
 
 /// Explicit roots allow fixture tests without reading or running personal skills.
 pub fn discover_from(workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
-    let mut commands = super::bundled::commands();
+    let mut commands = BTreeMap::new();
     scan_config(&workspace.join(".claude"), &mut commands)?;
     Ok(commands)
 }
@@ -301,11 +309,76 @@ fn scan_config_impl(
     Ok(())
 }
 
+/// Read-only scan of `<data dir>/skills/bundled`. Each immediate
+/// `<name>/SKILL.md` is a built-in skill named by its directory, with flags from
+/// its frontmatter. The installed files are the only built-in source.
+fn scan_bundled_dir(
+    root: &Path,
+    commands: &mut BTreeMap<String, SkillCommand>,
+    mut invalid: Option<&mut Vec<PathBuf>>,
+) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if let Some(invalid) = invalid.as_mut() {
+                    invalid.push(root.to_path_buf());
+                    continue;
+                }
+                return Err(error).with_context(|| format!("Scanning {}", root.display()));
+            }
+        };
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        directories.push(path);
+    }
+    directories.sort();
+    for directory in directories {
+        let Some(name) = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let path = directory.join("SKILL.md");
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            _ => continue,
+        }
+        let invalid_path = path.clone();
+        match parse_bundled_definition(&path, &name) {
+            Ok(Some(command)) => {
+                commands.insert(command.name.clone(), command);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(invalid) = invalid.as_mut() {
+                    invalid.push(invalid_path);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read-only scan of `<data dir>/skills`. Names keep the pre-round-01 slash
 /// spelling: the lowercase slug of the skill's own name, or its path-stable id
 /// when that slug is empty, unusable or shared with another data-dir skill.
-/// Managed subdirectories (`bundled`, `mcp`) stay visible, as they already were
-/// in the slash list, but never replace an embedded workflow of the same name.
+/// The managed `bundled` subdirectory is scanned separately; `mcp` entries stay
+/// visible and never replace a built-in skill of the same name.
 fn scan_data_dir(
     root: &Path,
     commands: &mut BTreeMap<String, SkillCommand>,
@@ -317,13 +390,15 @@ fn scan_data_dir(
     let mut entries = Vec::new();
     for path in collect_paths(root, true, invalid.as_deref_mut())? {
         let invalid_path = path.clone();
-        let managed = path
+        let first = path
             .strip_prefix(root)
             .ok()
-            .and_then(|relative| relative.components().next())
-            .is_some_and(|component| {
-                matches!(component.as_os_str().to_str(), Some("bundled" | "mcp"))
-            });
+            .and_then(|relative| relative.components().next());
+        if first.is_some_and(|component| component.as_os_str() == "bundled") {
+            // Installed built-in skills are scanned before this directory.
+            continue;
+        }
+        let managed = first.is_some_and(|component| component.as_os_str() == "mcp");
         match parse_definition(root, &path, true, true) {
             Ok(Some(command)) => entries.push((command, managed)),
             Ok(None) => {}
@@ -429,15 +504,14 @@ fn collect_paths(
     Ok(paths)
 }
 
-/// `root` is the naming root for config-scope relative names and local plugin
-/// metadata. Data-directory skills use the pre-round-01 slash spelling instead:
-/// the lowercase slug of the skill's own name (see [`legacy_data_dir_name`]).
-fn parse_definition(
-    root: &Path,
-    path: &Path,
-    skill_format: bool,
-    data_dir: bool,
-) -> Result<Option<SkillCommand>> {
+/// A skill file whose size and frontmatter have been validated.
+struct Definition {
+    metadata: Value,
+    content: String,
+}
+
+/// Read one skill definition. `None` means its frontmatter disables it.
+fn read_definition(path: &Path) -> Result<Option<Definition>> {
     ensure!(
         std::fs::metadata(path)?.len() <= 1024 * 1024,
         "Skill file exceeds 1 MiB: {}",
@@ -450,6 +524,66 @@ fn parse_definition(
     if boolean(&metadata, "enabled", true)? == false {
         return Ok(None);
     }
+    Ok(Some(Definition { metadata, content }))
+}
+
+fn command_from(path: &Path, name: String, definition: Definition) -> Result<SkillCommand> {
+    let Definition { metadata, content } = definition;
+    Ok(SkillCommand {
+        name,
+        description: metadata
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Run local skill instructions")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        path: path.to_path_buf(),
+        content,
+        user_invocable: boolean(
+            &metadata,
+            "user-invocable",
+            boolean(&metadata, "userInvocable", true)?,
+        )?,
+        disable_model_invocation: boolean(&metadata, "disable-model-invocation", false)?,
+        listing_name_only: false,
+        context: metadata
+            .get("context")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        shell: metadata
+            .get("shell")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        agent: metadata
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// A built-in skill is named by its installed directory; frontmatter supplies
+/// only the description and invocation flags.
+fn parse_bundled_definition(path: &Path, name: &str) -> Result<Option<SkillCommand>> {
+    let Some(definition) = read_definition(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(command_from(path, name.to_owned(), definition)?))
+}
+
+/// `root` is the naming root for config-scope relative names and local plugin
+/// metadata. Data-directory skills use the pre-round-01 slash spelling instead:
+/// the lowercase slug of the skill's own name (see [`legacy_data_dir_name`]).
+fn parse_definition(
+    root: &Path,
+    path: &Path,
+    skill_format: bool,
+    data_dir: bool,
+) -> Result<Option<SkillCommand>> {
+    let Some(definition) = read_definition(path)? else {
+        return Ok(None);
+    };
+    let metadata = &definition.metadata;
     let name = if data_dir {
         let raw = metadata
             .get("name")
@@ -502,37 +636,7 @@ fn parse_definition(
         );
         name
     };
-    Ok(Some(SkillCommand {
-        name: name.clone(),
-        description: metadata
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("Run local skill instructions")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-        path: path.to_path_buf(),
-        content,
-        user_invocable: boolean(
-            &metadata,
-            "user-invocable",
-            boolean(&metadata, "userInvocable", true)?,
-        )?,
-        disable_model_invocation: boolean(&metadata, "disable-model-invocation", false)?,
-        listing_name_only: false,
-        context: metadata
-            .get("context")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        shell: metadata
-            .get("shell")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        agent: metadata
-            .get("agent")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    }))
+    Ok(Some(command_from(path, name, definition)?))
 }
 
 fn local_plugin_name(scan_root: &Path, skill_file: &Path) -> Result<Option<Vec<String>>> {
@@ -688,7 +792,7 @@ fn expand_arguments(content: &str, arguments: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn tolerant_discovery_keeps_good_siblings_and_bundled_doctor() {
+    fn tolerant_discovery_keeps_good_siblings_and_lists_no_builtin_without_a_data_dir() {
         let root = tempfile::tempdir().unwrap();
         let commands = root.path().join(".claude/commands");
         std::fs::create_dir_all(&commands).unwrap();
@@ -696,7 +800,8 @@ mod tests {
         std::fs::write(commands.join("doctor.md"), "---\nname: doctor\nenabled: NOT_A_BOOL_SECRET\n---\nInvalid replacement").unwrap();
         let (available, invalid) = super::discover_available_from(root.path());
         assert!(available["good"].content.contains("Good instructions"));
-        assert_eq!(available["doctor"].path.parent().unwrap(), std::path::Path::new("__embedded_cli_skills__"));
+        // Without a data directory there is no installed built-in tree.
+        assert!(!available.contains_key("doctor"));
         assert_eq!(invalid, vec![commands.join("doctor.md")]);
         assert!(super::discover_from(root.path()).is_err());
     }
@@ -971,22 +1076,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_discovery_lists_managed_data_dirs_without_shadowing_embedded_workflows() {
+    fn runtime_discovery_lists_managed_data_dirs_without_shadowing_builtin_workflows() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
         let skills = data.join("skills");
-        write_skill(
-            &skills.join("bundled"),
-            "doctor",
-            "---\nname: doctor\n---\nMANAGED_DOCTOR",
-        );
-        write_skill(
-            &skills.join("bundled"),
-            "commit",
-            "---\nname: commit\ndescription: Commit fixture\n---\nCommit instructions",
-        );
+        crate::skills::SkillsManager::with_path(skills.clone())
+            .ensure_installed()
+            .unwrap();
         write_skill(
             &skills.join("mcp"),
             "mcp-fixture",
@@ -999,32 +1097,38 @@ mod tests {
         );
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
-        // A managed copy must not replace the embedded workflow.
+        // The installed built-in file is the definition, listed exactly once.
         assert_eq!(
-            found["doctor"].path.parent(),
-            Some(Path::new("__embedded_cli_skills__"))
+            found["doctor"].path,
+            data.join("skills/bundled/doctor/SKILL.md")
         );
-        assert!(!found["doctor"].content.contains("MANAGED_DOCTOR"));
-        // Managed directories are still listed when their name is free.
-        assert!(found.contains_key("commit"));
+        assert_eq!(
+            found
+                .values()
+                .filter(|command| command.name == "doctor")
+                .count(),
+            1
+        );
         assert!(found.contains_key("mcp-fixture"));
-        assert!(found["commit"].model_invocable());
-        assert!(found["commit"].user_invocable);
-        // A direct user skill keeps the normal user-overrides-embedded rule.
+        // A direct user skill overrides the built-in of the same name.
         assert!(found["code-review"].content.contains("USER_OVERRIDE"));
     }
 
     #[test]
-    fn runtime_discovery_does_not_let_a_modified_bundled_skill_creator_shadow_the_embedded_one() {
+    fn runtime_discovery_uses_a_user_edited_installed_builtin_skill() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
-        write_skill(
-            &data.join("skills").join("bundled"),
-            "skill-creator",
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+        let installed = data.join("skills/bundled/skill-creator/SKILL.md");
+        std::fs::write(
+            &installed,
             "---\nname: skill-creator\ndescription: Modified bundled copy\n---\nMODIFIED_BUNDLED_CREATOR",
-        );
+        )
+        .unwrap();
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let creators: Vec<_> = found
@@ -1032,19 +1136,19 @@ mod tests {
             .filter(|command| command.name == "skill-creator")
             .collect();
         assert_eq!(creators.len(), 1, "{found:?}");
-        assert_eq!(
-            creators[0].path.parent(),
-            Some(Path::new("__embedded_cli_skills__"))
-        );
-        assert!(!creators[0].content.contains("MODIFIED_BUNDLED_CREATOR"));
+        assert_eq!(creators[0].path, installed);
+        assert!(creators[0].content.contains("MODIFIED_BUNDLED_CREATOR"));
     }
 
     #[test]
-    fn runtime_discovery_lets_a_direct_user_skill_override_the_embedded_skill_creator() {
+    fn runtime_discovery_lets_a_direct_user_skill_override_the_builtin_skill_creator() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
         write_skill(
             &data.join("skills"),
             "skill-creator",
@@ -1095,8 +1199,8 @@ mod tests {
         assert!(!stub.join("agents").exists());
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
-        // The embedded skill-creator still reaches the model listing and the
-        // slash list as exactly one entry; the installed managed copy is skipped.
+        // The installed skill-creator reaches the model listing and the slash
+        // list as exactly one entry.
         let creators: Vec<_> = found
             .values()
             .filter(|command| command.name == "skill-creator")
@@ -1105,8 +1209,8 @@ mod tests {
         assert!(creators[0].model_invocable());
         assert!(creators[0].user_invocable);
         assert_eq!(
-            creators[0].path.parent(),
-            Some(Path::new("__embedded_cli_skills__"))
+            creators[0].path,
+            data.join("skills/bundled/skill-creator/SKILL.md")
         );
         // The five legacy built-ins are no longer installed or listed.
         for name in ["commit", "review", "test", "document", "build"] {
@@ -1114,6 +1218,80 @@ mod tests {
             assert!(!data.join(format!("skills/legacy-{name}")).exists());
             assert!(!data.join(format!("skills/bundled/legacy-{name}")).exists());
         }
+    }
+
+    #[test]
+    fn every_installed_builtin_skill_is_discovered_with_its_frontmatter_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        let names: BTreeSet<&str> = crate::skills::bundled_resources::FILES
+            .iter()
+            .filter(|(_, relative, _)| *relative == "SKILL.md")
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert!(!names.is_empty());
+        for name in names {
+            let command = found
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from discovery: {:?}", found.keys()));
+            assert_eq!(
+                command.path,
+                data.join("skills/bundled").join(name).join("SKILL.md"),
+                "{name}"
+            );
+            let text = std::fs::read_to_string(&command.path).unwrap();
+            let (metadata, body) = frontmatter(&text).unwrap();
+            assert_eq!(metadata["name"].as_str(), Some(name), "{name}");
+            assert_eq!(
+                metadata["description"].as_str(),
+                Some(command.description.as_str()),
+                "{name}"
+            );
+            assert_eq!(body, command.content, "{name}");
+            assert_eq!(
+                command.user_invocable,
+                metadata["user-invocable"].as_bool().unwrap_or(true),
+                "{name}"
+            );
+            let default_user_only = crate::skills::states::default_state(name)
+                == crate::skills::states::SkillState::UserOnly;
+            assert_eq!(
+                command.disable_model_invocation,
+                metadata["disable-model-invocation"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    || default_user_only,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_name_comes_from_the_installed_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        write_skill(
+            &data.join("skills").join("bundled"),
+            "renamed-directory",
+            "---\nname: frontmatter-name\ndescription: Directory fixture\n---\nBody",
+        );
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        assert!(found.contains_key("renamed-directory"), "{found:?}");
+        assert!(!found.contains_key("frontmatter-name"));
+        assert_eq!(
+            found["renamed-directory"].path,
+            data.join("skills/bundled/renamed-directory/SKILL.md")
+        );
     }
 
     #[test]
@@ -1148,9 +1326,12 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
-        let (found, _) = discover_runtime_from(&data, &workspace);
+        // Discovery is read-only: installing built-in skills is the caller's
+        // job, so an empty data directory yields no skills and no directories.
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
         assert!(!data.join("skills").exists());
-        assert!(found.contains_key("doctor"));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     fn legacy_id(path: &Path) -> String {

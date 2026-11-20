@@ -1,7 +1,6 @@
 pub mod engine;
 pub mod discovery;
 pub mod states;
-pub mod bundled;
 pub mod bundled_resources;
 mod bundled_install;
 pub mod code_review;
@@ -144,18 +143,6 @@ impl SkillsManager {
         skills.reverse();
         skills.retain(|skill| seen.insert(skill.id.clone()));
         skills.reverse();
-
-        // Embedded skills have no disk copy. Preserve the existing precedence
-        // of a same-name skill found by the inventory scan.
-        let embedded: [(&str, fn() -> Skill); 2] = [
-            (skill_creator::NAME, skill_creator::manager_skill),
-            (bundled::TASK_TEMPLATE_NAME, bundled::task_template_skill),
-        ];
-        for (name, make_skill) in embedded {
-            if !skills.iter().any(|skill| skill.name == name) {
-                skills.push(make_skill());
-            }
-        }
 
         Ok(skills)
     }
@@ -453,20 +440,6 @@ impl SkillsManager {
     }
 
     pub fn get_skill_content(&self, skill_id: &str, file_path: &str) -> Result<String> {
-        match skill_id {
-            skill_creator::EMBEDDED_ID => {
-                let bytes = skill_creator::embedded_file(file_path)?;
-                return Ok(String::from_utf8_lossy(bytes).into_owned());
-            }
-            bundled::TASK_TEMPLATE_ID => {
-                anyhow::ensure!(
-                    file_path == "SKILL.md",
-                    "Bundled skill file not found: {file_path}"
-                );
-                return Ok(bundled::TASK_TEMPLATE_DOCUMENT.to_owned());
-            }
-            _ => {}
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         let full_path = editing::relative_file(&skill_path, file_path)?;
         let content = std::fs::read_to_string(&full_path)?;
@@ -510,9 +483,6 @@ impl SkillsManager {
     }
 
     pub fn update_skill(&self, skill_id: &str, updates: HashMap<String, serde_json::Value>) -> Result<()> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only; create a user skill to customize it");
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         let skill_md_path = skill_path.join("SKILL.md");
 
@@ -521,14 +491,6 @@ impl SkillsManager {
         }
 
         editing::edit(&skill_md_path, &updates)
-    }
-
-    fn embedded_skill_name(skill_id: &str) -> Option<&'static str> {
-        match skill_id {
-            skill_creator::EMBEDDED_ID => Some(skill_creator::NAME),
-            bundled::TASK_TEMPLATE_ID => Some(bundled::TASK_TEMPLATE_NAME),
-            _ => None,
-        }
     }
 
     fn find_skill_path(&self, skill_id: &str) -> Result<PathBuf> {
@@ -552,9 +514,6 @@ impl SkillsManager {
     }
 
     pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only");
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         std::fs::remove_dir_all(skill_path)?;
         Ok(())
@@ -602,9 +561,6 @@ impl SkillsManager {
     }
 
     pub async fn toggle_skill(&self, skill_id: &str) -> Result<bool> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only and stays enabled");
-        }
         let skills = self.load_skills().await?;
         let skill = skills.into_iter()
             .find(|s| s.id == skill_id)

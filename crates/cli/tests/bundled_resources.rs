@@ -142,8 +142,8 @@ async fn manual_and_model_invocations_read_resources_and_preserve_custom_overrid
             assert!(capture.read_ok);
             assert_eq!(capture.calls, if index == 0 { 2 } else { 3 });
             assert!(
-                !capture.root.as_ref().unwrap().exists(),
-                "normal worker exit must release resources"
+                capture.root.as_ref().unwrap().exists(),
+                "the installed resource directory persists after the worker exits"
             );
         } else {
             assert_eq!(capture.calls, 1);

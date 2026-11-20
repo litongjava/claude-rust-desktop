@@ -1,117 +1,12 @@
-//! Embedded skill-creator: invocation metadata, the read-only manager entry,
-//! and migration away from the old placeholder written by earlier versions.
-use super::{bundled_resources, Skill, SkillFile, SkillSource};
-use anyhow::{anyhow, ensure, Context, Result};
+//! Bundled skill-creator migration away from the old placeholder written by
+//! earlier versions.
+use anyhow::{anyhow, Context, Result};
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 pub(super) const NAME: &str = "skill-creator";
-/// Stable id used by hosts that list the embedded skill without a disk copy.
-pub(super) const EMBEDDED_ID: &str = "embedded:skill-creator";
-pub(super) const DESCRIPTION: &str = "Create or update a DeepSeek Code skill with appropriately scoped instructions and any needed supporting resources.";
-pub(super) const WHEN_TO_USE: &str = "Use when creating a new skill, revising an existing skill, or adding scripts, references, or assets to a skill.";
-
-pub(super) struct Embedded {
-    pub content: &'static str,
-    pub files: Vec<SkillFile>,
-}
-
-/// Embedded bytes are the only source of truth; the manager entry mirrors the
-/// same manifest used for invocation materialization.
-pub(super) fn embedded() -> Embedded {
-    let mut files = Vec::new();
-    for (relative, _) in bundled_resources::files(NAME) {
-        insert_file(&mut files, &relative.split('/').collect::<Vec<_>>());
-    }
-    sort_tree(&mut files);
-    Embedded {
-        content: include_str!("bundled/skills/skill-creator/SKILL.md"),
-        files,
-    }
-}
-
-fn insert_file(nodes: &mut Vec<SkillFile>, parts: &[&str]) {
-    let Some((head, rest)) = parts.split_first() else {
-        return;
-    };
-    if rest.is_empty() {
-        if !nodes.iter().any(|node| node.name == *head) {
-            nodes.push(SkillFile {
-                name: (*head).to_string(),
-                file_type: "file".to_string(),
-                children: None,
-            });
-        }
-        return;
-    }
-    let index = match nodes
-        .iter()
-        .position(|node| node.name == *head && node.file_type == "folder")
-    {
-        Some(index) => index,
-        None => {
-            nodes.push(SkillFile {
-                name: (*head).to_string(),
-                file_type: "folder".to_string(),
-                children: Some(Vec::new()),
-            });
-            nodes.len() - 1
-        }
-    };
-    insert_file(nodes[index].children.get_or_insert_with(Vec::new), rest);
-}
-
-fn sort_tree(nodes: &mut [SkillFile]) {
-    nodes.sort_by(
-        |left, right| match (&left.file_type[..], &right.file_type[..]) {
-            ("folder", "file") => std::cmp::Ordering::Less,
-            ("file", "folder") => std::cmp::Ordering::Greater,
-            _ => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-        },
-    );
-    for node in nodes.iter_mut() {
-        if let Some(children) = node.children.as_mut() {
-            sort_tree(children);
-        }
-    }
-}
-
-pub(super) fn manager_skill() -> Skill {
-    let embedded = embedded();
-    Skill {
-        id: EMBEDDED_ID.to_string(),
-        name: NAME.to_string(),
-        description: DESCRIPTION.to_string(),
-        content: Some(embedded.content.to_string()),
-        when_to_use: Some(WHEN_TO_USE.to_string()),
-        enabled: true,
-        source: SkillSource::Bundled,
-        loaded_from: "bundled".to_string(),
-        source_dir: None,
-        is_example: false,
-        files: embedded.files,
-        created_at: None,
-        od_metadata: None,
-    }
-}
-
-/// Read one embedded file for the read-only manager entry. Relative paths must
-/// stay inside the skill; only manifest-registered names are served.
-pub(super) fn embedded_file(relative: &str) -> Result<&'static [u8]> {
-    let normalized = relative.replace('\\', "/");
-    ensure!(
-        !normalized.is_empty()
-            && !normalized.contains(':')
-            && normalized
-                .split('/')
-                .all(|part| !part.is_empty() && part != "." && part != ".."),
-        "Skill file path must stay within its directory"
-    );
-    bundled_resources::asset(NAME, &normalized)
-        .ok_or_else(|| anyhow!("Bundled skill file not found: {relative}"))
-}
 
 /// Called on every skill load. Creating the bundled root is enough for a new
 /// install; the placeholder files are never written again.
@@ -232,7 +127,8 @@ pub(super) const STUB_GRADER: &str = "# Grader\n\nGrades skill performance.";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::SkillsManager;
+    use crate::skills::{SkillSource, SkillsManager};
+    use std::path::PathBuf;
 
     fn write_stub(root: &Path) -> PathBuf {
         let directory = root.join(NAME);
@@ -250,30 +146,37 @@ mod tests {
     }
 
     #[test]
-    fn bundled_instructions_and_command_body_match_the_skill_markdown() {
-        let skill = include_str!("bundled/skills/skill-creator/SKILL.md");
-        let instructions = include_str!("bundled/skills/skill-creator/INSTRUCTIONS.md");
+    fn bundled_instructions_match_the_skill_markdown_body() {
+        let source = concat!(env!("CARGO_MANIFEST_DIR"), "/src/skills/bundled/skills");
+        let skill = std::fs::read_to_string(format!("{source}/skill-creator/SKILL.md")).unwrap();
+        let instructions =
+            std::fs::read_to_string(format!("{source}/skill-creator/INSTRUCTIONS.md")).unwrap();
         let body = &skill[skill.find("\n---\n").unwrap() + "\n---\n".len()..];
         assert_eq!(body, instructions);
-        assert_eq!(
-            include_str!("bundled/skill-creator.md"),
-            instructions,
-            "the embedded command body must stay in sync with INSTRUCTIONS.md"
-        );
         assert!(instructions.contains("DeepSeek Code"));
         assert!(instructions.contains("references/frontmatter.md"));
     }
 
     #[test]
-    fn embedded_skill_creator_is_discoverable_once_and_invocable() {
+    fn installed_skill_creator_is_discoverable_once_and_invocable() {
         let temp = tempfile::tempdir().unwrap();
-        let commands = crate::skills::discovery::discover_from(temp.path()).unwrap();
+        let data = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+        let commands = crate::skills::discovery::discover(&data, &workspace).unwrap();
         let matching: Vec<_> = commands
             .values()
             .filter(|command| command.name == NAME)
             .collect();
         assert_eq!(matching.len(), 1);
         let command = matching[0];
+        assert_eq!(
+            command.path,
+            data.join("skills/bundled").join(NAME).join("SKILL.md")
+        );
         assert!(command.model_invocable());
         assert!(command.user_invocable);
         assert!(command.content.contains("DeepSeek Code"));
@@ -399,10 +302,8 @@ mod tests {
         let manager = SkillsManager::with_path(skills_dir);
         let skills = manager.load_skills().await.unwrap();
         let matching: Vec<_> = skills.iter().filter(|skill| skill.name == NAME).collect();
-        // The user's copy and the installed bundled tree are separate skills;
-        // the embedded entry is not synthesized a third time.
+        // The user's copy and the installed bundled tree are separate skills.
         assert_eq!(matching.len(), 2);
-        assert!(matching.iter().all(|skill| skill.id != EMBEDDED_ID));
         let user = matching
             .iter()
             .find(|skill| skill.source == SkillSource::User)

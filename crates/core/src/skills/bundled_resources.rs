@@ -1,12 +1,12 @@
-//! Versioned upstream skill assets, loaded only when a skill is invoked.
+//! Installed built-in skill asset directories.
 //!
-//! Each process publishes assets into a fresh private temporary directory. Read
-//! serves only registered, exact asset names from the executable: registering a
-//! bundle never grants access to its parent directory or write permissions.
+//! Components that ship extra references or scripts (dataviz, skill-creator)
+//! are installed under `<data>/skills/bundled/<name>/`. Invocation points at
+//! that directory, and the Read tool serves registered asset names from it even
+//! when it sits outside the workspace.
 use anyhow::{ensure, Context, Result};
 use std::{
     collections::HashMap,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
 };
@@ -15,13 +15,13 @@ use std::{
 mod manifest;
 pub(crate) use manifest::FILES;
 
+/// One skill directory prepared in this process. The engine and its active
+/// children own the resources; the weak registry only exposes them to Read.
 struct Bundle {
-    directory: tempfile::TempDir,
-    files: HashMap<PathBuf, &'static [u8]>,
+    name: String,
+    directory: PathBuf,
 }
 
-// Weak registry exposes published immutable bytes without keeping temporary
-// files alive. The engine and its active children own the actual resources.
 static REGISTRY: LazyLock<Mutex<Vec<Weak<Bundle>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(Default)]
@@ -33,84 +33,49 @@ pub fn supports(name: &str) -> bool {
     matches!(name, "dataviz" | "skill-creator")
 }
 
-/// Embedded files for one bundled skill, in manifest order.
-pub(crate) fn files(name: &str) -> impl Iterator<Item = (&'static str, &'static [u8])> + '_ {
+/// Whether `relative` is one of the files installed for `name`.
+fn registered(name: &str, relative: &str) -> bool {
     manifest::FILES
         .iter()
-        .filter(move |(skill, _, _)| *skill == name)
-        .map(|(_, relative, bytes)| (*relative, *bytes))
-}
-
-/// Exact embedded bytes for a registered relative path.
-pub(crate) fn asset(name: &str, relative: &str) -> Option<&'static [u8]> {
-    manifest::FILES
-        .iter()
-        .find(|(skill, path, _)| *skill == name && *path == relative)
-        .map(|(_, _, bytes)| *bytes)
+        .any(|(skill, path, _)| *skill == name && *path == relative)
 }
 
 impl Resources {
-    pub fn prepare(&self, name: &str, arguments: &str, workspace: &Path) -> Result<String> {
+    /// Build the invocation prompt for an installed built-in skill. Instructions
+    /// are read from disk, so a user-edited file is what the model receives.
+    pub fn prepare(
+        &self,
+        name: &str,
+        arguments: &str,
+        workspace: &Path,
+        directory: &Path,
+    ) -> Result<String> {
         ensure!(supports(name), "Unknown bundled resource skill");
+        let directory = directory.canonicalize().with_context(|| {
+            format!(
+                "Bundled skill directory unavailable: {}",
+                directory.display()
+            )
+        })?;
+        let instructions_path = directory.join("INSTRUCTIONS.md");
+        let instructions = std::fs::read_to_string(&instructions_path)
+            .with_context(|| format!("Reading {}", instructions_path.display()))?;
         let mut bundles = self
             .bundles
             .lock()
             .map_err(|_| anyhow::anyhow!("Skill resource cache unavailable"))?;
-        if !bundles.contains_key(name) {
-            let prefix = if name == "skill-creator" {
-                "deepseek-skill-creator-".to_string()
-            } else {
-                format!("claude-skill-2.1.295-{name}-")
-            };
-            let directory = tempfile::Builder::new().prefix(&prefix).tempdir()?;
-            let mut files = HashMap::new();
-            for &(skill, relative, bytes) in manifest::FILES {
-                if skill != name {
-                    continue;
-                }
-                let relative = Path::new(relative);
-                ensure!(
-                    relative
-                        .components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_))),
-                    "Invalid embedded asset path"
-                );
-                let target = directory.path().join(relative);
-                std::fs::create_dir_all(target.parent().context("Missing asset parent")?)?;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)?;
-                file.write_all(bytes)?;
-                files.insert(target, bytes);
-            }
-            let bundle = Arc::new(Bundle { directory, files });
-            let mut registry = REGISTRY
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Skill resource registry unavailable"))?;
-            registry.retain(|entry| entry.strong_count() > 0);
-            registry.push(Arc::downgrade(&bundle));
-            bundles.insert(name.into(), bundle);
-        }
-        let bundle = &bundles[name];
-        // Never silently execute a changed script on a subsequent invocation.
-        // There are no overwrites or repairs of paths supplied by the workspace.
-        for (path, bytes) in &bundle.files {
-            let metadata = std::fs::symlink_metadata(path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "Bundled skill resource changed; restart the session"
-            );
-            ensure!(
-                std::fs::read(path)?.as_slice() == *bytes,
-                "Bundled skill resource changed; restart the session"
-            );
-        }
-        let instructions = match name {
-            "dataviz" => include_str!("bundled/skills/dataviz/INSTRUCTIONS.md"),
-            "skill-creator" => include_str!("bundled/skills/skill-creator/INSTRUCTIONS.md"),
-            _ => unreachable!(),
-        };
+        let bundle = Arc::new(Bundle {
+            name: name.to_owned(),
+            directory: directory.clone(),
+        });
+        let mut registry = REGISTRY
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Skill resource registry unavailable"))?;
+        registry.retain(|entry| entry.strong_count() > 0);
+        registry.push(Arc::downgrade(&bundle));
+        drop(registry);
+        bundles.insert(name.into(), bundle);
+        drop(bundles);
         let provenance = if name == "skill-creator" {
             "Bundled skill-creator embedded in DeepSeek Code; no network or prior install is required. Adapted from OpenAI Codex's skill-creator under the Apache-2.0 license; see NOTICE.md and license.txt in the base directory."
         } else {
@@ -118,13 +83,14 @@ impl Resources {
         };
         Ok(format!(
         "Base directory for this skill: {}\n\n{} Resolve resource paths against the base directory. Use Read for referenced documents. Execute scripts only through normal Bash permissions; invocation itself executes no scripts. After restarting a worker, invoke this skill again to obtain its current resource directory.\n\n{instructions}\n\nCurrent workspace: {}\n\n## User Request\n\n{arguments}",
-        bundle.directory.path().display(), provenance, workspace.display()
+        directory.display(), provenance, workspace.display()
     ))
     }
 }
 
-/// Exact registered filenames only; no directory, glob, alias or traversal grant.
-pub(crate) fn read(path: &Path) -> Option<&'static [u8]> {
+/// Exact registered filenames only; no directory, glob, alias or traversal
+/// grant. Returns the installed file's current bytes.
+pub(crate) fn read(path: &Path) -> Option<Vec<u8>> {
     if !path.is_absolute()
         || path
             .components()
@@ -132,27 +98,52 @@ pub(crate) fn read(path: &Path) -> Option<&'static [u8]> {
     {
         return None;
     }
-    REGISTRY
-        .lock()
-        .ok()?
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find_map(|bundle| bundle.files.get(path).copied())
+    let canonical = path.canonicalize().ok()?;
+    let registry = REGISTRY.lock().ok()?;
+    for bundle in registry.iter().filter_map(Weak::upgrade) {
+        let Ok(relative) = canonical.strip_prefix(&bundle.directory) else {
+            continue;
+        };
+        let relative = relative.to_str()?.replace('\\', "/");
+        if registered(&bundle.name, &relative) {
+            return std::fs::read(&canonical).ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Install the embedded tree the way the SkillsManager does.
+    fn installed() -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("skills/bundled");
+        super::super::bundled_install::install(&bundled).unwrap();
+        (temp, bundled)
+    }
+
+    fn embedded(skill: &str, relative: &str) -> &'static [u8] {
+        FILES
+            .iter()
+            .find(|(name, path, _)| *name == skill && *path == relative)
+            .map(|(_, _, bytes)| *bytes)
+            .expect("missing embedded fixture")
+    }
 
     #[test]
     fn packaged_resources_match_acquired_sha256_manifest() {
-        let provenance: serde_json::Value =
-            serde_json::from_str(include_str!("bundled/resources/manifest.json")).unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/skills/bundled/resources/manifest.json"
+        )))
+        .unwrap();
         let files = provenance["files"].as_array().unwrap();
         for entry in files {
             // The installed skill-creator SKILL.md adds the installer's
-            // frontmatter flags to the upstream body; skill-creator.rs checks
-            // that body against INSTRUCTIONS.md.
+            // frontmatter flags to the upstream body.
             if entry["skill"] == "skill-creator" && entry["path"] == "SKILL.md" {
                 continue;
             }
@@ -172,84 +163,75 @@ mod tests {
     }
 
     #[test]
-    fn changed_files_are_not_repaired_or_served_as_new_instructions() {
+    fn installed_resources_are_served_from_disk_and_edits_are_honored() {
+        let (_temp, bundled) = installed();
+        let directory = bundled.join("dataviz");
         let resources = Resources::default();
         let workspace = tempfile::tempdir().unwrap();
-        resources.prepare("dataviz", "", workspace.path()).unwrap();
-        let path = resources.bundles.lock().unwrap()["dataviz"]
-            .directory
-            .path()
-            .join("references/palette.md");
+        let prompt = resources
+            .prepare("dataviz", "", workspace.path(), &directory)
+            .unwrap();
+        assert!(prompt.contains(&directory.display().to_string()));
+        let path = directory.join("references/palette.md");
         let original = read(&path).unwrap();
-        std::fs::write(&path, "modified externally").unwrap();
-        assert_eq!(read(&path).unwrap(), original);
-        assert!(resources
-            .prepare("dataviz", "", workspace.path())
-            .unwrap_err()
-            .to_string()
-            .contains("resource changed"));
+        assert_eq!(
+            original.as_slice(),
+            embedded("dataviz", "references/palette.md")
+        );
+        std::fs::write(&path, "user edit").unwrap();
+        assert_eq!(read(&path).unwrap(), b"user edit");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "modified externally"
+            "user edit",
+            "Read never rewrites an installed resource"
         );
         drop(resources);
         assert!(read(&path).is_none());
-        assert!(!path.exists());
+        assert!(
+            path.exists(),
+            "the installed file survives Process teardown"
+        );
     }
 
     #[test]
-    fn skill_creator_bundle_is_available_and_materialized_on_invocation() {
+    fn skill_creator_bundle_is_installed_and_served() {
+        let (_temp, bundled) = installed();
+        let directory = bundled.join("skill-creator");
         let workspace = tempfile::tempdir().unwrap();
         let resources = Resources::default();
         let prompt = resources
-            .prepare("skill-creator", "build a PDF skill", workspace.path())
+            .prepare(
+                "skill-creator",
+                "build a PDF skill",
+                workspace.path(),
+                &directory,
+            )
             .unwrap();
         assert!(prompt.contains("build a PDF skill"));
         assert!(prompt.contains("NOTICE.md"));
         assert!(prompt.contains("Apache-2.0"));
-        let bundle = resources.bundles.lock().unwrap()["skill-creator"]
-            .directory
-            .path()
-            .to_path_buf();
-        assert!(prompt.contains(&bundle.display().to_string()));
-        for (relative, expected) in [
-            (
-                "SKILL.md",
-                &include_bytes!("bundled/skills/skill-creator/SKILL.md")[..],
-            ),
-            (
-                "INSTRUCTIONS.md",
-                &include_bytes!("bundled/skills/skill-creator/INSTRUCTIONS.md")[..],
-            ),
-            (
-                "NOTICE.md",
-                &include_bytes!("bundled/skills/skill-creator/NOTICE.md")[..],
-            ),
-            (
-                "license.txt",
-                &include_bytes!("bundled/skills/skill-creator/license.txt")[..],
-            ),
-            (
-                "references/frontmatter.md",
-                &include_bytes!("bundled/skills/skill-creator/references/frontmatter.md")[..],
-            ),
-            (
-                "scripts/init_skill.py",
-                &include_bytes!("bundled/skills/skill-creator/scripts/init_skill.py")[..],
-            ),
-            (
-                "scripts/quick_validate.py",
-                &include_bytes!("bundled/skills/skill-creator/scripts/quick_validate.py")[..],
-            ),
+        assert!(prompt.contains(&directory.display().to_string()));
+        for relative in [
+            "SKILL.md",
+            "INSTRUCTIONS.md",
+            "NOTICE.md",
+            "license.txt",
+            "references/frontmatter.md",
+            "scripts/init_skill.py",
+            "scripts/quick_validate.py",
         ] {
-            let materialized = std::fs::read(bundle.join(relative)).unwrap();
-            assert_eq!(materialized, expected, "{relative} is not byte-exact");
+            let installed_file = std::fs::read(directory.join(relative)).unwrap();
+            assert_eq!(
+                installed_file.as_slice(),
+                embedded("skill-creator", relative),
+                "{relative}"
+            );
         }
-        let skill_md = std::fs::read(bundle.join("SKILL.md")).unwrap();
-        assert!(String::from_utf8_lossy(&skill_md).contains("name: skill-creator"));
+        let skill_md = std::fs::read_to_string(directory.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: skill-creator"));
         let digest = ring::digest::digest(
             &ring::digest::SHA256,
-            &std::fs::read(bundle.join("license.txt")).unwrap(),
+            &std::fs::read(directory.join("license.txt")).unwrap(),
         );
         let digest: String = digest
             .as_ref()
@@ -260,8 +242,8 @@ mod tests {
             digest,
             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
         );
-        assert!(read(&bundle.join("scripts/init_skill.py")).is_some());
-        assert!(read(&bundle.join("agents/openai.yaml")).is_none());
+        assert!(read(&directory.join("scripts/init_skill.py")).is_some());
+        assert!(read(&directory.join("agents/openai.yaml")).is_none());
         assert!(std::fs::read_dir(workspace.path())
             .unwrap()
             .next()
@@ -270,15 +252,13 @@ mod tests {
 
     #[test]
     fn python_scripts_create_and_validate_skills_without_site_packages() {
+        let (_temp, bundled) = installed();
+        let directory = bundled.join("skill-creator");
         let workspace = tempfile::tempdir().unwrap();
         let resources = Resources::default();
         resources
-            .prepare("skill-creator", "", workspace.path())
+            .prepare("skill-creator", "", workspace.path(), &directory)
             .unwrap();
-        let bundle = resources.bundles.lock().unwrap()["skill-creator"]
-            .directory
-            .path()
-            .to_path_buf();
         let python = if cfg!(windows) { "python" } else { "python3" };
         if std::process::Command::new(python)
             .arg("--version")
@@ -293,7 +273,7 @@ mod tests {
         // -S disables site-packages, proving the scripts use only the standard library.
         let init = std::process::Command::new(python)
             .arg("-S")
-            .arg(bundle.join("scripts/init_skill.py"))
+            .arg(directory.join("scripts/init_skill.py"))
             .arg("test-skill")
             .arg("--path")
             .arg(output_dir.path())
@@ -314,7 +294,7 @@ mod tests {
         }
         let validate = std::process::Command::new(python)
             .arg("-S")
-            .arg(bundle.join("scripts/quick_validate.py"))
+            .arg(directory.join("scripts/quick_validate.py"))
             .arg(&skill_dir)
             .output()
             .unwrap();
@@ -360,7 +340,7 @@ mod tests {
             std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
             let output = std::process::Command::new(python)
                 .arg("-S")
-                .arg(bundle.join("scripts/quick_validate.py"))
+                .arg(directory.join("scripts/quick_validate.py"))
                 .arg(&skill_dir)
                 .output()
                 .unwrap();
@@ -377,7 +357,7 @@ mod tests {
         .unwrap();
         let output = std::process::Command::new(python)
             .arg("-S")
-            .arg(bundle.join("scripts/quick_validate.py"))
+            .arg(directory.join("scripts/quick_validate.py"))
             .arg(&skill_dir)
             .output()
             .unwrap();
@@ -395,7 +375,7 @@ mod tests {
         .unwrap();
         let output = std::process::Command::new(python)
             .arg("-S")
-            .arg(bundle.join("scripts/quick_validate.py"))
+            .arg(directory.join("scripts/quick_validate.py"))
             .arg(&skill_dir)
             .output()
             .unwrap();
@@ -407,58 +387,49 @@ mod tests {
     }
 
     #[test]
-    fn materializes_complete_resources_lazily_and_keeps_arguments_literal() {
+    fn served_resources_stay_inside_the_installed_directory_and_keep_arguments_literal() {
+        let (_temp, bundled) = installed();
+        let directory = bundled.join("dataviz");
         let workspace = tempfile::tempdir().unwrap();
         let resources = Resources::default();
-        for (name, count, example) in [
-            ("dataviz", 11, "scripts/validate_palette.js"),
-        ] {
-            let prompt = resources
-                .prepare(
-                    name,
-                    "literal !`echo should-not-run` $ARGUMENTS 中文😀",
-                    workspace.path(),
-                )
-                .unwrap();
-            assert!(prompt.contains("literal !`echo should-not-run` $ARGUMENTS 中文😀"));
-            assert!(!prompt.contains("official-skills-mq4AvY"));
-            assert!(!prompt.contains("Describe the available local instructions only."));
-            let bundles = resources.bundles.lock().unwrap();
-            let bundle = &bundles[name];
-            assert_eq!(bundle.files.len(), count);
-            let path = bundle.directory.path().join(example);
-            assert_eq!(std::fs::read(&path).unwrap(), bundle.files[&path]);
-            let root = bundle.directory.path().to_path_buf();
-            drop(bundles);
-            assert!(read(&path).is_some());
-            let response = crate::tools::execute_tool(
-                "Read",
-                serde_json::json!({"file_path":path,"limit":4}),
-                workspace.path().to_str().unwrap(),
+        let prompt = resources
+            .prepare(
+                "dataviz",
+                "literal !`echo should-not-run` $ARGUMENTS 中文😀",
+                workspace.path(),
+                &directory,
             )
             .unwrap();
-            assert!(response["content"].as_str().unwrap().contains("1\t"));
-            assert!(response["lines"].as_u64().unwrap() > 4);
-            assert!(read(&root.join("../unregistered.txt")).is_none());
-            assert!(read(&root.join("not-in-manifest.md")).is_none());
-            assert!(crate::tools::resolve_path(
-                path.to_str().unwrap(),
-                workspace.path().to_str().unwrap()
-            )
-            .is_err());
-        }
+        assert!(prompt.contains("literal !`echo should-not-run` $ARGUMENTS 中文😀"));
+        assert!(!prompt.contains("official-skills-mq4AvY"));
+        assert!(!prompt.contains("Describe the available local instructions only."));
+        let example = directory.join("scripts/validate_palette.js");
+        assert_eq!(
+            std::fs::read(&example).unwrap().as_slice(),
+            embedded("dataviz", "scripts/validate_palette.js")
+        );
+        assert!(read(&example).is_some());
+        let response = crate::tools::execute_tool(
+            "Read",
+            serde_json::json!({"file_path":example,"limit":4}),
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(response["content"].as_str().unwrap().contains("1\t"));
+        assert!(response["lines"].as_u64().unwrap() > 4);
+        assert!(read(&directory.join("../unregistered.txt")).is_none());
+        assert!(read(&directory.join("not-in-manifest.md")).is_none());
+        assert!(crate::tools::resolve_path(
+            example.to_str().unwrap(),
+            workspace.path().to_str().unwrap()
+        )
+        .is_err());
         assert!(std::fs::read_dir(workspace.path())
             .unwrap()
             .next()
             .is_none());
-        let directories: Vec<_> = resources
-            .bundles
-            .lock()
-            .unwrap()
-            .values()
-            .map(|b| b.directory.path().to_path_buf())
-            .collect();
         drop(resources);
-        assert!(directories.iter().all(|path| !path.exists()));
+        assert!(read(&example).is_none());
+        assert!(example.exists());
     }
 }
