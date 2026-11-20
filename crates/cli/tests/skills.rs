@@ -319,6 +319,15 @@ async fn doctor_injects_real_snapshot_despite_bad_skill_and_respects_custom_over
         if prompt == "/doctor custom request" {
             std::fs::write(&bad, "CUSTOM_DOCTOR_INSTRUCTIONS $ARGUMENTS").unwrap();
         }
+        // Built-in skills default to off; /doctor is exercised here because the
+        // user enabled it.
+        let data = temp.path().join(format!("data-{index}"));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("skill-states.json"),
+            r#"{"skills":{"doctor":"user"}}"#,
+        )
+        .unwrap();
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
         command
             .current_dir(&workspace)
@@ -326,7 +335,7 @@ async fn doctor_injects_real_snapshot_despite_bad_skill_and_respects_custom_over
             .env("DOCTOR_FIXTURE_KEY", "fixture-not-secret")
             .args([
                 "--data-dir",
-                temp.path().join(format!("data-{index}")).to_str().unwrap(),
+                data.to_str().unwrap(),
                 "--base-url",
                 &endpoint,
                 "--api-format",
@@ -391,6 +400,15 @@ async fn doctor_sdk_manual_invocation_uses_shared_native_snapshot() {
         .route("/v1/chat/completions", post(respond))
         .with_state(requests.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    // Built-in skills default to off; /doctor is exercised because the user
+    // enabled it.
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("skill-states.json"),
+        r#"{"skills":{"doctor":"user"}}"#,
+    )
+    .unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .current_dir(temp.path())
@@ -398,7 +416,7 @@ async fn doctor_sdk_manual_invocation_uses_shared_native_snapshot() {
         .env("DOCTOR_FIXTURE_KEY", "fixture-not-secret")
         .args([
             "--data-dir",
-            temp.path().join("data").to_str().unwrap(),
+            data.to_str().unwrap(),
             "--base-url",
             &endpoint,
             "--api-format",
@@ -586,8 +604,21 @@ fn skills_list_and_help_expose_the_embedded_task_template() {
     assert_eq!(matching.len(), 1);
     let skill = matching[0];
     assert_eq!(skill["source"], "bundled");
-    assert_eq!(skill["enabled"], true);
+    // Built-in skills ship disabled by default but stay listed with their state,
+    // and `enabled` agrees with that state.
+    assert_eq!(skill["state"], "off");
+    assert_eq!(skill["enabled"], false);
     assert_eq!(skill["files"][0]["name"], "SKILL.md");
+
+    let enabled = run(&["state", "task-template", "user"]);
+    assert!(enabled.contains("task-template  user"), "{enabled}");
+    let skills: Vec<Value> = serde_json::from_str(&run(&["list"])).unwrap();
+    let skill = skills
+        .iter()
+        .find(|skill| skill["name"] == "task-template")
+        .expect("task-template stays listed after enabling");
+    assert_eq!(skill["state"], "user");
+
     let help = run(&["help", "task-template"]);
     assert_eq!(
         help.trim_end(),
@@ -595,7 +626,11 @@ fn skills_list_and_help_expose_the_embedded_task_template() {
     );
     assert!(help.contains("name: task-template"));
     assert!(help.contains("requirement → evidence → unverified"));
-    assert!(!data.join("skills/bundled/task-template").exists());
+    let installed = data.join("skills/bundled/task-template/SKILL.md");
+    assert!(installed.exists());
+    let document = std::fs::read_to_string(installed).unwrap();
+    assert!(document.contains("user-invocable: true"));
+    assert!(document.contains("disable-model-invocation: false"));
 }
 
 #[test]
@@ -670,8 +705,17 @@ This skill provides utilities for:
     let files = creators[0]["files"].as_array().unwrap();
     assert!(files.iter().any(|file| file["name"] == "scripts"));
     assert!(files.iter().any(|file| file["name"] == "license.txt"));
-    assert!(!stub.exists());
-    assert!(data.join("skills/bundled/legacy-review/SKILL.md").exists());
+    assert!(stub.join("SKILL.md").exists());
+    assert!(!stub.join("agents").exists());
+    // The edited sibling belongs to the user and survives; pristine generated
+    // legacy skills are neither installed nor listed any more.
+    assert_eq!(
+        std::fs::read_to_string(data.join("skills/bundled/legacy-review/SKILL.md")).unwrap(),
+        "user sibling"
+    );
+    for name in ["build", "commit", "document", "test"] {
+        assert!(!data.join(format!("skills/bundled/legacy-{name}")).exists());
+    }
 
     let help = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
         .args([
@@ -694,4 +738,172 @@ This skill provides utilities for:
     assert!(text.contains("DeepSeek Code"));
     assert!(text.contains("NOTICE.md"));
     assert!(!text.contains("$CODEX_HOME"));
+}
+
+fn run_skills(data: &std::path::Path, args: &[&str]) -> Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
+        .args(["--data-dir", data.to_str().unwrap(), "skills"])
+        .args(args)
+        .env_remove("DEEPSEEK_CODE_DATA_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn listed_state(data: &std::path::Path, name: &str) -> String {
+    let skills = run_skills(data, &["list"]);
+    let skill = skills
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing from `dcl skills list`"))
+        .clone();
+    let state = skill["state"].as_str().unwrap().to_owned();
+    // `enabled` must agree with the effective state.
+    assert_eq!(skill["enabled"], state != "off", "{name}: {skill}");
+    state
+}
+
+#[test]
+fn disabled_builtins_keep_their_state_across_reinstall() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+
+    // A fresh data directory installs every built-in but only skill-creator is
+    // enabled; the rest are still listed with their state.
+    assert_eq!(listed_state(&data, "skill-creator"), "user");
+    for name in ["task-template", "docx", "pdf", "commit"] {
+        assert_eq!(listed_state(&data, name), "off", "{name}");
+        assert!(
+            data.join(format!("skills/bundled/{name}/SKILL.md")).is_file(),
+            "{name} must stay installed"
+        );
+    }
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "skills",
+            "state",
+            "docx",
+            "user",
+        ])
+        .env_remove("DEEPSEEK_CODE_DATA_DIR")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(listed_state(&data, "docx"), "user");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "skills",
+            "state",
+            "skill-creator",
+            "off",
+        ])
+        .env_remove("DEEPSEEK_CODE_DATA_DIR")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(listed_state(&data, "skill-creator"), "off");
+
+    // An upgrade rewrites the installed tree; the user's own choices stay.
+    std::fs::remove_dir_all(data.join("skills/bundled")).unwrap();
+    assert_eq!(listed_state(&data, "docx"), "user");
+    assert_eq!(listed_state(&data, "skill-creator"), "off");
+    assert_eq!(listed_state(&data, "task-template"), "off");
+    assert!(data.join("skills/bundled/docx/SKILL.md").is_file());
+}
+
+#[tokio::test]
+async fn disabled_builtins_are_absent_from_the_model_listing_but_stay_listed_with_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let data = temp.path().join("data");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/v1/chat/completions", post(respond))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
+    command
+        .current_dir(&workspace)
+        .env("CLAUDE_CONFIG_DIR", temp.path().join("empty-user-config"))
+        .env("SKILL_FIXTURE_KEY", "fixture-not-secret")
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--base-url",
+            &endpoint,
+            "--api-format",
+            "openai",
+            "--api-key-env",
+            "SKILL_FIXTURE_KEY",
+            "--model",
+            "fixture",
+            "--print",
+            "--",
+            "Say hello",
+        ])
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = requests.lock().unwrap()[0].clone();
+    let messages = request["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("system message");
+    // The listing travels in a reminder joined to the first user message so the
+    // session keeps the skills it started with; it must not return to the
+    // system prompt.
+    assert!(
+        !system.contains("Available skills"),
+        "the skill listing must stay out of the system prompt: {system}"
+    );
+    let first_user = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("first user message");
+    // Serialize the whole message so this works for both a joined string and
+    // per-reminder content parts.
+    let user_text = serde_json::to_string(first_user).unwrap();
+    let listing = user_text
+        .split_once("Available skills")
+        .expect("model skill listing in the first user message")
+        .1;
+    assert!(listing.contains("- skill-creator:"), "{listing}");
+    for name in ["task-template", "docx", "pdf", "commit"] {
+        assert!(
+            !listing.contains(&format!("- {name}:")),
+            "{name} must not reach the model listing: {listing}"
+        );
+    }
+    for name in ["task-template", "docx", "pdf", "commit"] {
+        assert_eq!(listed_state(&data, name), "off", "{name}");
+    }
+    server.abort();
 }

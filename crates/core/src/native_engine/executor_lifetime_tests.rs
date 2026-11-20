@@ -97,6 +97,7 @@ impl Fixture {
             provider_id: Some("fixture".into()),
             effort: None,
             system_prompt: Some("You are a fixture.".into()),
+            standalone_frontend: false,
             max_tokens: Some(64),
             max_turns: Some(1),
             response_schema: None,

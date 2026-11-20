@@ -219,7 +219,7 @@ impl BridgeServer {
         let analytics_dir = data_dir.join("analytics");
 
         let skill_manager = SkillsManager::with_path(skills_dir);
-        if let Err(e) = skill_manager.install_bundled_skills() {
+        if let Err(e) = skill_manager.ensure_installed() {
             tracing::error!(module = "Bridge", error = %e);
         }
 

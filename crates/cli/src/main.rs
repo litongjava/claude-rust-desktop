@@ -1,3 +1,5 @@
+#[macro_use]
+mod terminal_output;
 mod request_attempts;
 mod signals;
 // Local command output shares the terminal's display-only history.
@@ -6,7 +8,9 @@ macro_rules! command_eprintln {
         use std::io::IsTerminal as _;
         if std::io::stderr().is_terminal() {
             let _ = crate::terminal::print_recorded(&format!("{}\n", format_args!($($arg)*)));
-        } else { std::eprintln!($($arg)*); }
+        } else {
+            eprintln!($($arg)*);
+        }
     }};
 }
 macro_rules! command_println {
@@ -14,7 +18,7 @@ macro_rules! command_println {
         use std::io::IsTerminal as _;
         if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
             let _ = crate::terminal::print_recorded(&format!("{}\n", format_args!($($arg)*)));
-        } else { std::println!($($arg)*); }
+        } else { println!($($arg)*); }
     }};
 }
 mod account_commands;
@@ -138,11 +142,15 @@ async fn reload_skill_commands(
 
 /// Prints a turn or command error once, after removing an input box a
 /// finished turn left on screen for the prompt.
-fn report_error(error: &anyhow::Error) {
-    if !worker_frontend::already_presented(error) {
+fn report_error(error: anyhow::Error) -> Result<()> {
+    if error.is::<terminal_output::StdoutWriteFailed>() {
+        return Err(error);
+    }
+    if !worker_frontend::already_presented(&error) {
         terminal::release_handoff();
         command_eprintln!("Error: {error:#}");
     }
+    Ok(())
 }
 
 /// Tool calls nest deep futures. Windows gives the main thread a small stack and
@@ -151,6 +159,11 @@ fn report_error(error: &anyhow::Error) {
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn main() -> std::process::ExitCode {
+    cli_main(Cli::parse_with_mode_source)
+}
+
+fn cli_main(parse_cli: fn() -> Cli) -> std::process::ExitCode {
+    terminal_output::capture_terminals();
     // Internal managed-PTY roles are separate execs of this executable and must
     // run before the Tokio runtime, argument parsing or any database handle
     // exists. Nothing is printed for a normal start.
@@ -188,7 +201,7 @@ fn main() -> std::process::ExitCode {
         .name("dcl-main".into())
         .stack_size(MAIN_STACK_SIZE)
         .spawn(move || match build() {
-            Ok(runtime) => runtime.block_on(async_main()),
+            Ok(runtime) => runtime.block_on(async_main(parse_cli)),
             Err(error) => {
                 eprintln!("Starting the runtime: {error}");
                 std::process::ExitCode::FAILURE
@@ -202,7 +215,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn async_main() -> std::process::ExitCode {
+async fn async_main(parse_cli: fn() -> Cli) -> std::process::ExitCode {
     #[cfg(windows)]
     let _console_modes = terminal::screen_mode::ConsoleModes::capture();
     // Inside a sandbox with a domain allowlist: carry the proxy, then run the command.
@@ -255,7 +268,7 @@ async fn async_main() -> std::process::ExitCode {
         eprintln!("Error: {error}");
         return std::process::ExitCode::FAILURE;
     }
-    let mut cli = Cli::parse_with_mode_source();
+    let mut cli = parse_cli();
     if cli.agent_teams {
         std::env::set_var("DEEPSEEK_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
     }
@@ -264,7 +277,7 @@ async fn async_main() -> std::process::ExitCode {
     debug_logging::install(cli.verbose);
     let result = Box::pin(run(&mut cli)).await;
     terminal::release_handoff();
-    // A termination signal ends the process nonzero even when the interrupted
+    // A termination request ends the process nonzero even when the interrupted
     // command or prompt swallowed the turn's cancellation error.
     if signals::terminating() {
         if result.is_ok() {
@@ -673,7 +686,29 @@ async fn run(cli: &mut Cli) -> Result<()> {
             match action {
                 SkillsCommands::ImportLegacy { .. } => unreachable!(),
                 SkillsCommands::List => {
-                    println!("{}", serde_json::to_string_pretty(&skills)?);
+                    let states =
+                        deepseek_code_core::skills::states::load(&paths.data_dir);
+                    let listed = skills
+                        .iter()
+                        .map(|skill| {
+                            let bundled = skill.source
+                                == deepseek_code_core::skills::SkillSource::Bundled;
+                            let state = deepseek_code_core::skills::states::effective_in(
+                                &states,
+                                &skill.name,
+                                bundled,
+                            );
+                            let mut value = serde_json::to_value(skill)?;
+                            value["state"] = serde_json::Value::String(state.label().into());
+                            // `enabled` follows the effective state, so a built-in
+                            // that is off by default never reads as enabled.
+                            value["enabled"] = serde_json::Value::Bool(
+                                state != deepseek_code_core::skills::states::SkillState::Off,
+                            );
+                            Ok(value)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!("{}", serde_json::to_string_pretty(&listed)?);
                     return Ok(());
                 }
                 SkillsCommands::State { skill, state } => {
@@ -759,6 +794,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
         single || cli.output_format == OutputFormat::Text,
         "JSON output requires --print or query"
     );
+    #[cfg(unix)]
+    if !single {
+        signals::watch_terminal();
+    }
     let mut prompt = skill_prompt
         .or_else(|| match &cli.command {
             Some(Commands::Repl { prompt }) | Some(Commands::Query { prompt }) => prompt.clone(),
@@ -1029,13 +1068,13 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 if io::stderr().is_terminal() && !terminal::screen_reader() {
                     let mut history = terminal::scrollback::Scrollback::take();
                     terminal::prompt_display::write_recorded(
-                        &mut io::stderr(), &mut history, &prompt,
+                        &mut crate::terminal_output::stderr(), &mut history, &prompt,
                         crate::terminal::size().0.saturating_sub(1) as usize, false,
                     )?;
                     history.save();
                 } else {
                     terminal::prompt_display::write_submitted(
-                    &mut io::stderr(), &format!("{} ", terminal::prompt_glyph()), &prompt,
+                    &mut crate::terminal_output::stderr(), &format!("{} ", terminal::prompt_glyph()), &prompt,
                     crate::terminal::size().0.saturating_sub(1) as usize,
                     io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() && !terminal::screen_reader(), false,
                 )?;
@@ -1110,12 +1149,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 match background_commands::wake_for_notifications(cli, &mut session, &mut input).await {
                     Ok(true) => continue 'repl,
                     Ok(false) => {},
-                    Err(error) => report_error(&error),
+                    Err(error) => report_error(error)?,
                 }
             }
             if !session.waiting_for_continue() {
                 if let Some(prompt) = remote.take_deferred() {
-                    if let Err(error) = session.turn(cli, &prompt, &mut input).await { report_error(&error); }
+                    if let Err(error) = session.turn(cli, &prompt, &mut input).await { report_error(error)?; }
                 }
             }
             if let Err(error) = remote.sync(&session) { command_eprintln!("Remote Control: {error:#}"); }
@@ -1206,6 +1245,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         if let Err(error) = session.cycle_permission_mode().await { command_eprintln!("Permission mode: {error:#}"); }
                         continue 'repl;
                     },
+                    Err(_) if signals::terminating() => break 'repl,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                         if composer.is_pending() {
                             composer.cancel();
@@ -1216,6 +1256,8 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     },
                     Err(error) => return Err(error.into()),
                     Ok(None) => {
+                        #[cfg(unix)]
+                        signals::check_terminal_hangup();
                         if composer.is_pending() { command_eprintln!("Unfinished prompt discarded."); }
                         break 'repl;
                     }
@@ -1270,7 +1312,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     if !session.waiting_for_continue() && !composer.is_pending()
                         && deepseek_code_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session.id)
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
-                        if let Err(error) = session.wake_hooks(cli, &mut input).await { command_eprintln!("Hook wake: {error:#}"); }
+                        if let Err(error) = session.wake_hooks(cli, &mut input).await {
+                            if error.is::<terminal_output::StdoutWriteFailed>() { return Err(error); }
+                            command_eprintln!("Hook wake: {error:#}");
+                        }
                         continue 'repl;
                     }
                     if let Err(error) = session.sync_workspace() { command_eprintln!("Worktree: {error:#}"); }
@@ -1358,7 +1403,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     input.as_ref().expect("interactive reader").set_permission_mode(session.permission_mode());
                 },
                 // Idle Ctrl-C discards a draft and otherwise ends the prompt;
-                // SIGTERM/SIGHUP always stop the prompt after cleanup.
+                // Termination, including terminal loss, also stops the prompt.
                 _ = tokio::signal::ctrl_c() => {
                     if composer.is_pending() {
                         composer.cancel();
@@ -1374,7 +1419,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 terminal::prompt::Input::Cancelled => { command_eprintln!("Prompt discarded."); continue; },
                 terminal::prompt::Input::Prompt(prompt) => {
                     if !prompt.trim().is_empty() {
-                        if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input).await { report_error(&error); }
+                        if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input).await { report_error(error)?; }
                     }
                     continue;
                 },
@@ -1477,7 +1522,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             match background_commands::handle(cli, command, argument, &paths, &mut session, &mut input).await {
                 Ok(background_commands::Outcome::Handled) => continue,
                 Ok(background_commands::Outcome::Exit) => break,
-                Err(error) => { report_error(&error); continue; },
+                Err(error) => { report_error(error)?; continue; },
                 Ok(background_commands::Outcome::NotHandled) => {},
             }
             if command == "/scroll-speed" {
@@ -1499,7 +1544,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if command.starts_with("/mcp__") {
                 match mcp_prompts::expand(&session, command, argument).await {
                     Ok(Some(prompt)) => if let Err(error) = session.turn(cli, &prompt, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Ok(None) => {}
                     Err(error) => command_eprintln!("Error: {error:#}"),
@@ -1510,7 +1555,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 match repl_loop::run(argument, &mut loops) {
                     Ok(repl_loop::Outcome::Message(message)) => command_eprintln!("{message}"),
                     Ok(repl_loop::Outcome::Run(prompt)) => if let Err(error) = session.turn(cli, &prompt, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
                 }
@@ -1541,7 +1586,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if command == "/plan" {
                 match extended_commands::plan_task(argument, &paths, &mut session).await {
                     Ok(Some(task)) => if let Err(error) = session.turn(cli, &task, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
                     Ok(None) => {},
@@ -1552,7 +1597,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 match session_commands::handle(command, argument, &paths, &mut session).await {
                     Ok(_) if !argument.trim().is_empty() && !session_commands::is_goal_clear(argument) => {
                         if let Err(error) = session.turn(cli, argument.trim(), &mut input).await {
-                            report_error(&error);
+                            report_error(error)?;
                         }
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
@@ -1619,10 +1664,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     if let Err(error) = result { command_eprintln!("Tools: {error:#}"); }
                 },
                 command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {
-                    if let Err(error) = session.turn(cli, &line, &mut input).await { report_error(&error); }
+                    if let Err(error) = session.turn(cli, &line, &mut input).await { report_error(error)?; }
                 },
                 command if command.starts_with('/') => command_eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
-                _ => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input).await { report_error(&error); },
+                _ => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input).await { report_error(error)?; },
             }
         }
         if remote.is_connected() {
@@ -1634,7 +1679,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
         terminal::title::clear();
     }
     session
-        .end_hooks(if result.is_ok() && !single {
+        .end_hooks(if result.is_ok() && !single && !signals::terminating() {
             "prompt_input_exit"
         } else {
             "other"
@@ -1653,7 +1698,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
     drop(screen_mode);
     drop(_exit_cleanup);
     if resume_hint {
-        eprintln!("\nResume this session with:\ndcl --resume {}", session.id);
+        eprintln!(
+            "\nResume this session with:\ndcl --resume {}",
+            session.id
+        );
     }
     if let Some(launch) = restart_launch.take() {
         // The replacement inherits the session's current native root.

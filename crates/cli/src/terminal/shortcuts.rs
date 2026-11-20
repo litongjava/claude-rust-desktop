@@ -53,7 +53,7 @@ pub(crate) fn show(
     background: &[String],
     next: &mut dyn FnMut() -> io::Result<Option<Event>>,
 ) -> io::Result<()> {
-    let mut out = io::stderr();
+    let mut out = crate::terminal_output::stderr();
     run(context, background, next, &mut out)
 }
 

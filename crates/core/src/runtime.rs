@@ -164,13 +164,26 @@ pub fn create_engine(
     permissions: Arc<PermissionManager>,
     cache: Arc<FileCache>,
 ) -> NativeEngine {
-    NativeEngine::new(
+    let engine = NativeEngine::new(
         providers,
         db,
         paths.data_dir.join("workspaces"),
         permissions,
         cache,
-    )
+    );
+    // Old frozen files belong to abandoned sessions. Scan off the request path
+    // so engine startup and the first request are not delayed. A session that is
+    // starting now writes files with the current time, so the age check keeps it.
+    let prune_root = paths.data_dir.clone();
+    let _ = std::thread::Builder::new()
+        .name("session-file-prune".to_owned())
+        .spawn(move || {
+            crate::prompt::prune_session_files(
+                &prune_root,
+                crate::prompt::SESSION_FILE_MAX_AGE,
+            )
+        });
+    engine
 }
 
 pub fn default_permissions() -> Arc<PermissionManager> {

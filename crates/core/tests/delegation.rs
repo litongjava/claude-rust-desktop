@@ -138,6 +138,7 @@ async fn run_case(cancel: bool, team: bool) {
             provider_id: Some("local".into()),
             effort: None,
             system_prompt: None,
+            standalone_frontend: false,
             max_tokens: Some(1000),
             workspace_path: Some(workspace),
             temperature: None,

@@ -627,11 +627,14 @@ pub async fn run(
     let (requests_sender, mut requests) = mpsc::channel::<Control>(16);
     let (authenticated, mut handshakes) = mpsc::channel::<(uuid::Uuid, Channel)>(8);
     let mut filter = QueryFilter::default();
-    let mut stdout = std::io::stdout();
+    let mut stdout = crate::terminal_output::stdout();
     let mut size_check = tokio::time::interval(Duration::from_millis(250));
     let mut output_open = true;
     let code = loop {
         tokio::select! {
+            // Both callers exit the relay process with this code. Closing its
+            // PTY handles delivers hangup to the session-owning child.
+            _ = crate::signals::termination() => break 1,
             chunk = output.recv(), if output_open => match chunk {
                 Some(chunk) => host.output(&chunk, &mut filter, &mut stdout),
                 None => output_open = false,

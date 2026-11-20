@@ -5,6 +5,7 @@ pub mod tools;
 pub mod toolscript;
 pub mod research;
 pub mod prompt;
+mod session_files;
 pub mod mcp;
 pub mod streaming;
 pub mod task;
