@@ -1,4 +1,4 @@
-//! MemEx - Infinite Memory Engine for Claude Desktop (Tauri)
+//! MemEx - Infinite Memory Engine for DeepSeek Code (Tauri)
 //!
 //! Provides: semantic search, auto-ingest, context compression
 //! Backend: persistent local SQLite, or an optional MemEx HTTP service

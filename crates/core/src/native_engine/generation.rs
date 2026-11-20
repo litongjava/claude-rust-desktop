@@ -1416,11 +1416,23 @@ pub async fn generate_for_session(
     input: &str,
     session: Option<&str>,
 ) -> Result<String> {
+    generate_for_session_purpose(provider, system, input, session, "main").await
+}
+
+/// Generation with an explicit purpose so auxiliary requests are identifiable
+/// on the wire (for example prompt suggestions) without changing their body.
+pub async fn generate_for_session_purpose(
+    provider: ResolvedProvider,
+    system: &str,
+    input: &str,
+    session: Option<&str>,
+    purpose: &str,
+) -> Result<String> {
     generate_with_options(
         provider,
         system,
         input,
-        super::request_options::RequestOptions::for_session(session),
+        super::request_options::RequestOptions::for_session(session).with_purpose(purpose),
     )
     .await
 }

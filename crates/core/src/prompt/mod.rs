@@ -1301,6 +1301,15 @@ mod tests {
         skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
         set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
         set_changes(root, session, "skills", &["deploy".to_owned()]);
+        std::fs::write(
+            crate::session_files::environment_file(
+                root,
+                session,
+                crate::session_files::SUGGESTION_SUFFIX,
+            ),
+            b"{}",
+        )
+        .unwrap();
         let snapshot = crate::session_files::mcp_snapshot_file(root, session);
         std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
         std::fs::write(snapshot, b"{}").unwrap();

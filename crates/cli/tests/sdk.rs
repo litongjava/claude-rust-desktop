@@ -1,4 +1,6 @@
 //! End-to-end SDK tests run the actual CLI process against local model servers.
+#[path = "sdk/prompt_suggestion.rs"]
+mod prompt_suggestion;
 #[path = "sdk/toolscript_approval.rs"]
 mod toolscript_approval;
 #[path = "sdk/interrupt_usage.rs"]
@@ -573,9 +575,15 @@ fn responses_tool_call(id: &str, name: &str, arguments: Value) -> String {
 }
 
 fn responses_text(text: &str) -> String {
+    responses_text_with_usage(
+        text,
+        json!({"input_tokens":20,"output_tokens":10,"total_tokens":30}),
+    )
+}
+fn responses_text_with_usage(text: &str, usage: Value) -> String {
     [
         json!({"type":"response.output_text.delta","delta":text}),
-        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}),
+        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":usage}}),
     ]
     .into_iter()
     .map(responses_frame)
@@ -2545,9 +2553,9 @@ SKILL_SENTINEL",
 
 #[tokio::test]
 async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
-    let server = Server::start(false, Mode::Text).await;
+    let server = prompt_suggestion::Endpoint::start("chat").await;
     let root = tempfile::tempdir().unwrap();
-    let mut client = Client::start(root.path(), &server, &[]);
+    let mut client = server.client(root.path(), &[]);
     client
         .send(initialize_request(
             "init",
@@ -2571,11 +2579,11 @@ async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
     let result = client.result().await;
     assert_eq!(result["is_error"], false, "{result}");
     let suggestion = client.frame("prompt_suggestion").await;
-    assert_eq!(suggestion["suggestion"], "suggested-next");
+    assert_eq!(suggestion["suggestion"], "run the checks");
     assert_eq!(suggestion["session_id"], result["session_id"]);
     {
-        let requests = server.fixture.requests.lock().unwrap();
-        let first = requests[0].to_string();
+        let requests = server.requests.lock().unwrap();
+        let first = &requests[0].1;
         assert!(first.contains("MAIN_AGENT_SYSTEM_SENTINEL"), "{first}");
         assert!(first.contains("INITIAL_PROMPT_SENTINEL"), "{first}");
     }

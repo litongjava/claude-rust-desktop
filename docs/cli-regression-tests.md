@@ -870,6 +870,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `crates/cli/src/signals.rs`、`crates/cli/src/main.rs` 的信号处理：Q，以及 B（运行中排队与撤回）、E3（`Esc` 中断当前一轮）
 - `crates/cli/src/session.rs`、`worker_frontend.rs`、`sdk.rs`、`compaction.rs` 的取消分支：Q，以及 L 的取消场景和 SDK 测试
 - `tools/apply_patch*.rs`、`tools/mod.rs` 的 ApplyPatch 注册与分发、`services/checkpoints.rs` 的补丁记录、`native_engine/model_tool_output.rs`：ApplyPatch 一节的三条命令，并在真实终端确认多文件补丁的改动摘要和 `unrestored` 提示
+- `native_engine/{command_output_summary,bash_test_summary,model_tool_output}.rs`、`tools/{bash_process,background_shell}.rs` 的捕获与分页、`config/command_output.rs` 和 CLI 的摘要设置：执行下面“长命令输出摘要”的模型请求、设置和捕获回归。
 - `runtime.rs`、`db/message_repo.rs`（发给模型的历史）：D2、E5，以及 SDK 测试
 - `db/mod.rs`（`write_tx`）：`cargo test --locked -p deepseek-code-core --lib db::write_tx`（重试、非争用不重试、超时报 label、失败不留半行）与 `cargo test --locked -p deepseek-code-core --test session_concurrency`。真实争用复验：用 `VACUUM INTO` 复制数据库，`DEEPSEEK_CODE_DATA_DIR` 指向副本，另一个进程 `BEGIN IMMEDIATE` 占锁 8 秒，期间跑一轮带工具调用的请求，确认回合完成、日志有重试告警、工具行与快照完整；再占锁 40 秒，确认回合以带 label 的错误结束（不是裸 `database is locked`），且没有半成品工具行。
 - `db/message_repo.rs` 的请求快照去重（`request_blobs` / `*Ref`）：`cargo test --locked -p deepseek-code-core --lib db::message_repo`（同头只存一份、往返字段一致、旧内联行可读、缺 blob 不伪造、不修改调用方数据）、`cargo test --locked -p deepseek-code-core --test compaction_status_regressions` 与 `cargo test --locked -p deepseek-code-cli --bin dcl status_commands_tests`。历史数据不会自动回填：要缩小现有库需另跑一次性回填脚本并 `VACUUM`，验证方法是回填前后比较 `requests_json` 总字节、`request_blobs` 行数，并抽 3 条消息确认 `get_request_snapshots` 往返一致。
@@ -893,6 +894,22 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
 - 其他范围：至少跑 E
+
+## 长命令输出摘要
+
+```bash
+cargo test --locked -p deepseek-code-core --lib -- native_engine::tool_loop::model_output:: capture_counts_original_bytes_and_lines_through_lossy_truncation job_task_get_keeps_raw_sizes_across_the_blocking_page_read tools::output_page::tests:: command_output_opt_out_resolves_each_source_independently command_output_summary_defaults_on_and_can_be_disabled job_task_get_pages_event_output_without_duplicates completed_job_report_is_a_bounded_snapshot_and_refuses_a_cursor running_job_with_previous_assistant_report_pages_current_output task_get_pages_ task_get_without_page_fields_keeps_the_full_snapshot
+cargo test --locked -p deepseek-code-cli --test taskget_background --test taskget_backends
+cargo check --locked -p deepseek-code-desktop --all-targets
+```
+
+- 摘要缺省开启。用 `dcl config set summarize_long_command_output false`（可加全局 `--data-dir`）写入所选数据目录的 `settings.json`，CLI、SDK 和使用同一数据目录的 Desktop 共用此设置。任意来源明确设置 `false` 即关闭，其他位置的 `true` 无法覆盖。JSON 支持顶层或 `tools` 对象内的键，来源为数据目录的 `settings.json`、`config.json`、`customization.json` 及工作区的 `.claude/settings.json`、`.claude/settings.local.json`。TOML 支持 `[tools]`（或顶层）的同名键，读取数据目录的 `config/orchestration.toml` 及工作区和进程目录对应的 `config/orchestration.toml`、`src-tauri/config/orchestration.toml`、`../config/orchestration.toml`。启动时加载的 TOML 变更后可重启；`DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT=false` 同样关闭。
+- Bash（含 PowerShell）和后台 TaskGet 快照、分页合计 stdout/stderr 的原始字节，达到 12,000 字节才附加摘要。工具截断不单独触发摘要。PTY/ConPTY 控制台任务保留原结果。用 11,999 和 12,000 字节的无效 UTF-8 输入跨过门槛，核对真实模型请求中的快照和分页。完整短输出（包括 44 字节的字面占位符）应与关闭摘要时逐字节一致。
+- 用同一后台命令的快照和页验证：`seq -f 'row-%04.0f-diagnostic' 0 599` 的 600 行在快照的 `output`、`result`、`stdout` 中有多份，合并可见区间后没有省略项。重复内容跨多个片段时按源坐标去重；字节按原始宽度，整行数只计完全不可见的行。
+- 用 `printf '%012000d' 0; kill -TERM "$$"` 验证 TaskGet 保留信号 15；直接用 `exit 143` 验证正常非零退出。前台失败状态只出现一次。完全可见的流、头尾、已显示的标记行及小于 10 秒的耗时不添加说明。
+- `Omitted output:` 最多附五条带行号的隐藏标记行。生成双流、转义文本和无效 UTF-8，测试 9,999/10,000 毫秒边界、跨截断的源行、已有 spill 路径、无省略时逐字节保持原消息，以及 16,000 字节预算。
+- 回放跨捕获缺口或 stdout/stderr 的真实 libtest 输出、相互矛盾的 pytest/Jest footer。摘要只引用来源可核对的原文，不计算任何测试计数或推断结果。固定种子生成双流、伪 footer、随机内容、无效 UTF-8 和随机截断边界；逐一校验行号、引文、原始字节数、行数和 16,000 字节消息预算。
+- 本地 OpenAI 和 Anthropic mock 覆盖普通调用、后台 TaskGet、恢复/分叉、手动压缩与关闭设置。核对原始事件、SQLite 记录、分页文本和游标；摘要仅出现在模型副本。
 
 ## Shell 配置回归
 
@@ -1505,3 +1522,11 @@ cargo test --locked -p deepseek-code-cli --test initial_user_message --test inte
 - `registry_print_with_hook_prompt_publishes_incarnation`（Linux）：同样的 print 设置加 `--output-format json`，同步 SessionStart 命令钩子返回 `{"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"ROUND06_GATE"}}`，标准输入为空、argv 无提示；现有模型门控捕获到 `ROUND06_GATE` 时断言恰好一条 Open 前端行；放行后退出 0、同一会话一个成功 JSON 结果、模型请求恰好一次，且该实例 `Closed`。
 
 未运行/未验证（不得由上述自动化推断）：`resume_saved` 提交后钩子取消的运行时用例（与 clear 共用同一辅助函数，仅有源码级证据）；初始启动钩子取消仍传播错误的运行时用例（仅保留源码中的错误传播调用）；挂起场景下的 `SessionStart hooks cancelled`（后台取消分支）；B/D/E 交互式交棒矩阵；与 main 的集成合并；macOS/Windows PTY 与信号语义；voice 真实音频。
+
+### I39 提示建议与主会话缓存
+
+- `cargo test --locked -p deepseek-code-core --lib suggestion::` 验证五分钟时限、缓存未命中、各协议追加消息的格式，以及独立文件的替换、接受、历史校验和删除。`prompt::tests::prune_removes_old_files_and_keeps_recent_ones` 同时检查 30 天清理。
+- `cargo test --locked -p deepseek-code-cli --test sdk prompt_suggestion` 使用本机 HTTP mock。对比 Chat、Anthropic Messages 和 Responses 两次 POST 的原始字节，只去掉新追加的一条用户消息。检查建议的工具调用被丢弃、设置关闭后跳过、恢复只发一条事件且无 HTTP 请求、其他进程续聊后旧建议失效。
+- 用交互终端连接本机 mock，主回复报告缓存命中。确认输入框出现灰字，退出并恢复同一会话，再次出现同一条灰字且请求计数不变。按 Tab 接受后退出，再次恢复应无灰字。检查会话消息只含用户实际提交的内容和主回复。
+
+I39 第二轮：在本地 HTTP 服务上挂起上轮建议，再从同一 SDK 或另一进程提交新回合。下一回合可立即进入；返回 503 后不得重发旧前缀。Linux 单回合前台 Worker 在建议应答前应完成前台任务并释放租约。以目录内置 ID 指向自定义 Responses/Gemini 地址时，零缓存读取只发主请求。用 `cargo test --locked -p deepseek-code-cli --test sdk prompt_suggestion` 和 `cargo test --locked -p deepseek-code-core --lib suggestion::` 检查。记录目录的 Round 2 脚本另覆盖首发前等待录制锁、域名映射与跨进程切换绑定。
