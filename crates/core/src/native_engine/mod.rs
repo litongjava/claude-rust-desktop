@@ -10,7 +10,7 @@ pub mod tool_loop;
 #[cfg(not(target_os = "android"))]
 pub mod toolscript_job;
 pub mod request_trace;
-mod request_identity;
+pub(crate) mod request_identity;
 pub mod request_options;
 pub mod token_counter;
 pub mod task_context;

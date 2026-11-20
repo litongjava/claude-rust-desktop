@@ -360,9 +360,10 @@ impl OpenAIClient {
             }
         }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(
+        let identity = super::request_identity::RequestIdentity::from_options(
             None,
-            super::request_identity::is_opencode(provider),
+            provider,
+            &self.request_options,
         );
         let request = || async {
             let request = self
@@ -550,7 +551,7 @@ impl OpenAIClient {
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
         if let Some(capture) = context_capture { capture.record("openai-completions", &body, provider.model.context_window, max_tokens).await; }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(context_capture, provider, &self.request_options);
         let client = if budget.is_single_post() {
             self.single_post_client()?
         } else {

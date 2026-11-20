@@ -6033,6 +6033,7 @@ impl ToolLoopExecutor {
                                 options,
                                 conversation_messages.clone(),
                                 self.system_prompt.as_deref().unwrap_or(""),
+                                self.conv_id.as_deref(),
                             )
                             .await?;
                         if let Some(record) = &mut record {

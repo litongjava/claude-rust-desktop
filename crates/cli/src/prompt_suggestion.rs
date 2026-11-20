@@ -84,11 +84,12 @@ pub fn spawn(
     tokio::spawn(async move {
         let generated = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            deepseek_code_core::native_engine::generation::generate_for_session(
+            deepseek_code_core::native_engine::generation::generate_for_session_purpose(
                 provider,
                 SYSTEM,
                 &input,
                 Some(&session),
+                "suggestion",
             ),
         )
         .await;

@@ -79,7 +79,7 @@ pub(super) fn prompt_cache_key() -> Option<String> {
     )
 }
 
-pub(super) struct RequestIdentity {
+pub(crate) struct RequestIdentity {
     headers: HeaderMap,
     attempt: AtomicU32,
 }
@@ -88,9 +88,63 @@ impl RequestIdentity {
     pub(super) fn id(&self) -> &str {
         self.headers["x-request-id"].to_str().expect("generated request ID")
     }
+
+    /// Identity for a normal model request. The session in the options is a
+    /// fallback for auxiliary requests that run outside a turn scope.
+    pub(super) fn from_options(
+        capture: Option<&super::request_context::ContextCapture>,
+        provider: &ResolvedProvider,
+        options: &super::request_options::RequestOptions,
+    ) -> Self {
+        Self::build(
+            capture,
+            is_opencode(provider),
+            &options.purpose,
+            options.session_id.as_deref(),
+            options
+                .recording
+                .as_ref()
+                .and_then(|context| context.parent_session_id.as_deref()),
+            options.model_request_id.as_deref(),
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn new(
         capture: Option<&super::request_context::ContextCapture>,
         opencode: bool,
+        purpose: &str,
+    ) -> Self {
+        Self::build(capture, opencode, purpose, None, None, None)
+    }
+
+    /// Identity for a model request that may run outside a turn scope, such as
+    /// native compaction or provider search. A task-local turn still wins over
+    /// the explicit values, matching requests made during a live turn.
+    pub(crate) fn for_explicit(
+        provider: &ResolvedProvider,
+        purpose: &str,
+        session: Option<&str>,
+        parent: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Self {
+        Self::build(
+            None,
+            is_opencode(provider),
+            purpose,
+            session,
+            parent,
+            request_id,
+        )
+    }
+
+    fn build(
+        capture: Option<&super::request_context::ContextCapture>,
+        opencode: bool,
+        purpose: &str,
+        explicit_session: Option<&str>,
+        explicit_parent: Option<&str>,
+        explicit_request_id: Option<&str>,
     ) -> Self {
         let mut headers = HeaderMap::new();
         let mut set = |name: &'static str, value: &str| {
@@ -125,20 +179,35 @@ impl RequestIdentity {
             .and_then(|c| c.event.as_ref())
             .and_then(|(_, snapshot)| snapshot["id"].as_str())
             .map(str::to_owned)
+            .or_else(|| explicit_request_id.map(str::to_owned))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         set("x-request-id", &request_id);
         set("x-client-request-id", &request_id);
+        set("x-dcl-request-kind", &request_kind(purpose));
         let mut session = None;
+        let mut parent = None;
+        let mut turn = None;
         let _ = TURN.try_with(|identity| {
-            if let Some(current) = &identity.session {
-                set("x-dcl-session-id", current);
-                session = Some(current.clone());
-            }
-            if let Some(parent) = &identity.parent {
-                set("x-parent-session-id", parent);
-            }
-            set("x-dcl-turn-id", &identity.turn);
+            session = identity.session.clone();
+            parent = identity.parent.clone();
+            turn = Some(identity.turn.clone());
         });
+        // An explicit session is only a fallback: a live turn always owns the
+        // request identity, even when awareness of the session differs.
+        if session.is_none() {
+            session = explicit_session.map(str::to_owned);
+            parent = parent.or_else(|| explicit_parent.map(str::to_owned));
+        }
+        let parent = parent.filter(|id| Some(id) != session.as_ref());
+        if let Some(current) = &session {
+            set("x-dcl-session-id", current);
+        }
+        if let Some(parent) = &parent {
+            set("x-parent-session-id", parent);
+        }
+        if let Some(turn) = &turn {
+            set("x-dcl-turn-id", turn);
+        }
         // OpenCode requires a routing session on every request, including
         // connection tests that run before a conversation exists.
         if opencode {
@@ -150,13 +219,32 @@ impl RequestIdentity {
         }
     }
 
-    pub(super) fn headers(&self) -> HeaderMap {
+    pub(crate) fn headers(&self) -> HeaderMap {
         let mut headers = self.headers.clone();
         headers.insert(
             "x-dcl-retry-count",
             HeaderValue::from(self.attempt.fetch_add(1, Ordering::Relaxed)),
         );
         headers
+    }
+}
+
+/// Wire kind for the request. Conversation turns stay `turn`; a purpose with a
+/// token-shaped name is forwarded so an operator can group auxiliary requests
+/// without guessing. Anything else becomes `other` and is never sent verbatim.
+fn request_kind(purpose: &str) -> String {
+    match purpose.trim() {
+        "" | "main" | "subagent" | "turn" => "turn".into(),
+        purpose
+            if !purpose.is_empty()
+                && purpose.len() <= 32
+                && purpose
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) =>
+        {
+            purpose.replace('_', "-")
+        }
+        _ => "other".into(),
     }
 }
 
