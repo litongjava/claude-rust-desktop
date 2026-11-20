@@ -388,16 +388,20 @@ pub(crate) async fn search_with_options(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| anyhow!("Could not initialize the provider search HTTP client."))?;
+    let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
+        provider,
+        "web-search",
+        options.session_id.as_deref(),
+        options
+            .recording
+            .as_ref()
+            .and_then(|context| context.parent_session_id.as_deref()),
+        options.model_request_id.as_deref(),
+    );
     let mut request = client
         .post(url)
         .headers(options.headers(provider)?)
-        .header(
-            "x-request-id",
-            options
-                .model_request_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        )
+        .headers(identity.headers())
         .header("accept", "application/json")
         .bearer_auth(&api_key)
         .json(&request_body(selected, query, &provider.model.id));
@@ -407,7 +411,7 @@ pub(crate) async fn search_with_options(
             request = request.header("x-api-key", &api_key);
         }
     }
-    let mut response = crate::native_engine::request_recording::send(request, &options, provider, selected.api_format(), false).await.map_err(|e| if e.is_timeout() {
+    let mut response = crate::native_engine::request_recording::send(request, &options, provider, selected.api_format(), false).await.map_err(|e| if e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {
         anyhow!("Provider WebSearch timed out after 45 seconds.")
     } else { anyhow!("Could not reach the configured provider's native search API. Check its endpoint and connection.") })?;
     if !response.status().is_success() {

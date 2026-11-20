@@ -73,8 +73,8 @@ pub struct PromptEditor {
     transcript: Vec<crate::terminal::change_view::Line>,
     transcript_printed: bool,
     /// Suggested next prompts, generated after a turn; Tab accepts one.
-    suggestions: Option<std::sync::mpsc::Receiver<String>>,
-    suggestion: Option<String>,
+    suggestions: Option<std::sync::mpsc::Receiver<Option<crate::prompt_suggestion::Ghost>>>,
+    suggestion: Option<crate::prompt_suggestion::Ghost>,
     /// Project root for `@` file completion, and its files once listed.
     workspace: Option<std::path::PathBuf>,
     files: Option<Vec<String>>,
@@ -1124,7 +1124,10 @@ impl PromptEditor {
     pub fn set_todos(&mut self, todos: Box<dyn Fn() -> Vec<(String, String)> + Send>) {
         self.todos = Some(todos);
     }
-    pub fn set_suggestions(&mut self, suggestions: std::sync::mpsc::Receiver<String>) {
+    pub fn set_suggestions(
+        &mut self,
+        suggestions: std::sync::mpsc::Receiver<Option<crate::prompt_suggestion::Ghost>>,
+    ) {
         self.suggestions = Some(suggestions);
     }
     pub fn set_keybindings(&mut self, bindings: crate::keybindings::Keybindings) {
@@ -1246,9 +1249,6 @@ impl PromptEditor {
         self.suggestion = None;
         // Files may have changed since the last prompt; list them again on `@`.
         self.files = None;
-        if let Some(suggestions) = &self.suggestions {
-            while suggestions.try_recv().is_ok() {}
-        }
         loop {
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
@@ -1295,7 +1295,7 @@ impl PromptEditor {
             }
             if let Some(suggestions) = &self.suggestions {
                 while let Ok(suggestion) = suggestions.try_recv() {
-                    self.suggestion = Some(suggestion);
+                    self.suggestion = suggestion;
                 }
             }
             // Tasks start during turns, after this prompt set its counts, so the
@@ -1326,7 +1326,11 @@ impl PromptEditor {
                 }
             }
             let text = buffer.text();
-            let ghost = self.suggestion.clone().filter(|_| buffer.chars.is_empty());
+            let ghost = self
+                .suggestion
+                .as_ref()
+                .filter(|_| buffer.chars.is_empty())
+                .map(|g| g.saved.text.clone());
             let mention_query = mention(&text)
                 .filter(|_| buffer.cursor == buffer.chars.len())
                 .map(str::to_owned);
@@ -2388,7 +2392,9 @@ impl PromptEditor {
                         .as_ref()
                         .filter(|_| matches!(key.code, KeyCode::Tab | KeyCode::Right) && !control)
                     {
-                        buffer.insert(suggestion);
+                        if self.suggestion.as_ref().is_some_and(|g| g.accept()) {
+                            buffer.insert(suggestion);
+                        }
                         self.suggestion = None;
                         continue;
                     }

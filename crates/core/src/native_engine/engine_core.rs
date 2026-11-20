@@ -864,7 +864,7 @@ impl QueryEngine {
         request: ChatRequest,
         save_response: bool,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, false, None)
+        self.send_with_origin(request, save_response, false, None, None)
             .await
     }
 
@@ -874,7 +874,7 @@ impl QueryEngine {
         request: ChatRequest,
         save_response: bool,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, true, None)
+        self.send_with_origin(request, save_response, true, None, None)
             .await
     }
 
@@ -887,7 +887,7 @@ impl QueryEngine {
         save_response: bool,
         lease: std::sync::Arc<crate::services::session_messages::ExecutionLease>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, false, Some(lease))
+        self.send_with_origin(request, save_response, false, Some(lease), None)
             .await
     }
 
@@ -898,7 +898,18 @@ impl QueryEngine {
         save_response: bool,
         lease: std::sync::Arc<crate::services::session_messages::ExecutionLease>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, true, Some(lease))
+        self.send_with_origin(request, save_response, true, Some(lease), None)
+            .await
+    }
+
+    /// A CLI turn can retain its final provider request for a single follow-up.
+    pub async fn send_with_suggestion_capture(
+        &self,
+        request: ChatRequest,
+        lease: Option<Arc<crate::services::session_messages::ExecutionLease>>,
+        capture: Option<super::suggestion::SuggestionCapture>,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        self.send_with_origin(request, false, false, lease, capture)
             .await
     }
 
@@ -908,6 +919,7 @@ impl QueryEngine {
         save_response: bool,
         hook_wake: bool,
         execution_lease: Option<std::sync::Arc<crate::services::session_messages::ExecutionLease>>,
+        suggestion: Option<super::suggestion::SuggestionCapture>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
         // Every submission owns the session for its whole attempt. A host that
         // already acquired (CLI, SDK, Desktop SSE) shares that same `Arc`; an
@@ -1695,6 +1707,7 @@ impl QueryEngine {
         // including the cleanup after the public MessageStop. The host shares
         // this same lease; the last remaining owner performs the explicit
         // unlock. The engine must not drop its reference early.
+        executor.suggestion = suggestion;
         executor.execution_lease = execution_lease;
         executor.share_owned_child_budget();
 

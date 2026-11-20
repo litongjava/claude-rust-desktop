@@ -1521,3 +1521,11 @@ cargo test --locked -p deepseek-code-cli --test initial_user_message --test inte
 - `registry_print_with_hook_prompt_publishes_incarnation`（Linux）：同样的 print 设置加 `--output-format json`，同步 SessionStart 命令钩子返回 `{"hookSpecificOutput":{"hookEventName":"SessionStart","initialUserMessage":"ROUND06_GATE"}}`，标准输入为空、argv 无提示；现有模型门控捕获到 `ROUND06_GATE` 时断言恰好一条 Open 前端行；放行后退出 0、同一会话一个成功 JSON 结果、模型请求恰好一次，且该实例 `Closed`。
 
 未运行/未验证（不得由上述自动化推断）：`resume_saved` 提交后钩子取消的运行时用例（与 clear 共用同一辅助函数，仅有源码级证据）；初始启动钩子取消仍传播错误的运行时用例（仅保留源码中的错误传播调用）；挂起场景下的 `SessionStart hooks cancelled`（后台取消分支）；B/D/E 交互式交棒矩阵；与 main 的集成合并；macOS/Windows PTY 与信号语义；voice 真实音频。
+
+### I39 提示建议与主会话缓存
+
+- `cargo test --locked -p deepseek-code-core --lib suggestion::` 验证五分钟时限、缓存未命中、各协议追加消息的格式，以及独立文件的替换、接受、历史校验和删除。`prompt::tests::prune_removes_old_files_and_keeps_recent_ones` 同时检查 30 天清理。
+- `cargo test --locked -p deepseek-code-cli --test sdk prompt_suggestion` 使用本机 HTTP mock。对比 Chat、Anthropic Messages 和 Responses 两次 POST 的原始字节，只去掉新追加的一条用户消息。检查建议的工具调用被丢弃、设置关闭后跳过、恢复只发一条事件且无 HTTP 请求、其他进程续聊后旧建议失效。
+- 用交互终端连接本机 mock，主回复报告缓存命中。确认输入框出现灰字，退出并恢复同一会话，再次出现同一条灰字且请求计数不变。按 Tab 接受后退出，再次恢复应无灰字。检查会话消息只含用户实际提交的内容和主回复。
+
+I39 第二轮：在本地 HTTP 服务上挂起上轮建议，再从同一 SDK 或另一进程提交新回合。下一回合可立即进入；返回 503 后不得重发旧前缀。Linux 单回合前台 Worker 在建议应答前应完成前台任务并释放租约。以目录内置 ID 指向自定义 Responses/Gemini 地址时，零缓存读取只发主请求。用 `cargo test --locked -p deepseek-code-cli --test sdk prompt_suggestion` 和 `cargo test --locked -p deepseek-code-core --lib suggestion::` 检查。记录目录的 Round 2 脚本另覆盖首发前等待录制锁、域名映射与跨进程切换绑定。
