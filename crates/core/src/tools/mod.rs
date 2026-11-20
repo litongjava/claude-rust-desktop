@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
+mod base64_collapse;
 mod lsp;
 mod notebook;
 pub mod plan_import;
