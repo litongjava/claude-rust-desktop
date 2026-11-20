@@ -122,7 +122,7 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 
 注意事项：
 
-- 每轮用新的数据目录，测试结束后结束自己启动的进程。
+- 每轮用新的数据目录。启动前安排清理，正常退出、断言失败及超时都要终止并等待回收自己启动的 dcl。关闭 PTY 或停止 tmux 后仍要检查进程，必要时按已确认的进程身份强制结束并回收。
 - `until` 等待的文字如果也出现在自己输入的提示词里，会立刻匹配成功，这时后面的输入会变成运行中发送。等待模型回复时要选提示词里没有的文字，或用固定等待。
 - 不要用 `pkill -f "某段文字"`，它会连当前 shell 一起结束。
 - 用外部 `kill` 命令结束进程组时，负数 PID 前必须加 `--`（`kill -9 -- -123456`）。Debian 的 procps `kill -9 -123456` 会被解析成 `kill(-1, SIGKILL)`，结束当前用户的全部进程，包括 tmux 和正在运行的 dcl。代码里优先直接调用 `rustix::process::kill_process_group`；`external_kill_never_takes_a_negative_pid_without_separator` 会检查源码。
@@ -347,6 +347,21 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- signals::
 
 `interrupt_signals` 的六个用例分别覆盖 Bash+SIGTERM、Bash+SIGHUP、Codex+SIGTERM、启动中的 Codex 只收到一次 SIGINT，以及两条夹具回归（清理过程中的晚 fork、错误继承 token 的重设）。前三个用例确认取消与进程树清理，第四个用例覆盖“事件处理间隙”：`run_timed_turn` 在函数开始时创建一次 `signals::interrupt_scope()`，信号基线在创建时同步取得；改回每次 `tokio::select!` 新建 `signals::interrupted()` 时，若 Ctrl-C 在 select 结束、事件处理（stream-json 输出、transcript 写入）期间到达，下一次等待会把已经加一的计数当作自己的基线，信号丢失，回合继续。该用例用 `fcntl(F_SETPIPE_SZ, 4096)` 请求 4 KiB 的 dcl stdout 管道容量，再用 `F_GETPIPE_SZ` 读回实际容量并断言其为正、≤ 65536 且小于填充记录的长度（大页宿主机可能把请求向上取整，所以断言针对读回值），接着用 110 KB 的 prompt 让 `tool_start` 记录远超该容量，使 dcl 阻塞在事件处理的同步写入中；在此时只发一次 SIGINT，dcl 必须在 10 秒内以非零状态退出，且假 codex 启动器及其 `sleep 120` 子进程都不存活。夹具进程的环境里带有按运行生成的 token：假 codex 启动器发现自己的 token 不是本轮的准确值就 `exec` 重设（pid 不变），所有后代继承该值，因此调用方环境里的旧 token 不会让整棵进程树变得不可发现。发信号前用例还要求启动器和子进程都出现在按 token 的发现结果里（标记文件本身不能替代该前置条件）。清理按 token 扫描 `/proc/<pid>/environ` 找到进程，先打开 pidfd 再复核 token，只用该描述符发送 SIGKILL，因此扫描之后被复用的 pid 不会被误杀；清理服从单一 2 秒截止（晚 fork 用例用自己的有界预算），只有成功扫描连续为空满 150 ms 才算成功，否则在结果中报告 “cleanup deadline expired before an empty interval was confirmed”，不会因为最后一次扫描恰好为空就当作干净。僵尸（`Z`/`X`）不计入残留，产品断言前有 2 秒回收等待，且该断言先于任何守卫清理执行，否则会掩盖产品回归。dcl 由 `child.wait()` 回收后不再另行 kill。两条夹具回归分别验证：`cleanup_rescans_for_a_child_forked_after_discovery` 在第一次快照之后才释放被门控的启动器，就地用 pidfd 固定已被 token 认证的晚 fork 子进程，之后要求后续扫描发现并停掉它，并以“pidfd 报告进程已消失或 `Z`/`X` 状态”判定它不再运行（孤儿僵尸不算存活）；`the_launcher_replaces_a_wrong_inherited_token` 用每次运行唯一的错误 token 启动，并为该 stale token 单独创建一个守卫，即使启动器的重设回归也不会让 `sleep 120` 逃逸。两条独立夹具在启动任何进程之前都先预检 pidfd 能力。**该用例与上述夹具仅限 Linux 的 x86_64/aarch64 64 位目标**（pidfd 系统调用号 434/424、`/proc` 与 Linux 的单个参数长度上限；指针宽度排除 x32/ILP32 变体），启动夹具前先用自身进程预检 pidfd 能力，缺失时以明确信息失败。把它换回旧的每次新建等待时该用例会失败（旧代码挂起直到超时），用于确认测试覆盖该缺陷。`signals::tests` 另外覆盖平台无关的通知语义：多个等待者同时唤醒、旧信号不唤醒新等待者（新 scope 不继承旧信号）、终止信号在等待者出现前到达仍被记住、Ctrl-C 不触发进程退出、scope 在首次 poll 之前或两次等待之间收到的信号不会丢失、同一 scope 连续两次等待都报告已观察到的中断、计数器回绕（从 `u64::MAX` 起）仍能检测、`rearm()` 之后只等待下一个信号，以及注入的部分注册失败会在第一个错误处停止。worker 观察循环另有两条真实信号用例（Linux）：`worker_frontend::failure_tests::a_sigint_during_a_tick_cancels_the_worker` 在子进程里运行真实的 `observe`，先把 stderr 管道用 `F_SETPIPE_SZ` 请求 4 KiB、断言读回值低于 200000 字节，并 `OBSERVER-NOTICE-` 处停止读取，使观察者阻塞在 tick 的同步输出里（此时不轮询 select），再发一次 SIGINT，放开管道后要求任务目录出现 `cancel`——若把 scope 建在循环内部，这次信号会丢失，用例失败；`a_termination_does_not_make_the_observer_spin` 在 SIGTERM 后确认 `cancel` 出现，并比较 1 秒前后 `/proc/<pid>/stat` 的 utime+stime，确认粘性终止信号不会让循环空转。
 
+#### Q1. Linux PTY 断开
+
+```bash
+cargo test --locked -p deepseek-code-cli --bin dcl --test standalone -- close_during_streaming_output redirected_output --nocapture
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry terminal_hangup:: -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl -- --ignored --exact terminal_output::tests::redirected_output_file_eio_screen_reader_turn
+cargo test --locked -p deepseek-code-cli --bin dcl -- --ignored --exact terminal_output::tests::screen_reader_partial_write_and_full_session_volume
+```
+
+用隔离数据目录和本地 mock 在 Linux PTY 启动交互式 CLI。分别在空闲、回合中、启动确认界面及等待光标位置时关闭 master，并单独发送 SIGHUP 和空闲 SIGTERM。关闭非控制 PTY 时不会收到内核 SIGHUP，也必须取消。每次最多等 5 秒，使用 `wait4` 核对关闭阶段的 CPU 时间小于 700 毫秒，退出码为 1；空闲和回合中检查 frontend 注册记录已关闭，回合中检查用户消息及取消状态已写入数据库。 两个流式回归分别在读屏 stdout 和普通渲染 stderr 写入阻塞时断开 PTY，独立检查所有线程均未 panic、完整 assistant 增量已保存、SessionEnd 收到同一会话的 other 原因，以及退出耗时和 CPU 上限。
+
+重定向对照覆盖控制 PTY、另一个已挂断的 PTY、普通文件和 `/dev/full` 配置确认。读屏回合的 ENOSPC 与定向注入文件 EIO，以及输出路径与干净基线的比较脚本，见开发记录 `dev-support/deepseek-code/pty-hangup-20261119/report.md` 的 Round 4。
+
+共享卷用例需要可在普通用户下创建 tmpfs 的 `bwrap` 和 `strace`（可用 `STRACE` 指定路径）。用例创建独立的 16 MiB tmpfs，在模型回复前留下 32 KiB，核对 stdout 和 SQLite WAL 都出现 ENOSPC、回复只写入一部分、进程以 1 退出且未再提示输入。仅 WAL 写满与普通 flush 失败的基线对照见同一记录的 Round 5。
+
 ### I. 定时任务
 
 1. 让模型创建每分钟运行的 `CronCreate` 任务：空闲时按时触发，显示 `⏰ Scheduled:` 并得到回答。
@@ -550,10 +565,16 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 ### O2. 内置 task-template
 
 1. `cargo test --locked -p deepseek-code-core --lib skills::bundled::tests::task_template_` 应运行三项测试。用共享解析器检查 YAML frontmatter，验证发现、渲染和只读内置清单，共用的 `SKILL.md` 不落盘，同名用户技能仍优先。清单和展开正文只在决定把实质性工作交给 `Agent`、队友或后台代理时推荐此技能，并明确略过普通后台 shell 命令。
-2. 用独立数据目录、空 `CLAUDE_CONFIG_DIR` 和本地模拟接口启动 `dcl`。首个请求的 `Available skills` 应恰好列出一个 `task-template`，描述包含 `Agent`、队友和后台代理。模拟接口发起 `Skill` 调用后，第二个请求的工具结果应包含传入的任务参数和四段说明（问题、具体改动、验证方式、报告），并要求按 `requirement → evidence → unverified` 记录。
-3. 在真实终端输入 `/task-template <任务>`，确认本地模拟接口收到展开的任务参数及同一套四段说明。
-4. `cargo test --locked -p deepseek-code-cli --test skills` 覆盖全新数据目录的 `dcl skills list` 和 `dcl skills help task-template`，内置条目恰好一项，帮助内容与清单相同。Desktop 自定义技能清单走同一个 `SkillsManager`。
+2. 内置技能默认关闭。全新数据目录的第一个请求中，`Available skills` 只应包含默认启用的 `skill-creator`（装了 CodeGraph 时再加 `codegraph`），不应包含 `task-template`。先执行 `dcl skills state task-template user`，再用空 `CLAUDE_CONFIG_DIR` 和本地模拟接口启动 `dcl`：`Available skills` 应列出一个 `task-template`，描述包含 `Agent`、队友和后台代理。模拟接口发起 `Skill` 调用后，第二个请求的工具结果应包含传入的任务参数和四段说明（问题、具体改动、验证方式、报告），并要求按 `requirement → evidence → unverified` 记录。
+3. 在同一数据目录执行上面的启用命令后，在真实终端输入 `/task-template <任务>`，确认本地模拟接口收到展开的任务参数及同一套四段说明。
+4. `cargo test --locked -p deepseek-code-cli --test skills` 覆盖全新数据目录的 `dcl skills list` 和 `dcl skills help task-template`。即使默认关闭，`list` 仍列出该条目并把 `state` 标为 `off`，`help` 仍可读取内容；启用后 `state` 变为 `user`。Desktop 自定义技能清单走同一个 `SkillsManager`。
 5. `cargo test --locked -p deepseek-code-cli --test sdk sdk_agent_fields_reach_the_child_request -- --exact` 覆盖 SDK `initialize.agents[].skills`。OpenAI 和 Anthropic 两个本地模拟协议均接受 `task-template` 并把说明预载到子代理请求中。
+
+### O3. 内置技能默认状态与安装速度
+
+1. 全新数据目录中只有 `skill-creator` 默认启用；`codegraph` 仅当 `PATH` 上能找到可执行的 `codegraph`（Windows 也接受 `codegraph.cmd` / `codegraph.exe`）时默认启用；其余内置技能在 `dcl skills list` 中以 `state: "off"` 出现，但不在模型的 `Available skills` 中，模型调用被拒绝。用户可通过 `dcl skills state <NAME> user|off`、`/plugins` 面板或 Desktop 面板启用。
+2. 用户的显式选择写入 `<数据目录>/skill-states.json`，升级或重新安装 `<数据目录>/skills/bundled` 后保持不变；删除内置文件后再次运行任何列出/开始会话命令会重新安装它们，但不会重置状态。
+3. 安装器先用临时文件加 rename 写完全部文件，再对每个发生变化的目录 fsync 一次，最后原子写安装记录（记录文件与目录单独 fsync）。`cargo test --locked -p deepseek-code-core --lib skills::bundled_install` 覆盖首次安装、同版本空操作、升级保留用户编辑、删除未改动文件和二进制资源；自动测试不能代替真实磁盘上的耗时测量。
 
 ### 不经模型的 /doctor 子命令
 
@@ -849,6 +870,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `crates/cli/src/signals.rs`、`crates/cli/src/main.rs` 的信号处理：Q，以及 B（运行中排队与撤回）、E3（`Esc` 中断当前一轮）
 - `crates/cli/src/session.rs`、`worker_frontend.rs`、`sdk.rs`、`compaction.rs` 的取消分支：Q，以及 L 的取消场景和 SDK 测试
 - `tools/apply_patch*.rs`、`tools/mod.rs` 的 ApplyPatch 注册与分发、`services/checkpoints.rs` 的补丁记录、`native_engine/model_tool_output.rs`：ApplyPatch 一节的三条命令，并在真实终端确认多文件补丁的改动摘要和 `unrestored` 提示
+- `native_engine/{command_output_summary,bash_test_summary,model_tool_output}.rs`、`tools/{bash_process,background_shell}.rs` 的捕获与分页、`config/command_output.rs` 和 CLI 的摘要设置：执行下面“长命令输出摘要”的模型请求、设置和捕获回归。
 - `runtime.rs`、`db/message_repo.rs`（发给模型的历史）：D2、E5，以及 SDK 测试
 - `db/mod.rs`（`write_tx`）：`cargo test --locked -p deepseek-code-core --lib db::write_tx`（重试、非争用不重试、超时报 label、失败不留半行）与 `cargo test --locked -p deepseek-code-core --test session_concurrency`。真实争用复验：用 `VACUUM INTO` 复制数据库，`DEEPSEEK_CODE_DATA_DIR` 指向副本，另一个进程 `BEGIN IMMEDIATE` 占锁 8 秒，期间跑一轮带工具调用的请求，确认回合完成、日志有重试告警、工具行与快照完整；再占锁 40 秒，确认回合以带 label 的错误结束（不是裸 `database is locked`），且没有半成品工具行。
 - 共享数据库启动争用：在默认 DELETE 日志模式的空库上持有 `BEGIN IMMEDIATE` 8 秒，启动 `dcl sessions list`，释放后应成功并迁移至 WAL。在已初始化的库上重复测试，同时启动 8 个客户端，全部应成功。将持锁时间延长至 61 秒，客户端应在约 60 秒以带 SQLite 原因的锁超时退出。另在初始化之后持锁，覆盖无项目 Code 会话的目录回写、模型和提供商、标题、Git 工作树绑定，以及没有运行中回合时的执行租约探测。对应测试见 `startup_contention_tests`、`git_worktree_binding_waits_for_writer_after_init`、`projectless_code_resume_waits_for_another_writer` 和 `db::write_tx_tests`。共享权限管理器的双写入顺序由 `session_permission_mode` 测试验证。
@@ -872,6 +894,22 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
 - 其他范围：至少跑 E
+
+## 长命令输出摘要
+
+```bash
+cargo test --locked -p deepseek-code-core --lib -- native_engine::tool_loop::model_output:: capture_counts_original_bytes_and_lines_through_lossy_truncation job_task_get_keeps_raw_sizes_across_the_blocking_page_read tools::output_page::tests:: command_output_opt_out_resolves_each_source_independently command_output_summary_defaults_on_and_can_be_disabled job_task_get_pages_event_output_without_duplicates completed_job_report_is_a_bounded_snapshot_and_refuses_a_cursor running_job_with_previous_assistant_report_pages_current_output task_get_pages_ task_get_without_page_fields_keeps_the_full_snapshot
+cargo test --locked -p deepseek-code-cli --test taskget_background --test taskget_backends
+cargo check --locked -p deepseek-code-desktop --all-targets
+```
+
+- 摘要缺省开启。用 `dcl config set summarize_long_command_output false`（可加全局 `--data-dir`）写入所选数据目录的 `settings.json`，CLI、SDK 和使用同一数据目录的 Desktop 共用此设置。任意来源明确设置 `false` 即关闭，其他位置的 `true` 无法覆盖。JSON 支持顶层或 `tools` 对象内的键，来源为数据目录的 `settings.json`、`config.json`、`customization.json` 及工作区的 `.claude/settings.json`、`.claude/settings.local.json`。TOML 支持 `[tools]`（或顶层）的同名键，读取数据目录的 `config/orchestration.toml` 及工作区和进程目录对应的 `config/orchestration.toml`、`src-tauri/config/orchestration.toml`、`../config/orchestration.toml`。启动时加载的 TOML 变更后可重启；`DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT=false` 同样关闭。
+- Bash（含 PowerShell）和后台 TaskGet 快照、分页合计 stdout/stderr 的原始字节，达到 12,000 字节才附加摘要。工具截断不单独触发摘要。PTY/ConPTY 控制台任务保留原结果。用 11,999 和 12,000 字节的无效 UTF-8 输入跨过门槛，核对真实模型请求中的快照和分页。完整短输出（包括 44 字节的字面占位符）应与关闭摘要时逐字节一致。
+- 用同一后台命令的快照和页验证：`seq -f 'row-%04.0f-diagnostic' 0 599` 的 600 行在快照的 `output`、`result`、`stdout` 中有多份，合并可见区间后没有省略项。重复内容跨多个片段时按源坐标去重；字节按原始宽度，整行数只计完全不可见的行。
+- 用 `printf '%012000d' 0; kill -TERM "$$"` 验证 TaskGet 保留信号 15；直接用 `exit 143` 验证正常非零退出。前台失败状态只出现一次。完全可见的流、头尾、已显示的标记行及小于 10 秒的耗时不添加说明。
+- `Omitted output:` 最多附五条带行号的隐藏标记行。生成双流、转义文本和无效 UTF-8，测试 9,999/10,000 毫秒边界、跨截断的源行、已有 spill 路径、无省略时逐字节保持原消息，以及 16,000 字节预算。
+- 回放跨捕获缺口或 stdout/stderr 的真实 libtest 输出、相互矛盾的 pytest/Jest footer。摘要只引用来源可核对的原文，不计算任何测试计数或推断结果。固定种子生成双流、伪 footer、随机内容、无效 UTF-8 和随机截断边界；逐一校验行号、引文、原始字节数、行数和 16,000 字节消息预算。
+- 本地 OpenAI 和 Anthropic mock 覆盖普通调用、后台 TaskGet、恢复/分叉、手动压缩与关闭设置。核对原始事件、SQLite 记录、分页文本和游标；摘要仅出现在模型副本。
 
 ## Shell 配置回归
 

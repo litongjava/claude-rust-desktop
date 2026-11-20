@@ -152,10 +152,21 @@ pub(crate) fn recall_queued(
 // Attempt data is published only after optional recovery has settled.
 #[derive(Default)]
 struct TurnCompletion {
+    // Keep the original print failure even if saving the transcript, finishing
+    // the turn timer, or publishing the result also fails.
+    stdout_failure: Option<crate::terminal_output::StdoutWriteFailed>,
     status: Option<deepseek_code_core::db::turn_repo::TurnStatus>,
     failure: Option<Value>,
     sdk_result: Option<Value>,
     requests: Vec<Value>,
+}
+
+impl TurnCompletion {
+    fn remember_stdout_failure(&mut self, error: &anyhow::Error) {
+        if let Some(failure) = error.downcast_ref::<crate::terminal_output::StdoutWriteFailed>() {
+            self.stdout_failure.get_or_insert_with(|| failure.clone());
+        }
+    }
 }
 
 /// Fill the same SDK contract for completed attempts and setup/recovery errors.
@@ -1466,10 +1477,22 @@ impl Session {
                 Ok(Some(followup)) => next = followup,
                 Ok(None) => break,
                 Err(error) => {
-                    deepseek_code_core::services::goal_proposals::discard(
+                    let discarded = deepseek_code_core::services::goal_proposals::discard(
                         &self.store.db,
                         &self.id,
-                    )?;
+                    );
+                    if error.is::<crate::terminal_output::StdoutWriteFailed>() {
+                        if let Some(goal) = goal {
+                            let _ = deepseek_code_core::services::session_goals::pause(
+                                &self.store.db,
+                                &self.id,
+                                &goal.id,
+                                &error.to_string(),
+                            );
+                        }
+                        return Err(error);
+                    }
+                    discarded?;
                     if let Some(goal) = goal {
                         if crate::session_commands::retryable_goal_error(
                             &error,
@@ -1597,6 +1620,26 @@ impl Session {
         initial_hook: bool,
         publish: bool,
     ) -> Result<()> {
+        let mut completion = TurnCompletion::default();
+        let result = self
+            .run_and_finalize_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut completion)
+            .await;
+        match completion.stdout_failure {
+            Some(failure) => Err(failure.into()),
+            None => result,
+        }
+    }
+
+    async fn run_and_finalize_turn(
+        &self,
+        cli: &Cli,
+        prompt: &str,
+        input: &mut Option<TerminalInput>,
+        hook_wake: bool,
+        initial_hook: bool,
+        publish: bool,
+        completion: &mut TurnCompletion,
+    ) -> Result<()> {
         // Own the session before the turn becomes visible, and keep that
         // ownership until the turn is persisted. The engine only borrows a clone
         // while it runs, so a terminal that resumes during compaction, hooks or
@@ -1611,12 +1654,11 @@ impl Session {
         };
         let mut turn =
             deepseek_code_core::db::turn_repo::TurnTimer::start(self.store.db.clone(), &self.id)?;
-        let mut completion = TurnCompletion::default();
         let mut recovery_requests = Vec::new();
         let mut result = async {
-            let first = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, &mut completion, turn_lease.clone()).await;
+            let first = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, completion, turn_lease.clone()).await;
             match first {
-                Err(error) if !hook_wake && !initial_hook && crate::session_commands::is_context_overflow(&error) => {
+                Err(error) if completion.stdout_failure.is_none() && !hook_wake && !initial_hook && crate::session_commands::is_context_overflow(&error) => {
                     recovery_requests.extend(completion.requests.iter().cloned());
                     if let Err(log_error) = crate::request_attempts::record(&self.paths.data_dir, &self.id, &json!({
                         "type":"request_turn_attempt_end", "turnId":turn.record().turn_id,
@@ -1641,11 +1683,11 @@ impl Session {
                         }
                         Ok(true) => {
                             let previous = completion.sdk_result.take();
-                            completion = TurnCompletion::default();
+                            *completion = TurnCompletion::default();
                             // Retrying after compaction stays inside this turn and
                             // keeps its ownership; a failure here would mean the
                             // lease was lost, so it must not be ignored.
-                            let result = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, &mut completion, turn_lease.clone()).await;
+                            let result = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, completion, turn_lease.clone()).await;
                             completion.sdk_result = Some(merge_attempt_results(previous, completion.sdk_result.take()));
                             result
                         }
@@ -1711,7 +1753,7 @@ impl Session {
             )
             .map(|cost| cost["known_subtotal_usd"].as_f64().unwrap_or(0.0))
             .unwrap_or(0.0);
-            let mut payload = complete_sdk_result(completion.sdk_result, cost);
+            let mut payload = complete_sdk_result(completion.sdk_result.take(), cost);
             payload["session_id"] = json!(self.id);
             payload["subtype"] = json!(crate::sdk_messages::result_subtype(error.as_deref()));
             payload["is_error"] = json!(result.is_err());
@@ -1817,7 +1859,6 @@ impl Session {
         if let Some(goal) = crate::session_commands::goal_prompt(self)? {
             system.push_str(&goal);
         }
-        system.push_str("\nThe user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.\n");
         let cwd = &self.workspace;
         let mut checkpoint = if hook_wake {
             None
@@ -1907,6 +1948,7 @@ impl Session {
             },
             effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
             system_prompt: Some(system),
+            standalone_frontend: true,
             max_tokens: cli.max_tokens,
             max_turns: cli.max_turns.map(|limit| {
                 turn_goal.as_ref().map_or(limit, |g| {
@@ -2066,6 +2108,9 @@ impl Session {
                         continue;
                     },
                     action = progress.action() => {
+                        if action.is_none() && crate::signals::terminating() {
+                            bail!("Interrupted");
+                        }
                         match action.context("Live terminal input closed")? {
                             crate::terminal::live::Action::CyclePermission => {
                                 match self.cycle_permission_mode().await {
@@ -2152,7 +2197,16 @@ impl Session {
                 match event {
                     EngineEvent::Text(delta) => {
                         let delta = if std::mem::take(&mut separate_text) && !text.is_empty() && !text.ends_with('\n') { format!("\n\n{delta}") } else { delta };
-                        text.push_str(&delta); if publish && cli.output_format == OutputFormat::Text { progress.before_text(&delta); if !progress.is_live() { print!("{delta}"); io::stdout().flush()?; } } },
+                        text.push_str(&delta);
+                        if publish && cli.output_format == OutputFormat::Text {
+                            progress.before_text(&delta);
+                            if !progress.is_live() {
+                                let mut out = crate::terminal_output::stdout_locked();
+                                out.write_all(delta.as_bytes()).map_err(crate::terminal_output::stream_write_error)?;
+                                out.flush()?;
+                            }
+                        }
+                    },
                     EngineEvent::Thinking(delta) => {
                         thinking_text.push_str(&delta);
                         progress.record_thinking(&delta);
@@ -2175,7 +2229,15 @@ impl Session {
                     EngineEvent::MessageStop { full_text, stop_reason } => {
                         stop = stop_reason.clone();
                         if structured_output { text = full_text.clone(); }
-                        if text.is_empty() && !full_text.is_empty() { if publish && cli.output_format == OutputFormat::Text { progress.before_text(&full_text); if !progress.is_live() { print!("{full_text}"); } } text = full_text; }
+                        if text.is_empty() && !full_text.is_empty() {
+                            text = full_text;
+                            if publish && cli.output_format == OutputFormat::Text {
+                                progress.before_text(&text);
+                                if !progress.is_live() {
+                                    crate::terminal_output::stdout_locked().write_all(text.as_bytes()).map_err(crate::terminal_output::stream_write_error)?;
+                                }
+                            }
+                        }
                         if stop_reason.as_deref().is_some_and(|s| ["error", "panic", "stream_error", "interrupted", "failed", "cancelled", "max_iterations", "budget_warning", "max_tokens", "length", "incomplete"].contains(&s)) {
                             error.get_or_insert_with(|| format!("Turn stopped: {}", stop_reason.unwrap()));
                         }
@@ -2494,7 +2556,7 @@ impl Session {
                 }
             }
             Ok(())
-        }.await;
+        }.await.inspect_err(|error| completion.remember_stdout_failure(error));
         progress.clear();
         if let Some(translator) = sdk_messages.as_mut() {
             translator.finish()?;
@@ -2651,8 +2713,15 @@ impl Session {
             }
         }
         let transport_cancelled = turn_result.as_ref().err().is_some_and(is_turn_cancel_error);
-        if let Err(failure) = turn_result {
-            error = Some(failure.to_string());
+        if let Err(failure) = &turn_result {
+            // Finalization includes the diagnostic in the CLI/SDK result. Keep
+            // terminal loss recognizable as a cancellation across that boundary.
+            error = Some(if failure.downcast_ref::<io::Error>().is_some_and(crate::terminal_output::is_disconnected)
+            {
+                format!("Interrupted by terminal loss: {failure}")
+            } else {
+                failure.to_string()
+            });
         }
         if !completed && error.is_none() {
             error = Some("Incomplete response".into());
@@ -2746,12 +2815,15 @@ impl Session {
                     .filter(|failure| !failure.is_null())
                     .cloned()
             });
+        // A failed print already ended display for this turn. Keep its original
+        // error while the remaining finalizers and SessionEnd hook run.
+        let fatal_write = completion.stdout_failure.is_some();
         if publish || error.is_some() {
             match cli.output_format {
                 OutputFormat::Text => {
-                    if !progress.is_live() {
-                        println!();
-                        io::stdout().flush()?;
+                    if !fatal_write && !progress.is_live() && (input.is_none() || !crate::signals::terminating()) {
+                        crate::terminal_output::finish_stream_line()
+                            .inspect_err(|error| completion.remember_stdout_failure(error))?;
                     }
                 }
                 _ => {
@@ -2850,6 +2922,9 @@ impl Session {
                 "Executor for session {} is still cleaning up; the session remains owned.",
                 self.id
             ),
+        }
+        if fatal_write {
+            return turn_result;
         }
         if let Some(error) = error {
             if cli.output_format != OutputFormat::Text {

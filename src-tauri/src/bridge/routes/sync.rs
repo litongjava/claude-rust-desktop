@@ -317,6 +317,10 @@ async fn sync_push(
 
         match result {
             Ok(Ok(Ok(()))) => {
+                deepseek_code_core::prompt::forget_session_files(
+                    state.data_dir.as_ref(),
+                    deleted_id,
+                );
                 tracing::info!("Sync Deleted conversation: {}", deleted_id);
             }
             Ok(Ok(Err(db_err))) => {

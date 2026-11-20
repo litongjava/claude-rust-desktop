@@ -1,9 +1,11 @@
 //! Per-skill states stored in `<data dir>/skill-states.json`.
 //!
 //! A skill without an entry gets its default state: [`SkillState::User`], except
-//! the bundled translation skills, which default to [`SkillState::UserOnly`].
-//! Existing installations therefore keep their previous behavior until the user
-//! changes a state.
+//! the bundled translation skills, which default to [`SkillState::UserOnly`],
+//! and installed built-in skills, which default to [`SkillState::Off`] except
+//! `skill-creator` and `codegraph` when CodeGraph is installed. Existing
+//! installations therefore keep a stored user choice until the user changes it,
+//! while a built-in the user never touched follows the current defaults.
 use crate::skills::discovery::SkillCommand;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -92,7 +94,8 @@ pub fn load(data_dir: &Path) -> BTreeMap<String, SkillState> {
 /// Skills that ship hidden from the model: the user calls them by name.
 const USER_ONLY_BY_DEFAULT: [&str; 2] = ["translate-zh-en", "translate-en-zh"];
 
-/// The state a skill has when the states file does not mention it.
+/// The state a skill outside the built-in tree has when the states file does
+/// not mention it.
 pub fn default_state(name: &str) -> SkillState {
     if USER_ONLY_BY_DEFAULT.contains(&name) {
         SkillState::UserOnly
@@ -101,12 +104,78 @@ pub fn default_state(name: &str) -> SkillState {
     }
 }
 
-/// The stored state, or the skill's default.
+/// The default for one installed built-in skill.
+///
+/// Built-ins stay off unless they are part of the always-available toolkit or
+/// depend on a tool the user actually installed. A stored state always wins
+/// over this function, so a user choice survives upgrades and reinstallation.
+pub fn bundled_default_state(name: &str) -> SkillState {
+    match name {
+        "skill-creator" => SkillState::User,
+        "codegraph" if codegraph_installed() => SkillState::User,
+        _ => SkillState::Off,
+    }
+}
+
+/// Whether a `codegraph` executable is on `PATH`.
+pub fn codegraph_installed() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|directory| {
+        codegraph_names()
+            .iter()
+            .any(|name| executable(&directory.join(name)))
+    })
+}
+
+fn codegraph_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["codegraph", "codegraph.exe", "codegraph.cmd", "codegraph.bat"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["codegraph"]
+    }
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// The stored state, or the default for a skill outside the built-in tree.
 pub fn effective(states: &BTreeMap<String, SkillState>, name: &str) -> SkillState {
-    states
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| default_state(name))
+    effective_in(states, name, false)
+}
+
+/// The stored state, or the default for a built-in skill when `bundled`.
+pub fn effective_in(
+    states: &BTreeMap<String, SkillState>,
+    name: &str,
+    bundled: bool,
+) -> SkillState {
+    states.get(name).copied().unwrap_or_else(|| {
+        if bundled {
+            bundled_default_state(name)
+        } else {
+            default_state(name)
+        }
+    })
 }
 
 pub fn get(data_dir: &Path, name: &str) -> SkillState {
@@ -135,13 +204,28 @@ pub fn set(data_dir: &Path, name: &str, state: SkillState) -> Result<()> {
     Ok(())
 }
 
-/// Apply stored states to the merged command map. Names the file does not
-/// mention still get their default, so skills that ship user-only stay hidden
-/// from the model until the user changes them.
+/// Apply stored states to a command map that contains only non-built-in
+/// skills. Names the file does not mention still get their default.
 pub fn apply(commands: &mut BTreeMap<String, SkillCommand>, states: &BTreeMap<String, SkillState>) {
+    apply_in(commands, states, None);
+}
+
+/// Apply stored states to the merged command map. A command under
+/// `bundled_root` follows [`bundled_default_state`] until the user stores a
+/// state for it; every other command keeps the non-built-in defaults.
+pub fn apply_in(
+    commands: &mut BTreeMap<String, SkillCommand>,
+    states: &BTreeMap<String, SkillState>,
+    bundled_root: Option<&Path>,
+) {
     let names: Vec<String> = commands.keys().cloned().collect();
     for name in names {
-        match effective(states, &name) {
+        let bundled = bundled_root.is_some_and(|root| {
+            commands
+                .get(&name)
+                .is_some_and(|command| command.path.starts_with(root))
+        });
+        match effective_in(states, &name, bundled) {
             SkillState::Off => {
                 commands.remove(&name);
             }
@@ -160,6 +244,9 @@ pub fn apply(commands: &mut BTreeMap<String, SkillCommand>, states: &BTreeMap<St
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -287,5 +374,94 @@ mod tests {
         for label in ["off", "user", "name-only", "user-only"] {
             assert!(error.contains(label), "{error}");
         }
+    }
+
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl PathGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", value);
+            Self(previous)
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_defaults_disable_every_builtin_except_skill_creator_and_installed_codegraph() {
+        let _lock = PATH_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let empty = tempfile::tempdir().unwrap();
+        let _path = PathGuard::set(empty.path());
+
+        assert_eq!(bundled_default_state("skill-creator"), SkillState::User);
+        for name in ["codegraph", "docx", "task-template", "translate-zh-en"] {
+            assert_eq!(bundled_default_state(name), SkillState::Off, "{name}");
+        }
+        // The same names outside the built-in tree keep the old defaults.
+        assert_eq!(default_state("docx"), SkillState::User);
+        assert_eq!(default_state("translate-zh-en"), SkillState::UserOnly);
+
+        // A non-executable file on PATH is not an installed CodeGraph.
+        let codegraph = empty
+            .path()
+            .join(if cfg!(windows) { "codegraph.cmd" } else { "codegraph" });
+        std::fs::write(&codegraph, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codegraph, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(bundled_default_state("codegraph"), SkillState::Off);
+            std::fs::set_permissions(&codegraph, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(bundled_default_state("codegraph"), SkillState::User);
+    }
+
+    #[test]
+    fn bundled_paths_use_builtin_defaults_and_stored_states_win() {
+        let root = PathBuf::from("data").join("skills").join("bundled");
+        let mut docx = command("docx");
+        docx.path = root.join("docx/SKILL.md");
+        let mut creator = command("skill-creator");
+        creator.path = root.join("skill-creator/SKILL.md");
+        let mut commands = BTreeMap::from([
+            ("docx".to_owned(), docx),
+            ("skill-creator".to_owned(), creator),
+        ]);
+
+        apply_in(&mut commands, &BTreeMap::new(), Some(&root));
+        assert!(!commands.contains_key("docx"));
+        assert!(commands.contains_key("skill-creator"));
+
+        // A user skill with a built-in name is not forced off.
+        let mut user_docx = command("docx");
+        user_docx.path = PathBuf::from("data").join("skills").join("docx/SKILL.md");
+        let mut commands = BTreeMap::from([("docx".to_owned(), user_docx)]);
+        apply_in(&mut commands, &BTreeMap::new(), Some(&root));
+        assert!(commands.contains_key("docx"));
+
+        // A stored state always beats the built-in default.
+        let mut docx = command("docx");
+        docx.path = root.join("docx/SKILL.md");
+        let mut creator = command("skill-creator");
+        creator.path = root.join("skill-creator/SKILL.md");
+        let mut commands = BTreeMap::from([
+            ("docx".to_owned(), docx),
+            ("skill-creator".to_owned(), creator),
+        ]);
+        let states = BTreeMap::from([
+            ("docx".to_owned(), SkillState::User),
+            ("skill-creator".to_owned(), SkillState::Off),
+        ]);
+        apply_in(&mut commands, &states, Some(&root));
+        assert!(commands.contains_key("docx"));
+        assert!(!commands.contains_key("skill-creator"));
     }
 }

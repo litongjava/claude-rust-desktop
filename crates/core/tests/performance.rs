@@ -233,6 +233,7 @@ async fn shared_engine_routes_opt_in_and_preserves_explicit_provider() {
                 provider_id,
                 effort: None,
                 system_prompt: None,
+                standalone_frontend: false,
                 max_tokens: Some(100),
                 workspace_path: Some(dir.path().to_string_lossy().into()),
                 temperature: None,

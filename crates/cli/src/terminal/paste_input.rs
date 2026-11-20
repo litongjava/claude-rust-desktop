@@ -12,11 +12,19 @@ impl RawReader {
         Ok(Self)
     }
     pub fn next(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
-        if crossterm::event::poll(timeout)? {
-            crossterm::event::read().map(|event| Some(backspace_from_ctrl_h(event)))
-        } else {
-            Ok(None)
+        if crate::signals::terminating() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Terminal input stopped"));
         }
+        let result = match crossterm::event::poll(timeout) {
+            Ok(true) => crossterm::event::read().map(|event| Some(backspace_from_ctrl_h(event))),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        };
+        #[cfg(unix)]
+        if result.is_err() {
+            crate::signals::check_terminal_hangup();
+        }
+        result
     }
 }
 

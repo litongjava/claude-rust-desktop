@@ -89,6 +89,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub effort: Option<String>,
     pub system_prompt: Option<String>,
+    /// The standalone terminal is the frontend, so its constant facts travel in
+    /// the first user message as their own reminder.
+    #[serde(default)]
+    pub standalone_frontend: bool,
     pub max_tokens: Option<u32>,
     /// Per-request model/tool-loop budget. None keeps the configured default.
     #[serde(default)]
@@ -1029,10 +1033,10 @@ impl QueryEngine {
         )
         .await?;
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
+        let standalone_frontend = request.standalone_frontend;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
             prompt_profile,
-            Some(&workspace),
             &customization.system_prompt,
         ));
         let snapshot_root = plugin_context.paths.data_dir.clone();
@@ -1046,8 +1050,41 @@ impl QueryEngine {
             )
         })
         .await?;
+        // The environment and the date are frozen on the session's first
+        // request so a later date or runtime change cannot rewrite the first
+        // user message.
+        let environment_root = plugin_context.paths.data_dir.clone();
+        let environment_session = conv_id.clone();
+        let environment_workspace = workspace.clone();
+        let environment_project = project.as_ref().map(|project| {
+            (
+                project.name.clone(),
+                project
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let (environment, frozen_date) = tokio::task::spawn_blocking(move || {
+            let project = environment_project
+                .as_ref()
+                .map(|(name, folders)| (name.as_str(), folders.as_slice()));
+            (
+                crate::prompt::environment_for_session(
+                    &environment_root,
+                    &environment_session,
+                    Some(&environment_workspace),
+                    project,
+                ),
+                crate::prompt::date_for_session(&environment_root, &environment_session),
+            )
+        })
+        .await?;
         let workspace_path = workspace.to_string_lossy().into_owned();
         let mut discovered_skills = crate::services::plugins::skill_commands(&plugin_context)?;
+        crate::skills::SkillsManager::with_path(plugin_context.paths.data_dir.join("skills"))
+            .ensure_installed()?;
         discovered_skills.extend(crate::skills::discovery::discover(
             &plugin_context.paths.data_dir,
             &workspace,
@@ -1059,9 +1096,11 @@ impl QueryEngine {
             Vec::new();
         if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake) {
             let content = if let Some(skill) = discovered_skills.get(&command) {
-                let embedded =
-                    skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
-                let requires_execution = if embedded {
+                let bundled = crate::skills::discovery::is_bundled_path(
+                    &skill.path,
+                    &plugin_context.paths.data_dir,
+                );
+                let requires_execution = if bundled {
                     true
                 } else {
                     let template = skill.render_template(&arguments, &conv_id)?;
@@ -1126,9 +1165,12 @@ impl QueryEngine {
                 turn_blocks.push((content, Some(skill)));
             }
         }
-        let available_skills = discovered_skills
+        let model_skills: Vec<_> = discovered_skills
             .values()
             .filter(|skill| skill.model_invocable())
+            .collect();
+        let available_skills = model_skills
+            .iter()
             .map(|skill| {
                 skill_listing_line(
                     &skill.name,
@@ -1138,8 +1180,112 @@ impl QueryEngine {
                 )
             })
             .collect::<Vec<_>>();
-        if !available_skills.is_empty() {
-            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.\n{}\n", available_skills.join("\n")));
+        let available_skill_names = model_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        // The set of tools ToolLoad can offer and the model-invocable skills
+        // are frozen into the first user message. A later discovery only adds a
+        // change reminder to the latest message, never an edit to that prefix.
+        let allowed_tool_names = agent.as_ref().and_then(|definition| definition.tools.clone());
+        let tool_load_available = customization.loading("ToolLoad").enabled
+            && allowed_tool_names
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == "ToolLoad"));
+        let (loadable_builtin, loadable_mcp) = if tool_load_available {
+            let mcp_tools = match &self.mcp_registry {
+                Some(registry) => {
+                    crate::native_engine::tool_loop::discover_mcp_tools(registry)
+                        .await?
+                        .0
+                }
+                None => Vec::new(),
+            };
+            let mcp_states = crate::mcp::states::load(&plugin_context.paths.data_dir);
+            let goal_proposals = self
+                .local_goal_frontend
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && crate::services::goal_proposals::available(
+                    &self.db_manager,
+                    &conv_id,
+                    &plugin_context.paths.data_dir,
+                    &workspace,
+                    &self.permission_manager,
+                );
+            let compaction_requests = self
+                .context_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+            let catalog = crate::native_engine::tool_loop::builtin_catalog_for_session(
+                prompt_profile,
+                true,
+                goal_proposals,
+                compaction_requests,
+                true,
+                true,
+            );
+            let catalog = customization.described(catalog);
+            crate::native_engine::tool_loop::loadable_tool_lists(
+                &customization,
+                &catalog,
+                &mcp_tools,
+                &mcp_states,
+                allowed_tool_names.as_deref(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let loadable_names = loadable_builtin
+            .iter()
+            .chain(&loadable_mcp)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let first_message_root = plugin_context.paths.data_dir.clone();
+        let first_message_session = conv_id.clone();
+        let has_user_message = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        let (loadable_tools, available_skills_listing, set_changes) =
+            tokio::task::spawn_blocking(move || {
+                let loadable_tools = crate::prompt::loadable_tools_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &loadable_builtin,
+                    &loadable_mcp,
+                );
+                let available_skills = crate::prompt::skills_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &available_skills,
+                );
+                let changes = has_user_message
+                    .then(|| {
+                        let (now, gone) = if tool_load_available {
+                            crate::prompt::set_changes(
+                                &first_message_root,
+                                &first_message_session,
+                                crate::session_files::SET_CHANGE_LOADABLE_TOOLS,
+                                &loadable_names,
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        let (new_skills, removed_skills) = crate::prompt::set_changes(
+                            &first_message_root,
+                            &first_message_session,
+                            crate::session_files::SET_CHANGE_SKILLS,
+                            &available_skill_names,
+                        );
+                        crate::prompt::changes_reminder(now, gone, new_skills, removed_skills)
+                    })
+                    .flatten();
+                (loadable_tools, available_skills, changes)
+            })
+            .await?;
+        if let Some(reminder) = set_changes {
+            turn_blocks.push((reminder, None));
         }
         crate::tools::configure_lsp_servers(
             &workspace_path,
@@ -1212,12 +1358,28 @@ impl QueryEngine {
             &instruction_files,
         )
         .await?;
-        // Like the reference CLI, instructions and the Git snapshot open the first
-        // user message instead of the system prompt, which stays the same across
-        // projects and so shares one cache entry.
+        // Like the reference CLI, instructions, the environment and the Git
+        // snapshot open the first user message instead of the system prompt,
+        // which stays the same across projects and so shares one cache entry.
         let turn_root = plugin_context.paths.data_dir.clone();
         let turn_session = conv_id.clone();
         let turn_messages = request.messages.clone();
+        // The frozen environment keeps the first message stable; a date the
+        // session outlived is announced once, on the message it was attached to.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date_reminder = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| {
+                crate::prompt::date_change_reminder(
+                    &turn_root,
+                    &turn_session,
+                    &frozen_date,
+                    &today,
+                )
+            })
+            .flatten();
         let turn_context = tokio::task::spawn_blocking(move || {
             for (block, skill) in turn_blocks {
                 if let Some(entry) =
@@ -1230,22 +1392,38 @@ impl QueryEngine {
                     )?;
                 }
             }
+            if let Some(reminder) = date_reminder {
+                if let Some(entry) =
+                    crate::services::turn_context::for_last(&turn_messages, vec![reminder])
+                {
+                    crate::services::turn_context::save(&turn_root, &turn_session, &entry)?;
+                }
+            }
             crate::services::turn_context::load(&turn_root, &turn_session)
         })
         .await??;
-        // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
-            .into_iter()
-            .chain(
-                git_snapshot
+        // The first user message opens with the stable session context; skills
+        // whose message a compaction removed follow, as in the reference CLI.
+        let (user_instructions, project_instructions) =
+            crate::project_instructions::reminder_parts(&instructions);
+        let context_reminders = crate::prompt::first_message_reminders(
+            crate::prompt::SessionReminders {
+                user_instructions,
+                environment: Some(environment),
+                project_instructions,
+                standalone_frontend,
+                loadable_tools,
+                available_skills: available_skills_listing,
+                date: Some(frozen_date),
+                git: git_snapshot
                     .as_deref()
                     .map(crate::services::git_snapshot::reminder),
-            )
-            .chain(crate::services::turn_context::invoked_skills_reminder(
-                &turn_context,
-                &request.messages,
-            ))
-            .collect();
+                skills: crate::services::turn_context::invoked_skills_reminder(
+                    &turn_context,
+                    &request.messages,
+                ),
+            },
+        );
         let allowed_directories = project
             .as_ref()
             .map(|project| {
@@ -1257,13 +1435,7 @@ impl QueryEngine {
             })
             .unwrap_or_default();
         if let Some(project) = project {
-            let folders = project
-                .folders
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>();
             let system = request.system_prompt.get_or_insert_with(String::new);
-            crate::prompt::add_project_to_environment(system, &project.name, &folders);
             if let Some(instructions) = project
                 .instructions
                 .as_deref()

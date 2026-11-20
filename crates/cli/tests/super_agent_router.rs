@@ -20,6 +20,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/user_message.rs"]
+mod user_message;
+
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -65,9 +68,8 @@ fn last_user(body: &Value) -> String {
         .flatten()
         .rev()
         .find(|message| message["role"] == "user")
-        .and_then(|message| message["content"].as_str())
+        .map(|message| user_message::user_text(&message["content"]))
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn tool_results_this_turn(body: &Value) -> Vec<String> {

@@ -1197,26 +1197,125 @@ pub fn builtin_tool_catalog() -> Vec<crate::tools::ToolDefinition> {
     tools
 }
 
-/// The first sentence of a tool description, whitespace collapsed and bounded,
-/// for the runtime tool directory.
-fn one_sentence_purpose(description: &str) -> String {
-    let line = description
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    let sentence = line
-        .split(". ")
-        .next()
-        .unwrap_or(line)
-        .trim_end_matches('.')
-        .trim();
-    let mut text = sentence.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() > 180 {
-        text = text.chars().take(180).collect::<String>().trim_end().to_owned();
-        text.push('…');
+/// The built-in catalog with the session-dependent tools included only when
+/// this session can offer them. The first-message tool list uses it so it never
+/// advertises a tool the executor would not load.
+pub(crate) fn builtin_catalog_for_session(
+    profile: crate::prompt::PromptProfile,
+    session_search: bool,
+    goal_proposals: bool,
+    compaction_requests: bool,
+    delegation: bool,
+    workflow: bool,
+) -> Vec<crate::tools::ToolDefinition> {
+    let mut tools = get_tool_definitions();
+    if !session_search {
+        tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
     }
-    text
+    if !goal_proposals {
+        tools.retain(|tool| tool.name != "ProposeGoal");
+    }
+    if !compaction_requests {
+        tools.retain(|tool| tool.name != "CompactContext");
+    }
+    if delegation {
+        tools.extend(delegation::definitions());
+    }
+    if workflow {
+        tools.push(script_workflow::definition());
+    }
+    let mut tools = adapt_tools(tools, profile);
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools.dedup_by(|a, b| a.name == b.name);
+    tools
+}
+
+/// The MCP definitions discovered for this environment and the names the
+/// registry marks read-only. The executor and the first-message listing share
+/// it so both see the same catalog.
+pub(crate) async fn discover_mcp_tools(
+    registry: &crate::mcp::McpToolRegistry,
+) -> Result<(
+    Vec<crate::tools::ToolDefinition>,
+    std::collections::HashSet<String>,
+)> {
+    let mut builtin = get_tool_definitions();
+    builtin.extend(delegation::definitions());
+    builtin.push(script_workflow::definition());
+    let builtin = builtin
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<std::collections::HashSet<_>>();
+    let discovered = registry.get_all_tools().await?;
+    let read_only = discovered
+        .iter()
+        .filter(|tool| tool.is_read_only())
+        .map(|tool| tool.name.clone())
+        .collect();
+    let tools = discovered
+        .into_iter()
+        .map(|tool| {
+            anyhow::ensure!(
+                !builtin.contains(&tool.name),
+                "MCP tool conflicts with native tool: {}",
+                tool.name
+            );
+            Ok(crate::tools::ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((tools, read_only))
+}
+
+/// The on-demand catalog a session's first message lists: built-ins with the
+/// on-demand switch first, then MCP tools whose server is on demand. Both
+/// groups are sorted so a registry reordering never changes the text.
+pub(crate) fn loadable_tool_lists(
+    customization: &crate::services::customization::Customization,
+    catalog: &[crate::tools::ToolDefinition],
+    mcp_tools: &[crate::tools::ToolDefinition],
+    mcp_states: &std::collections::BTreeMap<String, McpState>,
+    allowed_tools: Option<&[String]>,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let allowed = |name: &str| {
+        allowed_tools.is_none_or(|names| names.iter().any(|granted| granted == name))
+    };
+    // Without a callable loader nothing in the list could be loaded, so the
+    // first message must not promise one.
+    if !(customization.loading("ToolLoad").enabled && allowed("ToolLoad")) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut builtin: Vec<(String, String)> = catalog
+        .iter()
+        .filter(|tool| allowed(&tool.name))
+        .filter(|tool| {
+            let loading = customization.loading(&tool.name);
+            loading.on_demand && !loading.enabled
+        })
+        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .collect();
+    let mut mcp: Vec<(String, String)> = mcp_tools
+        .iter()
+        .filter(|tool| allowed(&tool.name) && !customization.is_disabled(&tool.name))
+        .filter(|tool| {
+            crate::mcp::states::server_of(&tool.name)
+                .is_some_and(|server| {
+                    crate::mcp::states::effective(mcp_states, server) == McpState::OnDemand
+                })
+        })
+        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .collect();
+    let by_name = |a: &(String, String), b: &(String, String)| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    builtin.sort_by(by_name);
+    mcp.sort_by(by_name);
+    (builtin, mcp)
 }
 
 async fn execute_builtin_tool(
@@ -1719,7 +1818,10 @@ impl ToolLoopExecutor {
         for (call, prepared) in calls.iter().zip(&prepared) {
             pending.push(match &prepared.step {
                 CallStep::Builtin(input, approved) => Box::pin(async {
-                    Some(self.run_builtin(&call.name, input, &cwd, *approved).await)
+                    Some(
+                        self.run_builtin(&call.name, input, &call.id, &cwd, *approved)
+                            .await,
+                    )
                 }),
                 CallStep::Finished(_) => Box::pin(async { None }),
             });
@@ -1755,7 +1857,7 @@ impl ToolLoopExecutor {
         approved: bool,
     ) -> (Value, String, bool) {
         let cwd = self.get_workspace_cwd().to_owned();
-        let result = self.run_builtin(name, input, &cwd, approved).await;
+        let result = self.run_builtin(name, input, id, &cwd, approved).await;
         let (output, failed) = self.finish_builtin(name, input, id, result);
         (input.clone(), output, failed)
     }
@@ -2237,95 +2339,13 @@ impl ToolLoopExecutor {
         }
     }
 
-    /// The directory the model reads for one request. It is built from the same
-    /// catalog, settings and prepared definitions as the tool list sent with
-    /// that request, so a hot settings change cannot make the two disagree.
-    fn tool_directory(
-        &self,
-        customization: &crate::services::customization::Customization,
-        catalog: &[crate::tools::ToolDefinition],
-        prepared: &[crate::tools::ToolDefinition],
-    ) -> String {
-        let exposed: std::collections::HashSet<String> =
-            prepared.iter().map(|tool| tool.name.clone()).collect();
-        let mut lines = vec!["# Tool directory".to_string()];
-        let context_search = crate::tools::context_search::NAME;
-        let compacted = self.applied_compaction;
-        if compacted && exposed.contains(context_search) && self.session_search_storage().is_some() {
-            lines.push("After compaction, use ContextSearch to recover exact details omitted from the summary.".into());
-        }
-        // Whether discovery is actually callable comes from the definitions
-        // sent with this request, not from the user's switches.
-        if !exposed.contains(TOOL_LOAD_NAME) {
-            lines.push(
-                "ToolLoad is not available in this request, so no tools can be loaded through it."
-                    .to_string(),
-            );
-            return lines.join("\n");
-        }
-        let mut tools: Vec<_> = catalog
-            .iter()
-            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
-            .collect();
-        if compacted && tools.iter().any(|tool| tool.name == context_search) {
-            lines.push("After compaction, load ContextSearch with ToolLoad to recover exact details omitted from the summary.".into());
-        }
-        tools.sort_by(|a, b| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        if let Some(first) = tools.first() {
-            let example = json!({"names":[&first.name]});
-            lines.push(format!(
-                "Among built-ins, ToolLoad can load only the names listed below. Pass exact, case-sensitive names in the `names` array, e.g. {example}."
-            ));
-            lines.extend(tools.into_iter().map(|tool| {
-                format!(
-                    "- `{}`: {}",
-                    tool.name,
-                    one_sentence_purpose(&tool.description)
-                )
-            }));
-        } else {
-            lines.push(
-                "No built-in tools are available for ToolLoad to load in this request.".to_owned(),
-            );
-        }
-
-        let mcp_tools: Vec<_> = self
-            .mcp_tools
-            .iter()
-            .filter(|tool| crate::mcp::states::server_of(&tool.name).is_some())
-            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
-            .cloned()
-            .collect();
-        if !mcp_tools.is_empty() {
-            lines.push(String::new());
-            lines.push("MCP tools available on demand (pass exact names in the ToolLoad `names` array before calling):".to_owned());
-            lines.extend(customization.described(mcp_tools).iter().map(|tool| {
-                format!(
-                    "- {}: {}",
-                    tool.name,
-                    crate::mcp::states::description_summary(&tool.description)
-                )
-            }));
-        }
-        lines.join("\n")
-    }
-
-    /// The system prompt actually sent with this request: the configured prompt
-    /// followed by the directory built for the same request.
-    fn request_system_prompt(&self, directory: &str) -> Option<String> {
-        let base = self
-            .system_prompt
+    /// The system prompt sent with this request. The loadable-tool and skill
+    /// lists travel in the first user message, not here.
+    fn request_system_prompt(&self) -> Option<String> {
+        self.system_prompt
             .as_deref()
-            .filter(|text| !text.trim().is_empty());
-        Some(match base {
-            Some(base) => format!("{base}\n\n{directory}"),
-            None => directory.to_owned(),
-        })
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
     }
 
     /// Validate the full list before granting any definitions to the next request.
@@ -2680,30 +2700,63 @@ impl ToolLoopExecutor {
         }
     }
 
+    #[cfg(test)]
     fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
+        self.retained_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn retained_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
         self.record_tool_usage(tool_name);
-        self.preview_tool_output(tool_name, output)
+        self.preview_tool_output_for_id(tool_name, output, id)
     }
 
     fn preview_tool_output(&self, tool_name: &str, output: &str) -> String {
-        let original = output;
+        self.preview_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn summary_enabled(&self, root: Option<&std::path::Path>) -> bool {
+        crate::config::command_output::enabled(root, std::path::Path::new(self.get_workspace_cwd()))
+    }
+
+    fn preview_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
+        let root = self.search_config_path.as_deref().and_then(|p| p.parent());
+        if model_output::is_shell_result(tool_name) {
+            let enabled = self.summary_enabled(root);
+            let metadata = if enabled {
+                root.zip(id)
+                    .and_then(|(root, id)| {
+                        std::fs::read(model_output::metadata_path(root, id)).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            } else {
+                None
+            };
+            return model_output::command_preview(
+                tool_name,
+                output,
+                root,
+                metadata.as_ref(),
+                enabled,
+            );
+        }
         let cleaned = model_tool_output(tool_name, output);
-        let output = cleaned.as_str();
-        // Read already selects the requested line range. This is the fresh
-        // result sent to the model, not a summary of old conversation history.
-        // Spilling it would also truncate any subsequent Read of the spill file.
-        if tool_name == "Read" {
-            return output.to_string();
-        }
-        let preview = if tool_name == "Bash" {
-            model_output::render(tool_name, original, Some(12_000))
+        // Read already selects the requested line range.
+        if let Some(root) = root.filter(|_| tool_name != "Read") {
+            let preview = compact_tool_output(tool_name, &cleaned);
+            crate::performance::retain_tool_output(root, &cleaned, &preview)
         } else {
-            compact_tool_output(tool_name, output)
-        };
-        if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
-            return crate::performance::retain_tool_output(root, output, &preview);
+            cleaned
         }
-        output.to_string()
     }
 
     fn finish_mcp_output(
@@ -2858,10 +2911,47 @@ impl ToolLoopExecutor {
         self
     }
 
+    async fn run_builtin(
+        &self,
+        tool_name: &str,
+        tool_input: &Value,
+        id: &str,
+        cwd: &str,
+        approved: bool,
+    ) -> Result<Value> {
+        let run = self.run_builtin_inner(tool_name, tool_input, cwd, approved);
+        self.retain_command_metadata(tool_name, id, run).await
+    }
+
+    async fn retain_command_metadata(
+        &self,
+        tool_name: &str,
+        id: &str,
+        run: impl std::future::Future<Output = Result<Value>>,
+    ) -> Result<Value> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        if let Some(root) = root.filter(|root| {
+            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
+        }) {
+            let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
+            if let Some(metadata) = metadata {
+                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
+                    tracing::debug!(%error, "Could not retain shell capture metadata");
+                }
+            }
+            result
+        } else {
+            run.await
+        }
+    }
+
     /// Runs a built-in tool. While a sandboxed command with a domain
     /// allowlist runs, hosts outside the list are put to the user, as in the
     /// reference CLI; "don't ask again" saves a SandboxNetwork(domain:) rule.
-    async fn run_builtin(
+    async fn run_builtin_inner(
         &self,
         tool_name: &str,
         tool_input: &Value,
@@ -3169,9 +3259,8 @@ impl ToolLoopExecutor {
     fn prepare_request(&self) -> Result<PreparedRequest> {
         let customization = self.customization()?;
         let catalog = customization.described(self.builtin_catalog());
-        let tools = self.prepare_tool_definitions(&customization, catalog.clone())?;
-        let directory = self.tool_directory(&customization, &catalog, &tools);
-        let system_prompt = self.request_system_prompt(&directory);
+        let tools = self.prepare_tool_definitions(&customization, catalog)?;
+        let system_prompt = self.request_system_prompt();
         Ok(PreparedRequest {
             tools,
             system_prompt,
@@ -3270,6 +3359,13 @@ impl ToolLoopExecutor {
                 }
             }
         }
+        // A rediscovery or registry reordering must not rewrite the resident
+        // tool list: the same session always sends the same order.
+        tools.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.description.cmp(&b.description))
+        });
         Ok(tools)
     }
 
@@ -3850,35 +3946,46 @@ impl ToolLoopExecutor {
         self.mcp_tools.clear();
         self.mcp_read_only_tools.clear();
         if let Some(registry) = &self.mcp_registry {
-            let mut builtin = get_tool_definitions();
-            builtin.extend(delegation::definitions());
-            builtin.push(script_workflow::definition());
-            let builtin = builtin
-                .into_iter()
-                .map(|tool| tool.name)
-                .collect::<std::collections::HashSet<_>>();
-            let discovered = registry.get_all_tools().await?;
-            let read_only = discovered
-                .iter()
-                .filter(|tool| tool.is_read_only())
-                .map(|tool| tool.name.clone())
-                .collect();
-            self.mcp_tools = discovered
-                .into_iter()
-                .map(|tool| {
-                    anyhow::ensure!(
-                        !builtin.contains(&tool.name),
-                        "MCP tool conflicts with native tool: {}",
-                        tool.name
-                    );
-                    Ok(crate::tools::ToolDefinition {
-                        name: tool.name,
-                        description: tool.description,
-                        input_schema: tool.input_schema,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let (tools, read_only) = discover_mcp_tools(registry).await?;
+            self.mcp_tools = tools;
             self.mcp_read_only_tools = read_only;
+            self.snapshot_mcp_tools()?;
+        }
+        Ok(())
+    }
+
+    /// Freeze each MCP tool definition the first time this session sees it, so
+    /// a reconnecting server cannot rewrite a resident definition mid-session.
+    fn snapshot_mcp_tools(&mut self) -> Result<()> {
+        let (Some(root), Some(session)) = (
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
+            self.conv_id.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        let path = crate::session_files::mcp_snapshot_file(root, session);
+        let mut saved: std::collections::BTreeMap<String, crate::tools::ToolDefinition> =
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        let mut changed = false;
+        for tool in &mut self.mcp_tools {
+            if let Some(snapshot) = saved.get(&tool.name) {
+                tool.description = snapshot.description.clone();
+                tool.input_schema = snapshot.input_schema.clone();
+            } else {
+                saved.insert(tool.name.clone(), tool.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&saved)?)?;
         }
         Ok(())
     }
@@ -4713,7 +4820,10 @@ impl ToolLoopExecutor {
                         }
                     }
                 }
-                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+                let run = crate::tools::tasks::execute_for_session_async(
+                    tool_name, tool_input.clone(), root, session,
+                );
+                self.retain_command_metadata(tool_name, _tool_use_id, run).await
             }.await;
             return CallStep::Finished((
                 tool_input.clone(),
@@ -5789,7 +5899,11 @@ impl ToolLoopExecutor {
                             })
                             .await;
                         let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output(&tc.name, &output_str))
+                            json!(self.retained_tool_output_for_id(
+                                &tc.name,
+                                &output_str,
+                                Some(&tc.id)
+                            ))
                         });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
@@ -6725,9 +6839,9 @@ impl ToolLoopExecutor {
                         if let Some(content) = &mcp {
                             tool_images.extend(content.openai_images(&tc.id));
                         }
-                        let compacted = mcp
-                            .map(|value| value.openai_text())
-                            .unwrap_or_else(|| self.retained_tool_output(&tc.name, &output_str));
+                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
+                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
+                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),

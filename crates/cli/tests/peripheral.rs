@@ -10,6 +10,9 @@ use tokio::{
     process::{Child, Command},
 };
 
+#[path = "support/user_message.rs"]
+mod user_message;
+
 fn cli(path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
@@ -181,7 +184,10 @@ async fn voice_file_is_audio_upload_and_can_be_sent_to_shared_engine_session() {
         while let Some(field)=multipart.next_field().await.unwrap(){if field.name()==Some("file"){*captured.lock().await=field.bytes().await.unwrap().to_vec();}}
         Json(json!({"text":"recognized coding request"}))
     }})).route("/v1/chat/completions",post(|Json(body):Json<Value>|async move {
-        assert_eq!(body["messages"].as_array().unwrap().last().unwrap()["content"],"recognized coding request");
+        let messages = body["messages"].as_array().unwrap();
+        let first_user = messages.iter().find(|message| message["role"] == "user").unwrap();
+        assert!(first_user["content"].as_str().unwrap().starts_with("<system-reminder>"));
+        assert_eq!(user_message::user_text(&messages.last().unwrap()["content"]),"recognized coding request");
         let chunks=format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{"content":"shared engine replied"},"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
         ([("content-type","text/event-stream")],chunks)
     }));

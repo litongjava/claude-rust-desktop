@@ -343,6 +343,9 @@ pub async fn native_delete_conversation(
         if let Err(e) = session_mgr.save() {
             tracing::warn!(module = "Commands", "Failed to save session: {}", e);
         }
+        if let Ok(data_dir) = app_data_dir() {
+            deepseek_code_core::prompt::forget_session_files(&data_dir, &conversation_id);
+        }
         Ok(())
     } else {
         Err("SessionManager not initialized".to_string())

@@ -1,6 +1,8 @@
 //! Standalone CLI creates, spawns and disbands a team without Desktop.
 #[path = "support/tool_loading.rs"]
 mod tool_loading;
+#[path = "support/user_message.rs"]
+mod user_message;
 
 use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
@@ -33,14 +35,14 @@ fn text(value: &Value) -> String {
 }
 
 fn is_child_request(request: &Value) -> bool {
-    // The task is the first line of its user message. Recall can append context.
+    // The task is the first line of the user's own text. Context reminders open
+    // the first message and recall can append more.
     request["messages"].as_array().is_some_and(|messages| {
         messages.iter().any(|message| {
-            message["role"] == "user"
-                && matches!(
-                    text(message).lines().next(),
-                    Some(ALPHA_PROMPT | BETA_PROMPT)
-                )
+            message["role"] == "user" && {
+                let prompt = user_message::user_text(&message["content"]);
+                matches!(prompt.lines().next(), Some(ALPHA_PROMPT | BETA_PROMPT))
+            }
         })
     })
 }

@@ -123,7 +123,7 @@ impl View {
     }
 
     pub(crate) fn enter(&mut self) -> io::Result<()> {
-        crossterm::execute!(io::stderr(), crossterm::terminal::EnterAlternateScreen)?;
+        crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::EnterAlternateScreen)?;
         self.entered = true;
         Ok(())
     }
@@ -311,7 +311,7 @@ impl View {
             return Ok(());
         }
         self.last_frame.clone_from(&output);
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(output.as_bytes())?;
         out.flush()
     }
@@ -320,7 +320,7 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         if self.entered {
-            let _ = crossterm::execute!(io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+            let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
         }
     }
 }
@@ -423,7 +423,7 @@ mod tests {
         display.before_text("MAIN_TRANSCRIPT_SENTINEL\n");
         super::super::title::start();
         let mut notifications = super::super::scrollback::Scrollback::default();
-        super::super::prompt_display::write_recorded(&mut io::stderr(), &mut notifications,
+        super::super::prompt_display::write_recorded(&mut crate::terminal_output::stderr(), &mut notifications,
             "<task-notification>\n<summary>Agent NOTICE_SENTINEL completed</summary>\n</task-notification>", 130, true).unwrap();
         notifications.save();
         display.queued_delivered("<task-notification>\n<summary>Agent INTERNAL_NOTICE completed</summary>\n</task-notification>");
