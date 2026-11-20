@@ -69,10 +69,7 @@ impl WatchRequest {
         if crossterm::terminal::enable_raw_mode().is_err() {
             return;
         }
-        loop {
-            if self.stop.load(Ordering::Acquire) {
-                break;
-            }
+        while !self.stop.load(Ordering::Acquire) && !crate::signals::terminating() {
             match crossterm::event::poll(std::time::Duration::from_millis(50)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(crossterm::event::Event::Key(key))
@@ -661,7 +658,7 @@ fn map_readline(result: rustyline::Result<String>) -> io::Result<Option<String>>
 
 fn read_plain(reader: &mut impl BufRead, prompt: &str) -> io::Result<Option<String>> {
     eprint!("{prompt}");
-    io::stderr().flush()?;
+    crate::terminal_output::stderr().flush()?;
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(None);

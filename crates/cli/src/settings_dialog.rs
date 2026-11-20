@@ -11,7 +11,7 @@ struct SettingsScreen;
 
 impl SettingsScreen {
     fn enter() -> std::io::Result<Self> {
-        crossterm::execute!(std::io::stderr(), crossterm::terminal::EnterAlternateScreen,
+        crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0))?;
         Ok(Self)
@@ -20,7 +20,7 @@ impl SettingsScreen {
 
 impl Drop for SettingsScreen {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
     }
 }
 

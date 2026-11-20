@@ -268,7 +268,7 @@ impl Selection {
             .join("\n")
     }
     fn paint(&self, selected: bool) -> io::Result<()> {
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         self.paint_to(&mut out, selected)?;
         out.flush()
     }

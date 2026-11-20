@@ -141,7 +141,7 @@ struct RawMode;
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = execute!(
-            io::stderr(),
+            crate::terminal_output::stderr(),
             DisableBracketedPaste,
             DisableMouseCapture,
             ResetColor
@@ -634,7 +634,7 @@ impl Screen {
             return self.draw_pinned(lines, row, col);
         }
         self.cursor_col = col;
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         // Synchronized output keeps a large repaint from showing half drawn.
         out.write_all(b"\x1b[?2026h")?;
         let result = self.draw_to(&mut out, lines, row, col);
@@ -647,7 +647,7 @@ impl Screen {
         let rows = crate::terminal::size().1.max(1);
         let (_, cursor_y) = crate::terminal::cursor_position()?;
         self.cursor_col = col;
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
         let result =
             self.draw_pinned_to(&mut out, lines, row, col, rows as usize, cursor_y as usize);
@@ -870,14 +870,14 @@ impl Screen {
     }
 
     pub(crate) fn suspend(&mut self) -> io::Result<()> {
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         self.erase(&mut out)?;
         out.flush()
     }
 
     /// Remove the editor from the screen without echoing a submitted line.
     fn clear(&mut self) -> io::Result<()> {
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         self.erase(&mut out)?;
         out.flush()
     }
@@ -905,7 +905,7 @@ impl Screen {
         history: &mut crate::terminal::scrollback::Scrollback,
     ) -> io::Result<()> {
         // Clear menu and borders, retaining just submitted input in scrollback.
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         out.write_all(b"\x1b[?2026h")?;
         self.erase(&mut out)?;
         if let Some(end) = self.transcript_end.take() {
@@ -1170,7 +1170,7 @@ impl PromptEditor {
         terminal::enable_raw_mode()?;
         let _raw = RawMode;
         // Capture both tool disclosure clicks and drag selection.
-        execute!(io::stderr(), EnableBracketedPaste, EnableMouseCapture)?;
+        execute!(crate::terminal_output::stderr(), EnableBracketedPaste, EnableMouseCapture)?;
         let mut input_reader = crate::terminal::paste_input::Reader::new()?;
         let mut above = crate::terminal::scrollback::Scrollback::handoff();
         let mut buffer = self.resume_buffer();
@@ -1283,12 +1283,12 @@ impl PromptEditor {
                     history_view.close()?;
                     screen.finish("", "", &mut above)?;
                     write_notice(
-                        &mut io::stderr(),
+                        &mut crate::terminal_output::stderr(),
                         &mut above,
                         &notice,
                         crate::terminal::size().0.saturating_sub(1) as usize,
                     )?;
-                    io::stderr().flush()?;
+                    crate::terminal_output::stderr().flush()?;
                     screen = Screen::pinned();
                     screen.align_transcript = !above.has_welcome();
                 }
@@ -1659,11 +1659,11 @@ impl PromptEditor {
             } else if !selection.retained() {
                 if screen.height == 0 && above.needs_separator() {
                     if let Some(top) = screen.top {
-                        execute!(io::stderr(), MoveTo(0, top))?;
+                        execute!(crate::terminal_output::stderr(), MoveTo(0, top))?;
                         screen.top = Some(top.saturating_add(1).min(rows.saturating_sub(1)));
                     }
-                    write!(io::stderr(), "\r\n")?;
-                    io::stderr().flush()?;
+                    write!(crate::terminal_output::stderr(), "\r\n")?;
+                    crate::terminal_output::stderr().flush()?;
                     above.push(String::new(), None);
                 }
                 screen.draw(&lines, input_row, cursor_col)?;
@@ -1692,7 +1692,7 @@ impl PromptEditor {
                     screen.top.unwrap_or(0) as usize
                 };
                 command_overlay.draw_to(
-                    &mut io::stderr().lock(),
+                    &mut crate::terminal_output::stderr_locked(),
                     &command_menu,
                     bottom,
                     &background,
@@ -1717,7 +1717,7 @@ impl PromptEditor {
             };
             // Remove the overlay before an event can resize, scroll or repaint
             // its background. Otherwise a menu row can enter the transcript.
-            command_overlay.draw_to(&mut io::stderr().lock(), &[], 0, &[])?;
+            command_overlay.draw_to(&mut crate::terminal_output::stderr_locked(), &[], 0, &[])?;
             if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Left | KeyCode::Right))
             {
                 if let Some((context, session)) = &self.subagent_context {
@@ -1764,7 +1764,7 @@ impl PromptEditor {
                         history_view.invalidate();
                         if !history_view.active() {
                             write!(
-                                io::stderr(),
+                                crate::terminal_output::stderr(),
                                 "{}",
                                 above.repaint(
                                     screen
@@ -1775,7 +1775,7 @@ impl PromptEditor {
                                     cols
                                 )
                             )?;
-                            io::stderr().flush()?;
+                            crate::terminal_output::stderr().flush()?;
                         }
                         screen.invalidated = true;
                         continue;
@@ -1820,7 +1820,7 @@ impl PromptEditor {
                             .min(new_rows.saturating_sub(1));
                         let bottom = above.repaint_bottom(bottom, columns);
                         above.update_welcome(bottom as usize);
-                        let mut out = io::stderr().lock();
+                        let mut out = crate::terminal_output::stderr_locked();
                         write!(
                             out,
                             "\x1b[?2026h{}\x1b[?2026l",
@@ -2050,7 +2050,7 @@ impl PromptEditor {
                             out.push_str("\r\n");
                             above.push_logged(line);
                         }
-                        let mut stderr = io::stderr().lock();
+                        let mut stderr = crate::terminal_output::stderr_locked();
                         stderr.write_all(out.as_bytes())?;
                         stderr.flush()?;
                         screen = Screen::pinned();
@@ -2327,7 +2327,7 @@ impl PromptEditor {
                                 text.push_str("\r\n");
                             }
                             text.push_str("\x1b[?2026l");
-                            let mut out = io::stderr();
+                            let mut out = crate::terminal_output::stderr();
                             out.write_all(text.as_bytes())?;
                             out.flush()?;
                             screen = Screen::pinned();

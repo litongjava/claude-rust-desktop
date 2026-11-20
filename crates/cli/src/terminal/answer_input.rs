@@ -33,7 +33,7 @@ pub(super) fn read(
         return read_terminal(prompt, flag, secret);
     }
     eprint!("{prompt}");
-    io::stderr().flush()?;
+    crate::terminal_output::stderr().flush()?;
     let mut bytes = Vec::new();
     loop {
         cancelled(flag)?;
@@ -73,17 +73,17 @@ fn read_terminal(prompt: &str, flag: &AtomicBool, secret: bool) -> io::Result<Op
         .filter(|ch| !ch.is_control() || *ch == '\n')
         .collect();
     eprint!("{}", safe_prompt.replace('\n', "\r\n"));
-    io::stderr().flush()?;
+    crate::terminal_output::stderr().flush()?;
     loop {
         if let Err(error) = cancelled(flag) {
             // Keep prior prompt text but discard the canceled answer draft. No
             // global input flush: queued events for later prompts remain intact.
             if super::screen_reader() {
                 eprint!("\r\n");
-                io::stderr().flush()?;
+                crate::terminal_output::stderr().flush()?;
             } else {
                 execute!(
-                    io::stderr(),
+                    crate::terminal_output::stderr(),
                     terminal::Clear(terminal::ClearType::CurrentLine),
                     cursor::MoveToColumn(0)
                 )?;
@@ -126,7 +126,7 @@ fn read_terminal(prompt: &str, flag: &AtomicBool, secret: bool) -> io::Result<Op
                     KeyCode::Enter => {
                         cancelled(flag)?;
                         eprint!("\r\n");
-                        io::stderr().flush()?;
+                        crate::terminal_output::stderr().flush()?;
                         let visible = if secret { "*".repeat(value.chars().count()) } else { value.clone() };
                         let mut history = super::scrollback::Scrollback::take();
                         for row in format!("{safe_prompt}{visible}").lines() {
@@ -172,7 +172,7 @@ fn read_terminal(prompt: &str, flag: &AtomicBool, secret: bool) -> io::Result<Op
             }
             _ => {}
         }
-        io::stderr().flush()?;
+        crate::terminal_output::stderr().flush()?;
     }
 }
 
