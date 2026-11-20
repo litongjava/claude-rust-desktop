@@ -174,6 +174,19 @@ pub fn resolve_workspace(
     id: &str,
     requested: Option<&str>,
 ) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
+    resolve_workspace_inner(conn, workspaces_root, id, requested, true)
+}
+
+/// `persist_private_path` is false when resolving again after another writer
+/// rebound the conversation: the private directory must not replace that
+/// committed binding, even if the session is still projectless.
+fn resolve_workspace_inner(
+    conn: &Connection,
+    workspaces_root: &Path,
+    id: &str,
+    requested: Option<&str>,
+    persist_private_path: bool,
+) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
     let private_owner = private_workspace_owner(conn, id)?;
     if let Some(mut project) = conversation_project(conn, id)? {
         let path = project.workspace_path.as_deref().context("Project has no working directory")?;
@@ -211,24 +224,64 @@ pub fn resolve_workspace(
     let directory = std::fs::canonicalize(directory)?;
     ensure!(directory.starts_with(&root) && directory != root, "Conversation workspace is outside the application workspace directory");
     if private_owner.is_some() { ensure!(directory == expected, "Private workspace owner path is redirected"); }
-    if conversation.is_some() {
-        let persist = |connection: &Connection| -> Result<()> {
-            connection.execute(
-                "UPDATE conversations SET workspace_path = ?1 WHERE id = ?2",
-                params![directory.to_string_lossy(), id],
-            )?;
-            Ok(())
+    if conversation.is_some() && persist_private_path {
+        let previous_path = conversation
+            .as_ref()
+            .and_then(|conversation| conversation.workspace_path.clone());
+        let directory_text = directory.to_string_lossy().into_owned();
+        let persist = |connection: &Connection| -> Result<bool> {
+            // Another host may bind a project while this attempt waits for the
+            // writer. Re-read the binding under the acquired transaction so a
+            // committed assignment is never overwritten by the private path.
+            let (project_id, workspace_path) = connection
+                .query_row(
+                    "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
+                    [id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .context("Session not found")?;
+            let projectless = project_id.is_none_or(|project_id| project_id.is_empty());
+            if !projectless || workspace_path != previous_path {
+                return Ok(false);
+            }
+            ensure!(
+                connection.execute(
+                    "UPDATE conversations SET workspace_path=?1 \
+                     WHERE id=?2 AND (project_id IS NULL OR project_id='') \
+                     AND (workspace_path IS NULL OR workspace_path=?3)",
+                    params![directory_text, id, previous_path],
+                )? == 1,
+                "Session not found"
+            );
+            Ok(true)
         };
-        if conn.is_autocommit() {
+        let persisted = if conn.is_autocommit() {
             crate::db::write_tx(
                 conn,
                 "private session workspace",
                 crate::db::STARTUP_WRITE_DEADLINE,
                 |tx| persist(tx),
             )
-            .context("Saving private session workspace")?;
+            .context("Saving private session workspace")?
         } else {
-            persist(conn)?;
+            persist(conn)?
+        };
+        if !persisted {
+            // The binding changed while this attempt waited. Use the committed
+            // state instead of the directory created for the old decision.
+            let (path, project) =
+                resolve_workspace_inner(conn, workspaces_root, id, requested, false)?;
+            ensure!(
+                project.is_some() || path != directory,
+                "Session workspace binding changed while it was being saved"
+            );
+            return Ok((path, project));
         }
     }
     Ok((directory, None))
@@ -288,6 +341,109 @@ mod tests {
             store.resume(&id).unwrap().workspace_path.as_deref(),
             private.to_str()
         );
+    }
+
+    #[test]
+    fn projectless_resume_keeps_a_project_assigned_while_the_write_retries() {
+        use crate::runtime::{RuntimePaths, SessionStore, DATABASE_FILE};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
+                    [&id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let project_dir = root.path().join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project_dir = project_dir.canonicalize().unwrap();
+        let project_path = project_dir.to_string_lossy().into_owned();
+        store
+            .db
+            .with_conn(|conn| -> Result<()> {
+                project_repo::insert_project(
+                    conn,
+                    "project",
+                    "Project",
+                    None,
+                    None,
+                    Some(&project_path),
+                    false,
+                    "now",
+                    "now",
+                )?;
+                project_repo::set_folders(conn, "project", std::slice::from_ref(&project_path))?;
+                project_repo::trust_folders(conn, "project", std::slice::from_ref(&project_path))?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+
+        // The first attempt waits out SQLite's five-second busy timeout. When
+        // the holder finally commits, it also commits the project assignment,
+        // so the retry must observe the new binding instead of writing the
+        // private path it decided on earlier.
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let id_for_holder = id.clone();
+        let path_for_holder = project_path.clone();
+        let db_path = paths.data_dir.join(DATABASE_FILE);
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(db_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            conn.execute(
+                "UPDATE conversations SET project_id='project', workspace_path=?1 WHERE id=?2",
+                params![path_for_holder, id_for_holder],
+            )
+            .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+        });
+
+        let workspaces = paths.data_dir.join("workspaces");
+        let resolved = store.workspace(&id, &workspaces).unwrap();
+        releaser.join().unwrap();
+
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            project_dir,
+            "resume must use the project committed while the write retried"
+        );
+        let (project_id, workspace_path) = store
+            .db
+            .with_conn(|conn| -> Result<(Option<String>, Option<String>)> {
+                Ok(conn.query_row(
+                    "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(project_id.as_deref(), Some("project"));
+        assert_eq!(
+            workspace_path.as_deref(),
+            Some(project_path.as_str()),
+            "the private path must not replace the committed project path"
+        );
+        assert_ne!(resolved, workspaces.join(&id).canonicalize().unwrap());
     }
 
     #[test]
