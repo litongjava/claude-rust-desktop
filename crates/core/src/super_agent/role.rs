@@ -1,7 +1,7 @@
 //! Durable session role: a session is a normal Agent unless the user makes it a
 //! Router. The role never changes the permission mode.
 use crate::db::DbManager;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -81,12 +81,21 @@ pub fn load(db: &DbManager, session: &str) -> Result<Role> {
 
 pub fn set(db: &DbManager, session: &str, role: Role) -> Result<()> {
     anyhow::ensure!(!session.trim().is_empty(), "Session is required");
-    db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
+    db.with_conn(|conn| -> Result<()> {
+        crate::db::write_tx(
+            conn,
+            "session role",
+            crate::db::STARTUP_WRITE_DEADLINE,
+            |tx| {
+                tx.execute(
+                    "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [key(session), role.as_str().to_owned()],
+                    [key(session), role.as_str().to_owned()],
+                )?;
+                Ok(())
+            },
         )
+        .context("Saving session role")
     })??;
     Ok(())
 }
@@ -180,5 +189,27 @@ mod tests {
         );
         assert_eq!(membership(&db, &outsider).unwrap(), None);
         assert_eq!(membership(&db, &router).unwrap(), None);
+    }
+
+    #[test]
+    fn set_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let (_temp, db) = fixture();
+        let path = db.data_dir().join(crate::runtime::DATABASE_FILE);
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser = crate::db::test_support::release_after(
+            release,
+            holder,
+            Duration::from_secs(6),
+        );
+        let started = Instant::now();
+        set(&db, "session", Role::Router).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "set returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(load(&db, "session").unwrap(), Role::Router);
     }
 }

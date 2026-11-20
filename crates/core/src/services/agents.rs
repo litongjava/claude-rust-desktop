@@ -187,7 +187,18 @@ pub fn install(context: &ServiceContext, definition: Definition) -> Result<()> {
 pub fn bind(db: &DbManager, session: &str, definition: &Definition) -> Result<()> {
     definition.validate()?;
     let payload = serde_json::to_string(definition)?;
-    db.with_conn(|c|c.execute("INSERT INTO session_agents(conversation_id,definition) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition", rusqlite::params![session,payload]))??;
+    db.with_conn(|c| -> Result<()> {
+        crate::db::write_tx(
+            c,
+            "agent binding",
+            crate::db::STARTUP_WRITE_DEADLINE,
+            |tx| {
+                tx.execute("INSERT INTO session_agents(conversation_id,definition) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition", rusqlite::params![session,payload])?;
+                Ok(())
+            },
+        )
+        .context("Binding session agent")
+    })??;
     Ok(())
 }
 pub fn for_session(db: &DbManager, session: &str) -> Result<Option<Definition>> {
@@ -382,5 +393,36 @@ mod tests {
         std::fs::write(dir.path().join(MODELS_FILE), "not json").unwrap();
         assert!(load_models(dir.path()).is_empty());
         assert!(default_model(dir.path(), "explore").is_none());
+    }
+
+    #[test]
+    fn bind_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.sqlite");
+        let db = std::sync::Arc::new(DbManager::new(path.clone()).unwrap());
+        db.init().unwrap();
+        let store = crate::runtime::SessionStore::new(db.clone());
+        let session = store.create(dir.path(), "model", "provider").unwrap();
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let definition = Definition {
+            id: "explore".into(),
+            description: "Explore".into(),
+            system_prompt: "Search".into(),
+            tools: Some(vec!["Read".into()]),
+            read_only_shell: true,
+            legacy: None,
+        };
+        let started = Instant::now();
+        bind(&db, &session, &definition).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "bind returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(for_session(&db, &session).unwrap(), Some(definition));
     }
 }
