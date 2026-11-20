@@ -284,10 +284,21 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
             ),
         ]
     } else if kind == SESSION && expected >= 3 {
-        let triggers: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger'
-            AND name IN ('context_search_messages_insert','context_search_messages_update','context_search_messages_delete',
-                         'context_search_tool_calls_insert','context_search_tool_calls_update','context_search_tool_calls_delete')", [], |r|r.get(0))?;
-        ensure!(triggers == 6, "Missing session search trigger");
+        let search_objects: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE
+             (type='index' AND tbl_name='context_search_sources'
+              AND name IN ('context_search_order','context_search_boundary_order')) OR
+             (type='trigger' AND tbl_name IN ('messages','tool_calls')
+              AND name IN ('context_search_' || tbl_name || '_insert',
+                           'context_search_' || tbl_name || '_update',
+                           'context_search_' || tbl_name || '_delete'))",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            search_objects == 8,
+            "Missing required session search index or trigger"
+        );
         &[
             ("peripheral_settings", "key value"),
             ("file_read_stamps", "path modified_ns size"),

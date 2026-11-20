@@ -395,6 +395,15 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
     let result: Value =
         serde_json::from_str(&a.context_search(json!({"query":"archived needle"}))?)?;
     assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    // The reader selects its bounded query plan with INDEXED BY. Losing a
+    // required index makes this shard unreadable even if the tables survive.
+    Connection::open(&path)?.execute_batch("DROP INDEX context_search_boundary_order")?;
+    assert!(s
+        .open_session(A)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("search index"));
     Ok(())
 }
 
