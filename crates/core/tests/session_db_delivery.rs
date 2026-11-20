@@ -111,7 +111,7 @@ fn process_worker() -> Result<()> {
             let display = fs::read_to_string(root.join("display"))?;
             let v = s
                 .open_session(B)?
-                .read(|r| r.mcp("mcp", &display))?
+                .read(|r| r.mcp("assistant:mcp", &display))?
                 .unwrap();
             assert_eq!(v.1["_meta"]["trace"], "actual save");
             assert_eq!(v.0.as_array().unwrap().len(), 2);
@@ -157,7 +157,7 @@ fn admitted_mcp_result_is_durable_while_another_writer_remains_locked() -> Resul
             None
         };
         thread::sleep(Duration::from_millis(5150));
-        let display = b.save_mcp("mcp", &wire(), false)?;
+        let display = b.save_mcp("assistant", "mcp", &wire(), false)?;
         fs::write(root.path().join("display"), display)?;
         Worker::start(root.path(), "read-b")?.finish()?;
         assert!(worker.0.try_wait()?.is_none());
@@ -324,15 +324,16 @@ fn history_nested_replay_full_partial_clear_and_worker_address() -> Result<()> {
     let a = stores.create(A, Default::default())?;
     let (turn,m)=a.write(|w|{w.append_user("first",&json!([{"type":"text","text":"user scope"}]))?;
         w.bind_agent("agent restrictions")?;let t=w.start_turn()?;let m=w.segment(&t)?;w.message_content(&m,"reply")?;
-        w.tool(&tool("parent",&m,0),None)?;w.tool(&tool("nested",&m,1),Some(("parent",1)))?;
-        w.tool_duration("nested",37)?;w.tool_note("nested","note")?;
+        let nested=format!("{m}:nested");
+        w.tool(&tool("parent",&m,0),None)?;w.tool(&tool(&nested,&m,1),Some(("parent",1)))?;
+        w.tool_duration(&nested,37)?;w.tool_note(&nested,"note")?;
         w.attachment("file",&m,"a.txt","file","text/plain",5,"reference")?;
         w.approval(&PermissionApprovalRow{id:"approval".into(),conversation_id:A.into(),message_id:m.clone(),tool_name:"tool".into(),action:"write".into(),risk_level:"medium".into(),status:"pending".into(),user_decision:None,decision_reason:None,created_at:"now".into(),decided_at:None})?;
         w.decide("approval","approved",Some("allow"),None,"later")?;
         w.diff(&CodeDiffRow{id:"diff".into(),conversation_id:A.into(),message_id:m.clone(),file_path:"x".into(),original_content:None,modified_content:Some("new".into()),diff_text:None,status:"pending".into(),applied_at:None,created_at:"now".into()})?;
         w.snapshots(&m,&json!([{"id":"req","model":"fixture","systemPrompt":"header","tools":[{"name":"one"}],"responseBlocks":[{"id":"nested","type":"tool_call"}]}]))?;
         w.finish_turn(&t,TurnStatus::Cancelled,17)?;Ok((t,m))})?;
-    let display = a.save_mcp("nested", &wire(), true)?;
+    let display = a.save_mcp(&m, "nested", &wire(), true)?;
     assert_eq!(
         a.read(|r| r.turn(&turn))?.unwrap().status,
         TurnStatus::Cancelled
@@ -543,9 +544,9 @@ fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
             ..project(root.path())
         },
     )?;
-    let display = a.save_mcp("raw", &wire(), false)?;
-    let msg = a.write(|w| {
-        let msg = w.append("assistant", "")?;
+    let msg = a.write(|w| w.append("assistant", ""))?;
+    let display = a.save_mcp(&msg, "raw", &wire(), false)?;
+    a.write(|w| {
         let mut nested = tool("raw", &msg, 1);
         nested.output = Some(display.clone());
         let origins = std::collections::BTreeMap::from([("raw".into(), ("parent".into(), 1))]);
@@ -554,7 +555,7 @@ fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
             &msg,
             &json!([{"id":"trace","responseBlocks":[{"type":"tool_use","id":"raw"}]}]),
         )?;
-        Ok(msg)
+        Ok(())
     })?;
     let qualified = format!("{msg}:raw");
     let origin = a.read(|r| r.origins(&msg))?;
@@ -711,7 +712,7 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
     let a = stores.open_session(A)?;
     assert_eq!(a.address().incarnation, inc);
     assert_eq!(a.read(|r| r.messages())?[0].content, "old");
-    a.save_mcp("new", &wire(), false)?;
+    a.save_mcp("assistant", "new", &wire(), false)?;
     assert_eq!(a.read(|r| r.projection())?.revision, 2);
     assert_eq!(fs::read_to_string(locks.join(".initialized"))?, store);
     Ok(())
@@ -969,16 +970,17 @@ fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
 fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
     let root = tempdir()?;
     let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
-    let m = a.write(|w| {
+    let (m, last) = a.write(|w| {
         let first = w.append("assistant", "nested")?;
-        w.tool(&tool("child", &first, 0), Some(("parent", 1)))?;
         let last = w.append("assistant", "later")?;
-        w.tool(&tool("parent", &last, 0), None)?;
-        w.tool_note("parent", "later note")?;
-        w.tool_duration("parent", 9)?;
-        Ok(first)
+        let parent = format!("{last}:parent");
+        w.tool(&tool("child", &first, 0), Some((&parent, 1)))?;
+        w.tool(&tool(&parent, &last, 0), None)?;
+        w.tool_note(&parent, "later note")?;
+        w.tool_duration(&parent, 9)?;
+        Ok((first, last))
     })?;
-    a.save_mcp("parent", &wire(), false)?;
+    a.save_mcp(&last, "parent", &wire(), false)?;
     let fork = a.branch(
         B,
         Branch::Through {
@@ -1189,12 +1191,13 @@ fn review_unchanged_stream_preserves_each_occurrences_mcp_metadata() -> Result<(
     };
     let mut messages = Vec::new();
     for stamp in ["first", "second"] {
+        let m = a.write(|w| w.append("assistant", "reply"))?;
         a.save_mcp(
+            &m,
             "provider",
             &json!({"content":[{"type":"text","text":"same"}],"_meta":{"stamp":stamp}}),
             false,
         )?;
-        let m = a.write(|w| w.append("assistant", "reply"))?;
         stream(&m)?;
         messages.push(m);
     }
@@ -1208,4 +1211,49 @@ fn review_unchanged_stream_preserves_each_occurrences_mcp_metadata() -> Result<(
         );
     }
     Ok(())
+}
+
+#[test]
+fn round2_delayed_stream_and_transport_replay_keep_occurrence_results() -> Result<()> {
+    let root = tempdir()?;
+    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let first = a.write(|w| w.append("assistant", "one"))?;
+    let second = a.write(|w| w.append("assistant", "two"))?;
+    let send = |message: &str, owner: &str| -> Result<()> {
+        let wire = json!({"content":[{"type":"text","text":"done"}],
+                          "structuredContent":{"owner":owner},"_meta":{"stamp":owner}});
+        assert_eq!(a.save_mcp(message, "call", &wire, false)?, "done");
+        Ok(())
+    };
+    let stream = |m: &str| {
+        a.write(|w| {
+            let mut row = tool("call", m, 0);
+            row.output = Some("done".into());
+            w.stream_tools(m, "answer", &[row], &Default::default())
+        })
+    };
+    let check = |m: &str, owner: &str| -> Result<()> {
+        let (content, metadata, failed) = a.read(|r| r.mcp(&format!("{m}:call"), "done"))?.unwrap();
+        assert_eq!(content, json!({"owner":owner}).to_string());
+        assert_eq!(
+            metadata,
+            json!({"structuredContent":{"owner":owner},"_meta":{"stamp":owner}})
+        );
+        assert!(!failed);
+        Ok(())
+    };
+    send(&first, "A")?;
+    send(&second, "B")?;
+    stream(&second)?;
+    stream(&first)?;
+    check(&first, "A")?;
+    check(&second, "B")?;
+    send(&first, "A corrected")?;
+    stream(&first)?;
+    check(&first, "A corrected")?;
+    send(&first, "A")?;
+    stream(&first)?;
+    stream(&second)?;
+    check(&first, "A")?;
+    check(&second, "B")
 }

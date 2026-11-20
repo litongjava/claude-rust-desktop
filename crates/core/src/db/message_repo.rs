@@ -388,19 +388,8 @@ pub fn insert_tool_call(
     is_error: bool,
     sort_order: i64,
 ) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO tool_calls (id, message_id, name, input, output, is_error, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id, name=excluded.name, input=excluded.input, output=excluded.output, is_error=excluded.is_error, sort_order=excluded.sort_order"
-    )?;
-    stmt.execute(params![
-        id,
-        message_id,
-        name,
-        input,
-        output,
-        is_error as i64,
-        sort_order,
-    ])?;
-    // CLI/archive rows qualify provider IDs with their assistant-message ID.
+    upsert_tool_call(conn, id, message_id, name, input, output, is_error, sort_order)?;
+    // Legacy single-file callers save the transport under the raw provider ID.
     // Bind the typed MCP sidecar to that durable ID in the same save operation.
     if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
         conn.execute(
@@ -413,6 +402,31 @@ pub fn insert_tool_call(
             params![id,message_id,original,output,is_error],
         )?;
     }
+    Ok(())
+}
+
+pub(super) fn upsert_tool_call(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    name: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    is_error: bool,
+    sort_order: i64,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO tool_calls (id, message_id, name, input, output, is_error, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id, name=excluded.name, input=excluded.input, output=excluded.output, is_error=excluded.is_error, sort_order=excluded.sort_order"
+    )?;
+    stmt.execute(params![
+        id,
+        message_id,
+        name,
+        input,
+        output,
+        is_error as i64,
+        sort_order,
+    ])?;
     Ok(())
 }
 
@@ -515,16 +529,27 @@ pub fn save_nested_tool_row(
     Ok(())
 }
 
-pub(super) fn upsert_stream_tool_result(
+pub(super) fn upsert_stream_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+    content: &str,
+) -> Result<()> {
+    conn.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order)
+        VALUES (?1, ?2, 'assistant', ?3, ?4, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))
+        ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+        params![message_id, conversation_id, content, chrono::Utc::now().to_rfc3339()])?;
+    Ok(())
+}
+
+fn upsert_stream_tool_result(
     conn: &Connection,
     conversation_id: &str,
     message_id: &str,
     content: &str,
     tool: &ToolCallRow,
-) -> Result<()> {    conn.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order)
-        VALUES (?1, ?2, 'assistant', ?3, ?4, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))
-        ON CONFLICT(id) DO UPDATE SET content = excluded.content",
-        params![message_id, conversation_id, content, chrono::Utc::now().to_rfc3339()])?;
+) -> Result<()> {
+    upsert_stream_message(conn, conversation_id, message_id, content)?;
     insert_tool_call(
         conn,
         &tool.id,

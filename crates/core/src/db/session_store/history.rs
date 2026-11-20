@@ -122,15 +122,27 @@ impl GlobalDb {
     }
 }
 
+fn stream_occurrence_id(message: &str, provider_id: &str) -> String {
+    format!("{message}:{provider_id}")
+}
+
 impl SessionDb {
     pub fn id(&self) -> &str {
         &self.id
     }
-    pub fn save_mcp(&self, id: &str, transport: &Value, failed: bool) -> Result<String> {
+    /// Save to the same occurrence that a later assistant stream flush will address.
+    pub fn save_mcp(
+        &self,
+        message: &str,
+        provider_id: &str,
+        transport: &Value,
+        failed: bool,
+    ) -> Result<String> {
+        let id = stream_occurrence_id(message, provider_id);
         let output = McpOutput::from_transport(transport)?;
         let display = output.display();
         self.write_named("save MCP output", |tx| {
-            output.save(tx.0, &self.id, id, &display, failed)?;
+            output.save(tx.0, &self.id, &id, &display, failed)?;
             Ok(())
         })?;
         Ok(display)
@@ -289,19 +301,21 @@ impl SessionWrite<'_> {
         tools: &[messages::ToolCallRow],
         origins: &crate::services::tool_history::ToolOrigins,
     ) -> Result<()> {
+        if !tools.is_empty() {
+            messages::upsert_stream_message(self.0, self.1, message, content)?;
+        }
         for tool in tools {
-            let qualified = format!("{message}:{}", tool.id);
             let row = messages::ToolCallRow {
-                id: qualified,
+                id: stream_occurrence_id(message, &tool.id),
                 message_id: message.into(),
                 ..tool.clone()
             };
-            messages::upsert_stream_tool_result(self.0, self.1, message, content, &row)?;
+            self.tool(&row, None)?;
             if let Some((parent, sequence)) = origins.get(&tool.id) {
                 messages::save_tool_origin(
                     self.0,
                     &row.id,
-                    &format!("{message}:{parent}"),
+                    &stream_occurrence_id(message, parent),
                     i64::try_from(*sequence)?,
                 )?;
             }
@@ -309,7 +323,7 @@ impl SessionWrite<'_> {
         Ok(())
     }
     pub fn tool(&self, row: &messages::ToolCallRow, origin: Option<(&str, i64)>) -> Result<()> {
-        messages::insert_tool_call(
+        messages::upsert_tool_call(
             self.0,
             &row.id,
             &row.message_id,
