@@ -38,14 +38,17 @@ fn tool_names(body: &Value) -> Vec<String> {
         .collect()
 }
 
-fn last_tool_result(body: &Value) -> Option<Value> {
+fn last_tool_content(body: &Value) -> Option<&str> {
     body["messages"]
         .as_array()?
         .iter()
         .rev()
         .find(|message| message["role"] == "tool")
         .and_then(|message| message["content"].as_str())
-        .and_then(|content| serde_json::from_str(content).ok())
+}
+
+fn last_tool_result(body: &Value) -> Option<Value> {
+    last_tool_content(body).and_then(|content| serde_json::from_str(content).ok())
 }
 
 fn tool_call_frame(id: &str, name: &str, arguments: &Value) -> Vec<Value> {
@@ -127,9 +130,12 @@ async fn respond(
             tool_call_frame("call-search", "ToolLoad", &json!({"names":["TaskGet"]}))
         }
         2 => {
-            let loaded = last_tool_result(&body)
-                .unwrap_or_else(|| panic!("ToolLoad result missing in request {body}"));
-            assert_eq!(loaded["loaded_tools"], json!(["TaskGet"]), "{loaded}");
+            // The model sees one text line; the TaskGet schema travels in `tools`.
+            assert_eq!(
+                last_tool_content(&body),
+                Some("Loaded TaskGet. Available from the next request."),
+                "{body}"
+            );
             let started = fixture
                 .bash_result
                 .lock()
