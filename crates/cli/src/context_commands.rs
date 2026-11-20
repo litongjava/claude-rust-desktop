@@ -125,7 +125,7 @@ fn render(request: Option<deepseek_code_core::services::context_usage::LastReque
 /// What the first request would hold: the base system prompt, the project
 /// instructions, the built-in tool definitions and saved history.
 fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core::services::context_usage::LastRequest> {
-    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, &session.model, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
+    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
     let mut history = session.store.model_history(&session.id, &deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic)?;
     // The engine puts instructions at the start of the first user message.
     let reminders = deepseek_code_core::project_instructions::load_all(

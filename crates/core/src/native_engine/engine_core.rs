@@ -1031,7 +1031,6 @@ impl QueryEngine {
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
-            &request.model,
             prompt_profile,
             Some(&workspace),
             &customization.system_prompt,
