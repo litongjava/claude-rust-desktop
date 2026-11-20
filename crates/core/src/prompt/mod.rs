@@ -57,10 +57,176 @@ pub fn default_system_prompt(profile: PromptProfile) -> String {
 
 /// The CLI's constant runtime facts. They describe the frontend, so they travel
 /// in the first user message as their own reminder instead of the system prompt.
-pub const STANDALONE_FRONTEND: &str = "The user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly.";
+pub const STANDALONE_FRONTEND: &str = "The user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly. If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `! <command>` in the prompt — the `!` prefix runs the command in this session so its output lands directly in the conversation.";
 
 pub fn standalone_frontend_reminder() -> String {
     format!("<system-reminder>\n{STANDALONE_FRONTEND}\n</system-reminder>")
+}
+
+/// The lead-in of the reminder that lists tools ToolLoad can load.
+pub const LOADABLE_TOOLS_LEAD_IN: &str =
+    "Tools you can load with ToolLoad (pass exact names in the names array):";
+
+/// The lead-in of the reminder that lists the model-invocable skills.
+pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.";
+
+/// The first sentence of a description, whitespace collapsed and cut to
+/// `limit` characters. The loadable-tool listing uses 100.
+pub fn one_sentence(description: &str, limit: usize) -> String {
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = text
+        .split(". ")
+        .next()
+        .unwrap_or(&text)
+        .trim_end_matches('.')
+        .trim();
+    if sentence.chars().count() <= limit {
+        return sentence.to_owned();
+    }
+    let mut cut: String = sentence.chars().take(limit.saturating_sub(1)).collect();
+    cut = cut.trim_end().to_owned();
+    cut.push('…');
+    cut
+}
+
+/// One reminder listing the loadable built-in tools first, then the on-demand
+/// MCP tools. None when ToolLoad has nothing to offer.
+pub fn loadable_tools_reminder(
+    builtin: &[(String, String)],
+    mcp: &[(String, String)],
+) -> Option<String> {
+    if builtin.is_empty() && mcp.is_empty() {
+        return None;
+    }
+    let mut text = String::from(LOADABLE_TOOLS_LEAD_IN);
+    for (name, description) in builtin.iter().chain(mcp) {
+        text.push_str(&format!("\n- {name}: {}", one_sentence(description, 100)));
+    }
+    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
+}
+
+/// Read a frozen reminder stored as JSON `Option<String>`: `Some(None)` means
+/// the first request had an empty list, so later requests must keep omitting it.
+fn frozen_reminder(path: &Path) -> Option<Option<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn store_frozen_reminder(path: &Path, reminder: &Option<String>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_vec(reminder).unwrap_or_default());
+}
+
+/// The loadable-tool reminder frozen on the session's first request. A later
+/// MCP reconnect or settings change never rewrites the first user message.
+pub fn loadable_tools_for_session(
+    root: &Path,
+    session: &str,
+    builtin: &[(String, String)],
+    mcp: &[(String, String)],
+) -> Option<String> {
+    let path = root
+        .join("environment")
+        .join(format!("{session}.loadable-tools.json"));
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = loadable_tools_reminder(builtin, mcp);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// The reminder listing the model-invocable skills, with their one-line
+/// descriptions and context. None when there are no skills.
+pub fn skills_reminder(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<system-reminder>\n{SKILLS_LEAD_IN}\n{}\n</system-reminder>",
+        lines.join("\n")
+    ))
+}
+
+/// The skill list frozen on the session's first request, for the same
+/// prefix-stability reason as the environment.
+pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Option<String> {
+    let path = root.join("environment").join(format!("{session}.skills.json"));
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = skills_reminder(lines);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// The names added to and removed from a per-session set since the previous
+/// observed value. The first call records the set without reporting anything.
+/// Saving the current set here makes each change produce one reminder only.
+pub fn set_changes(
+    root: &Path,
+    session: &str,
+    kind: &str,
+    current: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut current: Vec<String> = current.to_vec();
+    current.sort();
+    current.dedup();
+    let path = root
+        .join("environment")
+        .join(format!("{session}.{kind}.names.json"));
+    let previous: Option<Vec<String>> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_vec(&current).unwrap_or_default());
+    let Some(previous) = previous else {
+        return (Vec::new(), Vec::new());
+    };
+    let before: std::collections::HashSet<_> = previous.iter().collect();
+    let after: std::collections::HashSet<_> = current.iter().collect();
+    (
+        current
+            .iter()
+            .filter(|name| !before.contains(name))
+            .cloned()
+            .collect(),
+        previous
+            .into_iter()
+            .filter(|name| !after.contains(&name))
+            .collect(),
+    )
+}
+
+/// One reminder on the latest user message describing only what changed since
+/// the first message froze its lists. None when nothing changed.
+pub fn changes_reminder(
+    now_loadable: Vec<String>,
+    no_longer_available: Vec<String>,
+    new_skills: Vec<String>,
+    removed_skills: Vec<String>,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if !now_loadable.is_empty() {
+        lines.push(format!("Now loadable: {}", now_loadable.join(", ")));
+    }
+    if !no_longer_available.is_empty() {
+        lines.push(format!(
+            "No longer available: {}",
+            no_longer_available.join(", ")
+        ));
+    }
+    if !new_skills.is_empty() {
+        lines.push(format!("New skills: {}", new_skills.join(", ")));
+    }
+    if !removed_skills.is_empty() {
+        lines.push(format!("Removed skills: {}", removed_skills.join(", ")));
+    }
+    (!lines.is_empty()).then(|| format!("<system-reminder>\n{}\n</system-reminder>", lines.join("\n")))
 }
 
 /// The session's date as its own reminder.
@@ -76,14 +242,20 @@ pub struct SessionReminders {
     pub environment: Option<String>,
     pub project_instructions: Option<String>,
     pub standalone_frontend: bool,
+    /// The tools ToolLoad can load, frozen on the first request.
+    pub loadable_tools: Option<String>,
+    /// The model-invocable skills, frozen on the first request.
+    pub available_skills: Option<String>,
     pub date: Option<String>,
     pub git: Option<String>,
+    /// Skills invoked earlier whose message a compaction removed.
     pub skills: Option<String>,
 }
 
 /// The reminders that open the first user message: the user's own instructions,
 /// the environment, the project's instructions, the CLI's frontend facts, the
-/// date, the Git snapshot and skills recovered after compaction.
+/// loadable tools, the skills, the date, the Git snapshot and skills recovered
+/// after compaction.
 pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     let mut blocks = Vec::new();
     blocks.extend(parts.user_instructions);
@@ -92,7 +264,8 @@ pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     if parts.standalone_frontend {
         blocks.push(standalone_frontend_reminder());
     }
-    // Round 2 adds loadable tools and the skill list here.
+    blocks.extend(parts.loadable_tools);
+    blocks.extend(parts.available_skills);
     blocks.extend(parts.date);
     blocks.extend(parts.git);
     blocks.extend(parts.skills);
@@ -843,11 +1016,17 @@ mod tests {
             environment: Some(environment),
             project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
             standalone_frontend: true,
+            loadable_tools: Some(
+                "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
+            ),
+            available_skills: Some(
+                "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
+            ),
             date: Some(date_reminder("2026-11-19")),
             git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
             skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
         });
-        assert_eq!(blocks.len(), 7);
+        assert_eq!(blocks.len(), 9);
         assert!(blocks[0].contains("user rules"));
         assert!(blocks[1].starts_with("<system-reminder>\n# Environment\n"));
         assert!(blocks[1].contains(" - Project: Demo\n - Primary working directory: "));
@@ -855,13 +1034,26 @@ mod tests {
         assert!(!blocks[1].contains("Today's date"));
         assert!(blocks[2].contains("project rules"));
         assert_eq!(blocks[3], standalone_frontend_reminder());
-        assert_eq!(blocks[4], date_reminder("2026-11-19"));
-        assert_eq!(blocks[5], "<system-reminder>\n# gitStatus\n</system-reminder>");
-        assert_eq!(blocks[6], "<system-reminder>\ninvoked skills\n</system-reminder>");
+        assert!(blocks[3].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
+        assert!(blocks[4].contains("Tools you can load with ToolLoad"));
+        assert!(blocks[5].contains("Available skills"));
+        assert_eq!(blocks[6], date_reminder("2026-11-19"));
+        assert_eq!(blocks[7], "<system-reminder>\n# gitStatus\n</system-reminder>");
+        assert_eq!(blocks[8], "<system-reminder>\ninvoked skills\n</system-reminder>");
         // The terminal facts are a first-message reminder, never system text.
         let system = compose_system_prompt_in(None, PromptProfile::Code);
         assert!(!system.contains(STANDALONE_FRONTEND));
         assert!(!compose_system_prompt(None, PromptProfile::Desktop).contains(STANDALONE_FRONTEND));
+        // The loadable tools and skills lists moved out of the system prompt.
+        for absent in [
+            "# Tool directory",
+            "MCP tools available on demand",
+            "Tools you can load with ToolLoad",
+            "Available skills:",
+            "! <command>",
+        ] {
+            assert!(!system.contains(absent), "{absent} in:\n{system}");
+        }
         // Absent optional parts are simply omitted.
         assert!(first_message_reminders(SessionReminders::default()).is_empty());
         for (index, block) in blocks.iter().enumerate() {
@@ -872,8 +1064,101 @@ mod tests {
     }
 
     #[test]
-    fn environment_and_date_are_frozen_per_session() {
+    fn loadable_tools_and_skills_freeze_and_report_changes_once() {
         let root = tempfile::tempdir().unwrap();
+        let builtin = vec![
+            (
+                "ListDir".to_owned(),
+                "List a directory. A second sentence is dropped.".to_owned(),
+            ),
+            (
+                "WebSearch".to_owned(),
+                format!("{}\nsecond line", "x".repeat(200)),
+            ),
+        ];
+        let mcp = vec![("mcp__gh__create_issue".to_owned(), "Create an issue.".to_owned())];
+        let reminder = loadable_tools_for_session(root.path(), "s", &builtin, &mcp).unwrap();
+        assert!(reminder.starts_with(
+            "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n"
+        ));
+        assert!(reminder.contains("- ListDir: List a directory"));
+        assert!(!reminder.contains("second sentence"));
+        assert!(reminder.contains("- mcp__gh__create_issue: Create an issue"));
+        let mcp_line = reminder.lines().find(|line| line.starts_with("- WebSearch:")).unwrap();
+        assert_eq!(mcp_line.trim_start_matches("- WebSearch: ").chars().count(), 100, "{reminder}");
+        // A later request reads the frozen file, whatever the current tools say.
+        assert_eq!(
+            loadable_tools_for_session(root.path(), "s", &[], &[]).as_deref(),
+            Some(reminder.as_str())
+        );
+        assert!(loadable_tools_for_session(root.path(), "other", &[], &[]).is_none());
+
+        // An empty first list is frozen too: a tool or skill discovered later
+        // must produce a change reminder, never a new block in the first message.
+        let empty_root = tempfile::tempdir().unwrap();
+        assert!(loadable_tools_for_session(empty_root.path(), "s", &[], &[]).is_none());
+        assert!(
+            loadable_tools_for_session(empty_root.path(), "s", &builtin, &mcp).is_none(),
+            "a later tool cannot add a list to the frozen first message"
+        );
+        assert!(skills_for_session(empty_root.path(), "s", &[]).is_none());
+        assert!(
+            skills_for_session(empty_root.path(), "s", &["- deploy: Ship it".to_owned()]).is_none(),
+            "a later skill cannot add a list to the frozen first message"
+        );
+
+        let lines = vec!["- deploy: Ship it (context: fork)".to_owned()];
+        let skills = skills_for_session(root.path(), "s", &lines).unwrap();
+        assert!(skills.starts_with("<system-reminder>\nAvailable skills: invoke the Skill tool"));
+        assert!(skills.contains("- deploy: Ship it (context: fork)"));
+        assert_eq!(
+            skills_for_session(root.path(), "s", &["- changed: New".to_owned()]).as_deref(),
+            Some(skills.as_str())
+        );
+
+        // The first observation records the set; every later change is reported
+        // exactly once against the previous observation.
+        let first = vec!["ListDir".to_owned(), "WebSearch".to_owned()];
+        assert_eq!(set_changes(root.path(), "s", "loadable-tools", &first), (Vec::new(), Vec::new()));
+        let (now, gone) = set_changes(
+            root.path(),
+            "s",
+            "loadable-tools",
+            &["ListDir".to_owned(), "Glob".to_owned()],
+        );
+        assert_eq!(now, vec!["Glob".to_owned()]);
+        assert_eq!(gone, vec!["WebSearch".to_owned()]);
+        assert_eq!(
+            set_changes(root.path(), "s", "loadable-tools", &["ListDir".to_owned(), "Glob".to_owned()]),
+            (Vec::new(), Vec::new()),
+            "an unchanged set reports nothing on the next request"
+        );
+        assert_eq!(
+            set_changes(root.path(), "s", "skills", &["deploy".to_owned()]),
+            (Vec::new(), Vec::new()),
+            "each kind tracks its own set"
+        );
+        assert_eq!(
+            changes_reminder(now, gone, vec!["new-skill".to_owned()], vec!["old-skill".to_owned()])
+                .unwrap(),
+            "<system-reminder>\nNow loadable: Glob\nNo longer available: WebSearch\nNew skills: new-skill\nRemoved skills: old-skill\n</system-reminder>"
+        );
+        assert!(changes_reminder(Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_none());
+    }
+
+    #[test]
+    fn one_sentence_collapses_whitespace_and_cuts_at_the_limit() {
+        assert_eq!(one_sentence("First line.\nSecond line.", 100), "First line");
+        assert_eq!(one_sentence("  spaced   words  ", 100), "spaced words");
+        let long = "a".repeat(120);
+        let cut = one_sentence(&long, 100);
+        assert_eq!(cut.chars().count(), 100);
+        assert!(cut.ends_with('…'));
+        assert_eq!(one_sentence(&"é".repeat(120), 100).chars().count(), 100);
+    }
+
+    #[test]
+    fn environment_and_date_are_frozen_per_session() {        let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let first = environment_for_session(root.path(), "s", Some(workspace.path()), None);
         // A resume asks again, possibly without the workspace; the stored text wins.

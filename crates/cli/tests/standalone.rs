@@ -1036,15 +1036,27 @@ async fn assert_cli_context_search(sdk: bool) {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 6);
     let fresh = requests[0]["messages"].to_string();
-    assert!(fresh.contains("- `ContextSearch`"));
+    assert!(fresh.contains("- ContextSearch:"), "{fresh}");
     assert!(!fresh.contains("After compaction, load ContextSearch"));
+    assert!(
+        !requests[0]["messages"][0]["content"]
+            .to_string()
+            .contains("Tools you can load with ToolLoad"),
+        "the list must stay out of the system prompt: {}",
+        requests[0]["messages"][0]["content"]
+    );
     assert!(requests[1].to_string().contains(CONTEXT_SEARCH_FACT));
     assert!(requests[2].to_string().contains(CONTEXT_SEARCH_FACT));
     for body in &requests[3..5] {
         assert!(body["messages"].to_string().contains("COMPACT_FIXTURE"));
         assert!(!body.to_string().contains(CONTEXT_SEARCH_FACT));
     }
+    // The first message is frozen, so the same list appears after compaction
+    // and nothing is appended to the system prompt.
     assert!(requests[3]["messages"]
+        .to_string()
+        .contains("- ContextSearch:"));
+    assert!(!requests[3]["messages"]
         .to_string()
         .contains("After compaction, load ContextSearch with ToolLoad"));
     let tool = |index: usize| {

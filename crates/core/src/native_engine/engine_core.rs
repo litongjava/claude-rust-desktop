@@ -1161,9 +1161,12 @@ impl QueryEngine {
                 turn_blocks.push((content, Some(skill)));
             }
         }
-        let available_skills = discovered_skills
+        let model_skills: Vec<_> = discovered_skills
             .values()
             .filter(|skill| skill.model_invocable())
+            .collect();
+        let available_skills = model_skills
+            .iter()
             .map(|skill| {
                 skill_listing_line(
                     &skill.name,
@@ -1173,8 +1176,112 @@ impl QueryEngine {
                 )
             })
             .collect::<Vec<_>>();
-        if !available_skills.is_empty() {
-            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.\n{}\n", available_skills.join("\n")));
+        let available_skill_names = model_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        // The set of tools ToolLoad can offer and the model-invocable skills
+        // are frozen into the first user message. A later discovery only adds a
+        // change reminder to the latest message, never an edit to that prefix.
+        let allowed_tool_names = agent.as_ref().and_then(|definition| definition.tools.clone());
+        let tool_load_available = customization.loading("ToolLoad").enabled
+            && allowed_tool_names
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == "ToolLoad"));
+        let (loadable_builtin, loadable_mcp) = if tool_load_available {
+            let mcp_tools = match &self.mcp_registry {
+                Some(registry) => {
+                    crate::native_engine::tool_loop::discover_mcp_tools(registry)
+                        .await?
+                        .0
+                }
+                None => Vec::new(),
+            };
+            let mcp_states = crate::mcp::states::load(&plugin_context.paths.data_dir);
+            let goal_proposals = self
+                .local_goal_frontend
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && crate::services::goal_proposals::available(
+                    &self.db_manager,
+                    &conv_id,
+                    &plugin_context.paths.data_dir,
+                    &workspace,
+                    &self.permission_manager,
+                );
+            let compaction_requests = self
+                .context_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+            let catalog = crate::native_engine::tool_loop::builtin_catalog_for_session(
+                prompt_profile,
+                true,
+                goal_proposals,
+                compaction_requests,
+                true,
+                true,
+            );
+            let catalog = customization.described(catalog);
+            crate::native_engine::tool_loop::loadable_tool_lists(
+                &customization,
+                &catalog,
+                &mcp_tools,
+                &mcp_states,
+                allowed_tool_names.as_deref(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let loadable_names = loadable_builtin
+            .iter()
+            .chain(&loadable_mcp)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let first_message_root = plugin_context.paths.data_dir.clone();
+        let first_message_session = conv_id.clone();
+        let has_user_message = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        let (loadable_tools, available_skills_listing, set_changes) =
+            tokio::task::spawn_blocking(move || {
+                let loadable_tools = crate::prompt::loadable_tools_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &loadable_builtin,
+                    &loadable_mcp,
+                );
+                let available_skills = crate::prompt::skills_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &available_skills,
+                );
+                let changes = has_user_message
+                    .then(|| {
+                        let (now, gone) = if tool_load_available {
+                            crate::prompt::set_changes(
+                                &first_message_root,
+                                &first_message_session,
+                                "loadable-tools",
+                                &loadable_names,
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        let (new_skills, removed_skills) = crate::prompt::set_changes(
+                            &first_message_root,
+                            &first_message_session,
+                            "skills",
+                            &available_skill_names,
+                        );
+                        crate::prompt::changes_reminder(now, gone, new_skills, removed_skills)
+                    })
+                    .flatten();
+                (loadable_tools, available_skills, changes)
+            })
+            .await?;
+        if let Some(reminder) = set_changes {
+            turn_blocks.push((reminder, None));
         }
         crate::tools::configure_lsp_servers(
             &workspace_path,
@@ -1301,6 +1408,8 @@ impl QueryEngine {
                 environment: Some(environment),
                 project_instructions,
                 standalone_frontend,
+                loadable_tools,
+                available_skills: available_skills_listing,
                 date: Some(frozen_date),
                 git: git_snapshot
                     .as_deref()
