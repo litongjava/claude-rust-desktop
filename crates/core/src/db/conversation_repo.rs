@@ -1,117 +1,123 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// Copy history through the selected response, keeping the source session intact.
 pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Option<&str>, message_index: Option<usize>) -> Result<String> {
     use super::message_repo;
-    let transaction = crate::db::write_transaction(&conn)?;
-    let source = get_conversation(&transaction, source_id)?.ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
-    let mut messages = message_repo::get_messages_by_conversation(&transaction, source_id)?;
-    let index = message_id.and_then(|id| messages.iter().position(|message| message.id == id)).or(message_index);
-    if let Some(index) = index {
-        anyhow::ensure!(index < messages.len(), "Branch message not found");
-        messages.truncate(index + 1);
-    } else {
-        anyhow::ensure!(message_id.is_none(), "Branch message not found");
-    }
-    let new_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let title = format!("{} (branch)", source.title.as_deref().unwrap_or("Conversation"));
-    insert_conversation(&transaction, &new_id, Some(&title), source.model.as_deref(), source.provider.as_deref(),
-        source.workspace_path.as_deref(), source.project_id.as_deref(), source.research_mode, false, false,
-        &now, &now, messages.len() as i64)?;
-    // The copied boundaries belong to the ancestor session; a branch counts
-    // only the compactions it commits itself.
-    transaction.execute(
-        "INSERT INTO peripheral_settings(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
-        [crate::services::compaction::count_key(&new_id)],
-    )?;
-    set_workspace_mode(&transaction, &new_id, &source.workspace_mode)?;
-    // Preserve the bound agent's prompt and tool restrictions for both CLI and
-    // Desktop branches. Older databases may not have the agent-service schema.
-    let has_agents: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_agents')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_agents {
-        transaction.execute(
-            "INSERT INTO session_agents (conversation_id, definition) SELECT ?1, definition FROM session_agents WHERE conversation_id = ?2",
-            params![new_id, source_id],
-        )?;
-    }
-    transaction.execute("INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2", rusqlite::params![new_id, source_id])?;
-    transaction.execute("INSERT INTO conversation_worktree_backends (conversation_id, backend, metadata) SELECT ?1, backend, metadata FROM conversation_worktree_backends WHERE conversation_id=?2", params![new_id,source_id])?;
-    for message in messages {
-        let new_message_id = uuid::Uuid::new_v4().to_string();
-        message_repo::insert_message(&transaction, &new_message_id, &new_id, &message.role, &message.content,
-            message.thinking.as_deref(), &message.created_at, message.is_compact_boundary, message.sort_order)?;
-        super::turn_repo::copy_message_turn(&transaction, &message.id, &new_message_id, &new_id)?;
-        let mut tool_ids = std::collections::HashMap::new();
-        for tool in message_repo::get_tool_calls_for_message(&transaction, &message.id)? {
-            // Shell result metadata is private sidecar data.
-            // Its unique occurrence suffix identifies them in every branch.
-            let new_tool_id = tool
-                .id
-                .rsplit(':')
-                .next()
-                .filter(|id| {
-                    matches!(tool.name.as_str(), "Bash" | "PowerShell" | "TaskGet" | "TaskOutput")
-                        && id.starts_with("inv-")
-                })
-                .map(|id| format!("{new_message_id}:{id}"))
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            message_repo::insert_tool_call(
-                &transaction,
-                &new_tool_id,
-                &new_message_id,
-                &tool.name,
-                tool.input.as_deref(),
-                tool.output.as_deref(),
-                tool.is_error,
-                tool.sort_order,
-            )?;
-            transaction.execute("INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) SELECT ?1,?2,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs WHERE conversation_id=?3 AND tool_use_id=?4", params![new_id,new_tool_id,source_id,tool.id])?;
-            transaction.execute("INSERT INTO tool_call_notes (tool_call_id, note) SELECT ?1, note FROM tool_call_notes WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;
-            transaction.execute("INSERT INTO tool_queued_inputs (tool_call_id, inputs_json) SELECT ?1, inputs_json FROM tool_queued_inputs WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;
-            if let Some(duration) = message_repo::tool_duration(&transaction, &tool.id)? { message_repo::set_tool_duration(&transaction, &new_tool_id, duration)?; }
-            tool_ids.insert(tool.id, new_tool_id);
-        }
-        // Nested ToolScript origins follow their tool rows into the branch,
-        // remapping both the child and the parent occurrence id.
-        for (child, parent, sequence) in message_repo::get_tool_origins_for_message(&transaction, &message.id)? {
-            if let (Some(new_child), Some(new_parent)) = (tool_ids.get(&child), tool_ids.get(&parent)) {
-                message_repo::save_tool_origin(&transaction, new_child, new_parent, sequence)?;
+    crate::db::write_tx(
+        conn,
+        "session branch",
+        crate::db::STARTUP_WRITE_DEADLINE,
+        |transaction| {
+            let source = get_conversation(&transaction, source_id)?.ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
+            let mut messages = message_repo::get_messages_by_conversation(&transaction, source_id)?;
+            let index = message_id.and_then(|id| messages.iter().position(|message| message.id == id)).or(message_index);
+            if let Some(index) = index {
+                anyhow::ensure!(index < messages.len(), "Branch message not found");
+                messages.truncate(index + 1);
+            } else {
+                anyhow::ensure!(message_id.is_none(), "Branch message not found");
             }
-        }
-        let mut snapshots = message_repo::get_request_snapshots(&transaction, &message.id)?;
-        if let Some(requests) = snapshots.as_array_mut() {
-            for request in requests {
-                request["id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
-                if let Some(blocks) = request.get_mut("responseBlocks").and_then(|value| value.as_array_mut()) {
-                    for block in blocks {
-                        if let Some(new_tool_id) = block.get("id").and_then(|id| id.as_str()).and_then(|id| tool_ids.get(id)) {
-                            block["id"] = serde_json::json!(new_tool_id);
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let title = format!("{} (branch)", source.title.as_deref().unwrap_or("Conversation"));
+            insert_conversation(&transaction, &new_id, Some(&title), source.model.as_deref(), source.provider.as_deref(),
+                source.workspace_path.as_deref(), source.project_id.as_deref(), source.research_mode, false, false,
+                &now, &now, messages.len() as i64)?;
+            // The copied boundaries belong to the ancestor session; a branch counts
+            // only the compactions it commits itself.
+            transaction.execute(
+                "INSERT INTO peripheral_settings(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
+                [crate::services::compaction::count_key(&new_id)],
+            )?;
+            set_workspace_mode(&transaction, &new_id, &source.workspace_mode)?;
+            // Preserve the bound agent's prompt and tool restrictions for both CLI and
+            // Desktop branches. Older databases may not have the agent-service schema.
+            let has_agents: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_agents')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_agents {
+                transaction.execute(
+                    "INSERT INTO session_agents (conversation_id, definition) SELECT ?1, definition FROM session_agents WHERE conversation_id = ?2",
+                    params![new_id, source_id],
+                )?;
+            }
+            transaction.execute("INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) SELECT ?1, project_id, source_path, repo_path, path, branch FROM conversation_worktrees WHERE conversation_id = ?2", rusqlite::params![new_id, source_id])?;
+            transaction.execute("INSERT INTO conversation_worktree_backends (conversation_id, backend, metadata) SELECT ?1, backend, metadata FROM conversation_worktree_backends WHERE conversation_id=?2", params![new_id,source_id])?;
+            for message in messages {
+                let new_message_id = uuid::Uuid::new_v4().to_string();
+                message_repo::insert_message(&transaction, &new_message_id, &new_id, &message.role, &message.content,
+                    message.thinking.as_deref(), &message.created_at, message.is_compact_boundary, message.sort_order)?;
+                super::turn_repo::copy_message_turn(&transaction, &message.id, &new_message_id, &new_id)?;
+                let mut tool_ids = std::collections::HashMap::new();
+                for tool in message_repo::get_tool_calls_for_message(&transaction, &message.id)? {
+                    // Shell result metadata is private sidecar data.
+                    // Its unique occurrence suffix identifies them in every branch.
+                    let new_tool_id = tool
+                        .id
+                        .rsplit(':')
+                        .next()
+                        .filter(|id| {
+                            matches!(tool.name.as_str(), "Bash" | "PowerShell" | "TaskGet" | "TaskOutput")
+                                && id.starts_with("inv-")
+                        })
+                        .map(|id| format!("{new_message_id}:{id}"))
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    message_repo::insert_tool_call(
+                        &transaction,
+                        &new_tool_id,
+                        &new_message_id,
+                        &tool.name,
+                        tool.input.as_deref(),
+                        tool.output.as_deref(),
+                        tool.is_error,
+                        tool.sort_order,
+                    )?;
+                    transaction.execute("INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) SELECT ?1,?2,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs WHERE conversation_id=?3 AND tool_use_id=?4", params![new_id,new_tool_id,source_id,tool.id])?;
+                    transaction.execute("INSERT INTO tool_call_notes (tool_call_id, note) SELECT ?1, note FROM tool_call_notes WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;
+                    transaction.execute("INSERT INTO tool_queued_inputs (tool_call_id, inputs_json) SELECT ?1, inputs_json FROM tool_queued_inputs WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;
+                    if let Some(duration) = message_repo::tool_duration(&transaction, &tool.id)? { message_repo::set_tool_duration(&transaction, &new_tool_id, duration)?; }
+                    tool_ids.insert(tool.id, new_tool_id);
+                }
+                // Nested ToolScript origins follow their tool rows into the branch,
+                // remapping both the child and the parent occurrence id.
+                for (child, parent, sequence) in message_repo::get_tool_origins_for_message(&transaction, &message.id)? {
+                    if let (Some(new_child), Some(new_parent)) = (tool_ids.get(&child), tool_ids.get(&parent)) {
+                        message_repo::save_tool_origin(&transaction, new_child, new_parent, sequence)?;
+                    }
+                }
+                let mut snapshots = message_repo::get_request_snapshots(&transaction, &message.id)?;
+                if let Some(requests) = snapshots.as_array_mut() {
+                    for request in requests {
+                        request["id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+                        if let Some(blocks) = request.get_mut("responseBlocks").and_then(|value| value.as_array_mut()) {
+                            for block in blocks {
+                                if let Some(new_tool_id) = block.get("id").and_then(|id| id.as_str()).and_then(|id| tool_ids.get(id)) {
+                                    block["id"] = serde_json::json!(new_tool_id);
+                                }
+                            }
                         }
                     }
                 }
+                message_repo::save_request_snapshots(&transaction, &new_message_id, &snapshots)?;
+                transaction.execute("INSERT INTO message_user_content (message_id, content_json) SELECT ?1, content_json FROM message_user_content WHERE message_id = ?2", params![new_message_id, message.id])?;
+                transaction.execute("INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2",
+                    params![crate::services::compaction::native::key(&new_message_id), crate::services::compaction::native::key(&message.id)])?;
+                transaction.execute("INSERT INTO attachments (id, message_id, file_name, file_type, mime_type, file_size, source)
+                    SELECT lower(hex(randomblob(16))), ?1, file_name, file_type, mime_type, file_size, source FROM attachments WHERE message_id = ?2",
+                    params![new_message_id, message.id])?;
             }
-        }
-        message_repo::save_request_snapshots(&transaction, &new_message_id, &snapshots)?;
-        transaction.execute("INSERT INTO message_user_content (message_id, content_json) SELECT ?1, content_json FROM message_user_content WHERE message_id = ?2", params![new_message_id, message.id])?;
-        transaction.execute("INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2",
-            params![crate::services::compaction::native::key(&new_message_id), crate::services::compaction::native::key(&message.id)])?;
-        transaction.execute("INSERT INTO attachments (id, message_id, file_name, file_type, mime_type, file_size, source)
-            SELECT lower(hex(randomblob(16))), ?1, file_name, file_type, mime_type, file_size, source FROM attachments WHERE message_id = ?2",
-            params![new_message_id, message.id])?;
-    }
-    // A full fork copies all explicit intent. Partial Desktop branches are not Auto-enabled.
-    if message_id.is_none() && message_index.is_none() {
-        crate::services::permission_authority::inherit_conn(&transaction, source_id, &new_id)?;
-    }
-    transaction.commit()?;
-    Ok(new_id)
+            // A full fork copies all explicit intent. Partial Desktop branches are not Auto-enabled.
+            if message_id.is_none() && message_index.is_none() {
+                crate::services::permission_authority::inherit_conn(&transaction, source_id, &new_id)?;
+            }
+            Ok(new_id)
+        },
+    )
+    .context("Branching session")
 }
 
 #[cfg(test)]
@@ -173,6 +179,39 @@ mod branch_tests {
         assert!(branch_conversation(&conn, "source", None, Some(99)).is_err());
         assert!(branch_conversation(&conn, "missing", None, None).is_err());
         assert_eq!(list_conversations(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn branch_waits_for_another_writer_instead_of_failing() {
+        use crate::db::DbManager;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("branch.sqlite");
+        let db = std::sync::Arc::new(DbManager::new(path.clone()).unwrap());
+        db.init().unwrap();
+        let store = crate::runtime::SessionStore::new(db.clone());
+        let source = store.create(temp.path(), "model", "provider").unwrap();
+        store.append(&source, "user", "hello").unwrap();
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        let id = db
+            .with_conn(|conn| branch_conversation(conn, &source, None, None))
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "branch returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        let count = db
+            .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &id))
+            .unwrap()
+            .unwrap()
+            .len();
+        assert_eq!(count, 1);
     }
 }
 

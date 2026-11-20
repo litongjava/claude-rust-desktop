@@ -41,8 +41,20 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
     }
     worktree_startup::apply(cli, session).await?;
     if let Some(name) = &cli.name {
-        session.store.db.with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::update_conversation_title(conn, &session.id, name)
+        session.store.db.with_conn(|conn| -> Result<()> {
+            deepseek_code_core::db::write_tx(
+                conn,
+                "session name update",
+                deepseek_code_core::db::STARTUP_WRITE_DEADLINE,
+                |tx| {
+                    deepseek_code_core::db::conversation_repo::update_conversation_title(
+                        tx,
+                        &session.id,
+                        name,
+                    )
+                },
+            )
+            .context("Updating session name")
         })??;
     }
     if cli.ide {
