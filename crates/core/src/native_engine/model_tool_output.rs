@@ -103,6 +103,13 @@ fn render_with_spans(
     body_budget: Option<usize>,
     spans: &mut [Option<BodySpan>; 2],
 ) -> String {
+    // ToolLoad's structured result (loaded names, schemas) is kept for the
+    // transcript, the UI and the SDK. The model only needs the content line:
+    // the next request already carries the loaded definitions, and repeating
+    // them here would grow every later request.
+    if name == "ToolLoad" {
+        return tool_load_content(output).unwrap_or_else(|| output.into());
+    }
     if !matches!(
         name,
         "Bash" | "Read" | "Write" | "Edit" | "MultiEdit" | "ApplyPatch"
@@ -288,6 +295,18 @@ fn render_with_spans(
     }
     parts.extend(bodies);
     format!("{prefix}{}{suffix}", parts.join("\n"))
+}
+
+/// ToolLoad's model-visible text: the result's own `content` line. A hook
+/// context appended after the JSON stays, but the loaded schemas do not.
+fn tool_load_content(output: &str) -> Option<String> {
+    let json = output.strip_prefix("Error: ").unwrap_or(output);
+    let mut stream = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+    let Some(Ok(value)) = stream.next() else {
+        return None;
+    };
+    let content = value.get("content")?.as_str()?;
+    Some(format!("{content}{}", &json[stream.byte_offset()..]))
 }
 
 pub(super) fn is_shell_result(name: &str) -> bool {
@@ -1278,6 +1297,51 @@ mod tests {
         let snapshot = json!({"task_id":"task-1","status":"completed","stdout":"done\n","stderr":"","result":"{\"exit_code\":0,\"shell_path\":\"/bin/bash\"}"}).to_string();
         assert_eq!(render("TaskGet", &snapshot, None), snapshot);
         assert_eq!(render("TaskOutput", &snapshot, None), snapshot);
+    }
+
+    #[test]
+    fn tool_load_reply_is_the_content_line_without_loaded_schemas() {
+        let raw = json!({
+            "success": true,
+            "loaded_tools": ["WebFetch"],
+            "tools": [{
+                "name": "WebFetch",
+                "description": "Fetch a URL and return its readable text.",
+                "input_schema": {"type":"object","properties":{"url":{"type":"string"}}}
+            }],
+            "content": "Loaded WebFetch. Available from the next request."
+        })
+        .to_string();
+        assert_eq!(
+            render("ToolLoad", &raw, None),
+            "Loaded WebFetch. Available from the next request."
+        );
+        assert!(!render("ToolLoad", &raw, None).contains("input_schema"));
+
+        let failed = json!({
+            "success": false,
+            "loaded_tools": [],
+            "tools": [],
+            "unknown": ["Nope"],
+            "unavailable": [{"name":"computer_use","reason":"disabled by tool settings"}],
+            "content": "Unknown tools: Nope. Unavailable tools: computer_use (disabled by tool settings).",
+        })
+        .to_string();
+        let rendered = render("ToolLoad", &failed, None);
+        assert_eq!(
+            rendered,
+            "Unknown tools: Nope. Unavailable tools: computer_use (disabled by tool settings)."
+        );
+        assert!(!rendered.contains("\"unknown\""), "{rendered}");
+
+        // Hook context appended after the JSON survives the lean rendering.
+        let with_context = format!("{raw}\nPostToolUse context: keep me");
+        assert_eq!(
+            render("ToolLoad", &with_context, None),
+            "Loaded WebFetch. Available from the next request.\nPostToolUse context: keep me"
+        );
+        // A non-JSON legacy result is left as it is.
+        assert_eq!(render("ToolLoad", "plain text", None), "plain text");
     }
 
     fn executor(root: &std::path::Path) -> ToolLoopExecutor {

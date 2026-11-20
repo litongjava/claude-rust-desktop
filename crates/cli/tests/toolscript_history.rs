@@ -227,10 +227,27 @@ async fn cli_toolscript_repeated_calls_keep_history_across_model_rounds_and_reop
         .unwrap()
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+        .map(|m| {
+            // ToolLoad now reaches the model as one text line; keep it in the
+            // ordered results so the first entry still marks the load.
+            let content = m["content"].as_str().unwrap();
+            serde_json::from_str(content).unwrap_or_else(|_| Value::String(content.to_owned()))
+        })
         .collect();
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0]["loaded_tools"], json!(["ToolScript"]));
+    assert_eq!(
+        results[0],
+        json!("Loaded ToolScript. Available from the next request.")
+    );
+    // The schema the line refers to is advertised by the request after the load.
+    assert!(
+        requests[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "ToolScript"),
+        "ToolScript schema missing from the request after ToolLoad"
+    );
     assert_eq!(jobs.len(), 2, "both model ToolScript calls must run");
     for result in &results[1..] {
         assert_eq!(result["status"], "completed", "{result}");
