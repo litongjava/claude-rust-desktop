@@ -975,6 +975,86 @@ async fn tool_load_loads_a_tool_named_in_the_first_message_reminder() {
     assert!(names(&executor).contains(&"ListDir".to_owned()));
 }
 
+/// Loading a tool appends it after the resident tools in load order, so the
+/// cached request prefix never moves. Loading WebFetch then ListDir must not
+/// fall back to the alphabetical ListDir, WebFetch.
+#[tokio::test]
+async fn loaded_tools_are_appended_after_the_resident_prefix_in_load_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut executor = executor(temp.path());
+    let resident = executor.tool_definitions().unwrap();
+    let resident_names: Vec<String> = resident.iter().map(|tool| tool.name.clone()).collect();
+    let resident_prefix = serde_json::to_string(&resident).unwrap();
+    executor.exposed_tools = Some(resident_names.iter().cloned().collect());
+
+    for (name, id) in [("WebFetch", "load-web"), ("ListDir", "load-dir")] {
+        let (_, output, failed) = executor
+            .execute_tool_call("ToolLoad", &json!({"names":[name]}), id)
+            .await;
+        assert!(!failed, "{output}");
+    }
+
+    let after = executor.tool_definitions().unwrap();
+    let after_names: Vec<String> = after.iter().map(|tool| tool.name.clone()).collect();
+    assert_eq!(
+        &after_names[..resident_names.len()],
+        resident_names.as_slice(),
+        "the resident prefix must not move"
+    );
+    assert_eq!(
+        &after_names[resident_names.len()..],
+        ["WebFetch", "ListDir"],
+        "loaded tools follow the order they were loaded: {after_names:?}"
+    );
+    assert_eq!(
+        serde_json::to_string(&after[..resident_names.len()]).unwrap(),
+        resident_prefix,
+        "the resident definitions stay byte-identical"
+    );
+
+    // Every later request rebuilds the same order.
+    assert_eq!(names(&executor), after_names);
+}
+
+/// A user-provided tool has no loading switch and is resident even though its
+/// name is not a built-in. Loading a builtin must not push it behind the
+/// loaded definitions.
+#[tokio::test]
+async fn loading_a_tool_keeps_a_user_tool_in_the_resident_prefix() {
+    use crate::services::customization::{CustomTool, Customization};
+    let temp = tempfile::tempdir().unwrap();
+    crate::services::customization::save(
+        temp.path(),
+        &Customization {
+            custom_tools: vec![CustomTool {
+                name: "zed_user_tool".into(),
+                description: "A user tool.".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+                command: "true".into(),
+                enabled: true,
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+    let mut executor = executor(temp.path());
+    let resident = names(&executor);
+    assert!(
+        resident.contains(&"zed_user_tool".to_owned()),
+        "{resident:?}"
+    );
+    executor.exposed_tools = Some(resident.iter().cloned().collect());
+    let (_, output, failed) = executor
+        .execute_tool_call("ToolLoad", &json!({"names":["WebFetch"]}), "load")
+        .await;
+    assert!(!failed, "{output}");
+    let after = names(&executor);
+    assert_eq!(&after[..resident.len()], resident.as_slice(), "{after:?}");
+    assert_eq!(after.last().map(String::as_str), Some("WebFetch"), "{after:?}");
+}
+
 #[test]
 fn resident_tool_order_is_stable_across_builds() {
     let temp = tempfile::tempdir().unwrap();
@@ -1118,7 +1198,7 @@ async fn tool_load_loads_on_demand_mcp_tools() {
     );
     assert!(executor.loaded_tools.contains("mcp__gh__create_issue"));
     // A resumed session restores the load from the stored ToolLoad result.
-    let mut restored = std::collections::BTreeSet::new();
+    let mut restored = LoadedTools::default();
     ToolLoopExecutor::absorb_loaded(&output, &mut restored);
     assert!(restored.contains("mcp__gh__create_issue"));
 
@@ -1380,6 +1460,35 @@ fn request_tool_names(body: &Value, format: &str) -> Vec<String> {    body["tool
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The tool result texts a provider request actually carries.
+fn request_tool_outputs(body: &Value, format: &str) -> Vec<String> {
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    match format {
+        "openai" => body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| text(&message["content"]))
+            .collect(),
+        "responses" => body["input"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| text(&item["output"]))
+            .collect(),
+        _ => body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "tool_result")
+            .filter_map(|block| text(&block["content"]))
+            .collect(),
+    }
 }
 
 /// The tools in a sent body, normalized to the `{name, description,
@@ -1645,24 +1754,38 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             .await
             .unwrap()
             .unwrap();
-        let failed = |rx: &mut mpsc::Receiver<EngineEvent>| {
-            let mut errors = Vec::new();
-            while let Ok(event) = rx.try_recv() {
-                if let EngineEvent::ToolUseDone {
-                    tool_name,
-                    is_error,
-                    output,
-                    ..
-                } = event
-                {
-                    if is_error {
-                        errors.push(format!("{tool_name}: {output}"));
-                    }
+        let mut errors = Vec::new();
+        let mut tool_load_outputs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::ToolUseDone {
+                tool_name,
+                is_error,
+                output,
+                ..
+            } = event
+            {
+                if is_error {
+                    errors.push(format!("{tool_name}: {output}"));
+                }
+                if tool_name == "ToolLoad" {
+                    tool_load_outputs.push(output);
                 }
             }
-            errors
-        };
-        assert!(failed(&mut rx).is_empty(), "{format}");
+        }
+        assert!(errors.is_empty(), "{format}: {errors:?}");
+        // Desktop and the SDK keep the structured result while the model sees
+        // only its content line.
+        assert_eq!(tool_load_outputs.len(), 1, "{format}");
+        let structured: Value = serde_json::from_str(&tool_load_outputs[0]).unwrap();
+        assert_eq!(
+            structured["loaded_tools"],
+            json!(["ListDir", "WebFetch"]),
+            "{format}"
+        );
+        assert!(
+            structured["tools"][0]["input_schema"].is_object(),
+            "{format}"
+        );
         assert_eq!(text, "done", "{format}");
         server.abort();
 
@@ -1684,9 +1807,31 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             second.contains(&"WebFetch".to_owned()),
             "{format}: {second:?}"
         );
+        // The resident tools keep their exact prefix, and the loaded tools
+        // follow in the order the search named them.
+        let first_tools = requests[0]["tools"].as_array().unwrap();
+        let second_tools = requests[1]["tools"].as_array().unwrap();
+        assert_eq!(
+            &second_tools[..first_tools.len()],
+            first_tools.as_slice(),
+            "{format}: loading moved a resident tool"
+        );
+        assert_eq!(
+            &second[first_tools.len()..],
+            ["ListDir", "WebFetch"],
+            "{format}: {second:?}"
+        );
         assert!(
             requests[1]["tools"].to_string().contains("\"path\""),
             "{format}"
+        );
+        // The model-visible result is only the content line: the next request
+        // already carries both definitions in its tools array.
+        let outputs = request_tool_outputs(&requests[1], format);
+        assert_eq!(
+            outputs,
+            ["Loaded ListDir, WebFetch. Available from the next request."],
+            "{format}: {outputs:?}"
         );
         assert!(requests[2].to_string().contains("needle.txt"), "{format}");
     }

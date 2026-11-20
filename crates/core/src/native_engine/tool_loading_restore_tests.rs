@@ -63,6 +63,57 @@ fn request_names(executor: &ToolLoopExecutor) -> Vec<String> {
         .collect()
 }
 
+/// The load order survives a resume: both the message history and the durable
+/// rows append the loaded tools in the order their ToolLoad calls ran, not in
+/// alphabetical order, so the request prefix after the resident tools stays
+/// what the provider cached.
+#[test]
+fn a_resumed_session_keeps_the_loaded_tool_order() {
+    let _ = crate::config::OrchestrationConfig::init_global();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let session = store.create(dir.path(), "fixture", "fixture").unwrap();
+
+    store.append(&session, "user", "Load both").unwrap();
+    for (name, suffix) in [("WebFetch", "web"), ("ListDir", "dir")] {
+        let assistant = uuid::Uuid::new_v4().to_string();
+        record_call(
+            &store,
+            &session,
+            &assistant,
+            suffix,
+            "ToolLoad",
+            &json!({"success":true,"loaded_tools":[name],"tools":[]}).to_string(),
+        );
+    }
+
+    let mut from_messages = restore_executor(
+        &paths,
+        store.model_history(&session, &ApiFormat::OpenAI).unwrap(),
+    );
+    from_messages.restore_loaded_tools();
+    let sent = request_names(&from_messages);
+    assert_eq!(
+        &sent[sent.len() - 2..],
+        ["WebFetch", "ListDir"],
+        "{sent:?}"
+    );
+
+    // The durable rows restore the same order even when the submitted display
+    // history is empty.
+    let mut from_rows = restore_executor(&paths, vec![])
+        .with_conv_id(session.clone())
+        .with_goal_state(store.db.clone());
+    from_rows.restore_persisted_loaded_tools().unwrap();
+    let sent = request_names(&from_rows);
+    assert_eq!(
+        &sent[sent.len() - 2..],
+        ["WebFetch", "ListDir"],
+        "{sent:?}"
+    );
+}
+
 #[test]
 fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
     let _ = crate::config::OrchestrationConfig::init_global();
