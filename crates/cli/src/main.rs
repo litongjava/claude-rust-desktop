@@ -681,7 +681,29 @@ async fn run(cli: &Cli) -> Result<()> {
             match action {
                 SkillsCommands::ImportLegacy { .. } => unreachable!(),
                 SkillsCommands::List => {
-                    println!("{}", serde_json::to_string_pretty(&skills)?);
+                    let states =
+                        deepseek_code_core::skills::states::load(&paths.data_dir);
+                    let listed = skills
+                        .iter()
+                        .map(|skill| {
+                            let bundled = skill.source
+                                == deepseek_code_core::skills::SkillSource::Bundled;
+                            let state = deepseek_code_core::skills::states::effective_in(
+                                &states,
+                                &skill.name,
+                                bundled,
+                            );
+                            let mut value = serde_json::to_value(skill)?;
+                            value["state"] = serde_json::Value::String(state.label().into());
+                            // `enabled` follows the effective state, so a built-in
+                            // that is off by default never reads as enabled.
+                            value["enabled"] = serde_json::Value::Bool(
+                                state != deepseek_code_core::skills::states::SkillState::Off,
+                            );
+                            Ok(value)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!("{}", serde_json::to_string_pretty(&listed)?);
                     return Ok(());
                 }
                 SkillsCommands::State { skill, state } => {

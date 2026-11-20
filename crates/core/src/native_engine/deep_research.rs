@@ -747,6 +747,13 @@ mod tests {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        // Built-in skills default to off; this fixture opts deep-research in.
+        crate::skills::states::set(
+            &paths.data_dir,
+            "deep-research",
+            crate::skills::states::SkillState::User,
+        )
+        .unwrap();
         let context =
             ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
         let sessions = crate::runtime::SessionStore::new(context.db.clone());
