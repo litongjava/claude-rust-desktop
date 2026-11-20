@@ -206,7 +206,7 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
         &[]
     } else if kind == GLOBAL {
         &[
-            ("conversation_private_workspace_bindings", "child_id parent_id"),
+            ("conversation_private_workspace_bindings", "child_id parent_id parent_incarnation"),
             ("conversation_worktree_backends", "conversation_id backend metadata"),
             ("conversation_worktrees", "conversation_id project_id source_path repo_path path branch"),
             ("legacy_session_imports", "id digest project_id incarnation"),

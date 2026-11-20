@@ -20,7 +20,7 @@ CREATE TABLE legacy_session_imports(id TEXT PRIMARY KEY, digest TEXT NOT NULL, p
 CREATE TABLE conversation_private_workspace_bindings (
     child_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     -- Retain an invalid binding after parent deletion: never silently redirect a child.
-    parent_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL, parent_incarnation TEXT NOT NULL,
     CHECK(child_id <> parent_id)
 );
 

@@ -677,16 +677,14 @@ impl Stores {
                 tx.execute(&format!("INSERT INTO {table}(conversation_id,{cols}) SELECT ?1,{cols} FROM {table} WHERE conversation_id=?2"),[&op.id,source])?;
             }
             if saved.child && project.is_none() {
-                tx.execute("INSERT INTO conversation_private_workspace_bindings(child_id,parent_id) VALUES(?1,COALESCE((SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2),?2))",[&op.id,source])?;
-            } else {
-                tx.execute("INSERT INTO conversation_private_workspace_bindings SELECT ?1,parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2",[&op.id,source])?;
+                tx.execute("INSERT INTO conversation_private_workspace_bindings
+                    SELECT ?1,coalesce(b.parent_id,c.id),coalesce(b.parent_incarnation,c.incarnation)
+                    FROM conversations c LEFT JOIN conversation_private_workspace_bindings b ON b.child_id=c.id WHERE c.id=?2",[&op.id,source])?;
             }
             if saved.child {
                 let root = self.root.path.join("workspaces");
-                let parent_path =
-                    crate::native_engine::workspace::resolve_workspace(tx, &root, source, None)?.0;
-                let child_path =
-                    crate::native_engine::workspace::resolve_workspace(tx, &root, &op.id, None)?.0;
+                let parent_path = copy::workspace(tx, &root, source)?;
+                let child_path = copy::workspace(tx, &root, &op.id)?;
                 let actual = parent_path.canonicalize()?;
                 ensure!(
                     child_path.canonicalize()? == actual

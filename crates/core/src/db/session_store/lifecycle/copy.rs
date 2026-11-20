@@ -24,23 +24,74 @@ pub(super) struct Source {
     pub binding: String,
 }
 
+fn private_owner(c: &Connection, id: &str) -> Result<(String, String)> {
+    // Child bindings point directly to the root owner. Retain the binding when
+    // that owner disappears so a reused logical ID cannot grant its workspace.
+    c.query_row(
+        "SELECT o.id,o.incarnation FROM conversations s
+        LEFT JOIN conversation_private_workspace_bindings b ON b.child_id=s.id
+        JOIN conversations o ON o.id=coalesce(b.parent_id,s.id)
+          AND o.incarnation=coalesce(b.parent_incarnation,s.incarnation)
+        WHERE s.id=?1 AND s.project_id IS NULL AND o.project_id IS NULL
+          AND o.workspace_mode=s.workspace_mode AND (b.child_id IS NULL OR o.archived=0)",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?
+    .context("Private workspace owner unavailable")
+}
+
+pub(super) fn workspace(c: &Connection, root: &Path, id: &str) -> Result<PathBuf> {
+    let row = crate::db::conversation_repo::conversation_metadata(c, id)?
+        .context("Session unavailable")?;
+    ensure!(!row.archived, "Session is archived");
+    if row.project_id.is_some() {
+        return Ok(crate::native_engine::workspace::resolve_workspace(c, root, id, None)?.0);
+    }
+    let (_, inc) = private_owner(c, id)?;
+    ensure!(
+        Uuid::parse_str(&inc)?.to_string() == inc,
+        "Invalid workspace incarnation"
+    );
+    fs::create_dir_all(root)?;
+    let path = root.canonicalize()?.join(inc);
+    fs::create_dir_all(&path)?;
+    ensure!(
+        path.canonicalize()? == path,
+        "Private workspace is redirected"
+    );
+    Ok(path)
+}
+
 pub(super) fn binding(c: &Connection, id: &str) -> Result<String> {
     // Worktree and private-parent changes can be made independently of title
     // and other directory metadata. Fence their actual values at publication.
-    let owner = crate::native_engine::workspace::private_workspace_owner(c, id)?;
+
     Ok(c.query_row(
         "SELECT json_array(c.workspace_mode,c.project_id,c.archived, w.project_id,
-        w.source_path,w.repo_path,w.path,w.branch,b.backend,b.metadata,p.parent_id,
-        (SELECT incarnation FROM conversations WHERE id=?2))
+        w.source_path,w.repo_path,w.path,w.branch,b.backend,b.metadata,p.parent_id,p.parent_incarnation,
+        (SELECT incarnation FROM conversations WHERE id=p.parent_id))
         FROM conversations c LEFT JOIN conversation_worktrees w ON w.conversation_id=c.id
         LEFT JOIN conversation_worktree_backends b ON b.conversation_id=c.id
         LEFT JOIN conversation_private_workspace_bindings p ON p.child_id=c.id WHERE c.id=?1",
-        params![id, owner],
+        [id],
         |r| r.get(0),
     )?)
 }
 
 impl SessionDb {
+    pub fn workspace(&self) -> Result<PathBuf> {
+        let _guards = self.stores.key_lock(&self.key, false, false)?;
+        self.check_directory()?;
+        self.stores.global().read(|c| {
+            let snapshot = c.unchecked_transaction()?;
+            workspace(
+                &snapshot,
+                &self.stores.root.path.join("workspaces"),
+                &self.id,
+            )
+        })
+    }
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
         self.branch_at(destination, boundary, None)
     }
@@ -75,7 +126,7 @@ impl SessionDb {
             if matches!(boundary, Branch::Child | Branch::Clear) {
                 ensure!(!row.archived, "Archived execution source");
                 if row.project_id.is_none() {
-                    crate::native_engine::workspace::private_workspace_owner(c, &self.id)?;
+                    private_owner(c, &self.id)?;
                 } else {
                     crate::native_engine::workspace::resolve_workspace(
                         c,

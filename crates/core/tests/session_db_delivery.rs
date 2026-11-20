@@ -628,3 +628,20 @@ fn rewind_retires_undispatched_generation_and_fork_keeps_early_nested_origin() -
         Ok(())
     })
 }
+
+#[test]
+fn private_child_never_resumes_in_a_reused_parents_workspace() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let parent = stores.create("../private/owner", Default::default())?;
+    let original = parent.workspace()?;
+    let child = parent.derive_owned_child("owned", &original)?;
+    let grandchild = child.derive_owned_child("also-owned", &original)?;
+    assert_eq!(grandchild.workspace()?, original);
+    parent.delete()?;
+    let replacement = stores.create("../private/owner", Default::default())?;
+    assert_ne!(replacement.workspace()?, original);
+    assert!(child.workspace().is_err());
+    assert!(grandchild.workspace().is_err());
+    Ok(())
+}
