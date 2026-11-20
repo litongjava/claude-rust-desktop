@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use r2d2::{ManageConnection, Pool};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // One pool budget for all access modes. A slot closes its old descriptor
 // before switching between an OS read-only connection and a writer.
@@ -78,7 +78,7 @@ impl GlobalDb {
                 "synchronous",
                 if publication { "FULL" } else { "NORMAL" },
             )?;
-            crate::db::write_tx(conn, label, Duration::from_secs(30), |tx| body(tx))
+            crate::db::write_tx(conn, label, super::WRITE_DEADLINE, |tx| body(tx))
         })
         .map_err(|e| crate::db::write_boundary_context(label, id, start, e))
     }

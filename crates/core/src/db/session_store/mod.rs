@@ -12,7 +12,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 type Fault = dyn Fn(Phase) -> Result<()> + Send + Sync;
 struct Root {
@@ -137,15 +139,15 @@ impl SessionDb {
             body(&SessionRead(&tx))
         })
     }
-    pub fn write<T>(&self, body: impl FnOnce(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
+    /// The closure may run again after SQLite contention rolls back its transaction.
+    pub fn write<T>(&self, mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
         let start = Instant::now();
         let _locks = lock_keys(&self.stores.root.path, vec![&self.key], false)?;
         self.check_directory()?;
         self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            let tx = crate::db::write_transaction(c)?;
-            let value = body(&SessionWrite(&tx))?;
-            tx.commit()?;
-            Ok(value)
+            crate::db::write_tx(c, "session write", WRITE_DEADLINE, |tx| {
+                body(&SessionWrite(tx))
+            })
         })
         .map_err(|e| crate::db::write_boundary_context("session write", &self.id, start, e))
     }
@@ -178,22 +180,22 @@ fn verify_manifest(c: &Connection, store: &str, id: &str, incarnation: &str) -> 
 pub struct SessionRead<'a>(&'a Connection);
 impl SessionRead<'_> {
     pub fn initial_message(&self) -> Result<Option<FirstMessage>> {
-        Ok(self
+        let pair = self
             .0
             .query_row(
                 "SELECT m.content,t.content_json FROM messages m LEFT JOIN message_user_content t
-            ON t.message_id=m.id WHERE m.sort_order=0",
+             ON t.message_id=m.id WHERE m.sort_order=0",
                 [],
                 |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?)),
             )
-            .optional()?
-            .map(|(text, json)| -> Result<_> {
-                Ok(FirstMessage {
-                    text,
-                    typed: json.map(|j| serde_json::from_str(&j)).transpose()?,
-                })
+            .optional()?;
+        pair.map(|(text, json)| {
+            Ok(FirstMessage {
+                text,
+                typed: json.map(|value| serde_json::from_str(&value)).transpose()?,
             })
-            .transpose()?)
+        })
+        .transpose()
     }
 }
 pub struct SessionWrite<'a>(&'a Connection);
