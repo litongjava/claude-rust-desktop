@@ -1,11 +1,18 @@
 //! Bounded shell output and descendant lifetime management.
+use crate::performance::command_lines::{LineCapture, Lines};
+use crate::performance::command_output::{qualifies, shown_extent, ByteLines, ReplacementWidths};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::Path,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
 };
+const CAPTURE_MARKER: &[u8] = b"\n... (capture truncated; middle omitted) ...\n";
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// bash reports a stage killed by SIGPIPE as 128 + 13. With `-o pipefail` that
@@ -18,7 +25,8 @@ fn cut_short_by_reader(shell: &str, code: Option<i32>) -> bool {
 struct Captured {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
-    total: usize,
+    extent: ByteLines,
+    excerpts: Option<LineCapture>,
     /// Bytes kept before the middle is dropped. A caller that must parse a
     /// complete document can raise this; Bash keeps the historical value.
     limit: usize,
@@ -28,7 +36,8 @@ impl Default for Captured {
         Self {
             head: Vec::new(),
             tail: std::collections::VecDeque::new(),
-            total: 0,
+            extent: ByteLines::default(),
+            excerpts: Some(LineCapture::default()),
             limit: OUTPUT_LIMIT,
         }
     }
@@ -42,26 +51,36 @@ impl Captured {
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        self.total = self.total.saturating_add(bytes.len());
+        self.extent.append(bytes);
+        if let Some(excerpts) = &mut self.excerpts {
+            excerpts.push(bytes);
+        }
         let head = bytes
             .len()
             .min((self.limit / 2).saturating_sub(self.head.len()));
         self.head.extend_from_slice(&bytes[..head]);
-        let rest = &bytes[head..];
-        let remove = (self.tail.len() + rest.len()).saturating_sub(self.limit / 2);
+        let tail_cap = self.limit - self.limit / 2;
+        let rest = &bytes[head.max(bytes.len().saturating_sub(tail_cap))..];
+        let remove = (self.tail.len() + rest.len()).saturating_sub(tail_cap);
         self.tail.drain(..remove.min(self.tail.len()));
         self.tail.extend(rest.iter().copied());
     }
 
     /// Whether more bytes arrived than this capture keeps.
     fn overflowed(&self) -> bool {
-        self.total > self.limit
+        self.extent.bytes > self.limit
     }
 
     fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes_and_omission().0).into_owned()
+    }
+
+    fn bytes_and_omission(&self) -> (Vec<u8>, usize, Option<std::ops::Range<usize>>) {
         let mut bytes = self.head.clone();
         let tail: Vec<_> = self.tail.iter().copied().collect();
         let mut tail_start = 0;
+        let mut retained = self.extent.bytes;
+        let mut marker = None;
         if self.overflowed() {
             if let Err(error) = std::str::from_utf8(&bytes) {
                 if error.error_len().is_none() {
@@ -71,16 +90,70 @@ impl Captured {
             while tail_start < tail.len() && tail[tail_start] & 0xc0 == 0x80 {
                 tail_start += 1;
             }
-            bytes.extend_from_slice(b"\n... (capture truncated; middle omitted) ...\n");
+            retained = bytes.len() + tail.len() - tail_start;
+            let start = String::from_utf8_lossy(&bytes).len();
+            marker = Some(start..start + CAPTURE_MARKER.len());
+            bytes.extend_from_slice(CAPTURE_MARKER);
         }
         bytes.extend_from_slice(&tail[tail_start..]);
-        String::from_utf8_lossy(&bytes).into_owned()
+        (bytes, self.extent.bytes - retained, marker)
     }
 
-    /// Bash presentation: the capture overflowed, or the head/tail preview is
-    /// still larger than the configured tool output limit.
-    fn truncated(&self) -> bool {
-        self.overflowed() || self.text().len() > super::max_output_bytes()
+    fn present(&self) -> (String, bool, StreamCapture) {
+        self.present_with_limit(super::max_output_bytes())
+    }
+
+    fn present_with_limit(&self, limit: usize) -> (String, bool, StreamCapture) {
+        let (bytes, capture_elided_bytes, marker) = self.bytes_and_omission();
+        let text = String::from_utf8_lossy(&bytes);
+        let sources = match marker {
+            Some(marker) => {
+                let tail = ByteLines::measure(&text.as_bytes()[marker.end..]);
+                vec![
+                    (0..marker.start, 0),
+                    (marker.end..text.len(), self.extent.lines() - tail.lines()),
+                ]
+            }
+            None => vec![(0..text.len(), 0)],
+        };
+        let (preview, kept) = crate::performance::preview_with_ranges(&text, limit);
+        let mut visible = Vec::new();
+        let mut ranges = Vec::new();
+        let mut first_lines = Vec::new();
+        for (part, offset) in kept.parts() {
+            for (source, origin) in &sources {
+                let start = part.start.max(source.start);
+                let end = part.end.min(source.end);
+                if start < end {
+                    visible.push(start..end);
+                    ranges.push(offset + (start - part.start)..offset + (end - part.start));
+                    first_lines.push(
+                        origin + ByteLines::measure(&text.as_bytes()[source.start..start]).newlines,
+                    );
+                }
+            }
+        }
+        let truncated = self.overflowed() || text.len() > kept.kept();
+        let (source_ranges, origins): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
+        let shown = shown_extent(
+            &text,
+            &source_ranges,
+            &origins,
+            &visible,
+            &ReplacementWidths::of(&bytes),
+        );
+        let stats = StreamCapture {
+            bytes: self.extent.bytes,
+            lines: self.extent.lines(),
+            excerpts: self.excerpts.as_ref().map(LineCapture::finish),
+            first_lines,
+            widths: shown.widths,
+            capture_elided_bytes,
+            tool_elided_text_bytes: source_ranges.iter().map(|r| r.len()).sum::<usize>()
+                - shown.text_bytes,
+            ranges,
+        };
+        (preview, truncated, stats)
     }
 }
 
@@ -96,7 +169,7 @@ async fn capture(
         if count == 0 {
             break;
         }
-        let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.total));
+        let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.extent.bytes));
         output.push(&buffer[..count]);
         if let Some(log) = log.as_mut() {
             std::io::Write::write_all(log, &buffer[..keep])?;
@@ -105,12 +178,175 @@ async fn capture(
     Ok(())
 }
 
-pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -> Result<Value> {
-    run_logged(command, Some(timeout), shell, None, None).await
+#[cfg(test)]
+#[test]
+fn capture_counts_original_bytes_and_lines_through_lossy_truncation() {
+    let mut capture = Captured::with_limit(8);
+    capture.push(b"a\n\xffb\n");
+    capture.push(b"c\nd\n");
+    capture.push(b"e\xff");
+    let (shown, truncated, stats) = capture.present();
+    assert!(truncated);
+    assert_eq!(stats.bytes, 11);
+    assert_eq!(stats.lines, 5);
+    assert_eq!(stats.capture_elided_bytes, 3);
+    assert_eq!(stats.tool_elided_text_bytes, 0);
+    assert!(shown.contains('�'));
 }
 
-/// `stdin` is `Some` only for an explicit interactive pipe; every ordinary call
-/// keeps the historical null stdin.
+#[cfg(test)]
+pub(crate) fn review_capture(large: bool) -> (String, ShellCapture) {
+    let mut captured = Captured::default();
+    let limit = if large {
+        // Same bytes and chunk boundaries as review-01's Python reproduction.
+        let mut row = vec![b'z'; 63];
+        row.push(b'\n');
+        let block = row.repeat(1024);
+        captured.push(b"BEGIN\n");
+        for _ in 0..400 {
+            captured.push(&block);
+        }
+        captured.push(b"error: midpoint sentinel\n");
+        for _ in 0..400 {
+            captured.push(&block);
+        }
+        captured.push(b"\x1b[31mwarning: final fixture\x1b[0m\n");
+        captured.push(b"invalid UTF-8: \xff\x00 suffix\n");
+        102_400
+    } else {
+        captured.push(b"small payload that the configured limit truncates\n");
+        24
+    };
+    let (text, truncated, stdout) = captured.present_with_limit(limit);
+    assert!(truncated);
+    (
+        text,
+        ShellCapture {
+            duration_ms: 50,
+            stdout,
+            stderr: Captured::default().present_with_limit(limit).2,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_capture(
+    streams: [&[u8]; 2],
+    capture_limit: usize,
+    tool_limit: usize,
+    exit: i64,
+) -> (String, Option<CommandMetadata>) {
+    let [(out, out_cut, stdout), (err, err_cut, stderr)] = streams.map(|bytes| {
+        let mut captured = Captured::with_limit(capture_limit);
+        for chunk in bytes.chunks(317) {
+            captured.push(chunk);
+        }
+        captured.present_with_limit(tool_limit)
+    });
+    let capture = shell_metadata(37, stdout, stderr, [out.len(), err.len()]);
+    let result = json!({"stdout":out, "stderr":err, "exit_code":exit, "stdout_truncated":out_cut,"stderr_truncated":err_cut});
+    (result.to_string(), capture.map(CommandMetadata::Shell))
+}
+
+pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -> Result<Value> {
+    let (value, capture) =
+        run_logged_with_capture(command, Some(timeout), shell, None, None).await?;
+    publish_capture(capture);
+    Ok(value)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StreamCapture {
+    pub(crate) bytes: usize,
+    pub(crate) lines: usize,
+    pub(crate) capture_elided_bytes: usize,
+    pub(crate) tool_elided_text_bytes: usize,
+    pub(crate) ranges: Vec<std::ops::Range<usize>>,
+    #[serde(default)]
+    pub(crate) first_lines: Vec<usize>,
+    #[serde(default)]
+    pub(crate) excerpts: Option<Lines>,
+    #[serde(default)]
+    pub(crate) widths: ReplacementWidths,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ShellCapture {
+    pub(crate) duration_ms: u64,
+    pub(crate) stdout: StreamCapture,
+    pub(crate) stderr: StreamCapture,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CommandMetadata {
+    Shell(ShellCapture),
+    Snapshot([crate::performance::command_output::SnapshotSize; 2]),
+    ShellSnapshot {
+        streams: [crate::performance::command_output::SnapshotSize; 2],
+    },
+    PageExit(i64), // Existing private sidecars.
+    Page {
+        bytes: [usize; 2],
+        widths: [ReplacementWidths; 2],
+    },
+}
+
+tokio::task_local! {
+    static MODEL_CAPTURE: std::cell::RefCell<Option<CommandMetadata>>;
+}
+
+pub(crate) async fn with_capture<F: std::future::Future>(
+    future: F,
+) -> (F::Output, Option<CommandMetadata>) {
+    MODEL_CAPTURE
+        .scope(Default::default(), async {
+            (future.await, MODEL_CAPTURE.with(|slot| slot.take()))
+        })
+        .await
+}
+
+pub(super) fn capture_sync<R>(run: impl FnOnce() -> R) -> (R, Option<CommandMetadata>) {
+    MODEL_CAPTURE.sync_scope(Default::default(), || {
+        (run(), MODEL_CAPTURE.with(|slot| slot.take()))
+    })
+}
+
+pub(super) fn publish_capture(capture: Option<ShellCapture>) {
+    if let Some(capture) = capture {
+        publish_metadata(CommandMetadata::Shell(capture));
+    }
+}
+
+pub(super) fn publish_metadata(metadata: CommandMetadata) {
+    replace_metadata(Some(metadata));
+}
+
+pub(super) fn replace_metadata(metadata: Option<CommandMetadata>) {
+    let _ = MODEL_CAPTURE.try_with(|slot| slot.replace(metadata));
+}
+
+pub(crate) fn publish_snapshot(
+    streams: [crate::performance::command_output::SnapshotSize; 2],
+    text_sizes: [usize; 2],
+) {
+    replace_metadata(qualifies(text_sizes).then_some(CommandMetadata::Snapshot(streams)));
+}
+
+pub(crate) fn publish_page(
+    stdout: &super::output_page::StreamPage,
+    stderr: &super::output_page::StreamPage,
+) {
+    let streams = [stdout, stderr];
+    // Decoded length is an upper bound. Save exact source widths for any
+    // candidate, including a page whose replacements crossed the threshold.
+    replace_metadata(
+        qualifies(streams.map(|s| s.text.len())).then(|| CommandMetadata::Page {
+            bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
+            widths: streams.map(|s| s.widths.clone()),
+        }),
+    );
+}
+
 pub(super) async fn run_logged(
     command: &mut Command,
     timeout: Option<Duration>,
@@ -118,27 +354,63 @@ pub(super) async fn run_logged(
     logs: Option<(std::path::PathBuf, std::path::PathBuf)>,
     stdin: Option<std::fs::File>,
 ) -> Result<Value> {
-    let run = run_captured(command, timeout, logs, stdin, OUTPUT_LIMIT).await?;
-    if run.timed_out {
+    Ok(
+        run_logged_with_capture(command, timeout, shell, logs, stdin)
+            .await?
+            .0,
+    )
+}
+
+pub(super) async fn run_logged_with_capture(
+    command: &mut Command,
+    timeout: Option<Duration>,
+    shell: &str,
+    logs: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    stdin: Option<std::fs::File>,
+) -> Result<(Value, Option<ShellCapture>)> {
+    let started = Instant::now();
+    let run = run_captured(command, timeout, logs, stdin, OUTPUT_LIMIT, true).await?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (stdout, stdout_truncated, stdout_stats) = run.stdout.present();
+    let (stderr, stderr_truncated, stderr_stats) = run.stderr.present();
+    let mut result = if run.timed_out {
         let timeout = timeout.unwrap_or_default();
-        return Ok(
-            json!({"error":format!("Command timed out after {} ms; descendants were terminated. For long installations or builds, set timeout explicitly (milliseconds, at most 600000), or use run_in_background.",timeout.as_millis()),"is_error":true,"timed_out":true,"shell":shell,"stdout":super::limit_output(&run.stdout.text()),"stderr":super::limit_output(&run.stderr.text()),"stdout_truncated":run.stdout.truncated(),"stderr_truncated":run.stderr.truncated()}),
-        );
-    }
-    let status = run.status.expect("a finished capture has a status");
-    let code = status.code();
-    // A pipeline cut short by `head` still produced the output the caller
-    // asked for. The exit code and the flag keep it visible.
-    let cut_short = cut_short_by_reader(shell, code);
-    Ok(json!({
-        "stdout":super::limit_output(&run.stdout.text()),
-        "stderr":super::limit_output(&run.stderr.text()),
-        "stdout_truncated":run.stdout.truncated(),"stderr_truncated":run.stderr.truncated(),
-        "exit_code":code.unwrap_or(-1),
-        "success":status.success() || cut_short,
-        "pipeline_sigpipe":cut_short,
-        "shell":shell
-    }))
+        json!({"error":format!("Command timed out after {} ms; descendants were terminated. For long installations or builds, set timeout explicitly (milliseconds, at most 600000), or use run_in_background.",timeout.as_millis()),"is_error":true,"timed_out":true})
+    } else {
+        let status = run.status.expect("a finished capture has a status");
+        let code = status.code();
+        let cut_short = cut_short_by_reader(shell, code);
+        let mut result =
+            json!({"success":status.success() || cut_short,"pipeline_sigpipe":cut_short});
+        record_status(&mut result, Some(status));
+        result
+    };
+    let capture = shell_metadata(
+        duration_ms,
+        stdout_stats,
+        stderr_stats,
+        [stdout.len(), stderr.len()],
+    );
+    result["stdout"] = json!(stdout);
+    result["stderr"] = json!(stderr);
+    result["stdout_truncated"] = json!(stdout_truncated);
+    result["stderr_truncated"] = json!(stderr_truncated);
+    result["shell"] = json!(shell);
+    Ok((result, capture))
+}
+
+// Keep source metrics when loss could make a short command look long on replay.
+fn shell_metadata(
+    duration_ms: u64,
+    stdout: StreamCapture,
+    stderr: StreamCapture,
+    text_bytes: [usize; 2],
+) -> Option<ShellCapture> {
+    (qualifies([stdout.bytes, stderr.bytes]) || qualifies(text_bytes)).then_some(ShellCapture {
+        duration_ms,
+        stdout,
+        stderr,
+    })
 }
 
 /// Runs a command with a bounded **raw** capture: the whole document within
@@ -152,17 +424,46 @@ pub(super) async fn run_raw(
     limit: usize,
     stdin: Option<std::fs::File>,
 ) -> Result<Value> {
-    let run = run_captured(command, Some(timeout), None, stdin, limit).await?;
-    let code = run.status.and_then(|status| status.code());
-    Ok(json!({
+    let run = run_captured(command, Some(timeout), None, stdin, limit, false).await?;
+    let mut value = json!({
         "stdout":run.stdout.text(),
         "stderr":run.stderr.text(),
         "stdout_truncated":run.stdout.overflowed(),
         "stderr_truncated":run.stderr.overflowed(),
-        "exit_code":code.unwrap_or(-1),
         "success":run.status.is_some_and(|status| status.success()),
         "timed_out":run.timed_out
-    }))
+    });
+    record_status(&mut value, run.status);
+    Ok(value)
+}
+
+fn record_status(value: &mut Value, status: Option<std::process::ExitStatus>) {
+    let code = status.and_then(|status| status.code());
+    #[cfg(windows)]
+    let code = code.map(|c| c as u32); // Windows process exit codes are DWORDs.
+    value["exit_code"] = json!(code);
+    #[cfg(unix)]
+    if let Some(signal) = status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)) {
+        value["signal"] = json!(signal);
+    }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn model_tool_output_records_exit_code_and_signal_distinctly() {
+    for (script, code, signal) in [
+        ("kill -TERM $$", None, Some(15)),
+        ("exit 143", Some(143), None),
+    ] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let result = run(&mut command, Duration::from_secs(5), "sh")
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"].as_i64(), code);
+        assert_eq!(result["signal"].as_i64(), signal);
+        assert_eq!(result["success"], false);
+    }
 }
 
 /// One bounded capture of a child process.
@@ -179,6 +480,7 @@ async fn run_captured(
     logs: Option<(std::path::PathBuf, std::path::PathBuf)>,
     stdin: Option<std::fs::File>,
     limit: usize,
+    collect_lines: bool,
 ) -> Result<CapturedRun> {
     command
         .kill_on_drop(true)
@@ -198,6 +500,10 @@ async fn run_captured(
     let stderr = child.stderr.take().context("Shell stderr missing")?;
     let (mut stdout_bytes, mut stderr_bytes) =
         (Captured::with_limit(limit), Captured::with_limit(limit));
+    if !collect_lines {
+        stdout_bytes.excerpts = None;
+        stderr_bytes.excerpts = None;
+    }
     let (out_log, err_log) = logs
         .map(|(out, err)| (Some(out), Some(err)))
         .unwrap_or_default();

@@ -65,6 +65,7 @@ pub(crate) async fn generate(
         options.compaction("native"),
         messages,
         instructions,
+        Some(id),
     )
     .await
 }
@@ -82,6 +83,7 @@ pub(crate) async fn generate_messages(
             .compaction("native"),
         messages,
         instructions,
+        session,
     )
     .await
 }
@@ -91,6 +93,7 @@ pub(crate) async fn generate_messages_with_options(
     options: crate::native_engine::request_options::RequestOptions,
     messages: Vec<OpenAIMessage>,
     instructions: &str,
+    session: Option<&str>,
 ) -> Result<GeneratedSummary> {
     let body = provider_runtime::compaction_request(provider, messages, instructions)?;
     let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
@@ -111,10 +114,20 @@ pub(crate) async fn generate_messages_with_options(
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
+        provider,
+        "compaction",
+        session,
+        options
+            .recording
+            .as_ref()
+            .and_then(|context| context.parent_session_id.as_deref()),
+        options.model_request_id.as_deref(),
+    );
     let mut request = client
         .post(url)
         .headers(options.headers(provider)?)
-        .header("x-request-id", uuid::Uuid::new_v4().to_string())
+        .headers(identity.headers())
         .json(&body);
     if !provider.provider.api_key.is_empty() {
         request = request.bearer_auth(&provider.provider.api_key);
