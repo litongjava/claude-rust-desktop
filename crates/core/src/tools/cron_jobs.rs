@@ -37,8 +37,8 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
         },
         super::ToolDefinition {
             name: "CronDelete".into(),
-            description: "Cancel a cron job previously scheduled with CronCreate. Removes it from .claude/scheduled_tasks.json (durable jobs) or the session store (session-only jobs).".into(),
-            input_schema: json!({"type":"object","properties":{"id":{"description":"Job ID returned by CronCreate.","type":"string"}},"required":["id"],"additionalProperties":false}),
+            description: "Remove a scheduled job created by CronCreate. The job is deleted from whichever store holds it, the session's job file or the project's .claude/scheduled_tasks.json, so it will not fire again. An unknown id returns an error and leaves other jobs alone.".into(),
+            input_schema: json!({"type":"object","properties":{"id":{"description":"Identifier CronCreate returned for the job to remove.","type":"string"}},"required":["id"],"additionalProperties":false}),
         },
         super::ToolDefinition {
             name: "CronList".into(),

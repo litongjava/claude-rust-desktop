@@ -182,12 +182,12 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         read::definition(),
         ToolDefinition {
             name: "Write".to_string(),
-            description: "Writes a file to the local filesystem, overwriting if one exists.\n\nWhen to use: creating a new file, or fully replacing one you've already Read. Overwriting an existing file you haven't Read will fail. For partial changes, use Edit instead.".to_string(),
+            description: "Create a file or replace its whole contents with UTF-8 text. Missing parent directories are created. If the path already exists, read it in this conversation first and leave it unchanged since, or the call is refused. For a partial change to an existing file, use Edit or MultiEdit instead. The result reports the resolved path and how many bytes were written.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "description": "The absolute path to the file to write (must be absolute, not relative)", "type": "string" },
-                    "content": { "description": "The content to write to the file", "type": "string" }
+                    "file_path": { "description": "Path of the file to create or overwrite.", "type": "string" },
+                    "content": { "description": "Full UTF-8 text for the file.", "type": "string" }
                 },
                 "required": ["file_path", "content"],
                 "additionalProperties": false
@@ -195,14 +195,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Edit".to_string(),
-            description: "Performs exact string replacement in a file.\n\n- You must Read the file in this conversation before editing, or the call will fail.\n- `old_string` must match the file including indentation and be unique (LF and CRLF are equivalent) — the edit fails otherwise. Strip the Read line prefix (line number + tab) before matching.\n- `replace_all: true` replaces every occurrence instead.".to_string(),
+            description: "Change a file by replacing an exact string. Read the file first in this conversation and leave it unchanged since, or the call is refused. old_string must match exactly once, indentation included, unless replace_all is true. LF and CRLF compare as equal, and replacements keep the file's existing line-ending style. A miss or duplicate match returns an error and writes nothing. Exclude the line-number prefix that Read adds; match only the file text.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "description": "The absolute path to the file to modify", "type": "string" },
-                    "old_string": { "description": "The text to replace", "type": "string" },
-                    "new_string": { "description": "The text to replace it with (must be different from old_string)", "type": "string" },
-                    "replace_all": { "description": "Replace all occurrences of old_string (default false)", "default": false, "type": "boolean" }
+                    "file_path": { "description": "Path of the file to change.", "type": "string" },
+                    "old_string": { "description": "Exact text to find, without Read's line-number prefix.", "type": "string" },
+                    "new_string": { "description": "Replacement text; it must differ from old_string.", "type": "string" },
+                    "replace_all": { "description": "Replace every match instead of requiring a unique one; default false.", "default": false, "type": "boolean" }
                 },
                 "required": ["file_path", "old_string", "new_string"],
                 "additionalProperties": false
@@ -260,13 +260,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebFetch".to_string(),
-            description: "Fetches a URL, converts the page to readable text, and answers `prompt` against it using the session's model.\n\n- Fails on authenticated/private URLs — use an authenticated MCP tool or `gh` for those instead.\n- Fails on localhost, private addresses and other hostnames without a dot; for a local server, use curl via Bash.\n- HTTP is upgraded to HTTPS. Cross-host redirects are returned to you rather than followed; call again with the redirect URL.\n- Responses are cached for 15 minutes per URL.\n- Long pages are read in parts: when the result has next_offset, call again with it as offset.".to_string(),
+            description: "Read a web page and answer prompt with the session's model. http(s) only; public http is upgraded to https, and localhost or private addresses need approval. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page. A successful download is reused for fifteen minutes.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "description": "The URL to fetch content from", "type": "string", "format": "uri" },
-                    "prompt": { "description": "The prompt to run on the fetched content", "type": "string" },
-                    "offset": { "description": "Character position in the page text to start reading from. Use it to read on through a page too long for one call, with the value the previous result gave.", "type": "integer", "minimum": 0 }
+                    "url": { "description": "Page address to fetch; http(s) only.", "type": "string", "format": "uri" },
+                    "prompt": { "description": "Question for the session's model to answer from the page text.", "type": "string" },
+                    "offset": { "description": "Zero-based character position to begin at; pass next_offset from a truncated result.", "type": "integer", "minimum": 0 }
                 },
                 "required": ["url", "prompt"],
                 "additionalProperties": false
@@ -274,13 +274,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebSearch".to_string(),
-            description: "Search the web. Returns result blocks with titles and URLs.\n\n- The current date is given in the system prompt — use it when searching for recent information.\n- `allowed_domains` / `blocked_domains` filter results.\n- After answering from results, end with a \"Sources:\" list of the URLs you used as markdown links.\n- DeepSeek models use separate search credentials configured in System settings > Web search. If configuration or native search support is missing, relay the tool's setup instructions to the user; do not claim a search succeeded or retry unchanged requests.".to_string(),
+            description: "Use the provider's native web search, or its public adapter when configured. Each call returns at most eight results with a title, URL and snippet. allowed_domains keeps matching hosts and blocked_domains drops them; both include subdomains. The query must be non-empty and at most 2,000 characters. If the provider has no native search or has search disabled, the call fails with a settings error; do not report that as a successful search. Use the system prompt date to judge recency.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "description": "The search query to use", "type": "string", "minLength": 2 },
-                    "allowed_domains": { "description": "Only include search results from these domains", "type": "array", "items": { "type": "string" } },
-                    "blocked_domains": { "description": "Never include search results from these domains", "type": "array", "items": { "type": "string" } }
+                    "query": { "description": "Search terms; non-empty and at most 2,000 characters.", "type": "string", "minLength": 2 },
+                    "allowed_domains": { "description": "Keep only results whose host matches one of these domains or a subdomain.", "type": "array", "items": { "type": "string" } },
+                    "blocked_domains": { "description": "Drop results from these domains and their subdomains.", "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -289,11 +289,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         apply_patch_tool::definition(),
         ToolDefinition {
             name: "MultiEdit".to_string(),
-            description: "Make multiple string replacements in a file at once.".to_string(),
+            description: "Apply several exact replacements to one file in a single call. Edits run in order against the working text, and the file is written only if every edit succeeds; one failure returns the failing edit's error and leaves the file unchanged. Read the file first and leave it unchanged since. Each old_string must be unique unless its replace_all is true, and LF and CRLF compare as equal.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "The path to the file" },
+                    "file_path": { "type": "string", "description": "Path of the file to edit." },
                     "edits": {
                         "type": "array",
                         "items": {

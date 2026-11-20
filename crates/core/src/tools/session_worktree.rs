@@ -20,10 +20,10 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
         },
         super::ToolDefinition {
             name: "ExitWorktree".into(),
-            description: "Exit a worktree session created by EnterWorktree and return the session to the original working directory.\n\n## Scope\n\nThis tool ONLY operates on the worktree this session entered with EnterWorktree (or `dcl --worktree`). If no worktree session is active, the tool is a no-op: it reports that and takes no action.\n\n## When to Use\n\n- The user explicitly asks to \"exit the worktree\", \"leave the worktree\", \"go back\", or otherwise end the worktree session\n- Do NOT call this proactively — only when the user asks\n\n## Parameters\n\n- `action` (required): `\"keep\"` or `\"remove\"`\n  - `\"keep\"` — leave the worktree directory and branch intact on disk.\n  - `\"remove\"` — delete the worktree directory. Its branch is kept so committed work is never lost.\n- `discard_changes` (optional, default false): only meaningful with `action: \"remove\"`. If the worktree has uncommitted or ignored files, the tool will REFUSE to remove it unless this is set to `true`. If the tool returns an error listing changes, confirm with the user before re-invoking with `discard_changes: true`.".into(),
+            description: "Leave the worktree bound to this session by EnterWorktree or `dcl --worktree` and return to the original checkout. action \"keep\" preserves the directory and branch; \"remove\" deletes the directory but keeps its branch, and is refused for a worktree you entered by path rather than created here. When removing a worktree with uncommitted or untracked files, the call lists them and stops unless discard_changes: true is passed; confirm with the user first. With no bound worktree, nothing changes.".into(),
             input_schema: json!({"type":"object","properties":{
-                "action":{"description":"\"keep\" leaves the worktree and branch on disk; \"remove\" deletes the worktree directory.","type":"string","enum":["keep","remove"]},
-                "discard_changes":{"description":"Required true when action is \"remove\" and the worktree has uncommitted or ignored files. The tool will refuse and list them otherwise.","type":"boolean"}
+                "action":{"description":"\"keep\" preserves the directory and branch; \"remove\" deletes the directory and keeps the branch.","type":"string","enum":["keep","remove"]},
+                "discard_changes":{"description":"Pass true to allow removal despite uncommitted or untracked files; otherwise the call lists them and stops.","type":"boolean"}
             },"required":["action"],"additionalProperties":false}),
         },
     ]

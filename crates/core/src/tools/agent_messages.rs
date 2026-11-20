@@ -4,10 +4,10 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 pub(super) fn definition() -> super::ToolDefinition {
-    super::ToolDefinition {name:"SendMessage".into(),description:"Send a message to another agent or session.\n\n```json\n{\"to\": \"researcher\", \"summary\": \"assign task 1\", \"message\": \"start on task #1\"}\n```\n\n- `to`: a teammate name, \"*\" to broadcast to your team, or the `to` value a ListAgents row shows (a background agent or another session of this project).\n- Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox.\n- Recipients read queued messages at their next safe model boundary; a successful send means the message was queued for that session, not that it was read.\n- When relaying, don't quote the original — it's already rendered to the user.\n\nTeam protocol (this runtime): `operation` also accepts shutdown_request (leader only), shutdown_response, plan_approval_response (leader only), request_status, receive, sent, pending_count and mark_read; it defaults to send.".into(),input_schema:json!({"type":"object","properties":{
+    super::ToolDefinition {name:"SendMessage".into(),description:"Post a message to another agent's or session's queue. to takes a teammate name, \"*\" for the team, or a `to` value from ListAgents. Messages are queued: a running recipient reads one at its next model boundary, an idle open session on its next turn, and a closed one when resumed. Messages for you arrive on their own; you never check an inbox. operation selects a team-protocol action (default send), such as shutdown_request, shutdown_response or plan_approval_response. Lead message with the point.".into(),input_schema:json!({"type":"object","properties":{
         "to":{"description":"Recipient: a teammate name, \"*\" for your team, or the `to` value from a ListAgents row","type":"string","maxLength":300},
-        "summary":{"description":"A 5-10 word label for your own transcript row (not transmitted — the recipient previews the first line of `message`).","type":"string","maxLength":200},
-        "message":{"default":"","description":"Plain text message content (or a structured shutdown/plan response for the team protocol). The recipient sees the sender, delivery state and full message body in the transcript. Make the first line a clear, self-contained sentence saying what this is about.","type":["string","object"]},
+        "summary":{"description":"Short label (5-10 words) shown only in your transcript; the recipient sees message.","type":"string","maxLength":200},
+        "message":{"default":"","description":"Body text, or a structured team-protocol payload. The recipient sees the sender, delivery state and full text, so begin with one self-contained sentence.","type":["string","object"]},
         "notify_when_idle":{"description":"Not supported by this runtime yet; leave unset.","type":"boolean"},
         "operation":{"description":"Team protocol operation; defaults to send.","type":"string","enum":["send","receive","pending_count","mark_read","sent","peers","shutdown_request","shutdown_response","plan_approval_response","request_status"]},
         "request_id":{"type":"string"},"approve":{"description":"true/false or yes/no"},"reason":{"type":"string"},"feedback":{"type":"string"},"message_id":{"type":"string"},"unread_only":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":1}
@@ -15,9 +15,9 @@ pub(super) fn definition() -> super::ToolDefinition {
 }
 
 pub(super) fn list_agents_definition() -> super::ToolDefinition {
-    super::ToolDefinition {name:"ListAgents".into(),description:"Lists agents you can SendMessage to — the parent, siblings and child agents of your current session. Each row shows the `to` value to pass to SendMessage, the kind, and whether the recipient is running or idle.".into(),input_schema:json!({"type":"object","properties":{
-        "channel":{"description":"Not available in this build; leave unset.","type":"string","maxLength":256},
-        "q":{"description":"Not available in this build; leave unset.","type":"string","maxLength":256}
+    super::ToolDefinition {name:"ListAgents".into(),description:"Show the background agents and project sessions you can message. Rows cover child agents plus other sessions of this project, never the current session; each gives the `to` value for SendMessage, a display name, the kind and whether it is running or idle. An empty result means there is nobody to contact.".into(),input_schema:json!({"type":"object","properties":{
+        "channel":{"description":"Reserved; no channel filtering in this build.","type":"string","maxLength":256},
+        "q":{"description":"Reserved; no text filter in this build.","type":"string","maxLength":256}
     },"additionalProperties":false})}
 }
 
