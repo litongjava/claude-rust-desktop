@@ -695,3 +695,54 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
     assert_eq!(fs::read_to_string(locks.join(".initialized"))?, store);
     Ok(())
 }
+
+#[test]
+fn simultaneous_inbox_consumers_commit_each_generation_in_fifo_order() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let a = stores.create(A, project(root.path()))?;
+    let b = stores.create(B, project(root.path()))?;
+    let g = global(root.path())?;
+    let size = || {
+        g.query_row(
+            "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size",
+            [],
+            |r| r.get::<_, usize>(0),
+        )
+    };
+    let baseline = size()?;
+    let mut sent_a = Vec::new();
+    let mut sent_b = Vec::new();
+    for index in 0..16 {
+        sent_a.push(b.send_peer(&a, &format!("to-a-{index}"), "peer message")?);
+        sent_b.push(a.send_peer(&b, &format!("to-b-{index}"), "peer message")?);
+    }
+    let start = Arc::new(Barrier::new(2));
+    let consume = |s: SessionDb, ids: Vec<String>, start: Arc<Barrier>| -> Result<Vec<u128>> {
+        start.wait();
+        let mut owner = s.delivery_owner()?;
+        let mut durations = Vec::new();
+        for id in ids {
+            let now = Instant::now();
+            let effect = owner.next_peer()?.unwrap();
+            durations.push(now.elapsed().as_micros());
+            assert!(effect.applied);
+            assert_eq!(effect.id, id);
+        }
+        assert!(owner.next_peer()?.is_none());
+        Ok(durations)
+    };
+    let other = start.clone();
+    let (one, two) = thread::scope(|scope| {
+        let one = scope.spawn(|| consume(a, sent_a, other));
+        let two = scope.spawn(|| consume(b, sent_b, start));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    let mut times = one?;
+    times.extend(two?);
+    times.sort();
+    let after = size()?;
+    eprintln!("concurrent inbox handoff: samples={} p95={}us p99={}us, G logical bytes for 2 sessions before admission={} after 32 acknowledged messages={}",times.len(),times[30],times[31],baseline,after);
+    Ok(())
+}
