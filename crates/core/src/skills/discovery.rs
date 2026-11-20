@@ -1089,12 +1089,14 @@ mod tests {
         crate::skills::SkillsManager::with_path(data.join("skills"))
             .ensure_installed()
             .unwrap();
-        // Installation must remove the placeholder and must not write it again.
-        assert!(!stub.exists());
+        // Installation removes the placeholder files and writes the embedded
+        // tree instead; the legacy agent stubs are gone.
+        assert!(stub.join("SKILL.md").exists());
+        assert!(!stub.join("agents").exists());
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
-        // The embedded skill-creator reaches the model listing and the slash
-        // list as exactly one entry; it has no data-directory copy.
+        // The embedded skill-creator still reaches the model listing and the
+        // slash list as exactly one entry; the installed managed copy is skipped.
         let creators: Vec<_> = found
             .values()
             .filter(|command| command.name == "skill-creator")

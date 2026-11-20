@@ -27,7 +27,7 @@ pub(super) fn embedded() -> Embedded {
     }
     sort_tree(&mut files);
     Embedded {
-        content: include_str!("bundled/resources/skill-creator/SKILL.md"),
+        content: include_str!("bundled/skills/skill-creator/SKILL.md"),
         files,
     }
 }
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn bundled_instructions_and_command_body_match_the_skill_markdown() {
-        let skill = include_str!("bundled/resources/skill-creator/SKILL.md");
-        let instructions = include_str!("bundled/resources/skill-creator/INSTRUCTIONS.md");
+        let skill = include_str!("bundled/skills/skill-creator/SKILL.md");
+        let instructions = include_str!("bundled/skills/skill-creator/INSTRUCTIONS.md");
         let body = &skill[skill.find("\n---\n").unwrap() + "\n---\n".len()..];
         assert_eq!(body, instructions);
         assert_eq!(
@@ -291,7 +291,11 @@ mod tests {
         let skills_dir = temp.path().join("skills");
         let manager = SkillsManager::with_path(skills_dir.clone());
         let skills = manager.load_skills().await.unwrap();
-        assert!(!skills_dir.join("bundled").join(NAME).exists());
+        assert!(skills_dir
+            .join("bundled")
+            .join(NAME)
+            .join("SKILL.md")
+            .exists());
         let matching: Vec<_> = skills.iter().filter(|skill| skill.name == NAME).collect();
         assert_eq!(matching.len(), 1);
         let skill = matching[0];
@@ -332,7 +336,8 @@ mod tests {
         write_sibling(&bundled);
         let manager = SkillsManager::with_path(skills_dir.clone());
         let skills = manager.load_skills().await.unwrap();
-        assert!(!bundled.join(NAME).exists());
+        assert!(!bundled.join(NAME).join("agents").exists());
+        assert!(bundled.join(NAME).join("SKILL.md").exists());
         assert_eq!(
             std::fs::read_to_string(bundled.join("legacy-review/SKILL.md")).unwrap(),
             "user sibling"
@@ -340,7 +345,10 @@ mod tests {
         let matching: Vec<_> = skills.iter().filter(|skill| skill.name == NAME).collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].source, SkillSource::Bundled);
-        assert!(matching[0].source_dir.is_none());
+        assert_eq!(
+            matching[0].source_dir.as_deref(),
+            Some(bundled.join(NAME).to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]
@@ -391,7 +399,14 @@ mod tests {
         let manager = SkillsManager::with_path(skills_dir);
         let skills = manager.load_skills().await.unwrap();
         let matching: Vec<_> = skills.iter().filter(|skill| skill.name == NAME).collect();
-        assert_eq!(matching.len(), 1);
-        assert_eq!(matching[0].description, "Custom user copy");
+        // The user's copy and the installed bundled tree are separate skills;
+        // the embedded entry is not synthesized a third time.
+        assert_eq!(matching.len(), 2);
+        assert!(matching.iter().all(|skill| skill.id != EMBEDDED_ID));
+        let user = matching
+            .iter()
+            .find(|skill| skill.source == SkillSource::User)
+            .unwrap();
+        assert_eq!(user.description, "Custom user copy");
     }
 }

@@ -581,7 +581,11 @@ fn skills_list_and_help_expose_the_embedded_task_template() {
     );
     assert!(help.contains("name: task-template"));
     assert!(help.contains("requirement → evidence → unverified"));
-    assert!(!data.join("skills/bundled/task-template").exists());
+    let installed = data.join("skills/bundled/task-template/SKILL.md");
+    assert!(installed.exists());
+    let document = std::fs::read_to_string(installed).unwrap();
+    assert!(document.contains("user-invocable: true"));
+    assert!(document.contains("disable-model-invocation: false"));
 }
 
 #[test]
@@ -656,7 +660,8 @@ This skill provides utilities for:
     let files = creators[0]["files"].as_array().unwrap();
     assert!(files.iter().any(|file| file["name"] == "scripts"));
     assert!(files.iter().any(|file| file["name"] == "license.txt"));
-    assert!(!stub.exists());
+    assert!(stub.join("SKILL.md").exists());
+    assert!(!stub.join("agents").exists());
     // The edited sibling belongs to the user and survives; pristine generated
     // legacy skills are neither installed nor listed any more.
     assert_eq!(

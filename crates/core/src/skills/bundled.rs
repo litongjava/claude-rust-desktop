@@ -172,6 +172,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_skill_frontmatter_matches_the_embedded_commands() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/skills/bundled/skills");
+        let commands = super::commands();
+        for (name, command) in &commands {
+            let text = std::fs::read_to_string(format!("{root}/{name}/SKILL.md")).unwrap();
+            let (metadata, body) = super::super::discovery::frontmatter(&text).unwrap();
+            assert_eq!(metadata["name"].as_str(), Some(name.as_str()));
+            assert_eq!(
+                metadata["description"].as_str(),
+                Some(command.description.as_str())
+            );
+            assert_eq!(metadata["user-invocable"].as_bool(), Some(true));
+            assert_eq!(
+                metadata["disable-model-invocation"].as_bool(),
+                Some(command.disable_model_invocation)
+            );
+            assert_eq!(
+                body.trim_start_matches('\n'),
+                command.content.trim_start_matches('\n'),
+                "{name} body drifted from the command"
+            );
+        }
+    }
+
+    #[test]
     fn task_template_is_discovered_and_loads_the_delegation_brief() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
@@ -215,7 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_template_inventory_serves_a_read_only_document_and_honors_user_override() {
+    async fn task_template_inventory_serves_the_installed_document_and_honors_user_override() {
         let temp = tempfile::tempdir().unwrap();
         let skills_dir = temp.path().join("skills");
         let manager = super::super::SkillsManager::with_path(skills_dir.clone());
@@ -226,22 +251,24 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1);
         let skill = matching[0];
-        assert_eq!(skill.id, TASK_TEMPLATE_ID);
         assert_eq!(skill.source, SkillSource::Bundled);
-        assert!(skill.enabled && skill.source_dir.is_none());
+        assert!(skill.enabled);
         assert_eq!(skill.files.len(), 1);
         assert_eq!(skill.files[0].name, "SKILL.md");
-        assert_eq!(skill.content.as_deref(), Some(TASK_TEMPLATE_DOCUMENT));
+        let installed = skills_dir
+            .join("bundled")
+            .join(TASK_TEMPLATE_NAME)
+            .join("SKILL.md");
+        let document = std::fs::read_to_string(&installed).unwrap();
+        assert!(document.contains("name: task-template"));
+        assert!(document.contains("disable-model-invocation: false"));
+        assert_eq!(skill.content.as_deref(), Some(document.as_str()));
         assert_eq!(
             manager.get_skill_content(&skill.id, "SKILL.md").unwrap(),
-            TASK_TEMPLATE_DOCUMENT
+            document
         );
         assert!(manager.get_skill_content(&skill.id, "../SKILL.md").is_err());
         assert!(manager.get_skill_content(&skill.id, "missing.md").is_err());
-        assert!(manager.update_skill(&skill.id, Default::default()).is_err());
-        assert!(manager.delete_skill(&skill.id).is_err());
-        assert!(manager.toggle_skill(&skill.id).await.is_err());
-        assert!(!skills_dir.join("bundled").join(TASK_TEMPLATE_NAME).exists());
 
         let custom = manager
             .create_skill(TASK_TEMPLATE_NAME, "Custom template", "Custom brief")
@@ -249,11 +276,10 @@ mod tests {
         let skills = manager.load_skills().await.unwrap();
         let matching: Vec<_> = skills
             .iter()
-            .filter(|skill| skill.name == TASK_TEMPLATE_NAME)
+            .filter(|skill| skill.name == TASK_TEMPLATE_NAME && skill.source == SkillSource::User)
             .collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].id, custom.id);
-        assert_eq!(matching[0].source, SkillSource::User);
     }
 
     #[test]

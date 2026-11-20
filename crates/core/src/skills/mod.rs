@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod states;
 pub mod bundled;
 pub mod bundled_resources;
+mod bundled_install;
 pub mod code_review;
 pub mod invocation;
 pub mod import;
@@ -193,7 +194,10 @@ impl SkillsManager {
 
     pub fn install_bundled_skills(&self) -> Result<()> {
         let bundled_path = self.get_skills_path(&SkillSource::Bundled);
-        skill_creator::install_and_migrate(&bundled_path)
+        // Migrate the pristine legacy placeholder first so the embedded tree is
+        // written into the same directory during this pass.
+        skill_creator::install_and_migrate(&bundled_path)?;
+        bundled_install::install(&bundled_path)
     }
 
     fn scan_skills_dir(&self, base_path: &Path, source: SkillSource) -> Result<Vec<Skill>> {

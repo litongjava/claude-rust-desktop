@@ -1,7 +1,9 @@
 ---
 name: skill-creator
-description: Create or update a DeepSeek Code skill with appropriately scoped instructions and any needed supporting resources.
-whenToUse: Use when creating a new skill, revising an existing skill, or adding scripts, references, or assets to a skill.
+description: "Create or update a DeepSeek Code skill with appropriately scoped instructions and any needed supporting resources."
+whenToUse: "Use when creating a new skill, revising an existing skill, or adding scripts, references, or assets to a skill."
+user-invocable: true
+disable-model-invocation: false
 ---
 
 # Skill Creator

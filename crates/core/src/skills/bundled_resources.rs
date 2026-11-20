@@ -13,6 +13,7 @@ use std::{
 
 #[path = "bundled_manifest.rs"]
 mod manifest;
+pub(crate) use manifest::FILES;
 
 struct Bundle {
     directory: tempfile::TempDir,
@@ -106,8 +107,8 @@ impl Resources {
             );
         }
         let instructions = match name {
-            "dataviz" => include_str!("bundled/resources/dataviz/INSTRUCTIONS.md"),
-            "skill-creator" => include_str!("bundled/resources/skill-creator/INSTRUCTIONS.md"),
+            "dataviz" => include_str!("bundled/skills/dataviz/INSTRUCTIONS.md"),
+            "skill-creator" => include_str!("bundled/skills/skill-creator/INSTRUCTIONS.md"),
             _ => unreachable!(),
         };
         let provenance = if name == "skill-creator" {
@@ -148,8 +149,13 @@ mod tests {
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("bundled/resources/manifest.json")).unwrap();
         let files = provenance["files"].as_array().unwrap();
-        assert_eq!(files.len(), manifest::FILES.len());
         for entry in files {
+            // The installed skill-creator SKILL.md adds the installer's
+            // frontmatter flags to the upstream body; skill-creator.rs checks
+            // that body against INSTRUCTIONS.md.
+            if entry["skill"] == "skill-creator" && entry["path"] == "SKILL.md" {
+                continue;
+            }
             let (_, _, bytes) = manifest::FILES
                 .iter()
                 .find(|(name, path, _)| entry["skill"] == *name && entry["path"] == *path)
@@ -209,31 +215,31 @@ mod tests {
         for (relative, expected) in [
             (
                 "SKILL.md",
-                &include_bytes!("bundled/resources/skill-creator/SKILL.md")[..],
+                &include_bytes!("bundled/skills/skill-creator/SKILL.md")[..],
             ),
             (
                 "INSTRUCTIONS.md",
-                &include_bytes!("bundled/resources/skill-creator/INSTRUCTIONS.md")[..],
+                &include_bytes!("bundled/skills/skill-creator/INSTRUCTIONS.md")[..],
             ),
             (
                 "NOTICE.md",
-                &include_bytes!("bundled/resources/skill-creator/NOTICE.md")[..],
+                &include_bytes!("bundled/skills/skill-creator/NOTICE.md")[..],
             ),
             (
                 "license.txt",
-                &include_bytes!("bundled/resources/skill-creator/license.txt")[..],
+                &include_bytes!("bundled/skills/skill-creator/license.txt")[..],
             ),
             (
                 "references/frontmatter.md",
-                &include_bytes!("bundled/resources/skill-creator/references/frontmatter.md")[..],
+                &include_bytes!("bundled/skills/skill-creator/references/frontmatter.md")[..],
             ),
             (
                 "scripts/init_skill.py",
-                &include_bytes!("bundled/resources/skill-creator/scripts/init_skill.py")[..],
+                &include_bytes!("bundled/skills/skill-creator/scripts/init_skill.py")[..],
             ),
             (
                 "scripts/quick_validate.py",
-                &include_bytes!("bundled/resources/skill-creator/scripts/quick_validate.py")[..],
+                &include_bytes!("bundled/skills/skill-creator/scripts/quick_validate.py")[..],
             ),
         ] {
             let materialized = std::fs::read(bundle.join(relative)).unwrap();
@@ -405,7 +411,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let resources = Resources::default();
         for (name, count, example) in [
-            ("dataviz", 9, "scripts/validate_palette.js"),
+            ("dataviz", 11, "scripts/validate_palette.js"),
         ] {
             let prompt = resources
                 .prepare(
