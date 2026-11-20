@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 const TIPS: &[&str] = &[
     "Tip: /help lists commands.",
@@ -129,12 +130,21 @@ impl TurnProgress {
         let next = self.numbers.values().copied().max().unwrap_or(0) + 1;
         let number = *self.numbers.entry(id.to_owned()).or_insert(next);
         if let Some(title) = title { self.tool_titles.insert(id.into(), title.into()); }
-        let preview = format!("• #{number} {}", if title.is_some() { super::tool_view::display_label(name, input, self.workspace.as_deref(), title) } else { tool_preview_in_workspace(name, input, self.workspace.as_deref()) });
-        self.notice_with_wrap(&preview, super::tool_view::mcp_call(name, input).is_some());
+        let preview = if title.is_some() {
+            super::tool_view::display_label(name, input, self.workspace.as_deref(), title)
+        } else {
+            tool_preview_in_workspace(name, input, self.workspace.as_deref())
+        };
+        self.notice_with_wrap(
+            &format!("• #{number} {preview}"),
+            super::tool_view::mcp_call(name, input).is_some(),
+        );
         let label = if let Some(activity) = super::tool_view::task_output_activity(name, input) {
             activity.to_owned()
         } else if name == "Agent" {
             format!("Running subagent: {name}")
+        } else if name == deepseek_code_core::tools::TOOL_LOAD_NAME {
+            format!("Working: {preview}")
         } else {
             format!("Working: {name}")
         };
@@ -266,7 +276,18 @@ impl TurnProgress {
         let (width, height) = crate::terminal::size();
         let size = (width, height);
         let width = width as usize;
-        let mut status = format!("* {} ({seconds}s{})", self.hook_activity.as_deref().unwrap_or(&self.activity), if self.hook_activity.is_some() { "" } else { self.phase });
+        let activity = status_activity(
+            self.hook_activity.as_deref().unwrap_or(&self.activity),
+            width.saturating_sub(1),
+        );
+        let mut status = format!(
+            "{activity} ({seconds}s{})",
+            if self.hook_activity.is_some() {
+                ""
+            } else {
+                self.phase
+            }
+        );
         if let Some(usage) = self.usage.summary() {
             status.push_str(&format!(" · {usage}"));
         }
@@ -469,8 +490,35 @@ fn notice_rows(message: &str, width: usize, wrap: bool) -> Vec<String> {
     if wrap {
         super::tool_view::wrap_call(message, width)
     } else {
-        vec![clipped(&single_line(message), width)]
+        let line = single_line(message);
+        if let Some((number, label)) = line
+            .strip_prefix("• #")
+            .and_then(|notice| notice.split_once(' '))
+        {
+            if let Some(fitted) = fit_tool_load_with_prefix(&format!("• #{number} "), label, width)
+            {
+                return vec![fitted];
+            }
+        }
+        vec![clipped(&line, width)]
     }
+}
+
+fn fit_tool_load_with_prefix(prefix: &str, label: &str, width: usize) -> Option<String> {
+    let fitted = super::tool_view::fit_tool_load_label(label, width.checked_sub(prefix.width())?)?;
+    Some(format!("{prefix}{fitted}"))
+}
+
+fn status_activity(activity: &str, width: usize) -> String {
+    if let Some(label) = activity.strip_prefix("Working: ") {
+        if let Some(fitted) = fit_tool_load_with_prefix("* Working: ", label, width)
+            .or_else(|| fit_tool_load_with_prefix("* ", label, width))
+            .or_else(|| super::tool_view::fit_tool_load_label(label, width))
+        {
+            return fitted;
+        }
+    }
+    format!("* {activity}")
 }
 
 pub(super) fn single_line(text: &str) -> String {
@@ -497,6 +545,9 @@ pub(crate) fn display_name(name: &str) -> &str {
 }
 
 pub(crate) fn tool_preview_in_workspace(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> String {
+    if name == deepseek_code_core::tools::TOOL_LOAD_NAME {
+        return tool_load_label(input, 80);
+    }
     if let Some(label) = super::tool_view::mcp_call(name, input) { return label; }
     let name = single_line(name);
     let preview = if name == "WebFetch" {
@@ -541,6 +592,25 @@ pub(crate) fn tool_preview_in_workspace(name: &str, input: &Value, workspace: Op
         Some(preview) if !preview.is_empty() => format!("{name}: {}", clipped(&preview, 100)),
         _ => name.to_owned(),
     }
+}
+
+pub(super) fn tool_load_label(input: &Value, arg_width: usize) -> String {
+    let mut names = input["names"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(single_line)
+        .filter(|name| !name.is_empty());
+    let mut preview = names.by_ref().take(5).collect::<Vec<_>>().join(", ");
+    if names.next().is_some() {
+        preview.push_str(", …");
+    }
+    super::tool_view::fit_tool_load_label(
+        &format!("ToolLoad({preview})"),
+        arg_width + "ToolLoad()".len(),
+    )
+    .expect("ToolLoad preview has parentheses and room for an ellipsis")
 }
 
 pub(crate) fn tool_result_summary(
@@ -621,18 +691,43 @@ fn styled(text: &str, color: bool, code: &str) -> String {
 }
 
 fn clipped(text: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let mut used = 0;
-    text.chars()
-        .take_while(|c| {
-            used += c.width().unwrap_or(0);
-            used <= width
-        })
-        .collect()
+    super::input::editor::clip_cells(text, width).to_owned()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_load_fallback_activity_shows_the_requested_names() {
+        let mut progress = super::TurnProgress::new(false);
+        progress.tool_started(
+            "load",
+            "ToolLoad",
+            &serde_json::json!({"names":["Read","Grep"]}),
+        );
+        assert_eq!(progress.activity, "Working: ToolLoad(Read, Grep)");
+    }
+
+    #[test]
+    fn tool_load_labels_show_names_and_bound_long_lists() {
+        let input = serde_json::json!({"names": ["Read", "Grep"]});
+        assert_eq!(
+            super::tool_preview("ToolLoad", &input),
+            "ToolLoad(Read, Grep)"
+        );
+        assert_eq!(
+            super::super::tool_view::label("ToolLoad", &input, None),
+            "ToolLoad(Read, Grep)"
+        );
+        let many =
+            serde_json::json!({"names": ["Read", "Grep", "Glob", "Edit", "TaskGet", "ListDir"]});
+        assert_eq!(
+            super::tool_preview("ToolLoad", &many),
+            "ToolLoad(Read, Grep, Glob, Edit, TaskGet, …)"
+        );
+        let long = serde_json::json!({"names": ["X".repeat(500)]});
+        assert!(super::tool_preview("ToolLoad", &long).ends_with("…)"));
+    }
+
     #[test]
     fn workspace_preview_changes_labels_only() {
         let workspace = std::env::temp_dir().join("preview workspace");
@@ -775,6 +870,44 @@ mod tests {
     fn status_never_wraps_on_narrow_or_unicode_terminals() {
         assert_eq!(clipped("Working: 搜索", 11), "Working: 搜");
         assert_eq!(clipped("Tip", 0), "");
+    }
+
+    #[test]
+    fn tool_load_progress_clips_at_grapheme_boundaries() {
+        for grapheme in ["界", "✈️", "👩🏽‍💻", "e\u{301}"] {
+            let input = serde_json::json!({"names": [grapheme.repeat(90)]});
+            let label = super::tool_load_label(&input, 80);
+            let notice = format!("• #1 {label}");
+            for width in [1, 8, 16, 17, 32, 64] {
+                let rows = super::notice_rows(&notice, width, false);
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].width() <= width, "{width}: {}", rows[0]);
+                if width >= 16 {
+                    let count = (width - 16) / grapheme.width();
+                    assert_eq!(
+                        rows[0],
+                        format!("• #1 ToolLoad({}…)", grapheme.repeat(count))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_fallback_activity_prioritizes_complete_tool_load_label() {
+        let activity = "Working: ToolLoad(Read, Grep)";
+        for (width, expected) in [
+            (11, "ToolLoad(…)"),
+            (13, "* ToolLoad(…)"),
+            (19, "* ToolLoad(Read…)"),
+            (22, "* Working: ToolLoad(…)"),
+            (64, "* Working: ToolLoad(Read, Grep)"),
+        ] {
+            let row = status_activity(activity, width);
+            assert_eq!(row, expected);
+            assert!(row.width() <= width);
+        }
+        assert_eq!(status_activity("Working: Read", 19), "* Working: Read");
     }
 
     #[test]

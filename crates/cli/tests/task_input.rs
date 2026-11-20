@@ -133,8 +133,8 @@ async fn respond(
         // Both TaskInput and TaskGet are deferred: load them before use.
         tool_call_frame(
             "call-search",
-            "ToolSearch",
-            &json!({"query":"select:TaskInput,TaskGet"}),
+            "ToolLoad",
+            &json!({"names":["TaskInput","TaskGet"]}),
         )
     } else if !has_bash {
         tool_call_frame(
@@ -391,7 +391,7 @@ async fn cli_pipe_shell_takes_utf8_input_across_two_turns() {
 }
 
 /// Plan mode must refuse TaskInput while still allowing the read-only part of
-/// the flow (ToolSearch and an ordinary shell command).
+/// the flow (ToolLoad and an ordinary shell command).
 async fn plan_respond(
     State(fixture): State<Fixture>,
     Json(body): Json<Value>,
@@ -417,11 +417,7 @@ async fn plan_respond(
     let attempted = history.iter().any(|(name, _)| name == "TaskInput");
     let stopped = history.iter().any(|(name, _)| name == "TaskStop");
     let framed = if !loaded {
-        tool_call_frame(
-            "plan-search",
-            "ToolSearch",
-            &json!({"query":"select:TaskInput"}),
-        )
+        tool_call_frame("plan-search", "ToolLoad", &json!({"names":["TaskInput"]}))
     } else if !has_bash {
         tool_call_frame(
             "plan-start",
@@ -698,8 +694,8 @@ async fn records_respond(
     let framed = if !loaded {
         tool_call_frame(
             "records-search",
-            "ToolSearch",
-            &json!({"query":"select:TaskInput,TaskGet"}),
+            "ToolLoad",
+            &json!({"names":["TaskInput","TaskGet"]}),
         )
     } else if !has_bash {
         tool_call_frame(
@@ -966,8 +962,8 @@ async fn deny_respond(
     let framed = if !tools.iter().any(|tool| tool == "TaskInput") {
         tool_call_frame(
             "deny-search",
-            "ToolSearch",
-            &json!({"query":"select:TaskInput,TaskGet"}),
+            "ToolLoad",
+            &json!({"names":["TaskInput","TaskGet"]}),
         )
     } else if !has_bash {
         tool_call_frame(

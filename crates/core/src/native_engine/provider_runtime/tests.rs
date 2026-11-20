@@ -5,7 +5,7 @@ use crate::native_engine::{
 };
 use axum::{
     extract::State,
-    http::{HeaderMap, Uri},
+    http::{HeaderMap, StatusCode, Uri},
     routing::post,
     Json, Router,
 };
@@ -1792,5 +1792,69 @@ async fn openai_counted_stream_invalid_orchestration_fails_before_open() {
             "{route}: the transport opened a request: {output}"
         );
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn responses_requests_send_a_stable_hashed_prompt_cache_key() {
+    use crate::native_engine::request_identity::TurnIdentity;
+
+    type Captured = Arc<Mutex<Vec<Value>>>;
+    async fn handler(
+        State(requests): State<Captured>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        requests.lock().unwrap().push(body);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":"fixture rejection"}})),
+        )
+    }
+    async fn send(address: std::net::SocketAddr, api: &str) {
+        let p = provider("openai", api, &format!("http://{address}/v1"));
+        // Every body is captured before the fixture rejects the request.
+        let _ = OpenAIClient::new()
+            .send_message(&p, vec![user()], None, vec![], 1024)
+            .await;
+    }
+
+    let requests = Captured::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(handler))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    TurnIdentity::new(Some("session-a".into()), None)
+        .scope(async {
+            send(address, "openai-responses").await;
+            send(address, "openai-responses").await;
+        })
+        .await;
+    TurnIdentity::new(Some("session-b".into()), None)
+        .scope(send(address, "openai-responses"))
+        .await;
+    send(address, "openai-responses").await;
+    TurnIdentity::new(Some("session-c".into()), None)
+        .scope(async {
+            send(address, "openai-completions").await;
+            send(address, "anthropic-messages").await;
+        })
+        .await;
+
+    let bodies = requests.lock().unwrap();
+    assert_eq!(bodies.len(), 6);
+    let key = |body: &Value| body["prompt_cache_key"].as_str().map(str::to_owned);
+    let first = key(&bodies[0]).expect("a Responses request carries a cache key");
+    assert_eq!(first, key(&bodies[1]).expect("same-session key"));
+    assert_eq!(first.len(), 32);
+    assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!first.contains("session-a"));
+    let other = key(&bodies[2]).expect("another session key");
+    assert_ne!(other, first);
+    assert!(bodies[3].get("prompt_cache_key").is_none());
+    assert!(bodies[4].get("prompt_cache_key").is_none());
+    assert!(bodies[5].get("prompt_cache_key").is_none());
+    drop(bodies);
     server.abort();
 }

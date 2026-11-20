@@ -58,6 +58,27 @@ pub(super) fn is_opencode(provider: &ResolvedProvider) -> bool {
         .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
 }
 
+/// Opaque routing key for provider prompt caches, stable across the requests
+/// of one conversation. The raw session ID never leaves this module.
+pub(super) fn prompt_cache_key() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let session = TURN
+        .try_with(|identity| identity.session.clone())
+        .ok()
+        .flatten()?;
+    let mut hash = Sha256::new();
+    hash.update(b"dcl-prompt-cache-v1:");
+    hash.update(session.as_bytes());
+    let digest = hash.finalize();
+    Some(
+        digest
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 pub(super) struct RequestIdentity {
     headers: HeaderMap,
     attempt: AtomicU32,

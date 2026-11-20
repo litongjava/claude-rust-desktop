@@ -782,7 +782,7 @@ pub(crate) fn pick_mcp_state(
         ),
         (
             McpState::OnDemand,
-            "Tools are listed by name and loaded with ToolSearch when needed".to_owned(),
+            "Tools are listed by name and loaded with ToolLoad when needed".to_owned(),
         ),
         (
             McpState::UserOnly,

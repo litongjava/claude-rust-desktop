@@ -22,6 +22,7 @@ chrono = "0.4"
 dirs = "5"
 rustyline = { version = "15", default-features = false }
 crossterm = "0.28"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 axum = "0.8"

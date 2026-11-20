@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_lists_it_once_and_tool_search_may_load_it() {
+    fn the_catalog_lists_it_once_and_tool_load_may_load_it() {
         let catalog = crate::native_engine::tool_loop::builtin_tool_catalog();
         let matches: Vec<_> = catalog
             .iter()
@@ -773,7 +773,7 @@ mod tests {
             .collect();
         assert_eq!(matches.len(), 1);
         assert!(matches[0].description.contains("*** Begin Patch"));
-        // ToolSearch's eligibility filter is (on_demand && !enabled && !exposed)
+        // ToolLoad's eligibility filter is (on_demand && !enabled && !exposed)
         // plus the agent allowlist; the default loading is what makes it
         // discoverable without becoming a resident tool.
         let customization = crate::services::customization::Customization::default();

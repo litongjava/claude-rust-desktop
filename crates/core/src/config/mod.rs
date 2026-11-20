@@ -60,14 +60,8 @@ pub struct ComputerUseConfig {
 pub struct MemoryConfig {
     #[serde(default = "default_memex_url")]
     pub memex_backend_url: String,
-    #[serde(default = "default_importance_threshold")]
-    pub auto_ingest_importance_threshold: f64,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_search: bool,
-    #[serde(default = "default_true")]
-    pub auto_ingest: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,7 +112,6 @@ fn default_bash_timeout_secs() -> u64 { 120 }
 fn default_display_width() -> u32 { 1920 }
 fn default_display_height() -> u32 { 1080 }
 fn default_memex_url() -> String { "http://127.0.0.1:8765".to_string() }
-fn default_importance_threshold() -> f64 { 0.5 }
 fn default_true() -> bool { true }
 fn default_bridge_port() -> u16 { 30085 }
 fn default_request_timeout_secs() -> u64 { 300 }
@@ -142,10 +135,7 @@ impl Default for OrchestrationConfig {
             },
             memory: MemoryConfig {
                 memex_backend_url: default_memex_url(),
-                auto_ingest_importance_threshold: default_importance_threshold(),
                 enabled: true,
-                auto_search: true,
-                auto_ingest: true,
             },
             bridge: BridgeConfig {
                 port: default_bridge_port(),
@@ -457,10 +447,7 @@ mod tests {
 
         // MemoryConfig
         assert_eq!(config.memory.memex_backend_url, "http://127.0.0.1:8765");
-        assert!((config.memory.auto_ingest_importance_threshold - 0.5).abs() < f64::EPSILON);
         assert!(config.memory.enabled);
-        assert!(config.memory.auto_search);
-        assert!(config.memory.auto_ingest);
 
         // BridgeConfig
         assert_eq!(config.bridge.port, 30085);

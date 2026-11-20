@@ -139,11 +139,7 @@ async fn respond(
     let has_tool = |name: &str| tools.iter().any(|tool| tool == name);
     let framed = if head == "start the shell" {
         if !has_tool("TaskInput") {
-            tool_call_frame(
-                "worker-search",
-                "ToolSearch",
-                &json!({"query":"select:TaskInput"}),
-            )
+            tool_call_frame("worker-search", "ToolLoad", &json!({"names":["TaskInput"]}))
         } else if !has("Bash") {
             let script = fixture
                 .script

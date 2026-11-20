@@ -851,6 +851,405 @@ async fn session_lifecycle_hooks_run_once_per_frontend_and_resume_context_reache
     server.abort();
 }
 
+const CONTEXT_SEARCH_FACT: &str = "x19-qrx-441";
+const CONTEXT_SEARCH_REPLY: &str = "Recovered archive ID x19-qrx-441 from the saved Read result.";
+
+async fn context_search_provider(
+    State(requests): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let step = {
+        let mut requests = requests.lock().unwrap();
+        requests.push(body.clone());
+        requests.len()
+    };
+    if step == 3 && body["stream"] != true {
+        return Json(json!({
+            "id":"summary","object":"chat.completion","created":0,"model":"fixture-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"COMPACT_FIXTURE: A file was read."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}
+        })).into_response();
+    }
+    let call = |id: &str, name: &str, args: Value| json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    let (delta, finish) = match step {
+        1 => (
+            call("fixture-read", "Read", json!({"file_path":"proof.txt"})),
+            "tool_calls",
+        ),
+        2 => (json!({"content":"The fixture artifact was read."}), "stop"),
+        4 => (
+            call(
+                "fixture-load",
+                "ToolLoad",
+                json!({"names":["ContextSearch"]}),
+            ),
+            "tool_calls",
+        ),
+        5 => (
+            call(
+                "fixture-search",
+                "ContextSearch",
+                json!({"query":"archive id:","range":"before","role":"tool","tool_name":"Read","limit":1}),
+            ),
+            "tool_calls",
+        ),
+        6 => {
+            let result: Value =
+                serde_json::from_str(last["content"].as_str().unwrap_or("")).unwrap_or_default();
+            let text = if last["role"] == "tool"
+                && result["matches"][0]["excerpt"]
+                    .as_str()
+                    .is_some_and(|excerpt| excerpt.contains(CONTEXT_SEARCH_FACT))
+            {
+                CONTEXT_SEARCH_REPLY
+            } else {
+                "The search result did not contain the archive ID."
+            };
+            (json!({"content":text}), "stop")
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"message":"Unexpected context search fixture request"}})),
+            )
+                .into_response()
+        }
+    };
+    context_search_stream(delta, finish)
+}
+
+fn context_search_stream(delta: Value, finish: &str) -> Response {
+    let start = json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+    let end = json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":12,"completion_tokens":8}});
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+    )
+        .into_response()
+}
+
+async fn assert_cli_context_search(sdk: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::write(
+        temp.path().join("proof.txt"),
+        format!("archive id: {CONTEXT_SEARCH_FACT}\n"),
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/v1/chat/completions", post(context_search_provider))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut initial = query(&data, temp.path(), &url);
+    initial.args(["--print", "Read proof.txt to learn the archive ID"]);
+    let first = execute(initial).await;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["result"], "The fixture artifact was read.");
+    std::fs::remove_file(temp.path().join("proof.txt")).unwrap();
+    let id = first["session_id"].as_str().unwrap();
+
+    let mut compact = query(&data, temp.path(), &url);
+    compact.args(["sessions", "compact", id]);
+    let compacted = execute(compact).await;
+    assert!(
+        compacted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compacted.stderr)
+    );
+    let compacted: Value = serde_json::from_slice(&compacted.stdout).unwrap();
+    let boundary = compacted["message_id"].as_str().unwrap();
+
+    let mut resume = query(&data, temp.path(), &url);
+    resume.args(["--resume", id, "--print"]);
+    let prompt = "Recover the exact archive ID from the earlier Read.";
+    let result: Value = if sdk {
+        resume
+            .args([
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::piped());
+        let mut child = resume.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = json!({"type":"user","message":{"role":"user","content":prompt}});
+        stdin
+            .write_all(format!("{input}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                if frame["type"] == "result" {
+                    return Some(frame);
+                }
+            }
+            None
+        })
+        .await
+        .expect("SDK result timeout");
+        drop(stdin);
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        result.unwrap_or_else(|| panic!("SDK result frame missing: {stderr}"))
+    } else {
+        resume.arg(prompt);
+        let output = execute(resume).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    assert_eq!(result["result"], CONTEXT_SEARCH_REPLY);
+    server.abort();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let fresh = requests[0]["messages"].to_string();
+    assert!(fresh.contains("- `ContextSearch`"));
+    assert!(!fresh.contains("After compaction, load ContextSearch"));
+    assert!(requests[1].to_string().contains(CONTEXT_SEARCH_FACT));
+    assert!(requests[2].to_string().contains(CONTEXT_SEARCH_FACT));
+    for body in &requests[3..5] {
+        assert!(body["messages"].to_string().contains("COMPACT_FIXTURE"));
+        assert!(!body.to_string().contains(CONTEXT_SEARCH_FACT));
+    }
+    assert!(requests[3]["messages"]
+        .to_string()
+        .contains("After compaction, load ContextSearch with ToolLoad"));
+    let tool = |index: usize| {
+        requests[index]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "ContextSearch")
+    };
+    assert!(tool(3).is_none());
+    assert_eq!(
+        tool(4).unwrap()["function"]["parameters"]["required"],
+        json!(["query"])
+    );
+    let messages = requests[5]["messages"].as_array().unwrap();
+    let final_tool = messages.iter().rev().find(|m| m["role"] == "tool").unwrap();
+    let value: Value = serde_json::from_str(final_tool["content"].as_str().unwrap()).unwrap();
+    assert_eq!(value["boundary_id"], boundary);
+    let hit = &value["matches"][0];
+    assert_eq!(hit["role"], "tool");
+    assert_eq!(hit["tool_name"], "Read");
+    assert!(hit["excerpt"]
+        .as_str()
+        .unwrap()
+        .contains(CONTEXT_SEARCH_FACT));
+
+    let db = deepseek_code_core::runtime::RuntimePaths::new(data)
+        .unwrap()
+        .open_database()
+        .unwrap();
+    db.with_conn(|conn| {
+        use deepseek_code_core::db::{message_repo, turn_repo};
+        let message_id = hit["message_id"].as_str().unwrap();
+        let original = message_repo::get_message(conn, message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.conversation_id, id);
+        assert_eq!(original.created_at, hit["timestamp"].as_str().unwrap());
+        assert_eq!(
+            turn_repo::get_message_turn(conn, message_id)
+                .unwrap()
+                .unwrap()
+                .turn_id,
+            hit["turn_id"].as_str().unwrap()
+        );
+        let tools = message_repo::get_tool_calls_for_message(conn, message_id).unwrap();
+        assert!(tools
+            .iter()
+            .any(|tool| tool.id == hit["tool_call_id"].as_str().unwrap()
+                && tool
+                    .output
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(CONTEXT_SEARCH_FACT)));
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn context_search_recovers_a_rare_fact_after_compaction_in_print() {
+    assert_cli_context_search(false).await;
+}
+
+#[tokio::test]
+async fn context_search_recovers_a_rare_fact_after_compaction_in_sdk() {
+    assert_cli_context_search(true).await;
+}
+
+#[tokio::test]
+async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundary() {
+    // On Windows dirs::home_dir() uses the OS profile even if USERPROFILE is set.
+    // Create the fixture directly below it so all project ancestors below home are ours.
+    #[cfg(windows)]
+    let temp = tempfile::tempdir_in(dirs::home_dir().expect("Windows profile directory")).unwrap();
+    #[cfg(not(windows))]
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let project = home.join("project");
+    let data = home.join("data");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    {
+        let path = data.join("deepseek_code.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        // The base schema predates the search migration. Prove the pre-upgrade
+        // replay order before the real CLI opens and upgrades this file.
+        db.execute_batch(deepseek_code_core::db::schema::SCHEMA_SQL)
+            .unwrap();
+        // Create the same code session and trusted project as the CLI, using
+        // only the base schema. The resumed CLI will run the search migration.
+        let manager = deepseek_code_core::db::DbManager::new(path).unwrap();
+        deepseek_code_core::runtime::SessionStore::new(Arc::new(manager))
+            .create_with_id(&project, "fixture-model", "cli-runtime", &session)
+            .unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='context_search_sources'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        for (id, role, content, boundary) in [
+            ("z-old", "user", "legacy-marker original", false),
+            ("m-boundary", "user", "Stored summary", true),
+            (
+                "a-reply",
+                "assistant",
+                "legacy-marker retained reply",
+                false,
+            ),
+        ] {
+            db.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,is_compact_boundary,sort_order)
+                VALUES(?1,?2,?3,?4,'2026-01-01T00:00:00Z',?5,50)", rusqlite::params![id,session,role,content,boundary]).unwrap();
+        }
+        let mut replay = db
+            .prepare("SELECT id FROM messages WHERE conversation_id=? ORDER BY sort_order")
+            .unwrap();
+        let ids = replay
+            .query_map([&session], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, ["z-old", "m-boundary", "a-reply"]);
+        // A checkout which already ran the earlier I16 version also upgrades
+        // with its ID-ordered index installed.
+        db.execute_batch(
+            "CREATE INDEX idx_context_search_messages ON messages(conversation_id,sort_order,id)",
+        )
+        .unwrap();
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = requests.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                let mut seen = captured.lock().unwrap();
+                seen.push(body);
+                let (name, args) = match seen.len() {
+                    1 => ("ToolLoad", json!({"names":["ContextSearch"]})),
+                    2 => (
+                        "ContextSearch",
+                        json!({"query":"legacy-marker","range":"before"}),
+                    ),
+                    3 => (
+                        "ContextSearch",
+                        json!({"query":"legacy-marker","range":"after","role":"assistant"}),
+                    ),
+                    _ => return context_search_stream(json!({"content":"finished"}), "stop"),
+                };
+                let delta = json!({"tool_calls":[{"index":0,"id":format!("legacy-{}",seen.len()),
+                "type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+                context_search_stream(delta, "tool_calls")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut cli = query(&data, &project, &url);
+    cli.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    cli.args([
+        "--resume",
+        &session,
+        "--print",
+        "Continue after the summary",
+    ]);
+    let output = execute(cli).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.abort();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let wire: Vec<_> = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] != "system")
+        .map(|m| (&m["role"], &m["content"]))
+        .collect();
+    assert_eq!(wire.len(), 3, "{wire:?}");
+    assert_eq!(wire[0], (&json!("user"), &json!("Stored summary")));
+    assert_eq!(
+        wire[1],
+        (&json!("assistant"), &json!("legacy-marker retained reply"))
+    );
+    assert_eq!(
+        wire[2],
+        (&json!("user"), &json!("Continue after the summary"))
+    );
+    for (body, expected) in [(&requests[2], "z-old"), (&requests[3], "a-reply")] {
+        let tool = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(tool["role"], "tool");
+        let result: Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["boundary_id"], "m-boundary");
+        let hits = result["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{result}");
+        assert_eq!(hits[0]["message_id"], expected);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn redirected_output_config_confirmation_reports_enospc() {
