@@ -145,7 +145,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let bash_tool = shell_tool_description::bash_tool();
     let mut defs = vec![
         image_generation::definition(),
-        ToolDefinition { name: "Skill".into(), description: "Invoke a skill.\n\nA skill is a packaged set of instructions the user or project has set up for a particular kind of task (deploy steps, a review checklist, a repo-specific workflow). Available skills are listed in the system prompt with one-line descriptions. When the task at hand is one a listed skill covers, call this tool first — the skill's instructions load into the turn for you to follow in place of your default approach; skills with context:fork instead run in an isolated child conversation and return the finished result. Users may also ask for one by name (`/<name>`, or \"slash command\"); that's a request to invoke it.\n\n- `skill`: exact name from the listing, no leading slash. Plugin skills use `plugin:skill`.\n- `args`: optional arguments to pass through.\n\nOnly names from the listing (or that the user typed explicitly) are valid. Built-in CLI commands (`/help`, `/clear`, …) aren't skills. Do not read a skill file to bypass this tool: dynamic shell context and fork isolation run through it.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"The name of a skill from the available-skills list. Do not guess names.","type":"string"},"args":{"description":"Optional arguments for the skill","type":"string"}},"required":["skill"],"additionalProperties":false}) },
+        ToolDefinition { name: "Skill".into(), description: "Invoke a skill by name. The available skills are listed in a system reminder in the conversation, one line each with an optional description and execution context. Pass the exact name from that list without a leading slash; plugin-provided skills use the plugin:skill form. args is optional and is passed to the skill's template. A skill marked context: fork runs in an isolated child conversation and returns its result. Call this tool rather than opening a skill's file yourself; the tool supplies shell context and fork isolation.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"Exact skill name from the reminder, without a leading slash; plugin skills use plugin:skill.","type":"string"},"args":{"description":"Optional arguments passed to the skill's template.","type":"string"}},"required":["skill"],"additionalProperties":false}) },
         notebook::definition(),
         lsp::definition(),
         // `worktree` stays dispatchable for older transcripts; the model sees Enter/ExitWorktree.
@@ -311,41 +311,41 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "AskUserQuestion".to_string(),
-            description: "Use this tool only when you are blocked on a decision that is genuinely the user's to make: one you cannot resolve from the request, the code, or sensible defaults.\n\nUsage notes:\n- Users will always be able to type a custom answer instead of picking an option\n- Use multiSelect: true to allow multiple answers to be selected for a question\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label\n\nReserve this for decisions where the user's answer changes what you do next — not for choices with a conventional default or facts you can verify in the codebase yourself. In those cases pick the obvious option, mention it in your response, and proceed.\n\nThe user may see only the question: make each question stand on its own. If it depends on something you found, say so briefly, and name the items you are asking about in the question itself.".to_string(),
+            description: "Ask when a decision belongs to the user: the request, the code and sensible defaults leave it open, and the answer changes what you do next. The schema allows 1-4 questions per call; each question has a short header, 2-4 options with a label and a description, and an optional multiSelect flag. Put your recommended option first. If a conventional default or something you can check settles it, decide yourself, say why, and continue.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "questions": {
-                        "description": "Questions to ask the user (1-4 questions)",
+                        "description": "One to four questions to present, each with its own options.",
                         "type": "array", "minItems": 1, "maxItems": 4,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "question": { "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark.", "type": "string" },
-                                "header": { "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\".", "type": "string" },
+                                "question": { "description": "The question text shown to the user.", "type": "string" },
+                                "header": { "description": "Short label for the question, at most 12 characters.", "type": "string" },
                                 "options": {
-                                    "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+                                    "description": "Two to four answer choices; the host adds a free-text answer.",
                                     "type": "array", "minItems": 2, "maxItems": 4,
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "label": { "description": "The display text for this option that the user will see and select. Should be concise (1-5 words).", "type": "string" },
-                                            "description": { "description": "Explanation of what this option means or what will happen if chosen.", "type": "string" },
-                                            "preview": { "description": "Optional preview content rendered when this option is focused, such as a code snippet or ASCII mockup.", "type": "string" }
+                                            "label": { "description": "Short text the user picks.", "type": "string" },
+                                            "description": { "description": "What choosing this option means or causes.", "type": "string" },
+                                            "preview": { "description": "Optional content shown while this option is highlighted, such as a code snippet or mockup.", "type": "string" }
                                         },
                                         "required": ["label", "description"],
                                         "additionalProperties": false
                                     }
                                 },
-                                "multiSelect": { "description": "Set to true to allow the user to select multiple options instead of just one.", "default": false, "type": "boolean" }
+                                "multiSelect": { "description": "Allow more than one option to be selected.", "default": false, "type": "boolean" }
                             },
                             "required": ["question", "header", "options", "multiSelect"],
                             "additionalProperties": false
                         }
                     },
-                    "answers": { "description": "User answers collected by the permission component", "type": "object", "additionalProperties": { "type": "string" } },
-                    "annotations": { "description": "Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text.", "type": "object" },
-                    "metadata": { "description": "Optional metadata for tracking and analytics purposes. Not displayed to user.", "type": "object", "properties": { "source": { "description": "Optional identifier for the source of this question.", "type": "string" } }, "additionalProperties": false }
+                    "answers": { "description": "Pre-filled answers keyed by question text; normally omitted.", "type": "object", "additionalProperties": { "type": "string" } },
+                    "annotations": { "description": "Notes the user attached to a question's selection, keyed by question text.", "type": "object" },
+                    "metadata": { "description": "Optional tracking data for the host; not shown to the user.", "type": "object", "properties": { "source": { "description": "Identifier for where the question originated.", "type": "string" } }, "additionalProperties": false }
                 },
                 "required": ["questions"],
                 "additionalProperties": false
