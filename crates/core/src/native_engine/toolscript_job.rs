@@ -737,7 +737,11 @@ fn snapshot(directory: &Path, id: &str, input: &Value, block: bool) -> Result<Va
         false,
     )?;
     let truncated = size.omitted > 0;
-    crate::tools::bash_process::publish_snapshot([size, Default::default()], [stdout.len(), 0]);
+    crate::tools::bash_process::publish_snapshot(
+        [size, Default::default()],
+        [stdout.len(), 0],
+        || None,
+    );
     value["stdout"] = json!(stdout);
     value["stderr"] = json!("");
     value["output_truncated"] = json!(truncated);

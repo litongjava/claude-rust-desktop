@@ -86,7 +86,7 @@ async fn respond(
         "TaskOutput is still advertised: {tools:?}"
     );
     // TaskGet is deferred: absent from the default request, loaded by the
-    // ToolSearch call at step 1, and carried from step 2 on.
+    // ToolLoad call at step 1, and carried from step 2 on.
     if index == 0 {
         assert!(
             !tools.contains(&"TaskGet".to_owned()),
@@ -96,7 +96,7 @@ async fn respond(
     if index >= 2 && !fixture.foreground {
         assert!(
             tools.contains(&"TaskGet".to_owned()),
-            "TaskGet missing after ToolSearch: {tools:?}"
+            "TaskGet missing after ToolLoad: {tools:?}"
         );
     }
     let frames = match index {
@@ -124,15 +124,11 @@ async fn respond(
                 result["task_id"].as_str().is_some(),
                 "Bash task_id missing: {result}"
             );
-            tool_call_frame(
-                "call-search",
-                "ToolSearch",
-                &json!({"query":"select:TaskGet"}),
-            )
+            tool_call_frame("call-search", "ToolLoad", &json!({"names":["TaskGet"]}))
         }
         2 => {
             let loaded = last_tool_result(&body)
-                .unwrap_or_else(|| panic!("ToolSearch result missing in request {body}"));
+                .unwrap_or_else(|| panic!("ToolLoad result missing in request {body}"));
             assert_eq!(loaded["loaded_tools"], json!(["TaskGet"]), "{loaded}");
             let started = fixture
                 .bash_result
@@ -654,6 +650,7 @@ async fn paged_run(raw_size: Option<usize>) {
                 .unwrap();
             assert_eq!(content.contains("Command output summary"), size >= 12_000);
             if size >= 12_000 {
+                assert!(content.contains("Exit status 0"), "{content}");
                 assert!(
                     content.contains("12000 source bytes") || content.contains("12000 page bytes"),
                     "{content}"

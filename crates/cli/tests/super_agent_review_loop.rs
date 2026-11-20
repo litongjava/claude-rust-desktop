@@ -400,7 +400,7 @@ fn delivery_tool_calls(state: &MockState) -> usize {
                     .is_some_and(|prompt| prompt.contains("deliver the host-verified integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         })
         .count()
 }
@@ -416,7 +416,7 @@ async fn wait_for_delivery_tool(state: &MockState) {
                     .is_some_and(|prompt| prompt.contains("deliver the host-verified integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.contains("Exit code: 0"))
+                    .is_some_and(|result| is_bash_result(result) && bash_succeeded(result))
         });
         if ran {
             return;
@@ -437,7 +437,7 @@ async fn wait_for_integration_tool(state: &MockState) {
                     .is_some_and(|prompt| prompt.contains("Prepare integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         });
         if ran {
             return;
@@ -461,7 +461,7 @@ fn integration_tool_calls(state: &MockState) -> usize {
                     .is_some_and(|prompt| prompt.contains("Prepare integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         })
         .count()
 }
@@ -471,6 +471,27 @@ fn tool_output(result: &str) -> String {
         .split_once("Output:\n")
         .map(|(_, output)| output.trim().to_owned())
         .unwrap_or_else(|| result.trim().to_owned())
+}
+
+/// A rendered shell result no longer leads with `Exit code: 0`, so a successful
+/// call is any result whose first status line is not a failure.
+fn bash_succeeded(result: &str) -> bool {
+    if result.starts_with("Error: ") {
+        return false;
+    }
+    let first = result.lines().next().unwrap_or_default();
+    !(first.starts_with("Exit code:")
+        || first == "Command failed"
+        || first.starts_with("Command timed out")
+        || first == "Tool reported an error")
+}
+
+/// Whether a model-visible result came from the shell tool. Shell text is
+/// rendered without a label once it has a single stdout body, so anything that
+/// is not a JSON payload (or a tool-start failure) counts here; this fixture's
+/// only non-shell tools return JSON.
+fn is_bash_result(result: &str) -> bool {
+    !result.starts_with("Error: ") && !result.trim_start().starts_with('{')
 }
 
 fn integration_repository(prompt: &str) -> String {
@@ -571,7 +592,7 @@ async fn coder_response(
                 let oid = |value: &str| {
                     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
                 };
-                if !result.contains("Exit code: 0") || !oid(&before) || !oid(&after) {
+                if !bash_succeeded(&result) || !oid(&before) || !oid(&after) {
                     state.violation(format!(
                         "the integration merge did not yield two commits: {result}"
                     ));
@@ -615,7 +636,7 @@ async fn coder_response(
             ),
             1 => {
                 let result = last_result.unwrap_or_default();
-                if !result.contains("Exit code: 0") {
+                if !bash_succeeded(&result) {
                     state.violation(format!(
                         "the reviewed correction command failed instead of committing: {result}"
                     ));
@@ -2061,12 +2082,8 @@ async fn run_review_loop_with(
                 .unwrap_or_default()
         })
         .filter_map(|result| result.as_str().map(str::to_owned))
-        .filter(|result| result.starts_with("Exit code:"))
-        .filter_map(|result| {
-            result
-                .split_once("Output:\n")
-                .map(|(_, output)| output.trim().to_owned())
-        })
+        .filter(|result| is_bash_result(result))
+        .map(|result| tool_output(&result))
         .collect();
     assert_eq!(
         bash_outputs.len(),
@@ -2428,12 +2445,8 @@ async fn run_review_loop_with(
                     .unwrap_or_default()
             })
             .filter_map(|result| result.as_str().map(str::to_owned))
-            .filter(|result| result.starts_with("Exit code:"))
-            .filter_map(|result| {
-                result
-                    .split_once("Output:\n")
-                    .map(|(_, output)| output.trim().to_owned())
-            })
+            .filter(|result| is_bash_result(result))
+            .map(|result| tool_output(&result))
             .collect();
         let final_output = reviewer_outputs
         .iter()
@@ -3455,18 +3468,12 @@ async fn run_review_loop_with(
                             })
                             && request["last_tool_result"]
                                 .as_str()
-                                .is_some_and(|result| result.starts_with("Exit code:"))
+                                .is_some_and(|result| is_bash_result(result))
                     })
                     .and_then(|request| request["last_tool_result"].as_str().map(str::to_owned))
                     .expect("delivery Bash result");
-                assert!(
-                    delivery_result.contains("Exit code: 0"),
-                    "{delivery_result}"
-                );
-                let output = delivery_result
-                    .split_once("Output:\n")
-                    .map(|(_, output)| output.trim())
-                    .unwrap_or_default();
+                assert!(bash_succeeded(&delivery_result), "{delivery_result}");
+                let output = tool_output(&delivery_result);
                 assert_eq!(
                     std::fs::canonicalize(output.lines().next().unwrap_or_default()).unwrap(),
                     std::fs::canonicalize(&coder_worktree).unwrap(),

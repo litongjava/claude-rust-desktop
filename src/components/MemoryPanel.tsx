@@ -91,7 +91,7 @@ export function MemoryPanel() {
         </div>
       </div>
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
-        <p className="text-xs leading-5 text-deepseek-textSecondary">跨对话保存重要信息。默认保存在本机，支持中英文关键词检索；开启自动存储后会保存完成的对话，自动检索会在新问题中引用相关记忆。</p>
+        <p className="text-xs leading-5 text-deepseek-textSecondary">跨对话保存重要信息。默认保存在本机，支持中英文关键词检索；记忆只在此处或通过 dcl memory 手动添加、检索、编辑和删除，不会自动附加到对话中。</p>
         {error && <div role="alert" className="rounded-lg bg-red-500/10 p-3 text-sm text-red-500">{error}</div>}
         {notice && <div role="status" className="rounded-lg bg-green-500/10 p-3 text-sm text-green-600">{notice}</div>}
         {config && !config.enabled && <p className="rounded-lg bg-deepseek-hover p-3 text-sm">长期记忆已关闭。已保存的数据会保留，重新启用后可检索。</p>}
@@ -157,17 +157,17 @@ export function MemoryPanel() {
               </div>
             </form> : <p className="whitespace-pre-wrap break-words text-sm">{item.content}</p>}
           </article>)}
-          {!busy && config?.enabled && results.length === 0 && <p className="py-8 text-center text-sm text-deepseek-textSecondary">{searchedQuery ? '未找到相关记忆，试试其他关键词。' : '还没有记忆。可以手动添加，或完成一次对话后自动保存。'}</p>}
+          {!busy && config?.enabled && results.length === 0 && <p className="py-8 text-center text-sm text-deepseek-textSecondary">{searchedQuery ? '未找到相关记忆，试试其他关键词。' : '还没有记忆。可以手动添加一条记忆。'}</p>}
         </div>
       </div>
       {showConfig && draftConfig && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setShowConfig(false)}>
         <div role="dialog" aria-modal="true" aria-label="长期记忆设置" className="w-full max-w-md space-y-4 rounded-xl border border-deepseek-border bg-deepseek-bg p-5 shadow-xl" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-between"><h3 className="font-semibold">长期记忆设置</h3><button aria-label="关闭设置" onClick={() => setShowConfig(false)}><X size={18} /></button></div>
-          {(['enabled', 'auto_search', 'auto_ingest'] as const).map((key, index) => <label key={key} className="flex items-center justify-between text-sm">{['启用长期记忆', '自动检索相关记忆', '自动保存完成的对话'][index]}<input type="checkbox" checked={draftConfig[key]} onChange={e => setDraftConfig({ ...draftConfig, [key]: e.target.checked })} /></label>)}
+          <label className="flex items-center justify-between text-sm">启用长期记忆<input type="checkbox" checked={draftConfig.enabled} onChange={e => setDraftConfig({ ...draftConfig, enabled: e.target.checked })} /></label>
           <label className="block space-y-1 text-sm"><span>存储方式</span><select value={draftConfig.backend_url === 'local' ? 'local' : 'remote'} onChange={e => setDraftConfig({ ...draftConfig, backend_url: e.target.value === 'local' ? 'local' : 'http://127.0.0.1:8765' })} className={inputClass}><option value="local">本机存储（推荐）</option><option value="remote">MemEx HTTP 服务</option></select></label>
           {draftConfig.backend_url !== 'local' && <label className="block space-y-1 text-sm"><span>服务地址</span><input type="url" value={draftConfig.backend_url} onChange={e => setDraftConfig({ ...draftConfig, backend_url: e.target.value })} className={inputClass} /></label>}
           <p className="text-xs text-deepseek-textSecondary">切换存储方式不会搬迁或删除已有记忆。使用 HTTP 服务时，记忆会发送到该地址。</p>
-          <label className="block space-y-1 text-sm"><span>每次自动检索条数（1–50）</span><input type="number" min="1" max="50" value={draftConfig.search_top_k} onChange={e => setDraftConfig({ ...draftConfig, search_top_k: Number(e.target.value) })} className={inputClass} /></label>
+          <label className="block space-y-1 text-sm"><span>默认检索条数（1–50）</span><input type="number" min="1" max="50" value={draftConfig.search_top_k} onChange={e => setDraftConfig({ ...draftConfig, search_top_k: Number(e.target.value) })} className={inputClass} /></label>
           <label className="block space-y-1 text-sm"><span>最低重要性（0–1）</span><input type="number" min="0" max="1" step="0.1" value={draftConfig.min_importance_threshold} onChange={e => setDraftConfig({ ...draftConfig, min_importance_threshold: Number(e.target.value) })} className={inputClass} /></label>
           {error && <p role="alert" className="text-sm text-red-500">{error}</p>}
           <button disabled={busy || draftConfig.search_top_k < 1 || draftConfig.search_top_k > 50 || !Number.isInteger(draftConfig.search_top_k) || draftConfig.min_importance_threshold < 0 || draftConfig.min_importance_threshold > 1} onClick={() => void saveConfig()} className={buttonClass}>保存设置</button>

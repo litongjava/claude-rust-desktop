@@ -36,7 +36,7 @@ const STATE_OPTIONS = [
 const STATE_HINTS: Record<string, string> = {
   off: 'Not started; its tools and prompts are unavailable.',
   user: 'All tool schemas are sent with every request.',
-  'on-demand': 'Tools are listed by name and loaded with ToolSearch when needed.',
+  'on-demand': 'Tools are listed by name and loaded with ToolLoad when needed.',
   'user-only': 'Connected; the model cannot see or call its tools.',
 };
 

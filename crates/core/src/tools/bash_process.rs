@@ -243,13 +243,7 @@ pub(crate) fn fixture_capture(
         }
         captured.present_with_limit(tool_limit)
     });
-    let capture = shell_metadata(
-        37,
-        stdout,
-        stderr,
-        [out.len(), err.len()],
-        out_cut || err_cut,
-    );
+    let capture = shell_metadata(37, stdout, stderr, [out.len(), err.len()]);
     let result = json!({"stdout":out, "stderr":err, "exit_code":exit, "stdout_truncated":out_cut,"stderr_truncated":err_cut});
     (result.to_string(), capture.map(CommandMetadata::Shell))
 }
@@ -287,6 +281,10 @@ pub(crate) struct ShellCapture {
 pub(crate) enum CommandMetadata {
     Shell(ShellCapture),
     Snapshot([crate::performance::command_output::SnapshotSize; 2]),
+    ShellSnapshot {
+        streams: [crate::performance::command_output::SnapshotSize; 2],
+        exit: i64,
+    },
     PageExit(i64), // Existing private sidecars.
     Page {
         exit: Option<i64>,
@@ -332,8 +330,12 @@ pub(super) fn replace_metadata(metadata: Option<CommandMetadata>) {
 pub(crate) fn publish_snapshot(
     streams: [crate::performance::command_output::SnapshotSize; 2],
     text_sizes: [usize; 2],
+    exit: impl FnOnce() -> Option<i64>,
 ) {
-    replace_metadata(qualifies(text_sizes, false).then_some(CommandMetadata::Snapshot(streams)));
+    replace_metadata(qualifies(text_sizes).then(|| match exit() {
+        Some(exit) => CommandMetadata::ShellSnapshot { streams, exit },
+        None => CommandMetadata::Snapshot(streams),
+    }));
 }
 
 pub(crate) fn publish_page(
@@ -344,13 +346,13 @@ pub(crate) fn publish_page(
     let streams = [stdout, stderr];
     // Decoded length is an upper bound. Save exact source widths for any
     // candidate, including a page whose replacements crossed the threshold.
-    replace_metadata(qualifies(streams.map(|s| s.text.len()), false).then(|| {
-        CommandMetadata::Page {
+    replace_metadata(
+        qualifies(streams.map(|s| s.text.len())).then(|| CommandMetadata::Page {
             exit: exit(),
             bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
             widths: streams.map(|s| s.widths.clone()),
-        }
-    }));
+        }),
+    );
 }
 
 pub(super) async fn run_logged(
@@ -393,7 +395,6 @@ pub(super) async fn run_logged_with_capture(
         stdout_stats,
         stderr_stats,
         [stdout.len(), stderr.len()],
-        stdout_truncated || stderr_truncated,
     );
     result["stdout"] = json!(stdout);
     result["stderr"] = json!(stderr);
@@ -409,14 +410,12 @@ fn shell_metadata(
     stdout: StreamCapture,
     stderr: StreamCapture,
     text_bytes: [usize; 2],
-    truncated: bool,
 ) -> Option<ShellCapture> {
-    (qualifies([stdout.bytes, stderr.bytes], truncated) || qualifies(text_bytes, truncated))
-        .then_some(ShellCapture {
-            duration_ms,
-            stdout,
-            stderr,
-        })
+    (qualifies([stdout.bytes, stderr.bytes]) || qualifies(text_bytes)).then_some(ShellCapture {
+        duration_ms,
+        stdout,
+        stderr,
+    })
 }
 
 /// Runs a command with a bounded **raw** capture: the whole document within

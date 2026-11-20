@@ -834,6 +834,18 @@ where
 /// Apply the same boundary to host-supplied histories without dropping unsaved input.
 /// A stale Desktop tab must reload, rather than accidentally resending pre-compact history.
 pub fn apply_boundary(db: &DbManager, id: &str, messages: &mut Vec<Value>) -> Result<()> {
+    apply_persisted_boundary(db, id, messages).map(|_| ())
+}
+
+/// Whether a real persisted boundary was applied to these messages. This is
+/// separate from request-recording provenance for host-supplied histories.
+pub(crate) fn apply_persisted_boundary(
+    db: &DbManager,
+    id: &str,
+    messages: &mut Vec<Value>,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+
     // Native blocks are accepted only from the persisted boundary, never host-supplied JSON.
     for message in messages.iter_mut() {
         if let Some(object) = message.as_object_mut() {
@@ -841,31 +853,40 @@ pub fn apply_boundary(db: &DbManager, id: &str, messages: &mut Vec<Value>) -> Re
         }
     }
     let boundary = db.with_conn(|conn| -> Result<_> {
-        Ok(message_repo::get_messages_by_conversation(conn, id)?
-            .into_iter()
-            .rev()
-            .find(|m| m.is_compact_boundary))
+        let tx = conn.unchecked_transaction()?;
+        let boundary: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id,content FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1
+                 ORDER BY sort_order DESC, rowid DESC LIMIT 1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, content)) = boundary else {
+            return Ok(None);
+        };
+        Ok(Some((content, native::load(&tx, &id)?)))
     })??;
-    if let Some(boundary) = boundary {
+    if let Some((content, native)) = boundary {
         let start = messages
             .iter()
             .rposition(|m| {
                 m["role"] == "user"
-                    && (m["content"].as_str() == Some(boundary.content.as_str())
+                    && (m["content"].as_str() == Some(content.as_str())
                         || m["content"].as_array().is_some_and(|blocks| {
                             blocks.iter().any(|b| {
-                                b["type"] == "text"
-                                    && b["text"].as_str() == Some(boundary.content.as_str())
+                                b["type"] == "text" && b["text"].as_str() == Some(content.as_str())
                             })
                         }))
             })
             .context("Session was compacted; reload its messages before sending again")?;
         messages.drain(..start);
-        if let Some(native) = db.with_conn(|conn| native::load(conn, &boundary.id))?? {
+        if let Some(native) = native {
             messages[0]["provider_content"] = native;
         }
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -4,8 +4,8 @@ use std::ops::Range;
 
 pub(crate) const LONG_COMMAND_OUTPUT_BYTES: usize = 12_000;
 
-pub(crate) fn qualifies(bytes: [usize; 2], truncated: bool) -> bool {
-    truncated || bytes[0].saturating_add(bytes[1]) >= LONG_COMMAND_OUTPUT_BYTES
+pub(crate) fn qualifies(bytes: [usize; 2]) -> bool {
+    bytes[0].saturating_add(bytes[1]) >= LONG_COMMAND_OUTPUT_BYTES
 }
 
 #[derive(Default)]

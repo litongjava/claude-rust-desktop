@@ -170,15 +170,21 @@ fn render_with_spans(
         {
             return output.into();
         }
-        fields.remove("output_capture");
+        let requested_shell = fields
+            .remove("shell")
+            .and_then(|shell| shell.as_str().map(str::to_owned));
+        // A zero exit code is the normal case; only a failure needs naming.
+        let mut exit_shown = false;
         if let Some(code) = fields.remove("exit_code") {
-            parts.push(format!("Exit code: {code}"));
+            if code.as_i64().is_some_and(|code| code != 0) {
+                parts.push(format!("Exit code: {code}"));
+                exit_shown = true;
+            }
         }
-        if fields.get("success") == Some(&Value::Bool(false)) && parts.is_empty() {
+        if fields.get("success") == Some(&Value::Bool(false)) && !exit_shown {
             parts.push("Command failed".into());
         }
         fields.remove("success");
-        fields.remove("shell");
         for (key, label) in [
             ("timed_out", "Command timed out"),
             ("is_error", "Tool reported an error"),
@@ -193,6 +199,20 @@ fn render_with_spans(
         ] {
             if fields.remove(key) == Some(Value::Bool(true)) {
                 parts.push(label.into());
+            }
+        }
+        // A pipeline closed early is not a failure; say so in words instead of
+        // leaving a raw flag for the model to decode.
+        if fields.remove("pipeline_sigpipe") == Some(Value::Bool(true)) {
+            parts.push("Output ended early: a later command in the pipeline closed it".into());
+        }
+        // The executable that ran is only news when it is not the one asked
+        // for; a matching shell needs no line at all.
+        if let Some(Value::String(path)) = fields.remove("shell_path") {
+            if let Some(requested) = requested_shell.as_deref() {
+                if !shell_matches(requested, &path) {
+                    parts.push(format!("Shell: {path} (requested {requested})"));
+                }
             }
         }
         if let Some(error) = fields.remove("error") {
@@ -225,6 +245,22 @@ fn render_with_spans(
                     span_parts.push((index, label.len() + 2, ranges));
                     bodies.push(format!("{label}:\n{text}"));
                 }
+            }
+        }
+        // Without a status line or a second stream, the `Output:` label adds
+        // nothing: the body is simply the command's output.
+        if prefix.is_empty() && parts.is_empty() && fields.is_empty() {
+            if let [(0, label_len, ranges)] = span_parts.as_slice() {
+                spans[0] = Some(BodySpan {
+                    start: 0,
+                    ranges: ranges.clone(),
+                });
+                return format!("{}{suffix}", &bodies[0][*label_len..]);
+            }
+            if bodies.is_empty() {
+                // A successful command with nothing to say must still read as
+                // finished rather than as an unfinished task.
+                return format!("(Completed with no output){suffix}");
             }
         }
     }
@@ -297,9 +333,11 @@ fn command_preview_with_room(
     use command_output_summary::{CommandOutput, Stream};
 
     let bash = name == "Bash";
-    let (capture, page_exit, page_bytes) = match metadata {
+    let (capture, saved_exit, page_bytes) = match metadata {
         Some(CommandMetadata::Shell(capture)) => (Some(capture), None, None),
-        Some(CommandMetadata::PageExit(exit)) => (None, Some(*exit), None),
+        Some(CommandMetadata::PageExit(exit) | CommandMetadata::ShellSnapshot { exit, .. }) => {
+            (None, Some(*exit), None)
+        }
         Some(CommandMetadata::Page {
             exit,
             bytes,
@@ -331,11 +369,16 @@ fn command_preview_with_room(
     let Some(Ok(value @ Value::Object(_))) = input.next() else {
         return base;
     };
+    if task && value["metadata"]["interaction"] == "pty" {
+        return base;
+    }
     if !bash && value.get("model_output_summary").is_some() {
         return base;
     }
     let json_end = raw.len() - json.len() + input.byte_offset();
-    let nested = if task {
+    // TaskGet renders managed-shell result strings as stdout, which can itself
+    // be JSON. Obtain their status from private capture metadata.
+    let nested = if task && value["metadata"]["managed_shell"] != true {
         value["result"]
             .as_str()
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -368,7 +411,9 @@ fn command_preview_with_room(
     let mut streams = streams.map(|(key, text)| {
         let index = usize::from(key == "stderr");
         let snapshot = match metadata {
-            Some(CommandMetadata::Snapshot(streams)) => Some(&streams[index]),
+            Some(
+                CommandMetadata::Snapshot(streams) | CommandMetadata::ShellSnapshot { streams, .. },
+            ) => Some(&streams[index]),
             _ => None,
         };
         let stats = capture.and_then(|capture| match key {
@@ -486,9 +531,7 @@ fn command_preview_with_room(
             })
         })
     });
-    let truncated =
-        !task && (value["stdout_truncated"] == true || value["stderr_truncated"] == true);
-    if !crate::performance::command_output::qualifies(bytes, truncated) {
+    if !crate::performance::command_output::qualifies(bytes) {
         return base;
     }
 
@@ -542,7 +585,7 @@ fn command_preview_with_room(
         exit: value["exit_code"]
             .as_i64()
             .or_else(|| command["exit_code"].as_i64())
-            .or(page_exit),
+            .or(saved_exit),
         duration_ms: capture
             .map(|s| s.duration_ms)
             .or_else(|| legacy_capture["duration_ms"].as_u64())
@@ -553,7 +596,10 @@ fn command_preview_with_room(
                     .checked_sub(value["started_ms"].as_u64()?)
             }),
         page,
-        log_snapshot: matches!(metadata, Some(CommandMetadata::Snapshot(_))),
+        log_snapshot: matches!(
+            metadata,
+            Some(CommandMetadata::Snapshot(_) | CommandMetadata::ShellSnapshot { .. })
+        ),
         serialized_elided,
     });
     let available = MODEL_TOOL_OUTPUT_BYTES
@@ -658,6 +704,29 @@ fn visible_ranges(
     visible
 }
 
+/// The executable name a shell path or request resolves to. Both separators
+/// are accepted because a stored result can be replayed on another platform.
+fn shell_stem(value: &str) -> String {
+    let name = value
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(value);
+    let name = if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe")
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    name.to_ascii_lowercase()
+}
+
+/// Whether the shell that actually ran is the one that was requested. The
+/// names are compared as executable stems, so `powershell.exe` matches a
+/// request for `powershell` while `pwsh` stays distinct.
+fn shell_matches(requested: &str, shell_path: &str) -> bool {
+    shell_stem(requested) == shell_stem(shell_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -700,10 +769,7 @@ mod tests {
     #[test]
     fn model_tool_output_preserves_payload_errors_and_hook_suffix() {
         let raw = json!({"stdout":"{\"user_json\": 1}\n", "stderr":"", "exit_code":0,"success":true,"shell":"bash","stdout_truncated":false,"stderr_truncated":false}).to_string();
-        assert_eq!(
-            render("Bash", &raw, None),
-            "Exit code: 0\nOutput:\n{\"user_json\": 1}\n"
-        );
+        assert_eq!(render("Bash", &raw, None), "{\"user_json\": 1}\n");
         assert_eq!(render("mcp__fixture__Bash", &raw, None), raw);
         let error = format!(
             "Error: {}\nPostToolUseFailure context: inspect dependency",
@@ -759,7 +825,7 @@ mod tests {
         assert_eq!(stdout.len(), 44);
         let raw = json!({"stdout":stdout,"stderr":"","stdout_truncated":false,"stderr_truncated":false,"success":true,"exit_code":0,"shell":"bash"}).to_string();
         let temp = tempfile::tempdir().unwrap();
-        let expected = format!("Exit code: 0\nOutput:\n{stdout}");
+        let expected = stdout;
         assert_eq!(
             command_preview("Bash", &raw, Some(temp.path()), None, true),
             expected
@@ -768,6 +834,63 @@ mod tests {
             command_preview("Bash", &raw, Some(temp.path()), None, false),
             expected
         );
+    }
+
+    #[test]
+    fn model_tool_output_command_lines_follow_unlabeled_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = format!(
+            "error: head\n{}\nfatal: middle\n{}\nFAILED tail\n",
+            "h".repeat(8000),
+            "t".repeat(8000)
+        );
+        let raw = json!({"stdout":stdout,"stderr":"","shell":"bash","shell_path":"/bin/bash","success":true,"exit_code":0,"pipeline_sigpipe":false}).to_string();
+        let result = command_preview("Bash", &raw, Some(dir.path()), None, true);
+        let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
+        assert!(body.starts_with("error: head\n"));
+        assert!(!body.contains("fatal: middle"));
+        assert!(summary.contains("Notable stdout L1 (in preview)"));
+        assert!(summary.contains(r#"Notable stdout L3 | "fatal: middle""#));
+        assert!(summary.contains("Notable stdout L5 (in preview)"));
+    }
+
+    #[test]
+    fn model_tool_output_preserves_long_console_task_outcomes_and_managed_shell_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = r#"{"exit_code":91,"final_drain_complete":true}"#;
+        let mut task = json!({"task_id":"fixture","stdout":"x".repeat(12000),"stderr":"","output":outcome,"result":outcome,"metadata":{"managed_shell":true,"interaction":"pty"}});
+        for name in ["TaskGet", "TaskOutput"] {
+            let raw = task.to_string();
+            assert_eq!(
+                command_preview(name, &raw, Some(dir.path()), None, true),
+                raw
+            );
+        }
+        // A plain managed shell can print JSON with a fabricated exit code.
+        task["metadata"]["interaction"] = json!("pipe");
+        let raw = task.to_string();
+        let metadata = CommandMetadata::ShellSnapshot {
+            streams: [
+                crate::performance::command_output::SnapshotSize {
+                    read: 12000,
+                    ..Default::default()
+                },
+                Default::default(),
+            ],
+            exit: 0,
+        };
+        for (capture, expected) in [
+            (Some(&metadata), "Exit status 0"),
+            (None, "Exit status unknown"),
+        ] {
+            let rendered = command_preview("TaskGet", &raw, Some(dir.path()), capture, true);
+            let value: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(value["result"], outcome);
+            assert!(value["model_output_summary"]
+                .as_str()
+                .unwrap()
+                .contains(expected));
+        }
     }
 
     #[test]
@@ -782,51 +905,37 @@ mod tests {
             let CommandMetadata::Shell(capture) = metadata else {
                 unreachable!()
             };
-            let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
-            if large {
-                let stream = &capture.stdout;
-                assert_eq!((stream.bytes, stream.lines), (52_428_888, 819_204));
-                let (_, stdout) = body.split_once("Output:\n").unwrap();
-                let (stdout, _) = stdout.rsplit_once("\nSaved tool result (").unwrap();
-                let (head, clipped) = stdout.split_once("\n... (output truncated; ").unwrap();
-                let (_, tail) = clipped.split_once(" bytes before preview) ...\n").unwrap();
-                let shown = head.len() + tail.len();
-                let lines = head.lines().count() + tail.lines().count();
-                assert!(summary.contains(&format!("stdout {shown} text bytes, {lines} lines shown of 52428888 source bytes / 819204 lines")), "{summary}");
-                let tool_text = stream.ranges.iter().map(Range::len).sum::<usize>();
-                assert!(
-                    summary.contains(&format!(
-                        "Model preview omitted {} text bytes",
-                        tool_text - shown
-                    )),
-                    "{summary}"
-                );
-                assert_eq!(
-                    result.matches("warning: final fixture").count(),
-                    1,
-                    "{summary}"
-                );
-                assert!(
-                    summary.contains(r#"Notable stdout L409602 | "error: midpoint sentinel""#),
-                    "{summary}"
-                );
-            } else {
-                assert!(body.ends_with("Output:\n..."), "{body}");
-                assert!(
-                    summary.contains(
-                        "stdout 0 text bytes, 0 lines shown of 50 source bytes / 1 lines"
-                    ),
-                    "{summary}"
-                );
-                assert!(
-                    summary.contains("50 text bytes omitted by tool preview"),
-                    "{summary}"
-                );
-                assert!(
-                    summary.contains("small payload that the configured limit truncates"),
-                    "{summary}"
-                );
+            if !large {
+                assert_eq!(result, render("Bash", &raw, None));
+                continue;
             }
+            let (body, summary) = result.split_once("\n\nCommand output summary").unwrap();
+            let stream = &capture.stdout;
+            assert_eq!((stream.bytes, stream.lines), (52_428_888, 819_204));
+            let (_, stdout) = body.split_once("Output:\n").unwrap();
+            let (stdout, _) = stdout.rsplit_once("\nSaved tool result (").unwrap();
+            let (head, clipped) = stdout.split_once("\n... (output truncated; ").unwrap();
+            let (_, tail) = clipped.split_once(" bytes before preview) ...\n").unwrap();
+            let shown = head.len() + tail.len();
+            let lines = head.lines().count() + tail.lines().count();
+            assert!(summary.contains(&format!("stdout {shown} text bytes, {lines} lines shown of 52428888 source bytes / 819204 lines")), "{summary}");
+            let tool_text = stream.ranges.iter().map(Range::len).sum::<usize>();
+            assert!(
+                summary.contains(&format!(
+                    "Model preview omitted {} text bytes",
+                    tool_text - shown
+                )),
+                "{summary}"
+            );
+            assert_eq!(
+                result.matches("warning: final fixture").count(),
+                1,
+                "{summary}"
+            );
+            assert!(
+                summary.contains(r#"Notable stdout L409602 | "error: midpoint sentinel""#),
+                "{summary}"
+            );
             assert!(result.len() <= MODEL_TOOL_OUTPUT_BYTES);
         }
     }
@@ -1002,6 +1111,88 @@ mod tests {
         let (preview, _) = rendered.split_once("\n\nCommand output summary").unwrap();
         let (_, path) = preview.rsplit_once("): ").unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn model_tool_output_shows_only_output_and_required_status() {
+        // A lone stdout body needs neither its label nor an exit-code line.
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","pipeline_sigpipe":false,"stdout_truncated":false,"stderr_truncated":false}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok\n");
+        // Two streams keep their labels so the model can tell them apart.
+        let raw = json!({"stdout":"out","stderr":"err","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Output:\nout\nStderr:\nerr");
+        let raw = json!({"stdout":"","stderr":"err\n","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Stderr:\nerr\n");
+        // A status line keeps the label even for a lone stdout body.
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"stdout_truncated":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Stdout is incomplete (capture or tool limit)\nOutput:\nok\n"
+        );
+        // A silent success must not read as an unfinished task.
+        let raw = json!({"stdout":"","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","pipeline_sigpipe":false,"stdout_truncated":false,"stderr_truncated":false}).to_string();
+        assert_eq!(render("Bash", &raw, None), "(Completed with no output)");
+        // A failure still names its non-zero code.
+        let raw = json!({"stdout":"","stderr":"boom\n","exit_code":2,"success":false,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "Exit code: 2\nStderr:\nboom\n");
+        // A failure without a code keeps the existing line.
+        let raw = json!({"stderr":"denied\n","success":false,"shell":"bash"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Command failed\nStderr:\ndenied\n"
+        );
+    }
+
+    #[test]
+    fn model_tool_output_explains_a_pipeline_cut_short() {
+        let raw = json!({"stdout":"first\n","stderr":"","exit_code":0,"success":true,"pipeline_sigpipe":true,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        let rendered = render("Bash", &raw, None);
+        assert_eq!(
+            rendered,
+            "Output ended early: a later command in the pipeline closed it\nOutput:\nfirst\n"
+        );
+        assert!(!rendered.contains("pipeline_sigpipe"), "{rendered}");
+        assert!(!rendered.contains("Metadata:"), "{rendered}");
+        // A normal success never mentions the flag.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"pipeline_sigpipe":false,"shell":"bash","shell_path":"/bin/bash"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+    }
+
+    #[test]
+    fn model_tool_output_names_only_a_fallback_shell() {
+        // The running executable matches the request, so its path stays hidden.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"pwsh","shell_path":"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+        // Windows PowerShell is not a request for pwsh.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"pwsh","shell_path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"}).to_string();
+        assert_eq!(
+            render("Bash", &raw, None),
+            "Shell: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe (requested pwsh)\nOutput:\nok"
+        );
+        // Case and the .exe suffix do not make powershell a fallback.
+        let raw = json!({"stdout":"ok","exit_code":0,"success":true,"shell":"PowerShell","shell_path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.EXE"}).to_string();
+        assert_eq!(render("Bash", &raw, None), "ok");
+    }
+
+    #[test]
+    fn model_tool_output_keeps_unknown_fields_in_metadata() {
+        let raw = json!({"stdout":"ok\n","stderr":"","exit_code":0,"success":true,"shell":"bash","shell_path":"/bin/bash","task_id":"task-1","note":"kept"}).to_string();
+        let rendered = render("Bash", &raw, None);
+        assert!(rendered.starts_with("Metadata: {"), "{rendered}");
+        assert!(rendered.contains("\"note\":\"kept\""), "{rendered}");
+        assert!(rendered.contains("\"task_id\":\"task-1\""), "{rendered}");
+        assert!(rendered.ends_with("Output:\nok\n"), "{rendered}");
+        assert!(!rendered.contains("shell_path"), "{rendered}");
+        assert!(!rendered.contains("exit_code"), "{rendered}");
+    }
+
+    #[test]
+    fn model_tool_output_leaves_task_results_alone() {
+        // TaskGet/TaskOutput snapshots keep their structured shape here; the
+        // managed-shell payload inside them is rendered by the task layer.
+        let snapshot = json!({"task_id":"task-1","status":"completed","stdout":"done\n","stderr":"","result":"{\"exit_code\":0,\"shell_path\":\"/bin/bash\"}"}).to_string();
+        assert_eq!(render("TaskGet", &snapshot, None), snapshot);
+        assert_eq!(render("TaskOutput", &snapshot, None), snapshot);
     }
 
     fn executor(root: &std::path::Path) -> ToolLoopExecutor {

@@ -33,8 +33,13 @@ const SHM_NAME: &str = "coordination.sqlite3-shm";
 const JOURNAL_NAME: &str = "coordination.sqlite3-journal";
 const MARKER_PROBE_BYTES: u64 = 37;
 const HEADER_PROBE_BYTES: usize = 100;
-const BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-const SCHEMA_LOCK_DEADLINE: Duration = Duration::from_secs(2);
+// Schema lock holders may synchronize several files during first open.
+const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+// A peer can hold a SQLite lock while a durable commit waits on storage.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+// WAL setup retries the mode change within its own window, with short attempts.
+const WAL_MODE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const WAL_MODE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_ROWS: usize = 100;
 
 /// One registry connection. Not `Sync`: callers serialize their own access.
@@ -101,23 +106,30 @@ impl Store {
         }
         #[cfg(unix)]
         {
-            let root = match paths::open_private_dir(&paths.root) {
-                Ok(root) => root,
-                Err(error) if is_missing(&error) => {
-                    paths.prepare_private().map_err(|error| {
-                        CoordinationError::Io(std::io::Error::other(error.to_string()))
-                    })?;
-                    paths::open_private_dir(&paths.root).map_err(anyhow_error)?
-                }
-                Err(error) => return Err(anyhow_error(error)),
-            };
-            let lock = acquire_schema_lock(&root)?;
-            let opened = match inspect_state(&root, paths)? {
-                DiskState::Absent => bootstrap(&root, paths),
-                DiskState::Existing { domain_id } => open_existing(paths, &domain_id),
-            };
-            drop(lock);
-            opened
+            Self::open_rw_with(paths, SCHEMA_LOCK_TIMEOUT, bootstrap)
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_rw_with(
+        paths: &CoordinationPaths,
+        lock_timeout: Duration,
+        initialize: impl FnOnce(&File, &CoordinationPaths) -> CoordResult<Self>,
+    ) -> CoordResult<Self> {
+        let root = match paths::open_private_dir(&paths.root) {
+            Ok(root) => root,
+            Err(error) if is_missing(&error) => {
+                paths.prepare_private().map_err(|error| {
+                    CoordinationError::Io(std::io::Error::other(error.to_string()))
+                })?;
+                paths::open_private_dir(&paths.root).map_err(anyhow_error)?
+            }
+            Err(error) => return Err(anyhow_error(error)),
+        };
+        let _lock = acquire_schema_lock(&root, lock_timeout)?;
+        match inspect_state(&root, paths)? {
+            DiskState::Absent => initialize(&root, paths),
+            DiskState::Existing { domain_id } => open_existing(paths, &domain_id),
         }
     }
 
@@ -388,9 +400,9 @@ fn inspect_state(root: &File, _paths: &CoordinationPaths) -> CoordResult<DiskSta
 }
 /// Acquire the stable schema lock, creating it only in a genuinely empty root.
 #[cfg(unix)]
-fn acquire_schema_lock(root: &File) -> CoordResult<crate::fs::OwnedFileLock> {
+fn acquire_schema_lock(root: &File, timeout: Duration) -> CoordResult<crate::fs::OwnedFileLock> {
     match paths::open_existing_private_at(root, OsStr::new(SCHEMA_LOCK), true) {
-        Ok(file) => return lock_file(file),
+        Ok(file) => return lock_file(file, timeout),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(state_error(error)),
     }
@@ -398,18 +410,18 @@ fn acquire_schema_lock(root: &File) -> CoordResult<crate::fs::OwnedFileLock> {
         RootEntries::Empty => {
             let file = paths::create_private_at(root, OsStr::new(SCHEMA_LOCK), false)
                 .map_err(anyhow_error)?;
-            lock_file(file)
+            lock_file(file, timeout)
         }
         RootEntries::LockOnly => {
             let file = paths::open_existing_private_at(root, OsStr::new(SCHEMA_LOCK), true)
                 .map_err(state_error)?;
-            lock_file(file)
+            lock_file(file, timeout)
         }
         RootEntries::Other => {
             // A concurrent cooperative bootstrap may have just created the lock;
             // only an already validated, acquired lock lets this call continue.
             match paths::open_existing_private_at(root, OsStr::new(SCHEMA_LOCK), true) {
-                Ok(file) => lock_file(file),
+                Ok(file) => lock_file(file, timeout),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     Err(CoordinationError::Corrupt)
                 }
@@ -421,13 +433,18 @@ fn acquire_schema_lock(root: &File) -> CoordResult<crate::fs::OwnedFileLock> {
 
 /// Bounded ownership wait on the schema lock.
 #[cfg(unix)]
-fn lock_file(file: File) -> CoordResult<crate::fs::OwnedFileLock> {
-    let deadline = Instant::now() + SCHEMA_LOCK_DEADLINE;
+fn lock_file(file: File, timeout: Duration) -> CoordResult<crate::fs::OwnedFileLock> {
+    let deadline = Instant::now() + timeout;
     loop {
         match crate::fs::OwnedFileLock::try_acquire(file.try_clone()?)? {
             Some(lock) => return Ok(lock),
-            None if Instant::now() >= deadline => return Err(CoordinationError::Busy),
-            None => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(CoordinationError::Busy);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
         }
     }
 }
@@ -461,7 +478,7 @@ fn open_validated_read(database: &Path, domain_id: &str) -> CoordResult<Connecti
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(database, flags)?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     // Header check first: a corrupt main file must not reach any SQL.
     check_main_header(&connection)?;
     let transaction = connection.unchecked_transaction()?;
@@ -491,17 +508,18 @@ fn open_writer(database: &Path, bootstrap: bool) -> CoordResult<Connection> {
     let connection = Connection::open_with_flags(database, flags)?;
     // Must happen before any query on this connection.
     persist_wal(&connection)?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
     if bootstrap {
+        connection.busy_timeout(WAL_MODE_BUSY_TIMEOUT)?;
         configure_wal(&connection)?;
     }
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
     Ok(connection)
 }
 
 /// Switch a freshly created file to WAL, tolerating a first-open race only.
 fn configure_wal(connection: &Connection) -> CoordResult<()> {
-    let deadline = Instant::now() + SCHEMA_LOCK_DEADLINE;
+    let deadline = Instant::now() + WAL_MODE_RETRY_TIMEOUT;
     loop {
         match connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
@@ -854,7 +872,6 @@ fn decode_row(row: &rusqlite::Row<'_>) -> CoordResult<Registration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
 
     fn paths_in(dir: &Path) -> CoordinationPaths {
         CoordinationPaths {
@@ -1360,6 +1377,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
         let mut store = Store::open_rw(&paths)?;
+        store.connection().busy_timeout(Duration::from_millis(25))?;
 
         // A peer holding the write reservation makes the immediate begin fail.
         let mut peer = raw_connection(&paths.database());
@@ -1386,6 +1404,88 @@ mod tests {
             Err(CoordinationError::UnsupportedSchema(2))
         ));
         assert!(!ran.get(), "the schema fence must run before the closure");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn while_peer_holds_sqlite_lock<T>(
+        paths: &CoordinationPaths,
+        exclusive: bool,
+        operation: impl FnOnce() -> CoordResult<T>,
+    ) -> CoordResult<T> {
+        use std::sync::mpsc;
+
+        let database = paths.database();
+        let peer_reservation = Duration::from_millis(350);
+        let (ready, reserved) = mpsc::channel();
+        let (start, attempting) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(move || -> CoordResult<()> {
+                let mut connection = raw_connection(&database);
+                if exclusive {
+                    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+                }
+                let reservation =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ready.send(()).unwrap();
+                attempting.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::sleep(peer_reservation);
+                reservation.commit()?;
+                Ok(())
+            });
+            reserved.recv_timeout(Duration::from_secs(10)).unwrap();
+            let started = Instant::now();
+            start.send(()).unwrap();
+            let result = operation();
+            let elapsed = started.elapsed();
+            peer.join().unwrap()?;
+            eprintln!(
+                "SQLite operation took {elapsed:?}, result {:?}",
+                result.as_ref().map(|_| ())
+            );
+            let result = result?;
+            assert!(
+                elapsed >= peer_reservation,
+                "operation bypassed the peer lock"
+            );
+            Ok(result)
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_coordination_write_waits_for_peer_commit() -> CoordResult<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let mut store = Store::open_rw(&paths)?;
+        while_peer_holds_sqlite_lock(&paths, false, || {
+            store.insert(&sample_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &hex64('a'),
+                None,
+                1_000,
+            ))
+        })?;
+        let read = Store::open_read(&paths)?.expect("initialized registry");
+        assert_eq!(read.rows(10)?.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_coordination_opens_wait_for_peer_lock() -> CoordResult<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let domain = Store::open_rw(&paths)?.domain_id().to_string();
+
+        // WAL readers coexist with a normal writer. An exclusive peer lock
+        // forces each open to wait during SQLite schema validation.
+        let read = while_peer_holds_sqlite_lock(&paths, true, || Store::open_read(&paths))?
+            .expect("initialized registry");
+        assert_eq!(read.domain_id(), domain);
+        drop(read);
+        let write = while_peer_holds_sqlite_lock(&paths, true, || Store::open_rw(&paths))?;
+        assert_eq!(write.domain_id(), domain);
         Ok(())
     }
 
@@ -2235,8 +2335,11 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_concurrent_bootstrap() -> CoordResult<()> {
+        use std::sync::{Arc, Barrier};
+
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
         let barrier = Arc::new(Barrier::new(2));
@@ -2246,11 +2349,18 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                Store::open_rw(&paths).map(|store| store.domain_id().to_string())
+                Store::open_rw_with(&paths, SCHEMA_LOCK_TIMEOUT, |root, paths| {
+                    let started = Instant::now();
+                    let opened = bootstrap(root, paths);
+                    eprintln!("bootstrap under schema.lock took {:?}", started.elapsed());
+                    opened
+                })
+                .map(|store| store.domain_id().to_string())
             }));
         }
-        let first = handles.remove(0).join().unwrap()?;
-        let second = handles.remove(0).join().unwrap()?;
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+        let (first, second) = (first?, second?);
         assert_eq!(first, second, "both initializers agree on one domain");
 
         let marker = std::fs::read_to_string(paths.root.join(DOMAIN_MARKER)).unwrap();
@@ -2292,12 +2402,57 @@ mod tests {
             .unwrap()
             .expect("the test holds the schema lock");
         assert!(matches!(
-            Store::open_rw(&paths),
+            Store::open_rw_with(&paths, Duration::from_millis(25), bootstrap),
             Err(CoordinationError::Busy)
         ));
         drop(held);
         let reopened = Store::open_read(&paths)?.expect("store remains readable");
         assert_eq!(reopened.rows(10)?.len(), 1);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_coordination_open_waits_for_slow_bootstrap() -> CoordResult<()> {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let injected_delay = Duration::from_millis(2_500);
+        let (ready, locked) = mpsc::channel();
+        let (start, opening) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let initializer_paths = &paths;
+            let initializer = scope.spawn(move || {
+                Store::open_rw_with(initializer_paths, SCHEMA_LOCK_TIMEOUT, |root, paths| {
+                    ready.send(()).unwrap();
+                    opening.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let started = Instant::now();
+                    std::thread::sleep(injected_delay);
+                    let opened = bootstrap(root, paths);
+                    eprintln!(
+                        "injected bootstrap under schema.lock took {:?}, result {:?}",
+                        started.elapsed(),
+                        opened.as_ref().map(Store::domain_id)
+                    );
+                    opened
+                })
+            });
+            locked.recv_timeout(Duration::from_secs(10)).unwrap();
+            let started = Instant::now();
+            start.send(()).unwrap();
+            let follower = Store::open_rw(&paths);
+            let elapsed = started.elapsed();
+            let initial = initializer.join().unwrap()?;
+            eprintln!(
+                "concurrent open took {elapsed:?}, result {:?}",
+                follower.as_ref().map(Store::domain_id)
+            );
+            let follower = follower?;
+            assert!(elapsed >= injected_delay);
+            assert_eq!(follower.domain_id(), initial.domain_id());
+            check_schema(follower.connection(), initial.domain_id())?;
+            Ok(())
+        })
     }
 }

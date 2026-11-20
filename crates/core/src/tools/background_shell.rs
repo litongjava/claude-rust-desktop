@@ -724,12 +724,12 @@ pub(crate) fn start(
         };
         completion.finish(status, output);
     });
-    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it.")});
+    let mut result = json!({"task_id":id,"subject":description,"status":"running","stdout_file":stdout,"stderr_file":stderr,"message":format!("Background command \"{description}\" started. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it.")});
     if interaction == Interaction::StdinPipe {
         result["interaction"] = json!("pipe");
         result["stdin_available"] = json!(true);
         result["stdin_pipe"] = json!(directory.join("stdin.pipe"));
-        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet with ToolSearch to read output, and TaskStop to stop it. You will be notified when it finishes."));
+        result["message"] = json!(format!("Background command \"{description}\" is running with a writable stdin pipe. Use TaskInput with task_id to write UTF-8 data (eof:true closes stdin), TaskGet (load with ToolLoad, names: [\"TaskGet\"]) to read output, and TaskStop to stop it. You will be notified when it finishes."));
     }
     Ok(result)
 }
@@ -997,11 +997,11 @@ pub(super) async fn run_foreground(
             "timeout_ms":millis,
             "stdout":stdout,
             "stderr":stderr,
-            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolSearch (block:true waits); TaskStop stops it. You will be notified when it finishes.")
+            "message":format!("The command was still running after {millis} ms, so it moved to the background and keeps running. Its output so far is in stdout/stderr. To wait for it or read more output, load TaskGet with ToolLoad (names: [\"TaskGet\"]), then call TaskGet with block:true to wait; TaskStop stops it. You will be notified when it finishes.")
         }));
     }
     Ok(
-        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolSearch; TaskStop stops it."}),
+        json!({"task_id":id,"status":"running","backgrounded":true,"message":"The user moved this command to the background; it keeps running. You will be notified when it finishes. To read its output earlier, load TaskGet with ToolLoad (names: [\"TaskGet\"]); TaskStop stops it."}),
     )
 }
 
@@ -1054,9 +1054,9 @@ fn lock_progress(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Requests a stop for every running managed shell of `session`. A task that
-/// finished between the listing and the request is left as it is; one failed
-/// request never prevents the requests and results of the others.
+/// Requests a stop for every running managed shell or monitor of `session`.
+/// A task that finished between the listing and the request keeps its final status.
+/// Each stop is requested independently.
 ///
 /// The listing is only a starting point: the deadline and the abandoned flag
 /// are checked before every stop, because this may run on a blocking thread
@@ -1072,7 +1072,13 @@ fn request_session_stops(
     let session = uuid::Uuid::parse_str(session)?.to_string();
     let listing = super::tasks::execute_for_session("TaskList", json!({}), root, &session)?;
     for task in listing["tasks"].as_array().into_iter().flatten() {
-        if task["metadata"]["managed_shell"] != true || task["status"] != "running" {
+        let metadata = &task["metadata"];
+        let active = if metadata["monitor"] == true {
+            super::monitor::is_active_status(&task["status"])
+        } else {
+            metadata["managed_shell"] == true && task["status"] == "running"
+        };
+        if !active {
             continue;
         }
         let Some(id) = task["id"].as_str() else {
@@ -1099,7 +1105,10 @@ fn request_session_stops(
             }
             // Nothing this call can stop: the task ended before the request.
             Ok(_) => {}
-            Err(error) => progress.outcome.failed.push((subject, format!("{error:#}"))),
+            Err(error) => progress
+                .outcome
+                .failed
+                .push((subject, format!("{error:#}"))),
         }
     }
     Ok(())
@@ -1190,9 +1199,9 @@ fn ordered(mut outcome: SessionStop) -> SessionStop {
 /// the same TaskStop path.
 ///
 /// A delegated child runs in its own conversation, so when it ends nothing
-/// would read or stop the background shells it left behind. Only managed shell
-/// tasks (metadata `managed_shell`, which includes PTY shells) are handled
-/// here; finished tasks keep their final record.
+/// would read or stop the background shells and monitors it left behind.
+/// Managed shells (including PTY shells) and monitors are handled here.
+/// Finished tasks keep their final record.
 ///
 /// `confirm` waits up to [`STOP_CONFIRM_TIMEOUT`] in total for the requested
 /// tasks' final status. With a blocking sleep it must not run on the runtime the
@@ -1370,6 +1379,12 @@ pub(super) fn control(
         return Ok(None);
     }
     anyhow::ensure!(policy.is_none_or(|(block, _)| !block), "Blocking TaskGet requires the asynchronous task entry point; synchronous callers must set block:false");
+    if monitor && name == "TaskStop" && !super::monitor::is_active_status(&task["status"]) {
+        return Ok(Some(json!({
+            "task_id":id,"status":task["status"],"cancellation_requested":false,
+            "message":"Monitor already finished."
+        })));
+    }
     let id = uuid::Uuid::parse_str(id)?.to_string();
     let session = uuid::Uuid::parse_str(session)?;
     let directory = directory(root, &session.to_string(), &task)?;
@@ -1408,7 +1423,11 @@ pub(super) fn control(
             64 * 1024,
             true,
         )?;
-        super::bash_process::publish_snapshot([size, Default::default()], [stdout.len(), 0]);
+        super::bash_process::publish_snapshot(
+            [size, Default::default()],
+            [stdout.len(), 0],
+            || None,
+        );
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
             .map(|file| {
@@ -1452,7 +1471,11 @@ pub(super) fn control(
     };
     let (stdout, out_size) = read("stdout.log")?;
     let (stderr, err_size) = read("stderr.log")?;
-    super::bash_process::publish_snapshot([out_size, err_size], [stdout.len(), stderr.len()]);
+    super::bash_process::publish_snapshot(
+        [out_size, err_size],
+        [stdout.len(), stderr.len()],
+        || stored_shell_exit(&task, terminal(&status)),
+    );
     let mut snapshot = task;
     snapshot["task_id"] = json!(id);
     snapshot["status"] = status.clone();
@@ -1460,6 +1483,24 @@ pub(super) fn control(
     snapshot["stderr"] = json!(stderr);
     let result = snapshot["output"].clone();
     snapshot["result"] = result;
+    // A plain managed shell stores the same payload a foreground Bash result
+    // carries. Render it the same way, so a finished task shows only its output
+    // and the status that matters instead of raw exit_code/shell_path
+    // bookkeeping. Status, IDs and paging cursors keep their structured values.
+    // A PTY/ConPTY console task instead stores its terminal outcome
+    // (`exit_code`, `cleanup_complete`, `final_drain_complete`, ...) as JSON that
+    // callers parse, so its output is left exactly as stored. "pty" covers the
+    // Linux PTY and the Windows ConPTY tasks; macOS has no PTY implementation.
+    let console = snapshot["metadata"]["interaction"].as_str() == Some("pty");
+    if !console {
+        for key in ["output", "result"] {
+            if let Some(text) = snapshot[key].as_str().map(str::to_owned) {
+                snapshot[key] = json!(crate::native_engine::tool_loop::model_tool_output(
+                    "Bash", &text
+                ));
+            }
+        }
+    }
     snapshot["block"] = json!(false);
     snapshot["retrieval_status"] = json!(if terminal(&status) {
         "success"
@@ -1470,6 +1511,21 @@ pub(super) fn control(
         snapshot["owner_loss"] = facts;
     }
     Ok(Some(snapshot))
+}
+
+/// Read the actual status before TaskGet renders a managed shell's stored
+/// result. Its rendered stdout may itself look like a JSON command result.
+fn stored_shell_exit(task: &Value, done: bool) -> Option<i64> {
+    if !done || task["metadata"]["interaction"] == "pty" {
+        return None;
+    }
+    [&task["result"], &task["output"]]
+        .into_iter()
+        .find_map(|result| {
+            result["exit_code"].as_i64().or_else(|| {
+                serde_json::from_str::<Value>(result.as_str()?).ok()?["exit_code"].as_i64()
+            })
+        })
 }
 
 /// Reads at most `limit` bytes from the end of a log file.
@@ -1750,16 +1806,7 @@ fn page_task_get(
     let mut value = task;
     value["task_id"] = json!(id);
     value["status"] = status.clone();
-    super::bash_process::publish_page(&stdout, &stderr, || {
-        [&value["result"], &value["output"]]
-            .into_iter()
-            .filter(|_| done)
-            .find_map(|result| {
-                result["exit_code"].as_i64().or_else(|| {
-                    serde_json::from_str::<Value>(result.as_str()?).ok()?["exit_code"].as_i64()
-                })
-            })
-    });
+    super::bash_process::publish_page(&stdout, &stderr, || stored_shell_exit(&value, done));
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
     // Page mode exposes only the page; the stored text is never repeated.
@@ -1963,6 +2010,114 @@ mod tests {
         assert_eq!(snapshot["status"], "running");
         assert_eq!(snapshot["stdout"], "live output");
         assert_eq!(snapshot["retrieval_status"], "not_ready");
+    }
+
+    /// Starts a real shell command under `session` and returns its snapshot once
+    /// the task reaches a terminal status.
+    async fn finished_shell(root: &Path, session: &str, script: &str) -> Value {
+        let (owner_root, owner_session) = (root.to_owned(), session.to_owned());
+        let task = {
+            let mut command = Command::new("node");
+            command.arg("-e").arg(script);
+            let (root, session) = (owner_root.clone(), owner_session.clone());
+            let command_text = script.to_owned();
+            scope(Some((root, session)), async move {
+                start(
+                    command,
+                    None,
+                    "node",
+                    "fixture",
+                    &command_text,
+                    None,
+                    super::Interaction::None,
+                )
+                .unwrap()
+            })
+            .await
+        };
+        wait_until(
+            &owner_root,
+            &owner_session,
+            task["task_id"].as_str().unwrap(),
+            "the finished task",
+            |value| super::terminal(&value["status"]),
+        )
+        .await
+    }
+
+    /// TaskGet hands the model the same cleaned payload a foreground Bash call
+    /// produces: only the output and the status that matters. The structured
+    /// fields the task tools need keep their own values.
+    #[tokio::test]
+    async fn task_get_renders_a_finished_shell_like_a_bash_result() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        // One stdout body with nothing else is simply the output.
+        let with_output =
+            finished_shell(root.path(), &session, "process.stdout.write('hello\\n')").await;
+        assert_eq!(with_output["status"], "completed", "{with_output}");
+        assert_eq!(with_output["result"], "hello\n", "{with_output}");
+        assert_eq!(with_output["output"], "hello\n", "{with_output}");
+        assert!(with_output["task_id"].as_str().is_some(), "{with_output}");
+        // A finished task with no output still reads as finished.
+        let empty = finished_shell(root.path(), &session, "").await;
+        assert_eq!(empty["status"], "completed", "{empty}");
+        assert_eq!(empty["result"], "(Completed with no output)", "{empty}");
+        assert_eq!(empty["retrieval_status"], "success", "{empty}");
+        // A failure still names its non-zero exit code.
+        let failed = finished_shell(root.path(), &session, "process.exit(2)").await;
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["result"], "Exit code: 2", "{failed}");
+    }
+
+    /// A ConPTY/console task stores a structured terminal outcome, not a Bash
+    /// payload. TaskGet must present it byte-for-byte so callers can still parse
+    /// the fields they rely on.
+    #[test]
+    fn task_get_keeps_a_console_task_outcome_structured() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = super::super::tasks::execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"console","metadata":{
+                "managed_shell":true,
+                "interaction":"pty"
+            }}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        let id = task["id"].as_str().unwrap();
+        let outcome = json!({
+            "exit_code":0,
+            "cleanup_complete":true,
+            "final_drain_complete":true,
+            "output_capture_complete":true
+        })
+        .to_string();
+        super::super::tasks::execute_for_shell_owner(
+            "TaskUpdate",
+            json!({"id":id,"status":"completed","output":outcome}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("shell-tasks").join(&session).join(id)).unwrap();
+        let snapshot = control(
+            "TaskGet",
+            &json!({"task_id":id,"block":false}),
+            root.path(),
+            &session,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot["status"], "completed", "{snapshot}");
+        assert_eq!(snapshot["output"], outcome, "{snapshot}");
+        assert_eq!(snapshot["result"], outcome, "{snapshot}");
+        let parsed: Value = serde_json::from_str(snapshot["output"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["cleanup_complete"], true, "{parsed}");
+        assert_eq!(parsed["final_drain_complete"], true, "{parsed}");
     }
 
     #[test]
@@ -3640,7 +3795,13 @@ setInterval(() => {}, 10000);
         )
         .await;
         assert_eq!(timed_out["status"], "failed");
-        assert!(timed_out["result"].as_str().unwrap().contains("timed_out"));
+        assert!(
+            timed_out["result"]
+                .as_str()
+                .unwrap()
+                .contains("Command timed out"),
+            "{timed_out}"
+        );
         assert!(
             mentions(&timed_out, "stdout", "partial output"),
             "the timeout lost the output written before it: {timed_out}"
@@ -4565,26 +4726,33 @@ setInterval(() => {}, 10000);
             pipe.session.clone(),
             pipe.id.clone(),
         );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let waiting = std::thread::spawn(move || {
-            super::super::shell_input::execute(
+            let mut entered_tx = Some(entered_tx);
+            super::super::shell_input::capacity_barrier::install(Box::new(move |_| {
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.recv();
+                }
+            }));
+            let result = super::super::shell_input::execute(
                 &json!({"task_id":id,"data":"p".repeat(8 * 1024),"timeout":60000}),
                 &root,
                 &session,
-            )
-            .unwrap()
-        });
-        // Readiness: the blocked call holds the per-task stdin lock while the
-        // pipe has no room (proved by the fill timeouts above).
-        let deadline = std::time::Instant::now() + READINESS_DEADLINE;
-        while !lock_is_held(&pipe.directory) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the blocked write never took the task stdin lock"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            super::super::shell_input::capacity_barrier::clear();
+            result.unwrap()
+        });
+        // The lock can be held before the writer rechecks the owner. Wait for
+        // the actual full-pipe write before releasing the lease.
+        tokio::time::timeout(READINESS_DEADLINE, entered_rx)
+            .await
+            .expect("the write never reached the pipe-capacity wait")
+            .expect("the writer exited before waiting for pipe capacity");
         pipe.lose_owner();
         let started = std::time::Instant::now();
+        resume_tx.send(()).unwrap();
         let outcome = waiting.join().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),

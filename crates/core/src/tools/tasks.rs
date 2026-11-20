@@ -13,7 +13,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TodoWrite", "Replace the session's durable todo list.", json!({"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}}),vec!["todos"]),
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
         // `TaskOutput` is not advertised. Its dispatch alias remains below for
-        // old transcripts and is not discoverable through ToolSearch.
+        // old transcripts and is not discoverable through ToolLoad.
         ("TaskStop", "\n- Stops a running background task by its ID\n- Takes a task_id parameter identifying the task to stop\n- Stops a background shell together with its descendant processes; for other task records it marks the record cancelled\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n",json!({"task_id":{"description":"The ID of the background task to stop.","type":"string"},"shell_id":{"description":"Deprecated: use task_id instead","type":"string"}}),vec![]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
 }
@@ -308,7 +308,11 @@ fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
         from_tail,
         ..Default::default()
     };
-    super::bash_process::publish_snapshot([out_size, err_size], [stdout.len(), stderr.len()]);
+    super::bash_process::publish_snapshot(
+        [out_size, err_size],
+        [stdout.len(), stderr.len()],
+        || None,
+    );
     let id = job.id.clone();
     Ok(
         json!({"id":id,"task_id":job.id,"subject":job.title,"status":job.status,"stdout":stdout,"stderr":stderr,"exit_code":job.exit_code,"error":job.error}),
@@ -334,7 +338,7 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     )
     .ok()?;
     conn.query_row(
-        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC LIMIT 1",
+        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC, rowid DESC LIMIT 1",
         [&execution],
         |row| row.get(0),
     )
@@ -594,7 +598,7 @@ fn execute_at(name: &str, input: Value, path: &Path) -> Result<Value> {
 fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool) -> Result<Value> {
     // `TaskOutput` was folded into `TaskGet`. Old transcripts may still
     // dispatch it; it goes through the same validation, storage and session
-    // path and is not advertised or loadable through ToolSearch.
+    // path and is not advertised or loadable through ToolLoad.
     let name = if name == "TaskOutput" {
         "TaskGet"
     } else {
@@ -609,12 +613,14 @@ fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool
         super::output_page::PageRequest::parse(&input)?;
     }
     if !shell_owner {
+        let metadata = input.get("metadata");
         ensure!(
-            input
-                .get("metadata")
-                .and_then(|m| m.get("managed_shell"))
-                .is_none(),
+            metadata.and_then(|m| m.get("managed_shell")).is_none(),
             "managed_shell provenance is reserved for the shell process owner"
+        );
+        ensure!(
+            metadata.and_then(|m| m.get("monitor")).is_none(),
+            "monitor provenance is reserved for the Monitor process owner"
         );
     }
     // shell_id is the reference CLI's deprecated TaskStop alias.
@@ -768,6 +774,9 @@ fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool
                     input.get("status").is_none() && input.get("output").is_none(),
                     "Managed shell status/output/deletion are owned by the running process; use TaskStop to cancel"
                 );
+            }
+            if task["metadata"]["monitor"] == true {
+                validate_monitor_update(&task, &input, shell_owner)?;
             }
             if input["status"] == "deleted" {
                 let mut statement = tx.prepare("SELECT id,body FROM tasks WHERE id!=?1")?;
@@ -1017,6 +1026,47 @@ fn execute_at_owned(name: &str, mut input: Value, path: &Path, shell_owner: bool
     Ok(result)
 }
 
+/// Validate against the row read inside TaskUpdate's immediate transaction.
+fn validate_monitor_update(task: &Value, input: &Value, process_owner: bool) -> Result<()> {
+    let current = task["status"].as_str().context("Missing Monitor status")?;
+    let terminal = matches!(current, "completed" | "failed" | "cancelled");
+    if let Some(next) = input.get("status") {
+        let next = next.as_str().context("status must be a string")?;
+        if terminal {
+            ensure!(
+                next == current || (!process_owner && next == "deleted"),
+                "Terminal Monitor status {current} is final"
+            );
+        } else {
+            ensure!(
+                process_owner,
+                "Live Monitor status/deletion are owned by the process; use TaskStop to cancel"
+            );
+            ensure!(
+                matches!(
+                    (current, next),
+                    ("pending", "running" | "failed")
+                        | (
+                            "running" | "in_progress",
+                            "completed" | "failed" | "cancelled"
+                        )
+                ),
+                "Invalid Monitor transition from {current} to {next}"
+            );
+        }
+    }
+    if !process_owner && !terminal {
+        ensure!(
+            input
+                .get("metadata")
+                .and_then(|m| m.get("log_dir"))
+                .is_none(),
+            "Live Monitor log_dir is owned by the process"
+        );
+    }
+    Ok(())
+}
+
 fn validate_todo(todo: &Value) -> Result<()> {
     if todo["content"].as_str().is_none_or(|s| s.trim().is_empty())
         || !matches!(
@@ -1119,6 +1169,145 @@ mod tests {
             &session
         )
         .is_err());
+    }
+
+    #[test]
+    fn monitor_record_enforces_every_status_transition_for_each_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let monitor = execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"transition fixture","metadata":{"monitor":true}}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        let id = monitor["id"].as_str().unwrap();
+        let db = rusqlite::Connection::open(
+            root.path().join("tasks").join(format!("{session}.sqlite3")),
+        )
+        .unwrap();
+        let directory = root.path().join("shell-tasks").join(&session).join(id);
+        let destinations = [
+            "pending",
+            "running",
+            "in_progress",
+            "completed",
+            "failed",
+            "cancelled",
+            "deleted",
+            "stopped",
+            "exited",
+            "expired",
+            "flooded",
+            "renewed",
+            "unresponsive",
+            "unknown",
+        ];
+        // Seed each pre-image independently. This includes pre-guard records and
+        // ensures a broken incoming transition cannot hide a broken outgoing one.
+        let seed = |task: &Value| {
+            db.execute(
+                "INSERT OR REPLACE INTO tasks(id,body) VALUES(?1,?2)",
+                params![id, task.to_string()],
+            )
+            .unwrap();
+        };
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            // (stored status, ordinary TaskUpdate destinations, process-owner destinations)
+            ("pending", &[], &["running", "failed"]),
+            ("running", &[], &["completed", "failed", "cancelled"]),
+            ("in_progress", &[], &["completed", "failed", "cancelled"]),
+            ("completed", &["completed", "deleted"], &["completed"]),
+            ("failed", &["failed", "deleted"], &["failed"]),
+            ("cancelled", &["cancelled", "deleted"], &["cancelled"]),
+            ("absent", &[], &[]),
+        ];
+        for &(current, ordinary, owner) in cases {
+            let mut before = monitor.clone();
+            before["status"] = json!(current);
+            if current == "absent" {
+                db.execute("DELETE FROM tasks WHERE id=?1", [id]).unwrap();
+            } else {
+                seed(&before);
+            }
+
+            let stop =
+                execute_for_session("TaskStop", json!({"task_id":id}), root.path(), &session);
+            if current == "absent" {
+                assert!(stop.unwrap_err().to_string().contains("Task not found"));
+            } else {
+                let active = matches!(current, "pending" | "running" | "in_progress");
+                assert_eq!(stop.unwrap()["cancellation_requested"], active, "{current}");
+                assert_eq!(read_for_session(id, root.path(), &session).unwrap(), before);
+                let cancel = directory.join("cancel");
+                assert_eq!(cancel.exists(), active, "{current}");
+                if active {
+                    std::fs::remove_file(cancel).unwrap();
+                }
+            }
+
+            for (process_owner, allowed) in [(false, ordinary), (true, owner)] {
+                for next in destinations {
+                    if current != "absent" {
+                        seed(&before);
+                    }
+                    let input = json!({"id":id,"subject":"changed","status":next});
+                    let update = if process_owner {
+                        execute_for_shell_owner("TaskUpdate", input, root.path(), &session)
+                    } else {
+                        execute_for_session("TaskUpdate", input, root.path(), &session)
+                    };
+                    let case = format!("owner={process_owner}, {current} -> {next}");
+                    assert_eq!(
+                        update.is_ok(),
+                        allowed.contains(&next),
+                        "{case}: {update:?}"
+                    );
+                    let stored = read_for_session(id, root.path(), &session);
+                    if current == "absent" || (next == "deleted" && update.is_ok()) {
+                        assert!(
+                            stored.unwrap_err().to_string().contains("Task not found"),
+                            "{case}"
+                        );
+                    } else if update.is_ok() {
+                        let task = stored.unwrap();
+                        assert_eq!(task["status"], next, "{case}");
+                        assert_eq!(task["subject"], "changed", "{case}");
+                    } else {
+                        assert_eq!(stored.unwrap(), before, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_provenance_cannot_be_forged() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = execute_for_session(
+            "TaskCreate",
+            json!({"subject":"ordinary task"}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        for (name, input) in [
+            (
+                "TaskCreate",
+                json!({"subject":"fake monitor","metadata":{"monitor":true}}),
+            ),
+            (
+                "TaskUpdate",
+                json!({"id":task["id"],"metadata":{"monitor":true}}),
+            ),
+        ] {
+            let error = execute_for_session(name, input, root.path(), &session).unwrap_err();
+            assert!(error.to_string().contains("monitor provenance"), "{error}");
+        }
+        let stored = read_for_session(task["id"].as_str().unwrap(), root.path(), &session).unwrap();
+        assert!(stored["metadata"].get("monitor").is_none());
     }
 
     #[test]
@@ -1900,7 +2089,7 @@ mod tests {
             assert_eq!(bytes, [0, size]);
             assert_eq!(widths[1].raw_bytes(text.len()), size);
             assert_eq!(
-                crate::performance::command_output::qualifies(bytes, false),
+                crate::performance::command_output::qualifies(bytes),
                 size >= 12_000
             );
         }

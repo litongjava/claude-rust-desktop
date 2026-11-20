@@ -244,7 +244,7 @@ fn session_messages(
     let messages = store.db().with_conn(|conn| -> Result<Vec<message_repo::MessageRow>> {
         let mut statement = conn.prepare(
             "SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order \
-             FROM messages WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order LIMIT ?3",
+             FROM messages WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order, rowid LIMIT ?3",
         )?;
         let rows = statement.query_map(
             rusqlite::params![session, cursor as i64, (limit + 1) as i64],

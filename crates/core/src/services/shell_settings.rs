@@ -2,7 +2,20 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+/// Bumped whenever shell settings are saved, so cached tool descriptions can
+/// be rebuilt without watching the settings file.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current settings generation; stable until [`save`] succeeds.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -79,6 +92,7 @@ pub(crate) fn save_document(root: &Path, value: &Value) -> Result<()> {
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.as_file().sync_all()?;
     file.persist(root.join("settings.json"))?;
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -294,6 +308,18 @@ impl ResolvedShell {
     }
 }
 
+/// The program the Bash tool would launch for this data directory; None when
+/// no shell resolves. Shares the executor's settings and resolution.
+pub fn resolve_tool_program_in(root: &Path) -> Option<String> {
+    load(root).ok()?.resolve(None, false).ok().map(|shell| shell.program)
+}
+
+/// The Bash tool's program for this process, from the default data directory
+/// the executor falls back to outside a scoped session.
+pub fn resolved_tool_program() -> Option<String> {
+    resolve_tool_program_in(&crate::runtime::resolve_default_data_dir().ok()?)
+}
+
 pub fn inspect(root: &Path) -> Result<Value> {
     let settings = load(root)?;
     let describe = |terminal| match settings.resolve(None, terminal) {
@@ -317,7 +343,9 @@ mod tests {
             r#"{"hooks":{"sentinel":true},"sandbox":{"enabled":true}}"#,
         )
         .unwrap();
+        let before = generation();
         set(root.path(), "toolDefault", "pwsh").unwrap();
+        assert!(generation() > before);
         assert_eq!(load(root.path()).unwrap().tool_default, "pwsh");
         assert_eq!(document(root.path()).unwrap()["hooks"]["sentinel"], true);
         let original = std::fs::read(&file).unwrap();
@@ -328,6 +356,29 @@ mod tests {
         std::fs::write(&file, "{broken").unwrap();
         assert!(set(root.path(), "toolDefault", "bash").is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn tool_program_follows_the_configured_bash_path() {
+        // The executor lets DEEPSEEK_CODE_BASH_PATH override settings; nothing to
+        // assert here when the test environment sets it.
+        if std::env::var_os("DEEPSEEK_CODE_BASH_PATH").is_some() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bash = root.path().join("bash.exe");
+        std::fs::write(&bash, "").unwrap();
+        let settings = ShellSettings {
+            bash_path: Some(bash.to_string_lossy().into()),
+            ..Default::default()
+        };
+        save(root.path(), &settings).unwrap();
+        assert_eq!(
+            resolve_tool_program_in(root.path()),
+            Some(bash.to_string_lossy().into())
+        );
+        std::fs::remove_file(&bash).unwrap();
+        assert_eq!(resolve_tool_program_in(root.path()), None);
     }
 
     #[test]

@@ -200,10 +200,7 @@ fn generated_two_stream_captures_keep_raw_gate_counts_and_unique_excerpt_positio
             _ => (100_000, 300 + rng.below(6000)),
         };
         let (result, base) = render_capture(dir.path(), [&streams[0], &streams[1]], cap, tool, 0);
-        let cut = streams
-            .iter()
-            .any(|s| s.len() > cap || String::from_utf8_lossy(s).len() > tool);
-        if !cut && size < 12_000 {
+        if size < 12_000 {
             assert_eq!(result, base, "seed {seed}");
             continue;
         }
@@ -412,6 +409,16 @@ fn reviewer_capture_gaps_cross_stream_frames_and_conflicting_reporters_only_quot
     let dir = tempfile::tempdir().unwrap();
     for (name, raw) in cases {
         let result = command_preview("Bash", &raw.to_string(), Some(dir.path()), None, true);
+        // These old public tool-cut records have no sidecar proving the raw
+        // gate was reached. Keep main's preview byte-for-byte in that case.
+        if raw["stdout"].as_str().unwrap().len() + raw["stderr"].as_str().unwrap().len() < 12_000 {
+            assert_eq!(
+                result,
+                command_preview("Bash", &raw.to_string(), Some(dir.path()), None, false),
+                "{name}"
+            );
+            continue;
+        }
         let (body, summary) = result.split_once("Command output summary").unwrap();
         check_factual_summary(
             summary,

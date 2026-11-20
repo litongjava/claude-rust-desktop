@@ -23,7 +23,7 @@ beforeEach(() => {
     default_system_prompt: 'BUILT IN PROMPT',
     builtin_tools: [
       builtin('Read', 'Reads a file', true, true),
-      builtin('ToolSearch', 'Finds tools', true, true),
+      builtin('ToolLoad', 'Finds tools', true, true),
       builtin('Write', 'Writes a file', false, false),
     ],
   } as never);
@@ -101,11 +101,11 @@ describe('tool settings page', () => {
     await waitFor(() => expect(saved().tool_loading).toEqual({ Write: { enabled: false, on_demand: false } }));
   });
 
-  it('warns when ToolSearch can no longer discover tools', async () => {
+  it('warns when ToolLoad can no longer discover tools', async () => {
     render(<AgentCustomization section="tools" />);
-    expect(screen.queryByText(zh.agentSettings.toolSearchDisabledHint)).not.toBeInTheDocument();
-    fireEvent.click(await screen.findByLabelText(named(zh.agentSettings.enableTool, 'ToolSearch')));
-    expect(screen.getByText(zh.agentSettings.toolSearchDisabledHint)).toBeInTheDocument();
+    expect(screen.queryByText(zh.agentSettings.toolLoadDisabledHint)).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByLabelText(named(zh.agentSettings.enableTool, 'ToolLoad')));
+    expect(screen.getByText(zh.agentSettings.toolLoadDisabledHint)).toBeInTheDocument();
   });
 
   it('shows the saved state of a legacy disabled tool', async () => {
@@ -116,7 +116,7 @@ describe('tool settings page', () => {
     } as never);
     render(<AgentCustomization section="tools" />);
     expect(await screen.findByLabelText(named(zh.agentSettings.enableTool, 'Write'))).not.toBeChecked();
-    // Discovery stays on, so the tool is reachable through ToolSearch.
+    // Discovery stays on, so the tool is reachable through ToolLoad.
     expect(screen.getByLabelText(named(zh.agentSettings.onDemandTool, 'Write'))).toBeChecked();
   });
 

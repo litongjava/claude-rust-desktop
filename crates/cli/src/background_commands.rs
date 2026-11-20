@@ -1707,12 +1707,12 @@ pub(crate) fn agent_transcript(
         ));
     }
     let saved = context.db.with_conn(|conn| -> anyhow::Result<()> {
-        let mut statement = conn.prepare("SELECT id,role,substr(content,-65536) FROM (SELECT id,role,content,sort_order FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC LIMIT 20) ORDER BY sort_order")?;
+        let mut statement = conn.prepare("SELECT id,role,substr(content,-65536) FROM (SELECT id,role,content,sort_order,rowid AS sequence FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC, rowid DESC LIMIT 20) ORDER BY sort_order,sequence")?;
         let messages = statement.query_map([id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
         for (message_id, role, content) in messages {
             if role == "user" { transcript.user(&content); continue; }
             if role != "assistant" { continue; }
-            let mut statement = conn.prepare("SELECT name,substr(input,1,8192),substr(output,-16384),is_error FROM (SELECT name,input,output,is_error,sort_order FROM tool_calls WHERE message_id=?1 ORDER BY sort_order DESC LIMIT 30) ORDER BY sort_order")?;
+            let mut statement = conn.prepare("SELECT name,substr(input,1,8192),substr(output,-16384),is_error FROM (SELECT name,input,output,is_error,sort_order,rowid AS sequence FROM tool_calls WHERE message_id=?1 ORDER BY sort_order DESC, rowid DESC LIMIT 30) ORDER BY sort_order,sequence")?;
             for row in statement.query_map([message_id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,Option<String>>(2)?, row.get::<_,bool>(3)?)))? {
                 let (name, input, output, failed) = row?;
                 let input = input.and_then(|input| serde_json::from_str(&input).ok()).unwrap_or_default();

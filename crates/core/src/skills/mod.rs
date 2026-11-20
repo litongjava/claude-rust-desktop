@@ -145,14 +145,16 @@ impl SkillsManager {
         skills.retain(|skill| seen.insert(skill.id.clone()));
         skills.reverse();
 
-        // The embedded skill-creator is not written to disk. A user copy with
-        // the same name wins; otherwise the manager lists the embedded one so
-        // `dcl skills` and the Customize page show exactly one skill-creator.
-        if !skills
-            .iter()
-            .any(|skill| skill.name == skill_creator::NAME)
-        {
-            skills.push(skill_creator::manager_skill());
+        // Embedded skills have no disk copy. Preserve the existing precedence
+        // of a same-name skill found by the inventory scan.
+        let embedded: [(&str, fn() -> Skill); 2] = [
+            (skill_creator::NAME, skill_creator::manager_skill),
+            (bundled::TASK_TEMPLATE_NAME, bundled::task_template_skill),
+        ];
+        for (name, make_skill) in embedded {
+            if !skills.iter().any(|skill| skill.name == name) {
+                skills.push(make_skill());
+            }
         }
 
         Ok(skills)
@@ -447,9 +449,19 @@ impl SkillsManager {
     }
 
     pub fn get_skill_content(&self, skill_id: &str, file_path: &str) -> Result<String> {
-        if skill_id == skill_creator::EMBEDDED_ID {
-            let bytes = skill_creator::embedded_file(file_path)?;
-            return Ok(String::from_utf8_lossy(bytes).into_owned());
+        match skill_id {
+            skill_creator::EMBEDDED_ID => {
+                let bytes = skill_creator::embedded_file(file_path)?;
+                return Ok(String::from_utf8_lossy(bytes).into_owned());
+            }
+            bundled::TASK_TEMPLATE_ID => {
+                anyhow::ensure!(
+                    file_path == "SKILL.md",
+                    "Bundled skill file not found: {file_path}"
+                );
+                return Ok(bundled::TASK_TEMPLATE_DOCUMENT.to_owned());
+            }
+            _ => {}
         }
         let skill_path = self.find_skill_path(skill_id)?;
         let full_path = editing::relative_file(&skill_path, file_path)?;
@@ -494,10 +506,9 @@ impl SkillsManager {
     }
 
     pub fn update_skill(&self, skill_id: &str, updates: HashMap<String, serde_json::Value>) -> Result<()> {
-        anyhow::ensure!(
-            skill_id != skill_creator::EMBEDDED_ID,
-            "The bundled skill-creator is read-only; create a user skill to customize it"
-        );
+        if let Some(name) = Self::embedded_skill_name(skill_id) {
+            anyhow::bail!("The bundled {name} is read-only; create a user skill to customize it");
+        }
         let skill_path = self.find_skill_path(skill_id)?;
         let skill_md_path = skill_path.join("SKILL.md");
 
@@ -506,6 +517,14 @@ impl SkillsManager {
         }
 
         editing::edit(&skill_md_path, &updates)
+    }
+
+    fn embedded_skill_name(skill_id: &str) -> Option<&'static str> {
+        match skill_id {
+            skill_creator::EMBEDDED_ID => Some(skill_creator::NAME),
+            bundled::TASK_TEMPLATE_ID => Some(bundled::TASK_TEMPLATE_NAME),
+            _ => None,
+        }
     }
 
     fn find_skill_path(&self, skill_id: &str) -> Result<PathBuf> {
@@ -529,10 +548,9 @@ impl SkillsManager {
     }
 
     pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
-        anyhow::ensure!(
-            skill_id != skill_creator::EMBEDDED_ID,
-            "The bundled skill-creator is read-only"
-        );
+        if let Some(name) = Self::embedded_skill_name(skill_id) {
+            anyhow::bail!("The bundled {name} is read-only");
+        }
         let skill_path = self.find_skill_path(skill_id)?;
         std::fs::remove_dir_all(skill_path)?;
         Ok(())
@@ -580,10 +598,9 @@ impl SkillsManager {
     }
 
     pub async fn toggle_skill(&self, skill_id: &str) -> Result<bool> {
-        anyhow::ensure!(
-            skill_id != skill_creator::EMBEDDED_ID,
-            "The bundled skill-creator is read-only and stays enabled"
-        );
+        if let Some(name) = Self::embedded_skill_name(skill_id) {
+            anyhow::bail!("The bundled {name} is read-only and stays enabled");
+        }
         let skills = self.load_skills().await?;
         let skill = skills.into_iter()
             .find(|s| s.id == skill_id)
