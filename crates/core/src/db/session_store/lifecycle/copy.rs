@@ -388,6 +388,9 @@ impl Copier<'_> {
         let message = Some(("message_id", "message"));
         self.rows("message_turns", message, None, &[("turn_id", "turn")])?;
         self.rows("tool_calls", message, Some(("id", "tool")), &[])?;
+        for table in ["message_metadata", "approved_plan_boundaries"] {
+            self.rows(table, message, None, &[])?;
+        }
         let tool = Some(("tool_call_id", "tool"));
         self.rows(
             "tool_call_origins",
@@ -406,6 +409,12 @@ impl Copier<'_> {
             self.rows(table, message, Some(("id", table)), &[])?
         }
         self.rows("model_requests", message, Some(("id", "request")), &[])?;
+        self.rows(
+            "request_metadata",
+            Some(("request_id", "request")),
+            None,
+            &[],
+        )?;
         // Forward retry references may point into a later selected trajectory.
         // Inspect the JSON only after checking its owning message.
         let mut source = self

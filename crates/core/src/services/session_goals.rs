@@ -87,19 +87,11 @@ pub fn revision_conn(conn: &rusqlite::Connection, session: &str) -> Result<u64> 
 pub fn active(db: &DbManager, session: &str) -> Result<Option<Goal>> {
     // Read without acquiring a write transaction: evaluator polls this while
     // another process may be clearing the goal.
-    db.with_conn(|conn| -> Result<Option<Goal>> {
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [format!("session.goal.{session}")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(json
-            .map(|s| serde_json::from_str::<State>(&s))
-            .transpose()?
-            .and_then(|s| s.active))
-    })?
+    db.with_conn(|conn| active_conn(conn, session))?
+}
+
+pub(crate) fn active_conn(conn: &rusqlite::Connection, session: &str) -> Result<Option<Goal>> {
+    Ok(read_conn(conn, session)?.active)
 }
 
 pub fn status(db: &DbManager, session: &str) -> Result<Option<Goal>> {
@@ -173,10 +165,16 @@ fn new_goal(condition: &str) -> Result<Goal> {
 }
 
 pub fn clear(db: &DbManager, session: &str) -> Result<bool> {
-    modify(db, session, |s| {
-        s.revision = s.revision.saturating_add(1);
-        s.active.take().is_some()
-    })
+    modify(db, session, clear_state)
+}
+
+fn clear_state(s: &mut State) -> bool {
+    s.revision = s.revision.saturating_add(1);
+    s.active.take().is_some()
+}
+
+pub(crate) fn clear_conn(conn: &rusqlite::Connection, session: &str) -> Result<bool> {
+    modify_conn(conn, session, |_, state| Ok(clear_state(state)))
 }
 
 /// Host-only boundary for an explicit human cancellation. Persist revocation

@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub id: String,
     pub condition: String,
@@ -25,21 +25,27 @@ pub struct Proposal {
     #[serde(default)]
     source_job: Option<String>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
 struct Presence {
     id: String,
     touched_ms: i64,
 }
-#[derive(Default, Serialize, Deserialize)]
-struct State {
+#[derive(PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProposalState {
     frontend: Option<Presence>,
     pending: Option<Proposal>,
     declined: Vec<String>,
 }
+type State = ProposalState;
+impl ProposalState {
+    pub fn pending(&self) -> Option<&Proposal> {
+        self.pending.as_ref()
+    }
+}
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
-fn read(conn: &Connection, session: &str) -> Result<State> {
+pub(crate) fn read(conn: &Connection, session: &str) -> Result<ProposalState> {
     let value: Option<String> = conn
         .query_row(
             "SELECT value FROM peripheral_settings WHERE key=?1",
@@ -63,10 +69,15 @@ fn update_conn<T>(conn: &Connection, session: &str, f: impl FnOnce(&Connection, 
     let tx = crate::db::write_transaction(conn)?;
     let mut state = read(&tx, session)?;
     let result = f(&tx, &mut state)?;
-    tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("session.goal-proposals.{session}"), serde_json::to_string(&state)?])?;
+    save_state(&tx, session, &state)?;
     tx.commit()?;
     Ok(result)
 }
+pub(crate) fn save_state(conn: &Connection, session: &str, state: &ProposalState) -> Result<()> {
+    conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value", [format!("session.goal-proposals.{session}"), serde_json::to_string(state)?])?;
+    Ok(())
+}
+
 fn live(frontend: &Presence) -> bool {
     now().saturating_sub(frontend.touched_ms) < 5_000
 }
