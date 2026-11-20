@@ -32,19 +32,28 @@ pub(super) fn projection(c: &Connection) -> Result<Projection> {
         (SELECT value FROM peripheral_settings WHERE key='git.branch'), usage.*
         FROM manifest CROSS JOIN (SELECT count(*),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),
             coalesce(sum(coalesce(total_tokens,coalesce(input_tokens,0)+coalesce(output_tokens,0))),0) FROM model_requests) usage
-        WHERE singleton=1", [], |r| {
+        WHERE singleton=1", [], Projection::from_row)?)
+}
+impl Projection {
+    pub(super) fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Projection {
             revision: r.get(0)?,
             count: r.get(1)?,
             activity: r.get(2)?,
             status: r.get(3)?,
-            first_prompt: r.get::<_, Option<String>>(4)?.as_deref().and_then(crate::db::conversation_repo::prompt_title),
+            first_prompt: r
+                .get::<_, Option<String>>(4)?
+                .as_deref()
+                .and_then(crate::db::conversation_repo::prompt_title),
             latest_prompt: r.get(5)?,
             transcript_bytes: r.get(6)?,
-            git_branch: r.get(7)?, request_count: r.get(8)?, input_tokens: r.get(9)?,
-            output_tokens: r.get(10)?, total_tokens: r.get(11)?,
+            git_branch: r.get(7)?,
+            request_count: r.get(8)?,
+            input_tokens: r.get(9)?,
+            output_tokens: r.get(10)?,
+            total_tokens: r.get(11)?,
         })
-    })?)
+    }
 }
 
 // Compare instants including offsets and sub-millisecond precision. Keep the

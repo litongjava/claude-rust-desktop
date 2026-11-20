@@ -150,6 +150,15 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
     verify_version(conn, kind, schema_version(kind))
 }
 
+pub(super) fn verify_supported_session(c: &Connection) -> Result<()> {
+    let version: i32 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        (1..=SESSION_VERSION).contains(&version),
+        "Unsupported session schema version"
+    );
+    verify_version(c, SESSION, version)
+}
+
 fn additions(kind: i32) -> &'static str {
     if kind == GLOBAL {
         include_str!("delivery.sql")
@@ -267,19 +276,35 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
         conn.prepare("SELECT sender_incarnation FROM session_inbox LIMIT 0")?;
     }
     let state: &[(&str, &str)] = if kind == GLOBAL && expected >= 4 {
-        &[("global_settings", "domain name value"),
-          ("conversations", "request_count input_tokens output_tokens total_tokens")]
+        &[
+            ("global_settings", "domain name value"),
+            (
+                "conversations",
+                "request_count input_tokens output_tokens total_tokens",
+            ),
+        ]
     } else if kind == SESSION && expected >= 3 {
         let triggers: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger'
             AND name IN ('context_search_messages_insert','context_search_messages_update','context_search_messages_delete',
                          'context_search_tool_calls_insert','context_search_tool_calls_update','context_search_tool_calls_delete')", [], |r|r.get(0))?;
         ensure!(triggers == 6, "Missing session search trigger");
-        &[("peripheral_settings","key value"),("file_read_stamps","path modified_ns size"),
-          ("compaction_request","singleton id keep"),("compaction_checkpoint","fingerprint request_key summary"),
-          ("approved_plan_boundaries","message_id"),("message_metadata","message_id value"),("request_metadata","request_id value"),
-          ("context_search_sources","kind id owner sort_order sequence label stamp boundary size chunked"),
-          ("context_search_chunks","kind id part body")]
-    } else { &[] };
+        &[
+            ("peripheral_settings", "key value"),
+            ("file_read_stamps", "path modified_ns size"),
+            ("compaction_request", "singleton id keep"),
+            ("compaction_checkpoint", "fingerprint request_key summary"),
+            ("approved_plan_boundaries", "message_id"),
+            ("message_metadata", "message_id value"),
+            ("request_metadata", "request_id value"),
+            (
+                "context_search_sources",
+                "kind id owner sort_order sequence label stamp boundary size chunked",
+            ),
+            ("context_search_chunks", "kind id part body"),
+        ]
+    } else {
+        &[]
+    };
     let mut columns = conn.prepare_cached(
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
@@ -543,6 +568,14 @@ static AVAILABLE: Mutex<usize> = Mutex::new(16);
 static RELEASED: Condvar = Condvar::new();
 pub(super) struct Permits(usize);
 impl Permits {
+    pub(super) fn try_one() -> Option<Self> {
+        let mut free = AVAILABLE.lock().unwrap();
+        if *free == 0 {
+            return None;
+        }
+        *free -= 1;
+        Some(Self(1))
+    }
     pub(super) fn take(count: usize) -> Self {
         let mut free = RELEASED
             .wait_while(AVAILABLE.lock().unwrap(), |free| *free < count)

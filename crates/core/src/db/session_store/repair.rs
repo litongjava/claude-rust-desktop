@@ -79,17 +79,16 @@ impl SessionDb {
         }
         self.check_directory()?;
         let path = self.stores.sessions().join(&self.key).join("session.db");
-        let old = {
-            let _permit = Permits::take(1);
-            layout::needs_upgrade(&path, SESSION)?
+        let Some(permit) = Permits::try_one() else {
+            return Ok(());
         };
+        let old = layout::needs_upgrade(&path, SESSION)?;
         if old {
             file.unlock()?;
             if file.try_lock().is_err() {
                 return Ok(());
             }
             self.check_directory()?;
-            let _permit = Permits::take(1);
             if layout::needs_upgrade(&path, SESSION)? {
                 let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 verify_manifest(
@@ -102,17 +101,17 @@ impl SessionDb {
                 layout::upgrade(&path, SESSION)?;
             }
         }
-        self.project_current()
+        self.project_current(permit)
     }
 
     pub(super) fn try_project_current(&self) {
-        if let Err(error) = self.project_current() {
+        if let Err(error) = self.project_current(Permits::take(1)) {
             tracing::debug!(%error,session=%self.id,"Directory projection pending");
         }
     }
 
     // Caller holds the shared or exclusive lifecycle lock.
-    fn project_current(&self) -> Result<()> {
+    fn project_current(&self, permit: Permits) -> Result<()> {
         let global = self.stores.global();
         let published: i64 = global.read(|c| {
             Ok(c.query_row(
@@ -121,15 +120,16 @@ impl SessionDb {
                 |r| r.get(0),
             )?)
         })?;
-        let snapshot = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
-            let tx = c.transaction()?;
-            let revision: i64 =
-                tx.query_row("SELECT content_revision FROM manifest", [], |r| r.get(0))?;
-            if revision <= published {
-                return Ok(None);
-            }
-            Ok(Some(history::projection(&tx)?))
-        })?;
+        let snapshot =
+            self.connection_with_permit(permit, OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+                let tx = c.transaction()?;
+                let revision: i64 =
+                    tx.query_row("SELECT content_revision FROM manifest", [], |r| r.get(0))?;
+                if revision <= published {
+                    return Ok(None);
+                }
+                Ok(Some(history::projection(&tx)?))
+            })?;
         if let Some(p) = snapshot {
             global.project(&self.id, &self.incarnation, &p)?;
         }

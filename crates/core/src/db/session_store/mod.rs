@@ -229,7 +229,14 @@ impl SessionDb {
         mode: OpenFlags,
         body: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
-        let _permit = Permits::take(1);
+        self.connection_with_permit(Permits::take(1), mode, body)
+    }
+    fn connection_with_permit<T>(
+        &self,
+        _permit: Permits,
+        mode: OpenFlags,
+        body: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = layout::open(
             &self.stores.sessions().join(&self.key).join("session.db"),
             mode,
@@ -286,7 +293,10 @@ impl SessionDb {
                 if changed {
                     history::advance(tx)?;
                     if writer.2.get() || !tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_turns WHERE status='running')",[],|r|r.get::<_,bool>(0))? {
-                        summary=Some(history::projection(tx)?);
+                        match history::projection(tx) {
+                            Ok(projection) => summary = Some(projection),
+                            Err(error) => tracing::warn!(%error, session=%self.id, "Directory summary could not be computed"),
+                        }
                     }
                 }
                 Ok((result,summary))

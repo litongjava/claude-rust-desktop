@@ -881,7 +881,7 @@ impl Stores {
                     fs::copy(&path, &copy)?;
                     fs::copy(wal, scratch.path().join("session.db-wal"))?;
                     let conn = layout::open(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                    layout::verify(&conn, SESSION)?;
+                    layout::verify_supported_session(&conn)?;
                     identity(&conn)?;
                     drop(conn);
                     scratch.close()?;
@@ -903,7 +903,7 @@ impl Stores {
             identity(&probe)?;
             drop(probe);
             let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            layout::verify(&conn, SESSION)?;
+            layout::verify_supported_session(&conn)?;
             identity(&conn)
         };
         if let Err(error) = inspect() {

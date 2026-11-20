@@ -118,10 +118,11 @@ impl GlobalDb {
             .optional()?)
         })
     }
-    pub fn conversation(
+    pub(super) fn read_directory_row<T>(
         &self,
         id: &str,
-    ) -> Result<Option<crate::db::conversation_repo::ConversationRow>> {
+        read: impl FnOnce(&Connection) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         let key = layout::storage_key(id)?;
         let stores = super::Stores {
             root: self.root.upgrade().expect("global belongs to a live root"),
@@ -130,7 +131,13 @@ impl GlobalDb {
         let Some(_locks) = stores.resolved_key(&key)? else {
             return Ok(None);
         };
-        self.read(|conn| {
+        self.read(read)
+    }
+    pub fn conversation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::db::conversation_repo::ConversationRow>> {
+        self.read_directory_row(id, |conn| {
             let snapshot = conn.unchecked_transaction()?;
             let mut row = crate::db::conversation_repo::conversation_metadata(&snapshot, id)?;
             if let Some(conversation) = row.as_mut().filter(|r| {
