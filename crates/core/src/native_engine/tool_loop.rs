@@ -214,6 +214,58 @@ pub enum EngineEvent {
     },
 }
 
+/// Tools the model loaded with ToolLoad, in the order they were first loaded.
+/// Membership is a set so a repeated load neither moves a tool nor advertises
+/// it twice; iteration follows the first load, which is also the order their
+/// definitions are appended to the next request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LoadedTools {
+    order: Vec<String>,
+    names: std::collections::BTreeSet<String>,
+}
+
+impl LoadedTools {
+    fn insert(&mut self, name: String) -> bool {
+        if self.names.insert(name.clone()) {
+            self.order.push(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.order.iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        for name in names {
+            self.insert(name);
+        }
+    }
+}
+
+// The membership set is what the loading policy consults; order never widens it.
+impl std::ops::Deref for LoadedTools {
+    type Target = std::collections::BTreeSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
 pub struct ToolLoopExecutor {
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
@@ -309,8 +361,9 @@ pub struct ToolLoopExecutor {
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
-    /// Built-in tools the model loaded with ToolLoad in this session.
-    loaded_tools: std::collections::BTreeSet<String>,
+    /// Built-in tools the model loaded with ToolLoad in this session, in load
+    /// order.
+    loaded_tools: LoadedTools,
     /// The names of the request the model is answering, or `None` before the
     /// first one, so a tool loaded in a batch is callable only from the next.
     exposed_tools: Option<std::collections::HashSet<String>>,
@@ -2033,7 +2086,7 @@ impl ToolLoopExecutor {
             Some(is_search)
         }
 
-        let mut loaded = std::collections::BTreeSet::new();
+        let mut loaded = LoadedTools::default();
         let mut calls: HashMap<String, Call> = HashMap::new();
         for message in &self.messages {
             match message["role"].as_str().unwrap_or_default() {
@@ -2107,7 +2160,7 @@ impl ToolLoopExecutor {
         }
         // Added, not replaced: a later turn on this same executor keeps what it
         // already learned, and the settings still decide what is reachable.
-        self.loaded_tools.extend(loaded);
+        self.loaded_tools.extend(loaded.order);
     }
 
     /// Desktop may submit display-only history. The durable tool row binds an
@@ -2124,10 +2177,11 @@ impl ToolLoopExecutor {
                  WHERE m.conversation_id=?1 AND m.role='assistant'
                    AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
                    AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
-                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)",
+                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)
+                 ORDER BY m.sort_order ASC, t.sort_order ASC",
                 )?;
                 let results = query.query_map([session], |row| row.get::<_, String>(0))?;
-                let mut loaded = std::collections::BTreeSet::new();
+                let mut loaded = LoadedTools::default();
                 for result in results {
                     Self::absorb_loaded(&result?, &mut loaded);
                 }
@@ -2137,13 +2191,13 @@ impl ToolLoopExecutor {
             .map_err(|error| {
                 crate::db::write_boundary_context("restore loaded tools", session, started, error)
             })?;
-        self.loaded_tools.extend(loaded);
+        self.loaded_tools.extend(loaded.order);
         Ok(())
     }
 
     /// Reads a stored ToolLoad result. Only the structured marker of a
     /// successful search is accepted.
-    fn absorb_loaded(text: &str, loaded: &mut std::collections::BTreeSet<String>) {
+    fn absorb_loaded(text: &str, loaded: &mut LoadedTools) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -2410,7 +2464,7 @@ impl ToolLoopExecutor {
         let mut content = Vec::new();
         if !names.is_empty() {
             content.push(format!(
-                "Loaded {}. Call these tools starting with the next model request.",
+                "Loaded {}. Available from the next request.",
                 names.join(", ")
             ));
         }
@@ -2813,9 +2867,10 @@ impl ToolLoopExecutor {
     }
 
     /// Treat these built-ins as already loaded, as a resumed session or a
-    /// durable job must. The loading gate is never widened beyond this set.
-    pub(super) fn with_loaded_tools(mut self, loaded: std::collections::BTreeSet<String>) -> Self {
-        self.loaded_tools = loaded;
+    /// durable job must. The loading gate is never widened beyond this set, and
+    /// the given order is the order their definitions are sent in.
+    pub(super) fn with_loaded_tools(mut self, loaded: impl IntoIterator<Item = String>) -> Self {
+        self.loaded_tools.extend(loaded);
         self
     }
 
@@ -3286,14 +3341,51 @@ impl ToolLoopExecutor {
                 }
             }
         }
-        // A rediscovery or registry reordering must not rewrite the resident
-        // tool list: the same session always sends the same order.
-        tools.sort_by(|a, b| {
+        // The resident tools keep one alphabetical order that a rediscovery or
+        // registry reordering cannot rewrite. Tools that exist only because
+        // ToolLoad loaded them follow in load order, so loading one never moves
+        // a resident tool or rewrites the request prefix the provider cached.
+        let mut resident = Vec::with_capacity(tools.len());
+        let mut deferred = Vec::new();
+        for tool in tools {
+            let resident_without_loading = match crate::mcp::states::server_of(&tool.name) {
+                Some(server) => {
+                    crate::mcp::states::effective(&self.mcp_states, server) != McpState::OnDemand
+                }
+                // The user's own tools and the Super Agent tools never go
+                // through ToolLoad, so they count as resident whenever they
+                // reached this list.
+                None if !self.builtin_names().contains(&tool.name) => true,
+                None => {
+                    let loading = customization.loading(&tool.name);
+                    loading.enabled || (restricted && loading.on_demand && allowed(&tool.name))
+                }
+            };
+            if resident_without_loading {
+                resident.push(tool);
+            } else {
+                deferred.push(tool);
+            }
+        }
+        resident.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
                 .then_with(|| a.description.cmp(&b.description))
         });
-        Ok(tools)
+        for name in self.loaded_tools.iter() {
+            if let Some(index) = deferred.iter().position(|tool| &tool.name == name) {
+                resident.push(deferred.remove(index));
+            }
+        }
+        // A host can mark a tool loaded without a load order (a durable job or
+        // a test); those definitions stay deterministic after the ordered ones.
+        deferred.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.description.cmp(&b.description))
+        });
+        resident.extend(deferred);
+        Ok(resident)
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -3763,9 +3855,11 @@ impl ToolLoopExecutor {
         }
         Box::pin(self.refresh_mcp_tools()).await?;
         // A tool loaded earlier in this session stays available; the current
-        // settings still decide whether it may come back.
-        self.restore_loaded_tools();
+        // settings still decide whether it may come back. The durable rows are
+        // read first so their load order wins over a display-only message
+        // window that may start in the middle of the session.
         self.restore_persisted_loaded_tools()?;
+        self.restore_loaded_tools();
         self.exposed_tools = None;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
