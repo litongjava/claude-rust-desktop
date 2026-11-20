@@ -195,12 +195,27 @@ impl Copier<'_> {
             .execute("INSERT INTO copied_ids VALUES(?1,?2,?3)", [kind, old, &id])?;
         Ok(id)
     }
-    fn remap_blocks(&self, blocks: &mut Json) -> Result<()> {
+    fn remap_blocks(&self, message: &str, blocks: &mut Json) -> Result<()> {
         if let Some(items) = blocks.as_array_mut() {
             for block in items {
                 for key in ["id", "tool_use_id", "toolCallId", "parentToolCallId"] {
                     if let Some(old) = block[key].as_str() {
-                        if let Some(new) = self.mapped("tool", old)? {
+                        // Request traces carry the provider ID. Streamed history qualifies
+                        // it with the assistant message, and providers may reuse it.
+                        let occurrence: Option<String> = self
+                            .src
+                            .query_row(
+                                "SELECT id FROM tool_calls WHERE message_id=?1 AND id IN (?2,?3)
+                             ORDER BY id=?3 DESC LIMIT 1",
+                                params![message, old, format!("{message}:{old}")],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        if let Some(new) = occurrence
+                            .map(|id| self.mapped("tool", &id))
+                            .transpose()?
+                            .flatten()
+                        {
                             block[key] = Json::String(new)
                         }
                     }
@@ -267,7 +282,7 @@ impl Copier<'_> {
             if table == "model_requests" {
                 let i = idx("response_blocks_json")?;
                 let mut blocks: Json = serde_json::from_str(&row.get::<_, String>(i)?)?;
-                self.remap_blocks(&mut blocks)?;
+                self.remap_blocks(&row.get::<_, String>(idx("message_id")?)?, &mut blocks)?;
                 values[i] = Value::Text(blocks.to_string());
             }
             if table == "session_permission_authority" {
@@ -400,7 +415,7 @@ impl Copier<'_> {
                         request["id"] = Json::String(self.assign("request", id)?);
                     }
                     if let Some(blocks) = request.get_mut("responseBlocks") {
-                        self.remap_blocks(blocks)?;
+                        self.remap_blocks(&old, blocks)?;
                     }
                 }
             }

@@ -550,6 +550,10 @@ fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
         nested.output = Some(display.clone());
         let origins = std::collections::BTreeMap::from([("raw".into(), ("parent".into(), 1))]);
         w.stream_tools(&msg, "reply", &[tool("parent", &msg, 0), nested], &origins)?;
+        w.snapshots(
+            &msg,
+            &json!([{"id":"trace","responseBlocks":[{"type":"tool_use","id":"raw"}]}]),
+        )?;
         Ok(msg)
     })?;
     let qualified = format!("{msg}:raw");
@@ -559,6 +563,16 @@ fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
         a.read(|r| r.mcp(&qualified, &display))?.unwrap().0[0]["text"],
         "durable reply"
     );
+    let fork = a.branch(B, Branch::Full)?;
+    fork.read(|r| {
+        let msg = &r.messages()?[0].id;
+        let occurrence = &r.origins(msg)?[0].0;
+        assert_eq!(
+            r.requests(msg)?[0]["responseBlocks"][0]["id"],
+            occurrence.as_str()
+        );
+        Ok(())
+    })?;
     let other = tempdir()?;
     assert!(a.derive_owned_child("wrong", other.path()).is_err());
     assert!(stores.open_session("wrong").is_err());
