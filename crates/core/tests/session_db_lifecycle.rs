@@ -641,6 +641,17 @@ impl Worker {
                 .unwrap(),
         )
     }
+    fn expect_success(&mut self) {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                assert!(status.success(), "child exited with {status}");
+                return;
+            }
+            assert!(start.elapsed() < WAIT, "child blocked");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     fn kill_and_wait(&mut self) {
         self.0.kill().unwrap();
         assert!(!self.0.wait().unwrap().success());
@@ -678,6 +689,21 @@ fn subprocess() -> Result<()> {
         )?;
         return Ok(());
     }
+    if mode == "reject-delete" {
+        let deletion = Stores::open_for_test(&root).and_then(|s| s.open_session(ID)?.delete());
+        anyhow::ensure!(
+            deletion.is_err(),
+            "deleted under another process's shared lock"
+        );
+        return Ok(());
+    }
+    if mode == "reject-open" {
+        anyhow::ensure!(
+            Stores::open_for_test(&root).is_err(),
+            "acknowledged failed directory barrier"
+        );
+        return Ok(());
+    }
     let s = Stores::open_for_test(&root)?;
     let hold = || -> Result<()> {
         fs::write(root.join("ready"), [])?;
@@ -685,6 +711,34 @@ fn subprocess() -> Result<()> {
         Ok(())
     };
     match mode.as_str() {
+        "nested-archive" => {
+            let h = s.open_session(ID)?;
+            h.write(|_| {
+                anyhow::ensure!(h.set_archived(true).is_err());
+                Ok(())
+            })?;
+        }
+        "nested-capacity" => {
+            let h = s.open_session(ID)?;
+            let gate = Barrier::new(16);
+            thread::scope(|scope| -> Result<()> {
+                let jobs: Vec<_> = (0..16)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            h.read(|_| {
+                                gate.wait();
+                                anyhow::ensure!(h.read(|_| Ok(())).is_err());
+                                Ok(())
+                            })
+                        })
+                    })
+                    .collect();
+                for job in jobs {
+                    job.join().unwrap()?;
+                }
+                Ok(())
+            })?;
+        }
         "snapshot" => s.open_session(ID)?.read(|r| {
             assert_eq!(r.initial_message()?, Some(first_message()));
             hold()
@@ -836,7 +890,7 @@ fn windows_sharing_violation_preserves_tombstone_for_retry() {
 }
 
 #[test]
-fn supported_format_checks_columns_tables_and_live_seal() {
+fn fix_round_supported_format_checks_columns_tables_and_live_seal() {
     for change in [
         "DROP TABLE conversations",
         "ALTER TABLE project_folders DROP COLUMN trusted",
@@ -866,13 +920,14 @@ fn supported_format_checks_columns_tables_and_live_seal() {
 }
 
 #[test]
-fn structural_damage_is_quarantined_before_publication_or_retirement() -> Result<()> {
+fn fix_round_structural_damage_is_quarantined_before_publication_or_retirement() -> Result<()> {
     for (deleting, change) in [
         (false, "DROP TABLE manifest"),
         (false, "DROP TABLE message_user_content"),
         (false, "DELETE FROM messages"),
         (false, "DELETE FROM message_user_content"),
         (true, "DROP TABLE manifest"),
+        (true, "corrupt file"),
     ] {
         let root = tempdir()?;
         let stores = Stores::open_for_test(root.path())?;
@@ -892,10 +947,14 @@ fn structural_damage_is_quarantined_before_publication_or_retirement() -> Result
                 .path()
                 .join("session.db")
         };
-        let db = Connection::open(path)?;
-        db.execute_batch("PRAGMA foreign_keys=OFF")?;
-        db.execute_batch(change)?;
-        drop((db, stores));
+        if change == "corrupt file" {
+            fs::write(path, b"damaged retiring session")?;
+        } else {
+            let db = Connection::open(path)?;
+            db.execute_batch("PRAGMA foreign_keys=OFF")?;
+            db.execute_batch(change)?;
+        }
+        drop(stores);
         for _ in 0..2 {
             let s = Stores::open_for_test(root.path())?;
             assert!(s.open_session(ID).is_err());
@@ -914,5 +973,236 @@ fn structural_damage_is_quarantined_before_publication_or_retirement() -> Result
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fix_round_namespace_loss_cannot_split_an_active_snapshot() -> Result<()> {
+    for name in [
+        "session-locks",
+        "session-locks/.initialized",
+        &format!("session-locks/{ID}"),
+    ] {
+        let root = tempdir()?;
+        let stores = Stores::open_for_test(root.path())?;
+        let handle = stores.create(ID, first())?;
+        let mut holder = Worker::start(root.path(), "snapshot");
+        wait_file(&root.path().join("ready"));
+        let old = root.path().join(name);
+        fs::rename(&old, root.path().join("held"))?;
+        Worker::start(root.path(), "reject-delete").expect_success();
+        assert!(!old.exists(), "{name} was recreated");
+        assert!(handle.read(|_| Ok(())).is_err());
+        assert_eq!(
+            query::<i64>(&global(root.path()), "SELECT count(*) FROM conversations"),
+            1
+        );
+        fs::write(root.path().join("release"), [])?;
+        holder.expect_success();
+    }
+    Ok(())
+}
+
+#[test]
+fn fix_round_transaction_callback_cannot_upgrade_a_shared_lock() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    stores.create(ID, first())?;
+    Worker::start(root.path(), "nested-archive").expect_success();
+    assert!(!stores.global().conversation(ID)?.unwrap().archived);
+    Ok(())
+}
+
+#[test]
+fn fix_round_nested_read_cannot_wait_for_a_seventeenth_permit() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    stores.create(ID, first())?;
+    Worker::start(root.path(), "nested-capacity").expect_success();
+    stores.open_session(ID)?.delete()
+}
+
+#[test]
+fn fix_round_resident_readers_finish_a_killed_creators_sealed_intent() -> Result<()> {
+    for directory_first in [true, false] {
+        let root = tempdir()?;
+        let stores = Stores::open_for_test(root.path())?;
+        let mut child = Worker::start(root.path(), "sealed-wal");
+        wait_file(&root.path().join("ready"));
+        child.kill_and_wait();
+        assert_eq!(pending(root.path()), 1);
+        if directory_first {
+            assert_eq!(stores.global().conversation(ID)?.unwrap().message_count, 1);
+        }
+        let session = stores.open_session(ID)?;
+        assert_eq!(
+            session.read(|r| r.initial_message())?,
+            Some(first_message())
+        );
+        assert_eq!(pending(root.path()), 0);
+        assert_eq!(
+            session.incarnation(),
+            query::<String>(
+                &global(root.path()),
+                "SELECT incarnation FROM conversations"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fix_round_pooled_global_reads_detect_path_replacement() -> Result<()> {
+    let a = tempdir()?;
+    let b = tempdir()?;
+    let stores = Stores::open_for_test(a.path())?;
+    let handle = stores.create(ID, first())?;
+    drop(Stores::open_for_test(b.path())?);
+    assert!(stores.global().conversation(ID)?.is_some());
+    fs::rename(b.path().join("global.db"), a.path().join("global.db"))?;
+    assert!(stores.global().conversation(ID).is_err());
+    assert!(handle.read(|_| Ok(())).is_err());
+    Ok(())
+}
+
+#[test]
+fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
+    let root = tempdir()?;
+    let other = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    Stores::open_for_test(other.path())?.create(ID, first())?;
+    let foreign = shard(other.path());
+    let seal: String = query(
+        &Connection::open(&foreign)?,
+        "SELECT sealed_operation FROM manifest",
+    );
+    let sessions = root.path().join("sessions");
+    let legacy_key = "aaaaaaaa-1111-2222-3333-000000000000";
+    let paths = [
+        sessions.join(legacy_key),
+        sessions.join(".staging").join(legacy_key),
+        sessions.join(ID),
+        sessions.join(".staging").join(&seal),
+    ];
+    for (i, dir) in paths.iter().enumerate() {
+        fs::create_dir(dir)?;
+        if i < 2 {
+            Connection::open(dir.join("session.db"))?
+                .execute_batch("CREATE TABLE legacy_data(value TEXT)")?;
+        } else {
+            fs::copy(&foreign, dir.join("session.db"))?;
+        }
+    }
+    assert!(stop_at(&stores, Phase::Sealed)
+        .create("unowned", first())
+        .is_err());
+    global(root.path()).execute("DELETE FROM lifecycle", [])?;
+    drop(stores);
+    drop(Stores::open_for_test(root.path())?);
+    for dir in paths {
+        assert!(dir.join("session.db").is_file());
+        assert_eq!(
+            fs::read_dir(dir)?.count(),
+            1,
+            "orphan inspection created sidecars"
+        );
+    }
+    assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+    Ok(())
+}
+
+#[test]
+fn fix_round_bootstrap_requires_a_durable_existing_data_root() -> Result<()> {
+    let parent = tempdir()?;
+    let missing = parent.path().join("missing/nested");
+    assert!(Stores::open_for_test(&missing).is_err());
+    assert!(!missing.exists());
+    Ok(())
+}
+
+#[test]
+fn partial_trash_removal_replays_only_after_cleanup_is_authorized() -> Result<()> {
+    for authorized in [false, true] {
+        let root = tempdir()?;
+        let s = Stores::open_for_test(root.path())?;
+        let at = if authorized {
+            Phase::BeforeTrashRemoval
+        } else {
+            Phase::Trashed
+        };
+        let h = stop_at(&s, at).create(ID, first())?;
+        assert!(h.delete().is_err());
+        fs::remove_file(
+            root.path()
+                .join("sessions/.trash")
+                .join(h.incarnation())
+                .join("session.db"),
+        )?;
+        drop((h, s));
+        let reopened = Stores::open_for_test(root.path())?;
+        assert!(reopened.open_session(ID).is_err());
+        assert_eq!(pending(root.path()), 0);
+        assert_eq!(count(root.path(), "sessions/.trash"), 0);
+        assert_eq!(
+            count(root.path(), "sessions/.quarantine"),
+            usize::from(!authorized)
+        );
+        assert_eq!(reopened.create(ID, first()).is_ok(), authorized);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
+    let fixture = tempdir()?;
+    let library = fixture.path().join("fault.so");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&library)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session_db_fsync.c"))
+        .arg("-ldl")
+        .status()?
+        .success());
+    let reject = |root: &Path, sync: &Path, after: &Path| -> Result<()> {
+        let child = Command::new(std::env::current_exe()?)
+            .args(["--exact", "subprocess", "--ignored", "--nocapture"])
+            .env(CHILD_ENV, root)
+            .env("I46_LIFECYCLE_ACTION", "reject-open")
+            .env("LD_PRELOAD", &library)
+            .env("I46_SYNC_DIRECTORY", sync)
+            .env("I46_SYNC_AFTER", after)
+            .spawn()?;
+        Worker(child).expect_success();
+        Ok(())
+    };
+    let tmp = tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    let global_db = root.join("global.db");
+    for sync in [&root, &root, &root.join(".global-staging")] {
+        reject(&root, sync, &global_db)?;
+        assert!(global_db.is_file());
+        assert!(!root.join("session-locks/.initialized").exists());
+    }
+    let stores = Stores::open_for_test(&root)?;
+    assert!(stop_at(&stores, Phase::Sealed).create(ID, first()).is_err());
+    let stage_parent = root.join("sessions/.staging");
+    let op: String = query(&global(&root), "SELECT operation FROM lifecycle");
+    Connection::open(stage_parent.join(&op).join("session.db"))?
+        .execute("UPDATE manifest SET sealed_operation='broken'", [])?;
+    drop(stores);
+    let quarantine = root.join("sessions/.quarantine");
+    for sync in [&quarantine, &quarantine, &stage_parent] {
+        reject(&root, sync, &quarantine.join(&op))?;
+        assert_eq!(pending(&root), 1);
+    }
+    let stores = Stores::open_for_test(&root)?;
+    assert_eq!(pending(&root), 0);
+    assert!(stores.open_session(ID).is_err());
+    assert!(
+        query::<String>(&global(&root), "SELECT quarantine_reason FROM lifecycle").contains("seal")
+    );
     Ok(())
 }
