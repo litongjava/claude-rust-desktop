@@ -120,6 +120,58 @@ fn environment_section(model: &str, workspace: Option<&Path>) -> String {
     lines.join("\n")
 }
 
+/// The span of the per-session environment block, from its heading to the blank
+/// line that ends it. Custom prompts without one return None.
+fn environment_range(system: &str) -> Option<(usize, usize)> {
+    let start = system.find("# Environment")?;
+    let end = system[start..].find("\n\n").map(|offset| start + offset).unwrap_or(system.len());
+    Some((start, end))
+}
+
+fn project_folder_lines(folders: &[&str]) -> String {
+    let mut text = String::from(" - Project source folders (the first is the working directory):");
+    for folder in folders {
+        text.push_str("\n   - ");
+        text.push_str(folder);
+    }
+    text
+}
+
+/// Put the project name and, when it spans more than one folder, its source
+/// folders inside the existing environment block, so the static prompt prefix
+/// stays cacheable and the session facts read in one place. Prompts without an
+/// environment block keep the same facts appended at the end.
+pub fn add_project_to_environment(system: &mut String, name: &str, folders: &[&str]) {
+    let Some((start, end)) = environment_range(system) else {
+        system.push_str(&format!("\n - Project: {name}"));
+        if folders.len() > 1 {
+            system.push('\n');
+            system.push_str(&project_folder_lines(folders));
+        }
+        return;
+    };
+    // Directly before the working directory, which always follows the heading.
+    if let Some(offset) = system[start..end].find("\n - Primary working directory:") {
+        let at = start + offset + 1;
+        system.insert_str(at, &format!(" - Project: {name}\n"));
+    } else {
+        // No workspace facts in this block; keep the name at its end.
+        let end = environment_range(system).map(|(_, end)| end).unwrap_or(system.len());
+        system.insert_str(end, &format!("\n - Project: {name}"));
+    }
+    if folders.len() > 1 {
+        let (start, end) = environment_range(system).unwrap_or((0, system.len()));
+        let at = system[start..end]
+            .find("\n - Is a git repository:")
+            .and_then(|offset| {
+                let line_start = start + offset + 1;
+                system[line_start..end].find('\n').map(|line| line_start + line)
+            })
+            .unwrap_or(end);
+        system.insert_str(at, &format!("\n{}", project_folder_lines(folders)));
+    }
+}
+
 /// Kernel name and release, as `uname -sr` prints them; read once per process.
 static OS_VERSION: LazyLock<Option<String>> = LazyLock::new(|| {
     #[cfg(unix)]
@@ -425,7 +477,9 @@ mod tests {
         assert!(prompt.contains(custom));
         assert!(prompt.contains("You are powered by the model \"deepseek-flash\"."));
         assert!(prompt.starts_with(super::CODE_IDENTITY));
-        assert_eq!(prompt.matches("<code_behavior>").count(), 1);
+        assert!(!prompt.contains("<code_behavior>") && !prompt.contains("</code_behavior>"));
+        assert!(!prompt.contains("IMPORTANT: Assist with authorized security testing"));
+        assert!(!prompt.contains("deepseek-code is available as a CLI in the terminal"));
         assert_eq!(prompt.matches("<memory_guidance>").count(), 1);
         assert!(!prompt.contains("Reply with OK only"));
         assert!(prompt.contains("-Encoding UTF8"));
@@ -436,6 +490,37 @@ mod tests {
             assert!(!desktop.contains("<code_behavior>"));
             assert!(desktop.contains("<memory_guidance>"));
         }
+    }
+
+    #[test]
+    fn project_facts_join_the_environment_block() {
+        let workspace = tempfile::tempdir().unwrap();
+        let compose = || super::compose_system_prompt_in(None, "m", super::PromptProfile::Code, Some(workspace.path()));
+
+        let mut single = compose();
+        super::add_project_to_environment(&mut single, "Solo", &["/w/a"]);
+        assert!(single.contains(" - Project: Solo\n - Primary working directory: "));
+        assert!(!single.contains("Project source folders"));
+
+        let mut multi = compose();
+        super::add_project_to_environment(&mut multi, "Multi", &["/w/a", "/w/b"]);
+        assert!(multi.contains(" - Project: Multi\n - Primary working directory: "));
+        let git = multi.find(" - Is a git repository: ").unwrap();
+        let after_git = git + multi[git..].find('\n').unwrap();
+        let expected = "\n - Project source folders (the first is the working directory):\n   - /w/a\n   - /w/b\n - Platform: ";
+        assert!(multi[after_git..].starts_with(expected), "{}", &multi[after_git..]);
+
+        // The facts stay in the per-session tail, never in the cached prefix.
+        let (fixed, tail) = super::split_tail(&multi).unwrap();
+        assert!(tail.contains(" - Project: Multi") && !fixed.contains(" - Project: Multi"));
+        let start = multi.find("# Environment").unwrap();
+        let end = multi[start..].find("\n\n").map(|offset| start + offset).unwrap();
+        println!("environment sample:\n{}", &multi[start..end]);
+
+        // A custom prompt without an environment block keeps them at the end.
+        let mut bare = String::from("Only this.");
+        super::add_project_to_environment(&mut bare, "Custom", &["/a", "/b"]);
+        assert_eq!(bare, "Only this.\n - Project: Custom\n - Project source folders (the first is the working directory):\n   - /a\n   - /b");
     }
 
     #[test]

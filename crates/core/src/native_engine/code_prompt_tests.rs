@@ -550,7 +550,7 @@ async fn all_modes_run_memory_tools_without_automatic_recall_or_saving() {
             } else {
                 first["messages"][0]["content"].to_string()
             };
-            assert_eq!(system.contains("<code_behavior>"), mode == "code");
+            assert_eq!(system.contains("# Harness"), mode == "code");
             assert!(system.contains("custom project rule") && system.contains("<memory_guidance>"));
             assert!(first["tools"].to_string().contains("memory_ingest"));
             assert!(first["tools"].to_string().contains("memory_search"));
