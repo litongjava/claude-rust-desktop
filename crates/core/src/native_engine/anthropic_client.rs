@@ -278,7 +278,7 @@ impl AnthropicClient {
         self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(None, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(None, provider, &self.request_options);
         let request = || async {
             let request = self.client
                 .post(&url)
@@ -361,7 +361,7 @@ impl AnthropicClient {
         self.apply_options(&mut body, provider)?;
         crate::performance::apply_prompt_cache(&mut body);
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(None, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(None, provider, &self.request_options);
         let client = self.streaming_client()?;
         let request = client.post(&url)
             .headers(harness_headers)
@@ -504,10 +504,16 @@ impl AnthropicClient {
                 .await;
         }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(
+            context_capture,
+            provider,
+            &self.request_options,
+        );
         let client = if self.request_options.suggestion_guard.is_some() {
             super::model_http::single_post_client()?
-        } else { self.streaming_client()? };
+        } else {
+            self.streaming_client()?
+        };
         let request = client.post(&url)
             .headers(harness_headers)
             .header("anthropic-version", "2023-06-01")

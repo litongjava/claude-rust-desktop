@@ -360,9 +360,10 @@ impl OpenAIClient {
             }
         }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(
+        let identity = super::request_identity::RequestIdentity::from_options(
             None,
-            super::request_identity::is_opencode(provider),
+            provider,
+            &self.request_options,
         );
         let request = || async {
             let request = self
@@ -579,7 +580,7 @@ impl OpenAIClient {
                 .await;
         }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(context_capture, provider, &self.request_options);
         let client = if budget.is_single_post() {
             self.single_post_client()?
         } else {

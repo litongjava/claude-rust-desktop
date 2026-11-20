@@ -140,6 +140,10 @@ async fn model_transports_preserve_identity_effort_and_retry_ids() {
                     assert_eq!(headers["x-dcl-session-id"], "session-child");
                     assert_eq!(headers["x-parent-session-id"], "session-parent");
                     assert_eq!(headers["x-dcl-runtime"], "rust");
+                    assert_eq!(headers["x-dcl-request-kind"], "turn");
+                    assert_eq!(headers["x-client-request-id"], headers["x-request-id"]);
+                    assert!(!headers["originator"].is_empty());
+                    assert!(headers.contains_key("user-agent"));
                     assert_eq!(headers["x-dcl-retry-count"], attempt.to_string());
                     assert_eq!(headers["x-request-id"], pair[0].0["x-request-id"]);
                     assert_eq!(headers["x-dcl-turn-id"], pair[0].0["x-dcl-turn-id"]);
@@ -177,23 +181,23 @@ async fn simultaneous_sessions_children_and_cancellation_do_not_leak_identity() 
         tasks.push(tokio::spawn(
             TurnIdentity::new(Some(session.into()), None).scope(async move {
                 barrier.wait().await;
-                let headers = RequestIdentity::new(None, true).headers();
+                let headers = RequestIdentity::new(None, true, "main").headers();
                 assert_eq!(headers["x-opencode-session"], session);
                 assert_eq!(headers["x-dcl-session-id"], session);
                 // A provider that is not OpenCode never receives a session ID.
-                let other = RequestIdentity::new(None, false).headers();
+                let other = RequestIdentity::new(None, false, "main").headers();
                 assert!(!other.contains_key("x-opencode-session"));
                 assert!(!other.contains_key("session-id"));
                 TurnIdentity::new(Some("child".into()), None)
                     .scope(async {
-                        let headers = RequestIdentity::new(None, true).headers();
+                        let headers = RequestIdentity::new(None, true, "main").headers();
                         assert_eq!(headers["x-parent-session-id"], session);
                         assert_eq!(headers["x-opencode-session"], "child");
                         assert!(!headers.contains_key("session-id"));
                     })
                     .await;
                 assert_eq!(
-                    RequestIdentity::new(None, true).headers()["x-opencode-session"],
+                    RequestIdentity::new(None, true, "main").headers()["x-opencode-session"],
                     session
                 );
             }),
@@ -207,13 +211,183 @@ async fn simultaneous_sessions_children_and_cancellation_do_not_leak_identity() 
         TurnIdentity::new(Some("cancelled".into()), None).scope(std::future::pending::<()>()),
     )
     .await;
-    let headers = RequestIdentity::new(None, true).headers();
+    let headers = RequestIdentity::new(None, true, "main").headers();
     assert!(!headers.contains_key("session-id"));
     // Outside a conversation the routing session falls back to the request ID.
     assert_eq!(headers["x-opencode-session"], headers["x-request-id"]);
-    assert!(!RequestIdentity::new(None, false)
+    assert!(!RequestIdentity::new(None, false, "main")
         .headers()
         .contains_key("x-opencode-session"));
+}
+
+#[tokio::test]
+async fn explicit_session_identity_covers_manual_compaction_requests_and_retries() {
+    let requests: Requests = Default::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .fallback(post(capture))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let p: Provider = serde_json::from_value(json!({
+        "id": "fixture", "name": "fixture", "base_url": url, "api_key": "test-only",
+        "api_format": "openai", "enabled": true,
+        "models": [{"id": "fixture-model", "name": "fixture", "enabled": true,
+            "supports_web_search": false, "api": "openai-completions"}]
+    }))
+    .unwrap();
+    let p = ResolvedProvider {
+        model: p.models[0].clone(),
+        provider: p,
+    };
+    // Manual compaction runs without a turn scope, so the explicit session is
+    // the only identity available. Two sends model the retry counter.
+    let identity = RequestIdentity::for_explicit(
+        &p,
+        "compaction",
+        Some("manual-compaction"),
+        Some("parent-session"),
+        Some("fixed-request-id"),
+    );
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        client
+            .post(format!("{}/v1/responses/compact", url))
+            .headers(identity.headers())
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (attempt, (headers, _)) in seen.iter().enumerate() {
+        assert_eq!(headers["x-dcl-session-id"], "manual-compaction");
+        assert_eq!(headers["x-parent-session-id"], "parent-session");
+        assert_eq!(headers["x-dcl-request-kind"], "compaction");
+        assert_eq!(headers["x-request-id"], "fixed-request-id");
+        assert_eq!(headers["x-client-request-id"], "fixed-request-id");
+        assert_eq!(headers["x-dcl-retry-count"], attempt.to_string());
+        assert!(!headers["originator"].is_empty());
+        assert!(headers.contains_key("user-agent"));
+    }
+    drop(seen);
+    // A live turn still owns identity when its session differs from the
+    // explicit one.
+    TurnIdentity::new(Some("turn-session".into()), None)
+        .scope(async {
+            let headers = RequestIdentity::for_explicit(
+                &p,
+                "compaction",
+                Some("manual-compaction"),
+                None,
+                None,
+            )
+            .headers();
+            assert_eq!(headers["x-dcl-session-id"], "turn-session");
+        })
+        .await;
+    server.abort();
+}
+
+#[test]
+fn request_kind_maps_purposes_without_forwarding_opaque_text() {
+    for (purpose, expected) in [
+        ("", "turn"),
+        ("main", "turn"),
+        ("subagent", "turn"),
+        ("compaction", "compaction"),
+        ("web_search", "web-search"),
+        ("suggestion", "suggestion"),
+        ("title", "title"),
+        ("side_question", "side-question"),
+        ("has space", "other"),
+        ("naïve", "other"),
+    ] {
+        assert_eq!(request_kind(purpose), expected, "{purpose:?}");
+    }
+    assert_eq!(request_kind(&"x".repeat(33)), "other");
+}
+
+/// Every reqwest `.post(` in core and CLI must either take its headers from
+/// `RequestIdentity` or be a documented non-model integration. This is a
+/// textual guard: it keeps a new provider request from silently bypassing the
+/// session identity headers, and the allowlist records why each exception is
+/// safe. Entries are paths relative to `crates/`.
+#[test]
+fn request_identity_covers_every_model_provider_post() {
+    const ALLOWLIST: &[(&str, &str)] = &[
+        ("core/src/memory/mod.rs", "memory backend API"),
+        ("core/src/scheduler/mod.rs", "scheduled webhook delivery"),
+        ("core/src/computer_use/http_bridge.rs", "local computer bridge"),
+        ("core/src/computer_use/browserless.rs", "local browserless service"),
+        ("core/src/services/anthropic_auth.rs", "OAuth token exchange"),
+        ("core/src/services/voice.rs", "speech service"),
+        ("core/src/services/remote_control.rs", "remote control sync"),
+        ("core/src/services/team.rs", "team sync service"),
+        ("core/src/services/feedback.rs", "telemetry"),
+        ("core/src/services/github_connector.rs", "GitHub OAuth"),
+        ("core/src/services/ide.rs", "local IDE bridge"),
+        ("core/src/services/tool_hook_http.rs", "tool hook endpoint"),
+        ("core/src/mcp/transport.rs", "MCP transport"),
+        ("core/src/mcp/composio.rs", "MCP transport"),
+        ("core/src/knowledge/github_hub.rs", "GitHub OAuth"),
+        ("core/src/im_integration/mod.rs", "messaging webhooks"),
+        ("core/src/im_integration/adapters/telegram_adapter.rs", "messaging webhooks"),
+        ("core/src/im_integration/adapters/feishu_adapter.rs", "messaging webhooks"),
+        ("core/src/im_integration/adapters/dingtalk_adapter.rs", "messaging webhooks"),
+        ("core/src/im_integration/adapters/wecom_adapter.rs", "messaging webhooks"),
+        ("core/src/github/mod.rs", "GitHub API"),
+        ("core/src/app_studio/mod.rs", "generated JavaScript string"),
+        ("core/src/native_engine/provider_runtime/cloud_auth.rs", "cloud OAuth token exchange"),
+        ("core/src/native_engine/model_http.rs", "HTTP client fixture"),
+        ("core/src/native_engine/stream_retry_tests.rs", "transport fixture"),
+        ("core/src/native_engine/request_recording/tests.rs", "transport fixture"),
+        ("core/src/tools/image_generation.rs", "provider image API, reviewed separately"),
+        ("core/src/research/mod.rs", "provider research adapter, reviewed separately"),
+    ];
+    fn sources(root: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = core.parent().unwrap();
+    let mut files = Vec::new();
+    sources(&core.join("src"), &mut files);
+    let cli = crates.join("cli/src");
+    if cli.is_dir() {
+        sources(&cli, &mut files);
+    }
+    let allowed = |relative: &str| {
+        ALLOWLIST
+            .iter()
+            .any(|(path, _reason)| *path == relative)
+    };
+    let mut failures = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        if !text.contains(".post(") {
+            continue;
+        }
+        let relative = file
+            .strip_prefix(crates)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !allowed(&relative) && !text.contains("RequestIdentity") {
+            failures.push(relative);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "model-provider .post( calls must take headers from RequestIdentity or be allowlisted: {failures:?}"
+    );
 }
 
 #[test]

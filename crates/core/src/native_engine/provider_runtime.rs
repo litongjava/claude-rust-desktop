@@ -616,9 +616,10 @@ pub(super) async fn stream_body(
         None
     };
     let harness_headers = options.headers(provider)?;
-    let identity = super::request_identity::RequestIdentity::new(
+    let identity = super::request_identity::RequestIdentity::from_options(
         context_capture,
-        super::request_identity::is_opencode(provider),
+        provider,
+        &options,
     );
     let api = api.to_owned();
     let opened = {
