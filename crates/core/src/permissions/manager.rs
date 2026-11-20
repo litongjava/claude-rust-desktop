@@ -774,7 +774,7 @@ impl PermissionManager {
                 context.tool_input["url"].as_str().unwrap_or_default(),
             );
         // Full Access grants everything bypass mode would, deny rules included.
-        if mode == PermissionMode::BypassPermissions && super::full_access() && !local_fetch {
+        if mode == PermissionMode::BypassPermissions && super::full_access() {
             return decision(PermissionResult::Granted, Mode);
         }
         let auto = mode == PermissionMode::Auto;
@@ -854,7 +854,7 @@ impl PermissionManager {
                 ToolSetting,
             );
         }
-        if local_fetch {
+        if local_fetch && mode != PermissionMode::BypassPermissions {
             return decision(self.request_confirmation(context), NetworkBoundary);
         }
         if mode == PermissionMode::BypassPermissions {
@@ -1705,13 +1705,12 @@ mod policy_tests {
         ));
     }
     #[test]
-    fn local_fetch_requires_explicit_review_in_every_mode() {
+    fn local_fetch_requires_review_except_in_bypass_mode() {
         for mode in [
             PermissionMode::PlanMode,
             PermissionMode::Auto,
             PermissionMode::AskPermissions,
             PermissionMode::AcceptEdits,
-            PermissionMode::BypassPermissions,
         ] {
             let manager = manager(mode);
             manager.set_session_rules(
@@ -1722,6 +1721,7 @@ mod policy_tests {
                 "http://localhost:8080/",
                 "http://127.0.0.1/",
                 "http://192.168.1.2/",
+                "http://169.254.169.254/latest/meta-data/",
                 "http://[::1]/",
                 "http://[::ffff:127.0.0.1]/",
                 "http://intranet/",
@@ -1750,6 +1750,38 @@ mod policy_tests {
                 PermissionResult::Denied(_)
             ));
         }
+    }
+
+    #[test]
+    fn bypass_grants_local_fetch_but_keeps_explicit_deny_rules() {
+        let manager = manager(PermissionMode::BypassPermissions);
+        for url in [
+            "http://localhost:8080/",
+            "http://192.168.1.2/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let call = PermissionContext {
+                tool_input: serde_json::json!({"url":url}),
+                ..context("WebFetch")
+            };
+            assert_eq!(
+                manager.check_permission(&call),
+                PermissionResult::Granted,
+                "{url}"
+            );
+        }
+        manager.set_session_rules(
+            "session",
+            HashMap::from([("WebFetch".into(), PermissionAction::Deny)]),
+        );
+        let call = PermissionContext {
+            tool_input: serde_json::json!({"url":"http://localhost/"}),
+            ..context("WebFetch")
+        };
+        assert!(matches!(
+            manager.check_permission(&call),
+            PermissionResult::Denied(_)
+        ));
     }
 
     #[test]

@@ -161,9 +161,12 @@ pub(crate) async fn approved_auto_call<F: Future>(
 }
 
 pub(super) fn approved_local_fetch(url: &str) -> bool {
-    EXACT_FETCH
-        .try_with(|approved| approved.as_deref() == Some(url))
-        .unwrap_or(false)
+    // Bypass mode grants local and private addresses without a prompt, like
+    // every other tool. Other modes need an approval for this exact call.
+    bypass_permissions()
+        || EXACT_FETCH
+            .try_with(|approved| approved.as_deref() == Some(url))
+            .unwrap_or(false)
 }
 
 fn canonical_target(path: &Path) -> Option<PathBuf> {
