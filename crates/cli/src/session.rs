@@ -5342,3 +5342,5 @@ mod request_usage_tests {
 #[cfg(test)]
 #[path = "session_binding_tests.rs"]
 mod binding_tests;
+#[path = "startup_contention_tests.rs"]
+mod startup_contention_tests;

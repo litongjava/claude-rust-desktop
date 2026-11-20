@@ -192,8 +192,7 @@ pub fn default_permissions() -> Arc<PermissionManager> {
 
 /// Whole-transaction retry budget for session writes, matching turn writes.
 ///
-/// The pooled connection keeps its 5 s `busy_timeout`; this deadline only bounds
-/// how long the boundary keeps retrying a typed writer conflict after that.
+/// The contention budget includes SQLite lock acquisition and retry backoff.
 const SESSION_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sessions use the same project trust, Code prompt and SQLite schema as Desktop.

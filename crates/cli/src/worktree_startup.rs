@@ -45,24 +45,30 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
         .store
         .db
         .with_conn(|conn| -> Result<()> {
-            let transaction = deepseek_code_core::db::write_transaction(&conn)?;
-            let project: String = transaction.query_row(
-                "SELECT project_id FROM conversations WHERE id=?1",
-                [&session.id],
-                |row| row.get(0),
-            )?;
-            prepared.save(
-                &transaction,
-                &session.id,
-                &project,
-                &source.to_string_lossy(),
-            )?;
-            transaction.execute(
-                "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
-                [prepared.path.to_string_lossy().as_ref(), &session.id],
-            )?;
-            transaction.commit()?;
-            Ok(())
+            deepseek_code_core::db::write_tx(
+                conn,
+                "session worktree binding",
+                deepseek_code_core::db::STARTUP_WRITE_DEADLINE,
+                |transaction| {
+                    let project: String = transaction.query_row(
+                        "SELECT project_id FROM conversations WHERE id=?1",
+                        [&session.id],
+                        |row| row.get(0),
+                    )?;
+                    prepared.save(
+                        &transaction,
+                        &session.id,
+                        &project,
+                        &source.to_string_lossy(),
+                    )?;
+                    transaction.execute(
+                        "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
+                        [prepared.path.to_string_lossy().as_ref(), &session.id],
+                    )?;
+                    Ok(())
+                },
+            )
+            .context("Binding session worktree")
         })
         .and_then(|result| result);
     if let Err(error) = saved {

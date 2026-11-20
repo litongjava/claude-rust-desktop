@@ -188,11 +188,18 @@ pub async fn create(
     let metadata = json!({"canonical_path":path,"created_ns":created_ns,"newly_created":newly_created,"baseline":baseline,"provenance":provenance(&runner)?});
     // A failed DB transaction deliberately retains hook output rather than deleting unknown files.
     db.with_conn(|conn|->Result<()> {
-        let tx=crate::db::write_transaction(&conn)?;
-        tx.execute("INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?3,?4,?5)",params![session,project.id,source.to_string_lossy(),path.to_string_lossy(),name])?;
-        tx.execute("INSERT INTO conversation_worktree_backends(conversation_id,backend,metadata) VALUES(?1,'hook',?2)",params![session,metadata.to_string()])?;
-        tx.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2",params![path.to_string_lossy(),session])?;
-        tx.commit()?; Ok(())
+        crate::db::write_tx(
+            conn,
+            "worktree hook binding",
+            crate::db::STARTUP_WRITE_DEADLINE,
+            |tx| {
+                tx.execute("INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?3,?4,?5)",params![session,project.id,source.to_string_lossy(),path.to_string_lossy(),name])?;
+                tx.execute("INSERT INTO conversation_worktree_backends(conversation_id,backend,metadata) VALUES(?1,'hook',?2)",params![session,metadata.to_string()])?;
+                tx.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2",params![path.to_string_lossy(),session])?;
+                Ok(())
+            },
+        )
+        .context("Binding hook worktree")
     })??;
     Ok(Some(path))
 }
@@ -442,6 +449,36 @@ mod tests {
         crate::services::plugins::enable(&context, "worktree-fixture", false).unwrap();
         assert!(!configured(&paths.data_dir, &source).unwrap());
     }
+    #[tokio::test]
+    async fn hook_binding_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let (_temp, paths, store, source) = fixture();
+        let session = store.create(&source, "fixture", "fixture").unwrap();
+        let (holder, release) = crate::db::test_support::hold_write_lock(
+            paths.data_dir.join(crate::runtime::DATABASE_FILE),
+        );
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        let path = create(
+            &paths.data_dir,
+            &store.db,
+            &session,
+            &source,
+            Some("wait"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "binding returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert!(path.exists());
+    }
+
     fn fixture() -> (tempfile::TempDir, RuntimePaths, SessionStore, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");

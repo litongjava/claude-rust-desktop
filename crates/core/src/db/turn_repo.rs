@@ -1,6 +1,6 @@
 //! Durable, host-owned timing of a complete execution turn (not a model request).
 use super::DbManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -167,24 +167,30 @@ pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<S
 /// time as work time. The caller must first establish that no process holds the
 /// execution lease.
 pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
-    let running: Vec<TurnRecord> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running'",
-        )?;
-        let rows = stmt.query_map([conversation_id], read_record)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    let next = |conn: &Connection| {
+        conn.query_row(
+            "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running' LIMIT 1",
+            [conversation_id],
+            read_record,
+        ).optional()
     };
-    for record in &running {
-        conn.execute(
-            "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
-            [&record.turn_id],
-        )?;
-    }
-    let mut settled = running;
-    for record in &mut settled {
-        record.status = TurnStatus::Cancelled;
-        record.ended_at = None;
-        record.elapsed_ms = None;
+    let mut settled = Vec::new();
+    while next(conn)?.is_some() {
+        // Re-select under the writer lock. Another connection may have
+        // finished the observed turn or published a different one.
+        let record = super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE, |tx| {
+            let Some(mut record) = next(tx)? else { return Ok(None) };
+            tx.execute(
+                "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
+                [&record.turn_id],
+            )?;
+            record.status = TurnStatus::Cancelled;
+            record.ended_at = None;
+            record.elapsed_ms = None;
+            Ok(Some(record))
+        }).context("Settling interrupted turn")?;
+        let Some(record) = record else { break };
+        settled.push(record);
     }
     Ok(settled)
 }
@@ -393,6 +399,54 @@ mod tests {
         let session = store.create(temp.path(), "model", "provider").unwrap();
         store.append(&session, "user", "task").unwrap();
         (temp, db, session)
+    }
+
+    #[test]
+    fn settle_interrupted_waits_for_another_writer_instead_of_failing() {
+        let (temp, db, session) = fixture();
+        let mut turn = TurnTimer::start(db.clone(), &session).unwrap();
+        turn.ensure_segment().unwrap();
+        let path = temp.path().join("turns.sqlite");
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = std::time::Instant::now();
+        let settled = db
+            .with_conn(|conn| settle_interrupted(conn, &session))
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "settle returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert!(!settled.is_empty());
+        drop(turn);
+    }
+
+    #[test]
+    fn settlement_rechecks_running_rows_and_preserves_prior_commits_on_error() {
+        let (_temp, db, session) = fixture();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES ('first',?1,'now','running')",
+                [&session],
+            ).unwrap();
+            conn.execute_batch("
+                CREATE TRIGGER add_late AFTER UPDATE OF status ON execution_turns WHEN NEW.id='first'
+                BEGIN INSERT INTO execution_turns(id,conversation_id,started_at,status)
+                      VALUES('late',NEW.conversation_id,'later','running'); END;
+                CREATE TRIGGER reject_late BEFORE UPDATE OF status ON execution_turns WHEN NEW.id='late'
+                BEGIN SELECT RAISE(ABORT,'late settlement rejected'); END;
+            ").unwrap();
+            let error = settle_interrupted(conn, &session).unwrap_err();
+            assert_eq!(super::super::sqlite_extended_code(&error), Some(1811));
+            assert_eq!(get_turn(conn, "first").unwrap().unwrap().status, TurnStatus::Cancelled);
+            assert_eq!(get_turn(conn, "late").unwrap().unwrap().status, TurnStatus::Running);
+            conn.execute_batch("DROP TRIGGER reject_late").unwrap();
+            assert_eq!(settle_interrupted(conn, &session).unwrap()[0].turn_id, "late");
+        }).unwrap();
     }
 
     #[test]
