@@ -99,6 +99,13 @@ fn process_worker() -> Result<()> {
     }
     let s = Stores::open_for_test(&root)?;
     match action.as_str() {
+        "dispatch" => {
+            let mut owner = s.open_session(B)?.delivery_owner()?;
+            owner.next_queue(QueueMode::NextTurn, None)?;
+            let (_, turn) = owner.begin_generation()?.unwrap();
+            fs::write(root.join("started-turn"), turn)?;
+            hold()?;
+        }
         "block-session" => s.open_session(A)?.write(|_| hold())?,
         "read-b" => {
             let display = fs::read_to_string(root.join("display"))?;
@@ -744,5 +751,28 @@ fn simultaneous_inbox_consumers_commit_each_generation_in_fifo_order() -> Result
     times.sort();
     let after = size()?;
     eprintln!("concurrent inbox handoff: samples={} p95={}us p99={}us, G logical bytes for 2 sessions before admission={} after 32 acknowledged messages={}",times.len(),times[30],times[31],baseline,after);
+    Ok(())
+}
+
+#[test]
+fn killed_executor_settles_its_started_turn_and_never_redispatches_it() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let b = stores.create(B, Default::default())?;
+    b.enqueue("launch", &json!("work"), QueueMode::NextTurn)?;
+    let mut worker = Worker::start(root.path(), "dispatch")?;
+    wait(&root.path().join("ready"))?;
+    let turn = fs::read_to_string(root.path().join("started-turn"))?;
+    assert_eq!(
+        b.read(|r| r.turn(&turn))?.unwrap().status,
+        TurnStatus::Running
+    );
+    worker.kill()?;
+    let mut owner = b.delivery_owner()?;
+    assert!(owner.begin_generation()?.is_none());
+    let interrupted = b.read(|r| r.turn(&turn))?.unwrap();
+    assert_eq!(interrupted.status, TurnStatus::Cancelled);
+    assert!(interrupted.ended_at.is_none());
+    assert_eq!(b.read(|r| r.receipt_count())?, 1);
     Ok(())
 }

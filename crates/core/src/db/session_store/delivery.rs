@@ -339,10 +339,24 @@ impl SessionDb {
         self.check_directory()?;
         let lease = ExecutionLease::acquire(&self.stores.root.path, &self.incarnation)?
             .context("Invalid execution incarnation")?;
+        let consumer = ExecutionLease::acquire_inbox(&self.stores.root.path, &self.incarnation)?;
+        // Possession of the execution lock proves the previous executor ended.
+        // Preserve the cause (missing endpoint), and keep its generation receipt.
+        let interrupted =
+            self.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM execution_turns WHERE status='running')",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })?;
+        if interrupted {
+            self.write_locked("settle interrupted execution", |tx| tx.settle_interrupted())?;
+        }
         Ok(DeliveryOwner {
             session: self.clone(),
             _lease: lease,
-            _consumer: ExecutionLease::acquire_inbox(&self.stores.root.path, &self.incarnation)?,
+            _consumer: consumer,
             _locks: locks,
         })
     }
@@ -389,7 +403,7 @@ impl DeliveryOwner {
         let s = &self.session;
         let ids = s.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let mut q = c.prepare(
-                "SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL ORDER BY rowid",
+                "SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL AND NOT EXISTS(SELECT 1 FROM execution_turns WHERE status='running') ORDER BY rowid",
             )?;
             let rows = q
                 .query_map([], |r| r.get::<_, String>(0))?
