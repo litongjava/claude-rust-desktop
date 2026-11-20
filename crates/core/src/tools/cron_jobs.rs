@@ -42,7 +42,7 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
         },
         super::ToolDefinition {
             name: "CronList".into(),
-            description: "List all cron jobs scheduled via CronCreate, both durable (.claude/scheduled_tasks.json) and session-only.".into(),
+            description: "Read the current session’s scheduled prompts together with those saved for the project. Each entry gives its ID, cron expression, prompt, recurrence and durability flags, and next run in local time. The result includes the total count.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
     ]
