@@ -43,10 +43,11 @@ impl SuggestionCapture {
         body: &Value,
         builtin_vision: Option<bool>,
         url: &str,
+        model: &str,
     ) {
         *self.0.lock().unwrap() = CaptureState {
             body: Some((protocol.to_owned(), body.clone())),
-            automatic_cache: automatic_cache(url),
+            automatic_cache: automatic_cache(url, model),
             builtin_vision,
             completed: None,
         };
@@ -200,10 +201,18 @@ fn append_instruction(api: &str, body: &mut Value) -> Result<()> {
     Ok(())
 }
 
+// Groq documents automatic prompt caching only for these model families.
+// Every other Groq model must show a cache read like any custom endpoint.
+const GROQ_CACHED_MODEL_PREFIXES: &[&str] = &[
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-safeguard-20b",
+];
+
 // These services document automatic prefix caching. Match the final model URL,
 // including catalog defaults and regional endpoints. A protocol ID, a cache
 // price, or support for explicit cache markers says nothing about a proxy.
-fn automatic_cache(url: &str) -> bool {
+fn automatic_cache(url: &str, model: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -211,19 +220,28 @@ fn automatic_cache(url: &str) -> bool {
         return false;
     };
     let host = host.trim_end_matches('.');
+    if host == "api.groq.com" {
+        return GROQ_CACHED_MODEL_PREFIXES
+            .iter()
+            .any(|prefix| model.starts_with(prefix));
+    }
     matches!(
         host,
         "api.deepseek.com"
             | "api.openai.com"
             | "chatgpt.com"
-            | "api.groq.com"
             | "api.x.ai"
             | "generativelanguage.googleapis.com"
             | "aiplatform.googleapis.com"
     ) || host.ends_with("-aiplatform.googleapis.com")
-        || [".openai.azure.com", ".openai.azure.us", ".openai.azure.cn"]
-            .iter()
-            .any(|suffix| host.ends_with(suffix))
+        || [
+            ".openai.azure.com",
+            ".openai.azure.us",
+            ".openai.azure.cn",
+            ".services.ai.azure.com",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -232,7 +250,7 @@ mod tests {
     use crate::native_engine::provider_manager::Provider;
 
     #[test]
-    fn automatic_cache_uses_only_the_service_host() {
+    fn automatic_cache_depends_on_the_service_host_and_model() {
         for host in [
             "api.deepseek.com",
             "API.OPENAI.COM",
@@ -240,24 +258,52 @@ mod tests {
             "west.openai.azure.com",
             "svc.openai.azure.us",
             "svc.openai.azure.cn",
-            "api.groq.com",
+            "review.services.ai.azure.com",
             "api.x.ai",
             "generativelanguage.googleapis.com",
             "aiplatform.googleapis.com",
             "us-central1-aiplatform.googleapis.com",
         ] {
-            assert!(automatic_cache(&format!("http://{host}:1234/v1")), "{host}");
+            assert!(
+                automatic_cache(&format!("http://{host}:1234/v1"), "any-model"),
+                "{host}"
+            );
         }
-        for url in [
-            "http://127.0.0.1/openai",
-            "https://api.openai.com.evil.example",
-            "https://api.groq.com@proxy.example",
-            "https://notopenai.azure.com",
-            "https://api.x.ai.example",
-            "https://us-east1-aiplatform.googleapis.com.example",
-            "invalid",
+        for model in [
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-safeguard-20b",
         ] {
-            assert!(!automatic_cache(url), "{url}");
+            assert!(
+                automatic_cache("https://api.groq.com/openai/v1/chat/completions", model),
+                "{model}"
+            );
+        }
+        for model in [
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3.6-27b",
+        ] {
+            assert!(
+                !automatic_cache("https://api.groq.com/openai/v1/chat/completions", model),
+                "{model}"
+            );
+        }
+        for (url, model) in [
+            ("http://127.0.0.1/openai", "any-model"),
+            ("https://api.openai.com.evil.example", "any-model"),
+            ("https://api.groq.com.evil.example", "openai/gpt-oss-120b"),
+            ("https://services.ai.azure.com.evil.example", "gpt-4.1"),
+            ("https://api.groq.com@proxy.example", "openai/gpt-oss-120b"),
+            ("https://notopenai.azure.com", "any-model"),
+            ("https://api.x.ai.example", "any-model"),
+            (
+                "https://us-east1-aiplatform.googleapis.com.example",
+                "any-model",
+            ),
+            ("invalid", "any-model"),
+        ] {
+            assert!(!automatic_cache(url, model), "{url}");
         }
     }
 
@@ -303,6 +349,7 @@ mod tests {
                 &json!({"messages":[]}),
                 None,
                 &provider.provider.base_url,
+                &provider.model.id,
             );
             capture.finish(
                 &json!({"status":"completed","cacheReadTokens":cached}),
@@ -326,6 +373,104 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    async fn groq_fixture() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let events = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"run the checks\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{events}",
+                    events.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, requests, task)
+    }
+
+    #[tokio::test]
+    async fn groq_llama_cold_turn_sends_no_suggestion() {
+        use crate::{
+            db::turn_repo::{TurnStatus, TurnTimer},
+            runtime::{RuntimePaths, SessionStore},
+            session_files::suggestion::SuggestionTurn,
+        };
+        for (model, expected) in [
+            ("llama-3.1-8b-instant", None),
+            ("openai/gpt-oss-120b", Some("run the checks")),
+        ] {
+            let (base_url, requests, server) = groq_fixture().await;
+            let config: Provider = serde_json::from_value(json!({
+                "id":"groq-fixture","name":"fixture","base_url":base_url,
+                "api_key":"mock","api_format":"openai","enabled":true,
+                "models":[{"id":model,"name":"fixture","enabled":true,"supports_web_search":false}]
+            }))
+            .unwrap();
+            let provider = ResolvedProvider {
+                model: config.models[0].clone(),
+                provider: config,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+            let store = SessionStore::new(paths.open_database().unwrap());
+            let session = store.create(root.path(), model, "groq-fixture").unwrap();
+            let mut turn = TurnTimer::start(store.db.clone(), &session).unwrap();
+            let origin = SuggestionTurn::begin(
+                store.db.clone(),
+                &session,
+                &turn.record().turn_id,
+                model,
+                "groq-fixture",
+            )
+            .unwrap()
+            .unwrap();
+            let assistant = turn.ensure_segment().unwrap();
+            turn.finish(TurnStatus::Completed).unwrap();
+            let guard = Arc::new(origin.complete(&assistant).unwrap().unwrap());
+
+            let capture = SuggestionCapture::default();
+            capture.record(
+                "openai-completions",
+                &json!({"messages":[]}),
+                None,
+                "https://api.groq.com/openai/v1/chat/completions",
+                model,
+            );
+            capture.finish(
+                &json!({"status":"completed","cacheReadTokens":0}),
+                &provider,
+                &RequestOptions::for_session(Some("session")),
+            );
+            assert_eq!(
+                capture.generate(guard).await.unwrap().as_deref(),
+                expected,
+                "{model}"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(expected.is_some()),
+                "{model}"
+            );
+            server.abort();
+        }
     }
 
     #[test]

@@ -229,9 +229,10 @@ impl ContextCapture {
         requested: u32,
         builtin_vision: Option<bool>,
         url: &str,
+        model: &str,
     ) {
         if let Some(capture) = &self.suggestion {
-            capture.record(protocol, body, builtin_vision, url);
+            capture.record(protocol, body, builtin_vision, url, model);
         }
         self.record(protocol, body, window, requested).await;
     }

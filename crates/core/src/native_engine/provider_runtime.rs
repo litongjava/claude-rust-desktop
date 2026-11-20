@@ -714,7 +714,7 @@ pub(super) async fn stream_body(
                 }
                 if let Some(capture) = &capture {
                     capture
-                        .record_transport(&api, &body, provider.model.context_window, max_tokens, Some(vision), &url)
+                        .record_transport(&api, &body, provider.model.context_window, max_tokens, Some(vision), &url, &provider.model.id)
                         .await;
                 }
                 checked_response(

@@ -499,6 +499,7 @@ impl AnthropicClient {
                     max_tokens,
                     None,
                     &url,
+                    &provider.model.id,
                 )
                 .await;
         }
