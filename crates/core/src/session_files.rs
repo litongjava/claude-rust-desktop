@@ -1,5 +1,4 @@
-//! Paths of the per-session files written for the first user message and for
-//! the frozen MCP tool definitions.
+//! Paths shared by per-session writers, deletion and time-based pruning.
 //!
 //! Every writer resolves its path through this module, and cleanup and pruning
 //! use the same lists, so a newly written file cannot be left out of either.
@@ -23,6 +22,7 @@ const ENVIRONMENT_SUFFIXES: &[&str] = &[
     ".announced-date",
     ".loadable-tools.json",
     ".skills.json",
+    SUGGESTION_SUFFIX,
 ];
 
 /// The MCP tool snapshot for a session.
@@ -49,7 +49,7 @@ pub(crate) fn mcp_snapshot_file(root: &Path, session: &str) -> PathBuf {
         .join(format!("{session}{MCP_SNAPSHOT_SUFFIX}"))
 }
 
-/// Every file the two features write for one session, in a stable order.
+/// Every tracked file for one session, in a stable order.
 pub(crate) fn files_for_session(root: &Path, session: &str) -> Vec<PathBuf> {
     ENVIRONMENT_SUFFIXES
         .iter()
@@ -75,3 +75,7 @@ pub(crate) fn environment_suffixes() -> Vec<String> {
         )
         .collect()
 }
+
+pub(crate) const SUGGESTION_SUFFIX: &str = ".suggestion.json";
+
+pub mod suggestion;

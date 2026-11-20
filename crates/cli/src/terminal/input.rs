@@ -162,7 +162,7 @@ struct PendingRead {
 
 pub struct TerminalInput {
     notices: std::sync::mpsc::Sender<String>,
-    suggestions: std::sync::mpsc::Sender<String>,
+    suggestions: std::sync::mpsc::Sender<Option<crate::prompt_suggestion::Ghost>>,
     requests: std::sync::mpsc::Sender<Message>,
     pending: Option<PendingRead>,
     fixture: Option<mpsc::UnboundedReceiver<String>>,
@@ -413,9 +413,8 @@ impl TerminalInput {
         let _ = self.requests.send(Message::Workspace(workspace.to_owned()));
     }
 
-    /// Where a background task delivers the suggested next prompt.
-    pub fn suggestion_sender(&self) -> std::sync::mpsc::Sender<String> {
-        self.suggestions.clone()
+    pub fn set_suggestion(&self, suggestion: Option<crate::prompt_suggestion::Ghost>) {
+        let _ = self.suggestions.send(suggestion);
     }
 
     pub fn set_details(&self, details: Vec<(String, String)>) {
