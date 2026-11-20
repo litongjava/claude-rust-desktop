@@ -200,8 +200,15 @@ pub fn publish(
     publish_choice(c, id, expected, state, legacy, "", None)
 }
 
+/// Names the binding write boundary for lock-timeout diagnostics.
+pub const PUBLISH_LABEL: &str = "session binding update";
+
 /// The inner option represents the picker's model-default effort. An absent
 /// outer option leaves the settings untouched, including for non-picker writes.
+///
+/// A resume can carry an explicit `--model`/`--provider`, so this startup write
+/// shares [`crate::db::STARTUP_WRITE_DEADLINE`] and waits for another host's
+/// writer instead of failing at the pooled connection's 5 s busy_timeout.
 pub fn publish_choice(
     c: &Connection,
     id: &str,
@@ -211,26 +218,50 @@ pub fn publish_choice(
     requester: &str,
     picker_effort: Option<Option<&str>>,
 ) -> Result<Write> {
-    let tx = crate::db::write_transaction(c)?;
-    let mut result = publish_in(&tx, id, expected, state, legacy)?;
-    match result {
-        Write::Published(generation) if legacy.is_some() => {
-            tx.execute("INSERT INTO cli_binding_reservations(session_id,generation,requester,effort,requested)
-                VALUES(?1,?2,?3,?4,?5)", (id,generation,requester,picker_effort.map(|e| e.unwrap_or("default")),
-                format!("{}::{}",state.provider_id,state.model)))?;
-        }
-        Write::Unchanged if picker_effort.is_some() && read(&tx, id)?.pending.is_some() => {
-            result = Write::Conflict;
-        }
-        Write::Unchanged | Write::Published(_) => {
-            if let Some(effort) = picker_effort {
-                apply_effort(&tx, id, effort)?;
+    publish_choice_with_deadline(
+        c,
+        id,
+        expected,
+        state,
+        legacy,
+        requester,
+        picker_effort,
+        crate::db::STARTUP_WRITE_DEADLINE,
+    )
+}
+
+fn publish_choice_with_deadline(
+    c: &Connection,
+    id: &str,
+    expected: u64,
+    state: &BindingSnapshot,
+    legacy: Option<(&str, Option<u32>)>,
+    requester: &str,
+    picker_effort: Option<Option<&str>>,
+    deadline: std::time::Duration,
+) -> Result<Write> {
+    crate::db::write_tx(c, PUBLISH_LABEL, deadline, |tx| {
+        // Every retried attempt re-reads the generation inside its own
+        // transaction, so the compare-and-set cannot publish over a newer writer.
+        let mut result = publish_in(tx, id, expected, state, legacy)?;
+        match result {
+            Write::Published(generation) if legacy.is_some() => {
+                tx.execute("INSERT INTO cli_binding_reservations(session_id,generation,requester,effort,requested)
+                    VALUES(?1,?2,?3,?4,?5)", (id,generation,requester,picker_effort.map(|e| e.unwrap_or("default")),
+                    format!("{}::{}",state.provider_id,state.model)))?;
             }
+            Write::Unchanged if picker_effort.is_some() && read(tx, id)?.pending.is_some() => {
+                result = Write::Conflict;
+            }
+            Write::Unchanged | Write::Published(_) => {
+                if let Some(effort) = picker_effort {
+                    apply_effort(tx, id, effort)?;
+                }
+            }
+            Write::Conflict => {}
         }
-        Write::Conflict => {}
-    }
-    tx.commit()?;
-    Ok(result)
+        Ok(result)
+    })
 }
 
 fn apply_effort(c: &Connection, id: &str, effort: Option<&str>) -> Result<()> {
