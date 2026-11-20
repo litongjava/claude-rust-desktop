@@ -128,6 +128,13 @@ pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 pub(super) fn open(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    ensure!(
+        fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting {}", path.display()))?
+            .is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
     let conn = Connection::open_with_flags(
         path,
         flags | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,

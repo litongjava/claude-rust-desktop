@@ -386,16 +386,11 @@ impl Stores {
             return Ok(());
         }
         let db = dir.join("session.db");
-        let unsealed = if db.try_exists()? {
-            match self.unsealed(&db) {
-                Ok(value) => value,
-                Err(e) if damaged_shard(&e) => {
-                    return self.quarantine(&op, dir, &format!("invalid staged database: {e:#}"))
-                }
-                Err(e) => return Err(e),
+        let unsealed = match self.unsealed(&db) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.quarantine(&op, dir, &format!("invalid staged database: {error:#}"));
             }
-        } else {
-            true
         };
         if unsealed {
             if dir == &live && live.try_exists()? {
@@ -417,6 +412,14 @@ impl Stores {
     }
 
     fn unsealed(&self, db: &Path) -> Result<bool> {
+        // A crash before initialization can leave a private stage without a file.
+        match fs::symlink_metadata(db) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", db.display()))
+            }
+            Ok(_) => {}
+        }
         let _permit = Permits::take(1);
         let c = layout::open(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Schema, version and seal are installed in a single transaction.
@@ -452,7 +455,7 @@ impl Stores {
         };
         let dest = self.sessions().join(".quarantine").join(&op.operation);
         if !dest.try_exists()? {
-            layout::rename(&source, &dest)?;
+            layout::rename(&source, &dest).context(QuarantineMove)?;
         }
         sync_dir(dest.parent().unwrap())?;
         sync_dir(source.parent().unwrap())?;
@@ -515,11 +518,10 @@ impl Stores {
         };
         let projection = match inspect() {
             Ok(p) => p,
-            Err(e) if damaged_shard(&e) => {
+            Err(e) => {
                 self.quarantine(op, dir, &format!("invalid sealed database: {e:#}"))?;
                 return Err(e);
             }
-            Err(e) => return Err(e),
         };
 
         self.step(Phase::Checkpointed)?;
@@ -585,9 +587,6 @@ impl Stores {
         if (dir == &live || !cleanup_authorized) && dir.try_exists()? {
             let verify = || -> Result<()> {
                 let path = dir.join("session.db");
-                if !path.try_exists()? {
-                    return Err(layout::InvalidFormat("Missing retiring session.db".into()).into());
-                }
                 let _permit = Permits::take(1);
                 let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 layout::verify(&conn, SESSION)?;
@@ -595,14 +594,7 @@ impl Stores {
                 verify_manifest(&conn, &op.store, &op.id, &op.incarnation)
             };
             if let Err(error) = verify() {
-                if damaged_shard(&error) {
-                    return self.quarantine(
-                        op,
-                        dir,
-                        &format!("invalid retiring database: {error:#}"),
-                    );
-                }
-                return Err(error);
+                return self.quarantine(op, dir, &format!("invalid retiring database: {error:#}"));
             }
         }
         if live.try_exists()? {
@@ -643,8 +635,11 @@ impl Stores {
             if let Err(error) = self.recover_key(&key) {
                 // Quarantined operations are terminal. Windows sharing errors
                 // stay journaled and can be retried independently of other IDs.
-                if self.pending(&key)?.is_some() && !sharing_violation(&error) {
-                    return Err(error);
+                if self.pending(&key)?.is_some() {
+                    if !error.is::<QuarantineMove>() && !sharing_violation(&error) {
+                        return Err(error);
+                    }
+                    tracing::warn!(%key, cause = %error, "Session remains hidden pending filesystem recovery");
                 }
             }
         }
@@ -834,36 +829,9 @@ fn owned_inspection(dir: &Path, store: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn damaged_shard(error: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(_, Some(message))) = error.downcast_ref() {
-        if [
-            "no such table:",
-            "no such column:",
-            "foreign key mismatch",
-            "malformed database schema",
-        ]
-        .iter()
-        .any(|prefix| message.starts_with(prefix))
-        {
-            return true;
-        }
-    }
-    error.is::<layout::InvalidFormat>()
-        || matches!(
-            error.downcast_ref::<rusqlite::Error>(),
-            Some(
-                rusqlite::Error::QueryReturnedNoRows
-                    | rusqlite::Error::InvalidColumnType(..)
-                    | rusqlite::Error::FromSqlConversionFailure(..)
-            ) | Some(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase,
-                    ..
-                },
-                _
-            ))
-        )
-}
+#[derive(Debug, thiserror::Error)]
+#[error("Moving journaled shard into quarantine")]
+struct QuarantineMove;
 
 fn sharing_violation(e: &anyhow::Error) -> bool {
     cfg!(windows)

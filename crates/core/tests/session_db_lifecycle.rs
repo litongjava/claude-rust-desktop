@@ -1260,3 +1260,53 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
     assert!(Stores::open_for_test(&root)?.open_session(ID).is_err());
     Ok(())
 }
+
+#[test]
+fn round2_pending_shard_path_damage_is_local_to_create_and_delete() -> Result<()> {
+    for deleting in [false, true] {
+        let root = tempdir()?;
+        let s = Stores::open_for_test(root.path())?;
+        s.create("healthy", first())?;
+        let path = if deleting {
+            let handle = stop_at(&s, Phase::DeleteIntent).create(ID, first())?;
+            assert!(handle.delete().is_err());
+            shard(root.path())
+        } else {
+            assert!(stop_at(&s, Phase::Sealed).create(ID, first()).is_err());
+            fs::read_dir(root.path().join("sessions/.staging"))?
+                .next()
+                .unwrap()?
+                .path()
+                .join("session.db")
+        };
+        fs::rename(&path, path.with_extension("saved"))?;
+        fs::create_dir(path)?;
+        drop(s);
+        for _ in 0..2 {
+            let reopened = Stores::open_for_test(root.path())?;
+            assert_eq!(
+                reopened
+                    .open_session("healthy")?
+                    .read(|r| r.initial_message())?,
+                Some(first_message())
+            );
+            assert!(reopened.open_session(ID).is_err());
+            assert_eq!(pending(root.path()), 0);
+            let reason: String = query(
+                &global(root.path()),
+                "SELECT quarantine_reason FROM lifecycle",
+            );
+            assert!(reason.contains("regular file"), "{reason}");
+            let evidence = fs::read_dir(root.path().join("sessions/.quarantine"))?
+                .next()
+                .unwrap()?
+                .path();
+            assert!(evidence.join("session.db").is_dir());
+            assert!(evidence.join("session.saved").is_file());
+            if deleting {
+                assert!(reopened.create(ID, first()).is_err());
+            }
+        }
+    }
+    Ok(())
+}
