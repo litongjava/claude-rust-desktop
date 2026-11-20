@@ -866,6 +866,11 @@ fn populated_v2_inbox_upgrades_with_outstanding_claim() -> Result<()> {
         g.execute_batch("INSERT INTO session_inbox SELECT id,sender,recipient,project_source,payload,size,created_at,state,generation,read,blocked_reason,committed_at FROM inbox_fixture;
             INSERT INTO session_inbox_operations SELECT * FROM operations_fixture;
             DROP TABLE operations_fixture; DROP TABLE inbox_fixture;
+            DROP TABLE global_settings;
+            ALTER TABLE conversations DROP COLUMN request_count;
+            ALTER TABLE conversations DROP COLUMN input_tokens;
+            ALTER TABLE conversations DROP COLUMN output_tokens;
+            ALTER TABLE conversations DROP COLUMN total_tokens;
             PRAGMA user_version=2; COMMIT;")?;
     }
     let stores = Stores::open_for_test(root.path())?;

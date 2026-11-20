@@ -12,8 +12,8 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-const GLOBAL_VERSION: i32 = 3;
-const SESSION_VERSION: i32 = 2;
+const GLOBAL_VERSION: i32 = 4;
+const SESSION_VERSION: i32 = 3;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -158,9 +158,9 @@ fn additions(kind: i32) -> &'static str {
     }
 }
 
-pub(super) fn is_v1(path: &Path, kind: i32) -> Result<bool> {
+pub(super) fn needs_upgrade(path: &Path, kind: i32) -> Result<bool> {
     let c = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    Ok(c.query_row("SELECT application_id=?1 AND user_version=1 FROM pragma_application_id,pragma_user_version", [kind], |r| r.get(0))?)
+    Ok(c.query_row("SELECT application_id=?1 AND user_version BETWEEN 1 AND ?2-1 FROM pragma_application_id,pragma_user_version", [kind, schema_version(kind)], |r| r.get(0))?)
 }
 
 // Caller owns the exclusive lifecycle lock and has checked the store identity.
@@ -169,18 +169,29 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     ensure!(
-        version == 1 || (kind == GLOBAL && version == 2),
+        (1..schema_version(kind)).contains(&version),
         "Unsupported upgrade"
     );
     verify_version(&tx, kind, version)?;
     if version == 1 {
         tx.execute_batch(additions(kind))?;
     }
-    if kind == GLOBAL {
+    if kind == GLOBAL && version < 3 {
         tx.execute_batch(include_str!("inbox_v3.sql"))?;
     }
+    install_state(&tx, kind)?;
     tx.pragma_update(None, "user_version", schema_version(kind))?;
     tx.commit()?;
+    Ok(())
+}
+
+fn install_state(c: &Connection, kind: i32) -> Result<()> {
+    if kind == GLOBAL {
+        c.execute_batch(include_str!("summaries.sql"))?;
+    } else {
+        c.execute_batch(include_str!("state.sql"))?;
+        crate::db::context_search_index::migrate(c)?;
+    }
     Ok(())
 }
 
@@ -255,11 +266,25 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
     if kind == GLOBAL && expected >= 3 {
         conn.prepare("SELECT sender_incarnation FROM session_inbox LIMIT 0")?;
     }
+    let state: &[(&str, &str)] = if kind == GLOBAL && expected >= 4 {
+        &[("global_settings", "domain name value"),
+          ("conversations", "request_count input_tokens output_tokens total_tokens")]
+    } else if kind == SESSION && expected >= 3 {
+        let triggers: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger'
+            AND name IN ('context_search_messages_insert','context_search_messages_update','context_search_messages_delete',
+                         'context_search_tool_calls_insert','context_search_tool_calls_update','context_search_tool_calls_delete')", [], |r|r.get(0))?;
+        ensure!(triggers == 6, "Missing session search trigger");
+        &[("peripheral_settings","key value"),("file_read_stamps","path modified_ns size"),
+          ("compaction_request","singleton id keep"),("compaction_checkpoint","fingerprint request_key summary"),
+          ("approved_plan_boundaries","message_id"),("message_metadata","message_id value"),("request_metadata","request_id value"),
+          ("context_search_sources","kind id owner sort_order sequence label stamp boundary size chunked"),
+          ("context_search_chunks","kind id part body")]
+    } else { &[] };
     let mut columns = conn.prepare_cached(
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
     )?;
-    for &(table, required) in tables.iter().chain(added) {
+    for &(table, required) in tables.iter().chain(added).chain(state) {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -338,6 +363,7 @@ pub(super) fn initialize(
     if kind == GLOBAL {
         tx.execute_batch(include_str!("inbox_v3.sql"))?;
     }
+    install_state(&tx, kind)?;
     populate(&tx)?;
     tx.commit()?;
     Ok(conn)

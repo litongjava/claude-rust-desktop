@@ -551,7 +551,7 @@ impl Stores {
     }
 
     fn upgrade_pending(&self, op: &Intent, path: &Path) -> Result<()> {
-        if layout::is_v1(path, SESSION)? {
+        if layout::needs_upgrade(path, SESSION)? {
             let c = layout::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             verify_manifest(&c, &op.store, &op.id, &op.incarnation)?;
             if op.kind == "create" {

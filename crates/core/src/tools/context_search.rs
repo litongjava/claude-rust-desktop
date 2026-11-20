@@ -120,6 +120,14 @@ impl Matcher<'_> {
 }
 
 pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<String> {
+    search(session, value, |selection| db.with_conn(|conn| context_search_repo::read(conn, session, selection))?)
+}
+
+pub(crate) fn search(
+    cursor_scope: &str,
+    value: Value,
+    read: impl FnOnce(Selection<'_>) -> Result<context_search_repo::Transcript>,
+) -> Result<String> {
     let input: Input = serde_json::from_value(value).context("Invalid ContextSearch input")?;
     let limit = input.limit.unwrap_or(5);
     ensure!(
@@ -162,7 +170,7 @@ pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<Str
         Role::Tool => "tool",
     });
     let scope: [u8; 32] = Sha256::digest(serde_json::to_vec(&(
-        session,
+        cursor_scope,
         &input.query,
         input.regex,
         role,
@@ -196,19 +204,13 @@ pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<Str
         (None, Some(id)) => Boundary::Pinned(Some(id)),
         (None, None) => Boundary::Latest,
     };
-    let mut transcript = db.with_conn(|conn| {
-        context_search_repo::read(
-            conn,
-            session,
-            Selection {
-                range: input.range,
-                boundary,
-                role,
-                tool_name: input.tool_name.as_deref(),
-                position: previous.as_ref().map(|cursor| &cursor.position),
-            },
-        )
-    })??;
+    let mut transcript = read(Selection {
+        range: input.range,
+        boundary,
+        role,
+        tool_name: input.tool_name.as_deref(),
+        position: previous.as_ref().map(|cursor| &cursor.position),
+    })?;
 
     transcript.sources.retain_mut(|source| {
         if let Some(name) = &source.location.tool_name {

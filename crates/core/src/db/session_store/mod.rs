@@ -177,14 +177,14 @@ impl Stores {
         let path = self.sessions().join(&handle.key).join("session.db");
         let old = {
             let _permit = Permits::take(1);
-            layout::is_v1(&path, SESSION)?
+            layout::needs_upgrade(&path, SESSION)?
         };
         if old {
             drop(locks);
             locks = self.key_lock(&handle.key, true, false)?;
             handle.check_directory()?;
             let _permit = Permits::take(1);
-            if layout::is_v1(&path, SESSION)? {
+            if layout::needs_upgrade(&path, SESSION)? {
                 let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 verify_manifest(&c, self.global().store_uuid(), id, &handle.incarnation)?;
                 drop(c);

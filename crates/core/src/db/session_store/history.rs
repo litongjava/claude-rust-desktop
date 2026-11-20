@@ -127,6 +127,11 @@ fn stream_occurrence_id(message: &str, provider_id: &str) -> String {
 }
 
 impl SessionDb {
+    pub fn context_search(&self, input: Value) -> Result<String> {
+        crate::tools::context_search::search(&self.incarnation, input, |selection| {
+            self.read(|r| crate::db::context_search_repo::read_snapshot(r.0, &self.id, selection))
+        })
+    }
     pub fn id(&self) -> &str {
         &self.id
     }
