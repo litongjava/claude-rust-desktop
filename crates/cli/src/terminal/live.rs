@@ -150,7 +150,7 @@ impl LiveTurn {
         let worker = thread::spawn(move || {
             let result = terminal::enable_raw_mode()
                 // Capture tool disclosure clicks and drag selection.
-                .and_then(|_| execute!(io::stderr(), EnableBracketedPaste, EnableMouseCapture));
+                .and_then(|_| execute!(crate::terminal_output::stderr(), EnableBracketedPaste, EnableMouseCapture));
             if result.is_err() {
                 let _ = terminal::disable_raw_mode();
                 let _ = ready.send(false);
@@ -177,7 +177,14 @@ impl LiveTurn {
                 aligned,
                 ..Frame::default()
             };
-            let _ = run(&mut state, &mut screen, receiver, actions);
+            // Publish terminal loss before dropping the action and answer senders.
+            let result = run(&mut state, &mut screen, &receiver, &actions);
+            #[cfg(unix)]
+            if result.is_err() {
+                crate::signals::check_terminal_hangup();
+            }
+            #[cfg(not(unix))]
+            let _ = result;
             let _ = screen.clear();
             // The prompt that follows starts right below these lines.
             std::mem::take(&mut screen.scrollback).save();
@@ -290,7 +297,7 @@ impl Drop for LiveTurn {
 struct RawGuard;
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stderr(), DisableBracketedPaste, DisableMouseCapture);
+        let _ = execute!(crate::terminal_output::stderr(), DisableBracketedPaste, DisableMouseCapture);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -2182,7 +2189,7 @@ fn choice_lines(choice: &Choice, kept: &str, typeahead: &str, status: &str, mode
 }
 
 fn write(text: &str) -> io::Result<()> {
-    let mut output = io::stderr().lock();
+    let mut output = crate::terminal_output::stderr_locked();
     // Synchronized output: terminals that support it present the whole update
     // at once; others ignore the private mode.
     output.write_all(b"\x1b[?2026h")?;
@@ -2193,8 +2200,8 @@ fn write(text: &str) -> io::Result<()> {
 fn run(
     state: &mut State,
     screen: &mut Frame,
-    updates: mpsc::Receiver<Update>,
-    actions: async_mpsc::UnboundedSender<Action>,
+    updates: &mpsc::Receiver<Update>,
+    actions: &async_mpsc::UnboundedSender<Action>,
 ) -> io::Result<()> {
     let _alternate_cleanup = AlternateCleanup;
     let mut selection = super::mouse_selection::Selection::default();
@@ -2244,7 +2251,7 @@ fn run(
                         state.copy_feedback = Some(text);
                     } else if command.trim() == "/status" || command.trim().starts_with("/tasks") {
                         if state.status_page.is_none() {
-                            execute!(io::stderr(), terminal::EnterAlternateScreen)?;
+                            execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
                         }
                         state.inspection_scroll = 0;
                         state.inspection_title = if command.trim().starts_with("/tasks") { "Tasks" } else { "Status" }.into();
@@ -2458,7 +2465,7 @@ fn run(
                     drop(subagents.take());
                     state.subagents_open = false;
                     if state.status_page.take().is_some() {
-                        execute!(io::stderr(), terminal::LeaveAlternateScreen)?;
+                        execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen)?;
                     }
                     state.agent_detail = None;
                     screen.history_view.close()?;
@@ -2591,7 +2598,7 @@ fn run(
                 if matches!(&event, Event::Key(key) if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) || key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
                 {
                     state.status_page = None;
-                    execute!(io::stderr(), terminal::LeaveAlternateScreen)?;
+                    execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen)?;
                     screen.lines.clear();
                     screen.draw(state)?;
                 }
@@ -2661,7 +2668,7 @@ fn run(
                     }
                     // With a menu open, shift+tab belongs to the menu.
                     if crate::keybindings::is_cycle_permission(key) && state.choice.is_none() {
-                        state.cycle_permission(&actions);
+                        state.cycle_permission(actions);
                         continue;
                     }
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2671,7 +2678,7 @@ fn run(
                     let before: String = state.draft.characters.iter().collect();
                     if state.choice_key(key) || state.menu_key(key) {
                     } else if control && matches!(key.code, KeyCode::Char('y' | 'n')) && state.goal_proposal.is_some() && state.answer.is_none() {
-                        state.decide_goal(key.code == KeyCode::Char('y'), &actions);
+                        state.decide_goal(key.code == KeyCode::Char('y'), actions);
                     } else if crate::images::is_image_paste_key(key) && state.answer.is_none() {
                         // As at the prompt: an image on the clipboard joins the
                         // message being written as [Image #N].
@@ -2808,10 +2815,10 @@ fn run(
                                 state.draft.insert("\n");
                             }
                             KeyCode::Tab if state.answer.is_none() => {
-                                state.queue_message(&actions);
+                                state.queue_message(actions);
                             }
                             KeyCode::Enter => {
-                                if let Some(message) = state.submit(&actions) {
+                                if let Some(message) = state.submit(actions) {
                                     screen.log(&message)?;
                                 }
                             }
@@ -3238,7 +3245,7 @@ fn flush_notices(state: &mut State, screen: &mut Frame) -> io::Result<()> {
 struct AlternateCleanup;
 impl Drop for AlternateCleanup {
     fn drop(&mut self) {
-        let _ = execute!(io::stderr(), terminal::LeaveAlternateScreen);
+        let _ = execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen);
     }
 }
 
@@ -3268,7 +3275,7 @@ pub(crate) fn show_inspection(title: &str, text: &str) -> io::Result<()> {
         terminal::enable_raw_mode()?;
     }
     let _raw = (!was_raw).then(|| RawGuard);
-    execute!(io::stderr(), terminal::EnterAlternateScreen)?;
+    execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
     let _screen = AlternateCleanup;
     let mut reader = super::paste_input::Reader::new()?;
     let title = format!("{title} · ↑/↓ scroll · Esc to close");

@@ -83,10 +83,11 @@ pub async fn turn(
     input: &mut Option<TerminalInput>,
 ) -> Result<()> {
     let mut next = prompt.to_owned();
-    loop {
+    while !crate::signals::terminating() {
         let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input)).await? else { return Ok(()) };
         next = kickoff;
     }
+    Ok(())
 }
 
 /// A frontend that was killed cannot release its lease, which then expires
@@ -413,6 +414,7 @@ async fn observe(
     // loop keeps watching after cancelling, so the branch rearms.
     let mut interrupt = crate::signals::interrupt_scope();
     let mut termination_handled = false;
+    let mut terminal_actions_open = true;
     loop {
         tokio::select! {
             hooks = local_hooks.changed() => {
@@ -601,6 +603,7 @@ async fn observe(
             },
             answer = async { match pending.as_mut() { Some((_, answer)) => answer.await, None => std::future::pending().await } } => {
                 let (request, _) = pending.take().unwrap();
+                if crate::signals::terminating() { continue; }
                 let mut answer = answer?;
                 if let Some((plan, path)) = pending_plan.take() {
                     if answer == "edit" {
@@ -625,11 +628,17 @@ async fn observe(
                 } else { std::future::pending().await }
             } => {
                 let (request, _) = plain_pending.take().unwrap();
+                #[cfg(unix)]
+                if answer.is_err() { crate::signals::check_terminal_hangup(); }
+                if crate::signals::terminating() { continue; }
                 if let Some(answer) = answer? { answer_if_current(root, id, owner, &request, &answer)?; }
                 answered.insert(request);
                 display.set_activity("Working");
             },
-            action = display.action() => {
+            action = display.action(), if terminal_actions_open => {
+                // A closed action channel remains ready forever. Cancel once
+                // and let the observer sleep between worker status checks.
+                terminal_actions_open = action.is_some();
                 match action {
                     Some(Action::GoalDecision { id, approved }) => {
                         if let Some(frontend) = proposal_frontend {

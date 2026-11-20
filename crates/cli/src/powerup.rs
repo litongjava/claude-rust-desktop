@@ -207,7 +207,7 @@ struct Modal {
 impl Drop for Modal {
     fn drop(&mut self) {
         let _ = self.screen.suspend();
-        let _ = execute!(io::stderr(), Show, ResetColor);
+        let _ = execute!(crate::terminal_output::stderr(), Show, ResetColor);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -231,7 +231,7 @@ pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
     let mut modal = Modal {
         screen: Screen::default(),
     };
-    execute!(io::stderr(), Hide)?;
+    execute!(crate::terminal_output::stderr(), Hide)?;
     let mut reader = crate::terminal::paste_input::Reader::new()?;
     loop {
         let (columns, rows) = crate::terminal::size();

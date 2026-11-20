@@ -6,3 +6,5 @@ crates/core/tests/fixtures/*.pdf binary
 # Android preparation runs in Linux/WSL even when checked out on Windows.
 scripts/fetch-android-proot.sh text eol=lf
 src-tauri/gen/android/gradlew text eol=lf
+# Preserve the crates.io README, including upstream trailing spaces.
+vendor/crossterm/README.md text eol=lf whitespace=-blank-at-eol

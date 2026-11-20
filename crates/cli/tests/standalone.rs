@@ -850,3 +850,24 @@ async fn session_lifecycle_hooks_run_once_per_frontend_and_resume_context_reache
     assert!(!requests[1]["messages"][0]["content"].as_str().unwrap().contains("LIFECYCLE_CONTEXT:startup"));
     server.abort();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn redirected_output_config_confirmation_reports_enospc() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let status = command(&data, root.path())
+        .args(["config", "set", "tools.Read.enabled", "true"])
+        .stderr(full)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.join("customization.json")).unwrap()).unwrap();
+    assert_eq!(saved["tool_loading"]["Read"]["enabled"], true);
+}

@@ -20,7 +20,7 @@ struct PluginsScreen;
 impl PluginsScreen {
     fn enter() -> std::io::Result<Self> {
         crossterm::execute!(
-            std::io::stderr(),
+            crate::terminal_output::stderr(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0)
@@ -31,7 +31,7 @@ impl PluginsScreen {
 
 impl Drop for PluginsScreen {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
     }
 }
 

@@ -57,12 +57,13 @@ pub async fn run(address: &str, token: Option<&str>) -> Result<()> {
         .send(&json!({"type": "size", "cols": size.0, "rows": size.1}))
         .await?;
     let mut input = spawn_input();
-    let mut stdout = std::io::stdout();
+    let mut stdout = crate::terminal_output::stdout();
     let mut size_check = tokio::time::interval(Duration::from_millis(250));
     let mut keep_alive = tokio::time::interval(peer::KEEP_ALIVE);
     let mut last_seen = Instant::now();
     let ending = loop {
         tokio::select! {
+            _ = crate::signals::termination() => break Ending::Detached,
             frame = channel.recv() => {
                 let frame = match frame {
                     Ok(Some(frame)) => frame,
@@ -141,7 +142,7 @@ struct Terminal;
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        let mut stderr = std::io::stderr();
+        let mut stderr = crate::terminal_output::stderr();
         let _ = stderr.write_all(
             b"\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b[999;1H\r\n",
         );

@@ -33,6 +33,9 @@ base64 = "0.22"
 tracing = "0.1"
 vte = "0.15"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # The workflow script engine; the crate ships no Android bindings.
 rquickjs = { version = "0.14.0", features = ["futures", "macro"] }

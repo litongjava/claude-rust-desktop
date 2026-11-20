@@ -132,7 +132,7 @@ pub async fn command(paths: &deepseek_code_core::runtime::RuntimePaths, workspac
                 use std::io::{BufRead, IsTerminal, Write};
                 anyhow::ensure!(std::io::stdin().is_terminal(), "Pass --yes to install without a terminal");
                 eprint!("{question} ");
-                std::io::stderr().flush()?;
+                crate::terminal_output::stderr().flush()?;
                 let mut answer = String::new();
                 std::io::stdin().lock().read_line(&mut answer)?;
                 if !is_yes(&answer) {

@@ -120,7 +120,7 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 
 注意事项：
 
-- 每轮用新的数据目录，测试结束后结束自己启动的进程。
+- 每轮用新的数据目录。启动前安排清理，正常退出、断言失败及超时都要终止并等待回收自己启动的 dcl。关闭 PTY 或停止 tmux 后仍要检查进程，必要时按已确认的进程身份强制结束并回收。
 - `until` 等待的文字如果也出现在自己输入的提示词里，会立刻匹配成功，这时后面的输入会变成运行中发送。等待模型回复时要选提示词里没有的文字，或用固定等待。
 - 不要用 `pkill -f "某段文字"`，它会连当前 shell 一起结束。
 - 用外部 `kill` 命令结束进程组时，负数 PID 前必须加 `--`（`kill -9 -- -123456`）。Debian 的 procps `kill -9 -123456` 会被解析成 `kill(-1, SIGKILL)`，结束当前用户的全部进程，包括 tmux 和正在运行的 dcl。代码里优先直接调用 `rustix::process::kill_process_group`；`external_kill_never_takes_a_negative_pid_without_separator` 会检查源码。
@@ -314,6 +314,21 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- signals::
 ```
 
 `interrupt_signals` 的六个用例分别覆盖 Bash+SIGTERM、Bash+SIGHUP、Codex+SIGTERM、启动中的 Codex 只收到一次 SIGINT，以及两条夹具回归（清理过程中的晚 fork、错误继承 token 的重设）。前三个用例确认取消与进程树清理，第四个用例覆盖“事件处理间隙”：`run_timed_turn` 在函数开始时创建一次 `signals::interrupt_scope()`，信号基线在创建时同步取得；改回每次 `tokio::select!` 新建 `signals::interrupted()` 时，若 Ctrl-C 在 select 结束、事件处理（stream-json 输出、transcript 写入）期间到达，下一次等待会把已经加一的计数当作自己的基线，信号丢失，回合继续。该用例用 `fcntl(F_SETPIPE_SZ, 4096)` 请求 4 KiB 的 dcl stdout 管道容量，再用 `F_GETPIPE_SZ` 读回实际容量并断言其为正、≤ 65536 且小于填充记录的长度（大页宿主机可能把请求向上取整，所以断言针对读回值），接着用 110 KB 的 prompt 让 `tool_start` 记录远超该容量，使 dcl 阻塞在事件处理的同步写入中；在此时只发一次 SIGINT，dcl 必须在 10 秒内以非零状态退出，且假 codex 启动器及其 `sleep 120` 子进程都不存活。夹具进程的环境里带有按运行生成的 token：假 codex 启动器发现自己的 token 不是本轮的准确值就 `exec` 重设（pid 不变），所有后代继承该值，因此调用方环境里的旧 token 不会让整棵进程树变得不可发现。发信号前用例还要求启动器和子进程都出现在按 token 的发现结果里（标记文件本身不能替代该前置条件）。清理按 token 扫描 `/proc/<pid>/environ` 找到进程，先打开 pidfd 再复核 token，只用该描述符发送 SIGKILL，因此扫描之后被复用的 pid 不会被误杀；清理服从单一 2 秒截止（晚 fork 用例用自己的有界预算），只有成功扫描连续为空满 150 ms 才算成功，否则在结果中报告 “cleanup deadline expired before an empty interval was confirmed”，不会因为最后一次扫描恰好为空就当作干净。僵尸（`Z`/`X`）不计入残留，产品断言前有 2 秒回收等待，且该断言先于任何守卫清理执行，否则会掩盖产品回归。dcl 由 `child.wait()` 回收后不再另行 kill。两条夹具回归分别验证：`cleanup_rescans_for_a_child_forked_after_discovery` 在第一次快照之后才释放被门控的启动器，就地用 pidfd 固定已被 token 认证的晚 fork 子进程，之后要求后续扫描发现并停掉它，并以“pidfd 报告进程已消失或 `Z`/`X` 状态”判定它不再运行（孤儿僵尸不算存活）；`the_launcher_replaces_a_wrong_inherited_token` 用每次运行唯一的错误 token 启动，并为该 stale token 单独创建一个守卫，即使启动器的重设回归也不会让 `sleep 120` 逃逸。两条独立夹具在启动任何进程之前都先预检 pidfd 能力。**该用例与上述夹具仅限 Linux 的 x86_64/aarch64 64 位目标**（pidfd 系统调用号 434/424、`/proc` 与 Linux 的单个参数长度上限；指针宽度排除 x32/ILP32 变体），启动夹具前先用自身进程预检 pidfd 能力，缺失时以明确信息失败。把它换回旧的每次新建等待时该用例会失败（旧代码挂起直到超时），用于确认测试覆盖该缺陷。`signals::tests` 另外覆盖平台无关的通知语义：多个等待者同时唤醒、旧信号不唤醒新等待者（新 scope 不继承旧信号）、终止信号在等待者出现前到达仍被记住、Ctrl-C 不触发进程退出、scope 在首次 poll 之前或两次等待之间收到的信号不会丢失、同一 scope 连续两次等待都报告已观察到的中断、计数器回绕（从 `u64::MAX` 起）仍能检测、`rearm()` 之后只等待下一个信号，以及注入的部分注册失败会在第一个错误处停止。worker 观察循环另有两条真实信号用例（Linux）：`worker_frontend::failure_tests::a_sigint_during_a_tick_cancels_the_worker` 在子进程里运行真实的 `observe`，先把 stderr 管道用 `F_SETPIPE_SZ` 请求 4 KiB、断言读回值低于 200000 字节，并 `OBSERVER-NOTICE-` 处停止读取，使观察者阻塞在 tick 的同步输出里（此时不轮询 select），再发一次 SIGINT，放开管道后要求任务目录出现 `cancel`——若把 scope 建在循环内部，这次信号会丢失，用例失败；`a_termination_does_not_make_the_observer_spin` 在 SIGTERM 后确认 `cancel` 出现，并比较 1 秒前后 `/proc/<pid>/stat` 的 utime+stime，确认粘性终止信号不会让循环空转。
+
+#### Q1. Linux PTY 断开
+
+```bash
+cargo test --locked -p deepseek-code-cli --bin dcl --test standalone -- close_during_streaming_output redirected_output --nocapture
+cargo test --locked -p deepseek-code-cli --test local_coordination_registry terminal_hangup:: -- --nocapture
+cargo test --locked -p deepseek-code-cli --bin dcl -- --ignored --exact terminal_output::tests::redirected_output_file_eio_screen_reader_turn
+cargo test --locked -p deepseek-code-cli --bin dcl -- --ignored --exact terminal_output::tests::screen_reader_partial_write_and_full_session_volume
+```
+
+用隔离数据目录和本地 mock 在 Linux PTY 启动交互式 CLI。分别在空闲、回合中、启动确认界面及等待光标位置时关闭 master，并单独发送 SIGHUP 和空闲 SIGTERM。关闭非控制 PTY 时不会收到内核 SIGHUP，也必须取消。每次最多等 5 秒，使用 `wait4` 核对关闭阶段的 CPU 时间小于 700 毫秒，退出码为 1；空闲和回合中检查 frontend 注册记录已关闭，回合中检查用户消息及取消状态已写入数据库。 两个流式回归分别在读屏 stdout 和普通渲染 stderr 写入阻塞时断开 PTY，独立检查所有线程均未 panic、完整 assistant 增量已保存、SessionEnd 收到同一会话的 other 原因，以及退出耗时和 CPU 上限。
+
+重定向对照覆盖控制 PTY、另一个已挂断的 PTY、普通文件和 `/dev/full` 配置确认。读屏回合的 ENOSPC 与定向注入文件 EIO，以及输出路径与干净基线的比较脚本，见开发记录 `dev-support/deepseek-code/pty-hangup-20261119/report.md` 的 Round 4。
+
+共享卷用例需要可在普通用户下创建 tmpfs 的 `bwrap` 和 `strace`（可用 `STRACE` 指定路径）。用例创建独立的 16 MiB tmpfs，在模型回复前留下 32 KiB，核对 stdout 和 SQLite WAL 都出现 ENOSPC、回复只写入一部分、进程以 1 退出且未再提示输入。仅 WAL 写满与普通 flush 失败的基线对照见同一记录的 Round 5。
 
 ### I. 定时任务
 

@@ -357,7 +357,7 @@ fn write_frame(output: &str) {
     if output.is_empty() {
         return;
     }
-    let mut stderr = io::stderr().lock();
+    let mut stderr = crate::terminal_output::stderr_locked();
     let _ = stderr.write_all(output.as_bytes());
     let _ = stderr.flush();
 }
