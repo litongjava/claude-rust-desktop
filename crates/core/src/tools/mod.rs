@@ -157,7 +157,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         context_search::definition(),
         ToolDefinition {
             name: TOOL_LOAD_NAME.into(),
-            description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the system prompt and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
+            description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the conversation's system reminder and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

@@ -1019,15 +1019,23 @@ mod tests {
         assert!(body["messages"][2]["content"][1].get("cache_control").is_none());
 
         // The per-session tail moves after the first user message where accepted.
-        let composed = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code, Some(std::path::Path::new("/w")));
+        let composed = crate::prompt::compose_system_prompt_in(Some("custom rule"), crate::prompt::PromptProfile::Code);
         let (fixed, tail) = crate::prompt::split_tail(&composed).unwrap();
-        assert!(tail.starts_with("# Environment") && tail.contains("Primary working directory: /w") && !fixed.contains("Primary working directory"));
+        assert!(tail.starts_with("<additional_instructions>") && tail.contains("custom rule") && !tail.contains("# Environment"));
+        assert!(!fixed.contains("custom rule"));
         let mut moved = serde_json::json!({"system":composed,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
         move_system_tail(&mut moved);
         assert_eq!(moved["system"], fixed.as_str());
         assert_eq!(moved["messages"][1], serde_json::json!({"role":"system","content":tail}));
         apply_conversation_cache(&mut moved);
         assert!(moved["system"].as_array().unwrap().iter().all(|block| block["cache_control"]["type"] == "ephemeral"));
+        // A system prompt with no per-request tail is left where it is.
+        let plain = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code);
+        assert!(crate::prompt::split_tail(&plain).is_none() && !plain.contains("# Environment"));
+        let mut untouched = serde_json::json!({"system":plain,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
+        move_system_tail(&mut untouched);
+        assert_eq!(untouched["system"], plain);
+        assert_eq!(untouched["messages"].as_array().unwrap().len(), 2);
         let mut chat = serde_json::json!({"messages":[{"role":"system","content":composed},{"role":"user","content":"hi"}]});
         move_system_tail_chat(&mut chat);
         assert_eq!(chat["messages"][0]["content"], fixed.as_str());

@@ -129,6 +129,7 @@ async fn h5_chat_handler(
                 })],
                 model: model.clone(),
                 system_prompt: None,
+                standalone_frontend: false,
                 max_tokens: None,
                 workspace_path: None,
                 temperature: None,
