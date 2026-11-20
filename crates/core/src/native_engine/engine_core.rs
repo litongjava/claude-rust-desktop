@@ -1228,7 +1228,7 @@ impl QueryEngine {
         })
         .await??;
         // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminder(&instructions)
+        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
             .into_iter()
             .chain(
                 git_snapshot
