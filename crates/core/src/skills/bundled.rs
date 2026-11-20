@@ -176,7 +176,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let (commands, invalid) =
-            super::super::discovery::discover_runtime_from(None, &data, temp.path());
+            super::super::discovery::discover_runtime_from(&data, temp.path());
         assert!(invalid.is_empty(), "{invalid:?}");
         let command = &commands["task-template"];
         assert!(command.model_invocable());
@@ -260,7 +260,7 @@ mod tests {
     fn embedded_workflows_render_arguments_without_nonexistent_file_references() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("Cargo.toml"), "[package]").unwrap();
-        let commands = super::super::discovery::discover_from(None, temp.path()).unwrap();
+        let commands = super::super::discovery::discover_from(temp.path()).unwrap();
         for name in [
             "code-review",
             "dataviz",
@@ -288,7 +288,7 @@ mod tests {
         let data = temp.path().join("data");
 
         let (commands, invalid) =
-            super::super::discovery::discover_runtime_from(None, &data, &workspace);
+            super::super::discovery::discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         for name in ["translate-zh-en", "translate-en-zh"] {
             let command = &commands[name];
@@ -303,7 +303,7 @@ mod tests {
         )
         .unwrap();
         let (commands, invalid) =
-            super::super::discovery::discover_runtime_from(None, &data, &workspace);
+            super::super::discovery::discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         assert!(!commands["translate-zh-en"].disable_model_invocation);
         assert!(commands["translate-zh-en"].user_invocable);
@@ -316,7 +316,7 @@ mod tests {
         let dir = temp.path().join(".claude/commands");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("code-review.md"), "Custom review $ARGUMENTS").unwrap();
-        let commands = super::super::discovery::discover_from(None, temp.path()).unwrap();
+        let commands = super::super::discovery::discover_from(temp.path()).unwrap();
         assert!(commands["code-review"]
             .render("HEAD", "id")
             .unwrap()

@@ -124,9 +124,9 @@ impl SkillsManager {
     pub async fn load_skills(&self) -> Result<Vec<Skill>> {
         let mut skills = Vec::new();
 
-        // Migrate before scanning so a removed placeholder cannot be reported
-        // as a user skill from the same directory tree.
-        self.install_bundled_skills()?;
+        // Migrate and clean up before scanning so a removed placeholder or a
+        // pristine legacy built-in cannot be reported as a user skill.
+        self.ensure_installed()?;
 
         let user_skills_path = self.get_skills_path(&SkillSource::User);
         if user_skills_path.exists() {
@@ -136,7 +136,6 @@ impl SkillsManager {
         }
 
         let bundled_skills_path = self.get_skills_path(&SkillSource::Bundled);
-        legacy_builtin::install(&bundled_skills_path)?;
         skills.extend(self.scan_skills_dir(&bundled_skills_path, SkillSource::Bundled)?);
 
         // Nested collections can be visited by both root and bundled scans.
@@ -160,14 +159,15 @@ impl SkillsManager {
         Ok(skills)
     }
 
-    /// Install first-run bundled and legacy built-in files without scanning.
-    /// Listing stays on the read-only discovery path. The pristine
-    /// `skill-creator` placeholder migration runs here too, because every
-    /// listing path calls this method before reading the data directory.
+    /// Install first-run bundled files and remove pristine legacy built-in
+    /// files without scanning. Listing stays on the read-only discovery path.
+    /// The pristine `skill-creator` placeholder migration runs here too, because
+    /// every listing path calls this method before reading the data directory.
     pub fn ensure_installed(&self) -> Result<()> {
         let bundled = self.get_skills_path(&SkillSource::Bundled);
         self.install_bundled_skills()?;
-        legacy_builtin::install(&bundled)
+        legacy_builtin::cleanup(&self.get_skills_path(&SkillSource::User))?;
+        legacy_builtin::cleanup(&bundled)
     }
 
     fn scan_skills_subdirs(&self, base_path: &Path) -> Result<Vec<Skill>> {

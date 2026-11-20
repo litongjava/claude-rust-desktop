@@ -657,7 +657,15 @@ This skill provides utilities for:
     assert!(files.iter().any(|file| file["name"] == "scripts"));
     assert!(files.iter().any(|file| file["name"] == "license.txt"));
     assert!(!stub.exists());
-    assert!(data.join("skills/bundled/legacy-review/SKILL.md").exists());
+    // The edited sibling belongs to the user and survives; pristine generated
+    // legacy skills are neither installed nor listed any more.
+    assert_eq!(
+        std::fs::read_to_string(data.join("skills/bundled/legacy-review/SKILL.md")).unwrap(),
+        "user sibling"
+    );
+    for name in ["build", "commit", "document", "test"] {
+        assert!(!data.join(format!("skills/bundled/legacy-{name}")).exists());
+    }
 
     let help = std::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
         .args([

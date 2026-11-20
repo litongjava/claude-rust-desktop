@@ -78,39 +78,27 @@ impl SkillCommand {
 
 /// One resolver for the model-visible listing, the `Skill` tool and the CLI
 /// slash list. Precedence, lowest to highest: embedded workflows,
-/// `CLAUDE_CONFIG_DIR` (or `~/.claude`), `<data dir>/skills`,
-/// `<workspace>/.claude`. The data directory is the native user scope, so it
-/// overrides the Claude-compatible user root while the project still wins.
+/// `<data dir>/skills`, `<workspace>/.claude`. The data directory is the only
+/// user scope; the Claude-compatible user directory is not read.
 /// Data-directory names keep the pre-round-01 lowercase slugs (see
-/// [`scan_data_dir`]); the other roots keep their existing spelling.
+/// [`scan_data_dir`]); the project root keeps its existing spelling.
 pub fn discover(data_dir: &Path, workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
-    let user = user_config_dir();
-    Ok(discover_runtime_from(user.as_deref(), data_dir, workspace).0)
+    Ok(discover_runtime_from(data_dir, workspace).0)
 }
 
 /// Skill files discovery had to skip because they are invalid or unreadable;
 /// the plugins panel's Errors tab lists them.
 pub fn invalid_skill_files(data_dir: &Path, workspace: &Path) -> Vec<PathBuf> {
-    discover_runtime_from(user_config_dir().as_deref(), data_dir, workspace).1
+    discover_runtime_from(data_dir, workspace).1
 }
 
-fn user_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
-}
-
-/// Explicit roots for tests; same precedence as [`discover`].
+/// Explicit roots for tests; same roots as [`discover`].
 pub fn discover_runtime_from(
-    user_config: Option<&Path>,
     data_dir: &Path,
     workspace: &Path,
 ) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
     let mut commands = super::bundled::commands();
     let mut invalid = Vec::new();
-    if let Some(user) = user_config {
-        let _ = scan_config_impl(user, &mut commands, Some(&mut invalid));
-    }
     let _ = scan_data_dir(&data_dir.join("skills"), &mut commands, Some(&mut invalid));
     let _ = scan_config_impl(
         &workspace.join(".claude"),
@@ -126,18 +114,15 @@ pub fn discover_runtime_from(
 /// Invalid files never override valid definitions.
 /// Errors retain paths only: parser messages may contain credential values.
 pub fn discover_available_from(
-    user_config: Option<&Path>,
     workspace: &Path,
 ) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
     let mut commands = super::bundled::commands();
     let mut invalid = Vec::new();
-    for config in user_config
-        .into_iter()
-        .map(Path::to_path_buf)
-        .chain(std::iter::once(workspace.join(".claude")))
-    {
-        let _ = scan_config_impl(&config, &mut commands, Some(&mut invalid));
-    }
+    let _ = scan_config_impl(
+        &workspace.join(".claude"),
+        &mut commands,
+        Some(&mut invalid),
+    );
     log_invalid(&invalid);
     (commands, invalid)
 }
@@ -155,14 +140,8 @@ fn log_invalid(invalid: &[PathBuf]) {
 }
 
 /// Explicit roots allow fixture tests without reading or running personal skills.
-pub fn discover_from(
-    user_config: Option<&Path>,
-    workspace: &Path,
-) -> Result<BTreeMap<String, SkillCommand>> {
+pub fn discover_from(workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
     let mut commands = super::bundled::commands();
-    if let Some(user) = user_config {
-        scan_config(user, &mut commands)?;
-    }
     scan_config(&workspace.join(".claude"), &mut commands)?;
     Ok(commands)
 }
@@ -326,8 +305,7 @@ fn scan_config_impl(
 /// spelling: the lowercase slug of the skill's own name, or its path-stable id
 /// when that slug is empty, unusable or shared with another data-dir skill.
 /// Managed subdirectories (`bundled`, `mcp`) stay visible, as they already were
-/// in the slash list, but never replace an embedded workflow or a Claude-user
-/// definition of the same name.
+/// in the slash list, but never replace an embedded workflow of the same name.
 fn scan_data_dir(
     root: &Path,
     commands: &mut BTreeMap<String, SkillCommand>,
@@ -716,11 +694,11 @@ mod tests {
         std::fs::create_dir_all(&commands).unwrap();
         std::fs::write(commands.join("good.md"), "Good instructions").unwrap();
         std::fs::write(commands.join("doctor.md"), "---\nname: doctor\nenabled: NOT_A_BOOL_SECRET\n---\nInvalid replacement").unwrap();
-        let (available, invalid) = super::discover_available_from(None, root.path());
+        let (available, invalid) = super::discover_available_from(root.path());
         assert!(available["good"].content.contains("Good instructions"));
         assert_eq!(available["doctor"].path.parent().unwrap(), std::path::Path::new("__embedded_cli_skills__"));
         assert_eq!(invalid, vec![commands.join("doctor.md")]);
-        assert!(super::discover_from(None, root.path()).is_err());
+        assert!(super::discover_from(root.path()).is_err());
     }
 
     use super::*;
@@ -730,7 +708,7 @@ mod tests {
         let skill = temp.path().join(".claude/skills/private");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "---\ncontext: fork\nagent: Explore\nshell: powershell\nuser-invocable: false\n---\n!`Write-Output hidden`").unwrap();
-        let commands = discover_from(None, temp.path()).unwrap();
+        let commands = discover_from(temp.path()).unwrap();
         let skill = &commands["private"];
         assert_eq!(skill.context.as_deref(), Some("fork"));
         assert_eq!(skill.agent.as_deref(), Some("Explore"));
@@ -749,21 +727,19 @@ mod tests {
     }
 
     #[test]
-    fn project_overrides_user_and_nested_names_are_preserved() {
+    fn project_nested_names_and_invocation_flags_are_preserved() {
         let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
         let workspace = root.path().join("project");
-        for config in [&user, &workspace.join(".claude")] {
-            std::fs::create_dir_all(config.join("skills/team/review")).unwrap();
-            std::fs::write(config.join("skills/team/review/SKILL.md"), format!("---\ndescription: Review files\ndisable-model-invocation: true\n---\n{} $ARGUMENTS", config.display())).unwrap();
-        }
+        let config = workspace.join(".claude");
+        std::fs::create_dir_all(config.join("skills/team/review")).unwrap();
+        std::fs::write(config.join("skills/team/review/SKILL.md"), format!("---\ndescription: Review files\ndisable-model-invocation: true\n---\n{} $ARGUMENTS", config.display())).unwrap();
         std::fs::create_dir_all(workspace.join(".claude/commands")).unwrap();
         std::fs::write(
             workspace.join(".claude/commands/hidden.md"),
             "---\nuser-invocable: false\n---\nHidden",
         )
         .unwrap();
-        let found = discover_from(Some(&user), &workspace).unwrap();
+        let found = discover_from(&workspace).unwrap();
         assert!(found["team:review"].path.starts_with(&workspace));
         assert!(found["team:review"].disable_model_invocation);
         assert!(found["team:review"]
@@ -802,8 +778,8 @@ mod tests {
     #[test]
     fn plugin_checkouts_use_manifest_namespace_and_skip_structural_skills_directory() {
         let temp = tempfile::tempdir().unwrap();
-        let user = temp.path().join("user");
-        let plugin = user.join("skills/checkout-name");
+        let config = temp.path().join(".claude");
+        let plugin = config.join("skills/checkout-name");
         std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
         std::fs::write(
             plugin.join(".claude-plugin/plugin.json"),
@@ -821,10 +797,10 @@ mod tests {
             )
             .unwrap();
         }
-        let ordinary = user.join("skills/collection/skills/nested");
+        let ordinary = config.join("skills/collection/skills/nested");
         std::fs::create_dir_all(&ordinary).unwrap();
         std::fs::write(ordinary.join("SKILL.md"), "Ordinary nested skill").unwrap();
-        let found = discover_from(Some(&user), temp.path()).unwrap();
+        let found = discover_from(temp.path()).unwrap();
         assert!(found.contains_key("vendor-tools:deploy"));
         assert!(found.contains_key("vendor-tools:inspect"));
         assert!(found.contains_key("collection:skills:nested"));
@@ -842,10 +818,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_config_dir_skills_are_not_discovered_but_data_dir_skills_are() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        let claude_config = temp.path().join("claude-config");
+        write_skill(
+            &claude_config.join("skills"),
+            "user-scope",
+            "---\nname: user-scope\ndescription: Claude user fixture\n---\nCLAUDE_CONFIG",
+        );
+
+        // Set the variable only for this test and restore it afterwards.
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
+        let found = discover(&data, &workspace).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        assert!(
+            !found.contains_key("user-scope"),
+            "a skill under CLAUDE_CONFIG_DIR must not be discovered"
+        );
+
+        write_skill(
+            &data.join("skills"),
+            "user-scope",
+            "---\nname: user-scope\ndescription: Data directory fixture\n---\nDATA_DIR",
+        );
+        let found = discover(&data, &workspace).unwrap();
+        assert!(found["user-scope"].content.contains("DATA_DIR"));
+        assert!(found["user-scope"].path.starts_with(data.join("skills")));
+    }
+
+    #[test]
     fn runtime_discovery_lists_data_dir_skills_with_the_real_directory() {
         let temp = tempfile::tempdir().unwrap();
-        let user = temp.path().join("user");
-        std::fs::create_dir_all(&user).unwrap();
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
@@ -854,7 +864,7 @@ mod tests {
             "data-dir-check",
             "---\nname: data-dir-check\ndescription: Data directory fixture\n---\nRead references/setup.md, then inspect $ARGUMENTS",
         );
-        let (found, invalid) = discover_runtime_from(Some(&user), &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let skill = &found["data-dir-check"];
         assert_eq!(skill.path, data.join("skills/data-dir-check/SKILL.md"));
@@ -870,13 +880,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_discovery_prefers_project_then_data_dir_then_claude_user_and_lists_one_entry() {
+    fn runtime_discovery_prefers_project_over_data_dir_and_lists_one_entry() {
         let temp = tempfile::tempdir().unwrap();
-        let user = temp.path().join("user");
         let workspace = temp.path().join("project");
         let data = temp.path().join("data");
         for (root, label) in [
-            (&user, "CLAUDE_USER"),
             (&data.join("skills"), "DATA_DIR"),
             (&workspace.join(".claude/skills"), "PROJECT"),
         ] {
@@ -886,7 +894,7 @@ mod tests {
                 &format!("---\nname: shared\ndescription: {label}\n---\n{label}"),
             );
         }
-        let (found, _) = discover_runtime_from(Some(&user), &data, &workspace);
+        let (found, _) = discover_runtime_from(&data, &workspace);
         assert_eq!(
             found
                 .values()
@@ -898,7 +906,7 @@ mod tests {
         assert!(found["shared"].path.starts_with(&workspace));
 
         std::fs::remove_dir_all(workspace.join(".claude/skills/shared")).unwrap();
-        let (found, _) = discover_runtime_from(Some(&user), &data, &workspace);
+        let (found, _) = discover_runtime_from(&data, &workspace);
         assert_eq!(found["shared"].description, "DATA_DIR");
         assert!(found["shared"].path.starts_with(&data));
     }
@@ -925,7 +933,7 @@ mod tests {
             "manual-only",
             "---\nname: manual-only\nuser-invocable: false\n---\nModel only",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         assert!(!found.contains_key("disabled"));
         let hidden = &found["model-hidden"];
@@ -956,7 +964,7 @@ mod tests {
             "bad",
             "---\nname: bad\nenabled: NOT_A_BOOL\n---\nBroken",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(found.contains_key("good"));
         assert!(!found.contains_key("bad"));
         assert_eq!(invalid, vec![invalid_path]);
@@ -976,7 +984,7 @@ mod tests {
         );
         write_skill(
             &skills.join("bundled"),
-            "legacy-commit",
+            "commit",
             "---\nname: commit\ndescription: Commit fixture\n---\nCommit instructions",
         );
         write_skill(
@@ -989,7 +997,7 @@ mod tests {
             "code-review",
             "---\nname: code-review\ndescription: User review\n---\nUSER_OVERRIDE",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         // A managed copy must not replace the embedded workflow.
         assert_eq!(
@@ -1017,7 +1025,7 @@ mod tests {
             "skill-creator",
             "---\nname: skill-creator\ndescription: Modified bundled copy\n---\nMODIFIED_BUNDLED_CREATOR",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let creators: Vec<_> = found
             .values()
@@ -1042,7 +1050,7 @@ mod tests {
             "skill-creator",
             "---\nname: skill-creator\ndescription: User skill-creator copy\n---\nUSER_SKILL_CREATOR",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let creators: Vec<_> = found
             .values()
@@ -1054,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_placeholder_and_legacy_builtins_are_visible_to_both_views() {
+    fn installed_placeholder_is_migrated_and_no_legacy_builtins_are_listed() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1083,7 +1091,7 @@ mod tests {
             .unwrap();
         // Installation must remove the placeholder and must not write it again.
         assert!(!stub.exists());
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         // The embedded skill-creator reaches the model listing and the slash
         // list as exactly one entry; it has no data-directory copy.
@@ -1098,12 +1106,11 @@ mod tests {
             creators[0].path.parent(),
             Some(Path::new("__embedded_cli_skills__"))
         );
-        // The five legacy built-ins keep their previous data-directory entries.
+        // The five legacy built-ins are no longer installed or listed.
         for name in ["commit", "review", "test", "document", "build"] {
-            let skill = &found[name];
-            assert!(skill.model_invocable(), "{name} must stay model-invocable");
-            assert!(skill.user_invocable, "{name} must stay user-invocable");
-            assert!(skill.path.starts_with(data.join("skills")), "{name}");
+            assert!(!found.contains_key(name), "{name} must not be listed");
+            assert!(!data.join(format!("skills/legacy-{name}")).exists());
+            assert!(!data.join(format!("skills/bundled/legacy-{name}")).exists());
         }
     }
 
@@ -1121,14 +1128,14 @@ mod tests {
 
         crate::skills::states::set(&data, "demo", crate::skills::states::SkillState::UserOnly)
             .unwrap();
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let demo = &found["demo"];
         assert!(!demo.model_invocable());
         assert!(demo.user_invocable);
 
         crate::skills::states::set(&data, "demo", crate::skills::states::SkillState::Off).unwrap();
-        let (found, _) = discover_runtime_from(None, &data, &workspace);
+        let (found, _) = discover_runtime_from(&data, &workspace);
         assert!(!found.contains_key("demo"));
     }
 
@@ -1139,7 +1146,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
-        let (found, _) = discover_runtime_from(None, &data, &workspace);
+        let (found, _) = discover_runtime_from(&data, &workspace);
         assert!(!data.join("skills").exists());
         assert!(found.contains_key("doctor"));
     }
@@ -1169,7 +1176,7 @@ mod tests {
             "Deep Nested",
             "---\nname: Deep Nested\ndescription: Nested fixture\n---\nNested",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let keys = found.keys().collect::<Vec<_>>();
         assert!(found.contains_key("my-skill"), "{keys:?}");
@@ -1193,7 +1200,7 @@ mod tests {
             "Punctuation",
             "---\nname: R&D (team)'s check\ndescription: Punctuation fixture\n---\nCheck",
         );
-        let (found, invalid) = discover_runtime_from(None, &data, &workspace);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         let name = "r&d-(team)'s-check";
         let keys = found.keys().collect::<Vec<_>>();
@@ -1216,8 +1223,8 @@ mod tests {
                 "---\nname: Shared Skill\ndescription: Shared fixture\n---\nShared body",
             );
         }
-        let first = discover_runtime_from(None, &data, &workspace).0;
-        let second = discover_runtime_from(None, &data, &workspace).0;
+        let first = discover_runtime_from(&data, &workspace).0;
+        let second = discover_runtime_from(&data, &workspace).0;
         let first_path = skills.join("first-skill/SKILL.md");
         let second_path = skills.join("second-skill/SKILL.md");
         assert!(!first.contains_key("shared-skill"));

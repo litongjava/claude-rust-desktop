@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn embedded_skill_creator_is_discoverable_once_and_invocable() {
         let temp = tempfile::tempdir().unwrap();
-        let commands = crate::skills::discovery::discover_from(None, temp.path()).unwrap();
+        let commands = crate::skills::discovery::discover_from(temp.path()).unwrap();
         let matching: Vec<_> = commands
             .values()
             .filter(|command| command.name == NAME)

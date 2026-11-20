@@ -48,7 +48,7 @@ pub fn inspect(
     data: Option<&Path>,
     env: &Environment,
 ) {
-    let (_, invalid) = discovery::discover_available_from(env.user_config.as_deref(), workspace);
+    let (_, invalid) = discovery::discover_available_from(workspace);
     for path in invalid {
         let reason = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.len() > 1024 * 1024 => "Definition exceeds 1 MiB".to_owned(),
