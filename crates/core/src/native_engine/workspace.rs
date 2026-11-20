@@ -130,13 +130,13 @@ pub(crate) fn move_conversation_workspace_with(
 
 /// Use persisted mode, never infer Code from a directory, model, or client prompt.
 pub fn conversation_prompt_profile(conn: &Connection, id: &str) -> Result<crate::prompt::PromptProfile> {
-    Ok(conversation_repo::get_conversation(conn, id)?
+    Ok(conversation_repo::conversation_metadata(conn, id)?
         .map(|conversation| crate::prompt::PromptProfile::from_workspace_mode(&conversation.workspace_mode))
         .unwrap_or_default())
 }
 
 pub fn conversation_project(conn: &Connection, id: &str) -> Result<Option<project_repo::ProjectRow>> {
-    let conversation = conversation_repo::get_conversation(conn, id)?;
+    let conversation = conversation_repo::conversation_metadata(conn, id)?;
     if let Some(conversation) = conversation {
         if let Some(project_id) = conversation.project_id.filter(|id| !id.is_empty()) {
             let project = project_repo::require_trusted(conn, &project_id)?;
@@ -153,13 +153,13 @@ pub(crate) fn private_workspace_owner(conn: &Connection, id: &str) -> Result<Opt
         Ok(conn.query_row("SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?1", [id], |row| row.get(0)).optional()?)
     };
     if binding(id)?.is_none() { return Ok(None); }
-    let child = conversation_repo::get_conversation(conn,id)?.context("Private child not found")?;
+    let child = conversation_repo::conversation_metadata(conn,id)?.context("Private child not found")?;
     let mode = child.workspace_mode;
     let mut current=id.to_owned();
     let mut seen=std::collections::HashSet::new();
     for _ in 0..16 {
         ensure!(seen.insert(current.clone()), "Private workspace ownership cycle");
-        let session=conversation_repo::get_conversation(conn,&current)?.context("Private workspace owner not found")?;
+        let session=conversation_repo::conversation_metadata(conn,&current)?.context("Private workspace owner not found")?;
         ensure!(!session.archived && session.workspace_mode==mode && session.project_id.as_deref().is_none_or(str::is_empty), "Private workspace ownership mode/project/trust changed");
         match binding(&current)? {Some(parent)=>current=parent,None=>return Ok(Some(current))}
     }
@@ -189,7 +189,7 @@ pub fn resolve_workspace(
         return Ok((PathBuf::from(path), Some(project)));
     }
 
-    let conversation = conversation_repo::get_conversation(conn, id)?;
+    let conversation = conversation_repo::conversation_metadata(conn, id)?;
     // Internal jobs without a desktop conversation may explicitly supply their cwd.
     if conversation.is_none() {
         if let Some(path) = requested.filter(|path| !path.trim().is_empty()) {

@@ -33,6 +33,7 @@ pub enum Phase {
     BeforeTrashRemoval,
     Removed,
     Retired,
+    ForkSnapshot,
     DeliveryClaimed,
     DeliveryCommitted,
     DeliveryAcknowledged,
@@ -67,7 +68,7 @@ struct Metadata {
     #[serde(default)]
     copied: bool,
     #[serde(default)]
-    source: Option<(String, String, i64, bool)>,
+    source: Option<copy::Source>,
     title: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -251,7 +252,7 @@ impl Stores {
         id: &str,
         options: &CreateOptions,
         seed: &Seed<'_>,
-        source: Option<(String, String, i64, bool)>,
+        source: Option<copy::Source>,
     ) -> Result<(Intent, Metadata)> {
         let key = storage_key(id)?;
         let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2 UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?2 AND (quarantine_reason IS NULL OR kind='delete'))",[id,&key],|r|r.get(0))?;
@@ -305,7 +306,7 @@ impl Stores {
         id: &str,
         options: CreateOptions,
         seed: Seed<'_>,
-        source: Option<(String, String, i64, bool)>,
+        source: Option<copy::Source>,
     ) -> Result<SessionDb> {
         let (op, meta) = self.global().write("create intent", id, true, |tx| {
             let (op, meta) = self.prepare(tx, id, &options, &seed, source.clone())?;
@@ -346,6 +347,16 @@ impl Stores {
                     params![op.store, id, op.incarnation, op.operation, created, n],
                 )?;
                 if let Some(first) = first {
+                    let content = first
+                        .typed
+                        .clone()
+                        .unwrap_or_else(|| serde_json::Value::String(first.text.clone()));
+                    crate::services::permission_authority::record_conn(
+                        tx,
+                        id,
+                        crate::services::permission_authority::Source::User,
+                        &content,
+                    )?;
                     let message = Uuid::new_v4().to_string();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
@@ -649,9 +660,13 @@ impl Stores {
         tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
             workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status])?;
-        if let Some((source, inc, rev, child)) = &meta.source {
-            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2 AND metadata_revision=?3)",params![source,inc,rev],|r|r.get(0))?;
-            ensure!(valid, "Source binding changed");
+        if let Some(saved) = &meta.source {
+            let source = &saved.id;
+            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2 AND metadata_revision=?3)",params![source,saved.incarnation,saved.revision],|r|r.get(0))?;
+            ensure!(
+                valid && copy::binding(tx, source)? == saved.binding,
+                "Source binding changed"
+            );
             for (table, cols) in [
                 (
                     "conversation_worktrees",
@@ -661,10 +676,23 @@ impl Stores {
             ] {
                 tx.execute(&format!("INSERT INTO {table}(conversation_id,{cols}) SELECT ?1,{cols} FROM {table} WHERE conversation_id=?2"),[&op.id,source])?;
             }
-            if *child && project.is_none() {
+            if saved.child && project.is_none() {
                 tx.execute("INSERT INTO conversation_private_workspace_bindings(child_id,parent_id) VALUES(?1,COALESCE((SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2),?2))",[&op.id,source])?;
             } else {
                 tx.execute("INSERT INTO conversation_private_workspace_bindings SELECT ?1,parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2",[&op.id,source])?;
+            }
+            if saved.child {
+                let root = self.root.path.join("workspaces");
+                let parent_path =
+                    crate::native_engine::workspace::resolve_workspace(tx, &root, source, None)?.0;
+                let child_path =
+                    crate::native_engine::workspace::resolve_workspace(tx, &root, &op.id, None)?.0;
+                let actual = parent_path.canonicalize()?;
+                ensure!(
+                    child_path.canonicalize()? == actual
+                        && saved.expected_cwd.as_ref().is_none_or(|p| *p == actual),
+                    "Child workspace binding changed"
+                );
             }
         }
         op.finish(tx)?;
@@ -753,7 +781,7 @@ impl Stores {
     pub(super) fn reconcile(&self) -> Result<()> {
         self.reconcile_batches()?;
         let keys = self.global().read(|c| {
-            let mut q = c.prepare("SELECT storage_key FROM lifecycle WHERE quarantine_reason IS NULL ORDER BY storage_key")?;
+            let mut q = c.prepare("SELECT storage_key FROM lifecycle WHERE quarantine_reason IS NULL AND storage_key NOT IN (SELECT storage_key FROM import_members) ORDER BY storage_key")?;
             let rows = q.query_map([],|r|r.get::<_,String>(0))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })?;

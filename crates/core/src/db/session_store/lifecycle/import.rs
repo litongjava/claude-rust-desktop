@@ -132,9 +132,10 @@ impl Stores {
                         |r| r.get::<_, bool>(0),
                     )?)
                 })?;
-                if pending {
+                if pending && e.downcast_ref::<QuarantineMove>().is_none() {
                     return Err(e);
                 }
+                tracing::warn!(%batch, error=%e, "Recovering import batch");
             }
         }
         Ok(())
@@ -167,10 +168,26 @@ impl Stores {
         self.finish_batch(batch)
     }
     fn finish_batch(&self, batch: &str) -> Result<()> {
-        let members=self.global().read(|c|{
-            let mut q=c.prepare("SELECT l.operation,l.store_uuid,l.id,l.storage_key,l.incarnation,l.kind,l.metadata,m.digest,m.abort_reason
+        let members = self.global().read(|c| {
+            let mut q = c.prepare("SELECT l.operation,l.store_uuid,l.id,l.storage_key,l.incarnation,l.kind,l.metadata,m.digest,m.abort_reason
                 FROM import_members m JOIN lifecycle l ON l.operation=m.operation WHERE m.batch=?1 ORDER BY m.storage_key")?;
-            let rows=q.query_map([batch],|r|Ok((Intent{operation:r.get(0)?,store:r.get(1)?,id:r.get(2)?,key:r.get(3)?,incarnation:r.get(4)?,kind:r.get(5)?,metadata:r.get(6)?},r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let rows = q
+                .query_map([batch], |r| {
+                    Ok((
+                        Intent {
+                            operation: r.get(0)?,
+                            store: r.get(1)?,
+                            id: r.get(2)?,
+                            key: r.get(3)?,
+                            incarnation: r.get(4)?,
+                            kind: r.get(5)?,
+                            metadata: r.get(6)?,
+                        },
+                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
         if members.is_empty() {
@@ -214,19 +231,27 @@ impl Stores {
             bail!("Import aborted: {reason}")
         }
         let mut rejected = false;
-        self.global().write("publish import batch",batch,true,|tx|{
-            for ((op,digest,_),(meta,p)) in members.iter().zip(&ready){
-                self.publish_row(tx,op,meta,p).inspect_err(|e|rejected=e.downcast_ref::<rusqlite::Error>().is_none())?;
-                tx.execute("INSERT INTO legacy_session_imports SELECT id,?2,project_id FROM conversations WHERE id=?1",[&op.id,digest])?;
-            }
-            tx.execute("DELETE FROM import_members WHERE batch=?1",[batch])?;
-            self.step(Phase::BeforePublishCommit)
-        }).or_else(|e|{
-            if rejected {
-                self.abort_batch(batch,&members,&format!("Import publication failed: {e:#}"))?;
-            }
-            Err(e)
-        })?;
+        self.global()
+            .write("publish import batch", batch, true, |tx| {
+                for ((op, digest, _), (meta, p)) in members.iter().zip(&ready) {
+                    self.publish_row(tx, op, meta, p).inspect_err(|e| {
+                        rejected = e.downcast_ref::<rusqlite::Error>().is_none()
+                    })?;
+                    tx.execute("INSERT INTO legacy_session_imports SELECT id,?2,project_id,incarnation FROM conversations WHERE id=?1", [&op.id, digest])?;
+                }
+                tx.execute("DELETE FROM import_members WHERE batch=?1", [batch])?;
+                self.step(Phase::BeforePublishCommit)
+            })
+            .or_else(|e| {
+                if rejected {
+                    self.abort_batch(
+                        batch,
+                        &members,
+                        &format!("Import publication failed: {e:#}"),
+                    )?;
+                }
+                Err(e)
+            })?;
         self.step(Phase::Published)
     }
     fn abort_batch(
@@ -262,7 +287,11 @@ impl Stores {
                     let _permit = Permits::take(1);
                     let db =
                         layout::open(&live.join("session.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                    Ok(db.query_row("SELECT store_uuid=?1 AND incarnation=?2 AND sealed_operation=?3 FROM manifest",[&op.store,&op.incarnation,&op.operation],|r|r.get(0))?)
+                    Ok(
+                        db.query_row("SELECT store_uuid=?1 AND incarnation=?2 AND sealed_operation=?3 FROM manifest", [&op.store, &op.incarnation, &op.operation], |r| {
+                            r.get(0)
+                        })?,
+                    )
                 })();
                 if own.unwrap_or(false) {
                     self.quarantine(op, &live, reason)?
@@ -285,6 +314,16 @@ impl Stores {
         workspace: &Path,
         preview: bool,
     ) -> Result<ImportResult> {
+        self.import_json_into_project(source, workspace, preview, None)
+    }
+
+    pub fn import_json_into_project(
+        &self,
+        source: &Path,
+        workspace: &Path,
+        preview: bool,
+        target_project: Option<&str>,
+    ) -> Result<ImportResult> {
         let archive = read_archive(source)?;
         let workspace = workspace.canonicalize()?;
         ensure!(workspace.is_dir(), "Project directory required");
@@ -303,17 +342,57 @@ impl Stores {
             backup: None,
         };
         let mut selected = Vec::new();
-        self.global().read(|c|{
-            for (session,digest) in &archive{
-                if let Some((prior,path,exists))=c.query_row("SELECT i.digest,p.workspace_path,EXISTS(SELECT 1 FROM conversations WHERE id=i.id)
-                        FROM legacy_session_imports i JOIN projects p ON p.id=i.project_id WHERE i.id=?1",[&session.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).optional()? {
-                    ensure!(prior==*digest && Path::new(&path)==workspace && exists,"Import conflicts with previous import");
-                    result.skipped.push(session.id.clone());continue
+        self.global().read(|c| {
+            let selection = if let Some(id) = target_project {
+                let p = project_repo::require_trusted(c, id)?;
+                ensure!(
+                    !p.is_archived
+                        && p.workspace_path.as_deref().map(Path::new) == Some(workspace.as_path()),
+                    "Selected project is unavailable"
+                );
+                ProjectSelection::Existing(id.into())
+            } else {
+                ProjectSelection::Workspace(workspace.clone())
+            };
+            let plan = Project::select(c, &selection)?;
+            if let Project::NewWorkspace(path) = &plan {
+                ensure!(
+                    !c.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_path=?1 AND is_archived=0)", [path], |r| r.get::<_, bool>(0))?,
+                    "Workspace project selection changed"
+                );
+            }
+            for (session, digest) in &archive {
+                let previous = c
+                    .query_row("SELECT digest,project_id,EXISTS(SELECT 1 FROM conversations c WHERE c.id=i.id AND c.incarnation=i.incarnation AND c.project_id=i.project_id)
+                    FROM legacy_session_imports i WHERE i.id=?1", [&session.id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                        ))
+                    })
+                    .optional()?;
+                if let Some((prior, project, exists)) = previous {
+                    ensure!(
+                        prior == *digest
+                            && matches!(&plan,Project::Selected{id,..} if *id==project)
+                            && exists,
+                        "Import conflicts with previous import"
+                    );
+                    result.skipped.push(session.id.clone());
+                    continue;
                 }
-                let options=CreateOptions{title:Some(session.name.clone()),workspace_mode:Some("code".into()),project:Some(ProjectSelection::Workspace(workspace.clone())),..Default::default()};
-                self.prepare(c,&session.id,&options,&Seed::Import(session),None)?;
-                result.imported.push(session.id.clone());selected.push((session,digest,options))
-            } Ok(())
+                let options = CreateOptions {
+                    title: Some(session.name.clone()),
+                    workspace_mode: Some("code".into()),
+                    project: Some(selection.clone()),
+                    ..Default::default()
+                };
+                self.prepare(c, &session.id, &options, &Seed::Import(session), None)?;
+                result.imported.push(session.id.clone());
+                selected.push((session, digest, options))
+            }
+            Ok(())
         })?;
         if preview || selected.is_empty() {
             return Ok(result);
@@ -345,15 +424,18 @@ impl Stores {
         sync_dir(backup.parent().unwrap())?;
         sync_dir(&self.root.path)?;
         result.backup = Some(manifest);
-        let members=self.global().write("prepare import batch",&batch,true,|tx|{
-            let mut members=Vec::new();
-            for (s,digest,options) in &selected{
-                let (op,meta)=self.prepare(tx,&s.id,options,&Seed::Import(s),None)?;
-                op.insert(tx,Some(&serde_json::to_string(&meta)?))?;
-                tx.execute("INSERT INTO import_members(storage_key,batch,operation,digest) VALUES(?1,?2,?3,?4)",params![op.key,batch,op.operation,digest])?;
-                members.push((op,meta));
-            } Ok(members)
-        })?;
+        let members = self
+            .global()
+            .write("prepare import batch", &batch, true, |tx| {
+                let mut members = Vec::new();
+                for (s, digest, options) in &selected {
+                    let (op, meta) = self.prepare(tx, &s.id, options, &Seed::Import(s), None)?;
+                    op.insert(tx, Some(&serde_json::to_string(&meta)?))?;
+                    tx.execute("INSERT INTO import_members(storage_key,batch,operation,digest) VALUES(?1,?2,?3,?4)", params![op.key, batch, op.operation, digest])?;
+                    members.push((op, meta));
+                }
+                Ok(members)
+            })?;
         self.step(Phase::CreateIntent)?;
         for ((op, meta), (s, _, _)) in members.iter().zip(selected) {
             self.build(op, meta, None, Seed::Import(s))?;

@@ -9,13 +9,14 @@ CREATE TABLE session_input_queue_control(session_id TEXT PRIMARY KEY REFERENCES 
 CREATE TABLE session_inbox (
     id TEXT PRIMARY KEY, sender TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     recipient TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, project_source TEXT NOT NULL,
-    payload TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', generation INTEGER
+    payload TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', generation INTEGER,
+    read INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT, committed_at TEXT
 );
 CREATE INDEX inbox_fifo ON session_inbox(recipient,state,created_at);
 CREATE TABLE session_inbox_consumers(session_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,generation INTEGER NOT NULL);
 CREATE TABLE session_inbox_operations(sender TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, operation_id TEXT NOT NULL,
     message_id TEXT NOT NULL REFERENCES session_inbox(id) ON DELETE CASCADE,PRIMARY KEY(operation_id));
-CREATE TABLE legacy_session_imports(id TEXT PRIMARY KEY, digest TEXT NOT NULL, project_id TEXT NOT NULL);
+CREATE TABLE legacy_session_imports(id TEXT PRIMARY KEY, digest TEXT NOT NULL, project_id TEXT NOT NULL, incarnation TEXT NOT NULL);
 CREATE TABLE conversation_private_workspace_bindings (
     child_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     -- Retain an invalid binding after parent deletion: never silently redirect a child.

@@ -46,7 +46,7 @@ fn valid_id(id: &str) -> Result<()> {
 pub(crate) fn project(conn: &Connection, root: &Path, id: &str) -> Result<String> {
     valid_id(id)?;
     let row =
-        conversation_repo::get_conversation(conn, id)?.context("Message session not found")?;
+        conversation_repo::conversation_metadata(conn, id)?.context("Message session not found")?;
     ensure!(!row.archived, "Message session is archived");
     ensure!(
         row.workspace_mode == "code",
@@ -76,7 +76,7 @@ pub(crate) fn project(conn: &Connection, root: &Path, id: &str) -> Result<String
         source
     })
 }
-fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+pub(crate) fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
         sender: row.get(1)?,

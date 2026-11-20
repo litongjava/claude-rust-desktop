@@ -281,12 +281,16 @@ pub fn insert_conversation(
 }
 
 pub fn get_conversation(conn: &Connection, id: &str) -> Result<Option<ConversationRow>> {
+    conversation_metadata(conn,id)?.map(|row|with_session_title(conn,row)).transpose()
+}
+
+pub(crate) fn conversation_metadata(conn: &Connection, id: &str) -> Result<Option<ConversationRow>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, title, model, provider, workspace_path, project_id, research_mode, pinned, archived, created_at, updated_at, message_count, workspace_mode FROM conversations WHERE id = ?1"
     )?;
     let mut rows = stmt.query(params![id])?;
     match rows.next()? {
-        Some(row) => Ok(Some(with_session_title(conn, row_to_conversation(row)?)?)),
+        Some(row) => Ok(Some(row_to_conversation(row)?)),
         None => Ok(None),
     }
 }

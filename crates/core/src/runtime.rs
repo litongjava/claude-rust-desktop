@@ -218,6 +218,68 @@ mod identity_tests {
     }
 }
 
+pub(crate) fn replay_history(
+    conn: &rusqlite::Connection,
+    id: &str,
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let mut history = Vec::new();
+    let messages = message_repo::get_messages_by_conversation(conn, id)?;
+    let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
+    let boundary = messages
+        .get(start)
+        .filter(|m| m.is_compact_boundary)
+        .map(|m| m.id.clone());
+    for message in messages.into_iter().skip(start) {
+        if let Some(native) = native(&message.id)? {
+            history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
+            continue;
+        }
+        let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
+        // Nested ToolScript calls are history, not provider protocol:
+        // the provider never emitted their ids, so replaying them would
+        // fabricate an assistant tool_use with no matching requested
+        // call. Their rows stay visible to transcript/display readers.
+        let nested =
+            crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
+        calls.retain(|tool| !nested.contains(&tool.id));
+        if message.role == "assistant" && !calls.is_empty() {
+            match format {
+                ApiFormat::OpenAI => {
+                    let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
+                    history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
+                    for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
+                    for tool in &calls {
+                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
+                    }
+                }
+                ApiFormat::Anthropic => {
+                    let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
+                    history.push(json!({"role":"assistant","content":blocks}));
+                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
+                    // Approval notes follow the results as the user's own text.
+                    for tool in &calls {
+                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
+                    }
+                    history.push(json!({"role":"user","content":results}));
+                }
+            }
+            for tool in &calls {
+                for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
+                    history.push(input.model_message());
+                }
+            }
+        }
+        use rusqlite::OptionalExtension;
+        let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
+        if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
+        else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
+    }
+    crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
+    Ok((history, boundary))
+}
+
 impl SessionStore {
     pub fn new(db: Arc<DbManager>) -> Self {
         Self { db }
@@ -447,62 +509,9 @@ impl SessionStore {
         id: &str,
         format: &ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.db.with_conn(|conn| -> Result<_> {
-            let mut history = Vec::new();
-            let messages = message_repo::get_messages_by_conversation(conn, id)?;
-            let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
-            let boundary = messages
-                .get(start)
-                .filter(|m| m.is_compact_boundary)
-                .map(|m| m.id.clone());
-            for message in messages.into_iter().skip(start) {
-                if let Some(native) = crate::services::compaction::native::load(conn, &message.id)? {
-                    history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
-                    continue;
-                }
-                let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
-                // Nested ToolScript calls are history, not provider protocol:
-                // the provider never emitted their ids, so replaying them would
-                // fabricate an assistant tool_use with no matching requested
-                // call. Their rows stay visible to transcript/display readers.
-                let nested =
-                    crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
-                calls.retain(|tool| !nested.contains(&tool.id));
-                if message.role == "assistant" && !calls.is_empty() {
-                    match format {
-                        ApiFormat::OpenAI => {
-                            let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
-                            history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
-                            for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
-                            for tool in &calls {
-                                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
-                            }
-                        }
-                        ApiFormat::Anthropic => {
-                            let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
-                            history.push(json!({"role":"assistant","content":blocks}));
-                            let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
-                            // Approval notes follow the results as the user's own text.
-                            for tool in &calls {
-                                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
-                            }
-                            history.push(json!({"role":"user","content":results}));
-                        }
-                    }
-                    for tool in &calls {
-                        for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
-                            history.push(input.model_message());
-                        }
-                    }
-                }
-                use rusqlite::OptionalExtension;
-                let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
-                if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
-                else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
-            }
-            crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
-            Ok((history, boundary))
-        })?
+        self.db.with_conn(|conn| replay_history(conn, id, format, |message| {
+            crate::services::compaction::native::load(conn, message)
+        }))?
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {

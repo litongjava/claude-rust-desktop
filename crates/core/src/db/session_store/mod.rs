@@ -251,10 +251,17 @@ impl SessionDb {
     }
     /// The closure follows the same re-entry rules as `read` and may run again
     /// after SQLite contention rolls back its transaction.
-    pub fn write<T>(&self, mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
+        self.write_named("session write", body)
+    }
+    fn write_named<T>(
+        &self,
+        label: &str,
+        body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
+    ) -> Result<T> {
         let _locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
-        self.write_locked("session write", body)
+        self.write_locked(label, body)
     }
     fn write_locked<T>(
         &self,

@@ -23,15 +23,24 @@ pub(super) fn projection(c: &Connection) -> Result<Projection> {
     Ok(c.query_row("SELECT content_revision,message_count,updated_at,last_turn_status,
         (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1),
         (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
-        (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages) FROM manifest WHERE singleton=1",[],
-        |r|Ok(Projection{revision:r.get(0)?,count:r.get(1)?,activity:r.get(2)?,status:r.get(3)?,first_prompt:r.get(4)?,latest_prompt:r.get(5)?,transcript_bytes:r.get(6)?}))?)
+        (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages) FROM manifest WHERE singleton=1", [], |r| {
+        Ok(Projection {
+            revision: r.get(0)?,
+            count: r.get(1)?,
+            activity: r.get(2)?,
+            status: r.get(3)?,
+            first_prompt: r.get(4)?,
+            latest_prompt: r.get(5)?,
+            transcript_bytes: r.get(6)?,
+        })
+    })?)
 }
 
 pub(super) fn advance(c: &Connection) -> Result<()> {
     c.execute("UPDATE manifest SET updated_at=?1,content_revision=content_revision+1,
         message_count=(SELECT count(*) FROM messages),
         last_turn_status=(SELECT status FROM execution_turns ORDER BY started_at DESC,rowid DESC LIMIT 1)
-        WHERE singleton=1",[chrono::Utc::now().to_rfc3339()])?;
+        WHERE singleton=1", [chrono::Utc::now().to_rfc3339()])?;
     Ok(())
 }
 
@@ -39,6 +48,7 @@ impl GlobalDb {
     // Projection is secondary. Never wait for the G writer after a local commit.
     pub(super) fn project(&self, id: &str, incarnation: &str, p: &Projection) -> Result<()> {
         self.connection(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            c.pragma_update(None, "synchronous", "NORMAL")?;
             c.busy_timeout(std::time::Duration::ZERO)?;
             let result = c.execute(
                 "UPDATE conversations SET content_revision=?1,message_count=?2,updated_at=?3,
@@ -70,7 +80,7 @@ impl SessionDb {
     pub fn save_mcp(&self, id: &str, transport: &Value, failed: bool) -> Result<String> {
         let output = McpOutput::from_transport(transport)?;
         let display = output.display();
-        self.write(|tx| {
+        self.write_named("save MCP output", |tx| {
             output.save(tx.0, &self.id, id, &display, failed)?;
             Ok(())
         })?;
@@ -107,7 +117,12 @@ impl SessionRead<'_> {
         input_queue::load_delivered(self.0, id)
     }
     pub fn mcp(&self, id: &str, display: &str) -> Result<Option<(Value, Value, bool)>> {
-        let row:Option<(String,String,bool)>=self.0.query_row("SELECT content_json,metadata_json,is_error FROM mcp_tool_outputs WHERE tool_use_id=?1 AND display_text=?2",[id,display],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let row: Option<(String, String, bool)> = self
+            .0
+            .query_row("SELECT content_json,metadata_json,is_error FROM mcp_tool_outputs WHERE tool_use_id=?1 AND display_text=?2", [id, display], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
         row.map(|(c, m, e)| Ok((serde_json::from_str(&c)?, serde_json::from_str(&m)?, e)))
             .transpose()
     }
@@ -167,7 +182,8 @@ impl SessionWrite<'_> {
     }
     pub fn start_turn(&self) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.0.execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')",params![id,self.1,chrono::Utc::now().to_rfc3339()])?;
+        self.0
+            .execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')", params![id, self.1, chrono::Utc::now().to_rfc3339()])?;
         self.2.set(true);
         Ok(id)
     }
@@ -186,7 +202,18 @@ impl SessionWrite<'_> {
             status != turn_repo::TurnStatus::Running,
             "Expected terminal status"
         );
-        ensure!(self.0.execute("UPDATE execution_turns SET status=?1,ended_at=?2,elapsed_ms=?3 WHERE id=?4 AND status='running'",params![turn_repo::status_name(status),chrono::Utc::now().to_rfc3339(),elapsed_ms,turn])?==1,"Turn is no longer running");
+        ensure!(
+            self.0.execute(
+                "UPDATE execution_turns SET status=?1,ended_at=?2,elapsed_ms=?3 WHERE id=?4 AND status='running'",
+                params![
+                    turn_repo::status_name(status),
+                    chrono::Utc::now().to_rfc3339(),
+                    elapsed_ms,
+                    turn
+                ]
+            )? == 1,
+            "Turn is no longer running"
+        );
         self.2.set(true);
         Ok(())
     }
@@ -200,6 +227,35 @@ impl SessionWrite<'_> {
     pub fn snapshots(&self, message: &str, requests: &Value) -> Result<()> {
         if messages::get_request_snapshots(self.0, message)? != *requests {
             messages::save_request_snapshots(self.0, message, requests)?;
+        }
+        Ok(())
+    }
+    pub fn normalized_request(&self, message: &str, request: &Value) -> Result<()> {
+        crate::db::request_repo::save_request(self.0, message, request)
+    }
+    pub fn stream_tools(
+        &self,
+        message: &str,
+        content: &str,
+        tools: &[messages::ToolCallRow],
+        origins: &crate::services::tool_history::ToolOrigins,
+    ) -> Result<()> {
+        for tool in tools {
+            let qualified = format!("{message}:{}", tool.id);
+            let row = messages::ToolCallRow {
+                id: qualified,
+                message_id: message.into(),
+                ..tool.clone()
+            };
+            messages::upsert_stream_tool_result(self.0, self.1, message, content, &row)?;
+            if let Some((parent, sequence)) = origins.get(&tool.id) {
+                messages::save_tool_origin(
+                    self.0,
+                    &row.id,
+                    &format!("{message}:{parent}"),
+                    i64::try_from(*sequence)?,
+                )?;
+            }
         }
         Ok(())
     }
@@ -324,7 +380,7 @@ pub struct Attachment {
 }
 impl SessionRead<'_> {
     pub fn attachments(&self, message: &str) -> Result<Vec<Attachment>> {
-        let mut q=self.0.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY rowid")?;
+        let mut q = self.0.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY rowid")?;
         let rows = q
             .query_map([message], |r| {
                 Ok(Attachment {
@@ -349,7 +405,7 @@ impl SessionRead<'_> {
         &self,
         message: &str,
     ) -> Result<Vec<(String, crate::services::subagents::Invocation)>> {
-        let mut q=self.0.prepare("SELECT child_incarnation,invocation FROM child_invocations WHERE parent_message=?1 ORDER BY rowid")?;
+        let mut q = self.0.prepare("SELECT child_incarnation,invocation FROM child_invocations WHERE parent_message=?1 ORDER BY rowid")?;
         let mut cursor = q.query([message])?;
         let mut out = Vec::new();
         while let Some(r) = cursor.next()? {
@@ -386,18 +442,32 @@ impl SessionWrite<'_> {
         address: &HistoryAddress,
         row: &crate::services::subagents::Invocation,
     ) -> Result<()> {
+        let store: String = self
+            .0
+            .query_row("SELECT store_uuid FROM manifest", [], |r| r.get(0))?;
         ensure!(
-            row.parent_session_id == self.1
+            address.store == store
+                && address.session != self.1
+                && row.parent_session_id == self.1
                 && row.child_session_id == address.session
                 && !row.attempt_id.is_empty()
                 && !row.tool_use_id.is_empty(),
             "Invalid child invocation ownership"
         );
-        self.0.execute("INSERT INTO child_invocations VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_key) DO UPDATE SET invocation=excluded.invocation WHERE parent_message=excluded.parent_message AND child_incarnation=excluded.child_incarnation",params![row.key(),row.parent_message_id,address.incarnation,serde_json::to_string(row)?])?;
+        let updated = self.0.execute(
+            "INSERT INTO child_invocations VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_key) DO UPDATE SET invocation=excluded.invocation WHERE parent_message=excluded.parent_message AND child_incarnation=excluded.child_incarnation",
+            params![
+                row.key(),
+                row.parent_message_id,
+                address.incarnation,
+                serde_json::to_string(row)?
+            ],
+        )?;
+        ensure!(updated == 1, "Child invocation identity changed");
         Ok(())
     }
     pub fn bind_agent(&self, definition: &str) -> Result<()> {
-        self.0.execute("INSERT INTO session_agents VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition",params![self.1,definition])?;
+        self.0.execute("INSERT INTO session_agents VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition", params![self.1, definition])?;
         Ok(())
     }
     pub fn approved_plan(&self, content: &Value) -> Result<()> {
@@ -414,10 +484,53 @@ impl SessionWrite<'_> {
             [message],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)>=(?1,?2)) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)<(?1,?2))",params![order,row])?;
+        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)>=(?1,?2)) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE (m.sort_order,m.rowid)<(?1,?2))", params![order, row])?;
         self.0.execute(
             "DELETE FROM messages WHERE (sort_order,rowid)>=(?1,?2)",
             params![order, row],
+        )?;
+        self.2.set(true);
+        Ok(())
+    }
+}
+
+impl SessionRead<'_> {
+    pub fn compaction_count(&self) -> Result<i64> {
+        Ok(self.0.query_row(
+            "SELECT local_count FROM compaction_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn model_history(
+        &self,
+        format: &crate::native_engine::provider_manager::ApiFormat,
+    ) -> Result<(Vec<Value>, Option<String>)> {
+        let id: String = self
+            .0
+            .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
+        crate::runtime::replay_history(self.0, &id, format, |message| {
+            let raw: Option<String> = self
+                .0
+                .query_row(
+                    "SELECT value FROM native_boundaries WHERE message_id=?1",
+                    [message],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            raw.map(|v| serde_json::from_str(&v).map_err(Into::into))
+                .transpose()
+        })
+    }
+}
+impl SessionWrite<'_> {
+    pub fn native_boundary(&self, message: &str, value: &Value) -> Result<()> {
+        self.0.execute("UPDATE compaction_state SET local_count=local_count+1 WHERE singleton=1 AND NOT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)", [message])?;
+        self.0
+            .execute("INSERT INTO native_boundaries VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET value=excluded.value", params![message, serde_json::to_string(value)?])?;
+        self.0.execute(
+            "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
+            [message],
         )?;
         self.2.set(true);
         Ok(())

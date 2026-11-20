@@ -14,22 +14,65 @@ pub enum Branch<'a> {
     Child,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct Source {
+    pub id: String,
+    pub incarnation: String,
+    pub revision: i64,
+    pub child: bool,
+    pub expected_cwd: Option<PathBuf>,
+    pub binding: String,
+}
+
+pub(super) fn binding(c: &Connection, id: &str) -> Result<String> {
+    // Worktree and private-parent changes can be made independently of title
+    // and other directory metadata. Fence their actual values at publication.
+    let owner = crate::native_engine::workspace::private_workspace_owner(c, id)?;
+    Ok(c.query_row(
+        "SELECT json_array(c.workspace_mode,c.project_id,c.archived, w.project_id,
+        w.source_path,w.repo_path,w.path,w.branch,b.backend,b.metadata,p.parent_id,
+        (SELECT incarnation FROM conversations WHERE id=?2))
+        FROM conversations c LEFT JOIN conversation_worktrees w ON w.conversation_id=c.id
+        LEFT JOIN conversation_worktree_backends b ON b.conversation_id=c.id
+        LEFT JOIN conversation_private_workspace_bindings p ON p.child_id=c.id WHERE c.id=?1",
+        params![id, owner],
+        |r| r.get(0),
+    )?)
+}
+
 impl SessionDb {
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
+        self.branch_at(destination, boundary, None)
+    }
+    pub fn derive_owned_child(&self, destination: &str, expected_cwd: &Path) -> Result<SessionDb> {
+        self.branch_at(
+            destination,
+            Branch::Child,
+            Some(expected_cwd.canonicalize()?),
+        )
+    }
+    fn branch_at(
+        &self,
+        destination: &str,
+        boundary: Branch<'_>,
+        expected_cwd: Option<PathBuf>,
+    ) -> Result<SessionDb> {
         let dest = storage_key(destination)?;
         ensure!(dest != self.key, "Source and destination must differ");
         let s = &self.stores;
         let _locks = s.group_access(vec![(&self.key, false, false), (&dest, true, true)])?;
         self.check_directory()?;
-        let (row, revision) = s.global().read(|c| {
-            let row = crate::db::conversation_repo::get_conversation(c, &self.id)?
+        let (row, revision, binding) = s.global().read(|conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let c = &snapshot;
+            let row = crate::db::conversation_repo::conversation_metadata(c, &self.id)?
                 .context("Source unavailable")?;
             let revision = c.query_row(
                 "SELECT metadata_revision FROM conversations WHERE id=?1",
                 [&self.id],
                 |r| r.get(0),
             )?;
-            if matches!(boundary, Branch::Child) {
+            if matches!(boundary, Branch::Child | Branch::Clear) {
                 ensure!(!row.archived, "Archived execution source");
                 if row.project_id.is_none() {
                     crate::native_engine::workspace::private_workspace_owner(c, &self.id)?;
@@ -42,13 +85,17 @@ impl SessionDb {
                     )?;
                 }
             }
-            Ok((row, revision))
+            Ok((row, revision, binding(c, &self.id)?))
         })?;
         let options = CreateOptions {
-            title: Some(format!(
-                "{} (branch)",
-                row.title.as_deref().unwrap_or("Conversation")
-            )),
+            title: Some(if matches!(boundary, Branch::Child | Branch::Clear) {
+                "CLI session".into()
+            } else {
+                format!(
+                    "{} (branch)",
+                    row.title.as_deref().unwrap_or("Conversation")
+                )
+            }),
             model: row.model,
             provider: row.provider,
             workspace_mode: Some(row.workspace_mode),
@@ -60,12 +107,14 @@ impl SessionDb {
             destination,
             options,
             Seed::Fork(self, boundary),
-            Some((
-                self.id.clone(),
-                self.incarnation.clone(),
+            Some(Source {
+                id: self.id.clone(),
+                incarnation: self.incarnation.clone(),
                 revision,
-                matches!(boundary, Branch::Child),
-            )),
+                child: matches!(boundary, Branch::Child),
+                expected_cwd,
+                binding,
+            }),
         )
     }
 }
@@ -185,12 +234,19 @@ impl Copier<'_> {
         }
         let limit = match boundary {
             Branch::Through { message, index } => {
-                let by_id=message.map(|id| self.src.query_row("SELECT n FROM (SELECT id,row_number() OVER(ORDER BY sort_order,rowid)-1 n FROM messages) WHERE id=?1",[id],|r|r.get::<_,usize>(0)).optional()).transpose()?.flatten();
+                let by_id = message
+                    .map(|id| {
+                        self.src
+                            .query_row("SELECT n FROM (SELECT id,row_number() OVER(ORDER BY sort_order,rowid)-1 n FROM messages) WHERE id=?1", [id], |r| r.get::<_, usize>(0))
+                            .optional()
+                    })
+                    .transpose()?
+                    .flatten();
                 Some(by_id.or(index).context("Missing branch boundary")?)
             }
             _ => None,
         };
-        let mut q=self.src.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages ORDER BY sort_order,rowid")?;
+        let mut q = self.src.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages ORDER BY sort_order,rowid")?;
         let mut count = 0;
         for row in q.query_map([], message_repo::row_to_message)? {
             let m = row?;
@@ -223,8 +279,15 @@ impl Copier<'_> {
             let old: String = r.get(0)?;
             if limit.is_some() {
                 let mut selected = false;
-                for message in crate::db::turn_repo::turn_messages(self.src, &old)? {
-                    if self.mapped("message", &message)?.is_some() {
+                let mut q = self
+                    .src
+                    .prepare_cached("SELECT message_id FROM message_turns WHERE turn_id=?1")?;
+                let mut links = q.query([&old])?;
+                while let Some(link) = links.next()? {
+                    if self
+                        .mapped("message", &link.get::<_, String>(0)?)?
+                        .is_some()
+                    {
                         selected = true;
                         break;
                     }
@@ -233,7 +296,18 @@ impl Copier<'_> {
                     continue;
                 }
             }
-            self.dst.execute("INSERT INTO execution_turns(id,conversation_id,source_turn_id,started_at,ended_at,elapsed_ms,status) VALUES(?1,?2,?3,?4,?5,?6,CASE ?7 WHEN 'running' THEN 'cancelled' ELSE ?7 END)",params![self.assign("turn",&old)?,self.id,old,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,String>(4)?])?;
+            self.dst.execute(
+                "INSERT INTO execution_turns(id,conversation_id,source_turn_id,started_at,ended_at,elapsed_ms,status) VALUES(?1,?2,?3,?4,?5,?6,CASE ?7 WHEN 'running' THEN 'cancelled' ELSE ?7 END)",
+                params![
+                    self.assign("turn", &old)?,
+                    self.id,
+                    old,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, String>(4)?
+                ],
+            )?;
         }
         let message = Some(("message_id", "message"));
         self.rows("message_turns", message, None, &[("turn_id", "turn")])?;
@@ -269,7 +343,9 @@ impl Copier<'_> {
                     if let Some(id) = request["id"].as_str() {
                         request["id"] = Json::String(self.assign("request", id)?);
                     }
-                    self.remap_blocks(&mut request["responseBlocks"])?;
+                    if let Some(blocks) = request.get_mut("responseBlocks") {
+                        self.remap_blocks(blocks)?;
+                    }
                 }
             }
             message_repo::save_request_snapshots(self.dst, &new, &requests)?;
@@ -299,5 +375,6 @@ pub(super) fn copy_snapshot(
         &source.id,
         &source.incarnation,
     )?;
+    source.stores.step(Phase::ForkSnapshot)?;
     Copier { src: &tx, dst, id }.run(boundary)
 }

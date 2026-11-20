@@ -512,7 +512,7 @@ pub fn save_nested_tool_row(
     Ok(())
 }
 
-fn upsert_stream_tool_result(
+pub(super) fn upsert_stream_tool_result(
     conn: &Connection,
     conversation_id: &str,
     message_id: &str,
