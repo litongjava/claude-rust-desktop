@@ -55,6 +55,9 @@ pub struct CreateOptions {
 
 #[derive(Serialize, Deserialize)]
 struct Metadata {
+    // Prior v1 intents recorded only the manifest count.
+    #[serde(default)]
+    initial_shape: Option<(bool, bool)>,
     title: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -212,6 +215,19 @@ impl Stores {
         let key = storage_key(id)?;
         let _locks = lock_keys(&self.root.path, vec![&key], true)?;
         self.recover_key(&key)?;
+        self.global().read(|conn| {
+            let fenced: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lifecycle WHERE storage_key=?1
+                AND kind='delete' AND quarantine_reason IS NOT NULL)",
+                [&key],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                !fenced,
+                "Quarantined delete requires resolution before ID reuse"
+            );
+            Ok(())
+        })?;
         let op = Intent::new(self, id, &key, Uuid::new_v4().to_string(), "create");
         ensure!(
             !op.live(self).try_exists()?,
@@ -231,6 +247,13 @@ impl Stores {
             )?;
             ensure!(!exists, "Session already exists");
             let meta = Metadata {
+                initial_shape: Some((
+                    options.first_message.is_some(),
+                    options
+                        .first_message
+                        .as_ref()
+                        .is_some_and(|m| m.typed.is_some()),
+                )),
                 title: options.title.clone(),
                 model: options.model.clone(),
                 provider: options.provider.clone(),
@@ -312,10 +335,6 @@ impl Stores {
             return Ok(());
         };
         op.validate(self)?;
-        if op.kind == "delete" {
-            return self.retire(&op);
-        }
-        ensure!(op.kind == "create", "Unknown intent");
         let stage = op.stage(self);
         let live = op.live(self);
         let dir = if stage.try_exists()? { &stage } else { &live };
@@ -323,6 +342,10 @@ impl Stores {
         if recovered_quarantine.try_exists()? {
             return self.record_quarantine(&op, "interrupted quarantine");
         }
+        if op.kind == "delete" {
+            return self.retire(&op);
+        }
+        ensure!(op.kind == "create", "Unknown intent");
         let visible = self.global().read(|c| {
             Ok(c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1 OR id=?2)",
@@ -343,7 +366,7 @@ impl Stores {
             match self.unsealed(&db) {
                 Ok(value) => value,
                 Err(e) if damaged_shard(&e) => {
-                    return self.quarantine(&op, dir, "invalid staged database")
+                    return self.quarantine(&op, dir, &format!("invalid staged database: {e:#}"))
                 }
                 Err(e) => return Err(e),
             }
@@ -414,6 +437,24 @@ impl Stores {
                 (SELECT substr(content,1,80) FROM messages WHERE sort_order=0),
                 coalesce((SELECT length(CAST(content AS BLOB)) FROM messages WHERE sort_order=0),0) FROM manifest",
                 [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            let history_ok: bool = c.query_row("SELECT
+                m.message_count IN (0,1) AND m.content_revision=m.message_count
+                AND m.message_count=(SELECT count(*) FROM messages)
+                AND NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id IS NOT m.id
+                    OR role IS NOT 'user' OR sort_order IS NOT 0 OR typeof(content)<>'text'
+                    OR created_at IS NOT m.created_at)
+                AND NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)
+                AND NOT EXISTS(SELECT 1 FROM message_user_content WHERE NOT json_valid(content_json))
+                AND (?1 IS NULL OR m.message_count=?1)
+                AND (?2 IS NULL OR (SELECT count(*) FROM message_user_content)=?2)
+                FROM manifest m WHERE singleton=1",
+                params![meta.initial_shape.map(|v|v.0),meta.initial_shape.map(|v|v.1)],|r|r.get(0))?;
+            if !history_ok {
+                return Err(layout::InvalidFormat(
+                    "Initial history differs from sealed projection".into(),
+                )
+                .into());
+            }
             drop(c);
             layout::checkpoint(&db, SESSION)?;
             Ok(p)
@@ -421,7 +462,7 @@ impl Stores {
         let projection = match inspect() {
             Ok(p) => p,
             Err(e) if damaged_shard(&e) => {
-                self.quarantine(op, dir, "invalid sealed database")?;
+                self.quarantine(op, dir, &format!("invalid sealed database: {e:#}"))?;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -477,14 +518,32 @@ impl Stores {
     fn retire(&self, op: &Intent) -> Result<()> {
         let live = op.live(self);
         let trash = self.sessions().join(".trash").join(&op.incarnation);
+        let dir = if live.try_exists()? { &live } else { &trash };
+        if dir.try_exists()? {
+            let verify = || -> Result<()> {
+                let path = dir.join("session.db");
+                if !path.try_exists()? {
+                    return Err(layout::InvalidFormat("Missing retiring session.db".into()).into());
+                }
+                let _permit = Permits::take(1);
+                let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                layout::verify(&conn, SESSION)?;
+                layout::integrity(&conn)?;
+                verify_manifest(&conn, &op.store, &op.id, &op.incarnation)
+            };
+            if let Err(error) = verify() {
+                if damaged_shard(&error) {
+                    return self.quarantine(
+                        op,
+                        dir,
+                        &format!("invalid retiring database: {error:#}"),
+                    );
+                }
+                return Err(error);
+            }
+        }
         if live.try_exists()? {
             ensure!(!trash.try_exists()?, "Retired destination occupied");
-            {
-                let _permit = Permits::take(1);
-                let c = layout::open(&live.join("session.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                layout::verify(&c, SESSION)?;
-                verify_manifest(&c, &op.store, &op.id, &op.incarnation)?;
-            }
             layout::rename(&live, &trash)?;
             self.step(Phase::TrashRenamed)?;
         }
@@ -579,15 +638,17 @@ fn damaged_shard(error: &anyhow::Error) -> bool {
     error.is::<layout::InvalidFormat>()
         || matches!(
             error.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::QueryReturnedNoRows)
-                | Some(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error {
-                        code: rusqlite::ErrorCode::DatabaseCorrupt
-                            | rusqlite::ErrorCode::NotADatabase,
-                        ..
-                    },
-                    _
-                ))
+            Some(
+                rusqlite::Error::QueryReturnedNoRows
+                    | rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..)
+            ) | Some(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase,
+                    ..
+                },
+                _
+            ))
         )
 }
 

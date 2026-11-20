@@ -129,6 +129,47 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
     if journal != "wal" {
         return Err(InvalidFormat("Expected WAL journal mode".into()).into());
     }
+    let tables: &[(&str, &str)] = if kind == GLOBAL {
+        &[
+            ("store_identity", "singleton store_uuid"),
+            ("projects", "id name description instructions workspace_path is_archived created_at updated_at"),
+            ("project_folders", "project_id path trusted sort_order"),
+            ("conversations", "id storage_key incarnation title model provider workspace_path project_id workspace_mode research_mode pinned archived metadata_revision created_at updated_at message_count content_revision last_turn_status first_prompt latest_prompt git_branch transcript_bytes"),
+            ("lifecycle", "operation store_uuid id storage_key incarnation kind metadata quarantine_reason"),
+        ]
+    } else {
+        &[
+            ("manifest", "singleton store_uuid id incarnation sealed_operation created_at updated_at message_count content_revision last_turn_status"),
+            ("messages", "id conversation_id role content thinking created_at is_compact_boundary sort_order"),
+            ("message_user_content", "message_id content_json"),
+        ]
+    };
+    let mut columns = conn.prepare_cached(
+        "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
+         WHERE t.type='table' AND t.name=?1",
+    )?;
+    for &(table, required) in tables {
+        let actual = columns
+            .query_map([table], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for name in required.split_ascii_whitespace() {
+            if !actual.iter().any(|col| col == name) {
+                return Err(
+                    InvalidFormat(format!("Missing required column {table}.{name}")).into(),
+                );
+            }
+        }
+    }
+    if kind == SESSION {
+        let seal: String = conn.query_row(
+            "SELECT sealed_operation FROM manifest WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if !canonical_uuid(&seal) {
+            return Err(InvalidFormat("Invalid session seal".into()).into());
+        }
+    }
     Ok(())
 }
 

@@ -173,7 +173,9 @@ fn verify_manifest(c: &Connection, store: &str, id: &str, incarnation: &str) -> 
         [store, id, incarnation],
         |r| r.get(0),
     )?;
-    ensure!(matches, "Session identity mismatch");
+    if !matches {
+        return Err(layout::InvalidFormat("Session identity mismatch".into()).into());
+    }
     Ok(())
 }
 

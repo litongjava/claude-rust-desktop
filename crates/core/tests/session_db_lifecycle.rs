@@ -834,3 +834,85 @@ fn windows_sharing_violation_preserves_tombstone_for_retry() {
     drop(Stores::open_for_test(tmp.path()).unwrap());
     assert_eq!(pending(tmp.path()), 0);
 }
+
+#[test]
+fn supported_format_checks_columns_tables_and_live_seal() {
+    for change in [
+        "DROP TABLE conversations",
+        "ALTER TABLE project_folders DROP COLUMN trusted",
+    ] {
+        let root = tempdir().unwrap();
+        drop(Stores::open_for_test(root.path()).unwrap());
+        global(root.path()).execute_batch(change).unwrap();
+        assert!(Stores::open_for_test(root.path()).is_err(), "{change}");
+    }
+    for change in [
+        "DROP TABLE message_user_content",
+        "ALTER TABLE messages DROP COLUMN thinking",
+        "UPDATE manifest SET sealed_operation=''",
+        "UPDATE manifest SET sealed_operation='bogus'",
+    ] {
+        let root = tempdir().unwrap();
+        let stores = Stores::open_for_test(root.path()).unwrap();
+        let h = stores.create(ID, first()).unwrap();
+        Connection::open(shard(root.path()))
+            .unwrap()
+            .execute_batch(change)
+            .unwrap();
+        assert!(stores.open_session(ID).is_err(), "{change}");
+        assert!(h.read(|_| Ok(())).is_err(), "{change}");
+        assert!(h.write(|_| Ok(())).is_err(), "{change}");
+    }
+}
+
+#[test]
+fn structural_damage_is_quarantined_before_publication_or_retirement() -> Result<()> {
+    for (deleting, change) in [
+        (false, "DROP TABLE manifest"),
+        (false, "DROP TABLE message_user_content"),
+        (false, "DELETE FROM messages"),
+        (false, "DELETE FROM message_user_content"),
+        (true, "DROP TABLE manifest"),
+    ] {
+        let root = tempdir()?;
+        let stores = Stores::open_for_test(root.path())?;
+        stores.create("healthy", first())?;
+        let path = if deleting {
+            stores.create(ID, first())?;
+            assert!(stop_at(&stores, Phase::DeleteIntent)
+                .open_session(ID)?
+                .delete()
+                .is_err());
+            shard(root.path())
+        } else {
+            assert!(stop_at(&stores, Phase::Sealed).create(ID, first()).is_err());
+            fs::read_dir(root.path().join("sessions/.staging"))?
+                .next()
+                .unwrap()?
+                .path()
+                .join("session.db")
+        };
+        let db = Connection::open(path)?;
+        db.execute_batch("PRAGMA foreign_keys=OFF")?;
+        db.execute_batch(change)?;
+        drop((db, stores));
+        for _ in 0..2 {
+            let s = Stores::open_for_test(root.path())?;
+            assert!(s.open_session(ID).is_err());
+            s.open_session("healthy")?;
+            assert_eq!(pending(root.path()), 0);
+            assert_eq!(
+                query::<i64>(
+                    &global(root.path()),
+                    "SELECT count(*) FROM lifecycle WHERE length(quarantine_reason)>0"
+                ),
+                1
+            );
+            assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+            if deleting {
+                assert!(s.create(ID, first()).is_err());
+            }
+        }
+    }
+    Ok(())
+}
