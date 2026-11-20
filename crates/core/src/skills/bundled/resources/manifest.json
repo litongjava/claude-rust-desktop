@@ -3,69 +3,6 @@
   "method": "Normal slash invocation materialized bundled resources; copied from isolated temporary home.",
   "files": [
     {
-      "skill": "dataviz",
-      "path": "references/anti-patterns.md",
-      "bytes": 6271,
-      "sha256": "e2f41d94eb19992d48f1e624ff2c237abd6f984d2ed8f01aababb9c207a5a976",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/choosing-a-form.md",
-      "bytes": 3141,
-      "sha256": "557f48a2acacca11ba47aff067b847ebd6cb5407badf919619c2a82ad263cdd4",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/color-formula.md",
-      "bytes": 8286,
-      "sha256": "73b5cb5e8603b6a0905d5ddedc84696e393b1a8d4013f9e38b83ff15c760c244",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/components.md",
-      "bytes": 2145,
-      "sha256": "66a5ea18ff417cb4edb9406ed07add079ad9cc7b9cf23f54c3d1216935badcc9",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/interaction.md",
-      "bytes": 3801,
-      "sha256": "5f8fcc0c19d6612b948ec904f0dbdbe5a441a1bb369cad3fb3fe00c9f441eb0b",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/marks-and-anatomy.md",
-      "bytes": 6132,
-      "sha256": "0ba54de35c3537520d9d2c44ce284d4362a078cb6e79faa4fd98de477c49dc05",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "references/palette.md",
-      "bytes": 9217,
-      "sha256": "3844e2aa659d6181e24ddcbf7afbaee71d11b90bdc286d603bbf34c11fa99cc7",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "scripts/validate_palette.js",
-      "bytes": 18323,
-      "sha256": "5c1141c2e8225cd3726853f1f4459a539244c33e5877c058ad402edbbf3af290",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
-      "skill": "dataviz",
-      "path": "scripts/validate_palette.py",
-      "bytes": 16091,
-      "sha256": "13968104e3746cc903c1e2a9bd5bec949eccd81f7c3ea9bfee486c4777f386ce",
-      "bundleHash": "17e9a9a0ee8f2aad7a862f8f66282260"
-    },
-    {
       "skill": "skill-creator",
       "path": "INSTRUCTIONS.md",
       "bytes": 15735,

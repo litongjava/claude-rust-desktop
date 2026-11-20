@@ -44,7 +44,7 @@ async fn resource_reads_keep_explicit_permissions_and_model_api_invocation() {
         .unwrap()
         .strip_prefix("Base directory for this skill: ")
         .unwrap();
-    let path = Path::new(root).join("scripts/validate_palette.js");
+    let path = Path::new(root).join("scripts/check_contrast.py");
     let input = json!({"file_path":path,"offset":2,"limit":3});
     let (_, denied, failed) = executor
         .execute_tool_call("Read", &input, "denied-asset")

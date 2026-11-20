@@ -492,6 +492,62 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_removes_untouched_retired_dataviz_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("skills/bundled");
+        let retired_reference = bundled.join("dataviz/references/palette.md");
+        let retired_script = bundled.join("dataviz/scripts/validate_palette.py");
+        let edited = bundled.join("dataviz/references/anti-patterns.md");
+        for path in [&retired_reference, &retired_script, &edited] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&retired_reference, b"old palette guidance").unwrap();
+        std::fs::write(&retired_script, b"old validator").unwrap();
+        std::fs::write(&edited, b"user notes").unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "dataviz/references/palette.md".to_string(),
+            sha256(b"old palette guidance"),
+        );
+        files.insert(
+            "dataviz/scripts/validate_palette.py".to_string(),
+            sha256(b"old validator"),
+        );
+        files.insert(
+            "dataviz/references/anti-patterns.md".to_string(),
+            sha256(b"old anti-pattern notes"),
+        );
+        write_record_fixture(
+            &bundled,
+            &InstallRecord {
+                version: "previous".into(),
+                files,
+            },
+        );
+
+        install(&bundled).unwrap();
+
+        assert!(!retired_reference.exists());
+        assert!(!retired_script.exists());
+        assert_eq!(std::fs::read(&edited).unwrap(), b"user notes");
+        for current in [
+            "dataviz/SKILL.md",
+            "dataviz/references/checklist.md",
+            "dataviz/scripts/check_contrast.py",
+        ] {
+            assert!(bundled.join(current).is_file(), "{current}");
+        }
+        let record = read_record(&bundled.join(RECORD_FILE));
+        for key in [
+            "dataviz/references/palette.md",
+            "dataviz/scripts/validate_palette.py",
+            "dataviz/references/anti-patterns.md",
+        ] {
+            assert!(!record.files.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
     fn pre_existing_user_file_without_a_record_is_kept() {
         let temp = tempfile::tempdir().unwrap();
         let bundled = temp.path().join("skills/bundled");

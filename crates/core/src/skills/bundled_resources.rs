@@ -57,7 +57,14 @@ impl Resources {
                 directory.display()
             )
         })?;
-        let instructions_path = directory.join("INSTRUCTIONS.md");
+        // skill-creator ships long-form guidance in INSTRUCTIONS.md; other
+        // resource skills carry it in SKILL.md.
+        let instructions_file = if registered(name, "INSTRUCTIONS.md") {
+            "INSTRUCTIONS.md"
+        } else {
+            "SKILL.md"
+        };
+        let instructions_path = directory.join(instructions_file);
         let instructions = std::fs::read_to_string(&instructions_path)
             .with_context(|| format!("Reading {}", instructions_path.display()))?;
         let mut bundles = self
@@ -79,7 +86,7 @@ impl Resources {
         let provenance = if name == "skill-creator" {
             "Bundled skill-creator embedded in DeepSeek Code; no network or prior install is required. Adapted from OpenAI Codex's skill-creator under the Apache-2.0 license; see NOTICE.md and license.txt in the base directory."
         } else {
-            "Bundled documentation snapshot: Claude Code 2.1.295."
+            "Bundled dataviz guidance written for DeepSeek Code; no third-party documentation is required."
         };
         Ok(format!(
         "Base directory for this skill: {}\n\n{} Resolve resource paths against the base directory. Use Read for referenced documents. Execute scripts only through normal Bash permissions; invocation itself executes no scripts. After restarting a worker, invoke this skill again to obtain its current resource directory.\n\n{instructions}\n\nCurrent workspace: {}\n\n## User Request\n\n{arguments}",
@@ -172,11 +179,11 @@ mod tests {
             .prepare("dataviz", "", workspace.path(), &directory)
             .unwrap();
         assert!(prompt.contains(&directory.display().to_string()));
-        let path = directory.join("references/palette.md");
+        let path = directory.join("references/checklist.md");
         let original = read(&path).unwrap();
         assert_eq!(
             original.as_slice(),
-            embedded("dataviz", "references/palette.md")
+            embedded("dataviz", "references/checklist.md")
         );
         std::fs::write(&path, "user edit").unwrap();
         assert_eq!(read(&path).unwrap(), b"user edit");
@@ -403,10 +410,10 @@ mod tests {
         assert!(prompt.contains("literal !`echo should-not-run` $ARGUMENTS 中文😀"));
         assert!(!prompt.contains("official-skills-mq4AvY"));
         assert!(!prompt.contains("Describe the available local instructions only."));
-        let example = directory.join("scripts/validate_palette.js");
+        let example = directory.join("scripts/check_contrast.py");
         assert_eq!(
             std::fs::read(&example).unwrap().as_slice(),
-            embedded("dataviz", "scripts/validate_palette.js")
+            embedded("dataviz", "scripts/check_contrast.py")
         );
         assert!(read(&example).is_some());
         let response = crate::tools::execute_tool(

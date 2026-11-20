@@ -48,13 +48,13 @@ async fn respond(
         .iter()
         .any(|m| m["role"] == "tool" && m["tool_call_id"] == "asset-read");
     let delta = if read {
-        capture.read_ok = request.contains("Design-system-agnostic")
+        capture.read_ok = request.contains("Begin with the question the chart has to answer")
             && !request.contains("Path is outside allowed directories");
         json!({"content":"Resource fixture completed."})
     } else if let Some(root) = resource_root(&body["messages"]) {
-        assert!(root.join("scripts/validate_palette.js").is_file());
+        assert!(root.join("scripts/check_contrast.py").is_file());
         capture.root = Some(root.clone());
-        json!({"tool_calls":[{"index":0,"id":"asset-read","type":"function","function":{"name":"Read","arguments":json!({"file_path":root.join("scripts/validate_palette.js"),"offset":1,"limit":12}).to_string()}}]})
+        json!({"tool_calls":[{"index":0,"id":"asset-read","type":"function","function":{"name":"Read","arguments":json!({"file_path":root.join("scripts/check_contrast.py"),"offset":1,"limit":12}).to_string()}}]})
     } else if request.contains("CUSTOM_DATAVIZ") {
         json!({"content":"Custom override honored."})
     } else {
