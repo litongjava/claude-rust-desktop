@@ -9,14 +9,24 @@ use super::background_shell;
 use crate::services::shell_settings::{self, ResolvedShell, ShellSettings};
 use std::sync::Mutex;
 
-const GIT_BASH_NOTE: &str = "This tool runs Git Bash (POSIX sh), not cmd.exe or PowerShell. Use Unix shell syntax: /dev/null not NUL, forward slashes, $VAR not %VAR% or $env:VAR. Windows paths can be written as C:/Users/... or /c/Users/.... Arguments that look like POSIX paths are converted automatically when calling native .exe programs; when that breaks an argument (e.g. `cmd /c`, `adb push x /sdcard/...`), prefix the command with MSYS_NO_PATHCONV=1. When a native program needs a Windows path inside a variable, file or option value, convert it with `cygpath -w <path>` (or `cygpath -m` for C:/ form).";
-const POWER_SHELL_NOTE: &str = "This tool runs Windows PowerShell 5.1, not bash or cmd. Use PowerShell syntax: $env:VAR, $null or Out-Null instead of /dev/null, ; between commands (&& and || are not supported), and the backtick as the escape character, not backslash. PowerShell input/output is UTF-8.";
-const PWSH_NOTE: &str = "This tool runs PowerShell 7, not bash or cmd. Use PowerShell syntax: $env:VAR, $null or Out-Null instead of /dev/null, ; between commands (&& and || work), and the backtick as the escape character, not backslash. PowerShell input/output is UTF-8.";
-const CMD_NOTE: &str = "This tool runs cmd.exe, not bash or PowerShell. Use %VAR%, NUL, backslashes in paths, && between commands, and double quotes; there is no $VAR, /dev/null or single-quote quoting.";
-const FISH_NOTE: &str = "This tool runs fish, not bash: set variables with set -x VAR value; bash-only syntax may fail.";
-const WSL_NOTE_PREFIX: &str = "This tool runs bash inside WSL";
-const WSL_NOTE_BODY: &str = ", a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.";
-const OTHER_SHELL_HINT: &str = "Set shell only when you need a different shell; then use that shell's syntax (e.g. PowerShell quoting is not bash quoting).";
+const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call starts a fresh shell. Foreground calls can reuse the session's last allowed directory with bash, sh, zsh, WSL, PowerShell or cmd. Fish and explicit background tasks start in the workspace.
+
+A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop. For a detached service, check isolated to see whether it can survive the caller.
+
+Ordinary capture keeps up to 1 MiB per stream. Long results show the beginning and end within the configured preview budget (100 KiB per stream by default). Bash and zsh enable pipefail so a failed stage can surface even when the last stage succeeds. For bash, sh, zsh and WSL, status 141 is reported as incomplete output from a reader closing the pipe early.
+
+A PTY combines both output streams and requires a run without a sandbox policy or process timeout. On Windows, choose a shell other than cmd or WSL for a PTY. Command permission checks also apply outside the sandbox.";
+
+const GIT_BASH_NOTE: &str = "The default is Git Bash. Use $NAME for variables, /dev/null for discarded output and slash-separated paths. Native Windows executables receive translated path arguments. Set MSYS_NO_PATHCONV=1 for a command that needs its arguments verbatim, or use cygpath -w to supply a Windows path explicitly.";
+const POWER_SHELL_NOTE: &str = "The default is Windows PowerShell 5.1 with UTF-8 I/O. Read environment values with $env:NAME and discard output with Out-Null. Use a newline between statements and test $? for conditional execution. Backticks escape special characters.";
+const PWSH_NOTE: &str = "The default is PowerShell 7 with UTF-8 I/O. Use $env:NAME for the environment, Out-Null to discard output and a backtick for escaping. Conditional chains accept && and ||.";
+const CMD_NOTE: &str = "The default is cmd.exe. Expand variables with %NAME%, redirect to NUL to discard output and quote paths containing spaces with double quotes.";
+const FISH_NOTE: &str =
+    "The default is fish. Use fish syntax, including set -x to export a variable.";
+const WSL_NOTE_PREFIX: &str = "The default shell is Bash in WSL";
+const WSL_NOTE_BODY: &str = ". Work with Linux paths inside the distribution. Drive C is normally mounted at /mnt/c, and launching Windows executables requires WSL interop.";
+const OTHER_SHELL_HINT: &str =
+    "If you override the default with shell, write the command for that interpreter.";
 
 /// Shell-aware text for the Bash and Monitor tools.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +36,10 @@ pub(super) struct BashTool {
 }
 
 impl BashTool {
-    /// Today's base description plus the default-shell note and shell hint.
+    pub(super) fn description(&self) -> String {
+        format!("{BASH_DESCRIPTION}{}", self.description_suffix)
+    }
+
     pub(super) fn description_suffix(&self) -> &str {
         &self.description_suffix
     }
@@ -107,7 +120,7 @@ fn build(
 
     BashTool {
         description_suffix,
-        shell_parameter: format!("Shell to use: {} (default: {available})", shells.join(", ")),
+        shell_parameter: format!("Choose from {} (default {available}).", shells.join(", ")),
     }
 }
 
@@ -219,11 +232,11 @@ mod tests {
         assert_eq!(shell_note(&resolved("sh", "/bin/sh")), None);
         assert_eq!(
             shell_note(&wsl(Some("Ubuntu"))),
-            Some("This tool runs bash inside WSL (Ubuntu), a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.".to_string())
+            Some(format!("{WSL_NOTE_PREFIX} (Ubuntu){WSL_NOTE_BODY}"))
         );
         assert_eq!(
             shell_note(&wsl(None)),
-            Some("This tool runs bash inside WSL, a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.".to_string())
+            Some(format!("{WSL_NOTE_PREFIX}{WSL_NOTE_BODY}"))
         );
         assert_eq!(
             shell_note(&resolved("powershell", "powershell.exe")),
@@ -261,7 +274,7 @@ mod tests {
             false,
             &|name| name == "bash",
         );
-        assert_eq!(tool.shell_parameter(), "Shell to use: bash (default: bash)");
+        assert_eq!(tool.shell_parameter(), "Choose from bash (default bash).");
         assert_eq!(tool.description_suffix(), "");
 
         let tool = build(
@@ -272,7 +285,7 @@ mod tests {
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, pwsh (default: bash)"
+            "Choose from bash, zsh, fish, sh, pwsh (default bash)."
         );
         assert_eq!(tool.description_suffix(), format!("\n\n{OTHER_SHELL_HINT}"));
     }
@@ -287,7 +300,7 @@ mod tests {
         );
         assert_eq!(
             posix_only.shell_parameter(),
-            "Shell to use: bash, zsh, sh (default: bash)"
+            "Choose from bash, zsh, sh (default bash)."
         );
         assert_eq!(posix_only.description_suffix(), "");
 
@@ -299,7 +312,7 @@ mod tests {
         );
         assert_eq!(
             with_pwsh.shell_parameter(),
-            "Shell to use: bash, sh, pwsh (default: bash)"
+            "Choose from bash, sh, pwsh (default bash)."
         );
         assert_eq!(
             with_pwsh.description_suffix(),
@@ -314,11 +327,11 @@ mod tests {
         );
         assert_eq!(
             git_bash.shell_parameter(),
-            "Shell to use: bash, zsh, sh, cmd, powershell (default: bash)"
+            "Choose from bash, zsh, sh, cmd, powershell (default bash)."
         );
         assert_eq!(
-            git_bash.description_suffix(),
-            format!("\n\n{GIT_BASH_NOTE}\n\n{OTHER_SHELL_HINT}")
+            git_bash.description(),
+            format!("{BASH_DESCRIPTION}\n\n{GIT_BASH_NOTE}\n\n{OTHER_SHELL_HINT}")
         );
 
         let powershell_default = build(
@@ -329,11 +342,17 @@ mod tests {
         );
         assert_eq!(
             powershell_default.shell_parameter(),
-            "Shell to use: bash, cmd, powershell (default: powershell)"
+            "Choose from bash, cmd, powershell (default powershell)."
         );
         assert_eq!(
-            powershell_default.description_suffix(),
-            format!("\n\n{POWER_SHELL_NOTE}\n\n{OTHER_SHELL_HINT}")
+            powershell_default.description(),
+            format!("{BASH_DESCRIPTION}\n\n{POWER_SHELL_NOTE}\n\n{OTHER_SHELL_HINT}")
+        );
+        assert!(BASH_DESCRIPTION.chars().count() <= 1500);
+        println!(
+            "Git Bash\n{}\n\nPowerShell\n{}",
+            git_bash.description(),
+            powershell_default.description()
         );
     }
 
@@ -347,7 +366,7 @@ mod tests {
         );
         assert_eq!(
             git_bash_with_wsl.shell_parameter(),
-            "Shell to use: bash, cmd, powershell, wsl (default: bash)"
+            "Choose from bash, cmd, powershell, wsl (default bash)."
         );
         assert!(git_bash_with_wsl
             .description_suffix()
@@ -369,7 +388,7 @@ mod tests {
         });
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, pwsh (default: bash)"
+            "Choose from bash, zsh, fish, sh, pwsh (default bash)."
         );
         assert!(!tool.shell_parameter().contains("cmd"));
         assert!(!tool.shell_parameter().contains("powershell"));
@@ -389,7 +408,7 @@ mod tests {
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, cmd, powershell, pwsh, wsl (default: powershell)"
+            "Choose from bash, cmd, powershell, pwsh, wsl (default powershell)."
         );
         assert!(tool
             .description_suffix()
@@ -404,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, cmd, powershell (default: bash)"
+            "Choose from bash, zsh, fish, sh, cmd, powershell (default bash)."
         );
         assert_eq!(
             tool.description_suffix(),
@@ -422,7 +441,7 @@ mod tests {
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh (default: zsh)"
+            "Choose from bash, zsh (default zsh)."
         );
         assert_eq!(tool.description_suffix(), "");
     }
