@@ -3,8 +3,9 @@
 //! magic numbers live here now.
 
 pub mod api_endpoints;
-pub mod ui_language;
+pub mod command_output;
 mod deepseek_search;
+pub mod ui_language;
 pub use deepseek_search::DeepSeekSearchConfig;
 
 use anyhow::Result;
@@ -42,6 +43,8 @@ pub struct ToolLoopConfig {
 pub struct ToolsConfig {
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
+    #[serde(default = "default_true")]
+    pub summarize_long_command_output: bool,
     #[serde(default = "default_bash_timeout_secs")]
     pub default_bash_timeout_secs: u64,
     #[serde(default)]
@@ -130,6 +133,7 @@ impl Default for OrchestrationConfig {
             },
             tools: ToolsConfig {
                 max_output_bytes: default_max_output_bytes(),
+                summarize_long_command_output: true,
                 default_bash_timeout_secs: default_bash_timeout_secs(),
                 computer_use: ComputerUseConfig::default(),
             },
@@ -378,13 +382,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_output_summary_defaults_on_and_can_be_disabled() {
+        assert!(
+            OrchestrationConfig::default()
+                .tools
+                .summarize_long_command_output
+        );
+        for (config, expected) in [
+            ("", true),
+            ("summarize_long_command_output = true", true),
+            ("summarize_long_command_output = false", false),
+        ] {
+            let tools = toml::from_str::<ToolsConfig>(config).unwrap();
+            assert_eq!(tools.summarize_long_command_output, expected);
+        }
+    }
+
+    #[test]
     fn shared_config_reload_observes_changes_and_preserves_state_on_invalid_json() {
         let root = tempfile::tempdir().unwrap();
         let mut desktop = ConfigManager::new(root.path().to_path_buf());
         let mut cli = ConfigManager::new(root.path().to_path_buf());
-        cli.update_config(|config| config.default_provider_id = Some("shared".into())).unwrap();
+        cli.update_config(|config| config.default_provider_id = Some("shared".into()))
+            .unwrap();
         desktop.reload().unwrap();
-        assert_eq!(desktop.get_config().default_provider_id.as_deref(), Some("shared"));
+        assert_eq!(
+            desktop.get_config().default_provider_id.as_deref(),
+            Some("shared")
+        );
         std::fs::write(root.path().join("cli.json"), r#"{"model":"shared::model"}"#).unwrap();
         assert_eq!(desktop.saved_cli_model().as_deref(), Some("shared::model"));
         std::fs::write(root.path().join("config.json"), "invalid").unwrap();

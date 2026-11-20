@@ -243,15 +243,20 @@ fn page_result(
     } else {
         (String::new(), body.into_owned())
     };
+    let (text, collapsed) = super::base64_collapse::collapse(&text);
     let offset = input["offset"].as_u64().unwrap_or(0) as usize;
     let limit = input["max_chars"]
         .as_u64()
         .unwrap_or(DEFAULT_CHARS as u64)
         .clamp(1, MAX_CHARS as u64) as usize;
     let total_chars = text.chars().count();
-    let content: String = text.chars().skip(offset).take(limit).collect();
+    let mut content: String = text.chars().skip(offset).take(limit).collect();
     let returned_chars = content.chars().count();
     let has_more = offset.saturating_add(returned_chars) < total_chars;
+    if collapsed > 0 && !content.is_empty() {
+        content.push('\n');
+        content.push_str(&super::base64_collapse::note(collapsed));
+    }
     Ok(json!({
         "url":url, "title":title, "content_type":content_type,
         "format":if raw { "raw" } else if is_html { "readable_text" } else { "text" },
@@ -622,6 +627,44 @@ mod tests {
         assert_eq!(raw["returned_chars"], MAX_CHARS);
         assert_eq!(raw["source_truncated"], true);
         assert_eq!(raw["format"], "raw");
+    }
+
+    #[test]
+    fn collapses_long_base64_in_page_code() {
+        use base64::Engine;
+        let json = format!("{{\"request\":\"{}\"}}", "x".repeat(20_000));
+        let blob = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let html = format!("<html><head><title>Request</title></head><body><main><p>Example payload:</p><pre>{blob}</pre><p>Done.</p></main></body></html>");
+        let placeholder = format!(
+            "[base64 data omitted: about {} bytes decoded, looks like JSON]",
+            json.len()
+        );
+        let result = page_result(
+            &json!({}),
+            "https://example.org/request",
+            "text/html",
+            html.as_bytes(),
+            false,
+        )
+        .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains(&placeholder));
+        assert!(content.contains("Example payload:"));
+        assert!(content.contains("Done."));
+        assert!(content
+            .contains("(1 long base64 blocks were collapsed; read with raw: true to see them.)"));
+        assert!(!content.contains(&blob[..64]));
+
+        let raw = page_result(
+            &json!({"raw":true}),
+            "https://example.org/request",
+            "text/html",
+            html.as_bytes(),
+            false,
+        )
+        .unwrap();
+        assert!(raw["content"].as_str().unwrap().contains(&placeholder));
+        assert!(!raw["content"].as_str().unwrap().contains(&blob[..64]));
     }
 
     #[test]

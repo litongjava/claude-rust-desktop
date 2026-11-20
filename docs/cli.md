@@ -71,6 +71,12 @@ dcl skills execute <skill-id> '任务说明'
 
 REPL 支持 `/help`、`/status`、`/history`、`/tools`、`/exit`；Ctrl+C 取消当前任务，EOF 退出。普通输出只在 stdout 写模型文本，日志和交互提示写 stderr。`json` 返回最终对象；`stream-json` 每行一个事件，以 `type=result` 结束。执行失败返回非零退出码。
 
+## 长命令输出
+
+Bash（含 PowerShell）与 TaskGet 的 stdout 和 stderr 合计达到 12,000 个原始字节后，模型预览按流列出丢失的字节、整行数，以及最多五条未显示的错误标记行和源行号。快照中多次出现的内容合并计量。耗时达到 10 秒才显示；输出完整且没有需要补充的信息时保留原预览。PTY/ConPTY 控制台保留原有结构。
+
+摘要默认开启。运行 `dcl config set summarize_long_command_output false` 可以关闭，环境变量 `DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT=false` 也可关闭。该选项只影响发送给模型的预览，原始工具事件和保存的命令输出仍可查看。
+
 ## 权限
 
 默认 `--permission-mode ask`。交互会话在终端确认工具操作；单次脚本遇到需要批准的操作立即失败，不自动授权，也不等待五分钟。

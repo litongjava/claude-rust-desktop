@@ -1,0 +1,9 @@
+
+ RUN  v3.2.4 /home/dev/code/deepseek-code-test-summary/target/i6-vitest
+
+ ✓ pass.test.js (2 tests | 1 skipped) 1ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 1 skipped (2)
+   Start at  16:43:45
+   Duration  328ms (transform 17ms, setup 0ms, collect 8ms, tests 1ms, environment 0ms, prepare 243ms)
