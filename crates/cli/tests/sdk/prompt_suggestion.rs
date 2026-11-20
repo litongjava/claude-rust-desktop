@@ -25,7 +25,9 @@ async fn reply(
     let raw = String::from_utf8(bytes.to_vec()).unwrap();
     let mut requests = captured.lock().unwrap();
     let next_turn = requests.iter().any(|(s, _)| *s);
-    let cache_read = if next_turn && !suggestion {
+    let cache_read = if raw.contains("COLD_CUSTOM_FIXTURE") {
+        0
+    } else if next_turn && !suggestion {
         let original: Value = serde_json::from_str(&requests[0].1).unwrap();
         let current: Value = serde_json::from_str(&raw).unwrap();
         let key = if api == "responses" {
@@ -98,7 +100,10 @@ async fn reply(
         }
         _ if load_tool => responses_tool_call("load", "ToolLoad", json!({"names":["ListDir"]})),
         _ if tool => responses_tool_call("ignored", "Write", json!({})),
-        _ => responses_text(text),
+        _ => responses_text_with_usage(
+            text,
+            json!({"input_tokens":128,"output_tokens":4,"total_tokens":132,"input_tokens_details":{"cached_tokens":cache_read}}),
+        ),
     };
     ([("content-type", "text/event-stream")], events)
 }
@@ -111,6 +116,10 @@ impl Drop for Endpoint {
 
 impl Endpoint {
     pub(super) async fn start(api: &'static str) -> Self {
+        Self::with_gate(api, None).await
+    }
+
+    async fn with_gate(api: &'static str, gate: Option<Arc<tokio::sync::Notify>>) -> Self {
         let requests = Arc::new(Mutex::new(Vec::<(bool, String)>::new()));
         let captured = requests.clone();
         let path = match api {
@@ -118,9 +127,22 @@ impl Endpoint {
             "anthropic" => "/v1/messages",
             _ => "/responses",
         };
-        let app = Router::new()
-            .route(path, post(reply))
-            .with_state((api, captured));
+        let app = Router::new().route(path, post(move |headers: HeaderMap, bytes: Bytes| {
+            let gate = gate.clone();
+            let captured = captured.clone();
+            async move {
+                if serde_json::from_slice::<Value>(&bytes).unwrap()["stream"] != true {
+                    return Json(json!({"choices":[{"message":{"role":"assistant","content":"Fixture title"}}]})).into_response();
+                }
+                let is_suggestion = headers.get("x-dcl-request-kind").is_some_and(|v| v == "suggestion");
+                let response = reply(State((api, captured.clone())), headers, bytes).await.into_response();
+                if let Some(gate) = gate.filter(|_| is_suggestion && captured.lock().unwrap().len() == 2) {
+                    gate.notified().await;
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                response
+            }
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -337,4 +359,173 @@ async fn final_tool_round_reuses_the_full_history_and_loaded_tools() {
         .unwrap()
         .iter()
         .any(|v| v["type"] == "function_call_output"));
+}
+
+#[tokio::test]
+async fn custom_responses_builtin_needs_a_positive_read() {
+    let endpoint = Endpoint::start("responses").await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = endpoint.client(root.path(), &[]);
+    initialize(&mut client, true).await;
+    client.send(user("COLD_CUSTOM_FIXTURE")).await;
+    assert_eq!(client.result().await["is_error"], false);
+    let (status, _, frames) = client.finish_with_transcript().await;
+    assert!(status.success() && !frames.contains("prompt_suggestion"));
+    assert_eq!(endpoint.requests.lock().unwrap().len(), 1);
+}
+
+async fn wait_for_posts(endpoint: &Endpoint, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while endpoint.requests.lock().unwrap().len() < count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture did not receive the expected POST");
+}
+
+#[tokio::test]
+async fn new_turn_preempts_pending_suggestion_and_its_retries() {
+    for api in ["chat", "anthropic", "responses"] {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let endpoint = Endpoint::with_gate(api, Some(gate.clone())).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut first = endpoint.client(root.path(), &[]);
+        initialize(&mut first, true).await;
+        first.send(user("first probe")).await;
+        let result = first.result().await;
+        let session = result["session_id"].as_str().unwrap();
+        wait_for_posts(&endpoint, 2).await;
+        if api == "chat" {
+            first.send(user("second probe")).await;
+            assert_eq!(first.result().await["is_error"], false);
+        } else {
+            let mut second = endpoint.client(root.path(), &["--resume", session]);
+            initialize(&mut second, false).await;
+            second.send(user("second probe")).await;
+            assert_eq!(second.result().await["is_error"], false);
+            assert!(second.finish().await.0.success());
+        }
+        gate.notify_one();
+        assert!(first.finish().await.0.success());
+        let requests = endpoint.requests.lock().unwrap();
+        assert_eq!(requests.len(), if api == "chat" { 4 } else { 3 }, "{api}");
+        assert!(!requests[2].0 && requests[2].1.contains("second probe"));
+        if requests.len() == 4 {
+            assert!(requests[3].0 && requests[3].1.contains("second probe"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../support/linux_terminal.rs"]
+mod terminal_fixture;
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn single_turn_worker_releases_foreground_before_suggestion_finishes() {
+    use portable_pty::CommandBuilder;
+    use terminal_fixture::Terminal;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let endpoint = Endpoint::with_gate("chat", Some(gate.clone())).await;
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let data = root.path().join("data");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    terminal_fixture::write_provider(&data, &endpoint.url);
+    std::fs::write(
+        data.join("startup-prompts.json"),
+        json!({"trusted_folders":[workspace]}).to_string(),
+    )
+    .unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let mut command = Terminal::command(
+        CommandBuilder::new(env!("CARGO_BIN_EXE_dcl")),
+        &workspace,
+        &data,
+        &root.path().join("coord"),
+        true,
+        false,
+    );
+    command.env("DEEPSEEK_CODE_SINGLE_TURN_WORKER", "1");
+    command.env("TMPDIR", std::env::temp_dir());
+    command.args(["--session-id", &session, "first probe"]);
+    let mut terminal = Terminal::spawn(command);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            terminal.pump(true);
+            if endpoint.requests.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("single-turn worker did not start its suggestion");
+    // Both the foreground claim and the turn lease must become available
+    // while the optional response is held at the endpoint.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            terminal.pump(true);
+            let jobs =
+                deepseek_code_core::services::background_sessions::list(&data, Some(&session))
+                    .unwrap();
+            if jobs
+                .iter()
+                .any(|job| job.foreground && job.status == "completed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("foreground admission still occupied by the suggestion");
+    let output = Command::new(env!("CARGO_BIN_EXE_dcl"))
+        .current_dir(&workspace)
+        .arg("--data-dir")
+        .arg(&data)
+        .args([
+            "--provider",
+            "fixture",
+            "--model",
+            "fixture-model",
+            "--resume",
+            &session,
+            "--print",
+            "--no-interactive",
+            "second probe",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    gate.notify_one();
+    assert_eq!(endpoint.requests.lock().unwrap().len(), 3);
+    drop(terminal); // The PTY fixture reaps its child on drop.
+}
+
+#[tokio::test]
+async fn retry_preserves_an_eligible_anthropic_or_responses_suggestion() {
+    for api in ["anthropic", "responses"] {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let endpoint = Endpoint::with_gate(api, Some(gate.clone())).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = endpoint.client(root.path(), &[]);
+        initialize(&mut client, true).await;
+        client.send(user("first probe")).await;
+        assert_eq!(client.result().await["is_error"], false);
+        wait_for_posts(&endpoint, 2).await;
+        gate.notify_one();
+        assert!(client.finish().await.0.success());
+        let requests = endpoint.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "{api}");
+        assert!(requests[1].0 && requests[2] == requests[1]);
+    }
 }

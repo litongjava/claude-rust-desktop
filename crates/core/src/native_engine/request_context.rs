@@ -221,10 +221,6 @@ impl ContextCapture {
     pub fn snapshot(&self) -> Option<ContextUsage> {
         self.latest.lock().ok()?.clone()
     }
-    pub async fn record(&self, protocol: &str, body: &Value, window: Option<u32>, requested: u32) {
-        self.record_transport(protocol, body, window, requested, None)
-            .await;
-    }
     pub(super) async fn record_transport(
         &self,
         protocol: &str,
@@ -232,10 +228,14 @@ impl ContextCapture {
         window: Option<u32>,
         requested: u32,
         builtin_vision: Option<bool>,
+        url: &str,
     ) {
         if let Some(capture) = &self.suggestion {
-            capture.record(protocol, body, builtin_vision);
+            capture.record(protocol, body, builtin_vision, url);
         }
+        self.record(protocol, body, window, requested).await;
+    }
+    pub async fn record(&self, protocol: &str, body: &Value, window: Option<u32>, requested: u32) {
         let usage = ContextUsage::from_body(protocol, body, window, requested);
         if let Ok(mut current) = self.latest.lock() {
             *current = Some(usage.clone());

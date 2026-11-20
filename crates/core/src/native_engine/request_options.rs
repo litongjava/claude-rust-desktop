@@ -4,6 +4,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
+    pub(crate) suggestion_guard: Option<(
+        std::sync::Arc<crate::session_files::suggestion::SuggestionGuard>,
+        std::time::Instant,
+    )>,
     pub session_id: Option<String>,
     pub compact: bool,
     pub recording: Option<super::request_recording::RecordingContext>,

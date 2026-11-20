@@ -5,6 +5,7 @@ use super::{
     provider_manager::ResolvedProvider, provider_runtime, request_identity::TurnIdentity,
     request_options::RequestOptions, request_trace::RequestTrace,
 };
+use crate::session_files::suggestion::SuggestionGuard;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -25,6 +26,7 @@ pub struct SuggestionCapture(Arc<Mutex<CaptureState>>);
 struct CaptureState {
     body: Option<(String, Value)>,
     builtin_vision: Option<bool>,
+    automatic_cache: bool,
     completed: Option<CompletedRequest>,
 }
 
@@ -35,9 +37,16 @@ struct CompletedRequest {
 }
 
 impl SuggestionCapture {
-    pub(super) fn record(&self, protocol: &str, body: &Value, builtin_vision: Option<bool>) {
+    pub(super) fn record(
+        &self,
+        protocol: &str,
+        body: &Value,
+        builtin_vision: Option<bool>,
+        url: &str,
+    ) {
         *self.0.lock().unwrap() = CaptureState {
             body: Some((protocol.to_owned(), body.clone())),
+            automatic_cache: automatic_cache(url),
             builtin_vision,
             completed: None,
         };
@@ -51,7 +60,7 @@ impl SuggestionCapture {
     ) {
         let mut capture = self.0.lock().unwrap();
         let cache_read = snapshot["cacheReadTokens"].as_u64().unwrap_or_default() > 0;
-        if snapshot["status"] == "completed" && (cache_read || automatic_cache(provider)) {
+        if snapshot["status"] == "completed" && (cache_read || capture.automatic_cache) {
             capture.completed = Some(CompletedRequest {
                 provider: provider.clone(),
                 options: options.clone().with_purpose("suggestion"),
@@ -62,22 +71,23 @@ impl SuggestionCapture {
         }
     }
 
-    pub async fn generate(self) -> Result<Option<String>> {
+    pub async fn generate(self, guard: Arc<SuggestionGuard>) -> Result<Option<String>> {
         let capture = std::mem::take(&mut *self.0.lock().unwrap());
         let (
             Some((api, mut body)),
             Some(CompletedRequest {
                 provider,
-                options,
+                mut options,
                 finished,
             }),
         ) = (capture.body, capture.completed)
         else {
             return Ok(None);
         };
-        if finished.elapsed() > TTL {
+        if finished.elapsed() > TTL || !guard.is_current()? {
             return Ok(None);
         }
+        options.suggestion_guard = Some((guard.clone(), finished + TTL));
         append_instruction(&api, &mut body)?;
         let identity = TurnIdentity::new(options.session_id.clone(), None);
         let operation = async {
@@ -99,12 +109,12 @@ impl SuggestionCapture {
             } else if direct_anthropic {
                 AnthropicClient::new()
                     .with_request_options(options)
-                    .stream_body(&provider, body, None)
+                    .stream_body(&provider, body, 0, None)
                     .await?
             } else {
                 OpenAIClient::new()
                     .with_request_options(options)
-                    .stream_body(&provider, body, None, budget)
+                    .stream_body(&provider, body, 0, None, budget)
                     .await?
             };
             let mut response = String::new();
@@ -149,9 +159,18 @@ impl SuggestionCapture {
                     .collect(),
             ))
         };
-        identity
-            .scope(tokio::time::timeout(Duration::from_secs(15), operation))
-            .await?
+        let invalidated = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if finished.elapsed() > TTL || !guard.is_current()? {
+                    return Ok(None);
+                }
+            }
+        };
+        tokio::select! {
+            result = invalidated => result,
+            result = identity.scope(tokio::time::timeout(Duration::from_secs(15), operation)) => result?,
+        }
     }
 }
 
@@ -181,26 +200,66 @@ fn append_instruction(api: &str, body: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn automatic_cache(provider: &ResolvedProvider) -> bool {
-    super::request_options::is_deepseek(provider)
-        || matches!(
-            provider.provider.builtin_id.as_deref(),
-            Some("openai" | "openai-codex" | "azure-openai-responses" | "google" | "google-vertex")
-        )
-        || reqwest::Url::parse(&provider.provider.base_url)
-            .ok()
-            .is_some_and(|url| {
-                matches!(
-                    url.host_str(),
-                    Some("api.openai.com" | "generativelanguage.googleapis.com")
-                )
-            })
+// These services document automatic prefix caching. Match the final model URL,
+// including catalog defaults and regional endpoints. A protocol ID, a cache
+// price, or support for explicit cache markers says nothing about a proxy.
+fn automatic_cache(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    matches!(
+        host,
+        "api.deepseek.com"
+            | "api.openai.com"
+            | "chatgpt.com"
+            | "api.groq.com"
+            | "api.x.ai"
+            | "generativelanguage.googleapis.com"
+            | "aiplatform.googleapis.com"
+    ) || host.ends_with("-aiplatform.googleapis.com")
+        || [".openai.azure.com", ".openai.azure.us", ".openai.azure.cn"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native_engine::provider_manager::Provider;
+
+    #[test]
+    fn automatic_cache_uses_only_the_service_host() {
+        for host in [
+            "api.deepseek.com",
+            "API.OPENAI.COM",
+            "chatgpt.com",
+            "west.openai.azure.com",
+            "svc.openai.azure.us",
+            "svc.openai.azure.cn",
+            "api.groq.com",
+            "api.x.ai",
+            "generativelanguage.googleapis.com",
+            "aiplatform.googleapis.com",
+            "us-central1-aiplatform.googleapis.com",
+        ] {
+            assert!(automatic_cache(&format!("http://{host}:1234/v1")), "{host}");
+        }
+        for url in [
+            "http://127.0.0.1/openai",
+            "https://api.openai.com.evil.example",
+            "https://api.groq.com@proxy.example",
+            "https://notopenai.azure.com",
+            "https://api.x.ai.example",
+            "https://us-east1-aiplatform.googleapis.com.example",
+            "invalid",
+        ] {
+            assert!(!automatic_cache(url), "{url}");
+        }
+    }
 
     #[tokio::test]
     async fn expired_main_request_and_cold_custom_provider_send_nothing() {
@@ -214,9 +273,37 @@ mod tests {
             model: config.models[0].clone(),
             provider: config,
         };
+        use crate::{
+            db::turn_repo::{TurnStatus, TurnTimer},
+            runtime::{RuntimePaths, SessionStore},
+            session_files::suggestion::SuggestionTurn,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let session = store.create(root.path(), "mock", "mock").unwrap();
+        let mut turn = TurnTimer::start(store.db.clone(), &session).unwrap();
+        let origin = SuggestionTurn::begin(
+            store.db.clone(),
+            &session,
+            &turn.record().turn_id,
+            "mock",
+            "mock",
+        )
+        .unwrap()
+        .unwrap();
+        let assistant = turn.ensure_segment().unwrap();
+        turn.finish(TurnStatus::Completed).unwrap();
+        let guard = Arc::new(origin.complete(&assistant).unwrap().unwrap());
+        assert!(guard.is_current().unwrap());
         for (cached, expired) in [(0, false), (32, true)] {
             let capture = SuggestionCapture::default();
-            capture.record("openai-completions", &json!({"messages":[]}), None);
+            capture.record(
+                "openai-completions",
+                &json!({"messages":[]}),
+                None,
+                &provider.provider.base_url,
+            );
             capture.finish(
                 &json!({"status":"completed","cacheReadTokens":cached}),
                 &provider,
@@ -232,7 +319,7 @@ mod tests {
                     .unwrap()
                     .finished -= TTL + Duration::from_secs(1);
             }
-            assert!(capture.generate().await.unwrap().is_none());
+            assert!(capture.generate(guard.clone()).await.unwrap().is_none());
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(30), endpoint.accept())

@@ -1653,6 +1653,17 @@ async fn run(cli: &Cli) -> Result<()> {
                 output::ReportedError(format!("Session shutdown failed: {error:#}")).into(),
             );
         }
+        let pending = session.pending_suggestion.lock().unwrap().take();
+        if let Some(pending) = pending {
+            if deepseek_code_core::services::background_sessions::finish_before_suggestion(
+                &session.paths.data_dir,
+                &session.id,
+            )
+            .is_ok()
+            {
+                let _ = pending.generate().await;
+            }
+        }
         return result;
     }
     result.and(shutdown)

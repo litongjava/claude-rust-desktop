@@ -60,7 +60,7 @@ pub struct Session {
     waiting_for_continue: std::sync::atomic::AtomicBool,
     /// Runtime-only options of the latest worker turn, retained for internal wakes.
     pub(crate) hook_wake_cli: std::sync::Mutex<Option<Arc<Cli>>>,
-    pub(crate) sdk_suggestion: std::sync::Mutex<Option<crate::prompt_suggestion::Pending>>,
+    pub(crate) pending_suggestion: std::sync::Mutex<Option<crate::prompt_suggestion::Pending>>,
     pub(crate) sdk_permissions: Option<Arc<crate::sdk::Permissions>>,
     pub(crate) sdk_interrupt: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) sdk_content: Option<Value>,
@@ -153,7 +153,10 @@ pub(crate) fn recall_queued(
 // Attempt data is published only after optional recovery has settled.
 #[derive(Default)]
 struct TurnCompletion {
-    suggestion: Option<deepseek_code_core::native_engine::suggestion::SuggestionCapture>,
+    suggestion: Option<(
+        deepseek_code_core::native_engine::suggestion::SuggestionCapture,
+        deepseek_code_core::session_files::suggestion::SuggestionTurn,
+    )>,
     // Keep the original print failure even if saving the transcript, finishing
     // the turn timer, or publishing the result also fails.
     stdout_failure: Option<crate::terminal_output::StdoutWriteFailed>,
@@ -755,7 +758,7 @@ impl Session {
         Ok(Self {
             waiting_for_continue: std::sync::atomic::AtomicBool::new(resumed_id.is_some()),
             hook_wake_cli: std::sync::Mutex::new(None),
-            sdk_suggestion: Default::default(),
+            pending_suggestion: Default::default(),
             initial_hook_message: None,
             permissions,
             ide,
@@ -1725,6 +1728,7 @@ impl Session {
             })??;
         }
         let record = turn.finish(status)?;
+        drop(turn_lease);
         let terminal_event = json!({"type":"request_turn_end", "turnId":record.turn_id,
             "outcome":status, "failure":completion.failure,
             "timestampMs":chrono::Utc::now().timestamp_millis()});
@@ -1758,19 +1762,19 @@ impl Session {
             emit_json(&payload)?;
         }
         if status == deepseek_code_core::db::turn_repo::TurnStatus::Completed {
-            if let Some(pending) = completion.suggestion.take().and_then(|capture| {
-                crate::prompt_suggestion::Pending::new(self, capture, turn.message_id()?)
+            if let Some(pending) = completion.suggestion.take().and_then(|(capture, origin)| {
+                let guard = Arc::new(origin.complete(turn.message_id()?).ok()??);
+                Some(crate::prompt_suggestion::Pending { capture, guard })
             }) {
-                if self.sdk_permissions.is_some() {
-                    *self.sdk_suggestion.lock().unwrap() = Some(pending);
-                } else if input.is_some()
-                    || self.coordination_mode
-                        == crate::local_coordination::RegistrationMode::HostOwned
+                if self.sdk_permissions.is_some()
+                    || (input.is_none()
+                        && self.coordination_mode
+                            != crate::local_coordination::RegistrationMode::HostOwned)
                 {
-                    tokio::spawn(pending.generate());
+                    // SDK input and the one-shot worker own their follow-up lifetime.
+                    *self.pending_suggestion.lock().unwrap() = Some(pending);
                 } else {
-                    // A single-turn foreground worker exits as soon as this returns.
-                    let _ = pending.generate().await;
+                    tokio::spawn(pending.generate());
                 }
             }
         }
@@ -1985,9 +1989,22 @@ impl Session {
                 || local_terminal && crate::prompt_suggestion::foreground_worker(self))
             && crate::prompt_suggestion::enabled(&self.paths.data_dir)
         {
-            completion.suggestion = Some(Default::default());
+            completion.suggestion =
+                deepseek_code_core::session_files::suggestion::SuggestionTurn::begin(
+                    self.store.db.clone(),
+                    &self.id,
+                    &turn.record().turn_id,
+                    &self.model,
+                    &self.provider_id,
+                )
+                .ok()
+                .flatten()
+                .map(|origin| (Default::default(), origin));
         }
-        let suggestion_capture = completion.suggestion.clone();
+        let suggestion_capture = completion
+            .suggestion
+            .as_ref()
+            .map(|(capture, _)| capture.clone());
         let request = Box::pin(async {
             if hook_wake {
                 match execution_lease {

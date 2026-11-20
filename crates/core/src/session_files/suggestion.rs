@@ -35,6 +35,100 @@ impl HistoryPosition {
     }
 }
 
+/// Snapshot the binding before dispatching the main request. The execution
+/// turn ID changes on admission, even before the next user message is saved.
+pub struct SuggestionTurn {
+    db: std::sync::Arc<crate::db::DbManager>,
+    session: String,
+    turn_id: String,
+    generation: i64,
+}
+
+impl SuggestionTurn {
+    pub fn begin(
+        db: std::sync::Arc<crate::db::DbManager>,
+        session: &str,
+        turn_id: &str,
+        model: &str,
+        provider: &str,
+    ) -> Result<Option<Self>> {
+        use rusqlite::OptionalExtension;
+        let generation = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT coalesce(g.generation, 0) FROM conversations c
+             LEFT JOIN conversation_binding_generations g ON g.conversation_id=c.id
+             WHERE c.id=?1 AND c.model=?2 AND c.provider=?3",
+                [session, model, provider],
+                |row| row.get(0),
+            )
+            .optional()
+        })??;
+        Ok(generation.map(|generation| Self {
+            db,
+            session: session.into(),
+            turn_id: turn_id.into(),
+            generation,
+        }))
+    }
+
+    pub fn complete(self, assistant: &str) -> Result<Option<SuggestionGuard>> {
+        let Some(position) = HistoryPosition::current(&self.db, &self.session)? else {
+            return Ok(None);
+        };
+        Ok(
+            (position.assistant_id == assistant).then_some(SuggestionGuard {
+                turn: self,
+                position,
+            }),
+        )
+    }
+}
+
+pub struct SuggestionGuard {
+    turn: SuggestionTurn,
+    position: HistoryPosition,
+}
+
+impl std::fmt::Debug for SuggestionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuggestionGuard")
+            .field("turn_id", &self.turn.turn_id)
+            .field("position", &self.position)
+            .finish()
+    }
+}
+
+impl SuggestionGuard {
+    fn matches(&self, conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT (SELECT CASE WHEN status='completed' THEN id END FROM execution_turns WHERE conversation_id=?1 ORDER BY rowid DESC LIMIT 1) IS ?2
+                 AND coalesce((SELECT generation FROM conversation_binding_generations WHERE conversation_id=?1),0)=?3
+                 AND (SELECT count(*) FROM messages WHERE conversation_id=?1)=?4
+                 AND (SELECT CASE WHEN role='assistant' THEN id END FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC,rowid DESC LIMIT 1) IS ?5",
+            rusqlite::params![self.turn.session, self.turn.turn_id, self.turn.generation, self.position.history_len, self.position.assistant_id],
+            |row| row.get(0))
+    }
+
+    pub fn is_current(&self) -> Result<bool> {
+        Ok(self.turn.db.with_conn(|conn| self.matches(conn))??)
+    }
+
+    pub fn save(&self, text: String) -> Result<Option<String>> {
+        let saved = SavedSuggestion {
+            text,
+            created_at: chrono::Utc::now(),
+            position: self.position.clone(),
+        };
+        let published =
+            saved.save_if(
+                &self.turn.db,
+                &self.turn.session,
+                |tx| Ok(self.matches(tx)?),
+            )?;
+        Ok(published.then_some(saved.text))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SavedSuggestion {
     pub text: String,
@@ -69,11 +163,22 @@ impl SavedSuggestion {
     }
 
     pub fn save(&self, db: &crate::db::DbManager, session: &str) -> Result<bool> {
+        self.save_if(db, session, |tx| {
+            Ok(HistoryPosition::read(tx, session)?.as_ref() == Some(&self.position))
+        })
+    }
+
+    fn save_if(
+        &self,
+        db: &crate::db::DbManager,
+        session: &str,
+        current: impl FnOnce(&rusqlite::Connection) -> Result<bool>,
+    ) -> Result<bool> {
         let path = Self::path(db, session)?;
         db.with_conn(|conn| -> Result<bool> {
             // Serialize the comparison and publication with other turns and deletion.
             let tx = crate::db::write_transaction(conn)?;
-            if HistoryPosition::read(&tx, session)?.as_ref() != Some(&self.position) {
+            if !current(&tx)? {
                 return Ok(false);
             }
             let dir = path.parent().context("Missing session directory")?;
@@ -107,6 +212,64 @@ impl SavedSuggestion {
 mod tests {
     use super::*;
     use crate::runtime::{RuntimePaths, SessionStore};
+
+    #[test]
+    fn turn_admission_and_binding_round_trip_invalidate_without_new_history() -> Result<()> {
+        use crate::db::turn_repo::{TurnStatus, TurnTimer};
+        let root = tempfile::tempdir()?;
+        let paths = RuntimePaths::new(root.path().join("data"))?;
+        let store = SessionStore::new(paths.open_database()?);
+        let other = paths.open_database()?;
+        let session = store.create(root.path(), "old", "provider")?;
+        let mut turn = TurnTimer::start(store.db.clone(), &session)?;
+        let begin = || {
+            SuggestionTurn::begin(
+                store.db.clone(),
+                &session,
+                &turn.record().turn_id,
+                "old",
+                "provider",
+            )
+        };
+        let origin = begin()?.unwrap();
+        let assistant = turn.ensure_segment()?;
+        turn.finish(TurnStatus::Completed)?;
+        let guard = origin.complete(&assistant)?.unwrap();
+        let change = |model: &str| -> Result<()> {
+            other.with_conn(|c| {
+                c.execute(
+                    "UPDATE conversations SET model=?1 WHERE id=?2",
+                    [model, &session],
+                )
+            })??;
+            Ok(())
+        };
+        change("old")?;
+        assert!(guard.is_current()?);
+        change("other")?;
+        change("old")?;
+        assert!(!guard.is_current()?);
+        assert!(guard.save("old suggestion".into())?.is_none());
+        let guard = SuggestionTurn::begin(
+            store.db.clone(),
+            &session,
+            &turn.record().turn_id,
+            "old",
+            "provider",
+        )?
+        .unwrap()
+        .complete(&assistant)?
+        .unwrap();
+        assert!(guard.is_current()?);
+        let _next = TurnTimer::start(other, &session)?;
+        assert_eq!(
+            HistoryPosition::current(&store.db, &session)?.unwrap(),
+            guard.position
+        );
+        assert!(!guard.is_current()?);
+        assert!(guard.save("old suggestion".into())?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn replacement_acceptance_stale_history_and_deletion() -> Result<()> {

@@ -575,9 +575,15 @@ fn responses_tool_call(id: &str, name: &str, arguments: Value) -> String {
 }
 
 fn responses_text(text: &str) -> String {
+    responses_text_with_usage(
+        text,
+        json!({"input_tokens":20,"output_tokens":10,"total_tokens":30}),
+    )
+}
+fn responses_text_with_usage(text: &str, usage: Value) -> String {
     [
         json!({"type":"response.output_text.delta","delta":text}),
-        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}),
+        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":usage}}),
     ]
     .into_iter()
     .map(responses_frame)

@@ -2,7 +2,7 @@
 use deepseek_code_core::{
     db::DbManager,
     native_engine::suggestion::SuggestionCapture,
-    session_files::suggestion::{HistoryPosition, SavedSuggestion},
+    session_files::suggestion::{SavedSuggestion, SuggestionGuard},
 };
 use serde_json::Value;
 use std::{path::Path, sync::Arc};
@@ -65,42 +65,17 @@ pub(crate) fn foreground_worker(session: &crate::session::Session) -> bool {
 }
 
 pub(crate) struct Pending {
-    db: Arc<DbManager>,
-    session: String,
-    capture: SuggestionCapture,
-    position: HistoryPosition,
+    pub capture: SuggestionCapture,
+    pub guard: Arc<SuggestionGuard>,
 }
 
 impl Pending {
-    pub fn new(
-        session: &crate::session::Session,
-        capture: SuggestionCapture,
-        assistant: &str,
-    ) -> Option<Self> {
-        let db = session.store.db.clone();
-        let position = HistoryPosition::current(&db, &session.id).ok()??;
-        (position.assistant_id == assistant).then(|| Self {
-            db,
-            session: session.id.clone(),
-            capture,
-            position,
-        })
-    }
-
     pub async fn generate(self) -> anyhow::Result<Option<String>> {
-        if HistoryPosition::current(&self.db, &self.session)?.as_ref() != Some(&self.position) {
-            return Ok(None);
-        }
-        let text = self.capture.generate().await?;
+        let text = self.capture.generate(self.guard.clone()).await?;
         let Some(text) = text.as_deref().and_then(filter) else {
             return Ok(None);
         };
-        let saved = SavedSuggestion {
-            text,
-            created_at: chrono::Utc::now(),
-            position: self.position,
-        };
-        Ok(saved.save(&self.db, &self.session)?.then_some(saved.text))
+        self.guard.save(text)
     }
 }
 

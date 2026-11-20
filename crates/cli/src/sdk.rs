@@ -632,6 +632,7 @@ async fn run_inner(
     let mut failed = false;
     let mut started = false;
     let mut answered = Vec::<(String, String)>::new();
+    let mut suggestions = tokio::task::JoinSet::new();
     // Captures the count before the first poll, so a signal received while a
     // frame, a turn or a control reply is being handled still ends the input
     // loop instead of becoming the next wait's baseline.
@@ -676,6 +677,9 @@ async fn run_inner(
             started = true;
         }
         if let Some(message) = queue.pop_front() {
+            // Dropping the prior set aborts in-flight work and discards any
+            // queued result before this user message can start a new turn.
+            suggestions = tokio::task::JoinSet::new();
             initialization.start_user_turn();
             // Reference SDKs label messages "default" before they learn the session id.
             ensure!(
@@ -842,23 +846,31 @@ async fn run_inner(
             if let Some(id) = crate::sdk_operations::latest_user_message(session, &delivered_rows)? {
                 answered.push((message_uuid, id));
             }
-            let pending = session.sdk_suggestion.lock().unwrap().take();
-            if let Some(pending) = pending.filter(|_| !turn_failed) {
-                match pending.generate().await {
-                    Ok(Some(text)) => emit_prompt_suggestion(session, &text)?,
-                    Err(error) if cli.verbose => eprintln!("Prompt suggestion skipped: {error:#}"),
-                    _ => {}
-                }
+            let pending = session.pending_suggestion.lock().unwrap().take();
+            if let Some(pending) = pending.filter(|_| !turn_failed && queue.is_empty()) {
+                suggestions.spawn(pending.generate());
             }
             // Signals the turn handled must not end the session; one that
             // arrived after the turn stopped watching still does.
             signal_scope.rearm_to(handled);
             continue;
         }
-        if eof {
+        if eof && suggestions.is_empty() {
             break;
         }
-        match tokio::select! {frame=frames.recv()=>frame,_=signal_scope.interrupted()=>bail!("SDK input interrupted")}
+        match tokio::select! {
+            biased;
+            _ = signal_scope.interrupted() => bail!("SDK input interrupted"),
+            frame = frames.recv(), if !eof => frame,
+            result = suggestions.join_next(), if !suggestions.is_empty() => {
+                match result {
+                    Some(Ok(Ok(Some(text)))) => emit_prompt_suggestion(session, &text)?,
+                    Some(Ok(Err(error))) if cli.verbose => eprintln!("Prompt suggestion skipped: {error:#}"),
+                    _ => {}
+                }
+                continue;
+            }
+        }
         {
             None => {
                 eof = true;
