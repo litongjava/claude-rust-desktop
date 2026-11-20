@@ -38,6 +38,8 @@ pub fn change(db: &DbManager, id: &str, base: &Path, argument: &str, add: bool) 
             tx.execute("UPDATE conversation_worktrees SET project_id=?1 WHERE conversation_id=?2",rusqlite::params![project_id,id])?;
             tx.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2",rusqlite::params![path.to_string_lossy(),id])?;
         }
+        tx.execute("DELETE FROM peripheral_settings WHERE key=?1", [format!("memory.scope.{id}")])?;
+        tx.execute("DELETE FROM peripheral_settings WHERE key=?1", [format!("memory.private-owner.{id}")])?;
         tx.commit()?;
         Ok(managed_workspace.unwrap_or_else(||PathBuf::from(&folders[0])))
     })?

@@ -375,7 +375,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_search".to_string(),
-            description: "Search your persistent memory for relevant information from previous conversations. Use this to recall important context, decisions, or facts from past interactions.".to_string(),
+            description: "Remote HTTP memory only (when configured and enabled). Search your persistent memory for relevant information from previous conversations. Use this to recall important context, decisions, or facts from past interactions.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -387,7 +387,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_ingest".to_string(),
-            description: "Store important information in persistent memory for future retrieval. Use this to remember key decisions, architecture, configurations, or any information that should persist across conversations.".to_string(),
+            description: "Remote HTTP memory only (when configured and enabled). Store important information in persistent memory for future retrieval. Use this to remember key decisions, architecture, configurations, or any information that should persist across conversations.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

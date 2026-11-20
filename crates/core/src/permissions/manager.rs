@@ -727,22 +727,50 @@ impl PermissionManager {
         context: &PermissionContext,
         plan_document: bool,
     ) -> PermissionResult {
-        self.evaluate_permission_inner(context, plan_document)
+        self.evaluate_permission_inner(context, plan_document, false)
             .result
     }
 
     pub fn evaluate_permission(&self, context: &PermissionContext) -> PermissionDecision {
-        self.evaluate_permission_inner(context, false)
+        self.evaluate_permission_inner(context, false, false)
+    }
+
+    /// Host-only: the engine has validated one current-scope memory target.
+    pub(crate) fn check_memory_document_permission(
+        &self,
+        context: &PermissionContext,
+    ) -> PermissionResult {
+        let direct = self.evaluate_permission_inner(context, false, true).result;
+        if context.tool_name != "ApplyPatch" || matches!(direct, PermissionResult::Denied(_)) {
+            return direct;
+        }
+        // Patch deletion is also a file mutation: preserve explicit path rules
+        // expressed for Write/Edit, just as the ordinary patch adapter does.
+        let mut result = direct;
+        for tool in ["Write", "Edit"] {
+            let mut file_context = context.clone();
+            file_context.tool_name = tool.into();
+            let file_result = self
+                .evaluate_permission_inner(&file_context, false, true)
+                .result;
+            match file_result {
+                PermissionResult::Denied(_) => return file_result,
+                PermissionResult::RequiresConfirmation(_) => result = file_result,
+                PermissionResult::Granted => {}
+            }
+        }
+        result
     }
 
     fn evaluate_permission_inner(
         &self,
         context: &PermissionContext,
         plan_document: bool,
+        memory_document: bool,
     ) -> PermissionDecision {
         let mode = self.get_mode();
         let decision = self
-            .static_decision(context, mode, plan_document)
+            .static_decision(context, mode, plan_document, memory_document)
             .in_mode(mode);
         self.audit_logger.log(
             AuditEntry::new(
@@ -765,6 +793,7 @@ impl PermissionManager {
         context: &PermissionContext,
         mode: PermissionMode,
         plan_document: bool,
+        memory_document: bool,
     ) -> PermissionDecision {
         use DecisionOrigin::*;
         let decision = PermissionDecision::new;
@@ -931,6 +960,9 @@ impl PermissionManager {
         }
         if setting.as_ref().is_some_and(|p| p.requires_confirmation) {
             return decision(self.request_confirmation(context), ToolSetting);
+        }
+        if memory_document {
+            return decision(PermissionResult::Granted, DefaultOwnState);
         }
         if shell
             && context.tool_input["command"]
@@ -1387,6 +1419,46 @@ mod policy_tests {
             workspace_path: None,
         }
     }
+    #[test]
+    fn memory_scope_grant_preserves_plan_deny_and_ask() {
+        for mode in [
+            PermissionMode::AskPermissions,
+            PermissionMode::Auto,
+            PermissionMode::DontAsk,
+        ] {
+            let manager = manager(mode);
+            assert_eq!(
+                manager.check_memory_document_permission(&context("Write")),
+                PermissionResult::Granted
+            );
+            manager.set_session_rules(
+                "session",
+                HashMap::from([("Write".into(), PermissionAction::Deny)]),
+            );
+            assert!(matches!(
+                manager.check_memory_document_permission(&context("Write")),
+                PermissionResult::Denied(_)
+            ));
+            manager.set_session_rules(
+                "session",
+                HashMap::from([("Write".into(), PermissionAction::Confirm)]),
+            );
+            assert_ne!(
+                manager.check_memory_document_permission(&context("Write")),
+                PermissionResult::Granted
+            );
+        }
+        let manager = manager(PermissionMode::PlanMode);
+        assert_eq!(
+            manager.check_memory_document_permission(&context("Read")),
+            PermissionResult::Granted
+        );
+        assert!(matches!(
+            manager.check_memory_document_permission(&context("Write")),
+            PermissionResult::Denied(_)
+        ));
+    }
+
     #[test]
     fn legacy_task_output_keeps_task_get_read_only_authority() {
         for mode in [

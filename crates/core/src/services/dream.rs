@@ -82,6 +82,12 @@ async fn run_inner(
             skipped: Some(reason.into()),
         })
     };
+    if context
+        .setting::<bool>("memory.files.active")?
+        .unwrap_or(false)
+    {
+        return skip("file memory mode: dream paused; legacy data and configuration preserved");
+    }
     if automatic {
         let config: DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
         config.validate()?;
@@ -134,6 +140,12 @@ async fn run_inner(
         }
     };
     ensure!(lease.renew()?, "Dream cancelled or lease expired");
+    if context
+        .setting::<bool>("memory.files.active")?
+        .unwrap_or(false)
+    {
+        return skip("file memory activated during generation; dream paused");
+    }
     let summary_id = memory.commit_dream(&sources, &summary)?;
     lease.record(None)?;
     Ok(DreamReport {

@@ -1516,6 +1516,17 @@ impl QueryEngine {
             workspace_path.clone(),
         )));
 
+        let memory_config = crate::memory::MemExClient::with_path(
+            plugin_context.paths.data_dir.join("memory.sqlite3"),
+            None,
+        )
+        .get_config_blocking();
+        if memory_config.enabled && memory_config.backend_url == "local" {
+            executor = executor.with_file_memory(
+                crate::services::memory_files::FileMemory::session(&plugin_context, &conv_id)?,
+            );
+        }
+
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
         }

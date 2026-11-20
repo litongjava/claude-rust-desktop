@@ -1289,6 +1289,9 @@ impl ToolLoopExecutor {
         if let Some(memory) = &self.memex_client {
             child = child.with_memex(memory.clone());
         }
+        if let Some(memory) = &self.file_memory {
+            child = child.with_file_memory(memory.child(&id)?);
+        }
         let policy = self.child_owner_policy();
         Ok(PreparedChild {
             model,
@@ -1562,10 +1565,9 @@ impl ToolLoopExecutor {
                         child.streaming_tool_args.shrink_to_fit();
                         child.message_inbox = None;
                         child.execution_lease = None;
-                        child.context_manager = child
-                            .memex_client
-                            .clone()
-                            .map(|client| crate::memory::ContextManager::new(Arc::new(client)));
+                        if let Some(client) = child.memex_client.clone() {
+                            child = child.with_memex(client);
+                        }
                         child.answer_waiters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
                         child.permission_mailbox = Default::default();
                         let (events, _receiver) = tokio::sync::mpsc::channel(1);

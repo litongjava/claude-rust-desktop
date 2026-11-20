@@ -414,7 +414,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: MagicCommands,
     },
-    /// Manage personal memory shared with Desktop.
+    /// Manage project Markdown with `memory files`; other subcommands access the legacy archive.
     Memory {
         #[command(subcommand)]
         action: MemoryCommands,
@@ -538,6 +538,15 @@ pub enum AuthCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommands {
+    /// Manage scoped Markdown memories. Other memory commands access the legacy archive.
+    Files {
+        #[arg(long, conflicts_with = "project")]
+        session: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[command(subcommand)]
+        action: FileMemoryCommands,
+    },
     /// Consolidate new local memories using the selected model, preserving originals.
     Dream,
     /// Force one consolidation, ignoring automatic time/count gates.
@@ -1094,4 +1103,23 @@ mod tests {
             matches!(cli.command, Some(Commands::RemoteControl { action: RemoteControlCommands::Connect { token: Some(token), .. } }) if token.is_empty())
         );
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FileMemoryCommands {
+    List {
+        query: Option<String>,
+    },
+    /// Store a UTF-8 Markdown file; omit version only when creating a new entry.
+    Put {
+        name: String,
+        source: PathBuf,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    Delete {
+        name: String,
+        #[arg(long)]
+        version: String,
+    },
 }

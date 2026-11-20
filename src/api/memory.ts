@@ -26,7 +26,7 @@ export interface MemoryConfig {
 }
 
 async function json<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await request(`/memory${path}`, options);
+  const response = await request(`/memory/legacy${path}`, options);
   return response.json();
 }
 

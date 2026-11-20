@@ -2880,3 +2880,111 @@ async fn monitor_is_deferred_and_loadable() {
     let next: std::collections::HashSet<String> = names(&executor).into_iter().collect();
     assert!(next.contains("Monitor"), "{next:?}");
 }
+
+#[tokio::test]
+async fn file_memory_hides_legacy_tools_even_when_customization_enables_them() {
+    let temp = tempfile::tempdir().unwrap();
+    write_switches(
+        temp.path(),
+        &[("memory_search", true, true), ("memory_ingest", true, true)],
+    );
+    let client = crate::memory::MemExClient::with_path(temp.path().join("memory.sqlite3"), None);
+    let mut executor = executor(temp.path()).with_memex(client.clone());
+    assert!(executor.context_manager.is_none());
+    assert!(!names(&executor).contains(&"memory_search".into()));
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "memory_ingest",
+            &json!({"content":"must not save"}),
+            "local-memory-denied",
+        )
+        .await;
+    assert!(failed, "{output}");
+    assert_eq!(client.stats().await.unwrap().total_memories, 0);
+    let mut config = client.get_config().await;
+    config.backend_url = "http://127.0.0.1:1".into();
+    client.update_config(config).await.unwrap();
+    assert!(names(&executor).contains(&"memory_search".into()));
+    let mut config = client.get_config().await;
+    config.enabled = false;
+    client.update_config(config).await.unwrap();
+    assert!(!names(&executor).contains(&"memory_search".into()));
+}
+
+#[tokio::test]
+async fn file_memory_tool_dispatch_preserves_path_rules_hooks_roles_and_plan() {
+    use crate::permissions::{rules::PermissionAction, PermissionMode, PermissionResult};
+    use crate::services::{memory_files::FileMemory, EnvironmentCredentials, ServiceContext};
+    let temp = tempfile::tempdir().unwrap();
+    let paths = crate::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+    let service = ServiceContext::open(paths, Arc::new(EnvironmentCredentials)).unwrap();
+    let session = crate::runtime::SessionStore::new(service.db.clone())
+        .create(temp.path(), "fixture", "fixture")
+        .unwrap();
+    let memory = FileMemory::session(&service, &session).unwrap();
+    let path = memory.directory.join("test.md");
+    let input = json!({"file_path":path,"content":"---\nname: Testing\ndescription: Test preferences\nmetadata:\n  type: user\n---\nUse isolated fixtures\n"});
+    let mut executor = executor(temp.path())
+        .with_conv_id(session.clone())
+        .with_file_memory(memory.clone());
+    let pm = executor.permission_manager.clone().unwrap();
+    pm.set_mode(PermissionMode::DontAsk);
+    let (_, output, failed) = executor.execute_tool_call("Write", &input, "create").await;
+    assert!(!failed, "{output}");
+    assert!(path.exists());
+    pm.set_session_rules(
+        &session,
+        HashMap::from([(
+            format!("Write(/{})", path.display()),
+            PermissionAction::Deny,
+        )]),
+    );
+    let patch = json!({"patch":format!("*** Begin Patch\n*** Delete File: {}\n*** End Patch",path.display())});
+    assert!(matches!(
+        executor
+            .check_permission_with("ApplyPatch", &patch, "patch")
+            .await,
+        PermissionResult::Denied(_)
+    ));
+    pm.set_mode(PermissionMode::AskPermissions);
+    pm.set_session_rules(
+        &session,
+        HashMap::from([(
+            format!("Write(/{})", path.display()),
+            PermissionAction::Confirm,
+        )]),
+    );
+    executor.approved_call = Some(tool_approval::ExactApproval {
+        tool: "ApplyPatch".into(),
+        input: patch.clone(),
+        id: "patch".into(),
+        pre_tool_hook: true,
+    });
+    assert!(matches!(
+        executor
+            .check_permission_with("ApplyPatch", &patch, "patch")
+            .await,
+        PermissionResult::RequiresConfirmation(_)
+    ));
+    executor.approved_call = None;
+    pm.set_session_rules(&session, HashMap::new());
+    executor.super_agent_role = crate::super_agent::role::Role::Router;
+    let (_, output, failed) = executor.execute_tool_call("Write", &input, "router").await;
+    assert!(failed && output.contains("Router"), "{output}");
+    executor.super_agent_role = crate::super_agent::role::Role::Agent;
+    pm.set_mode(PermissionMode::PlanMode);
+    let (_, output, failed) = executor
+        .execute_tool_call("Read", &json!({"file_path":path}), "plan-read")
+        .await;
+    assert!(!failed, "{output}");
+    let (_, output, failed) = executor
+        .execute_tool_call("Write", &input, "plan-write")
+        .await;
+    assert!(failed && output.contains("Plan mode"), "{output}");
+    assert!(executor
+        .memory_target(
+            "Write",
+            &json!({"file_path":memory.directory.join("../../other/memory/test.md")})
+        )
+        .is_err());
+}

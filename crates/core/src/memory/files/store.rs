@@ -106,6 +106,7 @@ pub struct FileMemoryStore {
     state: Arc<SafeDir>,
     trash: Arc<SafeDir>,
     options: StoreOptions,
+    read_only: bool,
 }
 
 struct ProjectLock {
@@ -157,21 +158,40 @@ impl FileMemoryStore {
         scope: &MemoryScope,
         options: StoreOptions,
     ) -> Result<Self> {
+        Self::open_mode(data_dir, scope, options, false)
+    }
+
+    /// Never create files, repair an index or recover a journal in a read-only turn.
+    pub fn open_read_only(data_dir: &Path, scope: &MemoryScope) -> Result<Self> {
+        Self::open_mode(data_dir, scope, StoreOptions::default(), true)
+    }
+
+    fn open_mode(
+        data_dir: &Path,
+        scope: &MemoryScope,
+        options: StoreOptions,
+        read_only: bool,
+    ) -> Result<Self> {
         if options.cancelled.load(Ordering::Acquire) {
             return Err(MemoryFileError::Cancelled);
         }
-        let root = SafeDir::root(data_dir)?.child("memory")?;
-        let state = root.child("state")?.child(scope.key())?;
+        let root = SafeDir::root(data_dir)?.child_mode("memory", read_only)?;
+        let state = root
+            .child_mode("state", read_only)?
+            .child_mode(scope.key(), read_only)?;
         let directory = root
-            .child("projects")?
-            .child(scope.key())?
-            .child("memory")?;
-        let trash = root.child("trash")?.child(scope.key())?;
+            .child_mode("projects", read_only)?
+            .child_mode(scope.key(), read_only)?
+            .child_mode("memory", read_only)?;
+        let trash = root
+            .child_mode("trash", read_only)?
+            .child_mode(scope.key(), read_only)?;
         let store = Self {
             directory,
             state,
             trash,
             options,
+            read_only,
         };
         let _lock = store.lock()?;
         // Scope identity is persisted under the same project lock; hash collision
@@ -181,6 +201,7 @@ impl FileMemoryStore {
             Some(saved) if saved != identity => {
                 return Err(invalid("scope identity mismatch; explicit rebind required"))
             }
+            None if read_only => return Err(invalid("memory scope is not initialized")),
             None => store.state.atomic_write("scope.json", &identity)?,
             _ => {}
         }
@@ -205,7 +226,7 @@ impl FileMemoryStore {
 
     fn lock(&self) -> Result<ProjectLock> {
         self.cancelled()?;
-        let file = self.state.lock_file()?;
+        let file = self.state.lock_file(self.read_only)?;
         let start = Instant::now();
         loop {
             self.cancelled()?;
@@ -261,6 +282,9 @@ impl FileMemoryStore {
     }
 
     pub fn put(&self, filename: &str, bytes: &[u8], expected: ExpectedVersion) -> Result<Entry> {
+        if self.read_only {
+            return Err(invalid("memory is read-only"));
+        }
         memory_filename(filename)?;
         let document = MemoryDocument::parse(bytes)?;
         let _lock = self.lock()?;
@@ -282,6 +306,9 @@ impl FileMemoryStore {
     }
 
     pub fn delete(&self, filename: &str, expected: ExpectedVersion) -> Result<()> {
+        if self.read_only {
+            return Err(invalid("memory is read-only"));
+        }
         memory_filename(filename)?;
         let _lock = self.lock()?;
         self.recover()?;
@@ -306,12 +333,28 @@ impl FileMemoryStore {
     pub fn snapshot(&self) -> Result<Snapshot> {
         let _lock = self.lock()?;
         self.recover()?;
+        if self.read_only {
+            let (entries, diagnostics) = self.scan(None)?;
+            let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
+            let index = index::build(&entries, previous.as_deref().unwrap_or_default());
+            return Ok(Snapshot {
+                generation: self.generation()?,
+                index_hash: hash(index.as_bytes()),
+                index,
+                entries,
+                diagnostics,
+                index_repaired: false,
+            });
+        }
         self.mutate(None, None)
     }
 
     /// Accept index ordering through ordinary file adapters without allowing
     /// invented pointers or removal of an existing fact merely by hiding its row.
     pub fn update_index(&self, bytes: &[u8], expected: ExpectedVersion) -> Result<Snapshot> {
+        if self.read_only {
+            return Err(invalid("memory is read-only"));
+        }
         if bytes.len() > MAX_INDEX_BYTES || std::str::from_utf8(bytes).is_err() {
             return Err(invalid("invalid index encoding/size"));
         }
@@ -499,6 +542,11 @@ impl FileMemoryStore {
         let Some(bytes) = self.state.read("journal.json", MAX_JOURNAL_BYTES)? else {
             return Ok(());
         };
+        if self.read_only {
+            return Err(invalid(
+                "memory recovery requires a writable maintenance operation",
+            ));
+        }
         let envelope: JournalEnvelope = serde_json::from_slice(&bytes)
             .map_err(|_| invalid("corrupt memory journal; preserved for recovery"))?;
         let payload = serde_json::to_vec(&envelope.payload)

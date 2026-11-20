@@ -288,6 +288,7 @@ pub struct ToolLoopExecutor {
     runtime_agents: super::runtime_agents::Catalog,
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
+    file_memory: Option<crate::services::memory_files::FileMemory>,
     context_manager: Option<ContextManager>,
     prompt_profile: PromptProfile,
     /// `<system-reminder>` blocks placed before the first user message's text
@@ -1473,6 +1474,7 @@ impl ToolLoopExecutor {
             runtime_agents: Default::default(),
             permission_manager: None,
             memex_client: None,
+            file_memory: None,
             context_manager: None,
             prompt_profile: PromptProfile::Desktop,
             context_reminders: Vec::new(),
@@ -2064,6 +2066,9 @@ impl ToolLoopExecutor {
     /// the user turns into on-demand loses that exposure even though the older
     /// request still lists it, so it must be searched again.
     fn loading_violation(&self, name: &str) -> Option<String> {
+        if matches!(name, "memory_search" | "memory_ingest") && !self.remote_memory_enabled() {
+            return Some("Memory search/ingest require an enabled remote HTTP backend".into());
+        }
         // A legacy dispatch alias follows the loading policy of the current
         // name it was folded into; otherwise it would bypass disabled and
         // not-loaded checks that only know about TaskGet.
@@ -2985,9 +2990,61 @@ impl ToolLoopExecutor {
 
     pub fn with_memex(mut self, client: MemExClient) -> Self {
         let client_arc = Arc::new(client.clone());
-        self.context_manager = Some(ContextManager::new(client_arc));
+        let config = client.get_config_blocking();
+        self.context_manager = (config.enabled
+            && (config.backend_url.starts_with("https://")
+                || config.backend_url.starts_with("http://")))
+        .then(|| ContextManager::new(client_arc));
         self.memex_client = Some(client);
         self
+    }
+
+    pub fn with_file_memory(mut self, memory: crate::services::memory_files::FileMemory) -> Self {
+        self.file_memory = Some(memory);
+        self
+    }
+
+    fn remote_memory_enabled(&self) -> bool {
+        self.memex_client.as_ref().is_some_and(|client| {
+            let config = client.get_config_blocking();
+            config.enabled
+                && (config.backend_url.starts_with("https://")
+                    || config.backend_url.starts_with("http://"))
+        })
+    }
+
+    fn memory_budget(&self) -> usize {
+        let window = self
+            .provider
+            .model
+            .context_window
+            .map(|n| n as usize)
+            .unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id));
+        let used = TokenCounter::estimate(&self.messages)
+            .saturating_add(self.system_prompt.as_ref().map_or(0, String::len));
+        8192.min(window / 10)
+            .min((window * 85 / 100).saturating_sub(used))
+    }
+
+    fn memory_read_only(&self) -> bool {
+        self.permission_manager
+            .as_ref()
+            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
+    }
+
+    fn memory_target(&self, tool: &str, input: &Value) -> Result<Option<String>> {
+        match &self.file_memory {
+            Some(memory) => memory.target(tool, input, &self.workspace_cwd),
+            None => Ok(None),
+        }
+    }
+
+    fn memory_permission_input(&self, input: &Value, target: &str) -> Value {
+        let mut input = input.clone();
+        if let Some(memory) = &self.file_memory {
+            input["file_path"] = json!(memory.directory.join(target));
+        }
+        input
     }
 
     pub fn with_prompt_profile(mut self, profile: PromptProfile) -> Self {
@@ -3229,6 +3286,9 @@ impl ToolLoopExecutor {
     /// policy and before MCP or the user's own tools are added.
     fn builtin_catalog(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
+        if !self.remote_memory_enabled() {
+            tools.retain(|tool| !matches!(tool.name.as_str(), "memory_search" | "memory_ingest"));
+        }
         if !self.goal_proposals_available() {
             tools.retain(|tool| tool.name != "ProposeGoal");
         }
@@ -3289,6 +3349,7 @@ impl ToolLoopExecutor {
             self.builtin_catalog()
                 .into_iter()
                 .map(|tool| tool.name)
+                .chain(["memory_search".to_owned(), "memory_ingest".to_owned()])
                 .collect()
         })
     }
@@ -3305,12 +3366,43 @@ impl ToolLoopExecutor {
     /// settings and catalog snapshot, so the schemas the model receives and the
     /// directory it reads describe the same state. Execution still re-reads the
     /// settings and rechecks permission when a tool is actually called.
-    fn prepare_request(&self) -> Result<PreparedRequest> {
+    fn prepare_request(&self, message_bytes: usize) -> Result<PreparedRequest> {
         let customization = self.customization()?;
         let catalog = customization.described(self.builtin_catalog());
         let tools = self.prepare_tool_definitions(&customization, catalog.clone())?;
         let directory = self.tool_directory(&customization, &catalog, &tools);
-        let system_prompt = self.request_system_prompt(&directory);
+        let mut system_prompt = self.request_system_prompt(&directory);
+        if let Some(memory) = self.file_memory.as_ref().filter(|m| m.active()) {
+            let window = self
+                .provider
+                .model
+                .context_window
+                .map(|n| n as usize)
+                .unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id));
+            let used = message_bytes
+                .saturating_add(system_prompt.as_ref().map_or(0, String::len))
+                .saturating_add(serde_json::to_vec(&tools)?.len());
+            let latest = crate::services::turn_context::for_last(&self.messages, Vec::new());
+            let recall_bytes = latest.as_ref().map_or(0, |target| {
+                self.turn_context
+                    .iter()
+                    .filter(|entry| {
+                        entry.key == target.key && entry.occurrence == target.occurrence
+                    })
+                    .flat_map(|entry| &entry.blocks)
+                    .filter(|block| block.contains(crate::memory::RECALL_LEAD_IN))
+                    .map(String::len)
+                    .sum::<usize>()
+            });
+            let budget = self
+                .memory_budget()
+                .saturating_sub(recall_bytes)
+                .min((window * 85 / 100).saturating_sub(used));
+            let (block, _) = memory.context_with_budget("", self.memory_read_only(), budget)?;
+            system_prompt
+                .get_or_insert_with(String::new)
+                .push_str(&block);
+        }
         Ok(PreparedRequest {
             tools,
             system_prompt,
@@ -3489,12 +3581,16 @@ impl ToolLoopExecutor {
         tool_use_id: &str,
     ) -> PermissionResult {
         self.sync_parent_permission_mode();
+        let memory_target = match self.memory_target(tool_name, tool_input) {
+            Ok(target) => target,
+            Err(error) => return PermissionResult::Denied(error.to_string()),
+        };
         // ApplyPatch names many files in one patch. A tool-level decision does
         // not distinguish them, so aggregate the explicit rules for every
         // canonical target (both move endpoints included) before the normal
         // tool check. Deny always refuses; an explicit ask requests this exact
         // call's approval instead of inheriting a mode's automatic edit grant.
-        if tool_name == "ApplyPatch" {
+        if tool_name == "ApplyPatch" && memory_target.is_none() {
             use crate::tools::apply_patch_tool::PathAuthorization;
             if let Some(authorization) = crate::tools::apply_patch_tool::path_authorization(
                 &self.workspace_cwd,
@@ -3527,7 +3623,8 @@ impl ToolLoopExecutor {
             }
         }
         if let Some(approval) = self.approved_call.as_ref().filter(|approval| {
-            approval.tool == tool_name
+            !(approval.pre_tool_hook && memory_target.is_some())
+                && approval.tool == tool_name
                 && approval.input == *tool_input
                 && approval.id == tool_use_id
         }) {
@@ -3545,12 +3642,17 @@ impl ToolLoopExecutor {
                 // A legacy dispatch alias passes the same permission checks as
                 // the current tool name it was folded into.
                 tool_name: crate::permissions::patterns::canonical_tool_name(tool_name).to_owned(),
-                tool_input: tool_input.clone(),
+                tool_input: memory_target
+                    .as_ref()
+                    .map(|name| self.memory_permission_input(tool_input, name))
+                    .unwrap_or_else(|| tool_input.clone()),
                 conversation_id: conv_id,
                 user_id: None,
                 workspace_path,
             };
-            if self.is_plan_document_tool(tool_name, tool_input) {
+            if memory_target.is_some() {
+                pm.check_memory_document_permission(&context)
+            } else if self.is_plan_document_tool(tool_name, tool_input) {
                 pm.check_plan_document_permission(&context)
             } else if pm.get_mode() == crate::permissions::PermissionMode::Auto {
                 let decision = pm.evaluate_permission(&context);
@@ -4129,8 +4231,30 @@ impl ToolLoopExecutor {
                         .any(|block| block.contains(crate::memory::RECALL_LEAD_IN))
             })
         });
+        if !self.require_hook_wake && !recalled_before {
+            if let (Some(memory), Some(target)) = (
+                self.file_memory.as_ref().filter(|m| m.active()).cloned(),
+                recall_target.as_ref(),
+            ) {
+                if !memory.recalled(target)? {
+                    let (_, recall) = memory.context_with_budget(
+                        &last_user_msg,
+                        self.memory_read_only(),
+                        self.memory_budget(),
+                    )?;
+                    let hit = recall.is_some();
+                    if let Some(recall) = recall {
+                        self.attach_turn_context(vec![recall])?;
+                    }
+                    // A durable zero-hit receipt must not alter the user's text.
+                    memory.record_recall(target, hit)?;
+                }
+            }
+        }
         if let (Some(ctx_mgr), false, false) = (
-            &self.context_manager,
+            self.context_manager
+                .as_ref()
+                .filter(|_| self.remote_memory_enabled()),
             self.require_hook_wake,
             recalled_before,
         ) {
@@ -4301,7 +4425,11 @@ impl ToolLoopExecutor {
                             | "incomplete"
                     )
                 ) {
-                    if let Some(ctx_mgr) = &self.context_manager {
+                    if let Some(ctx_mgr) = self
+                        .context_manager
+                        .as_ref()
+                        .filter(|_| self.remote_memory_enabled())
+                    {
                         ctx_mgr
                             .after_response(&conv_id, &last_user_msg, full_text)
                             .await;
@@ -4334,6 +4462,13 @@ impl ToolLoopExecutor {
         // must not become a user-confirmable prompt that could authorize it.
         // A pre-tool hook that already allowed this exact call keeps the
         // existing prompt-mode semantics, but not the hard gates above.
+        if matches!(tool_name, "memory_search" | "memory_ingest") && !self.remote_memory_enabled() {
+            return CallStep::Finished((
+                tool_input.clone(),
+                "Memory tools require an enabled remote HTTP backend".into(),
+                true,
+            ));
+        }
         let hook_allowed = self.approved_call.as_ref().is_some_and(|approval| {
             approval.pre_tool_hook
                 && approval.tool == tool_name
@@ -5031,6 +5166,22 @@ impl ToolLoopExecutor {
                 return CallStep::Finished((tool_input.clone(), output_str, is_error));
             }
         }
+        match self.memory_target(tool_name, tool_input) {
+            Ok(Some(filename)) => {
+                let result = self.file_memory.as_ref().unwrap().tool(
+                    tool_name,
+                    tool_input,
+                    &filename,
+                    self.memory_read_only(),
+                );
+                return CallStep::Finished(match result {
+                    Ok(value) => (tool_input.clone(), value.to_string(), false),
+                    Err(error) => (tool_input.clone(), format!("Memory error: {error:#}"), true),
+                });
+            }
+            Err(error) => return CallStep::Finished((tool_input.clone(), error.to_string(), true)),
+            Ok(None) => {}
+        }
         if let Some(error) = self.unread_file_error(tool_name, tool_input) {
             return CallStep::Finished((tool_input.clone(), format!("Error: {error}"), true));
         }
@@ -5487,7 +5638,10 @@ impl ToolLoopExecutor {
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
-            let PreparedRequest { tools, system_prompt } = self.prepare_request()?;
+            let PreparedRequest {
+                tools,
+                system_prompt,
+            } = self.prepare_request(serde_json::to_vec(&conversation_messages)?.len())?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             self.streaming_tool_args.clear();
             let mut request_trace = RequestTrace::new(json!({
@@ -6266,7 +6420,10 @@ impl ToolLoopExecutor {
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
-            let PreparedRequest { tools, system_prompt } = self.prepare_request()?;
+            let PreparedRequest {
+                tools,
+                system_prompt,
+            } = self.prepare_request(serde_json::to_vec(&conversation_messages)?.len())?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             self.streaming_tool_args.clear();
             let mut request_trace = RequestTrace::new(json!({

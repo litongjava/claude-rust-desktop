@@ -82,3 +82,15 @@ fn memory_filename(name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Host adapters use the exact storage filename and CAS validation rules.
+pub fn valid_filename(name: &str) -> bool {
+    memory_filename(name).is_ok()
+}
+pub fn content_hash(bytes: &[u8]) -> String {
+    hash(bytes)
+}
+
+pub fn normalized_name(name: &str) -> String {
+    format::name_key(name)
+}

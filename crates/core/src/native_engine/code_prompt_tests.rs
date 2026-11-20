@@ -167,7 +167,7 @@ async fn all_modes_preserve_memory_and_settings_in_either_builder_order() {
     let (tx, _rx) = mpsc::channel(16);
     for mode in ["chat", "work", "study", "code"] {
         for memory_first in [true, false] {
-            let client = MemExClient::with_path(temp.path().join("memory.sqlite3"), None);
+            let (client, _remote) = remote_memory(temp.path()).await;
             let mut config = client.get_config().await;
             config.auto_search = false;
             config.auto_ingest = false;
@@ -264,7 +264,7 @@ async fn all_modes_recall_ingest_and_run_memory_tools_on_both_protocols() {
             });
             let (tx, mut rx) = mpsc::channel(128);
             let temp = tempfile::tempdir().unwrap();
-            let client = MemExClient::with_path(temp.path().join("memory.sqlite3"), None);
+            let (client, _remote) = remote_memory(temp.path()).await;
             let config = client.get_config().await;
             assert!(config.enabled && config.auto_search && config.auto_ingest);
             client
@@ -514,7 +514,7 @@ async fn recalled_memories_stay_with_their_message_on_later_turns() {
         axum::serve(listener, app).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
-    let client = MemExClient::with_path(temp.path().join("memory.sqlite3"), None);
+    let (client, _remote) = remote_memory(temp.path()).await;
     let mut config = client.get_config().await;
     config.auto_ingest = false;
     client.update_config(config).await.unwrap();
@@ -575,4 +575,73 @@ async fn recalled_memories_stay_with_their_message_on_later_turns() {
         message
     };
     assert_eq!(strip(&requests[0]["messages"][0]), strip(&last[0]));
+}
+
+// Existing memory protocol assertions now exercise the retained HTTP backend.
+// The server uses an isolated SQLite archive, never the application's own files.
+struct RemoteMemoryGuard(tokio::task::JoinHandle<()>);
+impl Drop for RemoteMemoryGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn remote_memory(root: &std::path::Path) -> (MemExClient, RemoteMemoryGuard) {
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    let backend = MemExClient::with_path(root.join("remote-fixture.sqlite3"), None);
+    let app =
+        Router::new()
+            .route(
+                "/search",
+                post(
+                    |State(client): State<MemExClient>, Json(input): Json<Value>| async move {
+                        let results = client
+                            .search(
+                                input["query"].as_str().unwrap_or_default(),
+                                input["top_k"].as_u64().map(|v| v as usize),
+                            )
+                            .await
+                            .unwrap();
+                        Json(json!({"total_indexed":results.len(),"results":results}))
+                    },
+                ),
+            )
+            .route(
+                "/ingest",
+                post(
+                    |State(client): State<MemExClient>, Json(input): Json<Value>| async move {
+                        client
+                            .ingest(
+                                input["content"].as_str().unwrap(),
+                                input["importance"].as_f64(),
+                                input
+                                    .get("metadata")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            )
+                            .await
+                            .unwrap();
+                        Json(json!({"ok":true}))
+                    },
+                ),
+            )
+            .route(
+                "/stats",
+                get(|State(client): State<MemExClient>| async move {
+                    Json(client.stats().await.unwrap())
+                }),
+            )
+            .with_state(backend);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = RemoteMemoryGuard(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let client = MemExClient::with_path(root.join("memory.sqlite3"), None);
+    let mut config = client.get_config().await;
+    config.backend_url = base;
+    client.update_config(config).await.unwrap();
+    (client, server)
 }

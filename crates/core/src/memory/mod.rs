@@ -8,7 +8,8 @@
 
 mod caveman_rtk;
 mod local;
-/// Opt-in file storage primitives; not wired into the current memory backend.
+pub(crate) use local::search_terms;
+/// Scoped file storage primitives; runtime policy lives in services::memory_files.
 pub mod files;
 mod transfer;
 pub mod dream;

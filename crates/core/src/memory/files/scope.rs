@@ -71,6 +71,10 @@ impl MemoryScope {
         Ok(Self::from_identity(identity))
     }
 
+    pub fn is_private(&self) -> bool {
+        self.identity.starts_with(b"private-v1\0")
+    }
+
     fn from_identity(identity: Vec<u8>) -> Self {
         Self {
             key: format!("v1-{}", hash(&identity)),

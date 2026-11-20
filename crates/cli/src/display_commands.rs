@@ -346,7 +346,8 @@ pub async fn handle(
                         command_println!("{instructions}");
                     }
                 }
-                "entries" => crate::memory::manage(paths).await?,
+                "entries" => crate::memory::manage_files(paths, &session.id).await?,
+                "legacy" => crate::memory::manage(paths).await?,
                 "user" => {
                     let (_, path) = &paths_by_scope[0];
                     edit_file(path, "# User instructions\n\n").await?;

@@ -371,3 +371,18 @@ D1–D7 已全部按建议确认。P1 的代码/验证状态见下一节及第 2
 - **只读/权限衔接**：P1 `open/read/snapshot` 可能恢复未完成事务，snapshot 还会修复索引。这些是存储维护 API，不是已实现的 Plan 工具授权。P3 必须在受管维护完成后获取稳定只读快照，Plan 模型不得调用任何 mutation/repair；若底层目录只读且需恢复，返回不可用，不绕过 OS 限制。本轮未添加任何目录免确认能力。
 
 本轮明确未做：迁移/回退工具、召回排序与性能、prompt/工具暴露切换、Plan/角色/sandbox adapter、Bridge scope/ETag、CLI/Desktop 管理界面、files dream。旧 SQLite dream 保持现状；D5 的暂停在启用 files 后端时生效，不能提前改变旧路径。
+
+## 14. 第 3 轮 P2 接入修订（2026-11-13）
+
+用户本轮将 P2 明确扩大为引擎/工具/提示词和两端调用链接入，且允许旧库迁移**或兼容**。因此本轮先上线文件服务和显式旧库兼容，不把原 §11 的离线迁移作为前置；原 P3/P4 的相关接入在本轮完成，批量迁移、原生界面验收及性能优化仍单独验收。本节是本轮实现契约；实际通过/失败数量以 `codex-round-03-report.md` 为准，不以本文描述代替测试结果。
+
+- `services::memory_files::FileMemory` 从持久可信 project/session 选择 scope。引擎不接收模型自报的项目键；会话首次绑定的 scope 保存在 `peripheral_settings`，恢复时重新验证可信目录与身份。显式宿主 workspace move/add-dir 事务撤销旧绑定，下一轮重算；本轮持有的旧能力检测到变化即拒绝。Read 回执按 session + scope + filename 保存内容 hash，partial Read/召回片段不授予写回执，owned child 重新绑定自己的会话。
+- 文件模式为启用且 `backend_url=local`；保持现有后端设置结构。`auto_search` 和 `search_top_k` 生效；`auto_ingest`、importance/compression 设置仅留给 legacy/remote。文件模式不再自动保存完整对话。索引每次实际请求按当前快照重建，包含 scope、generation、hash；两种协议的既有 request snapshot 记录实际 system prompt 和 user recall，因此 Trajectory 不直接读取当前记忆文件，也暂不新增专用 `memoryContext` 数据结构。
+- 召回复用 Latin/CJK tokenizer，首版对受管快照线性评分 `0.25 name + 0.50 description + 0.25 body`，阈值 0.15，同分按 filename；最多 5 条，空余容量扩展最多 2 条同 scope 的一跳链接，按规范化 name 去重。**尚不实现倒排缓存、上一轮 query 加权或 embedding**。索引/正文用 UTF-8 byte 保守估算 token；200 行/25 KiB/4096 tokens 的硬上限不变，总额受 8192、窗口 10% 和估算输入余量约束，索引优先；wrapper、路径和元数据计入预算。整行截断，标注省略数；召回 XML 字符转义。命中的正文沿用 turn_context；hit/zero-hit 在 peripheral_settings 保存 session + scope + 用户消息 hash/occurrence 的结构化收据，无命中不改写用户消息，尚未引入独立 receipt 表。
+- 普通 Read/Write/Edit 和只含一条 Delete File 的 ApplyPatch 路由到 FileMemoryStore。只允许当前受管目录的一层合法文件名，拒绝其他 scope/state/trash、`..`、混合 patch、通过其他路径别名取得免确认。存储层继续 no-follow、锁、CAS、journal。ApplyPatch 删除也检查 Write/Edit 路径规则；显式 ask/deny、工具禁用、角色、hook、Plan 均保留，shell/MCP 不得继承此例外。这里的模式/角色约束属于模型调用链；用户直接在管理命令或面板编辑是独立的显式操作，不把该操作权限传给模型。Plan 使用只读打开：不创建目录、不修复磁盘索引、不恢复 journal；索引只在内存规范化。待恢复 journal 要求可写维护操作并保留原件。
+- `memory_search`/`memory_ingest` 的原始定义保留以便设置界面和远程使用，但本地/禁用时从模型 catalog、ToolSearch 与直接执行门禁排除。仅 enabled HTTP(S) 后端可加载，仍遵守 customization 的常驻/按需/关闭规则。远程故障不回退到 SQLite 或文件。首期继续沿用用户显式配置的全局 HTTP endpoint 和现有超时；未实现 §10.1 建议的项目级 endpoint/opt-in 与统一 800ms deadline，不能宣称远程具有文件模式的项目隔离。项目级远程配置留给后续独立变更。既有协议测试改用本地 HTTP MemEx mock，保持原有断言。
+- **兼容而非迁移**：原 `memory.sqlite3` 及 dream/caveman/FTS 等数据原位保留；它整体是无可靠归属的 legacy archive，不自动注入项目。`dcl memory files [--session ID | --project ID] list|put|delete` 操作文件，无选择时使用明确启动 workspace（Home 要求 session）。原 flat `dcl memory list/add/export/import/...` 暂保留为旧库兼容命令，help 明示；`/memory entries` 改为会话文件面板，`/memory legacy` 保留旧面板。终端编辑通过临时 Markdown 草稿和编辑器完成，成功后经 CAS 提交。旧数据的实际转换、超限隔离与 v2 archive 待后续阶段实施。
+- Desktop 默认 FileMemoryPanel 使用当前会话，未开会话时用当前选中可信项目。显示 name/type/description、Markdown、索引省略数和坏文件诊断；取消删除、冲突保留草稿、scope 切换后不接收旧请求结果。显式 legacy archive/remote settings 入口保留旧管理页。`/api/memory/search|ingest|items/{id}` 使用 scope 和内容 hash version，文件响应标记 schema_version=2；更新/删除缺少版本拒绝，旧无 scope 写入拒绝，Conflict 为 409。`stats/export` 要 scope；批量 `clear/import` 暂明确拒绝并给出版本化单条/legacy 路径。旧接口完整移至 `/api/memory/legacy/*`；不允许旧客户端无 scope 写到文件模式。
+- 文件服务首次使用记录 `memory.files.active=true`，dream 服务从此暂停（生成提交前再检查），原数据/配置保留。**只有从未使用文件服务的纯 legacy 数据目录仍保留旧 dream 行为**，用于兼容既有工作流；不把这个兼容行为称为文件 dream。回退旧程序可以继续读取原 SQLite，新增文件保持原样但旧程序不可见；本轮没有自动反向同步或双写，回退不等于把新事实转回 SQLite。
+
+后续阶段调整：P3 完成显式迁移/归属预览、v2 archive 与逆向导出；P4 完成真实 Desktop/WebView2、终端 picker、Windows 文件原语及规模/延迟验收，按结果优化阻塞读取/缓存与更多诊断；P5 再设计文件 dream 的预览和显式应用。不得把本轮 Linux 单元/本地 mock 的结果等同于其他平台或原生 UI 验收。

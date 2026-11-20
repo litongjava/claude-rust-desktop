@@ -37,9 +37,17 @@ impl SafeDir {
     }
 
     pub fn child(self: &Arc<Self>, name: &str) -> Result<Arc<Self>> {
+        self.child_mode(name, false)
+    }
+
+    pub fn child_mode(self: &Arc<Self>, name: &str, read_only: bool) -> Result<Arc<Self>> {
         safe_component(name)?;
         self.verify()?;
-        let file = platform::open_child(self, name)?;
+        let file = if read_only {
+            platform::existing_child(self, name)?
+        } else {
+            platform::open_child(self, name)?
+        };
         platform::validate_dir(&file)?;
         let result = Arc::new(Self {
             file,
@@ -173,9 +181,9 @@ impl SafeDir {
         Ok(names)
     }
 
-    pub fn lock_file(&self) -> Result<File> {
+    pub fn lock_file(&self, read_only: bool) -> Result<File> {
         self.verify()?;
-        let file = platform::open_file(self, "lock", true, false)?;
+        let file = platform::open_file(self, "lock", !read_only, false)?;
         platform::validate_file(&file)?;
         Ok(file)
     }

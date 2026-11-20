@@ -181,3 +181,15 @@ Desktop 的模型技能列表和 `Skill` 工具与 CLI 共用 `crates/core` 的�
 ### ToolScript 内层审批来源
 
 复用 `ToolPermissionPrompt` 和已有权限响应路由。模型经 ToolSearch 加载 ToolScript 后，ask 模式中的内层 Write 应展示实际输入以及 ToolScript 父调用 ID，允许/拒绝与普通工具一致；取消或 TaskStop 后提示消失，旧回复不能执行工具。`ToolPermissionPrompt.test.tsx` 覆盖来源文字与既有按钮行为；真实 Desktop/WebView 和私有 worker 的全链路需另行运行，不以 SDK 测试代替。
+
+### 文件记忆模式补充（2026-11-13）
+
+A 节旧流程适用于显式 Legacy archive 入口；默认 Project memories 面板改为当前会话/可信项目的 Markdown 记忆：
+
+1. 无会话/项目时不查询全局记忆；选择项目后显示文件 name、description、type。与同 data_dir、同 Git common-dir 的 `dcl memory files list` 对照。
+2. 新增带 frontmatter 的文件；编辑正文保留 metadata，feedback/project 缺 Why 或 How to apply 应报错。删除取消不变，确认后索引同步删除。
+3. 两个窗口读同版本，窗口一保存后窗口二保存报 409；第二窗口草稿保留，刷新后重读。切换 scope 时旧请求返回不能显示前一项目内容。
+4. 缺 scope 的旧 `/api/memory/ingest`、缺版本更新/删除明确失败；Legacy archive 下的导出/导入继续保留旧数据，默认项目召回不使用它们。
+5. 新会话/恢复/compact 后，用本次 Desktop 模型请求与 Trajectory 核对索引、scope/generation/hash 和用户消息后的正文；删除当前记忆不应改写历史请求。
+6. Plan Read 成功，Write/Edit/ApplyPatch 删除拒绝；Router/Coder 门禁、显式 deny/ask 与 hooks 不被目录免确认绕过。禁用记忆后不注入，配置远程 HTTP 后只有远程工具可加载；本地工具目录不得残留 memory_search/ingest。
+7. 自动化组件覆盖文件编辑、CAS 参数、冲突草稿、删除取消和显式旧归档入口；这不代表原生 Desktop/WebView2、Windows reparse 和服务器/手机操作已验证。

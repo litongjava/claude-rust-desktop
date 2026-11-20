@@ -1087,3 +1087,9 @@ Windows 测试编译回归（Codex 04）：core 的 `--lib <filter>` 仍会编�
 记录保存在 `<数据目录>/request-records/<会话ID>/NNNN-<请求ID>-aK.*`，请求体及响应不脱敏；元数据 URL 去掉查询、fragment 和 userinfo。头名称包含 auth/cookie/api-key/apikey/api_key/token/secret/credential/password 或以 -key 结尾时移除；任意头值匹配 Bearer/Basic、sk-/sk_、ghp_/github_pat_、AIza、AKIA、eyJ 前缀也移除；所有头值中，长度至少 32、混合字母数字、仅含 token 字符且不是 UUID 的值视为不透明密钥移除。合法 UUID 保留，但敏感头名称和已知密钥前缀仍优先移除。逐块写并 sync_data；开始时元数据即为未完成，收到完整结束标记或正常非流式 EOF 后标记完成；进程突然退出至少保留初始未完成元数据。
 
 需另行验证 Windows 路径、ACL/文件锁/替换行为、ConPTY、Desktop 实际运行、真实供应商与 Bedrock 二进制事件。Linux 本地 mock 和 all-targets 编译不能代替这些证据。
+
+## 文件记忆接入（2026-11-13）
+
+隔离数据目录运行 `cargo test --locked -p deepseek-code-cli --test memory_files`：两个协议的本地模型 mock 必须在实际首个及恢复请求看到 MEMORY.md 索引和中文相关正文；普通 Read/Edit/Write/ApplyPatch 完成版本化维护，其他目录写入不继承免确认；Plan Read 成功而 Edit 拒绝；无归属 SQLite 哨兵不出现在请求，旧条目数量不变。core 跑 `services::memory_files::tests`、`file_memory`、`memory_scope_grant` 和原 `memory::files::tests`；原 code_prompt_tests 的记忆工具场景使用真实本地 HTTP MemEx mock，所有原断言保留。
+
+手工终端：`dcl --data-dir <临时数据> --path <临时项目> memory files list`；用 `put <name.md> <source.md> [--version HASH]` 创建/更新、delete 必须提供版本，过时版本失败。`/memory entries` 新建、编辑器保存、取消和删除确认；另一进程改相同文件后旧面板提交应报 Conflict。`/memory legacy` 与 flat memory 命令仅管理旧归档，不能误报为当前项目文件。Home 使用 `--session`，移动会话工作区后旧能力不能继续写；Plan 不创建记忆目录或修复磁盘索引。Windows 和真实终端的未执行项须独立列为未验证。
