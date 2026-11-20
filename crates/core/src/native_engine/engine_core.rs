@@ -1031,7 +1031,6 @@ impl QueryEngine {
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
-            &request.model,
             prompt_profile,
             Some(&workspace),
             &customization.system_prompt,
@@ -1235,7 +1234,7 @@ impl QueryEngine {
         })
         .await??;
         // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminder(&instructions)
+        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
             .into_iter()
             .chain(
                 git_snapshot

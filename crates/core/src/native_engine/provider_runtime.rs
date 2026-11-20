@@ -126,6 +126,14 @@ pub(crate) fn chat_completions_eligible(provider: &ResolvedProvider) -> bool {
     resolved_transport(provider).is_ok_and(|(_, api)| api == "openai-completions")
 }
 
+/// Whether the transport serializes user text as Responses `input_text` parts.
+/// Direct (non-catalog) providers always dial Chat Completions, whose
+/// compatible servers may reject content arrays.
+pub(crate) fn responses_api(provider: &ResolvedProvider) -> bool {
+    provider.provider.builtin_id.is_some()
+        && resolved_transport(provider).is_ok_and(|(_, api)| api == "openai-responses")
+}
+
 pub async fn stream(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
