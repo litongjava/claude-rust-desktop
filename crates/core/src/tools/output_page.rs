@@ -239,6 +239,7 @@ pub(crate) struct StreamPage {
     pub(crate) truncated: bool,
     /// Bytes that could not be decoded and became U+FFFD.
     pub(crate) invalid_bytes: usize,
+    pub(crate) widths: crate::performance::command_output::ReplacementWidths,
     /// Identity of the opened file this page came from, for the next cursor.
     pub(crate) generation: String,
 }
@@ -431,6 +432,9 @@ pub(crate) fn read_stream_page(
         joined: false,
         truncated: next < size || decoded.truncated,
         invalid_bytes: decoded.invalid,
+        widths: crate::performance::command_output::ReplacementWidths::of(
+            &bytes[..decoded.consumed],
+        ),
         generation,
     })
 }
@@ -589,6 +593,7 @@ pub(crate) fn read_stream_events(
                 joined: true,
                 truncated: true,
                 invalid_bytes: 0,
+                widths: Default::default(),
                 generation,
             });
         }
@@ -607,6 +612,7 @@ pub(crate) fn read_stream_events(
         joined: prior_text,
         truncated: next < size,
         invalid_bytes: 0,
+        widths: Default::default(),
         generation,
     })
 }
