@@ -1,8 +1,8 @@
 pub mod engine;
 pub mod discovery;
 pub mod states;
-pub mod bundled;
 pub mod bundled_resources;
+mod bundled_install;
 pub mod code_review;
 pub mod invocation;
 pub mod import;
@@ -124,9 +124,9 @@ impl SkillsManager {
     pub async fn load_skills(&self) -> Result<Vec<Skill>> {
         let mut skills = Vec::new();
 
-        // Migrate before scanning so a removed placeholder cannot be reported
-        // as a user skill from the same directory tree.
-        self.install_bundled_skills()?;
+        // Migrate and clean up before scanning so a removed placeholder or a
+        // pristine legacy built-in cannot be reported as a user skill.
+        self.ensure_installed()?;
 
         let user_skills_path = self.get_skills_path(&SkillSource::User);
         if user_skills_path.exists() {
@@ -136,7 +136,6 @@ impl SkillsManager {
         }
 
         let bundled_skills_path = self.get_skills_path(&SkillSource::Bundled);
-        legacy_builtin::install(&bundled_skills_path)?;
         skills.extend(self.scan_skills_dir(&bundled_skills_path, SkillSource::Bundled)?);
 
         // Nested collections can be visited by both root and bundled scans.
@@ -145,29 +144,18 @@ impl SkillsManager {
         skills.retain(|skill| seen.insert(skill.id.clone()));
         skills.reverse();
 
-        // Embedded skills have no disk copy. Preserve the existing precedence
-        // of a same-name skill found by the inventory scan.
-        let embedded: [(&str, fn() -> Skill); 2] = [
-            (skill_creator::NAME, skill_creator::manager_skill),
-            (bundled::TASK_TEMPLATE_NAME, bundled::task_template_skill),
-        ];
-        for (name, make_skill) in embedded {
-            if !skills.iter().any(|skill| skill.name == name) {
-                skills.push(make_skill());
-            }
-        }
-
         Ok(skills)
     }
 
-    /// Install first-run bundled and legacy built-in files without scanning.
-    /// Listing stays on the read-only discovery path. The pristine
-    /// `skill-creator` placeholder migration runs here too, because every
-    /// listing path calls this method before reading the data directory.
+    /// Install first-run bundled files and remove pristine legacy built-in
+    /// files without scanning. Listing stays on the read-only discovery path.
+    /// The pristine `skill-creator` placeholder migration runs here too, because
+    /// every listing path calls this method before reading the data directory.
     pub fn ensure_installed(&self) -> Result<()> {
         let bundled = self.get_skills_path(&SkillSource::Bundled);
         self.install_bundled_skills()?;
-        legacy_builtin::install(&bundled)
+        legacy_builtin::cleanup(&self.get_skills_path(&SkillSource::User))?;
+        legacy_builtin::cleanup(&bundled)
     }
 
     fn scan_skills_subdirs(&self, base_path: &Path) -> Result<Vec<Skill>> {
@@ -193,7 +181,10 @@ impl SkillsManager {
 
     pub fn install_bundled_skills(&self) -> Result<()> {
         let bundled_path = self.get_skills_path(&SkillSource::Bundled);
-        skill_creator::install_and_migrate(&bundled_path)
+        // Migrate the pristine legacy placeholder first so the embedded tree is
+        // written into the same directory during this pass.
+        skill_creator::install_and_migrate(&bundled_path)?;
+        bundled_install::install(&bundled_path)
     }
 
     fn scan_skills_dir(&self, base_path: &Path, source: SkillSource) -> Result<Vec<Skill>> {
@@ -449,20 +440,6 @@ impl SkillsManager {
     }
 
     pub fn get_skill_content(&self, skill_id: &str, file_path: &str) -> Result<String> {
-        match skill_id {
-            skill_creator::EMBEDDED_ID => {
-                let bytes = skill_creator::embedded_file(file_path)?;
-                return Ok(String::from_utf8_lossy(bytes).into_owned());
-            }
-            bundled::TASK_TEMPLATE_ID => {
-                anyhow::ensure!(
-                    file_path == "SKILL.md",
-                    "Bundled skill file not found: {file_path}"
-                );
-                return Ok(bundled::TASK_TEMPLATE_DOCUMENT.to_owned());
-            }
-            _ => {}
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         let full_path = editing::relative_file(&skill_path, file_path)?;
         let content = std::fs::read_to_string(&full_path)?;
@@ -506,9 +483,6 @@ impl SkillsManager {
     }
 
     pub fn update_skill(&self, skill_id: &str, updates: HashMap<String, serde_json::Value>) -> Result<()> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only; create a user skill to customize it");
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         let skill_md_path = skill_path.join("SKILL.md");
 
@@ -517,14 +491,6 @@ impl SkillsManager {
         }
 
         editing::edit(&skill_md_path, &updates)
-    }
-
-    fn embedded_skill_name(skill_id: &str) -> Option<&'static str> {
-        match skill_id {
-            skill_creator::EMBEDDED_ID => Some(skill_creator::NAME),
-            bundled::TASK_TEMPLATE_ID => Some(bundled::TASK_TEMPLATE_NAME),
-            _ => None,
-        }
     }
 
     fn find_skill_path(&self, skill_id: &str) -> Result<PathBuf> {
@@ -548,9 +514,6 @@ impl SkillsManager {
     }
 
     pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only");
-        }
         let skill_path = self.find_skill_path(skill_id)?;
         std::fs::remove_dir_all(skill_path)?;
         Ok(())
@@ -598,9 +561,6 @@ impl SkillsManager {
     }
 
     pub async fn toggle_skill(&self, skill_id: &str) -> Result<bool> {
-        if let Some(name) = Self::embedded_skill_name(skill_id) {
-            anyhow::bail!("The bundled {name} is read-only and stays enabled");
-        }
         let skills = self.load_skills().await?;
         let skill = skills.into_iter()
             .find(|s| s.id == skill_id)

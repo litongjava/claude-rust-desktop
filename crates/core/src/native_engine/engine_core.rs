@@ -1083,6 +1083,8 @@ impl QueryEngine {
         .await?;
         let workspace_path = workspace.to_string_lossy().into_owned();
         let mut discovered_skills = crate::services::plugins::skill_commands(&plugin_context)?;
+        crate::skills::SkillsManager::with_path(plugin_context.paths.data_dir.join("skills"))
+            .ensure_installed()?;
         discovered_skills.extend(crate::skills::discovery::discover(
             &plugin_context.paths.data_dir,
             &workspace,
@@ -1094,9 +1096,11 @@ impl QueryEngine {
             Vec::new();
         if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake) {
             let content = if let Some(skill) = discovered_skills.get(&command) {
-                let embedded =
-                    skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
-                let requires_execution = if embedded {
+                let bundled = crate::skills::discovery::is_bundled_path(
+                    &skill.path,
+                    &plugin_context.paths.data_dir,
+                );
+                let requires_execution = if bundled {
                     true
                 } else {
                     let template = skill.render_template(&arguments, &conv_id)?;

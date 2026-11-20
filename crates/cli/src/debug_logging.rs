@@ -62,7 +62,7 @@ pub fn install(verbose: bool) {
                         .or_else(|| TERMINAL_FILE.read().unwrap_or_else(|e| e.into_inner()).clone());
                     let output: Box<dyn Write + Send> = match file {
                         Some(file) => Box::new(SharedFile(file)),
-                        None => Box::new(io::stderr()),
+                        None => Box::new(crate::terminal_output::stderr()),
                     };
                     Box::new(RedactingWriter {
                         output,

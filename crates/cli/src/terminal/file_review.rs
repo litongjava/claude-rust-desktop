@@ -174,7 +174,7 @@ pub(super) fn show(
     if review.files.is_empty() || review.selected >= review.files.len() {
         return Ok(());
     }
-    let mut out = io::stderr();
+    let mut out = crate::terminal_output::stderr();
     execute!(out, SavePosition, Hide)?;
     let mut view = View {
         review,

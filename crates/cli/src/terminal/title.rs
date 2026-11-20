@@ -34,8 +34,8 @@ static CURRENT: Mutex<TitleState> = Mutex::new(TitleState {
 });
 
 fn emit(text: &str) {
-    let mut out = std::io::stdout();
-    if out.is_terminal() && !crate::terminal::screen_reader() {
+    let mut out = crate::terminal_output::stdout();
+    if std::io::stdout().is_terminal() && !crate::terminal::screen_reader() {
         let clean: String = text.chars().filter(|ch| !ch.is_control()).collect();
         let _ = write!(out, "\x1b]0;{clean}\x07");
         let _ = out.flush();

@@ -9,6 +9,13 @@ async fn resource_reads_keep_explicit_permissions_and_model_api_invocation() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    // Built-in skills default to off; these fixtures opt dataviz in.
+    crate::skills::states::set(
+        &paths.data_dir,
+        "dataviz",
+        crate::skills::states::SkillState::User,
+    )
+    .unwrap();
     let provider = ResolvedProvider {
         provider: serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),
         model: serde_json::from_value(json!({"id":"fixture","name":"fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap(),
@@ -44,7 +51,7 @@ async fn resource_reads_keep_explicit_permissions_and_model_api_invocation() {
         .unwrap()
         .strip_prefix("Base directory for this skill: ")
         .unwrap();
-    let path = Path::new(root).join("scripts/validate_palette.js");
+    let path = Path::new(root).join("scripts/check_contrast.py");
     let input = json!({"file_path":path,"offset":2,"limit":3});
     let (_, denied, failed) = executor
         .execute_tool_call("Read", &input, "denied-asset")
@@ -66,7 +73,8 @@ async fn resource_reads_keep_explicit_permissions_and_model_api_invocation() {
     )
     .is_err());
     drop(executor);
-    assert!(!path.exists());
+    // Resources live in the installed skill directory, not a temporary tree.
+    assert!(path.exists());
 }
 
 fn doctor_executor(temp: &tempfile::TempDir) -> ToolLoopExecutor {
@@ -74,6 +82,13 @@ fn doctor_executor(temp: &tempfile::TempDir) -> ToolLoopExecutor {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+    // Built-in skills default to off; these fixtures opt dataviz in.
+    crate::skills::states::set(
+        &paths.data_dir,
+        "dataviz",
+        crate::skills::states::SkillState::User,
+    )
+    .unwrap();
     let provider = ResolvedProvider {
         provider: serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),
         model: serde_json::from_value(json!({"id":"fixture-model","name":"fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap(),
@@ -90,6 +105,12 @@ fn doctor_executor(temp: &tempfile::TempDir) -> ToolLoopExecutor {
     )
     .with_search_config_path(paths.data_dir.join("config.json"));
     // /doctor is a user-invocable skill, not a model-invocable one.
+    crate::skills::states::set(
+        &paths.data_dir,
+        "doctor",
+        crate::skills::states::SkillState::User,
+    )
+    .unwrap();
     executor.manual_skill_active = true;
     executor
 }

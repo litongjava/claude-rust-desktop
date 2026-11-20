@@ -36,7 +36,7 @@ pub fn show(topic: Option<&str>, commands: &[String]) -> Result<()> {
                 command = command.find_subcommand(name)
                     .with_context(|| format!("Unknown command {name}"))?.clone();
             }
-            command.print_long_help()?;
+            command.print_long_help().map_err(crate::terminal_output::stdout_error)?;
             println!();
             Ok(())
         })?
