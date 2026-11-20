@@ -363,6 +363,11 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
     match action {
         ConfigCommands::Show => {
             let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"shell":deepseek_code_core::services::shell_settings::inspect(&paths.data_dir)?,"permissions.auto":deepseek_code_core::permissions::auto_config::load(&crate::services::context(paths)?)?,"tools":crate::tool_settings::rows(paths)?});
+            value[deepseek_code_core::config::command_output::KEY] =
+                json!(deepseek_code_core::config::command_output::enabled(
+                    Some(&paths.data_dir),
+                    &std::env::current_dir()?,
+                ));
             redact(&mut value);
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
@@ -370,6 +375,16 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
             if let Some(field) = key.strip_prefix("shell.") {
                 deepseek_code_core::services::shell_settings::set(&paths.data_dir, field, value)?;
                 eprintln!("Updated {key}; applies to the next command or new terminal");
+                return Ok(());
+            }
+            if matches!(
+                key.as_str(),
+                deepseek_code_core::config::command_output::KEY
+                    | "tools.summarize_long_command_output"
+            ) {
+                let enabled = value.parse::<bool>().context("Expected true or false")?;
+                deepseek_code_core::config::command_output::set(&paths.data_dir, enabled)?;
+                eprintln!("Updated {key}");
                 return Ok(());
             }
             if key.starts_with("tools.") {
