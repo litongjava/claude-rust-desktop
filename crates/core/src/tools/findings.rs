@@ -6,18 +6,18 @@ use serde_json::{json, Value};
 pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         name: "ReportFindings".into(),
-        description: "Report code-review findings as a typed list so the host UI can render them. Use this only when the active code-review instructions tell you to report findings with this tool; otherwise follow whatever output format those instructions specify. When reporting a review's results, call it once with the verified findings ranked most-severe first (empty array if nothing survived verification) and do not also print the findings as text. When re-reporting after applying fixes (only if the apply instructions ask for it), set `outcome` on each finding to what actually happened.".into(),
+        description: "Record a code review's findings as structured data. Call it once when the review instructions ask for findings through this tool, and give the verified findings most severe first; an empty array records that nothing survived verification. Each finding needs `file`, `summary` and `failure_scenario`, while `line` is optional. The result is a numbered list for the terminal, so do not repeat the findings in your reply. If the apply instructions ask for a follow-up report after fixes, set `outcome` on each finding.".into(),
         input_schema: json!({"type":"object","properties":{
-            "level":{"description":"Effort level the review ran at","type":"string","enum":["low","medium","high","xhigh","max"]},
-            "findings":{"description":"Verified findings, most-severe first; empty if none survived","maxItems":32,"type":"array","items":{"type":"object","properties":{
-                "file":{"description":"Repo-relative path of the file the finding is in","type":"string"},
-                "line":{"description":"1-indexed line the finding anchors to","type":"integer"},
-                "summary":{"description":"One-sentence statement of the defect","type":"string"},
-                "short_summary":{"description":"Compressed label for compact UI (≤60 chars): the claim alone, no rationale or consequence clause","type":"string","maxLength":60},
-                "failure_scenario":{"description":"Concrete inputs/state → wrong output/crash","type":"string"},
-                "category":{"description":"Short kebab-case slug of the finding type, e.g. \"correctness\", \"simplification\", \"efficiency\", \"test-coverage\"","type":"string","maxLength":40},
-                "verdict":{"description":"Set when a verify pass ran; absent on inline-only reviews","type":"string","enum":["CONFIRMED","PLAUSIBLE"]},
-                "outcome":{"description":"Set ONLY when re-reporting after applying fixes: what happened to this finding","type":"string","enum":["fixed","skipped","no_change_needed"]}
+            "level":{"description":"Review effort level to record with the report.","type":"string","enum":["low","medium","high","xhigh","max"]},
+            "findings":{"description":"Verified findings, most severe first; at most 32, or empty when none survived.","maxItems":32,"type":"array","items":{"type":"object","properties":{
+                "file":{"description":"Repository-relative path of the file containing the finding.","type":"string"},
+                "line":{"description":"Line number the finding refers to.","type":"integer"},
+                "summary":{"description":"One sentence naming the defect.","type":"string"},
+                "short_summary":{"description":"Short label of at most 60 characters that states only the claim.","type":"string","maxLength":60},
+                "failure_scenario":{"description":"Concrete input or state that produces the wrong result.","type":"string"},
+                "category":{"description":"Short kebab-case kind of finding, up to 40 characters.","type":"string","maxLength":40},
+                "verdict":{"description":"`CONFIRMED` or `PLAUSIBLE` when a verification pass ran.","type":"string","enum":["CONFIRMED","PLAUSIBLE"]},
+                "outcome":{"description":"What happened after a fix: `fixed`, `skipped` or `no_change_needed`.","type":"string","enum":["fixed","skipped","no_change_needed"]}
             },"required":["file","summary","failure_scenario"],"additionalProperties":false}}
         },"required":["findings"],"additionalProperties":false}),
     }

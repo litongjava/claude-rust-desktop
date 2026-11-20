@@ -27,22 +27,22 @@ pub fn definitions() -> Vec<super::ToolDefinition> {
     vec![
         super::ToolDefinition {
             name: "CronCreate".into(),
-            description: "Schedule a prompt to be enqueued at a future time. Use for both recurring schedules and one-shot reminders.\n\nUses standard 5-field cron in the user's local timezone: minute hour day-of-month month day-of-week. \"0 9 * * *\" means 9am local — no timezone conversion needed.\n\n## One-shot tasks (recurring: false)\n\nFor \"remind me at X\" or \"at <time>, do Y\" requests — fire once then auto-delete.\nPin minute/hour/day-of-month/month to specific values:\n  \"remind me at 2:30pm today to check the deploy\" → cron: \"30 14 <today_dom> <today_month> *\", recurring: false\n  \"tomorrow morning, run the smoke test\" → cron: \"57 8 <tomorrow_dom> <tomorrow_month> *\", recurring: false\n\n## Recurring jobs (recurring: true, the default)\n\nFor \"every N minutes\" / \"every hour\" / \"weekdays at 9am\" requests:\n  \"*/5 * * * *\" (every 5 min), \"0 * * * *\" (hourly), \"0 9 * * 1-5\" (weekdays at 9am local)\n\n## Avoid the :00 and :30 minute marks when the task allows it\n\nWhen the user's request is approximate, pick a minute that is NOT 0 or 30, so scheduled requests do not all reach the API at the same instant:\n  \"every morning around 9\" → \"57 8 * * *\" or \"3 9 * * *\" (not \"0 9 * * *\")\n  \"hourly\" → \"7 * * * *\" (not \"0 * * * *\")\n\nOnly use minute 0 or 30 when the user names that exact time and clearly means it.\n\n## Durability\n\nBy default (durable: false) the job lives only in this session and is gone when the session ends. Pass durable: true to write to .claude/scheduled_tasks.json so the job survives restarts. Only use durable: true when the user explicitly asks for the task to persist.\n\n## Runtime behavior\n\nJobs only fire while the interactive session is idle (not mid-turn); the prompt then runs as if the user typed it. Recurring tasks auto-expire after 7 days — they fire one final time, then are deleted. Tell the user about the 7-day limit when scheduling recurring jobs. The result gives the job's next run time: tell the user that time.\n\nReturns a job ID you can pass to CronDelete.".into(),
+            description: "Schedule a prompt to run later. `cron` has five local-time fields (minute, hour, day-of-month, month, day-of-week); the result shows the first fire time. `recurring: true` (default) fires at every match, `recurring: false` fires once and deletes the job. Jobs run only while the session is idle, so a missed match fires once at the next idle check. Recurring jobs expire 7 days after creation, firing once more at the first due time and then being removed. Session jobs (default) end with the session; `durable: true` saves them in `.claude/scheduled_tasks.json`. Prompts are limited to 64 KiB.".into(),
             input_schema: json!({"type":"object","properties":{
-                "cron":{"description":"Standard 5-field cron expression in local time: \"M H DoM Mon DoW\" (e.g. \"*/5 * * * *\" = every 5 minutes, \"30 14 28 2 *\" = Feb 28 at 2:30pm local once).","type":"string"},
-                "prompt":{"description":"The prompt to enqueue at each fire time.","type":"string"},
-                "recurring":{"description":"true (default) = fire on every cron match until deleted or auto-expired after 7 days. false = fire once at the next match, then auto-delete. Use false for \"remind me at X\" one-shot requests with pinned minute/hour/dom/month.","type":"boolean"},
-                "durable":{"description":"true = persist to .claude/scheduled_tasks.json and survive restarts. false (default) = this session only. Use true only when the user asks the task to survive across sessions.","type":"boolean"}
+                "cron":{"description":"Five-field cron expression in local time: minute, hour, day-of-month, month, day-of-week.","type":"string"},
+                "prompt":{"description":"Text to send as a user turn whenever the job fires.","type":"string"},
+                "recurring":{"description":"true (default) repeats on every match until the 7-day expiry; false fires once and removes the job.","type":"boolean"},
+                "durable":{"description":"true saves the job in .claude/scheduled_tasks.json so later sessions of the project can fire it; false (default) keeps it in this session.","type":"boolean"}
             },"required":["cron","prompt"],"additionalProperties":false}),
         },
         super::ToolDefinition {
             name: "CronDelete".into(),
-            description: "Cancel a cron job previously scheduled with CronCreate. Removes it from .claude/scheduled_tasks.json (durable jobs) or the session store (session-only jobs).".into(),
-            input_schema: json!({"type":"object","properties":{"id":{"description":"Job ID returned by CronCreate.","type":"string"}},"required":["id"],"additionalProperties":false}),
+            description: "Remove a scheduled job created by CronCreate. The job is deleted from whichever store holds it, the session's job file or the project's .claude/scheduled_tasks.json, so it will not fire again. An unknown id returns an error and leaves other jobs alone.".into(),
+            input_schema: json!({"type":"object","properties":{"id":{"description":"Identifier CronCreate returned for the job to remove.","type":"string"}},"required":["id"],"additionalProperties":false}),
         },
         super::ToolDefinition {
             name: "CronList".into(),
-            description: "List all cron jobs scheduled via CronCreate, both durable (.claude/scheduled_tasks.json) and session-only.".into(),
+            description: "Read the current session’s scheduled prompts together with those saved for the project. Each entry gives its ID, cron expression, prompt, recurrence and durability flags, and next run in local time. The result includes the total count.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
     ]
