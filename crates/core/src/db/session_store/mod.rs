@@ -1,6 +1,10 @@
 //! Session database layout. The sole constructor is an internal integration-test
 //! factory until all production hosts switch together.
+mod delivery;
 mod global;
+mod history;
+pub use delivery::*;
+pub use history::*;
 mod layout;
 mod lifecycle;
 pub use global::GlobalDb;
@@ -160,7 +164,7 @@ impl Stores {
 
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
         let key = storage_key(id)?;
-        let _locks = self.resolved_key(&key)?.context("Session unavailable")?;
+        let mut locks = self.resolved_key(&key)?.context("Session unavailable")?;
         let incarnation = self
             .global()
             .incarnation(id, &key)?
@@ -171,6 +175,24 @@ impl Stores {
             key,
             incarnation,
         };
+        let path = self.sessions().join(&handle.key).join("session.db");
+        let old = {
+            let _permit = Permits::take(1);
+            layout::is_v1(&path, SESSION)?
+        };
+        if old {
+            drop(locks);
+            locks = self.key_lock(&handle.key, true, false)?;
+            handle.check_directory()?;
+            let _permit = Permits::take(1);
+            if layout::is_v1(&path, SESSION)? {
+                let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                verify_manifest(&c, self.global().store_uuid(), id, &handle.incarnation)?;
+                drop(c);
+                layout::upgrade(&path, SESSION)?;
+            }
+        }
+        let _locks = locks;
         handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| layout::integrity(c))?;
         Ok(handle)
     }
@@ -228,15 +250,43 @@ impl SessionDb {
     /// The closure follows the same re-entry rules as `read` and may run again
     /// after SQLite contention rolls back its transaction.
     pub fn write<T>(&self, mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>) -> Result<T> {
-        let start = Instant::now();
         let _locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
-        self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            crate::db::write_tx(c, "session write", WRITE_DEADLINE, |tx| {
-                layout::callback(|| body(&SessionWrite(tx)))
+        self.write_locked("session write", body)
+    }
+    fn write_locked<T>(
+        &self,
+        label: &str,
+        mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let start = Instant::now();
+        let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            crate::db::write_tx(c, label, WRITE_DEADLINE, |tx| {
+                let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
+                let writer=SessionWrite(tx,&self.id,false.into());
+                let result=layout::callback(|| body(&writer))?;
+                let changed:bool=tx.query_row("SELECT total_changes()>?1",[before],|r|r.get(0))?;
+                let mut summary=None;
+                if changed {
+                    history::advance(tx)?;
+                    if writer.2.get() || !tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_turns WHERE status='running')",[],|r|r.get::<_,bool>(0))? {
+                        summary=Some(history::projection(tx)?);
+                    }
+                }
+                Ok((result,summary))
             })
         })
-        .map_err(|e| crate::db::write_boundary_context("session write", &self.id, start, e))
+        .map_err(|e| crate::db::write_boundary_context(label, &self.id, start, e))?;
+        if let Some(p) = projection {
+            if let Err(error) = self
+                .stores
+                .global()
+                .project(&self.id, &self.incarnation, &p)
+            {
+                tracing::debug!(%error,session=%self.id,"Directory projection pending");
+            }
+        }
+        Ok(result)
     }
     pub fn set_archived(&self, archived: bool) -> Result<()> {
         let _locks = self.stores.key_lock(&self.key, true, false)?;
@@ -275,7 +325,7 @@ impl SessionRead<'_> {
                 "SELECT m.id,m.conversation_id,m.role,m.content,m.thinking,m.created_at,
                         m.is_compact_boundary,m.sort_order,t.message_id,t.content_json
                  FROM messages m LEFT JOIN message_user_content t ON t.message_id=m.id
-                 WHERE m.sort_order=0",
+                 ORDER BY m.sort_order,m.rowid LIMIT 1",
                 [],
                 |row| {
                     let message = crate::db::message_repo::row_to_message(row)?;
@@ -296,7 +346,7 @@ impl SessionRead<'_> {
         .transpose()
     }
 }
-pub struct SessionWrite<'a>(&'a Connection);
+pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>);
 impl SessionWrite<'_> {
     #[doc(hidden)]
     pub fn synchronous_for_test(&self) -> Result<i32> {

@@ -29,6 +29,9 @@ pub enum Phase {
     BeforeTrashRemoval,
     Removed,
     Retired,
+    DeliveryClaimed,
+    DeliveryCommitted,
+    DeliveryAcknowledged,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -96,7 +96,7 @@ pub fn copy_message_turn(
     link_message(conn, &id, target_message)
 }
 
-fn status_name(status: TurnStatus) -> &'static str {
+pub(super) fn status_name(status: TurnStatus) -> &'static str {
     match status {
         TurnStatus::Running => "running",
         TurnStatus::Completed => "completed",

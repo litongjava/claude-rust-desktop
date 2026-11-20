@@ -264,7 +264,7 @@ fn invalid_session_files_fail_closed_without_recreation() {
                 let c = Connection::open(&path).unwrap();
                 c.execute_batch(match other {
                     "kind" => "PRAGMA application_id=0x44434c47",
-                    "newer" => "PRAGMA user_version=2",
+                    "newer" => "PRAGMA user_version=99",
                     "wal" => "PRAGMA journal_mode=delete",
                     "store" => "UPDATE manifest SET store_uuid='other'",
                     "id" => "UPDATE manifest SET id='other'",
@@ -295,7 +295,7 @@ fn invalid_global_files_fail_closed_without_reinitialization() {
             d => global(tmp.path())
                 .execute_batch(match d {
                     "kind" => "PRAGMA application_id=0x44434c53",
-                    "newer" => "PRAGMA user_version=2",
+                    "newer" => "PRAGMA user_version=99",
                     _ => "PRAGMA journal_mode=delete",
                 })
                 .unwrap(),
@@ -485,7 +485,7 @@ fn damaged_or_foreign_seals_are_quarantined_while_other_sessions_open() {
                 .unwrap()
                 .execute_batch(match damage {
                     "operation" => "UPDATE manifest SET sealed_operation='foreign'",
-                    "newer" => "PRAGMA user_version=2",
+                    "newer" => "PRAGMA user_version=99",
                     _ => "UPDATE manifest SET incarnation='foreign'",
                 })
                 .unwrap();

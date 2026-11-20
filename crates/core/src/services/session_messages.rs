@@ -43,7 +43,7 @@ fn valid_id(id: &str) -> Result<()> {
     );
     Ok(())
 }
-fn project(conn: &Connection, root: &Path, id: &str) -> Result<String> {
+pub(crate) fn project(conn: &Connection, root: &Path, id: &str) -> Result<String> {
     valid_id(id)?;
     let row =
         conversation_repo::get_conversation(conn, id)?.context("Message session not found")?;

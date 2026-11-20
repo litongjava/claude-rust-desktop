@@ -45,7 +45,7 @@ impl GlobalDb {
         })
     }
 
-    fn connection<T>(
+    pub(super) fn connection<T>(
         &self,
         flags: OpenFlags,
         body: impl FnOnce(&Connection) -> Result<T>,

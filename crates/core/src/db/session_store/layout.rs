@@ -12,8 +12,8 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-const GLOBAL_VERSION: i32 = 1;
-const SESSION_VERSION: i32 = 1;
+const GLOBAL_VERSION: i32 = 2;
+const SESSION_VERSION: i32 = 2;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -147,13 +147,41 @@ pub(super) fn open(path: &Path, flags: OpenFlags) -> Result<Connection> {
 }
 
 pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
+    verify_version(conn, kind, schema_version(kind))
+}
+
+fn additions(kind: i32) -> &'static str {
+    if kind == GLOBAL {
+        include_str!("delivery.sql")
+    } else {
+        include_str!("history.sql")
+    }
+}
+
+pub(super) fn is_v1(path: &Path, kind: i32) -> Result<bool> {
+    let c = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(c.query_row("SELECT application_id=?1 AND user_version=1 FROM pragma_application_id,pragma_user_version", [kind], |r| r.get(0))?)
+}
+
+// Caller owns the exclusive lifecycle lock and has checked the store identity.
+pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
+    let mut c = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    verify_version(&tx, kind, 1)?;
+    tx.execute_batch(additions(kind))?;
+    tx.pragma_update(None, "user_version", schema_version(kind))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
     let (app, version, journal): (i32, i32, String) = conn.query_row(
         "SELECT application_id,user_version,journal_mode FROM pragma_application_id,pragma_user_version,pragma_journal_mode",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if app != kind {
         return Err(InvalidFormat(format!("Unexpected SQLite application ID {app}")).into());
     }
-    if version != schema_version(kind) {
+    if version != expected {
         return Err(InvalidFormat(format!("Unsupported schema version {version}")).into());
     }
     if journal != "wal" {
@@ -174,11 +202,47 @@ pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
             ("message_user_content", "message_id content_json"),
         ]
     };
+    let added: &[(&str, &str)] = if expected == 1 {
+        &[]
+    } else if kind == GLOBAL {
+        &[
+            ("conversation_private_workspace_bindings", "child_id parent_id"),
+            ("conversation_worktree_backends", "conversation_id backend metadata"),
+            ("conversation_worktrees", "conversation_id project_id source_path repo_path path branch"),
+            ("legacy_session_imports", "id digest project_id"),
+            ("session_inbox", "id sender recipient project_source payload created_at state generation"),
+            ("session_inbox_consumers", "session_id generation"),
+            ("session_inbox_operations", "sender operation_id message_id"),
+            ("session_input_queue", "id session_id request_id admission_digest payload mode revision state delivery_id target"),
+            ("session_input_queue_control", "session_id paused"),
+        ]
+    } else {
+        &[
+            ("attachments", "id message_id file_name file_type mime_type file_size source"),
+            ("code_diffs", "id conversation_id message_id file_path original_content modified_content diff_text status applied_at created_at"),
+            ("delivery_receipts", "delivery_id digest effect_id kind"),
+            ("execution_turns", "id conversation_id source_turn_id started_at ended_at elapsed_ms status"),
+            ("mcp_tool_outputs", "conversation_id tool_use_id content_json metadata_json display_text is_error"),
+            ("message_trajectory", "message_id requests_json"),
+            ("message_turns", "message_id turn_id"),
+            ("model_requests", "id message_id conversation_id request_number provider_id model response_model api_format status started_at_ms first_token_at_ms ended_at_ms total_duration_ms ttft_ms generation_ms throughput_tokens_per_second input_tokens output_tokens reasoning_tokens content_tokens total_tokens cache_read_tokens cache_write_tokens max_output_tokens effort finish_reason response_id timing_source error response_blocks_json usage_json"),
+            ("native_boundaries", "message_id value"),
+            ("permission_approvals", "id conversation_id message_id tool_name action risk_level status user_decision decision_reason created_at decided_at"),
+            ("request_blobs", "hash body"),
+            ("session_agents", "conversation_id definition"),
+            ("session_permission_authority", "id conversation_id source origin_id content_json"),
+            ("tool_call_notes", "tool_call_id note"),
+            ("tool_call_origins", "tool_call_id parent_tool_call_id sequence origin"),
+            ("tool_call_timings", "tool_call_id duration_ms"),
+            ("tool_calls", "id message_id name input output is_error sort_order"),
+            ("tool_queued_inputs", "tool_call_id inputs_json"),
+        ]
+    };
     let mut columns = conn.prepare_cached(
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
     )?;
-    for &(table, required) in tables {
+    for &(table, required) in tables.iter().chain(added) {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -253,6 +317,7 @@ pub(super) fn initialize(
     } else {
         include_str!("session.sql")
     })?;
+    tx.execute_batch(additions(kind))?;
     populate(&tx)?;
     tx.commit()?;
     Ok(conn)
@@ -377,6 +442,23 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             }
             fs::remove_dir(stage)?;
             sync_dir(root)?;
+        }
+    }
+    if is_v1(&path, GLOBAL)? {
+        let _guard = lock_existing(&locks.join(".directory"), true)?;
+        if is_v1(&path, GLOBAL)? {
+            let c = open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let uuid: String = c.query_row(
+                "SELECT store_uuid FROM store_identity WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                fs::read_to_string(&marker)? == uuid,
+                "Global store UUID changed"
+            );
+            drop(c);
+            upgrade(&path, GLOBAL)?;
         }
     }
     let uuid = read_global_uuid(&path)?;
