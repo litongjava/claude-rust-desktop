@@ -221,7 +221,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "interaction": { "description": "For background input via TaskInput, choose pipe on Unix or pty on Linux or Windows (default closed stdin).", "type": "string", "enum": ["pipe", "pty"] },
                     "rows": { "description": "Set the opening PTY height to 1–500 rows (default 24).", "type": "integer", "minimum": 1, "maximum": 500, "default": 24 },
                     "cols": { "description": "Set the opening PTY width to 1–1000 columns (default 80).", "type": "integer", "minimum": 1, "maximum": 1000, "default": 80 },
-                    "detach": { "description": "Request an unmanaged process with a PID and log paths (default false, incompatible with timeout or run_in_background).", "type": "boolean" },
+                    "detach": { "description": "Start a long-running service outside this call's process tree so it survives the call; returns the PID and log paths, and you stop it explicitly (default false, cannot be combined with timeout or run_in_background).", "type": "boolean" },
                     "dangerouslyDisableSandbox": { "description": "Request execution outside the configured sandbox if policy allows it (default false).", "type": "boolean" },
                     "shell": { "description": bash_tool.shell_parameter(), "type": "string" }
                 },

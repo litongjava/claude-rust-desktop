@@ -13,6 +13,8 @@ const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call sta
 
 A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop.
 
+When a call ends, every process it started is stopped, including background children. A server, daemon or other service that must keep running after the call has to be started with `detach: true`, which returns its PID and log files; stop it yourself when it is no longer needed.
+
 Ordinary capture keeps up to 1 MiB per stream. Long results show the beginning and end within the configured preview budget (100 KiB per stream by default).
 
 Command permission checks also apply outside the sandbox.";
@@ -549,6 +551,32 @@ mod tests {
                 serde_json::json!({
                     "shell_fixture": label, "description": text, "shell_parameter": tool.shell_parameter()
                 })
+            );
+        }
+    }
+
+    #[test]
+    fn description_says_calls_stop_their_processes_and_detach_survives() {
+        for (label, host, shell) in [
+            (
+                "Git Bash",
+                "windows",
+                resolved("bash", r"C:\Program Files\Git\bin\bash.exe"),
+            ),
+            ("bash on Linux", "linux", resolved("bash", "/bin/bash")),
+        ] {
+            let tool = build(&settings("bash", None), Some(&shell), host, &|n| {
+                n == "bash"
+            });
+            let text = tool.description();
+            assert!(
+                text.contains("every process it started is stopped"),
+                "{label}: {text}"
+            );
+            assert!(text.contains("`detach: true`"), "{label}: {text}");
+            assert!(
+                text.contains("keep running after the call"),
+                "{label}: {text}"
             );
         }
     }
