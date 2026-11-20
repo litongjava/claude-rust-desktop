@@ -93,6 +93,16 @@ async fn manual_and_model_invocations_read_resources_and_preserve_custom_overrid
             std::fs::write(dir.join("dataviz.md"), "CUSTOM_DATAVIZ $ARGUMENTS").unwrap();
         }
         let capture = Arc::new(Mutex::new(Capture::default()));
+        let data = temp.path().join(format!("data-{index}"));
+        if index < 2 {
+            // Built-in skills default to off; this fixture exercises dataviz.
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(
+                data.join("skill-states.json"),
+                r#"{"skills":{"dataviz":"user"}}"#,
+            )
+            .unwrap();
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
@@ -106,7 +116,7 @@ async fn manual_and_model_invocations_read_resources_and_preserve_custom_overrid
             .env("BUNDLE_FIXTURE_KEY", "fixture-not-secret")
             .args([
                 "--data-dir",
-                temp.path().join(format!("data-{index}")).to_str().unwrap(),
+                data.to_str().unwrap(),
                 "--base-url",
                 &endpoint,
                 "--api-format",

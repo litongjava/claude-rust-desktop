@@ -82,6 +82,40 @@ pub fn is_bundled_path(path: &Path, data_dir: &Path) -> bool {
     path.starts_with(bundled_dir(data_dir))
 }
 
+/// Installed built-in skills and their `SKILL.md` paths, including skills whose
+/// state keeps them out of the model listing. The slash list and the plugins
+/// panel use this so a disabled built-in can still be found and enabled.
+pub fn installed_bundled_skills(data_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut found = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(bundled_dir(data_dir)) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(name) = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let path = directory.join("SKILL.md");
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                found.insert(name.to_owned(), path);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// One resolver for the model-visible listing, the `Skill` tool and the CLI
 /// slash list. Precedence, lowest to highest: installed built-in skills under
 /// `<data dir>/skills/bundled`, other `<data dir>/skills` entries, then
@@ -106,14 +140,19 @@ pub fn discover_runtime_from(
 ) -> (BTreeMap<String, SkillCommand>, Vec<PathBuf>) {
     let mut commands = BTreeMap::new();
     let mut invalid = Vec::new();
-    let _ = scan_bundled_dir(&bundled_dir(data_dir), &mut commands, Some(&mut invalid));
+    let bundled_root = bundled_dir(data_dir);
+    let _ = scan_bundled_dir(&bundled_root, &mut commands, Some(&mut invalid));
     let _ = scan_data_dir(&data_dir.join("skills"), &mut commands, Some(&mut invalid));
     let _ = scan_config_impl(
         &workspace.join(".claude"),
         &mut commands,
         Some(&mut invalid),
     );
-    super::states::apply(&mut commands, &super::states::load(data_dir));
+    super::states::apply_in(
+        &mut commands,
+        &super::states::load(data_dir),
+        Some(&bundled_root),
+    );
     log_invalid(&invalid);
     (commands, invalid)
 }
@@ -1085,6 +1124,8 @@ mod tests {
         crate::skills::SkillsManager::with_path(skills.clone())
             .ensure_installed()
             .unwrap();
+        crate::skills::states::set(&data, "doctor", crate::skills::states::SkillState::User)
+            .unwrap();
         write_skill(
             &skills.join("mcp"),
             "mcp-fixture",
@@ -1233,14 +1274,18 @@ mod tests {
         crate::skills::SkillsManager::with_path(data.join("skills"))
             .ensure_installed()
             .unwrap();
-        let (found, invalid) = discover_runtime_from(&data, &workspace);
-        assert!(invalid.is_empty(), "{invalid:?}");
         let names: BTreeSet<&str> = crate::skills::bundled_resources::FILES
             .iter()
             .filter(|(_, relative, _)| *relative == "SKILL.md")
             .map(|(name, _, _)| *name)
             .collect();
         assert!(!names.is_empty());
+        for name in &names {
+            crate::skills::states::set(&data, name, crate::skills::states::SkillState::User)
+                .unwrap();
+        }
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
         for name in names {
             let command = found
                 .get(name)
@@ -1266,14 +1311,13 @@ mod tests {
                 metadata["user-invocable"].as_bool().unwrap_or(true),
                 "{name}"
             );
-            let default_user_only = crate::skills::states::default_state(name)
-                == crate::skills::states::SkillState::UserOnly;
+            // Every name has an explicit `user` state in this fixture, so only
+            // the frontmatter switch decides model invocation.
             assert_eq!(
                 command.disable_model_invocation,
                 metadata["disable-model-invocation"]
                     .as_bool()
-                    .unwrap_or(false)
-                    || default_user_only,
+                    .unwrap_or(false),
                 "{name}"
             );
         }
@@ -1305,6 +1349,10 @@ mod tests {
         crate::skills::SkillsManager::with_path(data.join("skills"))
             .ensure_installed()
             .unwrap();
+        for name in IMPORTED_SKILLS {
+            crate::skills::states::set(&data, name, crate::skills::states::SkillState::User)
+                .unwrap();
+        }
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         for name in IMPORTED_SKILLS {
@@ -1365,6 +1413,12 @@ mod tests {
             "renamed-directory",
             "---\nname: frontmatter-name\ndescription: Directory fixture\n---\nBody",
         );
+        crate::skills::states::set(
+            &data,
+            "renamed-directory",
+            crate::skills::states::SkillState::User,
+        )
+        .unwrap();
         let (found, invalid) = discover_runtime_from(&data, &workspace);
         assert!(invalid.is_empty(), "{invalid:?}");
         assert!(found.contains_key("renamed-directory"), "{found:?}");
@@ -1398,6 +1452,118 @@ mod tests {
         crate::skills::states::set(&data, "demo", crate::skills::states::SkillState::Off).unwrap();
         let (found, _) = discover_runtime_from(&data, &workspace);
         assert!(!found.contains_key("demo"));
+    }
+
+    #[test]
+    fn fresh_install_lists_only_default_builtins_for_the_model() {
+        let _lock = crate::skills::states::PATH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+
+        let empty_path = temp.path().join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let _path = TestPathGuard::set(&empty_path);
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        assert!(found.contains_key("skill-creator"));
+        for name in ["codegraph", "task-template", "docx", "pdf", "commit"] {
+            assert!(!found.contains_key(name), "{name} must be off by default");
+        }
+        // A disabled built-in stays installed so the panel and `dcl skills
+        // list` can still show it.
+        let installed = installed_bundled_skills(&data);
+        assert!(installed.contains_key("task-template"));
+        assert!(installed.contains_key("docx"));
+
+        // CodeGraph on PATH enables its skill without any stored state.
+        let codegraph = empty_path.join(if cfg!(windows) {
+            "codegraph.cmd"
+        } else {
+            "codegraph"
+        });
+        std::fs::write(&codegraph, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codegraph, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (found, _) = discover_runtime_from(&data, &workspace);
+        assert!(found.contains_key("codegraph"), "{:?}", found.keys());
+    }
+
+    #[test]
+    fn explicit_builtin_states_survive_reinstall_and_upgrades() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let data = temp.path().join("data");
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+        crate::skills::states::set(
+            &data,
+            "task-template",
+            crate::skills::states::SkillState::User,
+        )
+        .unwrap();
+        crate::skills::states::set(
+            &data,
+            "skill-creator",
+            crate::skills::states::SkillState::Off,
+        )
+        .unwrap();
+
+        // An upgrade reinstalls the whole embedded tree; stored user choices
+        // live beside it and are never part of that rewrite.
+        std::fs::remove_dir_all(data.join("skills/bundled")).unwrap();
+        crate::skills::SkillsManager::with_path(data.join("skills"))
+            .ensure_installed()
+            .unwrap();
+
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        assert!(found.contains_key("task-template"));
+        assert!(!found.contains_key("skill-creator"));
+        assert_eq!(
+            crate::skills::states::get(&data, "task-template"),
+            crate::skills::states::SkillState::User
+        );
+        assert_eq!(
+            crate::skills::states::get(&data, "skill-creator"),
+            crate::skills::states::SkillState::Off
+        );
+        assert!(data
+            .join("skills/bundled/task-template/SKILL.md")
+            .is_file());
+        assert!(data
+            .join("skills/bundled/skill-creator/SKILL.md")
+            .is_file());
+    }
+
+    struct TestPathGuard(Option<std::ffi::OsString>);
+
+    impl TestPathGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", value);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TestPathGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
     }
 
     #[test]

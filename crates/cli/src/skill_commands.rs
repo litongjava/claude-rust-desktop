@@ -398,17 +398,26 @@ pub async fn state_command(
     use deepseek_code_core::skills::{discovery, states};
     SkillsManager::with_path(paths.data_dir.join("skills")).ensure_installed()?;
     let stored = states::load(&paths.data_dir);
+    let installed = discovery::installed_bundled_skills(&paths.data_dir);
+    let discovered = discovery::discover(&paths.data_dir, workspace)?;
+    let is_bundled = |name: &str| {
+        discovered.get(name).map_or_else(
+            || installed.contains_key(name),
+            |command| discovery::is_bundled_path(&command.path, &paths.data_dir),
+        )
+    };
     let line = |name: &str| {
-        let value = states::effective(&stored, name);
+        let value = states::effective_in(&stored, name, is_bundled(name));
         format!("{name}  {}", value.label())
     };
     match (skill, state) {
         (None, _) => {
             let context = crate::services::context(paths)?;
-            // `off` skills are removed by the resolver, so keep the names the
-            // states file already knows.
+            // `off` skills are removed by the resolver, so keep the installed
+            // built-ins and the names the states file already knows.
             let mut names: BTreeSet<String> = stored.keys().cloned().collect();
-            names.extend(discovery::discover(&paths.data_dir, workspace)?.into_keys());
+            names.extend(installed.keys().cloned());
+            names.extend(discovered.keys().cloned());
             names.extend(
                 deepseek_code_core::services::plugins::skill_commands(&context)?.into_keys(),
             );
@@ -422,7 +431,8 @@ pub async fn state_command(
         (Some(name), Some(label)) => {
             let update: states::SkillState = label.parse()?;
             let known = stored.contains_key(name)
-                || discovery::discover(&paths.data_dir, workspace)?.contains_key(name)
+                || installed.contains_key(name)
+                || discovered.contains_key(name)
                 || crate::services::context(paths)
                     .and_then(|context| {
                         deepseek_code_core::services::plugins::skill_commands(&context)

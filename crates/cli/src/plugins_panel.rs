@@ -143,20 +143,31 @@ pub(crate) async fn load(paths: &RuntimePaths, session: &Session) -> Result<Mode
         &context,
     )?);
     let states = states::load(&paths.data_dir);
+    let bundled = deepseek_code_core::skills::discovery::bundled_dir(&paths.data_dir);
+    let installed =
+        deepseek_code_core::skills::discovery::installed_bundled_skills(&paths.data_dir);
     let usages = skill_usage::skill_usage(&session.store.db, Utc::now())?;
     let mut names: BTreeSet<String> = commands.keys().cloned().collect();
+    names.extend(installed.keys().cloned());
     names.extend(states.keys().cloned());
     let mut skills: Vec<SkillRow> = names
         .into_iter()
         .map(|name| {
-            let state = states::effective(&states, &name);
             let command = commands.get(&name);
+            let is_bundled = command.map_or_else(
+                || installed.contains_key(&name),
+                |command| command.path.starts_with(&bundled),
+            );
+            let state = states::effective_in(&states, &name, is_bundled);
             let listing_tokens = if state == SkillState::Off {
                 0
             } else {
                 command.map_or(0, skill_usage::listing_tokens)
             };
-            let path = command.map_or(Path::new(""), |command| command.path.as_path());
+            let path = command.map_or_else(
+                || installed.get(&name).map_or(Path::new(""), |path| path.as_path()),
+                |command| command.path.as_path(),
+            );
             SkillRow {
                 source: source_label(&name, path, &session.workspace, &paths.data_dir),
                 state,

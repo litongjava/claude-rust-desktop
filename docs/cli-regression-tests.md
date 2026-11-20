@@ -550,10 +550,16 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 ### O2. 内置 task-template
 
 1. `cargo test --locked -p deepseek-code-core --lib skills::bundled::tests::task_template_` 应运行三项测试。用共享解析器检查 YAML frontmatter，验证发现、渲染和只读内置清单，共用的 `SKILL.md` 不落盘，同名用户技能仍优先。清单和展开正文只在决定把实质性工作交给 `Agent`、队友或后台代理时推荐此技能，并明确略过普通后台 shell 命令。
-2. 用独立数据目录、空 `CLAUDE_CONFIG_DIR` 和本地模拟接口启动 `dcl`。首个请求的 `Available skills` 应恰好列出一个 `task-template`，描述包含 `Agent`、队友和后台代理。模拟接口发起 `Skill` 调用后，第二个请求的工具结果应包含传入的任务参数和四段说明（问题、具体改动、验证方式、报告），并要求按 `requirement → evidence → unverified` 记录。
-3. 在真实终端输入 `/task-template <任务>`，确认本地模拟接口收到展开的任务参数及同一套四段说明。
-4. `cargo test --locked -p deepseek-code-cli --test skills` 覆盖全新数据目录的 `dcl skills list` 和 `dcl skills help task-template`，内置条目恰好一项，帮助内容与清单相同。Desktop 自定义技能清单走同一个 `SkillsManager`。
+2. 内置技能默认关闭。全新数据目录的第一个请求中，`Available skills` 只应包含默认启用的 `skill-creator`（装了 CodeGraph 时再加 `codegraph`），不应包含 `task-template`。先执行 `dcl skills state task-template user`，再用空 `CLAUDE_CONFIG_DIR` 和本地模拟接口启动 `dcl`：`Available skills` 应列出一个 `task-template`，描述包含 `Agent`、队友和后台代理。模拟接口发起 `Skill` 调用后，第二个请求的工具结果应包含传入的任务参数和四段说明（问题、具体改动、验证方式、报告），并要求按 `requirement → evidence → unverified` 记录。
+3. 在同一数据目录执行上面的启用命令后，在真实终端输入 `/task-template <任务>`，确认本地模拟接口收到展开的任务参数及同一套四段说明。
+4. `cargo test --locked -p deepseek-code-cli --test skills` 覆盖全新数据目录的 `dcl skills list` 和 `dcl skills help task-template`。即使默认关闭，`list` 仍列出该条目并把 `state` 标为 `off`，`help` 仍可读取内容；启用后 `state` 变为 `user`。Desktop 自定义技能清单走同一个 `SkillsManager`。
 5. `cargo test --locked -p deepseek-code-cli --test sdk sdk_agent_fields_reach_the_child_request -- --exact` 覆盖 SDK `initialize.agents[].skills`。OpenAI 和 Anthropic 两个本地模拟协议均接受 `task-template` 并把说明预载到子代理请求中。
+
+### O3. 内置技能默认状态与安装速度
+
+1. 全新数据目录中只有 `skill-creator` 默认启用；`codegraph` 仅当 `PATH` 上能找到可执行的 `codegraph`（Windows 也接受 `codegraph.cmd` / `codegraph.exe`）时默认启用；其余内置技能在 `dcl skills list` 中以 `state: "off"` 出现，但不在模型的 `Available skills` 中，模型调用被拒绝。用户可通过 `dcl skills state <NAME> user|off`、`/plugins` 面板或 Desktop 面板启用。
+2. 用户的显式选择写入 `<数据目录>/skill-states.json`，升级或重新安装 `<数据目录>/skills/bundled` 后保持不变；删除内置文件后再次运行任何列出/开始会话命令会重新安装它们，但不会重置状态。
+3. 安装器先用临时文件加 rename 写完全部文件，再对每个发生变化的目录 fsync 一次，最后原子写安装记录（记录文件与目录单独 fsync）。`cargo test --locked -p deepseek-code-core --lib skills::bundled_install` 覆盖首次安装、同版本空操作、升级保留用户编辑、删除未改动文件和二进制资源；自动测试不能代替真实磁盘上的耗时测量。
 
 ### 不经模型的 /doctor 子命令
 

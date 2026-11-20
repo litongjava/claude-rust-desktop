@@ -434,6 +434,14 @@ mod tests {
         }
         std::fs::write(temp.path().join("review.txt"), "core-review-snapshot\n").unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        // Built-in skills default to off; enable this one so the first assertion
+        // still exercises its frontmatter `disable-model-invocation` switch.
+        crate::skills::states::set(
+            &paths.data_dir,
+            "code-review",
+            crate::skills::states::SkillState::User,
+        )
+        .unwrap();
         let provider=ResolvedProvider {provider:serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),model:serde_json::from_value(json!({"id":"fixture","name":"fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap()};
         let (tx, _rx) = tokio::sync::mpsc::channel(32);
         let mut executor = ToolLoopExecutor::new(

@@ -129,6 +129,7 @@ pub(super) fn install(bundled: &Path) -> Result<()> {
 
     let mut installed = BTreeMap::new();
     let mut embedded_keys = BTreeSet::new();
+    let mut changed_dirs = BTreeSet::new();
     for &(skill, relative, bytes) in FILES {
         let key = record_key(skill, relative);
         let digest = sha256(bytes);
@@ -143,7 +144,16 @@ pub(super) fn install(bundled: &Path) -> Result<()> {
         };
         installed.insert(key.clone(), digest.clone());
         embedded_keys.insert(key.clone());
-        install_file(&target, &key, bytes, &digest, &recorded)?;
+        if install_file(&target, &key, bytes, &digest, &recorded)? {
+            let mut directory = target.parent();
+            while let Some(parent) = directory {
+                changed_dirs.insert(parent.to_path_buf());
+                if parent == bundled {
+                    break;
+                }
+                directory = parent.parent();
+            }
+        }
     }
 
     for (key, previous) in &recorded {
@@ -158,6 +168,12 @@ pub(super) fn install(bundled: &Path) -> Result<()> {
                 "Kept removed bundled skill entry: unsafe or symbolic-link path"
             ),
         }
+    }
+
+    // One fsync per directory after the writes, instead of one per file. The
+    // record is written last and remains individually durable.
+    for directory in changed_dirs {
+        sync_directory(&directory)?;
     }
 
     write_record(
@@ -175,9 +191,12 @@ fn install_file(
     bytes: &[u8],
     digest: &str,
     recorded: &BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<bool> {
     match std::fs::symlink_metadata(target) {
-        Err(error) if error.kind() == ErrorKind::NotFound => write_atomic(target, bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            write_atomic(target, bytes)?;
+            Ok(true)
+        }
         Ok(metadata) if metadata.is_file() => {
             let current = match sha256_file(target) {
                 Ok(current) => current,
@@ -189,15 +208,16 @@ fn install_file(
                         %error,
                         "Kept unreadable bundled skill file"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             match recorded.get(key) {
                 Some(previous) if *previous == current => {
                     if current == digest {
-                        Ok(())
+                        Ok(false)
                     } else {
-                        write_atomic(target, bytes)
+                        write_atomic(target, bytes)?;
+                        Ok(true)
                     }
                 }
                 Some(_) => {
@@ -207,7 +227,7 @@ fn install_file(
                         path = %target.display(),
                         "Kept user-edited bundled skill file"
                     );
-                    Ok(())
+                    Ok(false)
                 }
                 None => {
                     tracing::info!(
@@ -216,7 +236,7 @@ fn install_file(
                         path = %target.display(),
                         "Kept existing bundled skill file without an install record"
                     );
-                    Ok(())
+                    Ok(false)
                 }
             }
         }
@@ -227,7 +247,7 @@ fn install_file(
                 path = %target.display(),
                 "Kept non-file entry at a bundled skill path"
             );
-            Ok(())
+            Ok(false)
         }
         Err(error) => {
             tracing::warn!(
@@ -237,7 +257,7 @@ fn install_file(
                 %error,
                 "Kept bundled skill path that could not be inspected"
             );
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -311,11 +331,40 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
     temporary
         .persist(path)
         .map_err(|error| error.error)
         .context("Writing bundled skill file")?;
+    Ok(())
+}
+
+/// The install record must survive a crash even when the files it describes
+/// are still in the page cache.
+fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("Bundled skill record has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("Writing bundled skill record")?;
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .with_context(|| format!("Opening directory {}", path.display()))?
+            .sync_all()
+            .with_context(|| format!("Syncing directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -351,7 +400,7 @@ fn read_record(path: &Path) -> Result<InstallRecord> {
 
 fn write_record(path: &Path, record: &InstallRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record)?;
-    write_atomic(path, &bytes)
+    write_atomic_durable(path, &bytes)
 }
 
 #[cfg(test)]
