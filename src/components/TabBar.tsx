@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { X, Plus, Pin, PinOff, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useTabStore, TabItem } from '../stores/useTabStore';
 import { useI18n } from '../hooks/useI18n';
-import claudeImg from '../assets/icons/claude.png';
+import DeepSeekCodeLogo from './DeepSeekCodeLogo';
 
 const TabBar: React.FC<{
   onNewChat: () => void;
@@ -159,10 +159,9 @@ const TabBar: React.FC<{
                 )}
 
                 {!tab.pinned && (
-                  <img
-                    src={claudeImg}
-                    alt=""
-                    className="flex-shrink-0 w-3.5 h-3.5 dark:invert opacity-70"
+                  <DeepSeekCodeLogo
+                    className="flex-shrink-0 opacity-70"
+                    style={{ width: '14px', height: '14px' }}
                   />
                 )}
 
