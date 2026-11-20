@@ -1225,5 +1225,17 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
     assert!(
         query::<String>(&global(&root), "SELECT quarantine_reason FROM lifecycle").contains("seal")
     );
+
+    let orphan_root = tempdir()?;
+    let root = orphan_root.path().canonicalize()?;
+    Stores::open_for_test(&root)?.create(ID, first())?;
+    global(&root).execute("DELETE FROM conversations", [])?;
+    let quarantine = root.join("sessions/.quarantine");
+    for parent in [&quarantine, &quarantine, &root.join("sessions")] {
+        reject(&root, parent, &root.join("global.db"))?;
+        assert_eq!(count(&root, "sessions/.quarantine"), 1);
+        assert!(!shard(&root).exists());
+    }
+    assert!(Stores::open_for_test(&root)?.open_session(ID).is_err());
     Ok(())
 }

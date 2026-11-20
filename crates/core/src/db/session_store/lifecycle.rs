@@ -737,6 +737,14 @@ impl Stores {
         if scratch.try_exists()? {
             fs::remove_dir_all(scratch)?;
         }
+        // Unjournaled orphans have no G intent to drive replay after rename.
+        // A surviving destination can come from either the live or staging parent.
+        let quarantine = self.sessions().join(".quarantine");
+        if fs::read_dir(&quarantine)?.next().transpose()?.is_some() {
+            sync_dir(&quarantine)?;
+            sync_dir(&self.sessions())?;
+            sync_dir(&self.sessions().join(".staging"))?;
+        }
         for entry in fs::read_dir(self.sessions().join(".staging"))? {
             let entry = entry?;
             let operation = entry.file_name();
