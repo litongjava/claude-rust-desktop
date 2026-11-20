@@ -128,12 +128,17 @@ mod tests {
             }
         }
         assert!(custom.join("SKILL.md").exists());
-        for name in ["commit", "review", "test", "document", "build"] {
+        // Pristine generated skills are not listed; `commit` now ships as a
+        // bundled skill under its real name.
+        for name in ["review", "test", "document", "build"] {
             assert!(
                 !listed.iter().any(|skill| skill.name == name),
                 "{name} must not be installed"
             );
         }
+        assert!(listed.iter().any(|skill| {
+            skill.name == "commit" && skill.source == crate::skills::SkillSource::Bundled
+        }));
         assert!(listed.iter().any(|skill| skill.name == "custom"));
     }
 }

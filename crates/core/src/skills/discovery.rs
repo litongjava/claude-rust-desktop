@@ -1212,9 +1212,13 @@ mod tests {
             creators[0].path,
             data.join("skills/bundled/skill-creator/SKILL.md")
         );
-        // The five legacy built-ins are no longer installed or listed.
-        for name in ["commit", "review", "test", "document", "build"] {
+        // The generated legacy skills stay gone. `commit` is now a bundled
+        // skill under its real name, so only its old `legacy-commit`
+        // directory remains forbidden.
+        for name in ["review", "test", "document", "build"] {
             assert!(!found.contains_key(name), "{name} must not be listed");
+        }
+        for name in ["commit", "review", "test", "document", "build"] {
             assert!(!data.join(format!("skills/legacy-{name}")).exists());
             assert!(!data.join(format!("skills/bundled/legacy-{name}")).exists());
         }
