@@ -1114,6 +1114,27 @@ fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
 }
 
 #[test]
+fn orphan_sweep_recognizes_a_local_seal_in_a_killed_writers_wal() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let mut creator = Worker::start(root.path(), "sealed-wal");
+    wait_file(&root.path().join("ready"));
+    creator.kill_and_wait();
+    let stage = fs::read_dir(root.path().join("sessions/.staging"))?
+        .next()
+        .unwrap()?
+        .path();
+    assert!(stage.join("session.db-wal").metadata()?.len() > 32);
+    global(root.path()).execute("DELETE FROM lifecycle", [])?;
+    drop(stores);
+    let reopened = Stores::open_for_test(root.path())?;
+    assert!(reopened.open_session(ID).is_err());
+    assert!(!stage.exists());
+    assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
+    Ok(())
+}
+
+#[test]
 fn fix_round_bootstrap_requires_a_durable_existing_data_root() -> Result<()> {
     let parent = tempdir()?;
     let missing = parent.path().join("missing/nested");

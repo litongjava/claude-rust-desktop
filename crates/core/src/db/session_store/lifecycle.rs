@@ -676,8 +676,29 @@ impl Stores {
                 );
                 Ok(())
             };
-            // An ordinary read-only WAL open may create sidecars. Establish
-            // ownership from the main file first, leaving foreign files untouched.
+            // A read-only SQLite WAL open can create or modify a shared-memory
+            // sidecar. Inspect a nonempty WAL with a private WAL index, even
+            // when the only copy of the sealed manifest is in that WAL.
+            let wal = dir.join("session.db-wal");
+            if wal.try_exists()? {
+                let meta = fs::symlink_metadata(&wal)?;
+                ensure!(meta.is_file(), "not a regular WAL");
+                if meta.len() > 0 {
+                    let scratch = self.sessions().join(".quarantine/.orphan-inspection");
+                    fs::create_dir(&scratch)?;
+                    let result = (|| -> Result<()> {
+                        let copy = scratch.join("session.db");
+                        fs::copy(&path, &copy)?;
+                        fs::copy(wal, scratch.join("session.db-wal"))?;
+                        let conn = layout::open(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                        layout::verify(&conn, SESSION)?;
+                        identity(&conn)
+                    })();
+                    fs::remove_dir_all(scratch)?;
+                    return result;
+                }
+            }
+            // An immutable probe never creates sidecars in a foreign directory.
             let mut url = reqwest::Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("Invalid database path"))?;
             url.set_query(Some("immutable=1"));
@@ -711,6 +732,11 @@ impl Stores {
     fn quarantine_orphans(&self) -> Result<()> {
         let _sweep =
             layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
+        // The sweep lock also serializes cleanup after a killed WAL inspection.
+        let scratch = self.sessions().join(".quarantine/.orphan-inspection");
+        if scratch.try_exists()? {
+            fs::remove_dir_all(scratch)?;
+        }
         for entry in fs::read_dir(self.sessions().join(".staging"))? {
             let entry = entry?;
             let operation = entry.file_name();
