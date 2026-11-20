@@ -463,6 +463,13 @@ async fn stream_with_options_client_budget(
     };
     let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
     let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
+    // Responses endpoints route requests to a prompt cache by this key, so the
+    // same conversation keeps reusing one cached prefix.
+    if api == "openai-responses" {
+        if let Some(key) = super::request_identity::prompt_cache_key() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+    }
     if let Some(schema) = response_schema.filter(|_| {
         !crate::structured_output::provider_enforces_schema(&provider.provider.base_url)
     }) {
