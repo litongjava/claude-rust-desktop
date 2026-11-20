@@ -1466,14 +1466,22 @@ pub(super) fn control(
     snapshot["stderr"] = json!(stderr);
     let result = snapshot["output"].clone();
     snapshot["result"] = result;
-    // A managed shell stores the same payload a foreground Bash result carries.
-    // Render it the same way, so a finished task shows only its output and the
-    // status that matters instead of raw exit_code/shell_path bookkeeping.
-    // Status, IDs and paging cursors keep their structured values.
-    for key in ["output", "result"] {
-        if let Some(text) = snapshot[key].as_str().map(str::to_owned) {
-            snapshot[key] =
-                json!(crate::native_engine::tool_loop::model_tool_output("Bash", &text));
+    // A plain managed shell stores the same payload a foreground Bash result
+    // carries. Render it the same way, so a finished task shows only its output
+    // and the status that matters instead of raw exit_code/shell_path
+    // bookkeeping. Status, IDs and paging cursors keep their structured values.
+    // A PTY/ConPTY console task instead stores its terminal outcome
+    // (`exit_code`, `cleanup_complete`, `final_drain_complete`, ...) as JSON that
+    // callers parse, so its output is left exactly as stored.
+    let console =
+        snapshot["metadata"]["interaction"].as_str() == Some(super::pty_owner::INTERACTION);
+    if !console {
+        for key in ["output", "result"] {
+            if let Some(text) = snapshot[key].as_str().map(str::to_owned) {
+                snapshot[key] = json!(crate::native_engine::tool_loop::model_tool_output(
+                    "Bash", &text
+                ));
+            }
         }
     }
     snapshot["block"] = json!(false);
@@ -2025,6 +2033,55 @@ mod tests {
         let failed = finished_shell(root.path(), &session, "process.exit(2)").await;
         assert_eq!(failed["status"], "failed", "{failed}");
         assert_eq!(failed["result"], "Exit code: 2", "{failed}");
+    }
+
+    /// A ConPTY/console task stores a structured terminal outcome, not a Bash
+    /// payload. TaskGet must present it byte-for-byte so callers can still parse
+    /// the fields they rely on.
+    #[test]
+    fn task_get_keeps_a_console_task_outcome_structured() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = super::super::tasks::execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"console","metadata":{
+                "managed_shell":true,
+                "interaction":super::super::pty_owner::INTERACTION
+            }}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        let id = task["id"].as_str().unwrap();
+        let outcome = json!({
+            "exit_code":0,
+            "cleanup_complete":true,
+            "final_drain_complete":true,
+            "output_capture_complete":true
+        })
+        .to_string();
+        super::super::tasks::execute_for_shell_owner(
+            "TaskUpdate",
+            json!({"id":id,"status":"completed","output":outcome}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("shell-tasks").join(&session).join(id)).unwrap();
+        let snapshot = control(
+            "TaskGet",
+            &json!({"task_id":id,"block":false}),
+            root.path(),
+            &session,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot["status"], "completed", "{snapshot}");
+        assert_eq!(snapshot["output"], outcome, "{snapshot}");
+        assert_eq!(snapshot["result"], outcome, "{snapshot}");
+        let parsed: Value = serde_json::from_str(snapshot["output"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["cleanup_complete"], true, "{parsed}");
+        assert_eq!(parsed["final_drain_complete"], true, "{parsed}");
     }
 
     #[test]
