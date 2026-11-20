@@ -972,7 +972,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
     })?
     .with_search_config_path(PathBuf::from(&spec.settings_path))
     .with_permission_manager(permissions)
-    .with_loaded_tools(spec.loaded_tools.iter().cloned().collect());
+    .with_loaded_tools(spec.loaded_tools.iter().cloned());
     if let Some(allowed) = &spec.allowed_tools {
         executor = executor.with_allowed_tools(Some(allowed.clone()));
     }

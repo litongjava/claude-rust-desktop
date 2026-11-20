@@ -1,0 +1,26 @@
+.deepseek-code-logo-spin {
+  animation: deepseek-code-logo-spin 3.6s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+.deepseek-code-logo-breathe {
+  animation: deepseek-code-logo-breathe 1.8s ease-in-out infinite;
+  transform-origin: 50% 50%;
+}
+
+@keyframes deepseek-code-logo-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes deepseek-code-logo-breathe {
+  0%, 100% { transform: scale(0.9); opacity: 0.55; }
+  50% { transform: scale(1.05); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deepseek-code-logo-spin,
+  .deepseek-code-logo-breathe {
+    animation: none;
+  }
+}

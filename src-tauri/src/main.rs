@@ -312,7 +312,7 @@ fn main() {
                         // Send initial "thinking" card
                         let card_start = serde_json::json!({
                             "config": { "wide_screen_mode": true },
-                            "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                            "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                             "elements": [
                                 { "tag": "markdown", "content": "🤔 *正在思考...*" },
                                 { "tag": "note", "elements": [{ "tag": "plain_text", "content": "流式输出中..." }] }
@@ -349,7 +349,7 @@ fn main() {
                                                 };
                                                 let card_update = serde_json::json!({
                                                     "config": { "wide_screen_mode": true },
-                                                    "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                                                    "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                                                     "elements": [
                                                         { "tag": "markdown", "content": preview },
                                                         { "tag": "note", "elements": [{ "tag": "plain_text", "content": "流式输出中..." }] }
@@ -381,7 +381,7 @@ fn main() {
                                             // Finalize card
                                             let card_final = serde_json::json!({
                                                 "config": { "wide_screen_mode": true },
-                                                "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                                                "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                                                 "elements": [
                                                     { "tag": "markdown", "content": &if full_text.is_empty() { "_(空回复)_" } else { &full_text } }
                                                 ]

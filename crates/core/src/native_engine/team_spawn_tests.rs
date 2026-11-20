@@ -375,7 +375,15 @@ async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
                 let loaded = body["tools"].as_array().unwrap().iter()
                     .any(|tool| tool["function"]["name"] == "ContextSearch");
                 let searches: Vec<_> = outputs.iter().copied()
-                    .filter(|output| !output.contains("\"loaded_tools\""))
+                    // ToolLoad now reaches the model as its content line rather
+                    // than a JSON marker, so exclude that line by shape and
+                    // keep every other result, including search errors.
+                    .filter(|output| {
+                        !(output.starts_with("Loaded ")
+                            || output.starts_with("Already available: ")
+                            || output.starts_with("Unknown tools: ")
+                            || output.starts_with("Unavailable tools: "))
+                    })
                     .collect();
                 let call = match searches.len() {
                     0 if !loaded && outputs.is_empty() => Some(("load", "ToolLoad", json!({"names":["ContextSearch"]}))),

@@ -53,7 +53,7 @@ impl ProjectIntel {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
-                .user_agent("Claude-Desktop-Intel/1.0")
+                .user_agent(concat!("DeepSeekCode-Intel/", env!("CARGO_PKG_VERSION")))
                 .build().unwrap_or_default(),
             kb,
         }
