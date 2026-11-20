@@ -1,7 +1,11 @@
+mod copy;
+mod import;
 use super::layout::{self, canonical_uuid, durable_move, storage_key, sync_dir, Permits, SESSION};
 use super::{verify_manifest, SessionDb, Stores};
 use crate::db::project_repo;
 use anyhow::{bail, ensure, Context, Result};
+pub use copy::Branch;
+pub use import::ImportResult;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -60,6 +64,10 @@ struct Metadata {
     // Prior v1 intents recorded only the manifest count.
     #[serde(default)]
     initial_shape: Option<(bool, bool)>,
+    #[serde(default)]
+    copied: bool,
+    #[serde(default)]
+    source: Option<(String, String, i64, bool)>,
     title: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -224,80 +232,120 @@ impl Intent {
     }
 }
 
+enum Seed<'a> {
+    New,
+    Fork(&'a SessionDb, Branch<'a>),
+    Import(&'a import::LegacySession),
+}
+
 impl Stores {
     pub fn create(&self, id: &str, options: CreateOptions) -> Result<SessionDb> {
         let key = storage_key(id)?;
-        let _locks = self.key_lock(&key, true, true)?;
-        self.recover_key(&key)?;
-        self.global().read(|conn| {
-            let fenced: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM lifecycle WHERE storage_key=?1
-                AND kind='delete' AND quarantine_reason IS NOT NULL)",
-                [&key],
-                |r| r.get(0),
-            )?;
-            ensure!(
-                !fenced,
-                "Quarantined delete requires resolution before ID reuse"
-            );
-            Ok(())
-        })?;
+        let _locks = self.group_access(vec![(&key, true, true)])?;
+        self.create_locked(id, options, Seed::New, None)
+    }
+
+    fn prepare(
+        &self,
+        tx: &Connection,
+        id: &str,
+        options: &CreateOptions,
+        seed: &Seed<'_>,
+        source: Option<(String, String, i64, bool)>,
+    ) -> Result<(Intent, Metadata)> {
+        let key = storage_key(id)?;
+        let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2 UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?2 AND (quarantine_reason IS NULL OR kind='delete'))",[id,&key],|r|r.get(0))?;
+        ensure!(!exists, "Session already exists or is fenced");
         let op = Intent::new(self, id, &key, Uuid::new_v4().to_string(), "create");
         ensure!(
             !op.live(self).try_exists()?,
             "Session directory already exists"
         );
-        let mode = options.workspace_mode.unwrap_or_else(|| "chat".into());
+        let mode = options
+            .workspace_mode
+            .clone()
+            .unwrap_or_else(|| "chat".into());
         ensure!(
             matches!(mode.as_str(), "chat" | "work" | "study" | "code"),
             "Invalid workspace mode"
         );
-        let created = chrono::Utc::now().to_rfc3339();
-        let meta = self.global().write("create intent", id, true, |tx| {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2)",
-                [id, &key],
-                |r| r.get(0),
-            )?;
-            ensure!(!exists, "Session already exists");
-            let meta = Metadata {
-                initial_shape: Some((
+        let copied = !matches!(seed, Seed::New);
+        let meta = Metadata {
+            initial_shape: (!copied).then(|| {
+                (
                     options.first_message.is_some(),
                     options
                         .first_message
                         .as_ref()
                         .is_some_and(|m| m.typed.is_some()),
-                )),
-                title: options.title.clone(),
-                model: options.model.clone(),
-                provider: options.provider.clone(),
-                mode: mode.clone(),
-                research: options.research,
-                created: created.clone(),
-                project: options
-                    .project
-                    .as_ref()
-                    .map(|p| Project::select(tx, p))
-                    .transpose()?,
-            };
+                )
+            }),
+            copied,
+            source,
+            title: options.title.clone(),
+            model: options.model.clone(),
+            provider: options.provider.clone(),
+            mode,
+            research: options.research,
+            created: match seed {
+                Seed::Import(s) => s.created_at.clone(),
+                _ => chrono::Utc::now().to_rfc3339(),
+            },
+            project: options
+                .project
+                .as_ref()
+                .map(|p| Project::select(tx, p))
+                .transpose()?,
+        };
+        Ok((op, meta))
+    }
+
+    fn create_locked(
+        &self,
+        id: &str,
+        options: CreateOptions,
+        seed: Seed<'_>,
+        source: Option<(String, String, i64, bool)>,
+    ) -> Result<SessionDb> {
+        let (op, meta) = self.global().write("create intent", id, true, |tx| {
+            let (op, meta) = self.prepare(tx, id, &options, &seed, source.clone())?;
             op.insert(tx, Some(&serde_json::to_string(&meta)?))?;
             self.step(Phase::BeforeCreateIntentCommit)?;
-            Ok(meta)
+            Ok((op, meta))
         })?;
         self.step(Phase::CreateIntent)?;
+        self.build(&op, &meta, options.first_message.as_ref(), seed)?;
+        self.publish(&op, &meta, &op.stage(self))?;
+        Ok(SessionDb {
+            stores: self.clone(),
+            id: id.into(),
+            key: op.key,
+            incarnation: op.incarnation,
+        })
+    }
+
+    fn build(
+        &self,
+        op: &Intent,
+        meta: &Metadata,
+        first: Option<&FirstMessage>,
+        seed: Seed<'_>,
+    ) -> Result<()> {
+        let id = &op.id;
+        let created = &meta.created;
         let stage = op.stage(self);
         fs::create_dir(&stage)?;
         sync_dir(stage.parent().unwrap())?;
         self.step(Phase::StageDirectory)?;
         {
-            let _permit = Permits::take(1);
+            let _permit = Permits::take(if matches!(seed, Seed::Fork(..)) { 2 } else { 1 });
             let sealed = layout::initialize(&stage.join("session.db"), SESSION, |tx| {
-                let n = i64::from(options.first_message.is_some());
+                let n = i64::from(first.is_some());
                 tx.execute(
                     "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,?5,?5,?6,?6,NULL)",
                     params![op.store, id, op.incarnation, op.operation, created, n],
                 )?;
-                if let Some(first) = &options.first_message {
+                if let Some(first) = first {
                     let message = Uuid::new_v4().to_string();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
@@ -308,18 +356,19 @@ impl Stores {
                         )?;
                     }
                 }
+                match seed {
+                    Seed::New => {}
+                    Seed::Fork(source, boundary) => {
+                        copy::copy_snapshot(source, tx, &op.id, boundary)?
+                    }
+                    Seed::Import(session) => session.populate(tx)?,
+                }
                 self.step(Phase::BeforeSeal)
             })?;
             self.step(Phase::Sealed)?;
             sealed.close().map_err(|(_, e)| e)?;
         }
-        self.publish(&op, &meta, &stage)?;
-        Ok(SessionDb {
-            stores: self.clone(),
-            id: id.into(),
-            key,
-            incarnation: op.incarnation,
-        })
+        Ok(())
     }
 
     pub(super) fn pending(&self, key: &str) -> Result<Option<Intent>> {
@@ -476,7 +525,7 @@ impl Stores {
             })
     }
 
-    fn publish(&self, op: &Intent, meta: &Metadata, dir: &Path) -> Result<()> {
+    fn install(&self, op: &Intent, meta: &Metadata, dir: &Path) -> Result<super::Projection> {
         let live = op.live(self);
         let db = dir.join("session.db");
         let inspect = || -> Result<_> {
@@ -493,12 +542,27 @@ impl Stores {
             if !matches {
                 return Err(layout::InvalidFormat("Sealed identity mismatch".into()).into());
             }
-            let p: (i64,i64,Option<String>,i64) = c.query_row("SELECT message_count,content_revision,
-                (SELECT substr(content,1,80) FROM messages WHERE sort_order=0),
-                coalesce((SELECT length(CAST(content AS BLOB)) FROM messages WHERE sort_order=0),0) FROM manifest",
-                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-            let history_ok: bool = c.query_row(
-                "SELECT
+            let p = super::history::projection(&c)?;
+            if meta.copied {
+                ensure!(
+                    p.count
+                        == c.query_row("SELECT count(*) FROM messages", [], |r| r
+                            .get::<_, i64>(0))?,
+                    "Invalid copied message count"
+                );
+                let broken: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                ensure!(!broken, "Invalid copied reference");
+                let mut q = c.prepare("SELECT content_json FROM message_user_content")?;
+                for value in q.query_map([], |r| r.get::<_, String>(0))? {
+                    serde_json::from_str::<serde_json::Value>(&value?)?;
+                }
+            } else {
+                let history_ok: bool = c.query_row(
+                    "SELECT
                 m.message_count IN (0,1) AND m.content_revision=m.message_count
                 AND m.message_count=(SELECT count(*) FROM messages)
                 AND NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id IS NOT m.id
@@ -509,17 +573,18 @@ impl Stores {
                 AND (?2 IS NULL OR EXISTS(SELECT 1 FROM messages JOIN message_user_content
                     ON message_id=messages.id WHERE sort_order=0)=?2)
                 FROM manifest m WHERE singleton=1",
-                params![
-                    meta.initial_shape.map(|v| v.0),
-                    meta.initial_shape.map(|v| v.1)
-                ],
-                |r| r.get(0),
-            )?;
-            if !history_ok {
-                return Err(layout::InvalidFormat(
-                    "Initial history differs from sealed projection".into(),
-                )
-                .into());
+                    params![
+                        meta.initial_shape.map(|v| v.0),
+                        meta.initial_shape.map(|v| v.1)
+                    ],
+                    |r| r.get(0),
+                )?;
+                if !history_ok {
+                    return Err(layout::InvalidFormat(
+                        "Initial history differs from sealed projection".into(),
+                    )
+                    .into());
+                }
             }
             drop(c);
             layout::checkpoint(&db, SESSION)?;
@@ -546,23 +611,57 @@ impl Stores {
         sync_dir(&self.sessions())?;
         sync_dir(&self.sessions().join(".staging"))?;
         self.step(Phase::Installed)?;
+        Ok(projection)
+    }
+
+    fn publish_row(
+        &self,
+        tx: &Connection,
+        op: &Intent,
+        meta: &Metadata,
+        p: &super::Projection,
+    ) -> Result<()> {
+        let (project, workspace) = match &meta.project {
+            None => (None, None),
+            Some(selection) => {
+                let (id, path) = selection.publish(tx, &meta.created)?;
+                (Some(id), path)
+            }
+        };
+        tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
+            workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status])?;
+        if let Some((source, inc, rev, child)) = &meta.source {
+            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2 AND metadata_revision=?3)",params![source,inc,rev],|r|r.get(0))?;
+            ensure!(valid, "Source binding changed");
+            for (table, cols) in [
+                (
+                    "conversation_worktrees",
+                    "project_id,source_path,repo_path,path,branch",
+                ),
+                ("conversation_worktree_backends", "backend,metadata"),
+            ] {
+                tx.execute(&format!("INSERT INTO {table}(conversation_id,{cols}) SELECT ?1,{cols} FROM {table} WHERE conversation_id=?2"),[&op.id,source])?;
+            }
+            if *child && project.is_none() {
+                tx.execute("INSERT INTO conversation_private_workspace_bindings(child_id,parent_id) VALUES(?1,COALESCE((SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2),?2))",[&op.id,source])?;
+            } else {
+                tx.execute("INSERT INTO conversation_private_workspace_bindings SELECT ?1,parent_id FROM conversation_private_workspace_bindings WHERE child_id=?2",[&op.id,source])?;
+            }
+        }
+        op.finish(tx)?;
+        Ok(())
+    }
+
+    fn publish(&self, op: &Intent, meta: &Metadata, dir: &Path) -> Result<()> {
+        let projection = self.install(op, meta, dir)?;
+        let live = op.live(self);
         let mut project_conflict = false;
         let result = self.global().write("publish session", &op.id, true, |tx| {
-            let (project,workspace) = match &meta.project {
-                None => (None,None),
-                Some(p) => {
-                    let (id, path) = p.publish(tx, &meta.created).inspect_err(|e| {
-                        project_conflict = e.downcast_ref::<rusqlite::Error>().is_none();
-                    })?;
-                    (Some(id), path)
-                }
-            };
-            tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
-                workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12,?13,?14,?14,?15)",
-                params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,
-                    meta.created,projection.0,projection.1,projection.2,projection.3])?;
-            op.finish(tx)?;
+            self.publish_row(tx, op, meta, &projection)
+                .inspect_err(|e| {
+                    project_conflict = e.downcast_ref::<rusqlite::Error>().is_none()
+                })?;
             self.step(Phase::BeforePublishCommit)
         });
         if let Err(e) = result {
@@ -640,8 +739,7 @@ impl Stores {
         })?;
         for key in keys {
             ensure!(layout::is_storage_key(&key), "Invalid journal storage key");
-            let _locks = self.key_lock(&key, true, false)?;
-            if let Err(error) = self.recover_key(&key) {
+            if let Err(error) = self.group_access(vec![(&key, true, false)]) {
                 // Quarantined operations are terminal. Windows sharing errors
                 // stay journaled and can be retried independently of other IDs.
                 if self.pending(&key)?.is_some() {

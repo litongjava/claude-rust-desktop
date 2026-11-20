@@ -38,3 +38,6 @@ CREATE TABLE conversation_worktree_backends (
     metadata TEXT NOT NULL
 );
 
+CREATE TABLE import_members(storage_key TEXT PRIMARY KEY, batch TEXT NOT NULL,
+ operation TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, abort_reason TEXT);
+CREATE INDEX import_batch ON import_members(batch);

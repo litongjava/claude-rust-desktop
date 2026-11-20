@@ -8,7 +8,7 @@ pub use history::*;
 mod layout;
 mod lifecycle;
 pub use global::GlobalDb;
-pub use lifecycle::{CreateOptions, FirstMessage, Phase, ProjectSelection};
+pub use lifecycle::{Branch, CreateOptions, FirstMessage, ImportResult, Phase, ProjectSelection};
 
 use anyhow::{ensure, Context, Result};
 use layout::{lock_keys, storage_key, Permits, SESSION};
@@ -157,8 +157,7 @@ impl Stores {
             return Ok(Some(shared));
         }
         drop(shared);
-        let exclusive = self.key_lock(key, true, false)?;
-        self.recover_key(key)?;
+        let exclusive = self.group_access(vec![(key, true, false)])?;
         Ok(Some(exclusive))
     }
 
