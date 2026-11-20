@@ -511,7 +511,16 @@ impl Scrollback {
         match result {
             Ok(value) => {
                 let status = value["status"].as_str().unwrap_or("unknown");
-                let exit = value["result"]["exit_code"].as_i64().map(|code| format!(" · exit {code}")).unwrap_or_default();
+                // A shell task's result is model-facing text (a failure names its
+                // code); an older structured record still carries `exit_code`.
+                let exit_code = value["result"]["exit_code"].as_i64().or_else(|| {
+                    value["result"]
+                        .as_str()
+                        .and_then(|text| text.lines().next())
+                        .and_then(|line| line.strip_prefix("Exit code: "))
+                        .and_then(|code| code.trim().parse().ok())
+                });
+                let exit = exit_code.map(|code| format!(" · exit {code}")).unwrap_or_default();
                 full.push(change_view::muted(&format!("  Background task {task} · {status}{exit} (click to collapse)")));
                 if matches!(status, "completed" | "failed" | "cancelled") {
                     entry.short.truncate(1);
