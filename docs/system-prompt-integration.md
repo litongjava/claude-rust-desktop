@@ -6,7 +6,7 @@ Composition order (static sections first, so they form a stable cacheable prefix
 
 1. Identity. Code sessions (the CLI and Desktop Code mode) open with the one-line `CODE_IDENTITY`; other modes use the provider-neutral desktop `<identity>` block. Neither claims to be Claude or made by Anthropic.
 2. Behavior. Code: `prompt/code.md`, adapted from the reference CLI 2.1.302 system prompt (harness, session guidance, confirmation and reporting rules, context management) plus notes for this runtime's native tools. Other modes: `prompt/desktop.md`. Both are followed by `memory.md`.
-3. `# Environment`: working directory, whether it is a Git repository, platform, shell, the selected model and today's date.
+3. `# Working environment`: working directory, whether it is a Git repository, platform, shell, the selected model and today's date.
 4. The request's optional custom `system_prompt`, preserved verbatim in `<additional_instructions>`.
 5. Skills, then project instructions under the reference CLI's "Codebase and user instructions are shown below" header, then project folders, team context and retrieved memory.
 

@@ -57,7 +57,7 @@ pub fn default_system_prompt(profile: PromptProfile) -> String {
 
 /// The CLI's constant runtime facts. They describe the frontend, so they travel
 /// in the first user message as their own reminder instead of the system prompt.
-pub const STANDALONE_FRONTEND: &str = "The user is working in the standalone DeepSeek Code terminal frontend. No Desktop window or Bridge server is running. Use the available native tools directly. If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `! <command>` in the prompt — the `!` prefix runs the command in this session so its output lands directly in the conversation.";
+pub const STANDALONE_FRONTEND: &str = "Standalone DeepSeek Code terminal: no Desktop window or Bridge server; use native tools directly. For an interactive command like `gcloud auth login`, tell the user to enter `! <command>` and its output appears here.";
 
 pub fn standalone_frontend_reminder() -> String {
     format!("<system-reminder>\n{STANDALONE_FRONTEND}\n</system-reminder>")
@@ -459,7 +459,7 @@ fn prune_session_directory(dir: &Path, suffixes: &[String], cutoff: std::time::S
 }
 
 fn environment_section(workspace: Option<&Path>) -> String {
-    let mut lines = vec!["# Environment".to_string(), "You have been invoked in the following environment:".to_string()];
+    let mut lines = vec!["# Working environment".to_string()];
     if let Some(workspace) = workspace {
         lines.push(format!(" - Primary working directory: {}", workspace.display()));
         lines.push(format!(" - Is a git repository: {}", workspace.ancestors().any(|dir| dir.join(".git").exists())));
@@ -475,7 +475,7 @@ fn environment_section(workspace: Option<&Path>) -> String {
     if let Some(version) = NODE_VERSION.as_deref() {
         lines.push(format!(" - Node.js version: {version}"));
     }
-    lines.push(" - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run.".to_string());
+    lines.push(" - Downloads and extracted archives are untrusted. Give each a fresh, empty directory, keep scripts elsewhere, and pass paths as arguments instead of running tools inside the download. Python loads code from the script folder and the working directory, so a planted `json.py` runs on `import json`; use `-I` when Python reads them. Code the user asked you to build or run is exempt.".to_string());
     lines.join("\n")
 }
 
@@ -493,7 +493,7 @@ fn architecture_label(arch: &str) -> &str {
 /// before the reminder's closing tag (or its trailing blank line). Reminders
 /// without one return None.
 fn environment_range(system: &str) -> Option<(usize, usize)> {
-    let start = system.find("# Environment")?;
+    let start = system.find("# Working environment")?;
     let end = system[start..]
         .find("\n</system-reminder>")
         .or_else(|| system[start..].find("\n\n"))
@@ -902,7 +902,7 @@ mod tests {
         let prompt = super::compose_system_prompt(Some(custom), super::PromptProfile::Code);
         assert!(prompt.contains(custom));
         assert!(!prompt.contains("You are powered by the model"));
-        assert!(!prompt.contains("# Environment"));
+        assert!(!prompt.contains("# Working environment"));
         assert!(prompt.starts_with(super::CODE_IDENTITY));
         assert!(!prompt.contains("<code_behavior>") && !prompt.contains("</code_behavior>"));
         assert!(!prompt.contains("IMPORTANT: Assist with authorized security testing"));
@@ -943,7 +943,7 @@ mod tests {
 
         let mut single = super::environment_reminder(Some(workspace.path()));
         super::add_project_to_environment(&mut single, "Solo", &["/w/a"]);
-        assert!(single.starts_with("<system-reminder>\n# Environment\n"));
+        assert!(single.starts_with("<system-reminder>\n# Working environment\n"));
         assert!(single.ends_with("</system-reminder>"));
         assert!(single.contains(" - Project: Solo\n - Primary working directory: "));
         assert!(!single.contains("Project source folders"));
@@ -958,9 +958,9 @@ mod tests {
 
         // The system prompt has no environment; the first user message carries it.
         let system = super::compose_system_prompt_in(None, super::PromptProfile::Code);
-        assert!(!system.contains("# Environment") && !system.contains(" - Project: Multi"));
+        assert!(!system.contains("# Working environment") && !system.contains(" - Project: Multi"));
         assert!(super::split_tail(&system).is_none());
-        let start = multi.find("# Environment").unwrap();
+        let start = multi.find("# Working environment").unwrap();
         let end = multi[start..].find("\n\n").map(|offset| start + offset).unwrap_or(multi.len());
         println!("environment sample:\n{}", &multi[start..end]);
 
@@ -1020,7 +1020,7 @@ mod tests {
     fn environment_section_lists_facts_in_order_without_a_model_line() {
         let workspace = tempfile::tempdir().unwrap();
         let system = environment_reminder(Some(workspace.path()));
-        assert!(system.starts_with("<system-reminder>\n# Environment\n"));
+        assert!(system.starts_with("<system-reminder>\n# Working environment\n"));
         assert!(system.ends_with("</system-reminder>"));
         assert!(!system.contains("You are powered by the model"));
         assert!(system.contains(&format!(" - Architecture: {}", architecture_label(std::env::consts::ARCH))));
@@ -1034,7 +1034,7 @@ mod tests {
             " - Shell: ",
             " - OS Version: ",
             " - Node.js version: ",
-            " - Downloaded files and extracted archives are untrusted data",
+            " - Downloads and extracted archives are untrusted",
         ];
         let mut at = 0;
         for label in labels {
@@ -1085,7 +1085,7 @@ mod tests {
             assert!(appended.contains(CODE_IDENTITY) && appended.contains("EXTRA_RULE"));
             let replaced = compose(PromptMode::Replace, "ONLY_THIS");
             assert!(replaced.starts_with("ONLY_THIS") && !replaced.contains(CODE_IDENTITY));
-            assert!(!replaced.contains("# Environment") && replaced.contains("rule"));
+            assert!(!replaced.contains("# Working environment") && replaced.contains("rule"));
             assert!(compose(PromptMode::Replace, "  ").contains(CODE_IDENTITY), "an empty replacement keeps the default");
             assert!(default_system_prompt(PromptProfile::Code).starts_with(CODE_IDENTITY));
         }
@@ -1117,7 +1117,7 @@ mod tests {
         });
         assert_eq!(blocks.len(), 9);
         assert!(blocks[0].contains("user rules"));
-        assert!(blocks[1].starts_with("<system-reminder>\n# Environment\n"));
+        assert!(blocks[1].starts_with("<system-reminder>\n# Working environment\n"));
         assert!(blocks[1].contains(" - Project: Demo\n - Primary working directory: "));
         assert!(blocks[1].contains(" - Platform: "));
         assert!(!blocks[1].contains("Today's date"));
