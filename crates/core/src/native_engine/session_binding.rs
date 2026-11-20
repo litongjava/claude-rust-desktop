@@ -126,8 +126,29 @@ impl BindingSnapshot {
 
 #[derive(Clone, Default)]
 pub struct SessionBinding {
-    state: Arc<RwLock<Option<Arc<BindingSnapshot>>>>,
+    state: Arc<std::sync::OnceLock<Arc<RwLock<Arc<BindingSnapshot>>>>>,
     authority: Arc<RwLock<Option<(std::sync::Weak<crate::db::DbManager>, String)>>>,
+}
+
+/// An open CLI session can only own an initialized handle. Both views share
+/// the same lock, including when the persistent worker replaces its snapshot.
+#[derive(Clone, Debug)]
+pub struct ActiveBinding {
+    handle: SessionBinding,
+    value: Arc<RwLock<Arc<BindingSnapshot>>>,
+}
+
+impl ActiveBinding {
+    pub fn snapshot(&self) -> Arc<BindingSnapshot> {
+        self.value.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl std::ops::Deref for ActiveBinding {
+    type Target = SessionBinding;
+    fn deref(&self) -> &SessionBinding {
+        &self.handle
+    }
 }
 
 impl std::fmt::Debug for SessionBinding {
@@ -174,7 +195,20 @@ impl SessionBinding {
     }
 
     pub fn read(&self) -> Option<Arc<BindingSnapshot>> {
-        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+        Some(
+            self.state
+                .get()?
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    pub fn initialized(&self) -> Result<ActiveBinding> {
+        Ok(ActiveBinding {
+            handle: self.clone(),
+            value: self.state.get().context("Missing session binding")?.clone(),
+        })
     }
 
     pub fn install(&self, next: BindingSnapshot) -> Result<()> {
@@ -207,23 +241,18 @@ impl SessionBinding {
             provider.lease = None;
         }
         next.active()?;
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let next = Arc::new(next);
+        let cell = self
+            .state
+            .get_or_init(|| Arc::new(RwLock::new(next.clone())));
+        let mut state = cell.write().unwrap_or_else(|e| e.into_inner());
         ensure!(
-            restoring
-                || state
-                    .as_ref()
-                    .is_none_or(|s| s.generation <= next.generation),
+            restoring || state.generation <= next.generation,
             "Provider binding changed; resume the current session before submitting"
         );
-        if !restoring
-            && next.generation != 0
-            && state
-                .as_ref()
-                .is_some_and(|old| old.generation == next.generation)
-        {
-            return Ok(());
+        if restoring || state.generation != next.generation || next.generation == 0 {
+            *state = next;
         }
-        *state = Some(Arc::new(next));
         Ok(())
     }
 }

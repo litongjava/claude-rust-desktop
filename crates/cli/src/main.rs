@@ -883,9 +883,16 @@ async fn run(cli: &mut Cli) -> Result<()> {
         None
     };
     cli.observed_generation = observed.as_ref().map(|row| row.generation);
-    if cli.binding_generation.is_some() && cli.binding_generation != cli.observed_generation {
-        cli.discard_transfer_binding();
+    if let Some(carried) = cli.binding_generation {
+        if Some(carried) != cli.observed_generation { eprintln!("Provider binding changed before relaunch; using the current binding."); }
         std::env::remove_var("API_BASE_URL");
+    }
+    let normal_frontend = match &resumed {
+        Some(saved) => deepseek_code_core::services::background_sessions::worker_directory(&paths.data_dir, &saved.id)?.is_none(),
+        None => true,
+    };
+    if cli.binding_generation.is_some() || (normal_frontend && cli.observes_binding(resumed.is_some())) {
+        cli.discard_binding_options();
     }
     let selection = config::select(
         cli,
@@ -959,6 +966,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
         resumed.as_ref().map(|s| s.id.as_str()),
     )
     .await?;
+    if normal_frontend && resumed.is_some() && session.startup_provider.is_none() {
+        // After observation or a rejected selection, raw startup options have no authority.
+        cli.discard_binding_options();
+    }
     if !startup_selected { session.startup_provider=None; }
     resource_sampling::session(&session.id);
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
@@ -1062,6 +1073,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if let Err(error) = remote.command("", &paths, &session, &mut input).await { command_eprintln!("Remote Control: {error:#}"); }
         }
         let mut last_config_error = String::new();
+        let mut reported_binding_failure = None;
         // Read-only view of a turn a direct print/json owner still executes.
         let mut execution_observer = observe::Observer::default();
         terminal::tips::start_session(&paths.data_dir);
@@ -1208,6 +1220,18 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
+                    if let Some((generation, requested, restored)) = binding_store::activation_failure(&session.store.db, &session.id)? {
+                        let notice = (session.id.clone(), generation);
+                        if reported_binding_failure.as_ref() != Some(&notice) {
+                            let reader = input.as_ref().expect("interactive reader");
+                            reader.notice(format!("Provider switch to {requested} did not apply: activation failed. Restored {restored}."));
+                            match session.refresh_binding().await {
+                                Ok(()) => reader.set_effort(Some(session_commands::model_label(&session).await)),
+                                Err(error) => reader.notice(format!("Could not refresh the restored binding: {error:#}")),
+                            }
+                            reported_binding_failure = Some(notice);
+                        }
+                    }
                     // While a resumed session is owned elsewhere, show the public
                     // text/tool progress that owner publishes. The observer never
                     // takes the lease, submits input or runs a tool.
@@ -1489,6 +1513,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if matches!(command, "/remote-control" | "/rc") {
                 if let Err(error) = remote.command(argument, &paths, &session, &mut input).await { command_eprintln!("Error: {error:#}"); }
                 if let Some(listening) = remote.take_handoff() {
+                    if let Err(error) = worker_binding::retain_for_transfer(&session).await {
+                        command_eprintln!("Handoff did not apply: {error:#}");
+                        continue;
+                    }
                     let launch = restart::resume(cli, &session)?;
                     // The session continues in a child dcl that local and remote terminals share.
                     drop(presence.take());
@@ -1553,8 +1581,8 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     command_eprintln!("Usage: /restart");
                     continue;
                 }
+                if let Err(error) = worker_binding::retain_for_transfer(&session).await { command_eprintln!("Relaunch did not apply: {error:#}"); continue; }
                 let launch = restart::resume(cli, &session)?;
-                session_trust::quit_worker(&session.paths, &session.id).await?;
                 restart_launch = Some(launch);
                 break;
             }

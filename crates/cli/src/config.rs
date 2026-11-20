@@ -45,16 +45,7 @@ impl StartupProvider {
         cli.max_tokens = self.max_tokens;
     }
 
-    pub fn transfer_arguments(&self, provider: &Provider) -> Vec<String> {
-        let mut args = Vec::new();
-        if self.base_url { args.extend(["--base-url".into(), provider.base_url.clone()]); }
-        if self.api_format { args.extend(["--api-format".into(), match provider.api_format { ApiFormat::OpenAI => "openai", ApiFormat::Anthropic => "anthropic" }.into()]); }
-        if self.bound_builtin {
-            if let Some(id) = &provider.builtin_id { args.extend(["--bound-builtin".into(), id.clone()]); }
-        }
-        if let Some(name) = &self.api_key_env { args.extend(["--api-key-env".into(), name.clone()]); }
-        args
-    }
+
 }
 
 pub struct Selection {
@@ -423,11 +414,12 @@ pub fn select(
         }
     }
     ensure!(!p.api_key.trim().is_empty() || matches!(p.builtin_id.as_deref(),Some("amazon-bedrock"|"google-vertex")), "No API key configured; set {key_env}, use --api-key-env, or configure a provider in Desktop");
-    if let Some(limit) = cli.max_tokens {
+    if cli.max_tokens.is_some() || cli.effort.is_some() {
         p.models
             .iter_mut()
             .filter(|m| m.id == model || (!exact && Some(m.id.as_str())==deepseek_code_core::native_engine::provider_manager::one_million_context_base(&model)))
-            .for_each(|m| m.max_tokens = Some(limit));
+            .for_each(|m| { if let Some(limit) = cli.max_tokens { m.max_tokens = Some(limit); }
+                if let Some(effort) = &cli.effort { m.effort = Some(effort.clone()); } });
     }
     let provider_id = p.id.clone();
     Ok(Selection {

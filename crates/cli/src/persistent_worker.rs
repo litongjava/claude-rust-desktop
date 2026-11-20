@@ -266,9 +266,9 @@ pub async fn run_from_env() -> Result<bool> {
                             let _=service::reply(stream,&response).await;
                         },
                         Request::SetBinding { binding: state } => {
+                            let changed = binding.read().is_none_or(|current| current.generation != state.generation);
                             let result = RuntimePaths::new(worker.root.clone()).and_then(|paths| crate::worker_binding::validate_worker_snapshot(&paths, &worker.session_id, &state)).and_then(|()| binding.install(state));
-                            if result.is_ok() {
-                                let state = binding.read().expect("installed binding");
+                            if let Some(state) = binding.read().filter(|_| changed && result.is_ok()) {
                                 crate::worker_binding::install_public(&state);
                                 // Pending autonomous work requires an explicit admission
                                 // with the new turn options.

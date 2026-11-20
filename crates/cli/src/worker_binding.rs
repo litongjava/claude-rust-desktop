@@ -157,15 +157,17 @@ pub async fn observe(
         local.generation = row.generation;
         return Ok(local);
     }
-    local.generation = row.generation;
-    if local.provider_id == row.provider && local.model == row.model {
-        if row.restore_options(&mut local).is_ok() && matches_revision(&row, &local)? {
-            local.observation_only = false;
-            return Ok(local);
-        }
-    }
     if let Some(state) = resident(paths, id, &row).await? {
         return Ok(state);
+    }
+    local.generation = row.generation;
+    if local.provider_id == row.provider
+        && local.model == row.model
+        && row.restore_options(&mut local).is_ok()
+        && matches_revision(&row, &local)?
+    {
+        local.observation_only = false;
+        return Ok(local);
     }
     if let Ok(selection) = crate::interactive_config::select(paths, &row.provider, &row.model) {
         let mut saved = snapshot(paths, selection, false)?;
@@ -219,10 +221,50 @@ fn matches_revision(row: &Observed, state: &BindingSnapshot) -> Result<bool> {
     Ok(state.generation == row.generation
         && state.provider_id == row.provider
         && state.model == row.model
-        && match &row.digest {
-            Some(digest) => *digest == binding_store::fingerprint(state)?,
-            None => true,
-        })
+        && row.matches(state)?)
+}
+
+/// Keep a launch-only snapshot reachable across exec through the user's worker
+/// socket. A stale frontend transfers only its identity and observed generation.
+pub async fn retain_for_transfer(session: &crate::session::Session) -> Result<()> {
+    let state = session.binding_state();
+    let row = binding_store::observe(&session.store.db, &session.id)?;
+    if row.pending.is_some() || state.observation_only || !matches_revision(&row, &state)? {
+        return Ok(());
+    }
+    if resident(&session.paths, &session.id, &row).await?.is_some() {
+        return Ok(());
+    }
+    // A legacy worker may still own an admitted turn. Leave it alone.
+    if let Some(worker) = session_worker::current(&session.paths.data_dir, &session.id)? {
+        if worker.status != "stopped"
+            && session_worker::call(&worker, &Request::Ping)
+                .await
+                .is_ok_and(|reply| reply.generation_supported != Some(true))
+        {
+            return Ok(());
+        }
+    }
+    let worker = session_worker::ensure_worker(
+        &session.paths.data_dir,
+        &std::env::current_exe()?,
+        &session.id,
+        &session.workspace,
+    )
+    .await?;
+    if let Err(error) = session_worker::call(
+        &worker,
+        &Request::SetBinding {
+            binding: (*state).clone(),
+        },
+    )
+    .await
+    {
+        if binding_store::observe(&session.store.db, &session.id)?.generation == row.generation {
+            return Err(error.context("Cannot transfer the private session binding"));
+        }
+    }
+    Ok(())
 }
 
 /// Commit the selector and its version together. A failed selector update rolls both back.
@@ -282,7 +324,9 @@ pub async fn commit(
                     let db = db.clone();
                     let generation = state.generation;
                     tokio::spawn(async move {
-                        let _ = retire_worker(&db, &worker, generation).await;
+                        if let Err(error) = retire_worker(&db, &worker, generation).await {
+                            eprintln!("Provider activation failed: {error:#}");
+                        }
                     });
                 }
             }

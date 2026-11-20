@@ -18,6 +18,8 @@ pub fn schema(c: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS cli_binding_generations(
         session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, pending TEXT, legacy_pid INTEGER,
         target_provider TEXT, target_model TEXT);
+        CREATE TABLE IF NOT EXISTS cli_binding_failures(
+        session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, requested TEXT NOT NULL, restored TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cli_binding_revisions(
         session_id TEXT NOT NULL, generation INTEGER NOT NULL, previous INTEGER NOT NULL,
         digest TEXT NOT NULL, options TEXT NOT NULL, PRIMARY KEY(session_id,generation));",
@@ -55,13 +57,22 @@ pub fn observe(db: &DbManager, id: &str) -> Result<Observed> {
     })?
 }
 
-pub fn fingerprint(state: &BindingSnapshot) -> Result<String> {
-    let mut value = serde_json::to_value(state)?;
-    value
-        .as_object_mut()
-        .context("Invalid binding")?
-        .remove("generation");
-    let bytes = serde_json::to_vec(&value)?;
+/// Store selector IDs only. Every attached terminal (including a reconnect)
+/// can report the outcome, even after the retirement helper has exited.
+pub fn activation_failure(db: &DbManager, id: &str) -> Result<Option<(u64, String, String)>> {
+    use rusqlite::OptionalExtension;
+    Ok(db.with_conn(|c| {
+        c.query_row(
+            "SELECT generation,requested,restored FROM cli_binding_failures WHERE session_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+    })??)
+}
+
+fn digest(value: &serde_json::Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
     Ok(ring::digest::digest(&ring::digest::SHA256, &bytes)
         .as_ref()
         .iter()
@@ -69,7 +80,40 @@ pub fn fingerprint(state: &BindingSnapshot) -> Result<String> {
         .collect())
 }
 
+fn binding_value(state: &BindingSnapshot) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(state)?;
+    value
+        .as_object_mut()
+        .context("Invalid binding")?
+        .remove("generation");
+    Ok(value)
+}
+
+pub fn fingerprint(state: &BindingSnapshot) -> Result<String> {
+    let mut value = binding_value(state)?;
+    let catalog = value["providers"]
+        .as_array_mut()
+        .context("Missing provider catalog")?;
+    // Provider identity is the stable ID. Presentation labels are not transport inputs.
+    catalog.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    for provider in catalog {
+        provider
+            .as_object_mut()
+            .context("Invalid provider")?
+            .remove("name");
+    }
+    Ok(format!("v2:{}", digest(&value)?))
+}
+
 impl Observed {
+    pub fn matches(&self, state: &BindingSnapshot) -> Result<bool> {
+        Ok(match self.digest.as_deref() {
+            None => true,
+            Some(saved) if saved.starts_with("v2:") => saved == fingerprint(state)?,
+            Some(saved) => saved == digest(&binding_value(state)?)?,
+        })
+    }
+
     pub fn restore_options(&self, state: &mut BindingSnapshot) -> Result<()> {
         if let Some(options) = &self.options {
             let (saved, effort): (
@@ -104,8 +148,20 @@ pub fn publish(
     legacy: Option<(&str, Option<u32>)>,
 ) -> Result<Write> {
     let tx = crate::db::write_transaction(c)?;
-    schema(&tx)?;
-    let current = read(&tx, id)?;
+    let result = publish_in(&tx, id, expected, state, legacy)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn publish_in(
+    tx: &Connection,
+    id: &str,
+    expected: u64,
+    state: &BindingSnapshot,
+    legacy: Option<(&str, Option<u32>)>,
+) -> Result<Write> {
+    schema(tx)?;
+    let current = read(tx, id)?;
     if current.generation != expected {
         return Ok(Write::Conflict);
     }
@@ -114,7 +170,8 @@ pub fn publish(
         "Unavailable credentials cannot be published as a new binding"
     );
     let digest = fingerprint(state)?;
-    if current.digest.as_ref() == Some(&digest)
+    if current.digest.is_some()
+        && current.matches(state)?
         && current.provider == state.provider_id
         && current.model == state.model
     {
@@ -164,14 +221,33 @@ pub fn publish(
     // A failed reservation remains the high-water mark until the next publish.
     tx.execute("DELETE FROM cli_binding_revisions WHERE session_id=?1 AND generation<?2 AND generation!=?3",
         (id,next,if legacy.is_some(){expected}else{next}))?;
-    tx.commit()?;
+    tx.execute("DELETE FROM cli_binding_failures WHERE session_id=?1", [id])?;
     Ok(Write::Published(next))
+}
+
+/// Called inside the same transaction which allocates the cleared conversation.
+pub fn publish_clear(
+    tx: &Connection,
+    source: &str,
+    child: &str,
+    state: &BindingSnapshot,
+) -> Result<u64> {
+    let parent = read(tx, source)?;
+    anyhow::ensure!(
+        parent.generation == state.generation && parent.pending.is_none(),
+        "Clear did not apply: the source binding changed or is pending. Retry the command."
+    );
+    match publish_in(tx, child, 0, state, None)? {
+        Write::Published(generation) => Ok(generation),
+        _ => anyhow::bail!("Clear did not apply: the new session binding changed"),
+    }
 }
 
 /// The worker incarnation and generation must both match the reservation.
 /// On activation failure undo its selector write and restore the previous generation
 /// with a conditional compensating transaction before returning the original error.
 pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result<()> {
+    schema(c)?;
     let attempt = (|| -> Result<()> {
         let tx = crate::db::write_transaction(c)?;
         let owns: bool = tx.query_row(
@@ -205,6 +281,10 @@ pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result
         // Also handles RAISE(ROLLBACK) and commit failures. The first transaction
         // is gone; a newer reservation cannot be touched by this compensation.
         let tx = crate::db::write_transaction(c)?;
+        tx.execute("INSERT OR REPLACE INTO cli_binding_failures(session_id,generation,requested,restored)
+            SELECT g.session_id,g.generation,g.target_provider||'::'||g.target_model,COALESCE(c.provider||'::'||c.model,'previous session default')
+            FROM cli_binding_generations g JOIN conversations c ON c.id=g.session_id
+            WHERE g.session_id=?1 AND g.pending=?2 AND g.generation=?3", (id, worker, expected))?;
         tx.execute("UPDATE cli_binding_generations AS g SET generation=COALESCE(
             (SELECT previous FROM cli_binding_revisions r WHERE r.session_id=g.session_id AND r.generation=g.generation),MAX(g.generation-1,0)),
             pending=NULL,legacy_pid=NULL,(target_provider,target_model)=(SELECT provider,model FROM conversations WHERE id=?1)
@@ -247,6 +327,25 @@ mod tests {
             }))
             .unwrap()],
         }
+    }
+
+    #[test]
+    fn revision_matches_stable_provider_ids_and_rejects_a_changed_key() {
+        let c = database();
+        let mut a = snapshot("a");
+        a.providers.extend(snapshot("b").providers);
+        publish(&c, "session", 0, &a, None).unwrap();
+        let row = read(&c, "session").unwrap();
+        let old_digest = digest(&binding_value(&a).unwrap()).unwrap();
+        let mut previous_format = read(&c, "session").unwrap();
+        previous_format.digest = Some(old_digest);
+        assert!(previous_format.matches(&a).unwrap());
+        a.providers.reverse();
+        a.providers[0].name = "New label".into();
+        assert!(row.matches(&a).unwrap());
+        a.providers[1].api_key = "other-fixture-key".into();
+        assert!(!row.matches(&a).unwrap());
+        assert!(!previous_format.matches(&a).unwrap());
     }
 
     #[test]

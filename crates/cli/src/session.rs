@@ -56,7 +56,7 @@ fn settle_abandoned_turns(
 }
 
 pub struct Session {
-    pub(crate) binding: deepseek_code_core::native_engine::session_binding::SessionBinding,
+    pub(crate) binding: deepseek_code_core::native_engine::session_binding::ActiveBinding,
     /// Restored sessions wait for explicit input before allowing idle model work.
     waiting_for_continue: std::sync::atomic::AtomicBool,
     /// Runtime-only options of the latest worker turn, retained for internal wakes.
@@ -462,17 +462,24 @@ impl Session {
         self.startup_provider.as_ref().is_some_and(|startup| startup.id == self.binding_state().provider_id)
     }
 
+    /// Only the frontend that admitted these launch arguments may apply their
+    /// per-request overrides. Worker turn arguments already belong to a validated admission.
+    pub(crate) fn admitted_launch_options<'a>(&self, cli: &'a Cli) -> Option<&'a Cli> {
+        (self.owns_startup_transport() ||
+            self.coordination_mode == crate::local_coordination::RegistrationMode::HostOwned).then_some(cli)
+    }
+
     pub(crate) async fn use_worker_binding(&mut self, binding: &deepseek_code_core::native_engine::session_binding::SessionBinding) -> Result<()> {
         let state = binding.read().context("Missing worker binding")?;
         binding.track(&self.store.db, &self.id);
-        self.binding = binding.clone();
+        self.binding = binding.initialized()?;
         self.providers.lock().await.binding = binding.clone();
         self.engine.invalidate_child_bindings(&*self.providers.lock().await, Some((&self.id, &state.active()?)));
         Ok(())
     }
 
     pub(crate) fn binding_state(&self) -> Arc<deepseek_code_core::native_engine::session_binding::BindingSnapshot> {
-        self.binding.read().expect("an open session has a provider binding")
+        self.binding.snapshot()
     }
 
     pub async fn selected_provider(
@@ -520,8 +527,8 @@ impl Session {
         )
         .await?
         {
-            self.binding.restore(next)?;
             self.startup_provider = None;
+            self.binding.restore(next).context("Provider change did not apply; the binding changed again during refresh")?;
             anyhow::bail!("Provider binding changed or is pending; refreshed the current selection. Retry the command.");
         }
         self.binding.install(next)
@@ -831,9 +838,11 @@ impl Session {
                         "One-shot admission no longer owns this binding"
                     );
                 } else if mode == crate::local_coordination::RegistrationMode::Automatic {
-                    if resumed_id.is_some() && !cli.fork_session && !cli.changes_binding() {
-                        snapshot =
-                            crate::worker_binding::observe(paths, &store.db, &id, snapshot).await?;
+                    if cli.observes_binding(resumed_id.is_some()) {
+                        snapshot = crate::worker_binding::observe(paths, &store.db, &id, snapshot).await?;
+                        if cli.binding_generation.is_some_and(|generation| generation != snapshot.generation) {
+                            eprintln!("Session binding changed before admission; using the current binding.");
+                        }
                     } else {
                         let expected = if resumed_id.is_some() && !cli.fork_session {
                             cli.observed_generation.unwrap_or(0)
@@ -850,7 +859,7 @@ impl Session {
                         .await?;
                         if !took_launch_selection {
                             eprintln!(
-                                "Session binding changed before admission; using the current binding."
+                                "Session binding changed before admission; using the current binding. The requested change did not apply (stale generation or pending switch)."
                             );
                         }
                     }
@@ -891,7 +900,8 @@ impl Session {
         )));
         // Registration is a separate step: it waits until startup options chose
         // the final workspace, so a failed startup publishes no incarnation.
-        let startup_provider=took_launch_selection.then(|| crate::config::StartupProvider::new(&binding.read().expect("installed selection").provider_id,cli));
+        let binding = binding.initialized()?;
+        let startup_provider=took_launch_selection.then(|| crate::config::StartupProvider::new(&binding.snapshot().provider_id,cli));
         Ok(Self {
             waiting_for_continue: std::sync::atomic::AtomicBool::new(resumed_id.is_some()),
             binding,
@@ -1044,8 +1054,7 @@ impl Session {
 
     pub async fn clear(&mut self) -> Result<String> {
         self.refresh_binding().await?;
-        let id = self.store.clear(&self.id)?;
-        crate::session_commands::copy_settings(&self.store.db, &self.id, &id)?;
+        let id = uuid::Uuid::new_v4().to_string();
         // Everything fallible runs before the commit: the target hooks are
         // preflighted while the old conversation still owns the lifecycle.
         let prepared = if self.lifecycle_owned {
@@ -1055,7 +1064,10 @@ impl Session {
         };
         // Read under the old id, before the commit below.
         let mut state = (*self.binding.read().context("Missing session binding")?).clone();
-        anyhow::ensure!(crate::worker_binding::commit(&self.paths.data_dir,&self.store.db,&id,0,&mut state).await?, "New session binding changed");
+        self.store.clear_with(&self.id, id.clone(), |tx, child| {
+            state.generation = crate::binding_store::publish_clear(tx, &self.id, child, &state)?;
+            crate::session_commands::copy_settings_in(tx, &self.id, child)
+        }).context("Clear did not apply")?;
         let target = deepseek_code_core::native_engine::session_binding::SessionBinding::default();
         target.track(&self.store.db, &id);
         target.install(state)?;
@@ -1067,8 +1079,8 @@ impl Session {
                 .db
                 .set_request_recording_policy(&id, policy.cli, policy.full_access);
         }
-        self.binding = target;
-        self.providers.lock().await.binding = self.binding.clone();
+        self.binding = target.initialized()?;
+        self.providers.lock().await.binding = target;
         self.id = id.clone();
         self.waiting_for_continue
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1077,6 +1089,13 @@ impl Session {
             self.finish_committed_start_hooks("clear").await;
         }
         Ok(id)
+    }
+
+    fn prepare_resumed_binding(&self, id: &str, state: deepseek_code_core::native_engine::session_binding::BindingSnapshot) -> Result<deepseek_code_core::native_engine::session_binding::ActiveBinding> {
+        let target = if self.id == id { (*self.binding).clone() } else { Default::default() };
+        target.track(&self.store.db, id);
+        target.restore(state)?;
+        target.initialized()
     }
 
     /// Validate the project and provider before replacing the current session.
@@ -1091,17 +1110,21 @@ impl Session {
             .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
         let model = saved.model.context("Saved session has no model")?;
         let provider_id = saved.provider.context("Saved session has no provider")?;
-        let next = if provider_id != self.binding_state().provider_id || (id != self.id && self.has_saved_providers) {
-            let current = self.selected_provider().await?;
-            let selected = crate::interactive_config::select_saved(paths, &provider_id, &model, self.startup_provider.as_ref().map(|owner| (owner, &current.provider)))
-                .context("Saved provider/model is unavailable; current session retained")?;
-            Some(ProviderManager::in_memory(selected.providers, paths.data_dir.join("providers.json")))
-        } else { None };
+        let row = crate::binding_store::observe(&self.store.db, id)?;
         let changing_provider = provider_id != self.binding_state().provider_id;
-        let resolved = {
-            let manager = self.providers.lock().await;
-            next.as_ref().unwrap_or(&manager).resolve_selected(&provider_id, &model)
-                .context("Saved provider/model is unavailable; current session retained")?
+        let reload_catalog = changing_provider || (id != self.id && self.has_saved_providers);
+        let candidate = if let Some(live) = crate::worker_binding::resident(paths, id, &row).await? {
+            live
+        } else {
+            let selected = if reload_catalog {
+                let current = self.selected_provider().await?;
+                crate::interactive_config::select_saved(paths, &provider_id, &model,
+                    self.startup_provider.as_ref().map(|owner| (owner, &current.provider)))
+                    .context("Saved provider/model is unavailable; current session retained")?
+            } else {
+                Selection { providers: self.binding_state().providers.clone(), provider_id, model }
+            };
+            crate::worker_binding::snapshot(paths, selected, self.owns_startup_transport() && !changing_provider)?
         };
         let lifecycle_owned = self.lifecycle_owned;
         // As in the reference CLI, the resumed conversation keeps the mode in use.
@@ -1114,32 +1137,32 @@ impl Session {
         } else {
             None
         };
-        deepseek_code_core::services::session_permission_mode::set(
-            &self.store.db,
-            id,
-            &self.permissions,
-            mode,
-        )?;
-        let providers = match &next {
-            Some(manager) => manager.list_providers().into_owned(),
-            None => self.providers.lock().await.list_providers().into_owned(),
-        };
-        let mut state = crate::worker_binding::snapshot(paths, Selection { providers, provider_id: provider_id.clone(), model: model.clone() }, self.owns_startup_transport() && provider_id == self.binding_state().provider_id)?;
-        state=crate::worker_binding::observe(paths,&self.store.db,id,state).await?;
         let policy = self.store.db.request_recording_policy(&self.id);
+        // SessionEnd can wait on a hook while another frontend changes the target.
+        // Validate a separate populated handle before changing any live reference.
         self.end_hooks("other").await;
+        let admission = async {
+            let state = crate::worker_binding::observe(paths, &self.store.db, id, candidate).await?;
+            let resolved = state.active()?;
+            let target = self.prepare_resumed_binding(id, state)?;
+            deepseek_code_core::services::session_permission_mode::set(
+                &self.store.db, id, &self.permissions, mode,
+            )?;
+            Ok::<_, anyhow::Error>((resolved, target))
+        }.await;
+        let (resolved, target) = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if lifecycle_owned { self.finish_committed_start_hooks("resume").await; }
+                return Err(error.context("Resume did not apply; current session retained"));
+            }
+        };
         {
             let mut manager = self.providers.lock().await;
-            if self.id != id {
-                self.binding = Default::default();
-                self.binding.track(&self.store.db, id);
-                manager.binding = self.binding.clone();
-            }
-            self.binding.restore(state)?;
-            if next.is_some() {
-                self.has_saved_providers = true;
-                if changing_provider { self.startup_provider = None; }
-            }
+            manager.binding = (*target).clone();
+            self.binding = target;
+            self.has_saved_providers |= reload_catalog;
+            if changing_provider || self.id != id { self.startup_provider = None; }
             self.engine.invalidate_child_bindings(&manager, Some((id, &resolved)));
         }
         self.workspace = workspace;
@@ -2066,9 +2089,9 @@ impl Session {
             } else {
                 Some(self.binding_state().provider_id.clone())
             },
-            effort: crate::session_commands::effective_effort(self, cli.effort.as_deref())?,
+            effort: crate::session_commands::effective_effort(self, self.admitted_launch_options(cli).and_then(|args| args.effort.as_deref()))?,
             system_prompt: Some(system),
-            max_tokens: cli.max_tokens,
+            max_tokens: self.admitted_launch_options(cli).and_then(|args| args.max_tokens),
             max_turns: cli.max_turns.map(|limit| {
                 turn_goal.as_ref().map_or(limit, |g| {
                     limit
@@ -5177,3 +5200,7 @@ mod request_usage_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "session_binding_tests.rs"]
+mod binding_tests;

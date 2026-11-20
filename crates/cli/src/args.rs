@@ -238,9 +238,11 @@ impl Cli {
         Ok(cli)
     }
     pub(crate) fn changes_binding(&self) -> bool {
-        self.launch_options
-            .iter()
-            .any(|(id, _)| id != "binding_generation" && Self::binding_option(id))
+        self.binding_generation.is_none() && self.launch_options.iter().any(|(id, _)| matches!(id.as_str(), "provider" | "model"))
+    }
+
+    pub(crate) fn observes_binding(&self, resumed: bool) -> bool {
+        resumed && !self.fork_session && !self.changes_binding()
     }
 
     fn binding_option(id: &str) -> bool {
@@ -258,7 +260,7 @@ impl Cli {
         )
     }
 
-    pub(crate) fn discard_transfer_binding(&mut self) {
+    pub(crate) fn discard_binding_options(&mut self) {
         self.model = None;
         self.provider = None;
         self.base_url = None;
@@ -267,7 +269,6 @@ impl Cli {
         self.max_tokens = None;
         self.effort = None;
         self.bound_builtin = None;
-        self.binding_generation = None;
         self.launch_options
             .retain(|(id, _)| !Self::binding_option(id));
     }

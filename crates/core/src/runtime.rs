@@ -362,15 +362,21 @@ impl SessionStore {
     /// Copy bindings atomically so agent restrictions and worktrees survive clear.
     pub fn clear(&self, id: &str) -> Result<String> {
         self.resume(id)?;
-        self.derive_empty(id, None)
+        self.derive_empty(id, None, uuid::Uuid::new_v4().to_string(), |_, _| Ok(()))
     }
 
     /// Derive a child without converting Desktop modes/private folders into Code projects.
     pub fn derive_owned_child(&self, id: &str, workspaces_root: &Path, expected_cwd: &Path) -> Result<String> {
-        self.derive_empty(id, Some((workspaces_root, expected_cwd)))
+        self.derive_empty(id, Some((workspaces_root, expected_cwd)), uuid::Uuid::new_v4().to_string(), |_, _| Ok(()))
     }
 
-    fn derive_empty(&self, id: &str, owned: Option<(&Path, &Path)>) -> Result<String> {
+    pub fn clear_with(&self, id: &str, new_id: String, initialize: impl FnOnce(&rusqlite::Connection, &str) -> Result<()>) -> Result<String> {
+        self.resume(id)?;
+        self.derive_empty(id, None, new_id, initialize)
+    }
+
+    fn derive_empty(&self, id: &str, owned: Option<(&Path, &Path)>, new_id: String,
+        initialize: impl FnOnce(&rusqlite::Connection, &str) -> Result<()>) -> Result<String> {
         self.db.with_conn(|conn| -> Result<String> {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let source = conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
@@ -380,7 +386,6 @@ impl SessionStore {
                 let actual = crate::native_engine::workspace::resolve_workspace(&tx, root, id, None)?.0;
                 ensure!(actual.canonicalize()? == expected.canonicalize()?, "Parent runtime workspace differs from its persisted binding");
             }
-            let new_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             conversation_repo::insert_conversation(
                 &tx, &new_id, Some("CLI session"), source.model.as_deref(),
@@ -409,6 +414,7 @@ impl SessionStore {
                 ensure!(actual.canonicalize()? == expected.canonicalize()?, "Child workspace differs from its parent binding");
             }
             if owned.is_some() { crate::services::permission_authority::inherit_conn(&tx, id, &new_id)?; }
+            initialize(&tx, &new_id)?;
             tx.commit()?;
             Ok(new_id)
         })?

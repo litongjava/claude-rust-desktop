@@ -90,11 +90,11 @@ async fn launch(
             provider.provider.api_key.clone(),
         ));
     }
-    if let Some(effort) = crate::session_commands::effective_effort(session, cli.effort.as_deref())?
+    if let Some(effort) = crate::session_commands::effective_effort(session, session.admitted_launch_options(cli).and_then(|args| args.effort.as_deref()).or(provider.model.effort.as_deref()))?
     {
         arguments.extend(["--effort".into(), effort]);
     }
-    if let Some(limit) = cli.max_tokens.or(provider.model.max_tokens) {
+    if let Some(limit) = session.admitted_launch_options(cli).and_then(|args| args.max_tokens).or(provider.model.max_tokens) {
         arguments.extend(["--max-tokens".into(), limit.to_string()]);
     }
     for rule in &cli.disallowed_tools {

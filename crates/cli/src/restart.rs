@@ -40,7 +40,7 @@ pub fn fresh(cli: &Cli, data_dir: &Path, workspace: &Path) -> Launch {
 pub fn resume(cli: &Cli, session: &Session) -> Result<Launch> {
     // Use the active session for identity, model and permissions. Replaying
     // the original startup mutations would overwrite changes made in the REPL.
-    let mut omit = vec![
+    let omit = [
         "path",
         "data_dir",
         "coordination_dir",
@@ -57,47 +57,20 @@ pub fn resume(cli: &Cli, session: &Session) -> Result<Launch> {
         "maintenance",
         "auto_route",
         "binding_generation",
+        "effort",
+        "max_tokens",
+        "base_url",
+        "api_format",
+        "api_key_env",
+        "bound_builtin",
         "model",
         "provider",
         "permission_mode",
         "dangerously_skip_permissions",
         "full_access",
     ];
-    // A provider reselected from disk has discarded all startup transport
-    // overrides. An in-memory resume may also select a different provider.
     let state = session.binding_state();
-    let durable = crate::binding_store::observe(&session.store.db, &session.id)?;
-    let current = state.generation == durable.generation
-        && durable.pending.is_none()
-        && !state.observation_only;
-    let inherit_api_base_url = current && session.owns_startup_transport();
-    omit.extend(["base_url", "api_format", "api_key_env", "bound_builtin"]);
-    if !current {
-        omit.extend(["effort", "max_tokens"]);
-    }
     let mut arguments = cli.launch_options(&omit);
-    if current {
-        if let Some(owner) = session
-            .startup_provider
-            .as_ref()
-            .filter(|s| s.id == state.provider_id)
-        {
-            if let Some(provider) = state.providers.iter().find(|p| p.id == state.provider_id) {
-                arguments.extend(
-                    owner
-                        .transfer_arguments(provider)
-                        .into_iter()
-                        .map(std::ffi::OsString::from),
-                );
-            }
-        }
-        arguments.extend([
-            "--provider".into(),
-            state.provider_id.as_str().into(),
-            "--model".into(),
-            state.model.as_str().into(),
-        ]);
-    }
     workspace_args(
         &mut arguments,
         &session.paths.data_dir,
@@ -120,7 +93,7 @@ pub fn resume(cli: &Cli, session: &Session) -> Result<Launch> {
     }
     Ok(Launch {
         arguments,
-        inherit_api_base_url,
+        inherit_api_base_url: false,
         resume_terminal: true,
     })
 }
@@ -224,7 +197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_keeps_only_the_active_providers_launch_overrides() {
+    async fn replacement_transfers_identity_and_generation_without_binding_arguments() {
         use crate::config::Selection;
         use deepseek_code_core::runtime::RuntimePaths;
         use serde_json::json;
@@ -264,9 +237,12 @@ mod tests {
         };
 
         let kept = inspect(resume(&cli, &session).unwrap());
-        assert_eq!(kept.api_key_env.as_deref(), Some("FIXTURE_KEY"));
-        assert_eq!(kept.base_url, cli.base_url);
-        assert_eq!(kept.api_format, cli.api_format);
+        assert!(kept.api_key_env.is_none() && kept.base_url.is_none() && kept.api_format.is_none());
+        assert!(kept.model.is_none() && kept.provider.is_none() && kept.max_tokens.is_none());
+        assert_eq!(
+            kept.binding_generation,
+            Some(session.binding_state().generation)
+        );
 
         // An explicit provider/model switch reloads even the same provider from disk.
         session.switch(&paths, selection()).await.unwrap();

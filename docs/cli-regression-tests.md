@@ -1524,3 +1524,7 @@ cargo test --locked -p deepseek-code-core --lib tools::external_agents
 
 - 运行 core 单元测试 `session_binding::store::tests`。检查过期写入被拒绝、相同有效配置不推进代际、只读恢复保留正在退役的 Worker 预约，以及激活失败后原配置仍可用且失败代际永不复用。
 - 开发记录 `launch-binding-20261119/round6/review04.sh` 覆盖过期终端的重启和远程交接、fast 模式、第三个观察终端、旧 Worker 激活故障以及无变更时的空闲唤醒。核对回环端点、模型、测试密钥和 SQLite 状态。配合 `review03.sh`、`lifecycle.sh` 和原版 `cli_creates_spawns_and_disbands_a_team_standalone` 检查进程边界、11 个生命周期场景和成员的首条任务消息。
+
+#### I4. Read-only relaunch and rejected binding changes
+
+Run `cargo test --locked -p deepseek-code-cli --bin dcl -- session::binding_tests restart::tests` and the core `session_binding::store::tests` selection. Cover a previous-version relaunch with explicit arguments, a late token-cap race, a rejected clear and a concurrent interactive resume. Replay the six review-05 findings with the records' Round 8 probes. Check the actual private endpoint, key and token cap after restart and handoff, including a third observer. Verify that two rejected clears leave the original conversation alone and that the requesting terminal displays the failed activation and restored selector before another submission.

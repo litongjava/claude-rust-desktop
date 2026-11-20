@@ -945,12 +945,12 @@ pub(crate) fn turn_arguments(
     {
         args.push("--record-requests".into());
     }
-    if let Some(value) = cli.effort.as_ref().or(provider.model.effort.as_ref()) {
+    if let Some(value) = session.admitted_launch_options(cli).and_then(|args| args.effort.as_ref()).or(provider.model.effort.as_ref()) {
         args.extend(["--effort".into(), value.clone()]);
     }
     // The snapshot already carries the selected model's budget. An explicit
     // request cap is separate and still applies to an auto-routed request.
-    if let Some(value) = cli.max_tokens {
+    if let Some(value) = session.admitted_launch_options(cli).and_then(|args| args.max_tokens) {
         args.extend(["--max-tokens".into(), value.to_string()]);
     }
     if let Some(value) = cli.max_turns {

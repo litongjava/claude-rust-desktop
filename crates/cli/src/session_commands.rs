@@ -59,23 +59,29 @@ enum GoalStatus {
 }
 
 fn load(db: &DbManager, id: &str) -> Result<Settings> {
-    db.with_conn(|conn| -> Result<Settings> {
-        let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = statement.query([format!("cli.session.{id}")])?;
-        Ok(match rows.next()? {
-            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
-            None => Settings::default(),
-        })
-    })?
+    db.with_conn(|conn| load_in(conn, id))?
+}
+
+fn load_in(conn: &rusqlite::Connection, id: &str) -> Result<Settings> {
+    let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
+    let mut rows = statement.query([format!("cli.session.{id}")])?;
+    Ok(match rows.next()? {
+        Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
+        None => Settings::default(),
+    })
 }
 
 fn save(db: &DbManager, id: &str, settings: &Settings) -> Result<()> {
+    db.with_conn(|conn| save_in(conn, id, settings))?
+}
+
+fn save_in(conn: &rusqlite::Connection, id: &str, settings: &Settings) -> Result<()> {
     let key = format!("cli.session.{id}");
     let value = serde_json::to_string(settings)?;
-    db.with_conn(|conn| conn.execute(
+    conn.execute(
         "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [&key, &value],
-    ))??;
+    )?;
     Ok(())
 }
 
@@ -131,17 +137,16 @@ pub fn live_requests(session: &Session) -> Result<Vec<Value>> {
 
 /// Copy only behavioral settings, retaining independent state after branching.
 pub fn copy_settings(db: &DbManager, from: &str, to: &str) -> Result<()> {
-    save(db, to, &load(db, from)?)?;
-    for prefix in [
-        "cli.display",
-        "cli.permissions",
-        "cli.permission-mode",
-        "cli.ide",
-    ] {
-        db.with_conn(|conn| conn.execute(
+    db.with_conn(|conn| copy_settings_in(conn, from, to))?
+}
+
+pub(crate) fn copy_settings_in(conn: &rusqlite::Connection, from: &str, to: &str) -> Result<()> {
+    save_in(conn, to, &load_in(conn, from)?)?;
+    for prefix in ["cli.display", "cli.permissions", "cli.permission-mode", "cli.ide"] {
+        conn.execute(
             "INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [format!("{prefix}.{to}"), format!("{prefix}.{from}")],
-        ))??;
+        )?;
     }
     Ok(())
 }
