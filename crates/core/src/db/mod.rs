@@ -76,6 +76,11 @@ pub fn write_boundary_context(
 const WRITE_TX_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(20);
 const WRITE_TX_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// Startup writes may legitimately wait for another process that is finishing a
+/// turn, so they use the same generous bound as session writes.
+pub const STARTUP_WRITE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// Exponential backoff plus up to 25% jitter, derived from the attempt and the
 /// calling thread so concurrent writers do not retry in lockstep.
 fn write_tx_backoff(attempts: u32) -> std::time::Duration {
@@ -88,6 +93,15 @@ fn write_tx_backoff(attempts: u32) -> std::time::Duration {
     attempts.hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     base + base.mul_f64((hasher.finish() % 2_501) as f64 / 10_000.0)
+}
+
+/// Human-readable deadline for a lock timeout message.
+fn deadline_text(deadline: std::time::Duration) -> String {
+    if deadline.as_secs() >= 1 {
+        format!("{} s", deadline.as_secs())
+    } else {
+        format!("{} ms", deadline.as_millis())
+    }
 }
 
 /// Retries a write transaction on transient SQLite contention.
@@ -224,18 +238,27 @@ impl DbManager {
     }
 
     pub fn init(&self) -> Result<()> {
-        self.with_conn(|conn| {
-            // Acquire the writer before schema reads; concurrent hosts must not upgrade a stale WAL snapshot.
-            conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.init_with_deadline(STARTUP_WRITE_DEADLINE)
+    }
 
-            let result: Result<()> = (|| {
-                conn.execute_batch(schema::SCHEMA_SQL)?;
-                context_search_index::migrate(conn)?;
-                crate::services::migrate(conn)?;
-                crate::services::input_queue::migrate(conn)?;
-                conversation_repo::migrate_workspace_mode(conn)?;
+    /// Run the schema bootstrap with an injectable contention deadline.
+    ///
+    /// The whole batch stays in one IMMEDIATE transaction so concurrent hosts
+    /// cannot observe half-migrated tables or upgrade from a stale WAL snapshot.
+    /// Every statement is idempotent, so [`write_tx`] can re-run the closure
+    /// after rolling back a contended attempt.
+    fn init_with_deadline(&self, deadline: std::time::Duration) -> Result<()> {
+        self.with_conn(|conn| -> Result<()> {
+            // A single attempt must not outlive the deadline that bounds all attempts.
+            conn.busy_timeout(deadline.min(std::time::Duration::from_secs(5)))?;
+            write_tx(conn, "schema init", deadline, |tx| {
+                tx.execute_batch(schema::SCHEMA_SQL)?;
+                context_search_index::migrate(tx)?;
+                crate::services::migrate(tx)?;
+                crate::services::input_queue::migrate(tx)?;
+                conversation_repo::migrate_workspace_mode(tx)?;
 
-                let has_col: i64 = conn
+                let has_col: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('im_configs') WHERE name='connection_type'",
                         [],
@@ -244,31 +267,31 @@ impl DbManager {
                     .unwrap_or(0);
 
                 if has_col == 0 {
-                    conn.execute(
+                    tx.execute(
                         "ALTER TABLE im_configs ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'webhook'",
                         [],
                     )?;
                 }
 
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_platform ON im_configs(platform)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_status ON im_configs(status)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_connection_type ON im_configs(connection_type)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_platform ON im_connections(platform)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_status ON im_connections(status)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_type ON im_connections(connection_type)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_message_stats_platform_date ON im_message_stats(platform, date)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_message_stats_date ON im_message_stats(date)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_platform_user ON im_user_permissions(platform, user_id)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_user_id ON im_user_permissions(user_id)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_paired_code ON im_user_permissions(paired_code)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_platform ON im_error_logs(platform)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_error_type ON im_error_logs(error_type)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_created_at ON im_error_logs(created_at)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_platform ON im_sessions(platform)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_user ON im_sessions(user_id)", [])?;
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_chat ON im_sessions(chat_id)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_platform ON im_configs(platform)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_status ON im_configs(status)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_configs_connection_type ON im_configs(connection_type)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_platform ON im_connections(platform)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_status ON im_connections(status)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_connections_type ON im_connections(connection_type)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_message_stats_platform_date ON im_message_stats(platform, date)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_message_stats_date ON im_message_stats(date)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_platform_user ON im_user_permissions(platform, user_id)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_user_id ON im_user_permissions(user_id)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_user_permissions_paired_code ON im_user_permissions(paired_code)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_platform ON im_error_logs(platform)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_error_type ON im_error_logs(error_type)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_error_logs_created_at ON im_error_logs(created_at)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_platform ON im_sessions(platform)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_user ON im_sessions(user_id)", [])?;
+                tx.execute("CREATE INDEX IF NOT EXISTS idx_im_sessions_chat ON im_sessions(chat_id)", [])?;
 
-                let has_session_key: i64 = conn
+                let has_session_key: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('im_sessions') WHERE name='session_key'",
                         [],
@@ -276,7 +299,7 @@ impl DbManager {
                     )
                     .unwrap_or(0);
                 if has_session_key == 0 {
-                    conn.execute(
+                    tx.execute(
                         "ALTER TABLE im_sessions ADD COLUMN session_key TEXT NOT NULL DEFAULT ''",
                         [],
                     )?;
@@ -284,7 +307,7 @@ impl DbManager {
 
                 // Delivery observations gained a provenance column. Older rows
                 // stay 'unknown' and completion treats them conservatively.
-                let has_observation_source: i64 = conn
+                let has_observation_source: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sa_repository_delivery_observations') WHERE name='source'",
                         [],
@@ -292,7 +315,7 @@ impl DbManager {
                     )
                     .unwrap_or(0);
                 if has_observation_source == 0 {
-                    conn.execute(
+                    tx.execute(
                         "ALTER TABLE sa_repository_delivery_observations ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'",
                         [],
                     )?;
@@ -303,7 +326,7 @@ impl DbManager {
                     // (col_name comes from hardcoded array, but defensive validation is good practice)
                     debug_assert!(col_name.chars().all(|c| c.is_alphanumeric() || c == '_'),
                         "Invalid column name in migration: {}", col_name);
-                    let has_col: i64 = conn
+                    let has_col: i64 = tx
                         .query_row(
                             &format!("SELECT COUNT(*) FROM pragma_table_info('im_sessions') WHERE name='{}'", col_name),
                             [],
@@ -311,7 +334,7 @@ impl DbManager {
                         )
                         .unwrap_or(0);
                     if has_col == 0 {
-                        conn.execute(
+                        tx.execute(
                             &format!("ALTER TABLE im_sessions ADD COLUMN {} TEXT", col_name),
                             [],
                         )?;
@@ -319,20 +342,18 @@ impl DbManager {
                 }
 
                 Ok(())
-            })();
-
-            match result {
-                Ok(()) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(()) as Result<()>
+            })
+            .map_err(|error| {
+                if is_contention(&error) {
+                    error.context(format!(
+                        "database stayed locked by another DeepSeek Code process for {}",
+                        deadline_text(deadline)
+                    ))
+                } else {
+                    error
                 }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e) as Result<()>
-                }
-            }
-        })??;
-        Ok(())
+            })
+        })?
     }
 
     pub fn with_conn<F, R>(&self, f: F) -> Result<R>
@@ -341,6 +362,43 @@ impl DbManager {
     {
         let conn = self.pool.get()?;
         Ok(f(&conn))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use rusqlite::Connection;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Hold `path`'s write lock in another thread until the returned sender fires.
+    pub(crate) fn hold_write_lock(
+        path: std::path::PathBuf,
+    ) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>) {
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            conn.execute_batch("ROLLBACK").unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        (holder, release_tx)
+    }
+
+    /// Release the writer after `delay`, so the call under test must wait for it.
+    pub(crate) fn release_after(
+        release: mpsc::Sender<()>,
+        holder: std::thread::JoinHandle<()>,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            release.send(()).unwrap();
+            holder.join().unwrap();
+        })
     }
 }
 
@@ -496,5 +554,71 @@ mod write_tx_tests {
             .unwrap()
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn init_waits_for_a_writer_that_outlasts_the_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("init_wait.sqlite");
+        // Put the fresh, schema-less file in WAL mode before the holder starts,
+        // so creating the pool cannot race the holder's write lock.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        let (holder, release) = hold_write_lock(path.clone());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(7));
+            release.send(()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let db = DbManager::new(path).unwrap();
+        db.init().unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(6),
+            "init returned before the holder released the writer: {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        let tables: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='conversations'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn init_deadline_reports_a_database_locked_by_another_process() {
+        let (_temp, db, path) = fixture();
+        let (holder, release) = hold_write_lock(path);
+        let started = std::time::Instant::now();
+        let error = db
+            .init_with_deadline(Duration::from_millis(300))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let text = format!("{error:#}");
+        assert!(is_contention(&error), "{text}");
+        assert!(
+            text.contains("database stayed locked by another DeepSeek Code process"),
+            "{text}"
+        );
+        assert!(text.contains("for 300 ms"), "{text}");
+        assert!(elapsed < Duration::from_secs(5), "returned after {elapsed:?}");
+        release.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn repeated_init_is_idempotent() {
+        let (_temp, db, _path) = fixture();
+        db.init().unwrap();
+        db.init().unwrap();
     }
 }

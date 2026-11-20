@@ -1,6 +1,6 @@
 //! Durable, host-owned timing of a complete execution turn (not a model request).
 use super::DbManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -167,26 +167,34 @@ pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<S
 /// time as work time. The caller must first establish that no process holds the
 /// execution lease.
 pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
-    let running: Vec<TurnRecord> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running'",
-        )?;
-        let rows = stmt.query_map([conversation_id], read_record)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for record in &running {
-        conn.execute(
-            "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
-            [&record.turn_id],
-        )?;
-    }
-    let mut settled = running;
-    for record in &mut settled {
-        record.status = TurnStatus::Cancelled;
-        record.ended_at = None;
-        record.elapsed_ms = None;
-    }
-    Ok(settled)
+    crate::db::write_tx(
+        conn,
+        "settle interrupted turn",
+        crate::db::STARTUP_WRITE_DEADLINE,
+        |conn| {
+            let running: Vec<TurnRecord> = {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running'",
+                )?;
+                let rows = stmt.query_map([conversation_id], read_record)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for record in &running {
+                conn.execute(
+                    "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
+                    [&record.turn_id],
+                )?;
+            }
+            let mut settled = running;
+            for record in &mut settled {
+                record.status = TurnStatus::Cancelled;
+                record.ended_at = None;
+                record.elapsed_ms = None;
+            }
+            Ok(settled)
+        },
+    )
+    .context("Settling interrupted turn")
 }
 
 pub fn terminal_status(stop_reason: Option<&str>, failed: bool) -> TurnStatus {
@@ -393,6 +401,30 @@ mod tests {
         let session = store.create(temp.path(), "model", "provider").unwrap();
         store.append(&session, "user", "task").unwrap();
         (temp, db, session)
+    }
+
+    #[test]
+    fn settle_interrupted_waits_for_another_writer_instead_of_failing() {
+        let (temp, db, session) = fixture();
+        let mut turn = TurnTimer::start(db.clone(), &session).unwrap();
+        turn.ensure_segment().unwrap();
+        let path = temp.path().join("turns.sqlite");
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = std::time::Instant::now();
+        let settled = db
+            .with_conn(|conn| settle_interrupted(conn, &session))
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "settle returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert!(!settled.is_empty());
+        drop(turn);
     }
 
     #[test]

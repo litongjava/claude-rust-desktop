@@ -594,11 +594,20 @@ impl Session {
         let workspace = store
             .workspace(&id, &paths.data_dir.join("workspaces"))
             .map_err(|error| crate::session_trust::diagnose(&store.db, paths, &id, error))?;
-        store.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE conversations SET model = ?1, provider = ?2 WHERE id = ?3",
-                [&selection.model, &selection.provider_id, &id],
+        store.db.with_conn(|conn| -> Result<()> {
+            deepseek_code_core::db::write_tx(
+                conn,
+                "session model update",
+                deepseek_code_core::db::STARTUP_WRITE_DEADLINE,
+                |tx| {
+                    tx.execute(
+                        "UPDATE conversations SET model = ?1, provider = ?2 WHERE id = ?3",
+                        [&selection.model, &selection.provider_id, &id],
+                    )?;
+                    Ok(())
+                },
             )
+            .context("Updating session model")
         })??;
         let permissions = runtime::default_permissions();
         permissions
