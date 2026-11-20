@@ -9,26 +9,42 @@ use super::background_shell;
 use crate::services::shell_settings::{self, ResolvedShell, ShellSettings};
 use std::sync::Mutex;
 
-const GIT_BASH_NOTE: &str = "This tool runs Git Bash (POSIX sh), not cmd.exe or PowerShell. Use Unix shell syntax: /dev/null not NUL, forward slashes, $VAR not %VAR% or $env:VAR. Windows paths can be written as C:/Users/... or /c/Users/.... Arguments that look like POSIX paths are converted automatically when calling native .exe programs; when that breaks an argument (e.g. `cmd /c`, `adb push x /sdcard/...`), prefix the command with MSYS_NO_PATHCONV=1. When a native program needs a Windows path inside a variable, file or option value, convert it with `cygpath -w <path>` (or `cygpath -m` for C:/ form).";
-const POWER_SHELL_NOTE: &str = "This tool runs Windows PowerShell 5.1, not bash or cmd. Use PowerShell syntax: $env:VAR, $null or Out-Null instead of /dev/null, ; between commands (&& and || are not supported), and the backtick as the escape character, not backslash. PowerShell input/output is UTF-8.";
-const PWSH_NOTE: &str = "This tool runs PowerShell 7, not bash or cmd. Use PowerShell syntax: $env:VAR, $null or Out-Null instead of /dev/null, ; between commands (&& and || work), and the backtick as the escape character, not backslash. PowerShell input/output is UTF-8.";
-const CMD_NOTE: &str = "This tool runs cmd.exe, not bash or PowerShell. Use %VAR%, NUL, backslashes in paths, && between commands, and double quotes; there is no $VAR, /dev/null or single-quote quoting.";
-const FISH_NOTE: &str = "This tool runs fish, not bash: set variables with set -x VAR value; bash-only syntax may fail.";
-const WSL_NOTE_PREFIX: &str = "This tool runs bash inside WSL";
-const WSL_NOTE_BODY: &str = ", a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.";
-const OTHER_SHELL_HINT: &str = "Set shell only when you need a different shell; then use that shell's syntax (e.g. PowerShell quoting is not bash quoting).";
+const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call starts a fresh shell. Explicit background tasks start in the workspace.
+
+A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop.
+
+When a call ends, every process it started is stopped, including background children. A server, daemon or other service that must keep running after the call has to be started with `detach: true`, which returns its PID and log files; stop it yourself when it is no longer needed.
+
+Ordinary capture keeps up to 1 MiB per stream. Long results show the beginning and end within the configured preview budget (100 KiB per stream by default).
+
+Command permission checks also apply outside the sandbox.";
+
+const GIT_BASH_NOTE: &str = "The default is Git Bash. Use $NAME for variables, /dev/null for discarded output and slash-separated paths. Native Windows executables receive translated path arguments. Set MSYS_NO_PATHCONV=1 for a command that needs its arguments verbatim, or use cygpath -w to supply a Windows path explicitly.";
+const POWER_SHELL_NOTE: &str = "The default is Windows PowerShell 5.1 with UTF-8 I/O. Read environment values with $env:NAME and discard output with Out-Null. Use a newline between statements and test $? for conditional execution. Backticks escape special characters.";
+const PWSH_NOTE: &str = "The default is PowerShell 7 with UTF-8 I/O. Use $env:NAME for the environment, Out-Null to discard output and a backtick for escaping. Conditional chains accept && and ||.";
+const CMD_NOTE: &str = "The default is cmd.exe. Expand variables with %NAME%, redirect to NUL to discard output and quote paths containing spaces with double quotes.";
+const FISH_NOTE: &str =
+    "The default is fish. Use fish syntax, including set -x to export a variable.";
+const WSL_NOTE_PREFIX: &str = "The default is WSL";
+const WSL_NOTE_BODY: &str = ". Work with Linux paths inside the distribution. Drive C is normally mounted at /mnt/c, and launching Windows executables requires WSL interop.";
+const OTHER_SHELL_HINT: &str =
+    "If you override the default with shell, write the command for that interpreter.";
 
 /// Shell-aware text for the Bash and Monitor tools.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BashTool {
-    description_suffix: String,
+    description: String,
+    monitor_suffix: String,
     shell_parameter: String,
 }
 
 impl BashTool {
-    /// Today's base description plus the default-shell note and shell hint.
-    pub(super) fn description_suffix(&self) -> &str {
-        &self.description_suffix
+    pub(super) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(super) fn monitor_suffix(&self) -> &str {
+        &self.monitor_suffix
     }
 
     pub(super) fn shell_parameter(&self) -> &str {
@@ -50,9 +66,12 @@ pub(super) fn bash_tool() -> BashTool {
     }
     let settings = background_shell::shell_settings().unwrap_or_default();
     let resolved = settings.resolve(None, false).ok();
-    let tool = build(&settings, resolved.as_ref(), cfg!(windows), &|name| {
-        super::find_shell(name).is_some()
-    });
+    let tool = build(
+        &settings,
+        resolved.as_ref(),
+        std::env::consts::OS,
+        &|name| super::find_shell(name).is_some(),
+    );
     *cache = Some((generation, tool.clone()));
     tool
 }
@@ -60,7 +79,7 @@ pub(super) fn bash_tool() -> BashTool {
 fn build(
     settings: &ShellSettings,
     default: Option<&ResolvedShell>,
-    is_windows: bool,
+    host_os: &str,
     found: &dyn Fn(&str) -> bool,
 ) -> BashTool {
     let mut shells = Vec::new();
@@ -76,8 +95,8 @@ fn build(
     ] {
         let usable = match name {
             "bash" => true,
-            "cmd" | "powershell" => is_windows,
-            "wsl" => is_windows && settings.wsl.distribution.is_some(),
+            "cmd" | "powershell" => host_os == "windows",
+            "wsl" => host_os == "windows" && settings.wsl.distribution.is_some(),
             _ => found(name),
         };
         if usable {
@@ -88,27 +107,60 @@ fn build(
         .map(|shell| shell.name.as_str())
         .filter(|name| shells.contains(name))
         .unwrap_or("bash");
-    let is_git_bash_default = default
-        .is_some_and(|shell| shell.name == "bash" && is_git_bash(&shell.program));
+    let is_git_bash_default =
+        default.is_some_and(|shell| shell.name == "bash" && is_git_bash(&shell.program));
 
-    let mut description_suffix = String::new();
-    if let Some(note) = default.and_then(shell_note) {
-        description_suffix.push_str("\n\n");
-        description_suffix.push_str(&note);
+    let mut description = BASH_DESCRIPTION.to_owned();
+    let mut monitor_suffix = String::new();
+    if let Some(shell) = default {
+        description.push_str("\n\n");
+        if let Some(syntax) = shell_note(shell) {
+            monitor_suffix = format!("\n\n{syntax}");
+            description.push_str(&syntax);
+        } else {
+            description.push_str(&format!("The default is {}.", shell.name));
+        }
+        append_execution_note(&mut description, shell, host_os);
     }
     let default_family = syntax_family(available, available, false);
     if shells
         .iter()
         .any(|name| syntax_family(name, available, is_git_bash_default) != default_family)
     {
-        description_suffix.push_str("\n\n");
-        description_suffix.push_str(OTHER_SHELL_HINT);
+        for text in [&mut description, &mut monitor_suffix] {
+            text.push_str("\n\n");
+            text.push_str(OTHER_SHELL_HINT);
+        }
     }
 
     BashTool {
-        description_suffix,
-        shell_parameter: format!("Shell to use: {} (default: {available})", shells.join(", ")),
+        description,
+        monitor_suffix,
+        shell_parameter: format!("Choose from {} (default {available}).", shells.join(", ")),
     }
+}
+
+/// Foreground directory tracking, pipeline status and PTY availability for this shell.
+fn append_execution_note(note: &mut String, shell: &ResolvedShell, host_os: &str) {
+    let name = shell.name.as_str();
+    note.push_str(if name == "fish" {
+        " Foreground commands start in the workspace."
+    } else {
+        " Foreground commands can reuse the session's last allowed directory."
+    });
+    if super::pipeline_failure_flag(shell.command_flag, name, shell.wsl.is_some()) {
+        note.push_str(" With pipefail enabled, a failing pipeline stage can surface even when the last stage succeeds.");
+    }
+    if matches!(name, "bash" | "sh" | "zsh" | "wsl") {
+        note.push_str(
+            " Status 141 indicates partial output because a pipeline reader closed early.",
+        );
+    }
+    note.push_str(match (host_os, name) {
+        ("windows", "cmd" | "wsl") => " PTY interaction is unavailable with this shell.",
+        ("linux" | "windows", _) => " A background PTY merges stdout and stderr and requires a run without a sandbox policy or process timeout.",
+        _ => " PTY interaction is unavailable on this host.",
+    });
 }
 
 /// Shells whose syntax differs when chosen explicitly. POSIX shells share one
@@ -131,7 +183,7 @@ fn syntax_family(shell: &str, default: &str, is_git_bash_default: bool) -> &'sta
     }
 }
 
-/// One note for the resolved default shell; `None` for ordinary POSIX shells.
+/// Syntax guidance shared with Monitor; ordinary POSIX shells need no extra syntax hint.
 fn shell_note(shell: &ResolvedShell) -> Option<String> {
     if let Some(wsl) = &shell.wsl {
         let distribution = wsl
@@ -219,11 +271,11 @@ mod tests {
         assert_eq!(shell_note(&resolved("sh", "/bin/sh")), None);
         assert_eq!(
             shell_note(&wsl(Some("Ubuntu"))),
-            Some("This tool runs bash inside WSL (Ubuntu), a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.".to_string())
+            Some(format!("{WSL_NOTE_PREFIX} (Ubuntu){WSL_NOTE_BODY}"))
         );
         assert_eq!(
             shell_note(&wsl(None)),
-            Some("This tool runs bash inside WSL, a Linux environment, not Windows. Use Linux paths and tools; Windows drives are under /mnt/c/...; Windows .exe programs run only through WSL interop.".to_string())
+            Some(format!("{WSL_NOTE_PREFIX}{WSL_NOTE_BODY}"))
         );
         assert_eq!(
             shell_note(&resolved("powershell", "powershell.exe")),
@@ -258,23 +310,23 @@ mod tests {
         let tool = build(
             &settings("bash", None),
             Some(&resolved("bash", "/bin/bash")),
-            false,
+            "linux",
             &|name| name == "bash",
         );
-        assert_eq!(tool.shell_parameter(), "Shell to use: bash (default: bash)");
-        assert_eq!(tool.description_suffix(), "");
+        assert_eq!(tool.shell_parameter(), "Choose from bash (default bash).");
+        assert_eq!(tool.monitor_suffix(), "");
 
         let tool = build(
             &settings("bash", None),
             Some(&resolved("bash", "/bin/bash")),
-            false,
+            "linux",
             &|name| matches!(name, "bash" | "zsh" | "fish" | "sh" | "pwsh"),
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, pwsh (default: bash)"
+            "Choose from bash, zsh, fish, sh, pwsh (default bash)."
         );
-        assert_eq!(tool.description_suffix(), format!("\n\n{OTHER_SHELL_HINT}"));
+        assert_eq!(tool.monitor_suffix(), format!("\n\n{OTHER_SHELL_HINT}"));
     }
 
     #[test]
@@ -282,57 +334,58 @@ mod tests {
         let posix_only = build(
             &settings("bash", None),
             Some(&resolved("bash", "/bin/bash")),
-            false,
+            "linux",
             &|name| matches!(name, "bash" | "sh" | "zsh"),
         );
         assert_eq!(
             posix_only.shell_parameter(),
-            "Shell to use: bash, zsh, sh (default: bash)"
+            "Choose from bash, zsh, sh (default bash)."
         );
-        assert_eq!(posix_only.description_suffix(), "");
+        assert_eq!(posix_only.monitor_suffix(), "");
+        assert!(!posix_only.description().contains(OTHER_SHELL_HINT));
 
         let with_pwsh = build(
             &settings("bash", None),
             Some(&resolved("bash", "/bin/bash")),
-            false,
+            "linux",
             &|name| matches!(name, "bash" | "sh" | "pwsh"),
         );
         assert_eq!(
             with_pwsh.shell_parameter(),
-            "Shell to use: bash, sh, pwsh (default: bash)"
+            "Choose from bash, sh, pwsh (default bash)."
         );
         assert_eq!(
-            with_pwsh.description_suffix(),
+            with_pwsh.monitor_suffix(),
             format!("\n\n{OTHER_SHELL_HINT}")
         );
 
         let git_bash = build(
             &settings("bash", None),
             Some(&resolved("bash", r"C:\Program Files\Git\bin\bash.exe")),
-            true,
+            "windows",
             &|name| matches!(name, "bash" | "sh" | "zsh"),
         );
         assert_eq!(
             git_bash.shell_parameter(),
-            "Shell to use: bash, zsh, sh, cmd, powershell (default: bash)"
+            "Choose from bash, zsh, sh, cmd, powershell (default bash)."
         );
         assert_eq!(
-            git_bash.description_suffix(),
+            git_bash.monitor_suffix(),
             format!("\n\n{GIT_BASH_NOTE}\n\n{OTHER_SHELL_HINT}")
         );
 
         let powershell_default = build(
             &settings("powershell", None),
             Some(&resolved("powershell", "powershell.exe")),
-            true,
+            "windows",
             &|name| name == "bash",
         );
         assert_eq!(
             powershell_default.shell_parameter(),
-            "Shell to use: bash, cmd, powershell (default: powershell)"
+            "Choose from bash, cmd, powershell (default powershell)."
         );
         assert_eq!(
-            powershell_default.description_suffix(),
+            powershell_default.monitor_suffix(),
             format!("\n\n{POWER_SHELL_NOTE}\n\n{OTHER_SHELL_HINT}")
         );
     }
@@ -342,15 +395,15 @@ mod tests {
         let git_bash_with_wsl = build(
             &settings("bash", Some("Ubuntu")),
             Some(&resolved("bash", r"C:\Program Files\Git\bin\bash.exe")),
-            true,
+            "windows",
             &|_| false,
         );
         assert_eq!(
             git_bash_with_wsl.shell_parameter(),
-            "Shell to use: bash, cmd, powershell, wsl (default: bash)"
+            "Choose from bash, cmd, powershell, wsl (default bash)."
         );
         assert!(git_bash_with_wsl
-            .description_suffix()
+            .monitor_suffix()
             .ends_with(OTHER_SHELL_HINT));
 
         assert_eq!(syntax_family("wsl", "bash", true), "wsl");
@@ -361,7 +414,7 @@ mod tests {
 
     #[test]
     fn non_windows_never_offers_cmd_powershell_or_wsl() {
-        let tool = build(&settings("cmd", Some("Ubuntu")), None, false, &|name| {
+        let tool = build(&settings("cmd", Some("Ubuntu")), None, "linux", &|name| {
             matches!(
                 name,
                 "bash" | "zsh" | "fish" | "sh" | "cmd" | "powershell" | "pwsh" | "wsl"
@@ -369,7 +422,7 @@ mod tests {
         });
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, pwsh (default: bash)"
+            "Choose from bash, zsh, fish, sh, pwsh (default bash)."
         );
         assert!(!tool.shell_parameter().contains("cmd"));
         assert!(!tool.shell_parameter().contains("powershell"));
@@ -384,30 +437,30 @@ mod tests {
                 "powershell",
                 r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             )),
-            true,
+            "windows",
             &|name| name == "pwsh",
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, cmd, powershell, pwsh, wsl (default: powershell)"
+            "Choose from bash, cmd, powershell, pwsh, wsl (default powershell)."
         );
         assert!(tool
-            .description_suffix()
+            .monitor_suffix()
             .starts_with(&format!("\n\n{POWER_SHELL_NOTE}")));
-        assert!(tool.description_suffix().ends_with(OTHER_SHELL_HINT));
+        assert!(tool.monitor_suffix().ends_with(OTHER_SHELL_HINT));
 
         let tool = build(
             &settings("bash", None),
             Some(&resolved("bash", r"C:\Program Files\Git\bin\bash.exe")),
-            true,
+            "windows",
             &|name| matches!(name, "bash" | "zsh" | "fish" | "sh"),
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh, fish, sh, cmd, powershell (default: bash)"
+            "Choose from bash, zsh, fish, sh, cmd, powershell (default bash)."
         );
         assert_eq!(
-            tool.description_suffix(),
+            tool.monitor_suffix(),
             format!("\n\n{GIT_BASH_NOTE}\n\n{OTHER_SHELL_HINT}")
         );
     }
@@ -417,14 +470,115 @@ mod tests {
         let tool = build(
             &settings("zsh", None),
             Some(&resolved("zsh", "/bin/zsh")),
-            false,
+            "linux",
             &|name| matches!(name, "bash" | "zsh"),
         );
         assert_eq!(
             tool.shell_parameter(),
-            "Shell to use: bash, zsh (default: zsh)"
+            "Choose from bash, zsh (default zsh)."
         );
-        assert_eq!(tool.description_suffix(), "");
+        assert_eq!(tool.monitor_suffix(), "");
+    }
+
+    #[test]
+    fn description_matches_the_resolved_shell_and_host() {
+        assert!(BASH_DESCRIPTION.chars().count() <= 1500);
+        for (label, host, shell) in [
+            (
+                "Git Bash",
+                "windows",
+                resolved("bash", r"C:\Program Files\Git\bin\bash.exe"),
+            ),
+            (
+                "PowerShell 5.1",
+                "windows",
+                resolved("powershell", "powershell.exe"),
+            ),
+            ("PowerShell 7", "windows", resolved("pwsh", "pwsh.exe")),
+            ("cmd", "windows", resolved("cmd", "cmd.exe")),
+            ("bash on Linux", "linux", resolved("bash", "/bin/bash")),
+            ("zsh on macOS", "macos", resolved("zsh", "/bin/zsh")),
+            ("fish", "linux", resolved("fish", "/usr/bin/fish")),
+            ("WSL", "windows", wsl(Some("Ubuntu"))),
+            ("sh", "linux", resolved("sh", "/bin/sh")),
+        ] {
+            let name = shell.name.as_str();
+            let tool = build(&settings(name, Some("Ubuntu")), Some(&shell), host, &|n| {
+                matches!(n, "sh" | "pwsh") || n == name
+            });
+            let text = tool.description();
+            let lower = text.to_ascii_lowercase();
+            let words: Vec<_> = lower.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            let interpreter = if name == "pwsh" { "powershell" } else { name };
+            for other in [
+                "bash",
+                "powershell",
+                "pwsh",
+                "cmd",
+                "sh",
+                "zsh",
+                "fish",
+                "wsl",
+            ] {
+                assert_eq!(
+                    words.contains(&other),
+                    interpreter == other,
+                    "{label}: {other}"
+                );
+            }
+            assert_eq!(text.contains("Git Bash"), label == "Git Bash");
+            assert_eq!(text.contains("PowerShell 5.1"), name == "powershell");
+            assert_eq!(text.contains("PowerShell 7"), name == "pwsh");
+            assert_eq!(text.contains("last allowed directory"), name != "fish");
+            assert_eq!(
+                text.contains("Foreground commands start in the workspace"),
+                name == "fish"
+            );
+            assert_eq!(text.contains("pipefail"), matches!(name, "bash" | "zsh"));
+            assert_eq!(
+                text.contains("141"),
+                matches!(name, "bash" | "zsh" | "sh" | "wsl")
+            );
+            let supports_pty = host != "macos" && !matches!(name, "cmd" | "wsl");
+            assert_eq!(text.contains("PTY merges stdout and stderr"), supports_pty);
+            assert_eq!(
+                text.contains("PTY interaction is unavailable"),
+                !supports_pty
+            );
+            assert!(text.ends_with(OTHER_SHELL_HINT));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "shell_fixture": label, "description": text, "shell_parameter": tool.shell_parameter()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn description_says_calls_stop_their_processes_and_detach_survives() {
+        for (label, host, shell) in [
+            (
+                "Git Bash",
+                "windows",
+                resolved("bash", r"C:\Program Files\Git\bin\bash.exe"),
+            ),
+            ("bash on Linux", "linux", resolved("bash", "/bin/bash")),
+        ] {
+            let tool = build(&settings("bash", None), Some(&shell), host, &|n| {
+                n == "bash"
+            });
+            let text = tool.description();
+            assert!(
+                text.contains("every process it started is stopped"),
+                "{label}: {text}"
+            );
+            assert!(text.contains("`detach: true`"), "{label}: {text}");
+            assert!(
+                text.contains("keep running after the call"),
+                "{label}: {text}"
+            );
+        }
     }
 
     #[test]

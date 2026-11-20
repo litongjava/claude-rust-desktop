@@ -13,15 +13,15 @@ const PDF_PAGES_REQUIRED_OVER: usize = 10;
 pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         name: "Read".into(),
-        description: "Reads a file from the local filesystem.\n\n- `file_path` must be an absolute path.\n- Reads up to 2000 lines by default.\n- When you already know which part of the file you need, only read that part. This can be important for larger files.\n- Results are returned using cat -n format, with line numbers starting at 1\n- Reads images (PNG, JPG, GIF, WebP) and presents them visually when the selected model accepts images. Reads PDFs as text via the `pages` parameter (e.g. \"1-5\", max 20 pages/request; required for PDFs over 10 pages). Reads Jupyter notebooks (.ipynb) as cells with outputs.\n- Long base64 runs in text are replaced with a short placeholder; pass raw=true to read them unchanged.\n- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.\n- Do NOT re-read a file you just edited to verify — Edit/Write would have errored if the change failed.".into(),
+        description: "Read a file and return its text with 1-based line numbers. Text reads 2000 lines from line 1 by default; offset and limit select another range, and rendered output over 256 KiB is refused unless allow_large is true. PNG, JPEG, GIF and WebP images up to 5 MiB return as image content when the model accepts it; PDFs return page text for the pages range; .ipynb files return cells with outputs. Long base64 runs in text are replaced with a short placeholder; pass raw=true to read them unchanged. A missing path or directory is an error, and an empty file returns only a warning.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "file_path": {"description": "The absolute path to the file to read", "type": "string"},
-                "offset": {"description": "The line number to start reading from. Only provide if the file is too large to read at once", "type": "integer", "minimum": 0},
-                "limit": {"description": "The number of lines to read. Only provide if the file is too large to read at once.", "type": "integer", "exclusiveMinimum": 0},
-                "pages": {"description": "Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request.", "type": "string"},
-                "allow_large": {"description": "Set to true to read a text file, or a line range of one, that is over the usual size limits, up to what still fits in your context. Only use this when you genuinely need all of it or the user asked for the whole file; otherwise read it in parts with offset and limit, or search it.", "type": "boolean"},
+                "file_path": {"description": "Path to the file; relative paths resolve against the working directory.", "type": "string"},
+                "offset": {"description": "First line to return, 1-based (0 is treated as 1); defaults to 1.", "type": "integer", "minimum": 0},
+                "limit": {"description": "Maximum lines to return; defaults to 2000 and must be greater than 0.", "type": "integer", "exclusiveMinimum": 0},
+                "pages": {"description": "PDF page range such as \"2\" or \"3-7\", at most 20 pages, required when the PDF has more than 10 pages.", "type": "string"},
+                "allow_large": {"description": "Allow text output over the 256 KiB limit; use only when the whole file is really needed.", "type": "boolean"},
                 "raw": {"description": "Return the file text without collapsing long base64 data.", "type": "boolean"}
             },
             "required": ["file_path"],
