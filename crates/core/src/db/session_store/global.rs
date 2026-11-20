@@ -127,7 +127,9 @@ impl GlobalDb {
             root: self.root.upgrade().expect("global belongs to a live root"),
             fault: None,
         };
-        let _locks = stores.resolved_key(&key)?;
+        let Some(_locks) = stores.resolved_key(&key)? else {
+            return Ok(None);
+        };
         self.read(|conn| crate::db::conversation_repo::get_conversation(conn, id))
     }
 

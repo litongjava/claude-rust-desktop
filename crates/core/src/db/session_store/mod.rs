@@ -58,7 +58,7 @@ impl Stores {
             }
         };
         let stores = Self { root, fault: None };
-        drop(stores.namespace(false)?);
+        drop(stores.namespace()?);
         stores.reconcile()?;
         Ok(stores)
     }
@@ -84,9 +84,9 @@ impl Stores {
     fn sessions(&self) -> PathBuf {
         self.root.path.join("sessions")
     }
-    fn namespace(&self, exclusive: bool) -> Result<std::fs::File> {
+    fn namespace(&self) -> Result<std::fs::File> {
         let dir = self.root.path.join("session-locks");
-        let guard = layout::lock_existing(&dir.join(".directory"), exclusive)?;
+        let guard = layout::lock_existing(&dir.join(".directory"), false)?;
         ensure!(
             std::fs::read_to_string(dir.join(".initialized"))? == self.global().uuid,
             "Lifecycle namespace identity changed"
@@ -105,31 +105,36 @@ impl Stores {
         })
     }
 
-    // All key holders retain shared namespace access until their connection closes.
-    // A new name can therefore only be allocated after all old inodes are idle.
     fn key_lock(&self, key: &str, exclusive: bool, allocate: bool) -> Result<Vec<std::fs::File>> {
+        self.try_key_lock(key, exclusive, allocate)?
+            .context("Session unavailable")
+    }
+
+    fn try_key_lock(
+        &self,
+        key: &str,
+        exclusive: bool,
+        allocate: bool,
+    ) -> Result<Option<Vec<std::fs::File>>> {
         let dir = self.root.path.join("session-locks");
         let path = dir.join(key);
-        let mut namespace = self.namespace(false)?;
+        let namespace = self.namespace()?;
         if !path.try_exists()? {
-            ensure!(
-                !self.has_directory_state(key)?,
-                "Missing lock for registered session"
-            );
-            if !allocate {
-                return Ok(vec![namespace]);
-            }
-            drop(namespace);
-            namespace = self.namespace(true)?;
+            let registered = self.has_directory_state(key)?;
+            // Another creator may have installed the permanent key while we read G.
             if !path.try_exists()? {
-                ensure!(
-                    !self.has_directory_state(key)?,
-                    "Missing lock for registered session"
-                );
-                std::fs::File::create_new(&path)?.sync_all()?;
+                ensure!(!registered, "Missing lock for registered session");
+                if !allocate {
+                    // Linearize an unknown-key lookup here. The caller must not
+                    // subsequently inspect a newly published G row without a key lock.
+                    return Ok(None);
+                }
+                match std::fs::File::create_new(&path) {
+                    Ok(file) => file.sync_all()?,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
-            drop(namespace);
-            namespace = self.namespace(false)?;
         }
         // Repeat the barrier on retry if allocation succeeded but fsync failed.
         if allocate {
@@ -137,23 +142,25 @@ impl Stores {
         }
         let mut guards = lock_keys(&dir, vec![key], exclusive)?;
         guards.push(namespace);
-        Ok(guards)
+        Ok(Some(guards))
     }
 
-    fn resolved_key(&self, key: &str) -> Result<Vec<std::fs::File>> {
-        let shared = self.key_lock(key, false, false)?;
+    fn resolved_key(&self, key: &str) -> Result<Option<Vec<std::fs::File>>> {
+        let Some(shared) = self.try_key_lock(key, false, false)? else {
+            return Ok(None);
+        };
         if self.pending(key)?.is_none() {
-            return Ok(shared);
+            return Ok(Some(shared));
         }
         drop(shared);
         let exclusive = self.key_lock(key, true, false)?;
         self.recover_key(key)?;
-        Ok(exclusive)
+        Ok(Some(exclusive))
     }
 
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
         let key = storage_key(id)?;
-        let _locks = self.resolved_key(&key)?;
+        let _locks = self.resolved_key(&key)?.context("Session unavailable")?;
         let incarnation = self
             .global()
             .incarnation(id, &key)?

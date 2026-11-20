@@ -718,6 +718,30 @@ fn subprocess() -> Result<()> {
                 Ok(())
             })?;
         }
+        "disjoint-registration" => {
+            let source = s.open_session(ID)?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .build()?;
+            rt.block_on(async {
+                let (tx, rx) = mpsc::channel();
+                let mut worker = None;
+                source.read(|snapshot| {
+                    let stores = s.clone();
+                    worker = Some(tokio::spawn(async move {
+                        let result = stores
+                            .create("destination", first())
+                            .and_then(|h| h.delete());
+                        tx.send(result).unwrap();
+                    }));
+                    rx.recv_timeout(Duration::from_secs(5))??;
+                    assert_eq!(snapshot.initial_message()?, Some(first_message()));
+                    Ok(())
+                })?;
+                worker.unwrap().await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
         "nested-capacity" => {
             let h = s.open_session(ID)?;
             let gate = Barrier::new(16);
@@ -1258,6 +1282,14 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
         assert!(!shard(&root).exists());
     }
     assert!(Stores::open_for_test(&root)?.open_session(ID).is_err());
+    Ok(())
+}
+
+#[test]
+fn round2_disjoint_registration_finishes_during_source_snapshot() -> Result<()> {
+    let root = tempdir()?;
+    Stores::open_for_test(root.path())?.create(ID, first())?;
+    Worker::start(root.path(), "disjoint-registration").expect_success();
     Ok(())
 }
 

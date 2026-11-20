@@ -652,7 +652,26 @@ impl Stores {
         self.quarantine_orphans()
     }
 
+    fn owns_live_directory(&self, key: &str) -> Result<bool> {
+        self.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1
+             UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?1 AND quarantine_reason IS NULL)",
+                [key],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     fn move_proven_orphan(&self, dir: &Path, name: &str, staged: bool) -> Result<()> {
+        let existing_lock = if staged {
+            None
+        } else {
+            self.try_key_lock(name, true, false)?
+        };
+        if !staged && self.owns_live_directory(name)? {
+            return Ok(());
+        }
         let path = dir.join("session.db");
         let inspect = || -> Result<()> {
             let _permit = Permits::take(1);
@@ -725,6 +744,16 @@ impl Stores {
             tracing::warn!(path = %dir.display(), reason = %error, "Leaving unverified session directory in place");
             return Ok(());
         }
+        // Only our sweep can move an unowned live directory. A concurrent
+        // creator must reject the occupied destination. Register a missing
+        // lock only after proving ownership, then recheck G under that key.
+        let _new_lock;
+        if !staged && existing_lock.is_none() {
+            _new_lock = self.key_lock(name, true, true)?;
+            if self.owns_live_directory(name)? {
+                return Ok(());
+            }
+        }
         durable_move(
             dir,
             &self
@@ -796,15 +825,7 @@ impl Stores {
                 tracing::warn!(path = %entry.path().display(), "Leaving unrelated sessions entry in place");
                 continue;
             }
-            let owned = || {
-                self.global().read(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE storage_key=?1
-                UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?1 AND quarantine_reason IS NULL)",[key],|r|r.get::<_,bool>(0))?))
-            };
-            if owned()? {
-                continue;
-            }
-            let _locks = self.key_lock(key, true, false)?;
-            if entry.path().try_exists()? && !owned()? {
+            if !self.owns_live_directory(key)? {
                 self.move_proven_orphan(&entry.path(), key, false)?;
             }
         }
