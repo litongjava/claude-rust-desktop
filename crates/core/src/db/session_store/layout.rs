@@ -12,7 +12,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-const GLOBAL_VERSION: i32 = 2;
+const GLOBAL_VERSION: i32 = 3;
 const SESSION_VERSION: i32 = 2;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
@@ -167,8 +167,18 @@ pub(super) fn is_v1(path: &Path, kind: i32) -> Result<bool> {
 pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
     let mut c = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    verify_version(&tx, kind, 1)?;
-    tx.execute_batch(additions(kind))?;
+    let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        version == 1 || (kind == GLOBAL && version == 2),
+        "Unsupported upgrade"
+    );
+    verify_version(&tx, kind, version)?;
+    if version == 1 {
+        tx.execute_batch(additions(kind))?;
+    }
+    if kind == GLOBAL {
+        tx.execute_batch(include_str!("inbox_v3.sql"))?;
+    }
     tx.pragma_update(None, "user_version", schema_version(kind))?;
     tx.commit()?;
     Ok(())
@@ -242,6 +252,9 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
             ("tool_queued_inputs", "tool_call_id inputs_json"),
         ]
     };
+    if kind == GLOBAL && expected >= 3 {
+        conn.prepare("SELECT sender_incarnation FROM session_inbox LIMIT 0")?;
+    }
     let mut columns = conn.prepare_cached(
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
@@ -322,6 +335,9 @@ pub(super) fn initialize(
         include_str!("session.sql")
     })?;
     tx.execute_batch(additions(kind))?;
+    if kind == GLOBAL {
+        tx.execute_batch(include_str!("inbox_v3.sql"))?;
+    }
     populate(&tx)?;
     tx.commit()?;
     Ok(conn)
@@ -424,7 +440,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             // Replay both sides of the move, even when global.db already exists.
             sync_dir(root)?;
             sync_dir(&stage)?;
-            let uuid = read_global_uuid(&path, is_v1(&path, GLOBAL)?)?;
+            let uuid = read_global_uuid(&path, global_version(&path)?)?;
             if !marker.try_exists()? {
                 ensure!(
                     fs::read_to_string(stage.join("store-uuid"))? == uuid,
@@ -448,9 +464,9 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             sync_dir(root)?;
         }
     }
-    if is_v1(&path, GLOBAL)? {
+    if global_version(&path)? < GLOBAL_VERSION {
         let _guard = lock_existing(&locks.join(".directory"), true)?;
-        if is_v1(&path, GLOBAL)? {
+        if global_version(&path)? < GLOBAL_VERSION {
             let c = open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             let uuid: String = c.query_row(
                 "SELECT store_uuid FROM store_identity WHERE singleton=1",
@@ -465,7 +481,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             upgrade(&path, GLOBAL)?;
         }
     }
-    let uuid = read_global_uuid(&path, false)?;
+    let uuid = read_global_uuid(&path, GLOBAL_VERSION)?;
     ensure!(
         fs::read_to_string(&marker)? == uuid,
         "Global store UUID changed"
@@ -473,9 +489,18 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
     Ok(uuid)
 }
 
-fn read_global_uuid(path: &Path, bootstrap_v1: bool) -> Result<String> {
+fn global_version(path: &Path) -> Result<i32> {
+    let c = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i32 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        (1..=GLOBAL_VERSION).contains(&version),
+        "Unsupported global schema version"
+    );
+    Ok(version)
+}
+fn read_global_uuid(path: &Path, version: i32) -> Result<String> {
     let conn = open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    verify_version(&conn, GLOBAL, if bootstrap_v1 { 1 } else { GLOBAL_VERSION })?;
+    verify_version(&conn, GLOBAL, version)?;
     integrity(&conn)?;
     let store: String = conn.query_row(
         "SELECT store_uuid FROM store_identity WHERE singleton=1",

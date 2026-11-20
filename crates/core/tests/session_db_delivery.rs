@@ -790,3 +790,177 @@ fn killed_executor_settles_its_started_turn_and_never_redispatches_it() -> Resul
     assert_eq!(b.read(|r| r.receipt_count())?, 1);
     Ok(())
 }
+
+#[test]
+fn review_sender_retirement_preserves_recipient_outcome() -> Result<()> {
+    for cut in [Phase::DeliveryClaimed, Phase::DeliveryCommitted] {
+        let root = tempdir()?;
+        let s = Stores::open_for_test(root.path())?;
+        let a = s.create(A, project(root.path()))?;
+        let b = s.create(B, project(root.path()))?;
+        let id = a.send_peer(&b, "op", "peer data")?;
+        let stop = s.with_fault_hook(move |phase| {
+            ensure!(phase != cut, "cut");
+            Ok(())
+        });
+        assert!(stop.open_session(B)?.delivery_owner()?.next_peer().is_err());
+        a.delete()?;
+        let replacement = s.create(A, project(root.path()))?;
+        assert!(replacement.sent()?.is_empty());
+        let result = b.delivery_owner()?.next_peer()?;
+        let inbox = b.inbox(false)?;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, id);
+        if cut == Phase::DeliveryClaimed {
+            assert!(result.is_none());
+            assert_eq!(inbox[0].state, "undeliverable");
+            assert!(inbox[0].blocked_reason.is_some());
+            assert_eq!(b.read(|r| r.receipt_count())?, 0);
+        } else {
+            assert!(!result.unwrap().applied);
+            assert_eq!(inbox[0].state, "context_committed");
+            assert_eq!(b.read(|r| r.messages())?.len(), 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn populated_v2_inbox_upgrades_with_outstanding_claim() -> Result<()> {
+    let root = tempdir()?;
+    {
+        let stores = Stores::open_for_test(root.path())?;
+        let sender = stores.create(A, project(root.path()))?;
+        let recipient = stores.create(B, project(root.path()))?;
+        sender.send_peer(&recipient, "operation", "accepted")?;
+        let stopped = stores.with_fault_hook(|p| {
+            ensure!(p != Phase::DeliveryClaimed, "cut");
+            Ok(())
+        });
+        assert!(stopped
+            .open_session(B)?
+            .delivery_owner()?
+            .next_peer()
+            .is_err());
+    }
+    // Rebuild the two changed tables with the original v2 definitions and
+    // leave the old claim, payload digest and consumer generation in place.
+    {
+        let g = global(root.path())?;
+        g.execute_batch(
+            "BEGIN IMMEDIATE;
+            ALTER TABLE session_inbox_operations RENAME TO operations_fixture;
+            ALTER TABLE session_inbox RENAME TO inbox_fixture;
+            DROP INDEX inbox_fifo;",
+        )?;
+        let schema = include_str!("../src/db/session_store/delivery.sql");
+        let inbox = &schema[schema.find("CREATE TABLE session_inbox (").unwrap()
+            ..schema.find("CREATE TABLE session_inbox_consumers").unwrap()];
+        let ops = &schema[schema
+            .find("CREATE TABLE session_inbox_operations")
+            .unwrap()
+            ..schema.find("CREATE TABLE legacy_session_imports").unwrap()];
+        g.execute_batch(inbox)?;
+        g.execute_batch(ops)?;
+        g.execute_batch("INSERT INTO session_inbox SELECT id,sender,recipient,project_source,payload,size,created_at,state,generation,read,blocked_reason,committed_at FROM inbox_fixture;
+            INSERT INTO session_inbox_operations SELECT * FROM operations_fixture;
+            DROP TABLE operations_fixture; DROP TABLE inbox_fixture;
+            PRAGMA user_version=2; COMMIT;")?;
+    }
+    let stores = Stores::open_for_test(root.path())?;
+    let a = stores.open_session(A)?;
+    let b = stores.open_session(B)?;
+    let id = a.send_peer(&b, "operation", "accepted")?;
+    assert_eq!(b.inbox(false)?[0].state, "claimed");
+    assert_eq!(b.delivery_owner()?.next_peer()?.unwrap().id, id);
+    a.delete()?;
+    assert_eq!(b.inbox(false)?[0].state, "context_committed");
+    Ok(())
+}
+
+#[test]
+fn review_frozen_rewound_tool_cancels_and_unblocks_fifo() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let b = s.create(B, Default::default())?;
+    let msg = b.write(|w| {
+        let m = w.append("assistant", "")?;
+        w.tool(&tool("tool", &m, 0), None)?;
+        Ok(m)
+    })?;
+    for key in ["one", "two"] {
+        b.enqueue(key, &json!(key), QueueMode::Steer)?;
+    }
+    let stop = s.with_fault_hook(|p| {
+        ensure!(p != Phase::DeliveryClaimed, "cut");
+        Ok(())
+    });
+    assert!(stop
+        .open_session(B)?
+        .delivery_owner()?
+        .next_queue(QueueMode::Steer, Some("tool"))
+        .is_err());
+    b.write(|w| w.rewind_from(&msg))?;
+    let mut owner = b.delivery_owner()?;
+    assert!(!owner.next_queue(QueueMode::Steer, None)?.unwrap().applied);
+    assert_eq!(
+        b.queue_items()?[0].state,
+        deepseek_code_core::services::input_queue::QueueState::Cancelled
+    );
+    assert!(owner.next_queue(QueueMode::Steer, None)?.unwrap().applied);
+    assert_eq!(b.read(|r| r.receipt_count())?, 1);
+    Ok(())
+}
+
+#[test]
+fn review_running_turn_consumes_steer_once() -> Result<()> {
+    let root = tempdir()?;
+    let b = Stores::open_for_test(root.path())?.create(B, Default::default())?;
+    let mut owner = b.delivery_owner()?;
+    let turn = b.write(|w| w.start_turn())?;
+    for key in ["one", "two"] {
+        b.enqueue(key, &json!(key), QueueMode::Steer)?;
+        assert!(owner.next_queue(QueueMode::Steer, None)?.unwrap().applied);
+    }
+    b.write(|w| w.finish_turn(&turn, TurnStatus::Completed, 10))?;
+    assert!(owner.begin_generation()?.is_none());
+    assert_eq!(b.read(|r| r.receipt_count())?, 2);
+    assert_eq!(b.read(|r| r.messages())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
+    use deepseek_code_core::services::input_queue::QueueError;
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let b = s.create(B, Default::default())?;
+    let input = json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]);
+    let item = b.enqueue("image", &input, QueueMode::NextTurn)?;
+    let edit = |id, rev| {
+        b.edit_queue(id, rev, QueueEdit::Text("edit"))
+            .unwrap_err()
+            .downcast::<QueueError>()
+            .unwrap()
+    };
+    assert_eq!(
+        edit(item.id, item.revision),
+        QueueError::AttachmentsReadOnly
+    );
+    let stop = s.with_fault_hook(|p| {
+        ensure!(p != Phase::DeliveryClaimed, "cut");
+        Ok(())
+    });
+    assert!(stop
+        .open_session(B)?
+        .delivery_owner()?
+        .next_queue(QueueMode::NextTurn, None)
+        .is_err());
+    assert_eq!(edit(item.id, item.revision), QueueError::Conflict);
+    assert_eq!(
+        edit(item.id, b.queue_items()?[0].revision),
+        QueueError::Conflict
+    );
+    assert_eq!(edit(999, 1), QueueError::NotFound);
+    Ok(())
+}
