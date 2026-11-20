@@ -7,7 +7,7 @@ import { planModeFromTool, approvedPermissionModeFromTool } from '../features/st
 import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, AlertTriangle, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, Loader2, Smartphone, Terminal, Monitor } from 'lucide-react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconWebSearch } from './Icons';
-import ClaudeLogo from './ClaudeLogo';
+import DeepSeekCodeLogo from './DeepSeekCodeLogo';
 import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getGenerationStatus, stopGeneration, getContextSize, getStreamStatus, reconnectStream, getSkills, warmEngine, getProjects, getProject, createProjectConversation, attachConversationToProject, Project, getProviders } from '../api';
 import { listSkillCommands } from '../api/skills';
 import ToolPermissionPrompt from './ToolPermissionPrompt';
@@ -1937,7 +1937,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             style={{ marginBottom: 0 }}
           >
             <div className="w-[80px] h-[80px] shrink-0 flex items-center justify-center -mx-[16px]" style={{ marginTop: '-16px', marginBottom: '-16px' }}>
-              <ClaudeLogo color="#D97757" maxScale={0.17} />
+              <DeepSeekCodeLogo color="#D97757" maxScale={0.17} />
             </div>
             <h1
               className="min-w-0 text-deepseek-text dark:!text-[#d6cec3] tracking-tight leading-tight pt-1 transition-all duration-100 ease-out"
