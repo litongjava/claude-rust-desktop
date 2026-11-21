@@ -560,3 +560,51 @@ async fn im_host_resumes_transport_threads_and_reads_only_their_messages() -> Re
     assert!(stores.conversations()?.is_empty());
     Ok(())
 }
+
+#[test]
+fn project_chat_rechecks_trust_and_recovers_the_prepared_workspace() -> Result<()> {
+    use deepseek_code_core::db::{
+        conversation_repo::WorkspaceMode,
+        session_store::{Phase, ProjectEdit, Projects},
+    };
+    let root = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let folders = vec![workspace.path().to_string_lossy().into_owned()];
+    stores.create_project(
+        "project",
+        &ProjectEdit {
+            name: Some("Project".into()),
+            folders: Some(folders.clone()),
+            ..Default::default()
+        },
+    )?;
+    assert!(stores
+        .create_project_chat("project", None, None, WorkspaceMode::Code, None, false)
+        .is_err());
+    stores.trust_project("project", &folders)?;
+    let fault = stores.with_fault_hook(|phase| {
+        anyhow::ensure!(phase != Phase::Sealed, "interrupted after seal");
+        Ok(())
+    });
+    assert!(fault
+        .create_project_chat(
+            "project",
+            Some("Desktop chat"),
+            None,
+            WorkspaceMode::Code,
+            None,
+            false
+        )
+        .is_err());
+    let reopened = Stores::open_for_test(root.path())?;
+    let (project, _, chats) = reopened.project_detail("project")?;
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].project_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(chats[0].title.as_deref(), Some("Desktop chat"));
+    assert_eq!(
+        reopened.open_session(&chats[0].id)?.workspace()?,
+        workspace.path().canonicalize()?
+    );
+    Ok(())
+}

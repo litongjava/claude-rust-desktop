@@ -82,6 +82,8 @@ struct Metadata {
     project: Option<Project>,
     #[serde(default)]
     sync: Option<sync::SyncPublication>,
+    #[serde(default)]
+    prepared: Option<crate::worktree::session::PreparedWorkspace>,
 }
 #[derive(Serialize, Deserialize, PartialEq)]
 enum Project {
@@ -257,6 +259,7 @@ enum Seed<'a> {
     New,
     Fork(&'a SessionDb, Branch<'a>),
     Import(&'a import::LegacySession),
+    Project(&'a Project, &'a crate::worktree::session::PreparedWorkspace),
     Sync(sync::SyncSeed<'a>),
 }
 
@@ -265,6 +268,53 @@ impl Stores {
         let key = storage_key(id)?;
         let _locks = self.group_access(vec![(&key, true, true)])?;
         self.create_locked(id, options, Seed::New, None)
+    }
+
+    pub fn create_project_chat(
+        &self,
+        project_id: &str,
+        title: Option<&str>,
+        model: Option<&str>,
+        mode: crate::db::conversation_repo::WorkspaceMode,
+        branch: Option<&str>,
+        use_worktree: bool,
+    ) -> Result<crate::db::conversation_repo::ConversationRow> {
+        let id = Uuid::new_v4().to_string();
+        let key = storage_key(&id)?;
+        let guards = self.group_access(vec![(&key, true, true)])?;
+        let selection = ProjectSelection::Existing(project_id.to_owned());
+        let plan = self.global().read(|c| Project::select(c, &selection))?;
+        let Project::Selected {
+            workspace: Some(source),
+            ..
+        } = &plan
+        else {
+            bail!("Project has no folder");
+        };
+        let prepared = crate::worktree::session::prepare(Path::new(source), branch, use_worktree)?;
+        let result = self.create_locked(
+            &id,
+            CreateOptions {
+                title: title.map(str::to_owned),
+                model: model.map(str::to_owned),
+                workspace_mode: Some(mode.as_str().into()),
+                project: Some(selection),
+                ..Default::default()
+            },
+            Seed::Project(&plan, &prepared),
+            None,
+        );
+        if let Err(error) = result {
+            // Recovery may still publish a sealed intent referencing this worktree.
+            if self.pending(&key)?.is_none() && self.global().incarnation(&id, &key)?.is_none() {
+                prepared.cleanup();
+            }
+            return Err(error);
+        }
+        drop(guards);
+        self.global()
+            .conversation(&id)?
+            .context("Published project conversation unavailable")
     }
 
     fn prepare(
@@ -287,7 +337,21 @@ impl Stores {
             matches!(mode.as_str(), "chat" | "work" | "study" | "code"),
             "Invalid workspace mode"
         );
-        let copied = !matches!(seed, Seed::New);
+        let project = options
+            .project
+            .as_ref()
+            .map(|p| Project::select(tx, p))
+            .transpose()?;
+        let prepared = if let Seed::Project(expected, prepared) = seed {
+            ensure!(
+                project.as_ref() == Some(*expected),
+                "Project changed while preparing the workspace"
+            );
+            Some((*prepared).clone())
+        } else {
+            None
+        };
+        let copied = !matches!(seed, Seed::New | Seed::Project(..));
         let meta = Metadata {
             initial_shape: (!copied).then(|| {
                 (
@@ -319,11 +383,8 @@ impl Stores {
                 }),
                 _ => None,
             },
-            project: options
-                .project
-                .as_ref()
-                .map(|p| Project::select(tx, p))
-                .transpose()?,
+            project,
+            prepared,
         };
         Ok((op, meta))
     }
@@ -405,7 +466,7 @@ impl Stores {
                     }
                 }
                 match seed {
-                    Seed::New => {}
+                    Seed::New | Seed::Project(..) => {}
                     Seed::Fork(source, boundary) => copy::copy_snapshot(
                         source,
                         tx,
@@ -719,6 +780,17 @@ impl Stores {
         tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
             workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status,git_branch,request_count,input_tokens,output_tokens,total_tokens)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status,p.git_branch,p.request_count,p.input_tokens,p.output_tokens,p.total_tokens])?;
+        if let Some(prepared) = &meta.prepared {
+            let project = project.as_deref().context("Missing prepared project")?;
+            let source = workspace
+                .as_deref()
+                .context("Missing prepared project folder")?;
+            prepared.save(tx, &op.id, project, source)?;
+            tx.execute(
+                "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
+                params![prepared.path.to_string_lossy(), op.id],
+            )?;
+        }
         if let Some(sync) = &meta.sync {
             tx.execute("UPDATE conversations SET pinned=?1,archived=?2,workspace_path=coalesce(?3,workspace_path) WHERE id=?4",
                 params![sync.pinned,sync.archived,sync.workspace_path,op.id])?;

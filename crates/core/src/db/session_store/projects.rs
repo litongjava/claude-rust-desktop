@@ -184,3 +184,67 @@ impl Projects for crate::db::DbManager {
         })?
     }
 }
+
+impl crate::db::DbManager {
+    pub fn create_project_chat(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        model: Option<&str>,
+        mode: crate::db::conversation_repo::WorkspaceMode,
+        branch: Option<&str>,
+        use_worktree: bool,
+    ) -> Result<ConversationRow> {
+        use crate::db::conversation_repo as chats;
+        let project = self.trusted_project(id)?;
+        anyhow::ensure!(!project.is_archived, "Select an active project");
+        let source = project
+            .workspace_path
+            .as_deref()
+            .context("Project has no folder")?;
+        let prepared =
+            crate::worktree::session::prepare(std::path::Path::new(source), branch, use_worktree)?;
+        let chat = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let saved = self
+            .with_conn(|c| {
+                crate::db::write_tx(
+                    c,
+                    "create project conversation",
+                    super::WRITE_DEADLINE,
+                    |tx| {
+                        let current = project::require_trusted(tx, id)?;
+                        anyhow::ensure!(
+                            !current.is_archived
+                                && current.workspace_path == project.workspace_path,
+                            "Project selection changed"
+                        );
+                        chats::insert_conversation(
+                            tx,
+                            &chat,
+                            title,
+                            model,
+                            None,
+                            Some(&prepared.path.to_string_lossy()),
+                            Some(id),
+                            false,
+                            false,
+                            false,
+                            &now,
+                            &now,
+                            0,
+                        )?;
+                        prepared.save(tx, &chat, id, source)?;
+                        chats::set_workspace_mode(tx, &chat, mode.as_str())?;
+                        chats::get_conversation(tx, &chat)?
+                            .context("Project conversation unavailable")
+                    },
+                )
+            })
+            .and_then(|r| r);
+        if saved.is_err() {
+            prepared.cleanup();
+        }
+        saved
+    }
+}
