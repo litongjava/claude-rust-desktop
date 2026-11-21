@@ -69,7 +69,7 @@ fn concurrent_first_open_shares_one_directory_and_pool() {
             let root = tmp.path().join(".");
             jobs.push(scope.spawn(move || {
                 gate.wait();
-                Stores::open_for_test(&root).unwrap()
+                Stores::open(&root).unwrap()
             }));
         }
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
@@ -86,7 +86,7 @@ fn concurrent_first_open_shares_one_directory_and_pool() {
 #[test]
 fn two_creates_racing_for_one_id_publish_exactly_once() {
     let tmp = tempdir().unwrap();
-    let stores = Stores::open_for_test(tmp.path()).unwrap();
+    let stores = Stores::open(tmp.path()).unwrap();
     let gate = Barrier::new(2);
     let outcomes = thread::scope(|scope| {
         let jobs: Vec<_> = (0..2)
@@ -134,7 +134,7 @@ fn legacy_database_wal_and_shm_remain_untouched() {
         w
     };
     let run = || {
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         let session = s.create(ID, first()).unwrap();
         session.set_archived(true).unwrap();
         drop(s.open_session(ID).unwrap());
@@ -169,7 +169,7 @@ fn legacy_database_wal_and_shm_remain_untouched() {
 #[test]
 fn exact_logical_ids_have_distinct_safe_storage_keys() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     for id in [
         ID,
         &ID.to_uppercase(),
@@ -207,7 +207,7 @@ fn exact_logical_ids_have_distinct_safe_storage_keys() {
 #[test]
 fn archive_and_stale_handles_are_fenced_by_incarnation() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     let old = s.create(ID, first()).unwrap();
     let previous = old.incarnation().to_owned();
     old.set_archived(true).unwrap();
@@ -257,7 +257,7 @@ fn invalid_session_files_fail_closed_without_recreation() {
         "incarnation",
     ] {
         let tmp = tempdir().unwrap();
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         let h = s.create(ID, first()).unwrap();
         let path = shard(tmp.path());
         match damage {
@@ -289,7 +289,7 @@ fn invalid_session_files_fail_closed_without_recreation() {
 fn invalid_global_files_fail_closed_without_reinitialization() {
     for damage in ["missing", "corrupt", "kind", "newer", "empty", "wal"] {
         let tmp = tempdir().unwrap();
-        drop(Stores::open_for_test(tmp.path()).unwrap());
+        drop(Stores::open(tmp.path()).unwrap());
         let path = tmp.path().join("global.db");
         match damage {
             "missing" => fs::remove_file(&path).unwrap(),
@@ -303,7 +303,7 @@ fn invalid_global_files_fail_closed_without_reinitialization() {
                 })
                 .unwrap(),
         }
-        assert!(Stores::open_for_test(tmp.path()).is_err(), "{damage}");
+        assert!(Stores::open(tmp.path()).is_err(), "{damage}");
         if damage == "missing" {
             assert!(!path.exists());
         }
@@ -326,7 +326,7 @@ fn recover_every_create_boundary() {
         Published,
     ] {
         let tmp = tempdir().unwrap();
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         let result = stop_at(&s, phase).create(ID, first());
         assert!(
             format!("{:#}", result.err().unwrap()).contains("interrupt at"),
@@ -337,7 +337,7 @@ fn recover_every_create_boundary() {
             i64::from(phase == Published)
         );
         drop(s);
-        let reopened = Stores::open_for_test(tmp.path()).unwrap();
+        let reopened = Stores::open(tmp.path()).unwrap();
         assert_eq!(pending(tmp.path()), 0);
         assert_eq!(count(tmp.path(), "sessions/.staging"), 0);
         if matches!(
@@ -380,21 +380,21 @@ fn recover_every_delete_boundary_without_resurrection() {
         Retired,
     ] {
         let tmp = tempdir().unwrap();
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         let crash = stop_at(&s, phase);
         let h = crash.create(ID, first()).unwrap();
         let old = h.incarnation().to_owned();
         assert!(format!("{:#}", h.delete().unwrap_err()).contains("interrupt at"));
         if phase == BeforeDeleteIntentCommit {
             drop((h, s, crash));
-            let reopened = Stores::open_for_test(tmp.path()).unwrap();
+            let reopened = Stores::open(tmp.path()).unwrap();
             assert_eq!(reopened.open_session(ID).unwrap().incarnation(), old);
             assert_eq!(pending(tmp.path()), 0);
             continue;
         }
         assert!(s.open_session(ID).is_err());
         drop((h, s, crash));
-        let reopened = Stores::open_for_test(tmp.path()).unwrap();
+        let reopened = Stores::open(tmp.path()).unwrap();
         assert!(reopened.open_session(ID).is_err());
         assert_eq!(pending(tmp.path()), 0);
         assert_eq!(count(tmp.path(), "sessions/.trash"), 0);
@@ -412,7 +412,7 @@ fn recover_every_delete_boundary_without_resurrection() {
 #[test]
 fn publication_rechecks_project_trust_and_quarantines_conflict() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     let workspace = tmp.path().join("project");
     fs::create_dir(&workspace).unwrap();
     s.create(
@@ -437,7 +437,7 @@ fn publication_rechecks_project_trust_and_quarantines_conflict() {
     g.execute("UPDATE project_folders SET trusted=0", [])
         .unwrap();
     drop(s);
-    let reopened = Stores::open_for_test(tmp.path()).unwrap();
+    let reopened = Stores::open(tmp.path()).unwrap();
     assert!(reopened.open_session(ID).is_err());
     assert!(reopened.open_session("a").is_ok());
     assert!(!shard(tmp.path()).exists());
@@ -455,13 +455,13 @@ fn publication_rechecks_project_trust_and_quarantines_conflict() {
 #[test]
 fn orphaned_session_never_becomes_visible() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     s.create(ID, first()).unwrap();
     global(tmp.path())
         .execute("DELETE FROM conversations", [])
         .unwrap();
     drop(s);
-    let reopened = Stores::open_for_test(tmp.path()).unwrap();
+    let reopened = Stores::open(tmp.path()).unwrap();
     assert!(reopened.open_session(ID).is_err());
     assert!(!shard(tmp.path()).exists());
     assert_eq!(count(tmp.path(), "sessions/.quarantine"), 1);
@@ -471,7 +471,7 @@ fn orphaned_session_never_becomes_visible() {
 fn damaged_or_foreign_seals_are_quarantined_while_other_sessions_open() {
     for damage in ["bytes", "operation", "incarnation", "newer"] {
         let tmp = tempdir().unwrap();
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         s.create("other", first()).unwrap();
         assert!(stop_at(&s, Phase::Sealed).create(ID, first()).is_err());
         let stage = fs::read_dir(tmp.path().join("sessions/.staging"))
@@ -494,7 +494,7 @@ fn damaged_or_foreign_seals_are_quarantined_while_other_sessions_open() {
                 .unwrap();
         }
         drop(s);
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         assert!(s.open_session(ID).is_err());
         assert!(s.open_session("other").is_ok());
         assert_eq!(pending(tmp.path()), 0);
@@ -513,8 +513,8 @@ fn damaged_or_foreign_seals_are_quarantined_while_other_sessions_open() {
 fn journal_paths_and_cross_root_identity_are_checked_before_use() {
     let a = tempdir().unwrap();
     let b = tempdir().unwrap();
-    let sa = Stores::open_for_test(a.path()).unwrap();
-    let sb = Stores::open_for_test(b.path()).unwrap();
+    let sa = Stores::open(a.path()).unwrap();
+    let sb = Stores::open(b.path()).unwrap();
     let a_handle = sa.create(ID, first()).unwrap();
     let b_handle = sb.create(ID, first()).unwrap();
     // Match logical ID and incarnation so that only the store UUID distinguishes the files.
@@ -537,7 +537,8 @@ fn journal_paths_and_cross_root_identity_are_checked_before_use() {
         .execute("UPDATE lifecycle SET operation='../outside'", [])
         .unwrap();
     fs::write(a.path().join("outside"), "sentinel").unwrap();
-    assert!(Stores::open_for_test(a.path()).is_err());
+    drop((a_handle, sa));
+    assert!(Stores::open(a.path()).is_err());
     assert_eq!(fs::read(a.path().join("outside")).unwrap(), b"sentinel");
 }
 
@@ -546,7 +547,7 @@ fn session_capacity_is_process_wide_and_releases_after_snapshots() {
     let dirs = [tempdir().unwrap(), tempdir().unwrap()];
     let stores: Vec<_> = dirs
         .iter()
-        .map(|p| Stores::open_for_test(p.path()).unwrap())
+        .map(|p| Stores::open(p.path()).unwrap())
         .collect();
     let handles: Vec<_> = stores
         .iter()
@@ -588,7 +589,7 @@ fn session_capacity_is_process_wide_and_releases_after_snapshots() {
 #[test]
 fn global_pool_allows_four_concurrent_checkouts() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     let (entered, seen) = mpsc::channel();
     let mut jobs = vec![];
     let mut releases = vec![];
@@ -680,7 +681,7 @@ fn subprocess() -> Result<()> {
     if mode.starts_with("race") {
         fs::write(root.join(&mode), [])?;
         wait_file(&root.join("go"));
-        let s = Stores::open_for_test(&root)?;
+        let s = Stores::open(&root)?;
         let result = s.create(ID, first());
         fs::write(
             root.join(format!("{mode}.result")),
@@ -693,7 +694,7 @@ fn subprocess() -> Result<()> {
         return Ok(());
     }
     if mode == "reject-delete" {
-        let deletion = Stores::open_for_test(&root).and_then(|s| s.open_session(ID)?.delete());
+        let deletion = Stores::open(&root).and_then(|s| s.open_session(ID)?.delete());
         anyhow::ensure!(
             deletion.is_err(),
             "deleted under another process's shared lock"
@@ -702,12 +703,12 @@ fn subprocess() -> Result<()> {
     }
     if mode == "reject-open" {
         anyhow::ensure!(
-            Stores::open_for_test(&root).is_err(),
+            Stores::open(&root).is_err(),
             "acknowledged failed directory barrier"
         );
         return Ok(());
     }
-    let s = Stores::open_for_test(&root)?;
+    let s = Stores::open(&root)?;
     let hold = || -> Result<()> {
         fs::write(root.join("ready"), [])?;
         wait_file(&root.join("release"));
@@ -809,7 +810,7 @@ fn simultaneous_processes_bootstrap_and_race_create() {
         .map(|name| fs::read_to_string(tmp.path().join(name)).unwrap());
     outcomes.sort();
     assert_eq!(outcomes, ["created", "rejected"]);
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     assert_eq!(
         s.open_session(ID)
             .unwrap()
@@ -845,7 +846,7 @@ fn killing_writer_releases_lock_and_replays_only_sealed_work() {
             assert!(fs::metadata(stage.join("session.db-wal")).unwrap().len() > 32);
         }
         child.kill_and_wait();
-        let s = Stores::open_for_test(tmp.path()).unwrap();
+        let s = Stores::open(tmp.path()).unwrap();
         assert_eq!(pending(tmp.path()), 0);
         if mode == "before-seal" {
             assert!(s.open_session(ID).is_err());
@@ -865,7 +866,7 @@ fn killing_writer_releases_lock_and_replays_only_sealed_work() {
 #[test]
 fn active_child_snapshot_holds_off_delete_until_connection_closes() {
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     let h = s.create(ID, first()).unwrap();
     let mut child = Worker::start(tmp.path(), "snapshot");
     wait_file(&tmp.path().join("ready"));
@@ -900,7 +901,7 @@ fn active_child_snapshot_holds_off_delete_until_connection_closes() {
 fn windows_sharing_violation_preserves_tombstone_for_retry() {
     use std::os::windows::fs::OpenOptionsExt;
     let tmp = tempdir().unwrap();
-    let s = Stores::open_for_test(tmp.path()).unwrap();
+    let s = Stores::open(tmp.path()).unwrap();
     let h = s.create(ID, first()).unwrap();
     let file = fs::File::options()
         .read(true)
@@ -910,12 +911,12 @@ fn windows_sharing_violation_preserves_tombstone_for_retry() {
     assert!(h.delete().is_err());
     assert!(s.open_session(ID).is_err());
     assert_eq!(pending(tmp.path()), 1);
-    assert!(Stores::open_for_test(tmp.path())
+    assert!(Stores::open(tmp.path())
         .unwrap()
         .open_session(ID)
         .is_err());
-    drop(file);
-    drop(Stores::open_for_test(tmp.path()).unwrap());
+    drop((file, h, s));
+    drop(Stores::open(tmp.path()).unwrap());
     assert_eq!(pending(tmp.path()), 0);
 }
 
@@ -926,9 +927,9 @@ fn fix_round_supported_format_checks_columns_tables_and_live_seal() {
         "ALTER TABLE project_folders DROP COLUMN trusted",
     ] {
         let root = tempdir().unwrap();
-        drop(Stores::open_for_test(root.path()).unwrap());
+        drop(Stores::open(root.path()).unwrap());
         global(root.path()).execute_batch(change).unwrap();
-        assert!(Stores::open_for_test(root.path()).is_err(), "{change}");
+        assert!(Stores::open(root.path()).is_err(), "{change}");
     }
     for change in [
         "DROP TABLE message_user_content",
@@ -937,7 +938,7 @@ fn fix_round_supported_format_checks_columns_tables_and_live_seal() {
         "UPDATE manifest SET sealed_operation='bogus'",
     ] {
         let root = tempdir().unwrap();
-        let stores = Stores::open_for_test(root.path()).unwrap();
+        let stores = Stores::open(root.path()).unwrap();
         let h = stores.create(ID, first()).unwrap();
         Connection::open(shard(root.path()))
             .unwrap()
@@ -960,7 +961,7 @@ fn fix_round_structural_damage_is_quarantined_before_publication_or_retirement()
         (true, "corrupt file"),
     ] {
         let root = tempdir()?;
-        let stores = Stores::open_for_test(root.path())?;
+        let stores = Stores::open(root.path())?;
         stores.create("healthy", first())?;
         let path = if deleting {
             stores.create(ID, first())?;
@@ -986,7 +987,7 @@ fn fix_round_structural_damage_is_quarantined_before_publication_or_retirement()
         }
         drop(stores);
         for _ in 0..2 {
-            let s = Stores::open_for_test(root.path())?;
+            let s = Stores::open(root.path())?;
             assert!(s.open_session(ID).is_err());
             s.open_session("healthy")?;
             assert_eq!(pending(root.path()), 0);
@@ -1015,7 +1016,7 @@ fn fix_round_namespace_loss_cannot_split_an_active_snapshot() -> Result<()> {
         &format!("session-locks/{ID}"),
     ] {
         let root = tempdir()?;
-        let stores = Stores::open_for_test(root.path())?;
+        let stores = Stores::open(root.path())?;
         let handle = stores.create(ID, first())?;
         let mut holder = Worker::start(root.path(), "snapshot");
         wait_file(&root.path().join("ready"));
@@ -1037,7 +1038,7 @@ fn fix_round_namespace_loss_cannot_split_an_active_snapshot() -> Result<()> {
 #[test]
 fn fix_round_transaction_callback_cannot_upgrade_a_shared_lock() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     stores.create(ID, first())?;
     Worker::start(root.path(), "nested-archive").expect_success();
     assert!(!stores.global().conversation(ID)?.unwrap().archived);
@@ -1047,7 +1048,7 @@ fn fix_round_transaction_callback_cannot_upgrade_a_shared_lock() -> Result<()> {
 #[test]
 fn fix_round_nested_read_cannot_wait_for_a_seventeenth_permit() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     stores.create(ID, first())?;
     Worker::start(root.path(), "nested-capacity").expect_success();
     stores.open_session(ID)?.delete()
@@ -1057,7 +1058,7 @@ fn fix_round_nested_read_cannot_wait_for_a_seventeenth_permit() -> Result<()> {
 fn fix_round_resident_readers_finish_a_killed_creators_sealed_intent() -> Result<()> {
     for directory_first in [true, false] {
         let root = tempdir()?;
-        let stores = Stores::open_for_test(root.path())?;
+        let stores = Stores::open(root.path())?;
         let mut child = Worker::start(root.path(), "sealed-wal");
         wait_file(&root.path().join("ready"));
         child.kill_and_wait();
@@ -1087,9 +1088,9 @@ fn fix_round_resident_readers_finish_a_killed_creators_sealed_intent() -> Result
 fn fix_round_pooled_global_reads_detect_path_replacement() -> Result<()> {
     let a = tempdir()?;
     let b = tempdir()?;
-    let stores = Stores::open_for_test(a.path())?;
+    let stores = Stores::open(a.path())?;
     let handle = stores.create(ID, first())?;
-    drop(Stores::open_for_test(b.path())?);
+    drop(Stores::open(b.path())?);
     assert!(stores.global().conversation(ID)?.is_some());
     fs::rename(b.path().join("global.db"), a.path().join("global.db"))?;
     assert!(stores.global().conversation(ID).is_err());
@@ -1101,8 +1102,8 @@ fn fix_round_pooled_global_reads_detect_path_replacement() -> Result<()> {
 fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
     let root = tempdir()?;
     let other = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
-    Stores::open_for_test(other.path())?.create(ID, first())?;
+    let stores = Stores::open(root.path())?;
+    Stores::open(other.path())?.create(ID, first())?;
     let foreign = shard(other.path());
     let seal: String = query(
         &Connection::open(&foreign)?,
@@ -1144,7 +1145,7 @@ fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
         .is_err());
     global(root.path()).execute("DELETE FROM lifecycle", [])?;
     drop(stores);
-    drop(Stores::open_for_test(root.path())?);
+    drop(Stores::open(root.path())?);
     for dir in paths {
         assert!(dir.join("session.db").is_file());
         assert_eq!(
@@ -1167,7 +1168,7 @@ fn fix_round_orphan_sweep_requires_proof_of_local_ownership() -> Result<()> {
 #[test]
 fn orphan_sweep_recognizes_a_local_seal_in_a_killed_writers_wal() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let mut creator = Worker::start(root.path(), "sealed-wal");
     wait_file(&root.path().join("ready"));
     creator.kill_and_wait();
@@ -1178,7 +1179,7 @@ fn orphan_sweep_recognizes_a_local_seal_in_a_killed_writers_wal() -> Result<()> 
     assert!(stage.join("session.db-wal").metadata()?.len() > 32);
     global(root.path()).execute("DELETE FROM lifecycle", [])?;
     drop(stores);
-    let reopened = Stores::open_for_test(root.path())?;
+    let reopened = Stores::open(root.path())?;
     assert!(reopened.open_session(ID).is_err());
     assert!(!stage.exists());
     assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
@@ -1186,11 +1187,13 @@ fn orphan_sweep_recognizes_a_local_seal_in_a_killed_writers_wal() -> Result<()> 
 }
 
 #[test]
-fn fix_round_bootstrap_requires_a_durable_existing_data_root() -> Result<()> {
+fn export_requires_an_existing_root_and_host_startup_creates_it() -> Result<()> {
     let parent = tempdir()?;
     let missing = parent.path().join("missing/nested");
-    assert!(Stores::open_for_test(&missing).is_err());
+    assert!(Stores::export_session(&missing, ID, std::io::sink()).is_err());
     assert!(!missing.exists());
+    Stores::open(&missing)?;
+    assert!(missing.join("global.db").is_file());
     Ok(())
 }
 
@@ -1198,7 +1201,7 @@ fn fix_round_bootstrap_requires_a_durable_existing_data_root() -> Result<()> {
 fn partial_trash_removal_replays_only_after_cleanup_is_authorized() -> Result<()> {
     for authorized in [false, true] {
         let root = tempdir()?;
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let at = if authorized {
             Phase::BeforeTrashRemoval
         } else {
@@ -1213,7 +1216,7 @@ fn partial_trash_removal_replays_only_after_cleanup_is_authorized() -> Result<()
                 .join("session.db"),
         )?;
         drop((h, s));
-        let reopened = Stores::open_for_test(root.path())?;
+        let reopened = Stores::open(root.path())?;
         assert!(reopened.open_session(ID).is_err());
         assert_eq!(pending(root.path()), 0);
         assert_eq!(count(root.path(), "sessions/.trash"), 0);
@@ -1258,7 +1261,7 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
         assert!(global_db.is_file());
         assert!(!root.join("session-locks/.initialized").exists());
     }
-    let stores = Stores::open_for_test(&root)?;
+    let stores = Stores::open(&root)?;
     assert!(stop_at(&stores, Phase::Sealed).create(ID, first()).is_err());
     let stage_parent = root.join("sessions/.staging");
     let op: String = query(&global(&root), "SELECT operation FROM lifecycle");
@@ -1270,7 +1273,7 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
         reject(&root, sync, &quarantine.join(&op))?;
         assert_eq!(pending(&root), 1);
     }
-    let stores = Stores::open_for_test(&root)?;
+    let stores = Stores::open(&root)?;
     assert_eq!(pending(&root), 0);
     assert!(stores.open_session(ID).is_err());
     assert!(
@@ -1279,7 +1282,7 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
 
     let orphan_root = tempdir()?;
     let root = orphan_root.path().canonicalize()?;
-    Stores::open_for_test(&root)?.create(ID, first())?;
+    Stores::open(&root)?.create(ID, first())?;
     global(&root).execute("DELETE FROM conversations", [])?;
     let quarantine = root.join("sessions/.quarantine");
     for parent in [&quarantine, &quarantine, &root.join("sessions")] {
@@ -1287,14 +1290,14 @@ fn fix_round_rename_recovery_retries_both_parent_barriers() -> Result<()> {
         assert_eq!(count(&root, "sessions/.quarantine"), 1);
         assert!(!shard(&root).exists());
     }
-    assert!(Stores::open_for_test(&root)?.open_session(ID).is_err());
+    assert!(Stores::open(&root)?.open_session(ID).is_err());
     Ok(())
 }
 
 #[test]
 fn round2_disjoint_registration_finishes_during_source_snapshot() -> Result<()> {
     let root = tempdir()?;
-    Stores::open_for_test(root.path())?.create(ID, first())?;
+    Stores::open(root.path())?.create(ID, first())?;
     Worker::start(root.path(), "disjoint-registration").expect_success();
     Ok(())
 }
@@ -1311,7 +1314,7 @@ fn round2_typed_history_must_be_readable_before_publish_and_on_open() -> Result<
     ] {
         for staged in [true, false] {
             let root = tempdir()?;
-            let s = Stores::open_for_test(root.path())?;
+            let s = Stores::open(root.path())?;
             let path = if staged {
                 assert!(stop_at(&s, Phase::Sealed).create(ID, first()).is_err());
                 fs::read_dir(root.path().join("sessions/.staging"))?
@@ -1326,7 +1329,7 @@ fn round2_typed_history_must_be_readable_before_publish_and_on_open() -> Result<
             Connection::open(path)?.execute_batch(change)?;
             if staged {
                 drop(s);
-                let reopened = Stores::open_for_test(root.path())?;
+                let reopened = Stores::open(root.path())?;
                 assert!(reopened.global().conversation(ID)?.is_none(), "{change}");
                 assert_eq!(pending(root.path()), 0);
                 assert_eq!(count(root.path(), "sessions/.quarantine"), 1);
@@ -1336,7 +1339,7 @@ fn round2_typed_history_must_be_readable_before_publish_and_on_open() -> Result<
         }
     }
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let deep = (0..150).fold(serde_json::Value::Null, |v, _| {
         serde_json::Value::Array(vec![v])
     });
@@ -1356,7 +1359,7 @@ fn round2_pending_shard_path_damage_is_local_to_create_and_delete() -> Result<()
         }
         for deleting in [false, true] {
             let root = tempdir()?;
-            let s = Stores::open_for_test(root.path())?;
+            let s = Stores::open(root.path())?;
             s.create("healthy", first())?;
             let path = if deleting {
                 let handle = stop_at(&s, Phase::DeleteIntent).create(ID, first())?;
@@ -1386,7 +1389,7 @@ fn round2_pending_shard_path_damage_is_local_to_create_and_delete() -> Result<()
             }
             drop(s);
             for _ in 0..2 {
-                let reopened = Stores::open_for_test(root.path())?;
+                let reopened = Stores::open(root.path())?;
                 assert_eq!(
                     reopened
                         .open_session("healthy")?

@@ -97,7 +97,7 @@ fn process_worker() -> Result<()> {
         c.execute_batch("ROLLBACK")?;
         return Ok(());
     }
-    let s = Stores::open_for_test(&root)?;
+    let s = Stores::open(&root)?;
     match action.as_str() {
         "dispatch" => {
             let mut owner = s.open_session(B)?.delivery_owner()?;
@@ -143,7 +143,7 @@ fn process_worker() -> Result<()> {
 fn admitted_mcp_result_is_durable_while_another_writer_remains_locked() -> Result<()> {
     for action in ["block-session", "block-global"] {
         let root = tempdir()?;
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         let b = s.create(B, Default::default())?;
         let mut worker = Worker::start(root.path(), action)?;
@@ -189,7 +189,7 @@ fn killed_delivery_owners_recover_one_effect_and_one_dispatch() -> Result<()> {
     for kind in ["queue", "tool", "peer"] {
         for phase in ["claim", "commit", "ack"] {
             let root = tempdir()?;
-            let s = Stores::open_for_test(root.path())?;
+            let s = Stores::open(root.path())?;
             let a = s.create(A, project(root.path()))?;
             let b = s.create(B, project(root.path()))?;
             if kind == "queue" {
@@ -256,7 +256,7 @@ fn tool(id: &str, message: &str, n: i64) -> ToolCallRow {
 #[test]
 fn queue_revision_pause_tool_delivery_and_peer_revocation() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, project(root.path()))?;
     let b = s.create(B, project(root.path()))?;
     let q = b.enqueue("unique", &json!("earlier"), QueueMode::Steer)?;
@@ -320,7 +320,7 @@ fn queue_revision_pause_tool_delivery_and_peer_revocation() -> Result<()> {
 #[test]
 fn history_nested_replay_full_partial_clear_and_worker_address() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     let (turn,m)=a.write(|w|{w.append_user("first",&json!([{"type":"text","text":"user scope"}]))?;
         w.bind_agent("agent restrictions")?;let t=w.start_turn()?;let m=w.segment(&t)?;w.message_content(&m,"reply")?;
@@ -446,7 +446,7 @@ fn import_preview_replay_dedup_and_atomic_visibility() -> Result<()> {
     for phase in [Phase::Sealed, Phase::BeforePublishCommit] {
         let root = tempdir()?;
         let src = tempdir()?;
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         for id in ["a/one", "b/two"] {
             let json = json!({"id":id,"name":id,"created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-02T00:00:00Z","messages":[{"role":"assistant","content":"hello","timestamp":"2020-01-02T00:00:00Z"}]});
             fs::write(
@@ -470,7 +470,7 @@ fn import_preview_replay_dedup_and_atomic_visibility() -> Result<()> {
             0
         );
         drop((s, stopped));
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let n = global(root.path())?.query_row("SELECT count(*) FROM conversations", [], |r| {
             r.get::<_, usize>(0)
         })?;
@@ -497,7 +497,7 @@ fn fork_pins_one_snapshot_and_resets_local_compaction_count() -> Result<()> {
     use deepseek_code_core::native_engine::provider_manager::ApiFormat;
     use std::sync::{mpsc, Mutex};
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     let boundary = a.write(|w| {
         let id = w.append("assistant", "summary")?;
@@ -536,7 +536,7 @@ fn fork_pins_one_snapshot_and_resets_local_compaction_count() -> Result<()> {
 #[test]
 fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(
         A,
         CreateOptions {
@@ -587,7 +587,7 @@ fn streamed_occurrences_bind_typed_mcp_and_owned_workspace() -> Result<()> {
 #[test]
 fn projections_only_advance_and_identical_snapshots_leave_both_revisions_alone() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     let request = json!([{"id":"r","systemPrompt":"same","model":"model"}]);
     let m = a.write(|w| {
@@ -622,7 +622,7 @@ fn projections_only_advance_and_identical_snapshots_leave_both_revisions_alone()
 #[test]
 fn rewind_retires_undispatched_generation_and_fork_keeps_early_nested_origin() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     a.enqueue("request", &json!("withdrawn"), QueueMode::NextTurn)?;
     let mut owner = a.delivery_owner()?;
@@ -654,7 +654,7 @@ fn rewind_retires_undispatched_generation_and_fork_keeps_early_nested_origin() -
 #[test]
 fn private_child_never_resumes_in_a_reused_parents_workspace() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let parent = stores.create("../private/owner", Default::default())?;
     let original = parent.workspace()?;
     let child = parent.derive_owned_child("owned", &original)?;
@@ -708,7 +708,7 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
         )?;
         s.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES('m',?1,'user','old','now',0)",[A])?;
     }
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.open_session(A)?;
     assert_eq!(a.address().incarnation, inc);
     assert_eq!(a.read(|r| r.messages())?[0].content, "old");
@@ -724,7 +724,7 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
 fn simultaneous_inbox_consumers_commit_each_generation_in_fifo_order() -> Result<()> {
     use std::sync::{Arc, Barrier};
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, project(root.path()))?;
     let b = stores.create(B, project(root.path()))?;
     let g = global(root.path())?;
@@ -774,7 +774,7 @@ fn simultaneous_inbox_consumers_commit_each_generation_in_fifo_order() -> Result
 #[test]
 fn killed_executor_settles_its_started_turn_and_never_redispatches_it() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let b = stores.create(B, Default::default())?;
     b.enqueue("launch", &json!("work"), QueueMode::NextTurn)?;
     let mut worker = Worker::start(root.path(), "dispatch")?;
@@ -798,7 +798,7 @@ fn killed_executor_settles_its_started_turn_and_never_redispatches_it() -> Resul
 fn review_sender_retirement_preserves_recipient_outcome() -> Result<()> {
     for cut in [Phase::DeliveryClaimed, Phase::DeliveryCommitted] {
         let root = tempdir()?;
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, project(root.path()))?;
         let b = s.create(B, project(root.path()))?;
         let id = a.send_peer(&b, "op", "peer data")?;
@@ -832,7 +832,7 @@ fn review_sender_retirement_preserves_recipient_outcome() -> Result<()> {
 fn populated_v2_inbox_upgrades_with_outstanding_claim() -> Result<()> {
     let root = tempdir()?;
     {
-        let stores = Stores::open_for_test(root.path())?;
+        let stores = Stores::open(root.path())?;
         let sender = stores.create(A, project(root.path()))?;
         let recipient = stores.create(B, project(root.path()))?;
         sender.send_peer(&recipient, "operation", "accepted")?;
@@ -875,7 +875,7 @@ fn populated_v2_inbox_upgrades_with_outstanding_claim() -> Result<()> {
             ALTER TABLE conversations DROP COLUMN total_tokens;
             PRAGMA user_version=2; COMMIT;")?;
     }
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.open_session(A)?;
     let b = stores.open_session(B)?;
     let id = a.send_peer(&b, "operation", "accepted")?;
@@ -889,7 +889,7 @@ fn populated_v2_inbox_upgrades_with_outstanding_claim() -> Result<()> {
 #[test]
 fn review_frozen_rewound_tool_cancels_and_unblocks_fifo() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let b = s.create(B, Default::default())?;
     let msg = b.write(|w| {
         let m = w.append("assistant", "")?;
@@ -923,7 +923,7 @@ fn review_frozen_rewound_tool_cancels_and_unblocks_fifo() -> Result<()> {
 #[test]
 fn review_running_turn_consumes_steer_once() -> Result<()> {
     let root = tempdir()?;
-    let b = Stores::open_for_test(root.path())?.create(B, Default::default())?;
+    let b = Stores::open(root.path())?.create(B, Default::default())?;
     let mut owner = b.delivery_owner()?;
     let turn = b.write(|w| w.start_turn())?;
     for key in ["one", "two"] {
@@ -941,7 +941,7 @@ fn review_running_turn_consumes_steer_once() -> Result<()> {
 fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
     use deepseek_code_core::services::input_queue::QueueError;
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let b = s.create(B, Default::default())?;
     let input = json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]);
     let item = b.enqueue("image", &input, QueueMode::NextTurn)?;
@@ -976,7 +976,7 @@ fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
 #[test]
 fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let (m, last) = a.write(|w| {
         let first = w.append("assistant", "nested")?;
         let last = w.append("assistant", "later")?;
@@ -1015,7 +1015,7 @@ fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
 #[test]
 fn review_fork_rewrites_retry_and_compaction_references() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     a.write(|w|{
         let boundary=w.append("assistant","summary")?;
         w.native_boundary(&boundary,&json!({}))?;
@@ -1035,7 +1035,7 @@ fn review_fork_rewrites_retry_and_compaction_references() -> Result<()> {
 #[test]
 fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     a.write(|w| {
         w.append("user", "first")?;
@@ -1054,13 +1054,14 @@ fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
         "UPDATE messages SET thinking=CAST('bad' AS BLOB) WHERE sort_order=1",
         [],
     )?;
-    let again = Stores::open_for_test(root.path())?;
+    drop((stop, a, s));
+    let again = Stores::open(root.path())?;
     assert!(again.open_session(B).is_err());
     assert!(again.global().conversation(B)?.is_none());
     assert!(fs::read_dir(root.path().join("sessions/.quarantine"))?
         .next()
         .is_some());
-    assert_eq!(a.read(|r| r.messages())?.len(), 2);
+    assert_eq!(again.open_session(A)?.read(|r| r.messages())?.len(), 2);
     Ok(())
 }
 
@@ -1068,7 +1069,7 @@ fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
 fn review_import_keeps_selected_workspace_across_backup() -> Result<()> {
     use deepseek_code_core::db::project_repo;
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let old = tempdir()?;
     let new = tempdir()?;
     s.create(A, project(old.path()))?;
@@ -1111,7 +1112,7 @@ fn review_import_keeps_selected_workspace_across_backup() -> Result<()> {
 #[test]
 fn review_activity_is_monotonic_in_both_stores() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let input = root.path().join("import.json");
     let future = "2099-01-01T00:00:00Z";
     fs::write(
@@ -1148,7 +1149,7 @@ fn review_activity_is_monotonic_in_both_stores() -> Result<()> {
 #[test]
 fn review_directory_displays_clear_and_child_titles() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     for (id, kind) in [("clear", Branch::Clear), ("child", Branch::Child)] {
         let session = a.branch(id, kind)?;
@@ -1169,7 +1170,7 @@ fn review_directory_displays_clear_and_child_titles() -> Result<()> {
 #[test]
 fn review_rewind_removes_whole_tied_group() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let m = a.write(|w| {
         w.append("user", "first")?;
         let m = w.append("assistant", "second")?;
@@ -1188,7 +1189,7 @@ fn review_rewind_removes_whole_tied_group() -> Result<()> {
 #[test]
 fn review_unchanged_stream_preserves_each_occurrences_mcp_metadata() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let stream = |m: &str| {
         a.write(|w| {
             let mut row = tool("provider", m, 0);
@@ -1223,7 +1224,7 @@ fn review_unchanged_stream_preserves_each_occurrences_mcp_metadata() -> Result<(
 #[test]
 fn round2_delayed_stream_and_transport_replay_keep_occurrence_results() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let first = a.write(|w| w.append("assistant", "one"))?;
     let second = a.write(|w| w.append("assistant", "two"))?;
     let send = |message: &str, owner: &str| -> Result<()> {
@@ -1268,7 +1269,7 @@ fn round2_delayed_stream_and_transport_replay_keep_occurrence_results() -> Resul
 #[test]
 fn round2_partial_and_full_forks_preserve_snapshot_shapes() -> Result<()> {
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let object = json!({"id":"request-1","status":"completed"});
     let opaque = json!([true, null, 12, "text", ["nested"], {"unchanged":true}]);
     let (first, later) = a.write(|w| {

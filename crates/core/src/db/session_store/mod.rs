@@ -121,7 +121,6 @@ pub struct Stores {
 enum OpenMode {
     Host,
     Directory,
-    Reconcile,
 }
 
 impl Stores {
@@ -129,11 +128,6 @@ impl Stores {
         layout::allow_entry()?;
         std::fs::create_dir_all(path)?;
         Self::open_existing(path, OpenMode::Host)
-    }
-
-    #[doc(hidden)]
-    pub fn open_for_test(path: &Path) -> Result<Self> {
-        Self::open_existing(path, OpenMode::Reconcile)
     }
 
     /// Inspect the published directory from a short-lived listing process.
@@ -182,8 +176,7 @@ impl Stores {
             })
         };
         let stores = Self { root, fault: None, selected: None, router: None };
-        let initialized = stores.root.repair.get().is_some();
-        if !initialized {
+        if stores.root.repair.get().is_none() {
             drop(stores.namespace()?);
             if mode != OpenMode::Directory {
                 stores.reconcile()?;
@@ -192,10 +185,6 @@ impl Stores {
         }
         *cached = Arc::downgrade(&stores.root);
         drop(cached);
-        if initialized && mode == OpenMode::Reconcile {
-            drop(stores.namespace()?);
-            stores.reconcile()?;
-        }
         Ok(stores)
     }
 
@@ -708,7 +697,7 @@ mod tests {
     #[test]
     fn durability_and_busy_policy_follow_the_transaction_role() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let s = Stores::open_for_test(tmp.path())?;
+        let s = Stores::open(tmp.path())?;
         for publication in [true, false, true] {
             s.global()
                 .write("inspect pragma", "test", publication, |tx| {

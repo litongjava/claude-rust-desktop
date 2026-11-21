@@ -15,7 +15,7 @@ const A: &str = "10000000-1234-4234-9234-123456789abc";
 #[test]
 fn search_indexes_rollback_with_content_and_cursors_bind_to_the_incarnation() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     let b = stores.create("b", Default::default())?;
     let big = format!("{}needle old", "x".repeat(130_000));
@@ -89,7 +89,7 @@ fn search_indexes_rollback_with_content_and_cursors_bind_to_the_incarnation() ->
 fn projection_replaces_usage_and_recomputes_after_fork_rewind_and_restart() -> Result<()> {
     let root = tempdir()?;
     {
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         let (first, assistant) = a.write(|w| {
             let first = w.append("user", "first")?;
@@ -145,7 +145,7 @@ fn projection_replaces_usage_and_recomputes_after_fork_rewind_and_restart() -> R
         a.write(|w| w.rewind_from(&assistant))?;
         assert_eq!(a.read(|r| r.messages())?[0].id, first);
     }
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let p = s.global().summary(A)?.unwrap();
     assert_eq!(
         (
@@ -165,7 +165,7 @@ fn lost_projection_repairs_on_open_startup_and_unattended_rotation() -> Result<(
     let root = tempdir()?;
     let gpath = root.path().join("global.db");
     {
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         let g = Connection::open(&gpath)?;
         g.execute_batch("BEGIN IMMEDIATE")?;
@@ -178,7 +178,7 @@ fn lost_projection_repairs_on_open_startup_and_unattended_rotation() -> Result<(
         a.write(|w| w.append("user", "startup repair"))?;
         g.execute_batch("COMMIT")?;
     }
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     assert_eq!(s.global().summary(A)?.unwrap().count, 2);
     let handles = (0..19)
         .map(|i| s.create(&format!("idle-{i}"), Default::default()))
@@ -227,7 +227,7 @@ fn interrupted_compaction_resumes_checkpoint_and_commits_one_boundary() -> Resul
     let key = CheckpointKey::new(&provider, "configuration", "system", "fragment", 1024);
     let other = CheckpointKey::new(&provider, "configuration", "system", "changed", 1024);
     {
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         a.write(|w| {
             w.append("user", "task")?;
@@ -241,7 +241,7 @@ fn interrupted_compaction_resumes_checkpoint_and_commits_one_boundary() -> Resul
         a.write(|w| w.append("user", "new turn"))?;
         assert!(owner.finish_compaction(&claim, &"stale".into()).is_err());
     }
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.open_session(A)?;
     let owner = a.delivery_owner()?;
     let claim = owner.claim_compaction()?.unwrap();
@@ -281,7 +281,7 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
     let file = root.path().join("input.txt");
     fs::write(&file, "before")?;
     {
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         assert!(a.check_file_write(&file).is_err());
         assert_eq!(
@@ -303,7 +303,7 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
         assert!(b.check_file_write(&file).is_err());
         assert!(b.read(|r| r.goal())?.is_none());
     }
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.open_session(A)?;
     assert_eq!(
         s.global()
@@ -368,7 +368,7 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
     let root = tempdir()?;
     let text = format!("{}archived needle", "x".repeat(70_000));
     let seal = {
-        let s = Stores::open_for_test(root.path())?;
+        let s = Stores::open(root.path())?;
         let a = s.create(A, Default::default())?;
         a.write(|w| {
             let m = w.append("assistant", &text)?;
@@ -413,7 +413,7 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
             PRAGMA user_version=3; COMMIT",
         )?;
     }
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let p = s.global().summary(A)?.unwrap();
     assert_eq!((p.count, p.request_count, p.total_tokens), (1, 1, 19));
     let a = s.open_session(A)?;
@@ -437,7 +437,7 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
 fn tool_search_fragments_follow_result_replacement_and_rollback() -> Result<()> {
     use deepseek_code_core::db::message_repo::ToolCallRow;
     let root = tempdir()?;
-    let a = Stores::open_for_test(root.path())?.create(A, Default::default())?;
+    let a = Stores::open(root.path())?.create(A, Default::default())?;
     let m = a.write(|w| w.append("assistant", "reply"))?;
     let write = |w: &SessionWrite<'_>, name: &str, id: &str, text: &str| {
         w.tool(
@@ -479,7 +479,7 @@ fn tool_search_fragments_follow_result_replacement_and_rollback() -> Result<()> 
 #[test]
 fn clamped_summary_preserves_committed_history_and_reverses_on_replacement() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     let m = a.write(|w| {
         let m = w.append("assistant", "saved")?;
@@ -500,7 +500,7 @@ fn clamped_summary_preserves_committed_history_and_reverses_on_replacement() -> 
 #[test]
 fn replacing_anonymous_snapshot_metrics_preserves_independent_requests() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
     let message = a.write(|w| {
         let m = w.append("assistant", "result")?;
@@ -554,7 +554,7 @@ fn large_private_sidecar(stores: &Stores) -> Result<SessionDb> {
 #[test]
 fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = large_private_sidecar(&stores)?;
     let start = syscall_read_bytes("/proc/thread-self/io")?;
     let page: Value = serde_json::from_str(&a.context_search(
@@ -569,7 +569,7 @@ fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
     );
     drop(a);
     drop(stores);
-    let reopened = Stores::open_for_test(root.path())?;
+    let reopened = Stores::open(root.path())?;
     let start = syscall_read_bytes("/proc/thread-self/io")?;
     reopened.open_session(A)?;
     let bytes = syscall_read_bytes("/proc/thread-self/io")? - start;
@@ -609,7 +609,7 @@ fn fix_idle_rotation_reads_only_bounded_summary_state() -> Result<()> {
         return Ok(());
     }
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = large_private_sidecar(&stores)?;
     let g = Connection::open(root.path().join("global.db"))?;
     g.execute_batch("BEGIN IMMEDIATE")?;
@@ -628,7 +628,7 @@ fn fix_idle_rotation_reads_only_bounded_summary_state() -> Result<()> {
 #[test]
 fn fix_overflowing_usage_publishes_and_forks() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     let m = a.write(|w| {
         let m = w.append("assistant","response")?;
@@ -656,7 +656,7 @@ fn fix_overflowing_usage_publishes_and_forks() -> Result<()> {
 #[test]
 fn fix_plan_origin_survives_reentry_and_resume() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     for (id, origin, want) in [
         (A, PermissionMode::BypassPermissions, "true"),
         (
@@ -706,7 +706,7 @@ fn fix_plan_origin_survives_reentry_and_resume() -> Result<()> {
 #[test]
 fn fix_same_size_and_timestamp_restore_requires_another_read() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let path = root.path().join("tracked");
     std::fs::write(&path, b"first")?;
     let modified = path.metadata()?.modified()?;
@@ -725,7 +725,7 @@ fn fix_same_size_and_timestamp_restore_requires_another_read() -> Result<()> {
 #[test]
 fn fix_rewound_compaction_target_stays_cancelled() -> Result<()> {
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     let tail = a.write(|w| {
         w.append("user", "first")?;
@@ -780,7 +780,7 @@ fn fix_global_decoder_releases_checkout_before_entering_session() -> Result<()> 
         }
     }
     let root = tempdir()?;
-    let s = Stores::open_for_test(root.path())?;
+    let s = Stores::open(root.path())?;
     let a = s.create(A, Default::default())?;
     s.global()
         .set_setting(GlobalSetting::MachinePreference("test"), &"value")?;
@@ -843,7 +843,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
         .unwrap()
         .clone();
     {
-        let stores = Stores::open_for_test(workspace)?;
+        let stores = Stores::open(workspace)?;
         let a = stores.create(A, Default::default())?;
         a.write(|w| {
             w.set_setting(PREFERENCES, &prefs)?;
@@ -879,7 +879,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
             })
             .is_err());
     }
-    let stores = Stores::open_for_test(workspace)?;
+    let stores = Stores::open(workspace)?;
     stores.open_session(A)?.read(|r| {
         assert_eq!(r.setting(PREFERENCES)?, Some(prefs));
         assert_eq!(r.setting(PERMISSIONS)?, Some(rules));
@@ -929,7 +929,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
 #[test]
 fn shard_replacement_with_the_same_incarnation_requires_verification() -> Result<()> {
     let root = tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let session = stores.create(
         A,
         CreateOptions {
@@ -974,7 +974,7 @@ fn upgrading_p3_stamps_requires_rereading_and_binds_pending_requests() -> Result
     let path = root.path().join("tracked");
     std::fs::write(&path, b"first")?;
     let target = {
-        let stores = Stores::open_for_test(root.path())?;
+        let stores = Stores::open(root.path())?;
         let s = stores.create(A, Default::default())?;
         s.read_tracked_file(&path)?;
         s.write(|w| {
@@ -991,7 +991,7 @@ fn upgrading_p3_stamps_requires_rereading_and_binds_pending_requests() -> Result
         remove_v4_features(&c)?;
         c.execute_batch("PRAGMA user_version=3; COMMIT")?;
     }
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let s = stores.open_session(A)?;
     assert!(s.check_file_write(&path).is_err());
     s.read_tracked_file(&path)?;

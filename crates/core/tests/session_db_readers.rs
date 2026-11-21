@@ -7,7 +7,7 @@ use deepseek_code_core::db::{
 #[test]
 fn directory_filters_titles_and_sizes_follow_the_selected_incarnation() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create(
         "a",
         CreateOptions {
@@ -101,7 +101,7 @@ fn directory_listing_opens_zero_shards() -> Result<()> {
         },
     };
     let root = tempfile::tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let count = if std::env::var_os("I46_DIRECTORY_SCALE").is_some() {
         2048
     } else {
@@ -149,7 +149,7 @@ fn directory_listing_opens_zero_shards() -> Result<()> {
 fn usage_reports_exact_prices_and_retains_healthy_sessions_when_one_is_missing() -> Result<()> {
     use serde_json::json;
     let root = tempfile::tempdir()?;
-    let stores = Stores::open_for_test(root.path())?;
+    let stores = Stores::open(root.path())?;
     let a = stores.create("a", Default::default())?;
     a.write(|w| {
         let message=w.append("assistant","answer")?;
@@ -532,7 +532,7 @@ fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() 
     session.activate_provider("wrong", 2)?;
     assert!(session.observe_provider()?.pending.is_some());
     session.activate_provider("worker", 2)?;
-    let reopened = Stores::open_for_test(root.path())?.open_session(session.id())?;
+    let reopened = Stores::open(root.path())?.open_session(session.id())?;
     let mut prefs = reopened.read(|r| r.setting(PREFERENCES))?.unwrap();
     assert_eq!(prefs.effort, Some(Effort::High));
     prefs.effort = Some(Effort::Low);
@@ -688,7 +688,8 @@ fn project_chat_rechecks_trust_and_recovers_the_prepared_workspace() -> Result<(
             false
         )
         .is_err());
-    let reopened = Stores::open_for_test(root.path())?;
+    drop((fault, stores));
+    let reopened = Stores::open(root.path())?;
     let (project, _, chats) = reopened.project_detail("project")?;
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0].project_id.as_deref(), Some(project.id.as_str()));
