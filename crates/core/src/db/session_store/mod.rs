@@ -32,7 +32,6 @@ struct Root {
     global: GlobalDb,
     repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
     repair_cursor: Mutex<String>,
-    verified: Mutex<HashMap<String, Arc<Mutex<Option<VerifiedShard>>>>>,
     upgraded_directory: bool,
     migrating: std::sync::atomic::AtomicBool,
 }
@@ -68,7 +67,6 @@ impl Stores {
                         upgraded_directory,
                         repair: Default::default(),
                         repair_cursor: Default::default(),
-                        verified: Default::default(),
                         migrating: Default::default(),
                         path: path.clone(),
                     }
@@ -221,15 +219,25 @@ struct VerifiedShard {
     schema: i64,
     incarnation: String,
 }
+// Verification outlives the last resolver handle, without retaining a root,
+// pool or open file. Roots with different stores never share verification.
+type VerificationSlot = Arc<Mutex<Option<VerifiedShard>>>;
+static VERIFIED: LazyLock<Mutex<HashMap<(PathBuf, String), VerificationSlot>>> =
+    LazyLock::new(Default::default);
 impl Stores {
-    fn verification_slot(&self, key: &str) -> Arc<Mutex<Option<VerifiedShard>>> {
-        self.root
-            .verified
+    fn verification_slot(&self, key: &str) -> VerificationSlot {
+        VERIFIED
             .lock()
             .unwrap()
-            .entry(key.into())
+            .entry((self.root.path.clone(), key.into()))
             .or_default()
             .clone()
+    }
+    fn forget_verification(&self, key: &str) {
+        VERIFIED
+            .lock()
+            .unwrap()
+            .remove(&(self.root.path.clone(), key.into()));
     }
 }
 

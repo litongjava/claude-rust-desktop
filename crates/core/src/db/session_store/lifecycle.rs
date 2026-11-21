@@ -748,7 +748,7 @@ impl Stores {
     }
 
     fn retire(&self, op: &Intent) -> Result<()> {
-        self.root.verified.lock().unwrap().remove(&op.key);
+        self.forget_verification(&op.key);
         let live = op.live(self);
         let trash = self.sessions().join(".trash").join(&op.incarnation);
         let dir = if live.try_exists()? { &live } else { &trash };

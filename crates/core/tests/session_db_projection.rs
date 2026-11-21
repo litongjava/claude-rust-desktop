@@ -558,6 +558,16 @@ fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
         bytes < 4 << 20,
         "read {bytes} bytes outside the selected range"
     );
+    drop(a);
+    drop(stores);
+    let reopened = Stores::open_for_test(root.path())?;
+    let start = syscall_read_bytes("/proc/thread-self/io")?;
+    reopened.open_session(A)?;
+    let bytes = syscall_read_bytes("/proc/thread-self/io")? - start;
+    assert!(
+        bytes < 4 << 20,
+        "reopening the resolver rescanned {bytes} bytes"
+    );
     Ok(())
 }
 
