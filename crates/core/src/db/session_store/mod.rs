@@ -1,5 +1,6 @@
 //! Process-local resolver for the global directory and incarnation-bound session shards.
 mod approvals;
+mod admission;
 mod binding;
 mod compaction;
 mod directory;
@@ -252,6 +253,7 @@ impl Stores {
             handle.upgrade_locked()?;
         }
         let _locks = locks;
+        drop(admission::open(&path)?);
         handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
         handle.try_project_current();
         Ok(handle)
@@ -407,12 +409,13 @@ impl SessionDb {
         deadline: Duration,
         mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
     ) -> Result<T> {
+        let start=Instant::now();
+        let _admission=self.provider_fence(false,deadline)?;
         let binding = self.binding_control()?;
-        let start = Instant::now();
         let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            crate::db::write_tx(c, label, deadline, |tx| {
+            crate::db::write_tx(c, label, deadline.saturating_sub(start.elapsed()), |tx| {
                 let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
-                let writer=SessionWrite(tx,&self.id,false.into(),binding.pending);
+                let writer=SessionWrite(tx,&self.id,false.into(),&binding);
                 let result=layout::callback(|| body(&writer))?;
                 let changed:bool=tx.query_row("SELECT total_changes()>?1",[before],|r|r.get(0))?;
                 let mut summary=None;
@@ -429,6 +432,7 @@ impl SessionDb {
             })
         })
         .map_err(|e| crate::db::write_boundary_context(label, &self.id, start, e))?;
+        drop(_admission);
         if let Some(p) = projection {
             if let Err(error) = self
                 .stores
@@ -498,7 +502,7 @@ impl SessionRead<'_> {
         .transpose()
     }
 }
-pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>, bool);
+pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>, &'a binding::BindingControl);
 impl SessionWrite<'_> {
     #[doc(hidden)]
     pub fn synchronous_for_test(&self) -> Result<i32> {

@@ -598,7 +598,9 @@ impl DeliveryOwner {
                 s.stores.global().read(|c| authorize_queue(c, &s.id))?;
             }
             let payload = s.stores.payload(&claim.hash)?;
+            let _parent=if claim.sender.is_some(){s.peer_parent_fence()?}else{None};
             let delivered = s.write_locked("deliver input", |tx| {
+                ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {
                     let exists: bool = tx.0.query_row(
                         "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE id=?1)",

@@ -664,6 +664,7 @@ impl Stores {
         let inspect = || -> Result<_> {
             let _permit = Permits::take(1);
             self.upgrade_pending(op, &db)?;
+            drop(super::admission::open(&db)?);
             let c = layout::open(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             layout::verify(&c, SESSION)?;
             layout::integrity(&c)?;
@@ -824,6 +825,8 @@ impl Stores {
                     FROM conversations c LEFT JOIN conversation_private_workspace_bindings b ON b.child_id=c.id WHERE c.id=?2",[&op.id,source])?;
             }
             if saved.child {
+                tx.execute("INSERT INTO session_execution_parents(child_id,parent_id,parent_incarnation)
+                            SELECT ?1,id,incarnation FROM conversations WHERE id=?2",[&op.id,source])?;
                 let root = self.root.path.join("workspaces");
                 let parent_path = copy::workspace(tx, &root, source)?;
                 let child_path = copy::workspace(tx, &root, &op.id)?;

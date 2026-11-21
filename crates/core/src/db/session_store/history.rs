@@ -342,7 +342,7 @@ impl SessionWrite<'_> {
         Ok(id)
     }
     pub(crate) fn start_turn_at(&self, id: &str, at: &str) -> Result<()> {
-        ensure!(!self.3, "Provider switch pending; worker is retiring");
+        ensure!(!self.3.pending, "Provider switch pending; worker is retiring");
         self.0.execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')",params![id,self.1,at])?;
         self.2.set(true);
         Ok(())

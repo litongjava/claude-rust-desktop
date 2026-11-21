@@ -7,6 +7,7 @@ use rusqlite::{OpenFlags, OptionalExtension};
 
 pub(super) struct BindingControl {
     pub pending: bool,
+    pub retiring_here: bool,
     effort: Option<(i64, Option<String>)>,
 }
 
@@ -25,8 +26,10 @@ impl SessionDb {
         requester: &str,
         picker_effort: Option<Option<&str>>,
     ) -> Result<store::Write> {
+        let start = std::time::Instant::now();
         let _guard = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
+        let _admission = self.provider_fence(true, crate::db::STARTUP_WRITE_DEADLINE)?;
         let result = self
             .stores
             .global()
@@ -35,7 +38,7 @@ impl SessionDb {
                 crate::db::write_tx(
                     c,
                     store::PUBLISH_LABEL,
-                    crate::db::STARTUP_WRITE_DEADLINE,
+                    crate::db::STARTUP_WRITE_DEADLINE.saturating_sub(start.elapsed()),
                     |tx| {
                         store::publish_choice_in(
                             tx,
@@ -56,6 +59,7 @@ impl SessionDb {
     pub fn activate_provider(&self, worker: &str, generation: u64) -> Result<()> {
         let _guard = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
+        let _admission = self.provider_fence(true, crate::db::STARTUP_WRITE_DEADLINE)?;
         self.stores
             .global()
             .connection(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
@@ -70,13 +74,40 @@ impl SessionDb {
             })
     }
 
+    /// Hold the execution parent's publication fence across an owned child's inbox commit.
+    /// A deleted or replaced parent can never publish a selector for this child again.
+    pub(super) fn peer_parent_fence(&self) -> Result<Option<std::fs::File>> {
+        let parent=self.stores.global().read(|c|Ok(c.query_row(
+            "SELECT p.id,p.storage_key,p.incarnation FROM session_execution_parents e
+             JOIN conversations p ON p.id=e.parent_id AND p.incarnation=e.parent_incarnation WHERE e.child_id=?1",
+            [&self.id], |r|Ok(SessionDb{stores:self.stores.clone(),id:r.get(0)?,key:r.get(1)?,incarnation:r.get(2)?}))
+            .optional()?))?;
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        let guard = parent.provider_fence(false, crate::db::STARTUP_WRITE_DEADLINE);
+        let retiring:Option<bool>=self.stores.global().read(|c|Ok(c.query_row(
+            "SELECT coalesce(b.pending IS NOT NULL AND b.legacy_pid=?3,0) FROM conversations p
+             LEFT JOIN cli_binding_generations b ON b.session_id=p.id WHERE p.id=?1 AND p.incarnation=?2",
+            rusqlite::params![parent.id,parent.incarnation,std::process::id()],|r|r.get(0)).optional()?))?;
+        let Some(retiring) = retiring else {
+            return Ok(None);
+        };
+        let guard = guard?;
+        anyhow::ensure!(
+            !retiring,
+            "Provider switch pending; owned child inbox retained"
+        );
+        Ok(Some(guard))
+    }
+
     pub(super) fn binding_control(&self) -> Result<BindingControl> {
         let control = self.stores.global().read(|c| Ok(c.query_row(
-            "SELECT b.pending IS NOT NULL,e.revision,e.effort FROM conversations d
+            "SELECT b.pending IS NOT NULL,e.revision,e.effort,coalesce(b.pending IS NOT NULL AND b.legacy_pid=?4,0) FROM conversations d
              LEFT JOIN cli_binding_generations b ON b.session_id=d.id LEFT JOIN cli_binding_efforts e ON e.session_id=d.id
              WHERE d.id=?1 AND d.incarnation=?2 AND d.storage_key=?3",
-            [&self.id,&self.incarnation,&self.key], |r| Ok(BindingControl {
-                pending: r.get(0)?, effort:r.get::<_,Option<i64>>(1)?.map(|rev|r.get(2).map(|value|(rev,value))).transpose()?,
+            rusqlite::params![self.id,self.incarnation,self.key,std::process::id()], |r| Ok(BindingControl {
+                pending: r.get(0)?, retiring_here:r.get(3)?, effort:r.get::<_,Option<i64>>(1)?.map(|rev|r.get(2).map(|value|(rev,value))).transpose()?,
             })).optional()?.context("Session incarnation is no longer visible")?))?;
         if let Some((revision, effort)) = &control.effort {
             let applied = |c: &rusqlite::Connection| -> Result<i64> {

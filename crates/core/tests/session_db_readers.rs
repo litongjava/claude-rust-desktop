@@ -391,23 +391,70 @@ fn runtime_resolves_new_resume_clear_and_child_under_one_root() -> Result<()> {
     Ok(())
 }
 
+fn provider_choice(
+    id: &str,
+) -> deepseek_code_core::native_engine::session_binding::BindingSnapshot {
+    use deepseek_code_core::native_engine::session_binding::BindingSnapshot;
+    use serde_json::json;
+    BindingSnapshot {
+        provider_id:id.into(),model:"m".into(),generation:0,observation_only:false,environment:Default::default(),
+        providers:vec![serde_json::from_value(json!({"id":id,"name":id,"enabled":true,"api_format":"openai","api_key":"fixture","base_url":"http://localhost","models":[{"id":"m","name":"model","enabled":true,"supports_web_search":false}]})).unwrap()],
+    }
+}
+
+#[test]
+fn provider_publication_cannot_overtake_a_turn_inside_its_admission_transaction() -> Result<()> {
+    use deepseek_code_core::native_engine::session_binding::store::Write;
+    use std::{sync::mpsc, thread, time::Duration};
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let session = stores.create("admission", Default::default())?;
+    let owner = session.delivery_owner()?;
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let turn_session = session.clone();
+    let turn = thread::spawn(move || {
+        turn_session.write(|w| {
+            entered.send(())?;
+            wait.recv_timeout(Duration::from_secs(5))?;
+            w.start_turn()
+        })
+    });
+    ready.recv_timeout(Duration::from_secs(5))?;
+    let (published, done) = mpsc::channel();
+    let picker = session.clone();
+    let selection = thread::spawn(move || {
+        let result = picker.publish_provider(
+            0,
+            &provider_choice("b"),
+            Some(("worker", Some(123))),
+            "picker",
+            None,
+        );
+        published.send(()).unwrap();
+        result
+    });
+    let early = done.recv_timeout(Duration::from_millis(150)).is_ok();
+    release.send(())?;
+    turn.join().unwrap()?;
+    assert_eq!(selection.join().unwrap()?, Write::Published(1));
+    assert!(!early);
+    assert!(session.write(|w| w.start_turn()).is_err());
+    drop(owner);
+    Ok(())
+}
+
 #[test]
 fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() -> Result<()> {
     use deepseek_code_core::{
         db::session_store::settings::{Effort, PREFERENCES},
-        native_engine::session_binding::{store::Write, BindingSnapshot, SessionBinding},
+        native_engine::session_binding::{store::Write, SessionBinding},
     };
     use serde_json::json;
     let root = tempfile::tempdir()?;
     let stores = Stores::open(root.path())?;
     let session = stores.create("bound", Default::default())?;
-    let choice = |id: &str| {
-        BindingSnapshot {
-        provider_id:id.into(),model:"m".into(),generation:0,observation_only:false,environment:Default::default(),
-        providers:vec![serde_json::from_value(json!({"id":id,"name":id,"enabled":true,"api_format":"openai","api_key":"fixture","base_url":"http://localhost","models":[{"id":"m","name":"model","enabled":true,"supports_web_search":false}]})).unwrap()],
-    }
-    };
-    let mut original = choice("a");
+    let mut original = provider_choice("a");
     assert_eq!(
         session.publish_provider(0, &original, None, "", None)?,
         Write::Published(1)
@@ -418,7 +465,7 @@ fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() 
     binding.install(original.clone())?;
     let active = binding.resolve(None).unwrap();
     active.ensure_current()?;
-    let next = choice("b");
+    let next = provider_choice("b");
     assert_eq!(
         session.publish_provider(0, &next, None, "", None)?,
         Write::Conflict
@@ -629,5 +676,46 @@ fn conversation_routes_keep_rewind_and_full_branch_scoped_to_the_selected_chat()
         .rewind_messages("original", Rewind::From(&first))?
         .is_empty());
     assert_eq!(stores.conversation_detail(&full)?.1.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn retiring_worker_retains_its_own_and_its_project_childs_inbox() -> Result<()> {
+    use deepseek_code_core::native_engine::session_binding::store::Write;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let create = || uuid::Uuid::new_v4().to_string();
+    let parent = stores.create_code_session(root.path(), "m", "a", &create())?;
+    let child = parent.derive_owned_child(&create(), root.path())?;
+    let sender = stores.create_code_session(root.path(), "m", "a", &create())?;
+    let to_parent = sender.send_peer(&parent, "parent-msg", "parent feedback")?;
+    let to_child = sender.send_peer(&child, "child-msg", "child feedback")?;
+    let mut parent_owner = parent.delivery_owner()?;
+    let mut child_owner = child.delivery_owner()?;
+    assert_eq!(
+        parent.publish_provider(
+            0,
+            &provider_choice("b"),
+            Some(("worker", Some(std::process::id()))),
+            "picker",
+            None
+        )?,
+        Write::Published(1)
+    );
+    assert!(parent_owner
+        .next_peer()
+        .unwrap_err()
+        .to_string()
+        .contains("deliver input"));
+    assert!(child_owner
+        .next_peer()
+        .unwrap_err()
+        .to_string()
+        .contains("inbox retained"));
+    assert_eq!(child.read(|r| r.receipt_count())?, 0);
+    parent.activate_provider("worker", 1)?;
+    assert_eq!(parent_owner.next_peer()?.unwrap().id, to_parent);
+    assert_eq!(child_owner.next_peer()?.unwrap().id, to_child);
+    assert!(child_owner.next_peer()?.is_none());
     Ok(())
 }
