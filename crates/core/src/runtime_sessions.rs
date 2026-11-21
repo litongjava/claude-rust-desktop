@@ -58,8 +58,14 @@ impl SessionStore<Stores> {
         Ok(child)
     }
     fn session_in_root(&self, id: &str, root: &Path) -> Result<SessionDb> {
+        // The store has canonicalized its data directory, but a caller may use
+        // a Windows short path. The workspaces subdirectory need not exist yet.
+        let root = std::path::absolute(root)?;
+        let parent = root
+            .parent()
+            .context("Workspace root has no parent directory")?;
         ensure!(
-            std::path::absolute(root)? == self.db.data_dir().join("workspaces"),
+            root.ends_with("workspaces") && parent.canonicalize()? == self.db.data_dir(),
             "Workspace root differs from the session data root"
         );
         self.db.open_session(id)
@@ -89,5 +95,26 @@ impl SessionStore<Stores> {
         self.db
             .open_session(id)?
             .write(|w| w.append_hook_user(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_root_uses_the_existing_data_directory_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("data");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project)?;
+        let store = SessionStore::new(RuntimePaths::new(data.clone())?.open_database()?);
+        let id = store.create(&project, "model", "provider")?;
+        let root = data.join("..").join("data").join("workspaces");
+        assert!(!root.exists());
+        assert_eq!(store.workspace(&id, &root)?, project.canonicalize()?);
+        assert!(store.workspace(&id, &project.join("workspaces")).is_err());
+        assert!(store.workspace(&id, &data.join("other")).is_err());
+        Ok(())
     }
 }
