@@ -97,6 +97,15 @@ impl GlobalDb {
     }
 }
 impl Stores {
+    pub fn conversations(&self) -> Result<Vec<ConversationRow>> {
+        Ok(self
+            .global()
+            .list_sessions(DirectoryFilter::default())?
+            .into_iter()
+            .map(|row| row.conversation)
+            .collect())
+    }
+
     /// An enumerated row can be deleted and its logical ID reused before selection.
     pub fn open_listed(&self, row: &DirectoryEntry) -> Result<SessionDb> {
         let s = self.open_session(&row.conversation.id)?;

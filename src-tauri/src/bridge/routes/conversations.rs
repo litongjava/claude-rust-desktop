@@ -24,10 +24,10 @@ struct CreateConversationBody {
 async fn conversations_list(State(state): State<AppState>) -> Json<serde_json::Value> {
     let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::db::conversation_repo::list_conversations(conn))
+        db.conversations()
     }).await;
     match result {
-        Ok(Ok(Ok(convs))) => Json(serde_json::json!({ "conversations": convs })),
+        Ok(Ok(convs)) => Json(serde_json::json!({ "conversations": convs })),
         _ => Json(serde_json::json!({ "conversations": [] })),
     }
 }

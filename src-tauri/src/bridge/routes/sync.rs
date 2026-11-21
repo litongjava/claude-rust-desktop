@@ -387,12 +387,12 @@ async fn sync_pull(
     let db = state.db_manager.clone();
     let conversations_result = tokio::task::spawn_blocking({
         let db = db.clone();
-        move || db.with_conn(|conn| crate::db::conversation_repo::list_conversations(conn))
+        move || db.conversations()
     })
     .await;
 
     let conversations = match conversations_result {
-        Ok(Ok(Ok(convs))) => convs,
+        Ok(Ok(convs)) => convs,
         _ => {
             tracing::error!("Sync Failed to list conversations");
             vec![]

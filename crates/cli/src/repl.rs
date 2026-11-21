@@ -799,7 +799,7 @@ pub async fn handle(
             let sessions = session
                 .store
                 .db
-                .with_conn(conversation_repo::list_conversations)??;
+                .conversations()?;
             command_println!("{}", serde_json::to_string_pretty(&sessions)?);
         }
         "/skills" => {

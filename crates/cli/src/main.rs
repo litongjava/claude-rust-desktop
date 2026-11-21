@@ -644,7 +644,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     )?)?
                 }
                 SessionCommands::List => serde_json::to_value(
-                    db.with_conn(deepseek_code_core::db::conversation_repo::list_conversations)??,
+                    db.conversations()?,
                 )?,
                 SessionCommands::Show { id } => {
                     let store = SessionStore::new(db);

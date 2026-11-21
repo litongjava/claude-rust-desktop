@@ -353,6 +353,12 @@ pub(crate) fn conversation_metadata(conn: &Connection, id: &str) -> Result<Optio
     }
 }
 
+impl super::DbManager {
+    pub fn conversations(&self) -> Result<Vec<ConversationRow>> {
+        self.with_conn(list_conversations)?
+    }
+}
+
 pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationRow>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, title, model, provider, workspace_path, project_id, research_mode, pinned, archived, created_at, updated_at, message_count, workspace_mode FROM conversations ORDER BY updated_at DESC"

@@ -27,9 +27,7 @@ fn session_import_previews_backs_up_preserves_and_rolls_back_conflicts() {
     );
     assert!(context
         .db
-        .with_conn(deepseek_code_core::db::conversation_repo::list_conversations)
-        .unwrap()
-        .unwrap()
+        .conversations().unwrap()
         .is_empty());
     assert!(context
         .db

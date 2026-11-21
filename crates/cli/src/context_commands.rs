@@ -145,7 +145,7 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
     let mut usage = deepseek_code_core::native_engine::request_context::ContextUsage::from_body("anthropic-messages", &body, window, 0);
     // The engine's full system prompt and tool list barely change between
     // sessions; a recent measured request estimates them better.
-    let recent = session.store.db.with_conn(|conn| deepseek_code_core::db::conversation_repo::list_conversations(conn))??;
+    let recent = session.store.db.conversations()?;
     for row in recent.iter().filter(|row| row.id != session.id).take(20) {
         if let Some(measured) = deepseek_code_core::services::context_usage::last_request(&session.store.db, &row.id)?.and_then(|request| request.usage) {
             usage.instructions = measured.instructions;
