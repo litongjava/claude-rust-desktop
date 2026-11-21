@@ -730,3 +730,30 @@ impl SessionWrite<'_> {
         Ok(())
     }
 }
+
+/// Timings and token counts reported by a single model request.
+pub struct RequestMetrics {
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub content_tokens: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub generation_ms: Option<i64>,
+    pub status: String,
+    pub response_blocks: Value,
+}
+
+impl SessionRead<'_> {
+    pub fn request_metrics(&self, id: &str) -> Result<Option<RequestMetrics>> {
+        let row=self.0.query_row("SELECT output_tokens,reasoning_tokens,content_tokens,ttft_ms,generation_ms,status,response_blocks_json FROM model_requests WHERE id=?1",[id],|r|Ok((
+            RequestMetrics{output_tokens:r.get(0)?,reasoning_tokens:r.get(1)?,content_tokens:r.get(2)?,ttft_ms:r.get(3)?,generation_ms:r.get(4)?,status:r.get(5)?,response_blocks:Value::Null},
+            r.get::<_,Option<String>>(6)?
+        ))).optional()?;
+        row.map(|(mut metrics, raw)| {
+            if let Some(raw) = raw {
+                metrics.response_blocks = serde_json::from_str(&raw)?;
+            }
+            Ok(metrics)
+        })
+        .transpose()
+    }
+}
