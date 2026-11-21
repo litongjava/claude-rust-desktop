@@ -272,10 +272,6 @@ impl Stores {
         let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2 UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?2 AND (quarantine_reason IS NULL OR kind='delete'))",[id,&key],|r|r.get(0))?;
         ensure!(!exists, "Session already exists or is fenced");
         let op = Intent::new(self, id, &key, Uuid::new_v4().to_string(), "create");
-        ensure!(
-            !op.live(self).try_exists()?,
-            "Session directory already exists"
-        );
         let mode = options
             .workspace_mode
             .clone()
@@ -315,6 +311,15 @@ impl Stores {
         Ok((op, meta))
     }
 
+    // The lifecycle lock fences normal creators. Check the filesystem outside G.
+    fn check_destination(&self, id: &str) -> Result<()> {
+        ensure!(
+            !self.sessions().join(storage_key(id)?).try_exists()?,
+            "Session directory already exists"
+        );
+        Ok(())
+    }
+
     fn create_locked(
         &self,
         id: &str,
@@ -322,6 +327,7 @@ impl Stores {
         seed: Seed<'_>,
         source: Option<copy::Source>,
     ) -> Result<SessionDb> {
+        self.check_destination(id)?;
         let (op, meta) = self.global().write("create intent", id, true, |tx| {
             let (op, meta) = self.prepare(tx, id, &options, &seed, source.clone())?;
             op.insert(tx, Some(&serde_json::to_string(&meta)?))?;

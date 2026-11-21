@@ -404,6 +404,9 @@ impl Stores {
             }
             Ok(plan)
         })?;
+        for (session, _, _) in &selected {
+            self.check_destination(&session.id)?;
+        }
         if preview || selected.is_empty() {
             return Ok(result);
         }
