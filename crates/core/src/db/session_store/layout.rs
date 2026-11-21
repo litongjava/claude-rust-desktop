@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 const GLOBAL_VERSION: i32 = 4;
-const SESSION_VERSION: i32 = 3;
+pub(super) const SESSION_VERSION: i32 = 4;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -128,6 +128,9 @@ pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 pub(super) fn open(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    open_timed(path, flags, 5000)
+}
+pub(super) fn open_timed(path: &Path, flags: OpenFlags, timeout_ms: u64) -> Result<Connection> {
     ensure!(
         fs::symlink_metadata(path)
             .with_context(|| format!("inspecting {}", path.display()))?
@@ -140,10 +143,53 @@ pub(super) fn open(path: &Path, flags: OpenFlags) -> Result<Connection> {
         flags | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .with_context(|| format!("opening {}", path.display()))?;
-    conn.execute_batch(
-        "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL",
-    )?;
+    conn.busy_timeout(std::time::Duration::from_millis(timeout_ms))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL")?;
     Ok(conn)
+}
+
+pub(super) fn file_identity(path: &Path) -> Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)?;
+        ensure!(meta.is_file(), "Expected regular database file");
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        let file = File::open(path)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }?;
+        Ok((
+            u64::from(info.dwVolumeSerialNumber),
+            u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+        ))
+    }
+}
+
+/// Bounded checks for an admitted incarnation. Schema edits invalidate the
+/// cached format check. Unsealed external history edits require revalidation.
+pub(super) fn session_header(c: &Connection) -> Result<(i64, bool)> {
+    let (app,version,mode,schema):(i32,i32,String,i64)=c.query_row(
+        "SELECT application_id,user_version,journal_mode,schema_version FROM pragma_application_id,pragma_user_version,pragma_journal_mode,pragma_schema_version", [],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    ensure!(
+        app == SESSION && version == SESSION_VERSION && mode == "wal",
+        "Unsupported session header"
+    );
+    let (seal,dirty):(String,bool)=c.query_row("SELECT sealed_operation,history_dirty,updated_at,created_at,message_count,content_revision,last_turn_status
+        FROM manifest JOIN projection_state USING(singleton) WHERE singleton=1", [], |r|{
+        r.get::<_,String>(2)?; r.get::<_,String>(3)?; r.get::<_,i64>(4)?; r.get::<_,i64>(5)?; r.get::<_,Option<String>>(6)?;
+        Ok((r.get(0)?,r.get(1)?))
+    })?;
+    ensure!(canonical_uuid(&seal), "Invalid session seal");
+    Ok((schema, dirty))
 }
 
 pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
@@ -188,9 +234,20 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
     if kind == GLOBAL && version < 3 {
         tx.execute_batch(include_str!("inbox_v3.sql"))?;
     }
-    install_state(&tx, kind)?;
+    if kind == GLOBAL || version < 3 {
+        install_state(&tx, kind)?;
+    }
+    if kind == SESSION {
+        install_session_v4(&tx)?;
+        super::history::flush_summary(&tx)?;
+    }
     tx.pragma_update(None, "user_version", schema_version(kind))?;
     tx.commit()?;
+    Ok(())
+}
+
+fn install_session_v4(c: &Connection) -> Result<()> {
+    c.execute_batch(include_str!("projection.sql"))?;
     Ok(())
 }
 
@@ -205,6 +262,14 @@ fn install_state(c: &Connection, kind: i32) -> Result<()> {
 }
 
 fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
+    verify_structure(conn, kind, expected)?;
+    if kind == SESSION {
+        verify_history(conn)?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
     let (app, version, journal): (i32, i32, String) = conn.query_row(
         "SELECT application_id,user_version,journal_mode FROM pragma_application_id,pragma_user_version,pragma_journal_mode",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -316,11 +381,28 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
     } else {
         &[]
     };
+    let v4: &[(&str, &str)] = if kind == SESSION && expected >= 4 {
+        let objects: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE
+             (type='index' AND tbl_name='messages' AND name='projection_prompt_order') OR
+             (type='trigger' AND tbl_name IN ('messages','message_user_content','model_requests')
+              AND name IN ('projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_insert',
+                           'projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_update',
+                           'projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_delete'))", [], |r|r.get(0))?;
+        ensure!(
+            objects == 10,
+            "Missing required session summary index or trigger"
+        );
+        &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_dirty request_count input_tokens output_tokens total_tokens"),
+          ("request_metric_deltas","direction input output total")]
+    } else {
+        &[]
+    };
     let mut columns = conn.prepare_cached(
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
     )?;
-    for &(table, required) in tables.iter().chain(added).chain(state) {
+    for &(table, required) in tables.iter().chain(added).chain(state).chain(v4) {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -332,8 +414,11 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
             }
         }
     }
-    if kind == SESSION {
-        let (seal, count): (String, i64) = conn.query_row(
+    Ok(())
+}
+
+fn verify_history(conn: &Connection) -> Result<()> {
+    let (seal, count): (String, i64) = conn.query_row(
             "SELECT singleton,store_uuid,id,incarnation,sealed_operation,created_at,updated_at,
                     message_count,content_revision,last_turn_status FROM manifest WHERE singleton=1",
             [],
@@ -347,24 +432,23 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
                 Ok((row.get("sealed_operation")?, row.get("message_count")?))
             },
         )?;
-        if !canonical_uuid(&seal) {
-            return Err(InvalidFormat("Invalid session seal".into()).into());
-        }
-        let first = super::SessionRead(conn)
-            .initial_message()
-            .context("decoding initial message")?;
-        ensure!(
-            count >= 0 && first.is_some() == (count > 0),
-            "Initial message differs from manifest"
-        );
-        let detached: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_user_content t
-             WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=t.message_id))",
-            [],
-            |row| row.get(0),
-        )?;
-        ensure!(!detached, "Typed content has no matching message");
+    if !canonical_uuid(&seal) {
+        return Err(InvalidFormat("Invalid session seal".into()).into());
     }
+    let first = super::SessionRead(conn)
+        .initial_message()
+        .context("decoding initial message")?;
+    ensure!(
+        count >= 0 && first.is_some() == (count > 0),
+        "Initial message differs from manifest"
+    );
+    let detached: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM message_user_content t
+             WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=t.message_id))",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(!detached, "Typed content has no matching message");
     Ok(())
 }
 
@@ -400,7 +484,13 @@ pub(super) fn initialize(
         tx.execute_batch(include_str!("inbox_v3.sql"))?;
     }
     install_state(&tx, kind)?;
+    if kind == SESSION {
+        install_session_v4(&tx)?;
+    }
     populate(&tx)?;
+    if kind == SESSION {
+        super::history::flush_summary(&tx)?;
+    }
     tx.commit()?;
     Ok(conn)
 }

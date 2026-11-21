@@ -50,7 +50,22 @@ impl GlobalDb {
         flags: OpenFlags,
         body: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut slot = self.pool.get()?;
+        self.checkout(flags, false, body)
+    }
+
+    pub(super) fn checkout<T>(
+        &self,
+        flags: OpenFlags,
+        nonblocking: bool,
+        body: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut slot = if nonblocking {
+            self.pool
+                .try_get()
+                .ok_or_else(|| anyhow::anyhow!("Global pool busy"))?
+        } else {
+            self.pool.get()?
+        };
         #[cfg(unix)]
         ensure!(
             file_identity(&self.path)? == self.identity,
@@ -72,9 +87,17 @@ impl GlobalDb {
         );
         if slot.as_ref().map(|(mode, _)| *mode) != Some(flags) {
             *slot = None;
-            *slot = Some((flags, layout::open(&self.path, flags)?));
+            *slot = Some((
+                flags,
+                layout::open_timed(&self.path, flags, if nonblocking { 0 } else { 5000 })?,
+            ));
         }
         let conn = &slot.as_ref().unwrap().1;
+        conn.busy_timeout(std::time::Duration::from_millis(if nonblocking {
+            0
+        } else {
+            5000
+        }))?;
         layout::verify(conn, GLOBAL)?;
         let store: String = conn.query_row(
             "SELECT store_uuid FROM store_identity WHERE singleton=1",

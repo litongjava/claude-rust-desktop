@@ -363,7 +363,15 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
                 c.execute_batch(&format!("DROP TRIGGER context_search_{owner}_{operation}"))?;
             }
         }
+        c.execute_batch("DROP INDEX projection_prompt_order")?;
+        for name in ["message", "typed", "request"] {
+            for action in ["insert", "update", "delete"] {
+                c.execute_batch(&format!("DROP TRIGGER projection_{name}_{action}"))?;
+            }
+        }
         for table in [
+            "projection_state",
+            "request_metric_deltas",
             "context_search_chunks",
             "context_search_sources",
             "message_metadata",
@@ -451,7 +459,7 @@ fn tool_search_fragments_follow_result_replacement_and_rollback() -> Result<()> 
 }
 
 #[test]
-fn a_summary_error_leaves_committed_history_available_for_repair() -> Result<()> {
+fn clamped_summary_preserves_committed_history_and_reverses_on_replacement() -> Result<()> {
     let root = tempdir()?;
     let s = Stores::open_for_test(root.path())?;
     let a = s.create(A, Default::default())?;
@@ -464,7 +472,7 @@ fn a_summary_error_leaves_committed_history_available_for_repair() -> Result<()>
         Ok(m)
     })?;
     assert_eq!(a.read(|r| r.messages())?[0].content, "saved");
-    assert_eq!(s.global().summary(A)?.unwrap().count, 0);
+    assert_eq!(s.global().summary(A)?.unwrap().input_tokens, i64::MAX);
     a.write(|w| w.snapshots(&m, &json!([{"id":"two","inputTokens":1}])))?;
     let p = s.global().summary(A)?.unwrap();
     assert_eq!((p.count, p.input_tokens), (1, 1));

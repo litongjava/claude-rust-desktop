@@ -585,7 +585,6 @@ impl Stores {
             if !matches {
                 return Err(layout::InvalidFormat("Sealed identity mismatch".into()).into());
             }
-            let p = super::history::projection(&c)?;
             if meta.copied {
                 let mut messages=c.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages")?;
                 for row in messages.query_map([], crate::db::message_repo::row_to_message)? {
@@ -593,9 +592,7 @@ impl Stores {
                 }
 
                 ensure!(
-                    p.count
-                        == c.query_row("SELECT count(*) FROM messages", [], |r| r
-                            .get::<_, i64>(0))?,
+                    c.query_row("SELECT message_count=(SELECT count(*) FROM messages) FROM manifest WHERE singleton=1", [], |r| r.get::<_, bool>(0))?,
                     "Invalid copied message count"
                 );
                 let broken: bool = c.query_row(
@@ -634,12 +631,20 @@ impl Stores {
                     .into());
                 }
             }
+            let identity = super::VerifiedShard {
+                file: layout::file_identity(&db)?,
+                schema: c.pragma_query_value(None, "schema_version", |r| r.get(0))?,
+                incarnation: op.incarnation.clone(),
+            };
+            // A failure to read the secondary summary leaves the sealed intent retryable.
+            let summary = super::history::projection(&c);
             drop(c);
             layout::checkpoint(&db, SESSION)?;
-            Ok(p)
+            *self.verification_slot(&op.key).lock().unwrap() = Some(identity);
+            Ok(summary)
         };
         let projection = match inspect() {
-            Ok(p) => p,
+            Ok(summary) => summary?,
             Err(e) => {
                 self.quarantine(op, dir, &format!("invalid sealed database: {e:#}"))?;
                 return Err(e);
@@ -743,6 +748,7 @@ impl Stores {
     }
 
     fn retire(&self, op: &Intent) -> Result<()> {
+        self.root.verified.lock().unwrap().remove(&op.key);
         let live = op.live(self);
         let trash = self.sessions().join(".trash").join(&op.incarnation);
         let dir = if live.try_exists()? { &live } else { &trash };

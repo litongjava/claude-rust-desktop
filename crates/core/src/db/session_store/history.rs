@@ -26,14 +26,61 @@ pub struct Projection {
 
 pub(super) fn projection(c: &Connection) -> Result<Projection> {
     Ok(c.query_row("SELECT content_revision,message_count,updated_at,last_turn_status,
-        (SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1),
-        (SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
-        (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages),
-        (SELECT value FROM peripheral_settings WHERE key='git.branch'), usage.*
-        FROM manifest CROSS JOIN (SELECT count(*),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),
-            coalesce(sum(coalesce(total_tokens,coalesce(input_tokens,0)+coalesce(output_tokens,0))),0) FROM model_requests) usage
-        WHERE singleton=1", [], Projection::from_row)?)
+        first_prompt,latest_prompt,transcript_bytes,(SELECT value FROM peripheral_settings WHERE key='git.branch'),
+        request_count,CAST(input_tokens AS INTEGER),CAST(output_tokens AS INTEGER),CAST(total_tokens AS INTEGER)
+        FROM manifest JOIN projection_state USING(singleton) WHERE singleton=1", [], Projection::from_row)?)
 }
+
+// SQLite clamps decimal TEXT to the signed column range on the final CAST.
+// Keep the exact totals locally so deleting a large request can undo a clamp.
+pub(super) fn flush_summary(c: &Connection) -> Result<()> {
+    let (dirty, history_dirty): (bool, bool) = c.query_row(
+        "SELECT prompts_dirty,history_dirty FROM projection_state WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if dirty {
+        let first: Option<String> = c.query_row("SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1", [], |r|r.get(0)).optional()?;
+        c.execute("UPDATE projection_state SET first_prompt=?1,
+            latest_prompt=(SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
+            prompts_dirty=0,history_dirty=0 WHERE singleton=1", [first.as_deref().and_then(crate::db::conversation_repo::prompt_title)])?;
+    } else if history_dirty {
+        c.execute(
+            "UPDATE projection_state SET history_dirty=0 WHERE singleton=1",
+            [],
+        )?;
+    }
+    let mut stmt = c.prepare(
+        "SELECT direction,coalesce(input,0),coalesce(output,0),total FROM request_metric_deltas",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut delta = [0i128; 4];
+    let mut changed = false;
+    while let Some(r) = rows.next()? {
+        let sign = i128::from(r.get::<_, i64>(0)?);
+        let input = i128::from(r.get::<_, i64>(1)?);
+        let output = i128::from(r.get::<_, i64>(2)?);
+        let total = r
+            .get::<_, Option<i64>>(3)?
+            .map(i128::from)
+            .unwrap_or(input + output);
+        for (sum, value) in delta.iter_mut().zip([1, input, output, total]) {
+            *sum += sign * value;
+        }
+        changed = true;
+    }
+    if changed {
+        let stored: [String; 3] = c.query_row("SELECT input_tokens,output_tokens,total_tokens FROM projection_state WHERE singleton=1", [], |r|Ok([r.get(0)?,r.get(1)?,r.get(2)?]))?;
+        for (sum, prior) in delta[1..].iter_mut().zip(stored) {
+            *sum += prior.parse::<i128>()?;
+        }
+        c.execute("UPDATE projection_state SET request_count=request_count+?1,input_tokens=?2,output_tokens=?3,total_tokens=?4 WHERE singleton=1",
+            params![i64::try_from(delta[0])?,delta[1].to_string(),delta[2].to_string(),delta[3].to_string()])?;
+        c.execute("DELETE FROM request_metric_deltas", [])?;
+    }
+    Ok(())
+}
+
 impl Projection {
     pub(super) fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Projection {
@@ -69,6 +116,7 @@ fn latest_activity<'a>(existing: &'a str, incoming: &'a str) -> &'a str {
 }
 
 pub(super) fn advance(c: &Connection) -> Result<()> {
+    flush_summary(c)?;
     let existing: String = c.query_row(
         "SELECT updated_at FROM manifest WHERE singleton=1",
         [],
@@ -87,7 +135,7 @@ pub(super) fn advance(c: &Connection) -> Result<()> {
 impl GlobalDb {
     // Projection is secondary. Never wait for the G writer after a local commit.
     pub(super) fn project(&self, id: &str, incarnation: &str, p: &Projection) -> Result<()> {
-        self.connection(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+        self.checkout(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, true, |c| {
             c.pragma_update(None, "synchronous", "NORMAL")?;
             c.busy_timeout(std::time::Duration::ZERO)?;
             let result = (|| -> Result<()> {

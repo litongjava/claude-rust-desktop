@@ -1,13 +1,29 @@
-//! Directory maintenance never retains a G checkout while opening a shard.
+//! A repair page holds neither a global checkout nor a session connection while
+//! waiting for the other. Only schema migration is allowed to backfill history.
 use super::*;
 use std::fs::File;
-use std::sync::mpsc;
+use std::sync::{atomic::Ordering, mpsc};
+
 const PAGE: usize = 8;
+const PASS_BUDGET: Duration = Duration::from_millis(200);
 const INTERVAL: Duration = Duration::from_secs(2);
 
 impl Stores {
     pub(super) fn start_projection_repair(&self) {
         self.root.repair.get_or_init(|| {
+            // G invalidates pre-summary directory rows on upgrade. Finish that
+            // one-time format migration before exposing its new summary fields.
+            let old_rows = self.global().read(|c| {
+                let mut s=c.prepare("SELECT id,storage_key,incarnation FROM conversations WHERE content_revision=-1")?;
+                let rows=s.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            });
+            if let Ok(rows)=old_rows {
+                for (id,key,incarnation) in rows {
+                    let s=SessionDb {stores:self.clone(),id,key,incarnation};
+                    if let Err(error)=s.upgrade_for_repair(){tracing::debug!(%error,"Session migration postponed");}
+                }
+            }
             self.try_repair_page();
             let root = Arc::downgrade(&self.root);
             let (stop, rx) = mpsc::channel();
@@ -23,116 +39,187 @@ impl Stores {
 
     fn try_repair_page(&self) {
         if let Err(error) = self.repair_page() {
-            tracing::warn!(%error, "Directory projection pass postponed");
+            tracing::debug!(%error, "Directory projection pass postponed");
         }
     }
 
     fn repair_page(&self) -> Result<()> {
+        let start = Instant::now();
         let mut cursor = self.root.repair_cursor.lock().unwrap();
-        let entries = self.global().read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id, storage_key, incarnation FROM conversations
+        let entries = self
+            .global()
+            .checkout(OpenFlags::SQLITE_OPEN_READ_ONLY, true, |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id,storage_key,incarnation,content_revision FROM conversations
                 WHERE storage_key>?1 ORDER BY storage_key LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![*cursor, PAGE], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
+                )?;
+                let rows = stmt.query_map(rusqlite::params![*cursor, PAGE], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })?;
-        *cursor = if entries.len() == PAGE {
-            entries.last().unwrap().1.clone()
-        } else {
-            String::new()
-        };
-        drop(cursor);
-        for (id, key, incarnation) in entries {
-            if storage_key(&id)? != key {
-                continue;
+        let count = entries.len();
+        for (id, key, incarnation, revision) in entries {
+            *cursor = key.clone();
+            if storage_key(&id)? == key {
+                let session = SessionDb {
+                    stores: self.clone(),
+                    id,
+                    key,
+                    incarnation,
+                };
+                if let Err(error) = session.repair_background(revision) {
+                    tracing::debug!(%error,session=%session.id,"Directory projection pending");
+                }
             }
-            let session = SessionDb {
-                stores: self.clone(),
-                id,
-                key,
-                incarnation,
-            };
-            if let Err(error) = session.repair_background() {
-                tracing::debug!(%error,session=%session.id,"Directory projection pending");
+            if start.elapsed() >= PASS_BUDGET {
+                return Ok(());
             }
+        }
+        if count < PAGE {
+            cursor.clear();
         }
         Ok(())
     }
 }
 
+enum SummaryCheck {
+    Current,
+    Upgrade,
+    Publish(Projection),
+}
+
 impl SessionDb {
-    fn repair_background(&self) -> Result<()> {
-        let _namespace = self.stores.namespace()?;
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(self.stores.root.path.join("session-locks").join(&self.key))?;
-        if file.try_lock_shared().is_err() {
-            return Ok(());
+    fn repair_locks(&self, exclusive: bool) -> Result<Option<(File, File)>> {
+        let dir = self.stores.root.path.join("session-locks");
+        let open = |p: PathBuf| File::options().read(true).write(true).open(p);
+        let namespace = open(dir.join(".directory"))?;
+        if namespace.try_lock_shared().is_err() {
+            return Ok(None);
         }
-        self.check_directory()?;
-        let path = self.stores.sessions().join(&self.key).join("session.db");
-        let Some(permit) = Permits::try_one() else {
+        ensure!(
+            std::fs::read_to_string(dir.join(".initialized"))? == self.stores.global().uuid,
+            "Lifecycle namespace identity changed"
+        );
+        let key = open(dir.join(&self.key))?;
+        let locked = if exclusive {
+            key.try_lock()
+        } else {
+            key.try_lock_shared()
+        };
+        Ok(locked.ok().map(|_| (namespace, key)))
+    }
+
+    fn upgrade_for_repair(&self) -> Result<()> {
+        ensure!(storage_key(&self.id)? == self.key, "Invalid directory key");
+        let Some(_locks) = self.repair_locks(true)? else {
             return Ok(());
         };
-        let old = layout::needs_upgrade(&path, SESSION)?;
-        if old {
-            file.unlock()?;
-            if file.try_lock().is_err() {
-                return Ok(());
+        let Some(_permit) = Permits::try_one() else {
+            return Ok(());
+        };
+        self.check_directory()?;
+        let path = self.stores.sessions().join(&self.key).join("session.db");
+        if layout::needs_upgrade(&path, SESSION)? {
+            let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            verify_manifest(
+                &c,
+                self.stores.global().store_uuid(),
+                &self.id,
+                &self.incarnation,
+            )?;
+            drop(c);
+            layout::upgrade(&path, SESSION)?;
+        }
+        Ok(())
+    }
+
+    fn repair_background(&self, published: i64) -> Result<()> {
+        let Some(_locks) = self.repair_locks(false)? else {
+            return Ok(());
+        };
+        match self.summary_under_lock(published)? {
+            SummaryCheck::Current => Ok(()),
+            SummaryCheck::Publish(p) => {
+                self.stores
+                    .global()
+                    .project(&self.id, &self.incarnation, &p)
             }
-            self.check_directory()?;
-            if layout::needs_upgrade(&path, SESSION)? {
-                let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                verify_manifest(
-                    &c,
-                    self.stores.global().store_uuid(),
-                    &self.id,
-                    &self.incarnation,
-                )?;
-                drop(c);
-                layout::upgrade(&path, SESSION)?;
+            SummaryCheck::Upgrade => {
+                drop(_locks);
+                // Backfill outside the maintenance thread, at most one shard at a time.
+                if !self.stores.root.migrating.swap(true, Ordering::AcqRel) {
+                    let session = self.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = session.upgrade_for_repair() {
+                            tracing::debug!(%error, "Session migration postponed");
+                        }
+                        session
+                            .stores
+                            .root
+                            .migrating
+                            .store(false, Ordering::Release);
+                    });
+                }
+                Ok(())
             }
         }
-        self.project_current(permit)
+    }
+
+    fn summary_under_lock(&self, published: i64) -> Result<SummaryCheck> {
+        let Some(_permit) = Permits::try_one() else {
+            return Ok(SummaryCheck::Current);
+        };
+        let path = self.stores.sessions().join(&self.key).join("session.db");
+        let mut c = layout::open_timed(&path, OpenFlags::SQLITE_OPEN_READ_ONLY, 0)?;
+        let tx = c.transaction()?;
+        verify_manifest(
+            &tx,
+            self.stores.global().store_uuid(),
+            &self.id,
+            &self.incarnation,
+        )?;
+        let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if (1..layout::SESSION_VERSION).contains(&version) {
+            return Ok(SummaryCheck::Upgrade);
+        }
+        let (_, dirty) = layout::session_header(&tx)?;
+        ensure!(!dirty, "Unvalidated external history edit");
+        let revision: i64 = tx.query_row(
+            "SELECT content_revision FROM manifest WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision <= published {
+            return Ok(SummaryCheck::Current);
+        }
+        layout::verify_structure(&tx, SESSION, layout::SESSION_VERSION)?;
+        Ok(SummaryCheck::Publish(history::projection(&tx)?))
     }
 
     pub(super) fn try_project_current(&self) {
-        if let Err(error) = self.project_current(Permits::take(1)) {
+        let result = (|| {
+            let published = self.stores.global().read(|c| {
+                Ok(c.query_row(
+                    "SELECT content_revision FROM conversations WHERE id=?1 AND incarnation=?2",
+                    [&self.id, &self.incarnation],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })?;
+            if let SummaryCheck::Publish(p) = self.summary_under_lock(published)? {
+                self.stores
+                    .global()
+                    .project(&self.id, &self.incarnation, &p)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = result {
             tracing::debug!(%error,session=%self.id,"Directory projection pending");
         }
-    }
-
-    // Caller holds the shared or exclusive lifecycle lock.
-    fn project_current(&self, permit: Permits) -> Result<()> {
-        let global = self.stores.global();
-        let published: i64 = global.read(|c| {
-            Ok(c.query_row(
-                "SELECT content_revision FROM conversations WHERE id=?1 AND incarnation=?2",
-                [&self.id, &self.incarnation],
-                |r| r.get(0),
-            )?)
-        })?;
-        let snapshot =
-            self.connection_with_permit(permit, OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
-                let tx = c.transaction()?;
-                let revision: i64 =
-                    tx.query_row("SELECT content_revision FROM manifest", [], |r| r.get(0))?;
-                if revision <= published {
-                    return Ok(None);
-                }
-                Ok(Some(history::projection(&tx)?))
-            })?;
-        if let Some(p) = snapshot {
-            global.project(&self.id, &self.incarnation, &p)?;
-        }
-        Ok(())
     }
 }

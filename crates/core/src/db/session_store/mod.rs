@@ -31,6 +31,8 @@ struct Root {
     global: GlobalDb,
     repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
     repair_cursor: Mutex<String>,
+    verified: Mutex<HashMap<String, Arc<Mutex<Option<VerifiedShard>>>>>,
+    migrating: std::sync::atomic::AtomicBool,
 }
 static ROOTS: LazyLock<Mutex<HashMap<PathBuf, Weak<Root>>>> = LazyLock::new(Default::default);
 
@@ -63,6 +65,8 @@ impl Stores {
                         global,
                         repair: Default::default(),
                         repair_cursor: Default::default(),
+                        verified: Default::default(),
+                        migrating: Default::default(),
                         path: path.clone(),
                     }
                 });
@@ -202,9 +206,27 @@ impl Stores {
             }
         }
         let _locks = locks;
-        handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| layout::integrity(c))?;
+        handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
         handle.try_project_current();
         Ok(handle)
+    }
+}
+
+#[derive(PartialEq)]
+struct VerifiedShard {
+    file: (u64, u64),
+    schema: i64,
+    incarnation: String,
+}
+impl Stores {
+    fn verification_slot(&self, key: &str) -> Arc<Mutex<Option<VerifiedShard>>> {
+        self.root
+            .verified
+            .lock()
+            .unwrap()
+            .entry(key.into())
+            .or_default()
+            .clone()
     }
 }
 
@@ -241,20 +263,37 @@ impl SessionDb {
         mode: OpenFlags,
         body: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = layout::open(
-            &self.stores.sessions().join(&self.key).join("session.db"),
-            mode,
+        let path = self.stores.sessions().join(&self.key).join("session.db");
+        let file = layout::file_identity(&path)?;
+        let mut conn = layout::open(&path, mode)?;
+        let snap = conn.transaction()?;
+        let (schema, dirty) = layout::session_header(&snap)?;
+        verify_manifest(
+            &snap,
+            self.stores.global().store_uuid(),
+            &self.id,
+            &self.incarnation,
         )?;
+        ensure!(
+            file == layout::file_identity(&path)?,
+            "Session file changed during checkout"
+        );
+        let identity = VerifiedShard {
+            file,
+            schema,
+            incarnation: self.incarnation.clone(),
+        };
+        let slot = self.stores.verification_slot(&self.key);
         {
-            let snap = conn.transaction()?;
-            layout::verify(&snap, SESSION)?;
-            verify_manifest(
-                &snap,
-                self.stores.global().store_uuid(),
-                &self.id,
-                &self.incarnation,
-            )?;
+            let mut verified = slot.lock().unwrap();
+            if dirty || verified.as_ref() != Some(&identity) {
+                *verified = None;
+                layout::verify(&snap, SESSION)?;
+                layout::integrity(&snap)?;
+                *verified = Some(identity);
+            }
         }
+        snap.commit()?;
         body(&mut conn)
     }
     /// Use the supplied transaction for the duration of the callback. Nested

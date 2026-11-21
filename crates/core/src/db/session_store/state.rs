@@ -35,7 +35,8 @@ impl GlobalDb {
                 "SELECT value FROM global_settings WHERE domain=?1 AND name=?2",
                 key.parts(),
                 |r| r.get(0),
-            ).optional()?)
+            )
+            .optional()?)
         })?;
         raw.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
     }
