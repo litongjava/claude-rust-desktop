@@ -71,8 +71,12 @@ impl Stores {
         index: Option<usize>,
     ) -> Result<String> {
         let destination = uuid::Uuid::new_v4().to_string();
-        self.open_session(id)?
-            .branch(&destination, Branch::Through { message, index })?;
+        let boundary = if message.is_none() && index.is_none() {
+            Branch::Full
+        } else {
+            Branch::Through { message, index }
+        };
+        self.open_session(id)?.branch(&destination, boundary)?;
         Ok(destination)
     }
 }

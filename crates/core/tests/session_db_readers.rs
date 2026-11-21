@@ -608,3 +608,26 @@ fn project_chat_rechecks_trust_and_recovers_the_prepared_workspace() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn conversation_routes_keep_rewind_and_full_branch_scoped_to_the_selected_chat() -> Result<()> {
+    use deepseek_code_core::db::session_store::Rewind;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let session = stores.create("original", Default::default())?;
+    let first = session.write(|s| s.append("user", "first"))?;
+    session.write(|s| s.append("assistant", "second"))?;
+    let full = stores.branch_conversation("original", None, None)?;
+    assert_eq!(stores.conversation_detail(&full)?.1.len(), 2);
+    let partial = stores.branch_conversation("original", Some(&first), None)?;
+    assert_eq!(stores.conversation_detail(&partial)?.1.len(), 1);
+    assert_eq!(
+        stores.rewind_messages("original", Rewind::Tail(1))?.len(),
+        1
+    );
+    assert!(stores
+        .rewind_messages("original", Rewind::From(&first))?
+        .is_empty());
+    assert_eq!(stores.conversation_detail(&full)?.1.len(), 2);
+    Ok(())
+}
