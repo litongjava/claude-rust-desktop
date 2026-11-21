@@ -3,6 +3,8 @@ mod approvals;
 mod binding;
 mod compaction;
 mod directory;
+mod conversations;
+pub use conversations::Rewind;
 pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;

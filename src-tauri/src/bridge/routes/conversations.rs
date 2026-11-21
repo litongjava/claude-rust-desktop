@@ -39,25 +39,9 @@ async fn conversations_create(State(state): State<AppState>, Json(body): Json<Cr
     let title_clone = body.title.clone();
     let model_clone = body.model.clone();
     let workspace_mode = body.workspace_mode.as_str();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let tx = deepseek_code_core::db::write_transaction(&conn)?;
-            let now = chrono::Utc::now().to_rfc3339();
-            crate::db::conversation_repo::insert_conversation(
-                &tx, &id_clone,
-                title_clone.as_deref(),
-                model_clone.as_deref(),
-                None, None, None,
-                body.research_mode.unwrap_or(false), false, false,
-                &now, &now, 0
-            )?;
-            crate::db::conversation_repo::set_workspace_mode(&tx, &id_clone, workspace_mode)?;
-            tx.commit()?;
-            Ok::<(), anyhow::Error>(())
-        })
-    }).await;
+    tokio::task::spawn_blocking(move || db.create_conversation(&id_clone,title_clone,model_clone,body.research_mode.unwrap_or(false),body.workspace_mode))
+        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
     let now = chrono::Utc::now().to_rfc3339();
-    if !matches!(result, Ok(Ok(Ok(())))) { return Err(StatusCode::INTERNAL_SERVER_ERROR); }
     Ok(Json(serde_json::json!({
         "id": id,
         "title": body.title,
@@ -112,30 +96,23 @@ struct ConversationQuery {
     snapshot_parts: Option<String>,
 }
 
-async fn conversation_get(Path(id): Path<String>, Query(query): Query<ConversationQuery>, State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn conversation_get(Path(id): Path<String>, Query(query): Query<ConversationQuery>, State(state): State<AppState>) -> Result<Json<serde_json::Value>,StatusCode> {
     let share_parts = query.snapshot_parts.as_deref() == Some("1");
     let db = state.db_manager.clone();
     let id_clone = id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let conv = crate::db::conversation_repo::get_conversation(conn, &id_clone).ok().flatten();
-            let enriched_messages = enriched_messages(conn, &id_clone)?;
-
-            Ok::<_, anyhow::Error>((conv, enriched_messages))
-        })
-    }).await;
-    let result = result.map(|inner| inner.map(|inner| inner.map(|(conv, mut messages)| {
-        let parts = share_parts.then(|| share_snapshot_parts(&mut messages));
-        (conv, messages, parts)
-    })));
+    let result = tokio::task::spawn_blocking(move || db.conversation_detail(&id_clone)).await;
+    let result = result.map(|r| r.map(|(conv,mut messages)| {
+        let parts=share_parts.then(||share_snapshot_parts(&mut messages));
+        (conv,messages,parts)
+    }));
     let with_parts = |mut value: serde_json::Value, parts: Option<serde_json::Map<String, serde_json::Value>>| {
         if let Some(parts) = parts {
             value["snapshotParts"] = serde_json::Value::Object(parts);
         }
-        Json(value)
+        Ok(Json(value))
     };
     match result {
-        Ok(Ok(Ok((Some(conv), messages, parts)))) => with_parts(serde_json::json!({
+        Ok(Ok((Some(conv), messages, parts))) => with_parts(serde_json::json!({
             "id": conv.id,
             "title": conv.title,
             "model": conv.model,
@@ -150,8 +127,8 @@ async fn conversation_get(Path(id): Path<String>, Query(query): Query<Conversati
             "message_count": conv.message_count,
             "messages": messages,
         }), parts),
-        Ok(Ok(Ok((None, messages, parts)))) => with_parts(serde_json::json!({ "id": id, "messages": messages }), parts),
-        _ => Json(serde_json::json!({ "id": id, "messages": [] })),
+        Ok(Ok((None, messages, parts))) => with_parts(serde_json::json!({ "id": id, "messages": messages }), parts),
+        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -234,44 +211,21 @@ async fn conversation_update(Path(id): Path<String>, State(state): State<AppStat
 async fn conversation_delete(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
     let db = state.db_manager.clone();
     let id_for_error = id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::db::message_repo::delete_messages_from(conn, &id, 0).ok();
-            crate::db::conversation_repo::delete_conversation(conn, &id)
-        })
-    }).await;
-    match result {
-        Ok(Ok(Ok(()))) => {
-            deepseek_code_core::prompt::forget_session_files(
-                state.data_dir.as_ref(),
-                &id_for_error,
-            );
-            Json(serde_json::json!({ "ok": true }))
+    match tokio::task::spawn_blocking(move || db.sync_delete(&id)).await {
+        Ok(Ok(())) => {
+            deepseek_code_core::prompt::forget_session_files(state.data_dir.as_ref(),&id_for_error);
+            Json(serde_json::json!({"ok":true}))
         }
-        Err(e) => {
-            tracing::error!(module = "Conversations", "Failed to delete conversation {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
-        Ok(Ok(Err(e))) => {
-            tracing::error!(module = "Conversations", "Failed to delete conversation {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
-        Ok(Err(e)) => {
-            tracing::error!(module = "Conversations", "DB error on delete {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
+        Ok(Err(e)) => Json(serde_json::json!({"ok":false,"error":e.to_string()})),
+        Err(e) => Json(serde_json::json!({"ok":false,"error":e.to_string()})),
     }
 }
 
-async fn conversation_messages(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.db_manager.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| enriched_messages(conn, &id))
-    }).await;
-    match result {
-        Ok(Ok(Ok(messages))) => Json(serde_json::json!({ "messages": messages })),
-        _ => Json(serde_json::json!({ "messages": [] })),
-    }
+async fn conversation_messages(Path(id): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>,StatusCode> {
+    let db=state.db_manager.clone();
+    let (_,messages)=tokio::task::spawn_blocking(move || db.conversation_detail(&id)).await
+        .map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"messages":messages})))
 }
 
 async fn conversation_message_delete(
@@ -279,21 +233,12 @@ async fn conversation_message_delete(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db_manager.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let msg = crate::db::message_repo::get_message(conn, &mid)?;
-            if let Some(m) = msg {
-                crate::db::message_repo::delete_messages_from(conn, &id, m.sort_order)?;
-            }
-            enriched_messages(conn, &id)
-        })
-    }).await;
-    match result {
-        Ok(Ok(Ok(messages))) => Ok(Json(serde_json::json!({ "success": true, "messages": messages }))),
-        Ok(Ok(Err(e))) => { tracing::error!(module = "MessageDelete", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { tracing::error!(module = "MessageDelete", "DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    let result=tokio::task::spawn_blocking(move || db.rewind_messages(&id,deepseek_code_core::db::session_store::Rewind::From(&mid))).await
+        .map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?.map_err(|error| {
+            tracing::error!(%error,"Conversation operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({"success":true,"messages":result})))
 }
 
 async fn conversation_messages_tail_delete(
@@ -301,18 +246,12 @@ async fn conversation_messages_tail_delete(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db_manager.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::db::message_repo::delete_messages_tail(conn, &id, count)?;
-            enriched_messages(conn, &id)
-        })
-    }).await;
-    match result {
-        Ok(Ok(Ok(messages))) => Ok(Json(serde_json::json!({ "success": true, "messages": messages }))),
-        Ok(Ok(Err(e))) => { tracing::error!(module = "MessagesTailDelete", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { tracing::error!(module = "MessagesTailDelete", "DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    let result=tokio::task::spawn_blocking(move || db.rewind_messages(&id,deepseek_code_core::db::session_store::Rewind::Tail(count))).await
+        .map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?.map_err(|error| {
+            tracing::error!(%error,"Conversation operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({"success":true,"messages":result})))
 }
 
 #[derive(Deserialize)]
@@ -327,17 +266,12 @@ async fn conversation_branch_handler(
     Json(req): Json<BranchRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db_manager.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::db::conversation_repo::branch_conversation(conn, &id, req.from_message_id.as_deref(), req.from_message_index)
-        })
-    }).await;
-    match result {
-        Ok(Ok(Ok(new_id))) => Ok(Json(serde_json::json!({ "success": true, "new_conversation_id": new_id }))),
-        Ok(Ok(Err(e))) => { tracing::error!(module = "Branch", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { tracing::error!(module = "Branch", "DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    let result=tokio::task::spawn_blocking(move || db.branch_conversation(&id,req.from_message_id.as_deref(),req.from_message_index)).await
+        .map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?.map_err(|error| {
+            tracing::error!(%error,"Conversation operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({"success":true,"new_conversation_id":result})))
 }
 
 #[derive(Deserialize)]
@@ -505,7 +439,7 @@ async fn conversation_context_size(
     let db = state.db_manager.clone();
     let id_clone = id.clone();
     let measured = tokio::task::spawn_blocking(move || {
-        let conversation = db.with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &id_clone))??;
+        let conversation = db.conversation_metadata(&id_clone)?;
         let Some(conversation) = conversation else { return Ok(None) };
         let store = crate::runtime::SessionStore::new(db);
         // The prompt and tool overhead is only measurable for the
