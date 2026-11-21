@@ -211,7 +211,7 @@ fn reviewer_queries_page_redact_and_reject_out_of_scope_sessions() {
     fixture
         .context
         .db
-        .with_conn(|conn| {
+        .fixture_shard(&fixture.coder, |conn| {
             crate::db::message_repo::insert_tool_call(
                 conn,
                 "call-1",

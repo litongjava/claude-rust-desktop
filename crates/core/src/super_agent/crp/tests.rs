@@ -7,7 +7,7 @@ use std::sync::Arc;
 struct Fixture {
     _temp: tempfile::TempDir,
     data: PathBuf,
-    db: Arc<DbManager>,
+    db: Arc<crate::db::session_store::Stores>,
     runtime: ToolRuntime,
     router: String,
     coder: String,

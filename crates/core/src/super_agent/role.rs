@@ -88,7 +88,7 @@ mod tests {
     use super::*;
     use crate::runtime::RuntimePaths;
 
-    fn fixture() -> (tempfile::TempDir, std::sync::Arc<DbManager>) {
+    fn fixture() -> (tempfile::TempDir, std::sync::Arc<crate::db::session_store::Stores>) {
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();

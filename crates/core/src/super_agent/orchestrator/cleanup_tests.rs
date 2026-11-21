@@ -47,8 +47,7 @@ async fn cleanup_pending(f: &TwoRepoDeliveryFixture, reason: &str) {
     );
     assert_eq!(cleanup_events(f), 0);
     let saved: String = f
-        .context
-        .setting(&format!("super-agent.cleanup-pending.{}", f.task_id))
+        .context.db.task_state(&format!("super-agent.cleanup-pending.{}", f.task_id))
         .unwrap()
         .unwrap();
     assert!(saved.contains(reason), "{saved}");
@@ -499,7 +498,7 @@ async fn cleanup_missing_member_state_and_missing_report_preserve_assets() {
         } else {
             f.context
                 .db
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     conn.execute(
                         "DELETE FROM sa_reports WHERE task_id=?1 AND kind='HARNESS'",
                         [&f.task_id],
@@ -547,8 +546,8 @@ async fn cleanup_active_and_unknown_descendant_jobs_preserve_worktree() {
             updated_at: "fixture".into(),
             last_error: None,
         };
-        f.context
-            .save_setting(&format!("child-owner.{child}"), &owner)
+        use crate::db::session_store::WorkerDirectory as _;
+        f.context.db.save_child_owner(&f.context.db.worker_pair(&parent, &child).unwrap(), &owner)
             .unwrap();
         if status != "missing" {
             let directory = f.data.join("background-tasks").join(&job_id);
@@ -593,7 +592,7 @@ async fn cleanup_active_child_task_and_non_git_scope_stay_pending() {
                 .unwrap();
             f.context
                 .db
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     conn.execute(
                         "UPDATE sa_tasks SET parent_task_id=?1 WHERE task_id=?2",
                         [&f.task_id, &child.task_id],
@@ -636,7 +635,7 @@ async fn cleanup_active_child_task_and_non_git_scope_stay_pending() {
             if scenario == "non-git" {
                 f.context
                     .db
-                    .with_conn(|conn| {
+                    .fixture_directory(|conn| {
                         conn.execute("DELETE FROM sa_task_repos WHERE task_id=?1", [&f.task_id])
                     })
                     .unwrap()
@@ -906,8 +905,7 @@ async fn cleanup_unknown_jobs_are_filtered_by_readable_identity() {
                 cleanup_pending(&f, &id).await;
                 assert!(f.repos[0].worktree.is_dir());
                 let reason: String = f
-                    .context
-                    .setting(&format!("super-agent.cleanup-pending.{}", f.task_id))
+                    .context.db.task_state(&format!("super-agent.cleanup-pending.{}", f.task_id))
                     .unwrap()
                     .unwrap();
                 if relation == "unreadable" {

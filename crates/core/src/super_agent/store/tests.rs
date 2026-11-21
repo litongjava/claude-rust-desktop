@@ -265,8 +265,7 @@ fn transitions_persist_and_invalid_events_are_rejected_without_writing() {
     assert_eq!(record.status, Status::Running);
 
     // Reopening the database sees the committed transition and event.
-    let reopened = crate::db::DbManager::new(data.join("deepseek_code.db")).unwrap();
-    reopened.init().unwrap();
+    let reopened = crate::db::session_store::Stores::open(&data).unwrap();
     let reopened = TaskStore::new(Arc::new(reopened), data.clone());
     let persisted = reopened.get_task(&task.task_id).unwrap().unwrap();
     assert_eq!(persisted.phase, Phase::Planning);
@@ -899,7 +898,7 @@ fn completion_requires_durable_sessions_and_trace() {
         .unwrap();
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "DELETE FROM sa_events WHERE task_id=?1 AND event_type=?2",
                 rusqlite::params![record.task_id, "HARNESS_ANALYSIS_COMPLETED"],
@@ -1084,7 +1083,7 @@ fn record_plan(store: &TaskStore, plan: &crate::super_agent::delivery::DeliveryP
     let encoded = serde_json::to_string(plan).unwrap();
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "INSERT INTO sa_delivery_plans(operation_id,task_id,spec_version,review_round,created_at,plan_json) VALUES(?1,?2,?3,?4,?5,?6)",
                 rusqlite::params![
@@ -1109,7 +1108,7 @@ fn record_observation(
     for target in &plan.repositories {
         store
             .db()
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "INSERT INTO sa_repository_delivery_observations(task_id,plan_operation_id,repository_id,spec_version,review_round,coder_session_id,old_oid,new_oid,target_ref,attempt,observed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     rusqlite::params![
@@ -1258,7 +1257,7 @@ fn completion_rejects_a_malformed_current_delivery_plan() {
     let record = finalizing_with_a_merge_commit(&store);
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "INSERT INTO sa_delivery_plans(operation_id,task_id,spec_version,review_round,created_at,plan_json) VALUES(?1,?2,?3,?4,?5,?6)",
                 rusqlite::params![
@@ -1288,7 +1287,7 @@ fn completion_rejects_a_malformed_current_delivery_plan() {
     // into a completion or silently replaced by an older plan.
     let count: i64 = store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM sa_delivery_plans WHERE task_id=?1",
                 [&record.task_id],
@@ -1663,8 +1662,7 @@ fn completion_with_a_real_pinned_non_git_target_requires_the_reviewed_bytes() {
 }
 
 fn separate_store(data: &std::path::Path) -> TaskStore {
-    let db = crate::db::DbManager::new(data.join(crate::runtime::DATABASE_FILE)).unwrap();
-    db.init().unwrap();
+    let db = crate::db::session_store::Stores::open(&data).unwrap();
     TaskStore::new(Arc::new(db), data.to_path_buf())
 }
 
@@ -1865,7 +1863,7 @@ fn completion_rejects_an_empty_session_row_and_historical_round_events() {
     // to round 0 and must no longer satisfy the trace requirement.
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE sa_tasks SET review_round=1 WHERE task_id=?1",
                 [&record.task_id],

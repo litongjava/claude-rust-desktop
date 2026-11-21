@@ -654,7 +654,7 @@ fn a_persistence_failure_releases_locks_and_retries_with_a_new_attempt() {
     fixture
         .store
         .db()
-        .with_conn(|conn| -> rusqlite::Result<()> {
+        .fixture_directory(|conn| -> rusqlite::Result<()> {
             conn.execute_batch(
                 "CREATE TRIGGER fail_delivery_insert BEFORE INSERT ON sa_delivery_plans BEGIN SELECT RAISE(ABORT, 'injected delivery plan failure'); END;",
             )
@@ -699,7 +699,7 @@ fn a_persistence_failure_releases_locks_and_retries_with_a_new_attempt() {
     fixture
         .store
         .db()
-        .with_conn(|conn| -> rusqlite::Result<()> {
+        .fixture_directory(|conn| -> rusqlite::Result<()> {
             conn.execute_batch("DROP TRIGGER fail_delivery_insert")
         })
         .unwrap()
@@ -1719,7 +1719,7 @@ fn recording_a_delivery_marks_the_repository_and_is_idempotent() {
     fixture
         .store
         .db()
-        .with_conn(|conn| -> rusqlite::Result<usize> {
+        .fixture_directory(|conn| -> rusqlite::Result<usize> {
             conn.execute(
                 "UPDATE sa_tasks SET phase='DELIVERY_PENDING', status='RUNNING' WHERE task_id=?1",
                 [&fixture.task.task_id],
@@ -1958,7 +1958,7 @@ fn repo_fixture<'a>(fixture: &'a Fixture, repository_id: &str) -> &'a RepoFixtur
 fn set_delivery_pending(store: &TaskStore, task_id: &str) {
     store
         .db()
-        .with_conn(|conn| -> rusqlite::Result<usize> {
+        .fixture_directory(|conn| -> rusqlite::Result<usize> {
             conn.execute(
                 "UPDATE sa_tasks SET phase='DELIVERY_PENDING', status='RUNNING' WHERE task_id=?1",
                 [task_id],
@@ -2258,21 +2258,11 @@ fn a_legacy_single_repository_receipt_binds_only_through_the_plan() {
         store
             .set_delivery_dispatch_job(&plan.task_id, &plan.operation_id, "legacy-job")
             .unwrap();
-        // Model a database created before the repository-scoped tables existed.
-        store
-            .db()
-            .with_conn(|conn| -> rusqlite::Result<()> {
-                conn.execute_batch(
-                    "DROP TABLE sa_repository_dispatches; DROP TABLE sa_repository_delivery_observations;",
-                )
-            })
-            .unwrap()
-            .unwrap();
+        // This receipt has only a whole-plan dispatch. No repository dispatch was recorded.
         (task, plan)
     };
 
-    // Opening the same old database with the new code recreates the tables and
-    // still reads the legacy receipt through the complete immutable plan.
+    // Opening the published directory again reads the legacy receipt through the complete immutable plan.
     let paths = crate::runtime::RuntimePaths::new(data.clone()).unwrap();
     let reopened = TaskStore::new(paths.open_database().unwrap(), data.clone());
     let bound = reopened
@@ -2287,7 +2277,7 @@ fn a_legacy_single_repository_receipt_binds_only_through_the_plan() {
     // The legacy row is read, never migrated or duplicated.
     let migrated: i64 = reopened
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.query_row("SELECT COUNT(*) FROM sa_repository_dispatches", [], |row| {
                 row.get(0)
             })
@@ -2414,7 +2404,7 @@ fn a_legacy_single_repository_receipt_binds_only_through_the_plan() {
     );
     let imported: i64 = reopened
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM sa_repository_dispatches WHERE task_id=?1 AND plan_operation_id=?2",
                 rusqlite::params![

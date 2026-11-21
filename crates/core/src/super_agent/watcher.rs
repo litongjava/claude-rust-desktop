@@ -547,7 +547,7 @@ async fn watch_member(
         return Ok(());
     }
     if !processes_gone(&job)
-        || session_messages::execution_active(&host.context.paths.data_dir, session)?
+        || host.context.db.select_session(session)?.execution_active(&host.context.paths.data_dir)?
     {
         if !terminal {
             if !recovery.stop_requested {
