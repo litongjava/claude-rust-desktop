@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
+mod base64_collapse;
 mod lsp;
 mod notebook;
 pub mod plan_import;
@@ -52,7 +53,7 @@ pub(crate) mod apply_patch_apply;
 pub(crate) mod apply_patch_fs;
 pub(crate) mod apply_patch_tool;
 pub mod background_shell;
-mod bash_process;
+pub(crate) mod bash_process;
 #[cfg(windows)]
 mod conpty;
 pub mod file_change;
@@ -145,7 +146,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let bash_tool = shell_tool_description::bash_tool();
     let mut defs = vec![
         image_generation::definition(),
-        ToolDefinition { name: "Skill".into(), description: "Invoke a skill.\n\nA skill is a packaged set of instructions the user or project has set up for a particular kind of task (deploy steps, a review checklist, a repo-specific workflow). Available skills are listed in the system prompt with one-line descriptions. When the task at hand is one a listed skill covers, call this tool first — the skill's instructions load into the turn for you to follow in place of your default approach; skills with context:fork instead run in an isolated child conversation and return the finished result. Users may also ask for one by name (`/<name>`, or \"slash command\"); that's a request to invoke it.\n\n- `skill`: exact name from the listing, no leading slash. Plugin skills use `plugin:skill`.\n- `args`: optional arguments to pass through.\n\nOnly names from the listing (or that the user typed explicitly) are valid. Built-in CLI commands (`/help`, `/clear`, …) aren't skills. Do not read a skill file to bypass this tool: dynamic shell context and fork isolation run through it.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"The name of a skill from the available-skills list. Do not guess names.","type":"string"},"args":{"description":"Optional arguments for the skill","type":"string"}},"required":["skill"],"additionalProperties":false}) },
+        ToolDefinition { name: "Skill".into(), description: "Invoke a skill by name. The available skills are listed in a system reminder in the conversation, one line each with an optional description and execution context. Pass the exact name from that list without a leading slash; plugin-provided skills use the plugin:skill form. args is optional and is passed to the skill's template. A skill marked context: fork runs in an isolated child conversation and returns its result. Call this tool rather than opening a skill's file yourself; the tool supplies shell context and fork isolation.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"Exact skill name from the reminder, without a leading slash; plugin skills use plugin:skill.","type":"string"},"args":{"description":"Optional arguments passed to the skill's template.","type":"string"}},"required":["skill"],"additionalProperties":false}) },
         notebook::definition(),
         lsp::definition(),
         // `worktree` stays dispatchable for older transcripts; the model sees Enter/ExitWorktree.
@@ -182,12 +183,12 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         read::definition(),
         ToolDefinition {
             name: "Write".to_string(),
-            description: "Writes a file to the local filesystem, overwriting if one exists.\n\nWhen to use: creating a new file, or fully replacing one you've already Read. Overwriting an existing file you haven't Read will fail. For partial changes, use Edit instead.".to_string(),
+            description: "Create a file or replace its whole contents with UTF-8 text. Missing parent directories are created. If the path already exists, read it in this conversation first and leave it unchanged since, or the call is refused. For a partial change to an existing file, use Edit or MultiEdit instead. The result reports the resolved path and how many bytes were written.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "description": "The absolute path to the file to write (must be absolute, not relative)", "type": "string" },
-                    "content": { "description": "The content to write to the file", "type": "string" }
+                    "file_path": { "description": "Path of the file to create or overwrite.", "type": "string" },
+                    "content": { "description": "Full UTF-8 text for the file.", "type": "string" }
                 },
                 "required": ["file_path", "content"],
                 "additionalProperties": false
@@ -195,14 +196,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Edit".to_string(),
-            description: "Performs exact string replacement in a file.\n\n- You must Read the file in this conversation before editing, or the call will fail.\n- `old_string` must match the file including indentation and be unique (LF and CRLF are equivalent) — the edit fails otherwise. Strip the Read line prefix (line number + tab) before matching.\n- `replace_all: true` replaces every occurrence instead.".to_string(),
+            description: "Change a file by replacing an exact string. Read the file first in this conversation and leave it unchanged since, or the call is refused. old_string must match exactly once, indentation included, unless replace_all is true. LF and CRLF compare as equal, and replacements keep the file's existing line-ending style. A miss or duplicate match returns an error and writes nothing. Exclude the line-number prefix that Read adds; match only the file text.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "description": "The absolute path to the file to modify", "type": "string" },
-                    "old_string": { "description": "The text to replace", "type": "string" },
-                    "new_string": { "description": "The text to replace it with (must be different from old_string)", "type": "string" },
-                    "replace_all": { "description": "Replace all occurrences of old_string (default false)", "default": false, "type": "boolean" }
+                    "file_path": { "description": "Path of the file to change.", "type": "string" },
+                    "old_string": { "description": "Exact text to find, without Read's line-number prefix.", "type": "string" },
+                    "new_string": { "description": "Replacement text; it must differ from old_string.", "type": "string" },
+                    "replace_all": { "description": "Replace every match instead of requiring a unique one; default false.", "default": false, "type": "boolean" }
                 },
                 "required": ["file_path", "old_string", "new_string"],
                 "additionalProperties": false
@@ -210,21 +211,19 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Bash".to_string(),
-            description: format!("Executes a shell command and returns its output.\n\n- With bash, sh or zsh the working directory persists between calls, but prefer absolute paths; leaving the project resets it to the project directory. Shell state (env vars, functions) does not persist. Other shells start in the project directory each call.\n- Command output is displayed to you, not reliably to the user.\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command. A foreground command still running at its timeout is not killed: it moves to the background as a managed task, and you get its output so far and a task_id to wait on with TaskGet or stop with TaskStop.\n- `run_in_background` runs the command as a managed task: it keeps running across turns and returns a task_id. No `&` or Start-Process needed. You will be notified when it finishes, so do not poll or sleep waiting for it. To read its output before then, or to wait for it in a non-interactive run (nothing wakes the session after such a turn ends), load TaskGet with ToolLoad (names: [\"TaskGet\"]) and call it with the task_id (block:true waits up to timeout milliseconds). TaskStop stops it. Add `interaction: \"pipe\"` to that background call to give the process a writable stdin pipe: write UTF-8 data or close stdin with TaskInput. On Linux and Windows, interaction: \"pty\" instead provides a controlling terminal with merged output and TaskInput resize. Linux PTY EOF sends canonical VEOF, not a permanent stdin close. Windows ConPTY has no universal EOF: eof:true is rejected before writing; send application-specific control characters with data or use TaskStop. Windows input requires the original owning process (persistent worker across turns).
-- When a call finishes it cleans up the command's whole process tree, including children the command started. A service that must outlive the call (a local server, a daemon) needs `detach: true`, which starts it outside that tree and returns its pid and log files.
-- With bash and zsh a pipeline reports an earlier command's failure, so `failing | head` is not reported as success. When a later command such as `head` closes the pipe early, the result says the output ended early.\n\n# Git\n- Use the Bash tool for all Git commands; there are no separate Git tools.\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n- Commit or push only when the user asks. If on the default branch, branch first.{}", bash_tool.description_suffix()),
+            description: bash_tool.description().to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "description": "The command to execute", "type": "string" },
-                    "timeout": { "description": "Positive timeout in milliseconds: 1..600000 foreground, 1..86400000 background. Omit for no background runtime limit; zero is invalid.", "type": "number", "minimum": 1, "maximum": 86400000 },
-                    "description": { "description": "Clear, concise description of what this command does in active voice. Never use words like \"complex\" or \"risk\" in the description - just describe what it does.\n\nSay what the command does in plain words: do not echo the command's text, its flags, or file paths - the user reads this description, often without seeing the command.\n\nFor simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):\n- ls → \"List files in current directory\"\n- git status → \"Show working tree status\"\n- npm install → \"Install package dependencies\"\n\nFor commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:\n- find . -name \"*.tmp\" -exec rm {} \\; → \"Find and delete all .tmp files recursively\"\n- git reset --hard origin/main → \"Discard all local changes and match remote main\"\n- curl -s url | jq '.data[]' → \"Fetch JSON from URL and extract data array elements\"", "type": "string" },
-                    "run_in_background": { "description": "Set to true to run this command in the background.", "type": "boolean" },
-                    "interaction": { "description": "Use with run_in_background:true. pipe provides writable stdin; pty provides a Linux PTY or Windows ConPTY console with merged stdout/stderr. PTY is unsupported on macOS and with sandbox policies or Bash timeout; Windows WSL, cmd and pipe interaction are unsupported; use TaskGet timeout to bound a read and TaskStop to stop it.", "type": "string", "enum": ["pipe", "pty"] },
-                    "rows": { "description": "Initial PTY rows (pty only).", "type": "integer", "minimum": 1, "maximum": 500, "default": 24 },
-                    "cols": { "description": "Initial PTY columns (pty only).", "type": "integer", "minimum": 1, "maximum": 1000, "default": 80 },
-                    "detach": { "description": "Start an unmanaged service that must outlive this call, such as a local server or daemon. The command is not waited for and is not added to the process tree that a normal call cleans up, so it keeps running after this call, using `detach` with `run_in_background` or `timeout` is an error. Use it only when the process must survive; otherwise run the command normally or use `run_in_background`.", "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "description": "Set this to true to dangerously override sandbox mode and run commands without sandboxing.", "type": "boolean" },
+                    "command": { "description": "Supply the script in the syntax of the selected shell.", "type": "string" },
+                    "timeout": { "description": "Allow 1–600000 ms for a foreground wait (default 120000 ms) or 1–86400000 ms for a background run (unlimited by default).", "type": "number", "minimum": 1, "maximum": 86400000 },
+                    "description": { "description": "Give the command a short label for the user, such as “Check archive integrity”.", "type": "string" },
+                    "run_in_background": { "description": "Enable this to get a managed task ID immediately (default false).", "type": "boolean" },
+                    "interaction": { "description": "For background input via TaskInput, choose pipe on Unix or pty on Linux or Windows (default closed stdin).", "type": "string", "enum": ["pipe", "pty"] },
+                    "rows": { "description": "Set the opening PTY height to 1–500 rows (default 24).", "type": "integer", "minimum": 1, "maximum": 500, "default": 24 },
+                    "cols": { "description": "Set the opening PTY width to 1–1000 columns (default 80).", "type": "integer", "minimum": 1, "maximum": 1000, "default": 80 },
+                    "detach": { "description": "Start a long-running service outside this call's process tree so it survives the call; returns the PID and log paths, and you stop it explicitly (default false, cannot be combined with timeout or run_in_background).", "type": "boolean" },
+                    "dangerouslyDisableSandbox": { "description": "Request execution outside the configured sandbox if policy allows it (default false).", "type": "boolean" },
                     "shell": { "description": bash_tool.shell_parameter(), "type": "string" }
                 },
                 "required": ["command"],
@@ -233,7 +232,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "Monitor".to_string(),
-            description: format!("Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor expires after timeout_ms (default 30 min, max 60 min). Set max_runtime_ms to keep watching the same live script for another timeout_ms at each deadline, up to that total runtime. A renewal can send one notification, with at most one renewal notice per minute. You are notified when the monitor exits, expires or is stopped. More than 30 output events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.{}", bash_tool.description_suffix()),
+            description: format!("Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor expires after timeout_ms (default 30 min, max 60 min). Set max_runtime_ms to keep watching the same live script for another timeout_ms at each deadline, up to that total runtime. A renewal can send one notification, with at most one renewal notice per minute. You are notified when the monitor exits, expires or is stopped. More than 30 output events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.{}", bash_tool.monitor_suffix()),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -260,13 +259,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebFetch".to_string(),
-            description: "Fetches a URL, converts the page to readable text, and answers `prompt` against it using the session's model.\n\n- Fails on authenticated/private URLs — use an authenticated MCP tool or `gh` for those instead.\n- Fails on localhost, private addresses and other hostnames without a dot; for a local server, use curl via Bash.\n- HTTP is upgraded to HTTPS. Cross-host redirects are returned to you rather than followed; call again with the redirect URL.\n- Responses are cached for 15 minutes per URL.\n- Long pages are read in parts: when the result has next_offset, call again with it as offset.".to_string(),
+            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "description": "The URL to fetch content from", "type": "string", "format": "uri" },
-                    "prompt": { "description": "The prompt to run on the fetched content", "type": "string" },
-                    "offset": { "description": "Character position in the page text to start reading from. Use it to read on through a page too long for one call, with the value the previous result gave.", "type": "integer", "minimum": 0 }
+                    "url": { "description": "Page address to fetch; http(s) only.", "type": "string", "format": "uri" },
+                    "prompt": { "description": "Question for the session's model to answer from the page text.", "type": "string" },
+                    "offset": { "description": "Zero-based character position to begin at; pass next_offset from a truncated result.", "type": "integer", "minimum": 0 }
                 },
                 "required": ["url", "prompt"],
                 "additionalProperties": false
@@ -274,13 +273,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "WebSearch".to_string(),
-            description: "Search the web. Returns result blocks with titles and URLs.\n\n- The current date is given in the system prompt — use it when searching for recent information.\n- `allowed_domains` / `blocked_domains` filter results.\n- After answering from results, end with a \"Sources:\" list of the URLs you used as markdown links.\n- DeepSeek models use separate search credentials configured in System settings > Web search. If configuration or native search support is missing, relay the tool's setup instructions to the user; do not claim a search succeeded or retry unchanged requests.".to_string(),
+            description: "Use the provider's native web search, or its public adapter when configured. Each call returns at most eight results with a title, URL and snippet. allowed_domains keeps matching hosts and blocked_domains drops them; both include subdomains. The query must be non-empty and at most 2,000 characters. If the provider has no native search or has search disabled, the call fails with a settings error; do not report that as a successful search. Use the system prompt date to judge recency.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "description": "The search query to use", "type": "string", "minLength": 2 },
-                    "allowed_domains": { "description": "Only include search results from these domains", "type": "array", "items": { "type": "string" } },
-                    "blocked_domains": { "description": "Never include search results from these domains", "type": "array", "items": { "type": "string" } }
+                    "query": { "description": "Search terms; non-empty and at most 2,000 characters.", "type": "string", "minLength": 2 },
+                    "allowed_domains": { "description": "Keep only results whose host matches one of these domains or a subdomain.", "type": "array", "items": { "type": "string" } },
+                    "blocked_domains": { "description": "Drop results from these domains and their subdomains.", "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -289,11 +288,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         apply_patch_tool::definition(),
         ToolDefinition {
             name: "MultiEdit".to_string(),
-            description: "Make multiple string replacements in a file at once.".to_string(),
+            description: "Apply several exact replacements to one file in a single call. Edits run in order against the working text, and the file is written only if every edit succeeds; one failure returns the failing edit's error and leaves the file unchanged. Read the file first and leave it unchanged since. Each old_string must be unique unless its replace_all is true, and LF and CRLF compare as equal.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "The path to the file" },
+                    "file_path": { "type": "string", "description": "Path of the file to edit." },
                     "edits": {
                         "type": "array",
                         "items": {
@@ -311,41 +310,41 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "AskUserQuestion".to_string(),
-            description: "Use this tool only when you are blocked on a decision that is genuinely the user's to make: one you cannot resolve from the request, the code, or sensible defaults.\n\nUsage notes:\n- Users will always be able to type a custom answer instead of picking an option\n- Use multiSelect: true to allow multiple answers to be selected for a question\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label\n\nReserve this for decisions where the user's answer changes what you do next — not for choices with a conventional default or facts you can verify in the codebase yourself. In those cases pick the obvious option, mention it in your response, and proceed.\n\nThe user may see only the question: make each question stand on its own. If it depends on something you found, say so briefly, and name the items you are asking about in the question itself.".to_string(),
+            description: "Ask when a decision belongs to the user: the request, the code and sensible defaults leave it open, and the answer changes what you do next. The schema allows 1-4 questions per call; each question has a short header, 2-4 options with a label and a description, and an optional multiSelect flag. Put your recommended option first. If a conventional default or something you can check settles it, decide yourself, say why, and continue.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "questions": {
-                        "description": "Questions to ask the user (1-4 questions)",
+                        "description": "One to four questions to present, each with its own options.",
                         "type": "array", "minItems": 1, "maxItems": 4,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "question": { "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark.", "type": "string" },
-                                "header": { "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\".", "type": "string" },
+                                "question": { "description": "The question text shown to the user.", "type": "string" },
+                                "header": { "description": "Short label for the question, at most 12 characters.", "type": "string" },
                                 "options": {
-                                    "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+                                    "description": "Two to four answer choices; the host adds a free-text answer.",
                                     "type": "array", "minItems": 2, "maxItems": 4,
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "label": { "description": "The display text for this option that the user will see and select. Should be concise (1-5 words).", "type": "string" },
-                                            "description": { "description": "Explanation of what this option means or what will happen if chosen.", "type": "string" },
-                                            "preview": { "description": "Optional preview content rendered when this option is focused, such as a code snippet or ASCII mockup.", "type": "string" }
+                                            "label": { "description": "Short text the user picks.", "type": "string" },
+                                            "description": { "description": "What choosing this option means or causes.", "type": "string" },
+                                            "preview": { "description": "Optional content shown while this option is highlighted, such as a code snippet or mockup.", "type": "string" }
                                         },
                                         "required": ["label", "description"],
                                         "additionalProperties": false
                                     }
                                 },
-                                "multiSelect": { "description": "Set to true to allow the user to select multiple options instead of just one.", "default": false, "type": "boolean" }
+                                "multiSelect": { "description": "Allow more than one option to be selected.", "default": false, "type": "boolean" }
                             },
                             "required": ["question", "header", "options", "multiSelect"],
                             "additionalProperties": false
                         }
                     },
-                    "answers": { "description": "User answers collected by the permission component", "type": "object", "additionalProperties": { "type": "string" } },
-                    "annotations": { "description": "Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text.", "type": "object" },
-                    "metadata": { "description": "Optional metadata for tracking and analytics purposes. Not displayed to user.", "type": "object", "properties": { "source": { "description": "Optional identifier for the source of this question.", "type": "string" } }, "additionalProperties": false }
+                    "answers": { "description": "Pre-filled answers keyed by question text; normally omitted.", "type": "object", "additionalProperties": { "type": "string" } },
+                    "annotations": { "description": "Notes the user attached to a question's selection, keyed by question text.", "type": "object" },
+                    "metadata": { "description": "Optional tracking data for the host; not shown to the user.", "type": "object", "properties": { "source": { "description": "Identifier for where the question originated.", "type": "string" } }, "additionalProperties": false }
                 },
                 "required": ["questions"],
                 "additionalProperties": false
@@ -1707,10 +1706,7 @@ fn model_fetch_input(mut input: serde_json::Value) -> Result<serde_json::Value> 
     let url = input["url"]
         .as_str()
         .ok_or_else(|| anyhow!("url required"))?;
-    input["url"] = serde_json::json!(web::model_url(
-        url,
-        cfg!(test) || path_scope::approved_local_fetch(url)
-    )?);
+    input["url"] = serde_json::json!(web::model_url(url, path_scope::approved_local_fetch(url))?);
     Ok(input)
 }
 fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> {

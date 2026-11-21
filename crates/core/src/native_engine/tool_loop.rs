@@ -214,7 +214,60 @@ pub enum EngineEvent {
     },
 }
 
+/// Tools the model loaded with ToolLoad, in the order they were first loaded.
+/// Membership is a set so a repeated load neither moves a tool nor advertises
+/// it twice; iteration follows the first load, which is also the order their
+/// definitions are appended to the next request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LoadedTools {
+    order: Vec<String>,
+    names: std::collections::BTreeSet<String>,
+}
+
+impl LoadedTools {
+    fn insert(&mut self, name: String) -> bool {
+        if self.names.insert(name.clone()) {
+            self.order.push(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.order.iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        for name in names {
+            self.insert(name);
+        }
+    }
+}
+
+// The membership set is what the loading policy consults; order never widens it.
+impl std::ops::Deref for LoadedTools {
+    type Target = std::collections::BTreeSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
 pub struct ToolLoopExecutor {
+    pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
@@ -309,8 +362,9 @@ pub struct ToolLoopExecutor {
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
-    /// Built-in tools the model loaded with ToolLoad in this session.
-    loaded_tools: std::collections::BTreeSet<String>,
+    /// Built-in tools the model loaded with ToolLoad in this session, in load
+    /// order.
+    loaded_tools: LoadedTools,
     /// The names of the request the model is answering, or `None` before the
     /// first one, so a tool loaded in a batch is callable only from the next.
     exposed_tools: Option<std::collections::HashSet<String>>,
@@ -1531,6 +1585,7 @@ impl ToolLoopExecutor {
             toolscript_hosts: Vec::new(),
             local_goal_frontend: false,
             context_usage: None,
+            suggestion: None,
             auto_history: messages.clone(),
             provider,
             messages,
@@ -1818,7 +1873,10 @@ impl ToolLoopExecutor {
         for (call, prepared) in calls.iter().zip(&prepared) {
             pending.push(match &prepared.step {
                 CallStep::Builtin(input, approved) => Box::pin(async {
-                    Some(self.run_builtin(&call.name, input, &cwd, *approved).await)
+                    Some(
+                        self.run_builtin(&call.name, input, &call.id, &cwd, *approved)
+                            .await,
+                    )
                 }),
                 CallStep::Finished(_) => Box::pin(async { None }),
             });
@@ -1854,7 +1912,7 @@ impl ToolLoopExecutor {
         approved: bool,
     ) -> (Value, String, bool) {
         let cwd = self.get_workspace_cwd().to_owned();
-        let result = self.run_builtin(name, input, &cwd, approved).await;
+        let result = self.run_builtin(name, input, id, &cwd, approved).await;
         let (output, failed) = self.finish_builtin(name, input, id, result);
         (input.clone(), output, failed)
     }
@@ -2033,7 +2091,7 @@ impl ToolLoopExecutor {
             Some(is_search)
         }
 
-        let mut loaded = std::collections::BTreeSet::new();
+        let mut loaded = LoadedTools::default();
         let mut calls: HashMap<String, Call> = HashMap::new();
         for message in &self.messages {
             match message["role"].as_str().unwrap_or_default() {
@@ -2107,7 +2165,7 @@ impl ToolLoopExecutor {
         }
         // Added, not replaced: a later turn on this same executor keeps what it
         // already learned, and the settings still decide what is reachable.
-        self.loaded_tools.extend(loaded);
+        self.loaded_tools.extend(loaded.order);
     }
 
     /// Desktop may submit display-only history. The durable tool row binds an
@@ -2124,10 +2182,11 @@ impl ToolLoopExecutor {
                  WHERE m.conversation_id=?1 AND m.role='assistant'
                    AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
                    AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
-                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)",
+                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)
+                 ORDER BY m.sort_order ASC, t.sort_order ASC",
                 )?;
                 let results = query.query_map([session], |row| row.get::<_, String>(0))?;
-                let mut loaded = std::collections::BTreeSet::new();
+                let mut loaded = LoadedTools::default();
                 for result in results {
                     Self::absorb_loaded(&result?, &mut loaded);
                 }
@@ -2137,13 +2196,13 @@ impl ToolLoopExecutor {
             .map_err(|error| {
                 crate::db::write_boundary_context("restore loaded tools", session, started, error)
             })?;
-        self.loaded_tools.extend(loaded);
+        self.loaded_tools.extend(loaded.order);
         Ok(())
     }
 
     /// Reads a stored ToolLoad result. Only the structured marker of a
     /// successful search is accepted.
-    fn absorb_loaded(text: &str, loaded: &mut std::collections::BTreeSet<String>) {
+    fn absorb_loaded(text: &str, loaded: &mut LoadedTools) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -2410,7 +2469,7 @@ impl ToolLoopExecutor {
         let mut content = Vec::new();
         if !names.is_empty() {
             content.push(format!(
-                "Loaded {}. Call these tools starting with the next model request.",
+                "Loaded {}. Available from the next request.",
                 names.join(", ")
             ));
         }
@@ -2697,30 +2756,63 @@ impl ToolLoopExecutor {
         }
     }
 
+    #[cfg(test)]
     fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
+        self.retained_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn retained_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
         self.record_tool_usage(tool_name);
-        self.preview_tool_output(tool_name, output)
+        self.preview_tool_output_for_id(tool_name, output, id)
     }
 
     fn preview_tool_output(&self, tool_name: &str, output: &str) -> String {
-        let original = output;
+        self.preview_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn summary_enabled(&self, root: Option<&std::path::Path>) -> bool {
+        crate::config::command_output::enabled(root, std::path::Path::new(self.get_workspace_cwd()))
+    }
+
+    fn preview_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
+        let root = self.search_config_path.as_deref().and_then(|p| p.parent());
+        if model_output::is_shell_result(tool_name) {
+            let enabled = self.summary_enabled(root);
+            let metadata = if enabled {
+                root.zip(id)
+                    .and_then(|(root, id)| {
+                        std::fs::read(model_output::metadata_path(root, id)).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            } else {
+                None
+            };
+            return model_output::command_preview(
+                tool_name,
+                output,
+                root,
+                metadata.as_ref(),
+                enabled,
+            );
+        }
         let cleaned = model_tool_output(tool_name, output);
-        let output = cleaned.as_str();
-        // Read already selects the requested line range. This is the fresh
-        // result sent to the model, not a summary of old conversation history.
-        // Spilling it would also truncate any subsequent Read of the spill file.
-        if tool_name == "Read" {
-            return output.to_string();
-        }
-        let preview = if tool_name == "Bash" {
-            model_output::render(tool_name, original, Some(12_000))
+        // Read already selects the requested line range.
+        if let Some(root) = root.filter(|_| tool_name != "Read") {
+            let preview = compact_tool_output(tool_name, &cleaned);
+            crate::performance::retain_tool_output(root, &cleaned, &preview)
         } else {
-            compact_tool_output(tool_name, output)
-        };
-        if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
-            return crate::performance::retain_tool_output(root, output, &preview);
+            cleaned
         }
-        output.to_string()
     }
 
     fn finish_mcp_output(
@@ -2813,9 +2905,10 @@ impl ToolLoopExecutor {
     }
 
     /// Treat these built-ins as already loaded, as a resumed session or a
-    /// durable job must. The loading gate is never widened beyond this set.
-    pub(super) fn with_loaded_tools(mut self, loaded: std::collections::BTreeSet<String>) -> Self {
-        self.loaded_tools = loaded;
+    /// durable job must. The loading gate is never widened beyond this set, and
+    /// the given order is the order their definitions are sent in.
+    pub(super) fn with_loaded_tools(mut self, loaded: impl IntoIterator<Item = String>) -> Self {
+        self.loaded_tools.extend(loaded);
         self
     }
 
@@ -2875,10 +2968,47 @@ impl ToolLoopExecutor {
         self
     }
 
+    async fn run_builtin(
+        &self,
+        tool_name: &str,
+        tool_input: &Value,
+        id: &str,
+        cwd: &str,
+        approved: bool,
+    ) -> Result<Value> {
+        let run = self.run_builtin_inner(tool_name, tool_input, cwd, approved);
+        self.retain_command_metadata(tool_name, id, run).await
+    }
+
+    async fn retain_command_metadata(
+        &self,
+        tool_name: &str,
+        id: &str,
+        run: impl std::future::Future<Output = Result<Value>>,
+    ) -> Result<Value> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        if let Some(root) = root.filter(|root| {
+            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
+        }) {
+            let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
+            if let Some(metadata) = metadata {
+                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
+                    tracing::debug!(%error, "Could not retain shell capture metadata");
+                }
+            }
+            result
+        } else {
+            run.await
+        }
+    }
+
     /// Runs a built-in tool. While a sandboxed command with a domain
     /// allowlist runs, hosts outside the list are put to the user, as in the
     /// reference CLI; "don't ask again" saves a SandboxNetwork(domain:) rule.
-    async fn run_builtin(
+    async fn run_builtin_inner(
         &self,
         tool_name: &str,
         tool_input: &Value,
@@ -3286,14 +3416,51 @@ impl ToolLoopExecutor {
                 }
             }
         }
-        // A rediscovery or registry reordering must not rewrite the resident
-        // tool list: the same session always sends the same order.
-        tools.sort_by(|a, b| {
+        // The resident tools keep one alphabetical order that a rediscovery or
+        // registry reordering cannot rewrite. Tools that exist only because
+        // ToolLoad loaded them follow in load order, so loading one never moves
+        // a resident tool or rewrites the request prefix the provider cached.
+        let mut resident = Vec::with_capacity(tools.len());
+        let mut deferred = Vec::new();
+        for tool in tools {
+            let resident_without_loading = match crate::mcp::states::server_of(&tool.name) {
+                Some(server) => {
+                    crate::mcp::states::effective(&self.mcp_states, server) != McpState::OnDemand
+                }
+                // The user's own tools and the Super Agent tools never go
+                // through ToolLoad, so they count as resident whenever they
+                // reached this list.
+                None if !self.builtin_names().contains(&tool.name) => true,
+                None => {
+                    let loading = customization.loading(&tool.name);
+                    loading.enabled || (restricted && loading.on_demand && allowed(&tool.name))
+                }
+            };
+            if resident_without_loading {
+                resident.push(tool);
+            } else {
+                deferred.push(tool);
+            }
+        }
+        resident.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
                 .then_with(|| a.description.cmp(&b.description))
         });
-        Ok(tools)
+        for name in self.loaded_tools.iter() {
+            if let Some(index) = deferred.iter().position(|tool| &tool.name == name) {
+                resident.push(deferred.remove(index));
+            }
+        }
+        // A host can mark a tool loaded without a load order (a durable job or
+        // a test); those definitions stay deterministic after the ordered ones.
+        deferred.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.description.cmp(&b.description))
+        });
+        resident.extend(deferred);
+        Ok(resident)
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -3763,9 +3930,11 @@ impl ToolLoopExecutor {
         }
         Box::pin(self.refresh_mcp_tools()).await?;
         // A tool loaded earlier in this session stays available; the current
-        // settings still decide whether it may come back.
-        self.restore_loaded_tools();
+        // settings still decide whether it may come back. The durable rows are
+        // read first so their load order wins over a display-only message
+        // window that may start in the middle of the session.
         self.restore_persisted_loaded_tools()?;
+        self.restore_loaded_tools();
         self.exposed_tools = None;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
@@ -4747,7 +4916,10 @@ impl ToolLoopExecutor {
                         }
                     }
                 }
-                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+                let run = crate::tools::tasks::execute_for_session_async(
+                    tool_name, tool_input.clone(), root, session,
+                );
+                self.retain_command_metadata(tool_name, _tool_use_id, run).await
             }.await;
             return CallStep::Finished((
                 tool_input.clone(),
@@ -5357,7 +5529,8 @@ impl ToolLoopExecutor {
             // Real HTTP attempts observed by the send layer, so a clean
             // end-of-stream still reports a count instead of "unknown".
             let http_attempts: crate::performance::AttemptCounter;
-            let context_capture = request_trace.capture_context(self.event_tx.clone());
+            let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+            context_capture.suggestion = self.suggestion.clone();
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5719,6 +5892,13 @@ impl ToolLoopExecutor {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
             }
+            if let Some(capture) = &self.suggestion {
+                capture.finish(
+                    &snapshot,
+                    &self.provider,
+                    &self.anthropic_client.request_options,
+                );
+            }
             let response_status = snapshot["status"]
                 .as_str()
                 .unwrap_or("interrupted")
@@ -5823,7 +6003,11 @@ impl ToolLoopExecutor {
                             })
                             .await;
                         let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output(&tc.name, &output_str))
+                            json!(self.retained_tool_output_for_id(
+                                &tc.name,
+                                &output_str,
+                                Some(&tc.id)
+                            ))
                         });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
@@ -6067,6 +6251,7 @@ impl ToolLoopExecutor {
                                 options,
                                 conversation_messages.clone(),
                                 self.system_prompt.as_deref().unwrap_or(""),
+                                self.conv_id.as_deref(),
                             )
                             .await?;
                         if let Some(record) = &mut record {
@@ -6196,7 +6381,8 @@ impl ToolLoopExecutor {
                 // Real HTTP attempts observed by the send layer, so a clean
                 // end-of-stream still reports a count instead of "unknown".
                 let http_attempts: crate::performance::AttemptCounter;
-                let context_capture = request_trace.capture_context(self.event_tx.clone());
+                let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+                context_capture.suggestion = self.suggestion.clone();
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6599,6 +6785,13 @@ impl ToolLoopExecutor {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
                 }
+                if let Some(capture) = &self.suggestion {
+                    capture.finish(
+                        &snapshot,
+                        &self.provider,
+                        &self.openai_client.request_options,
+                    );
+                }
                 let response_status = snapshot["status"]
                     .as_str()
                     .unwrap_or("interrupted")
@@ -6759,9 +6952,9 @@ impl ToolLoopExecutor {
                         if let Some(content) = &mcp {
                             tool_images.extend(content.openai_images(&tc.id));
                         }
-                        let compacted = mcp
-                            .map(|value| value.openai_text())
-                            .unwrap_or_else(|| self.retained_tool_output(&tc.name, &output_str));
+                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
+                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
+                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),

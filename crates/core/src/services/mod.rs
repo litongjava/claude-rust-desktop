@@ -49,7 +49,6 @@ pub mod agent_import;
 pub mod diagnostics;
 pub mod runtime_status;
 pub mod doctor;
-pub mod cli_resources;
 pub mod feedback;
 pub mod statusline;
 pub mod statusline_setup;
@@ -113,12 +112,21 @@ impl ServiceContext {
     }
     pub fn save_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value)?;
-        self.db.with_conn(|c| {
-            c.execute(
-                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
+        self.db.with_conn(|c| -> Result<()> {
+            crate::db::write_tx(
+                c,
+                "save setting",
+                crate::db::STARTUP_WRITE_DEADLINE,
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [key, &json],
+                        [key, &json],
+                    )?;
+                    Ok(())
+                },
             )
+            .context("Saving session setting")
         })??;
         Ok(())
     }
@@ -236,3 +244,33 @@ pub mod context_usage;
 pub mod permission_updates;
 
 pub mod file_changed;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support;
+    use crate::runtime::{RuntimePaths, DATABASE_FILE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn save_setting_waits_for_another_writer_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        let context =
+            ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join(DATABASE_FILE));
+        let releaser = test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        context.save_setting("probe", &"value").unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "save returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(
+            context.setting::<String>("probe").unwrap().as_deref(),
+            Some("value")
+        );
+    }
+}

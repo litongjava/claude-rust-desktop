@@ -176,17 +176,12 @@ fn scripted(state: &Fixture, body: &Value) -> Vec<Value> {
         // scenario. Loading the tool is not authorization to write.
         1 => {
             assert_eq!(results[0].0, "ToolLoad", "{results:?}");
-            let search: Value = serde_json::from_str(&results[0].1).unwrap_or_else(|error| {
-                panic!("ToolLoad result is not JSON ({error}): {}", results[0].1)
-            });
-            assert_eq!(search["success"], true, "{search}");
-            let loaded: Vec<&str> = search["loaded_tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|name| name.as_str().unwrap())
-                .collect();
-            assert_eq!(loaded, ["GitHub"], "{search}");
+            // The model sees one text line; the schemas travel in `tools`.
+            assert_eq!(
+                results[0].1,
+                "Loaded GitHub. Available from the next request.",
+                "{results:?}"
+            );
             let schema = tool_parameters(body, "GitHub");
             let operations: Vec<&str> = schema["properties"]["operation"]["enum"]
                 .as_array()

@@ -1,7 +1,7 @@
 //! Durable same-project messages. Acknowledgement means committed context, not model processing.
 use super::{EnvironmentCredentials, ServiceContext};
 use crate::{
-    db::{conversation_repo, message_repo},
+    db::{conversation_repo, message_repo, BusyTimeoutGuard},
     runtime::RuntimePaths,
 };
 use anyhow::{ensure, Context, Result};
@@ -789,30 +789,6 @@ impl Target {
 /// a failed turn; the next model/tool boundary polls again.
 const INBOX_POLL_WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Restores a pooled connection's own `busy_timeout` on every exit path.
-///
-/// `DbManager` lends shared connections. Lowering the timeout for one bounded
-/// poll must not leak into the next borrower, including when the poll unwinds.
-struct BusyTimeoutGuard<'a> {
-    conn: &'a Connection,
-    original_ms: u64,
-}
-
-impl<'a> BusyTimeoutGuard<'a> {
-    fn within(conn: &'a Connection, wait: std::time::Duration) -> Result<Self> {
-        let original_ms: u64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-        conn.busy_timeout(wait)?;
-        Ok(Self { conn, original_ms })
-    }
-}
-
-impl Drop for BusyTimeoutGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self
-            .conn
-            .busy_timeout(std::time::Duration::from_millis(self.original_ms));
-    }
-}
 /// Source-project matching includes managed worktrees. Runtime probing happens
 /// separately: saved records and receiver ownership are not an HTTP health test.
 pub fn peers(context: &ServiceContext, session: &str) -> Result<Vec<serde_json::Value>> {

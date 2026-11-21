@@ -15,7 +15,11 @@ const DEFAULT_CHARS: usize = 12_000;
 const MAX_CHARS: usize = 50_000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; ClaudeDesktop/3.1; WebReader)";
+const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; DeepSeekCode/",
+    env!("CARGO_PKG_VERSION"),
+    "; WebReader)"
+);
 
 fn http_url(url: &str) -> Result<reqwest::Url> {
     let parsed = reqwest::Url::parse(url)?;
@@ -239,15 +243,20 @@ fn page_result(
     } else {
         (String::new(), body.into_owned())
     };
+    let (text, collapsed) = super::base64_collapse::collapse(&text);
     let offset = input["offset"].as_u64().unwrap_or(0) as usize;
     let limit = input["max_chars"]
         .as_u64()
         .unwrap_or(DEFAULT_CHARS as u64)
         .clamp(1, MAX_CHARS as u64) as usize;
     let total_chars = text.chars().count();
-    let content: String = text.chars().skip(offset).take(limit).collect();
+    let mut content: String = text.chars().skip(offset).take(limit).collect();
     let returned_chars = content.chars().count();
     let has_more = offset.saturating_add(returned_chars) < total_chars;
+    if collapsed > 0 && !content.is_empty() {
+        content.push('\n');
+        content.push_str(&super::base64_collapse::note(collapsed));
+    }
     Ok(json!({
         "url":url, "title":title, "content_type":content_type,
         "format":if raw { "raw" } else if is_html { "readable_text" } else { "text" },
@@ -559,6 +568,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_agent_names_the_product_and_its_version() {
+        assert!(USER_AGENT.contains("DeepSeekCode/"), "{USER_AGENT}");
+        assert!(
+            USER_AGENT.contains(env!("CARGO_PKG_VERSION")),
+            "{USER_AGENT}"
+        );
+        assert!(
+            !USER_AGENT.to_ascii_lowercase().contains("claude"),
+            "{USER_AGENT}"
+        );
+    }
+
+    #[test]
     fn readable_page_omits_markup_and_keeps_main_links() {
         let html = format!("<html><head><title>Release notes</title><script>{}</script></head><body><nav>Navigation</nav><main><header><h1>Release 4</h1></header><p>更快的回复 &amp; tools.</p><a href='/docs'>Read docs</a><script>secret()</script><style>css</style><div hidden>hidden</div></main><footer>Footer</footer></body></html>", "x".repeat(800_000));
         let result = page_result(
@@ -605,6 +627,44 @@ mod tests {
         assert_eq!(raw["returned_chars"], MAX_CHARS);
         assert_eq!(raw["source_truncated"], true);
         assert_eq!(raw["format"], "raw");
+    }
+
+    #[test]
+    fn collapses_long_base64_in_page_code() {
+        use base64::Engine;
+        let json = format!("{{\"request\":\"{}\"}}", "x".repeat(20_000));
+        let blob = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let html = format!("<html><head><title>Request</title></head><body><main><p>Example payload:</p><pre>{blob}</pre><p>Done.</p></main></body></html>");
+        let placeholder = format!(
+            "[base64 data omitted: about {} bytes decoded, looks like JSON]",
+            json.len()
+        );
+        let result = page_result(
+            &json!({}),
+            "https://example.org/request",
+            "text/html",
+            html.as_bytes(),
+            false,
+        )
+        .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains(&placeholder));
+        assert!(content.contains("Example payload:"));
+        assert!(content.contains("Done."));
+        assert!(content
+            .contains("(1 long base64 blocks were collapsed; read with raw: true to see them.)"));
+        assert!(!content.contains(&blob[..64]));
+
+        let raw = page_result(
+            &json!({"raw":true}),
+            "https://example.org/request",
+            "text/html",
+            html.as_bytes(),
+            false,
+        )
+        .unwrap();
+        assert!(raw["content"].as_str().unwrap().contains(&placeholder));
+        assert!(!raw["content"].as_str().unwrap().contains(&blob[..64]));
     }
 
     #[test]

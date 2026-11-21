@@ -11,13 +11,13 @@ const MAX_DELAY_SECS: f64 = 3600.0;
 pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         name: "ScheduleWakeup".into(),
-        description: "Schedule when to resume work in /loop dynamic mode — the user invoked /loop without an interval, asking you to self-pace iterations of a specific task.\n\nDo NOT schedule a short-interval wakeup to poll for background work you started — when tracked work finishes, you are woken automatically, so polling is wasted. Instead schedule a long fallback (1200s+) so the loop survives if the work hangs. The exception is external work the runtime cannot track (a CI run, a deploy, a remote queue) — there, pick a delay matched to how fast that state actually changes.\n\nPass the same /loop input back via `prompt` each turn so the next firing repeats the task. To end the loop, call this tool with `stop: true` (omit every other field).\n\nSet `noop: true` if nothing changed — you checked and there's nothing to report. Set `noop: false` if something happened worth keeping. Omit `noop` when stopping.\n\n## Picking delaySeconds\n\nThe runtime clamps the delay to [60, 3600]. Match it to what you're actually waiting for: a CI run that takes ~8 minutes deserves one ~480s check, not eight 60s ones. For idle ticks with no specific signal to watch, default to 1200s–1800s.\n\n## The reason field\n\nOne short sentence on what you chose and why; it is shown to the user. \"watching CI run\" beats \"waiting.\"".into(),
+        description: "Ask the runtime to wake this /loop session again later. Save the loop input in prompt each time: when the delay expires and the session is idle, that input fires once, so pass the same text to keep the loop going. delaySeconds is clamped to 60-3600 seconds; choose it from how fast the thing you watch changes. reason is a short note shown to the user. Set noop to true when the check found nothing new and false when it did. To end the loop, send stop: true alone; the saved wakeup is removed and no other field is used.".into(),
         input_schema: json!({"type":"object","properties":{
-            "delaySeconds":{"description":"Seconds from now to wake up. Clamped to [60, 3600] by the runtime. Required unless `stop` is true.","type":"number"},
-            "reason":{"description":"One short sentence explaining the chosen delay. Shown to the user. Be specific. Required unless `stop` is true.","type":"string"},
-            "prompt":{"description":"The /loop input to fire on wake-up. Pass the same /loop input verbatim each turn so the next firing continues the loop. Required unless `stop` is true.","type":"string"},
-            "stop":{"description":"Set to true to end the dynamic loop immediately instead of scheduling another wakeup. When true, all other fields are ignored and no further wakeups fire.","type":"boolean"},
-            "noop":{"description":"true = nothing changed (you checked and there is nothing to report). false = something happened worth keeping. Required unless `stop` is true.","type":"boolean"}
+            "delaySeconds":{"description":"Seconds until the wakeup; values outside 60-3600 are clamped. Required unless stop is true.","type":"number"},
+            "reason":{"description":"Short note for the user explaining this delay. Required unless stop is true.","type":"string"},
+            "prompt":{"description":"The /loop input to replay when the wakeup fires; reuse the same text each turn.","type":"string"},
+            "stop":{"description":"True ends the dynamic loop and deletes the saved wakeup; every other field is discarded.","type":"boolean"},
+            "noop":{"description":"True when the check found nothing new, false when it found something to keep.","type":"boolean"}
         },"additionalProperties":false}),
     }
 }
