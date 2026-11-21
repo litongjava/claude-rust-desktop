@@ -943,7 +943,9 @@ impl Stores {
                 .inspect_err(|e| {
                     project_conflict = e.downcast_ref::<rusqlite::Error>().is_none()
                 })?;
-            self.step(Phase::BeforePublishCommit)
+            let admission = self.admit_session_workspace(tx, &op.id)?;
+            self.step(Phase::BeforePublishCommit)?;
+            Ok(admission)
         });
         if let Err(e) = result {
             // Validation and constraint conflicts are permanent. IO, busy, and

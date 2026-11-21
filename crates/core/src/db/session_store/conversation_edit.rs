@@ -59,7 +59,7 @@ impl SessionDb {
                             [self.incarnation(), &operation],
                         )?;
                     }
-                    Ok(())
+                    self.admit_edited_workspace(g, body)
                 })?;
                 self.stores.step(super::Phase::EditMetadata)?;
                 Ok(tx.commit()?)

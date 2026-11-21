@@ -253,6 +253,17 @@ impl crate::db::DbManager {
 }
 
 impl super::SessionDb {
+    pub(super) fn admit_edited_workspace(
+        &self,
+        tx: &rusqlite::Connection,
+        body: &Value,
+    ) -> Result<Vec<std::fs::File>> {
+        if body.get("project_id").is_some() || body.get("workspace_path").is_some() {
+            return self.stores.admit_session_workspace(tx, self.id());
+        }
+        Ok(Vec::new())
+    }
+
     /// Serialize a Desktop edit with retirement and provider publication.
     pub fn edit_conversation(&self, body: &Value) -> Result<()> {
         // Pin, archive and title edits only serialize on the G writer. Keep
@@ -285,8 +296,9 @@ impl super::SessionDb {
                 self.stores
                     .global()
                     .write("edit conversation", self.id(), false, |tx| {
-                        edit_metadata(tx, self.id(), body)
-                    })
+                        edit_metadata(tx, self.id(), body)?;
+                        self.admit_edited_workspace(tx, body)
+                    }).map(drop)
             }
             (None, false) => Ok(()),
         }

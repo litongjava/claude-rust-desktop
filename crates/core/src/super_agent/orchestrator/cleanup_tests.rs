@@ -1149,3 +1149,65 @@ async fn cleanup_checks_grandchild_after_intermediate_retirement() {
     assert!(!wt.exists(), "{report:?}");
     assert_eq!(cleanup_events(&f), 1);
 }
+
+#[tokio::test]
+async fn cleanup_excludes_foreground_workspace_admission() {
+    let f = cleanup_fixture(1).await;
+    let host = f.orchestrator();
+    let path = f.task().repositories.remove(0).worktree_path;
+    let mut active = None;
+    let mut attempted = false;
+    let outcome = crate::super_agent::cleanup::run(
+        &host.launcher(),
+        &f.task_id,
+        &host.policy(),
+        &mut |stage| {
+            if stage == "before-worktree-remove" {
+                attempted = true;
+                let other = f.context.db.create_code_session(
+                    &path,
+                    "model",
+                    "provider",
+                    &uuid::Uuid::new_v4().to_string(),
+                )?;
+                assert_eq!(other.workspace()?.canonicalize()?, path.canonicalize()?);
+                active = Some(other.acquire_execution()?);
+            }
+            Ok(())
+        },
+    );
+    assert!(attempted);
+    assert!(
+        path.is_dir(),
+        "active foreground session lost its workspace"
+    );
+    assert!(outcome.is_err());
+    assert!(active.is_none());
+
+    let other = f
+        .context
+        .db
+        .create_code_session(
+            &path,
+            "model",
+            "provider",
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+    let lease = other.acquire_execution().unwrap();
+    let outcome =
+        crate::super_agent::cleanup::run(&host.launcher(), &f.task_id, &host.policy(), &mut |_| {
+            Ok(())
+        });
+    assert!(outcome.is_err());
+    assert!(path.is_dir(), "cleanup removed the leased workspace");
+    drop(lease);
+    crate::super_agent::cleanup::run(
+        &host.launcher(),
+        &f.task_id,
+        &host.policy(),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert!(!path.exists());
+}

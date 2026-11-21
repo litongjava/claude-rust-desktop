@@ -21,6 +21,7 @@ impl Stores {
             .canonicalize()
             .context("Project directory is unavailable")?;
         ensure!(path.is_dir(), "Project path must be a directory");
+        let _admission = self.admit_workspace_path(&path)?;
         self.create(
             &id,
             CreateOptions {

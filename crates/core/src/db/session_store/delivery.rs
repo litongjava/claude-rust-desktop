@@ -566,10 +566,15 @@ impl SessionDb {
             })
     }
     pub fn acquire_execution(&self) -> Result<ExecutionLease> {
-        let locks = self.stores.key_lock(&self.key, false, false)?;
+        let mut locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
         let mut lease = ExecutionLease::acquire(self.stores.data_dir(), &self.incarnation)?
             .context("Invalid execution incarnation")?;
+        locks.extend(
+            self.stores
+                .global()
+                .read(|c| self.stores.admit_session_workspace(c, self.id()))?,
+        );
         lease.address = Some(self.address());
         lease.lifecycle = locks;
         Ok(lease)

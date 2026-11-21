@@ -149,6 +149,9 @@ pub(crate) fn run(
         );
     }
     let _publication = background_sessions::job_publication_fence(&context.paths.data_dir, true)?;
+    let _workspace = context
+        .db
+        .hold_worktree_removal(&task.repositories[0].worktree_path)?;
     let _execution_leases = descendants_stopped(launcher, &task)?;
     let verification = delivery::verify_delivery_for_cleanup(&task, &plan)?;
     ensure!(
@@ -655,7 +658,9 @@ fn descendants_stopped(
     // Worktree occupancy independently includes unrelated current incarnations.
     let worktree = &task.repositories[0].worktree_path;
     for (id, incarnation, workspace) in context.db.workspace_sessions()? {
-        if Path::new(&workspace).starts_with(worktree) {
+        let path = Path::new(&workspace);
+        if path.starts_with(worktree) || path.canonicalize().is_ok_and(|p| p.starts_with(worktree))
+        {
             participants.insert((id, incarnation));
         }
     }

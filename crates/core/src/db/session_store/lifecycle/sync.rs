@@ -206,8 +206,11 @@ impl Stores {
                     params![h.title,h.model,h.provider,h.workspace_mode.map(|m|m.as_str()),h.research_mode,h.pinned,h.archived,h.project_id,workspace,h.created_at,h.updated_at,id,shard.incarnation,expected])?;
             }
             c.execute("INSERT INTO sync_publications VALUES(?1,?2,?3)",[id,&digest,&shard.incarnation])?;
-            Ok(())
-        })
+            if header.is_some() && expected.is_some() {
+                return self.admit_session_workspace(c, id);
+            }
+            Ok(Vec::new())
+        }).map(drop)
     }
 }
 

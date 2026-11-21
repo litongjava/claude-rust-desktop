@@ -42,8 +42,9 @@ impl SessionRepository<'_> {
                 let _guard = s.stores.key_lock(&s.key, false, false)?;
                 s.stores.global().write_with_deadline(label,s.id(),false,deadline,|tx| {
                     ensure!(tx.execute("UPDATE conversations SET metadata_revision=metadata_revision+1 WHERE id=?1 AND incarnation=?2",[s.id(),s.incarnation()])?==1,"Session was replaced");
-                    body(tx,s.id())
-                })
+                    let value = body(tx, s.id())?;
+                    Ok((value, s.stores.admit_session_workspace(tx, s.id())?))
+                }).map(|(value, _admission)| value)
             }
         }
     }

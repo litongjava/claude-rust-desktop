@@ -82,7 +82,20 @@ impl Projects for Stores {
     }
     fn edit_project(&self, id: &str, edit: &ProjectEdit) -> Result<ProjectRow> {
         self.global()
-            .write("update project", id, false, |c| save(c, id, edit, false))
+            .write("update project", id, false, |c| {
+                let project = save(c, id, edit, false)?;
+                let admission = if edit.folders.is_some() {
+                    project
+                        .workspace_path
+                        .as_deref()
+                        .map(|p| self.admit_workspace_path(std::path::Path::new(p)))
+                        .transpose()?
+                } else {
+                    None
+                };
+                Ok((project, admission))
+            })
+            .map(|(project, _admission)| project)
     }
     fn trust_project(&self, id: &str, folders: &[String]) -> Result<ProjectRow> {
         self.global()

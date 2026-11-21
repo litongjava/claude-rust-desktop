@@ -322,7 +322,10 @@ impl DbManager {
 impl Stores {
     pub(crate) fn workspace_sessions(&self) -> Result<Vec<(String, String, String)>> {
         self.global().read(|c| {
-            let mut q = c.prepare("SELECT id, incarnation, workspace_path FROM conversations WHERE workspace_path IS NOT NULL")?;
+            let mut q = c.prepare("SELECT id, incarnation, workspace_path FROM conversations WHERE workspace_path IS NOT NULL
+                UNION SELECT c.id,c.incarnation,coalesce(w.path,p.workspace_path) FROM conversations c
+                JOIN projects p ON p.id=c.project_id LEFT JOIN conversation_worktrees w ON w.conversation_id=c.id AND w.project_id=p.id
+                WHERE coalesce(w.path,p.workspace_path) IS NOT NULL")?;
             let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
