@@ -214,6 +214,12 @@ pub struct BridgeServer {
 }
 
 impl BridgeServer {
+    #[cfg(any(mobile, test))]
+    pub(crate) fn open_mobile(data_dir: PathBuf) -> Result<Self> {
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(data_dir.clone())?;
+        Ok(Self::new(data_dir, paths.open_database()?))
+    }
+
     pub fn new(data_dir: PathBuf, db_manager: Arc<Stores>) -> Self {
         let skills_dir = data_dir.join("skills");
         let log_dir = data_dir.join("logs");
