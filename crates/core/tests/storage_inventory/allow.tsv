@@ -100,5 +100,6 @@ crates/core/tests/session_db_projection.rs	Connection::open	12	3b0301a0b3b06ccf4
 crates/core/tests/session_db_projection.rs	peripheral_settings	2	0ba20f61469e5170300baf1560241a14feec346a042ebfe47221a3717df5ed6e	Projection damage, stale revisions and schema recovery fixtures
 crates/core/tests/session_db_readers.rs	Connection::open	1	cbda0bdb44496220228e1da8e83524b9adc5d99590d427af6a338ae48e1a3703	Directory writer contention and legacy-file sentinel
 crates/core/tests/session_db_readers.rs	deepseek_code.db	1	2c4a695641be9b8419879991ba23a5dbe1f4b1838a9db2e4482368bea9856505	Untouched legacy-file sentinel assertion
+crates/core/tests/session_db_resume_parity.rs	Connection::open	2	283ced05c80032b6ceab9f5296251a719e874f6c81d87722589ac9cde547c5fb	Temporary worktree migration fixture and tied directory activity
 crates/core/tests/support/session_sql.rs	Connection::open	1	7439f4f54f862e02509d4a0e97407507877c82334e1930807f73b6fd3cd23342	Fixture SQL opens existing files only and validates the selected shard identity
 src-tauri/tests/conversation_images_bridge.rs	Connection::open	1	06ef95e4704a8b311beb4a172f2d6bea2da032abb79f9596d78ea363b1fc1a90	conversation_images_bridge integration or repository fixture

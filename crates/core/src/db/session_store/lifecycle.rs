@@ -841,6 +841,11 @@ impl Stores {
             ] {
                 tx.execute(&format!("INSERT INTO {table}(conversation_id,{cols}) SELECT ?1,{cols} FROM {table} WHERE conversation_id=?2"),[&op.id,source])?;
             }
+            tx.execute(
+                "UPDATE conversations SET workspace_path=w.path FROM conversation_worktrees w
+                WHERE id=?1 AND w.conversation_id=id AND w.project_id=conversations.project_id",
+                [&op.id],
+            )?;
             if saved.child && project.is_none() {
                 tx.execute("INSERT INTO conversation_private_workspace_bindings
                     SELECT ?1,coalesce(b.parent_id,c.id),coalesce(b.parent_incarnation,c.incarnation)

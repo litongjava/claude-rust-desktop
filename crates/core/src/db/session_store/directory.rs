@@ -66,7 +66,6 @@ pub(super) fn list(
     let mut args = Vec::<Value>::new();
     for (predicate, value) in [
         ("project_id=?", filter.project),
-        ("workspace_path=?", filter.workspace),
         ("workspace_mode=?", filter.mode),
         ("id<>?", filter.exclude),
     ] {
@@ -74,6 +73,13 @@ pub(super) fn list(
             conditions.push(predicate);
             args.push(value.to_owned().into());
         }
+    }
+    if let Some(workspace) = filter.workspace {
+        // A Git worktree at the repository root can carry an empty final
+        // component. The picker canonicalizes its input and drops that separator.
+        conditions.push("(workspace_path=? OR workspace_path=?)");
+        args.push(workspace.to_owned().into());
+        args.push(format!("{workspace}{}", std::path::MAIN_SEPARATOR).into());
     }
     for (predicate, value) in [("archived=?", filter.archived), ("pinned=?", filter.pinned)] {
         if let Some(value) = value {

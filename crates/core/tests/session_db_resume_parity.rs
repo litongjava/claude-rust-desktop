@@ -1,0 +1,98 @@
+use anyhow::Result;
+use deepseek_code_core::{
+    db::{conversation_repo::WorkspaceMode, session_store::Stores},
+    runtime::SessionStore,
+};
+use std::{path::Path, process::Command, sync::Arc};
+
+#[test]
+fn fork_and_clear_remain_visible_in_the_worktree_picker() -> Result<()> {
+    // Use a fresh process for the upgrade so the resolver cannot reuse the
+    // in-process root that populated the fixture.
+    if let Some(root) = std::env::var_os("I46_WORKTREE_MIGRATION_ROOT") {
+        let db = Stores::open(Path::new(&root))?;
+        for id in ["I46_FORK_ID", "I46_CLEAR_ID"] {
+            let id = std::env::var(id)?;
+            let path = db.open_session(&id)?.workspace()?;
+            assert!(db
+                .resume_entries("none", Some(&path))?
+                .iter()
+                .any(|entry| entry.conversation.id == id));
+        }
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let project = root.path().join("project");
+    std::fs::create_dir(&project)?;
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args(args)
+            .status()?
+            .success());
+    }
+    let db = Stores::open(root.path())?;
+    let sessions = SessionStore::new(Arc::new(db.clone()));
+    let seed = sessions.create(&project, "model", "provider")?;
+    let project_id = sessions.resume(&seed)?.project_id.unwrap();
+    let source = db.create_project_chat(
+        &project_id,
+        Some("CLI session"),
+        Some("model"),
+        WorkspaceMode::Code,
+        None,
+        true,
+    )?;
+    sessions.append(&source.id, "user", "Pick this worktree")?;
+    let path = sessions.workspace(&source.id, &root.path().join("workspaces"))?;
+    let fork = sessions.fork(&source.id)?;
+    let clear = sessions.clear(&source.id)?;
+    sessions.append(&clear, "user", "New session")?;
+    for id in [&fork, &clear] {
+        assert_eq!(
+            sessions
+                .resume(id)?
+                .workspace_path
+                .as_deref()
+                .map(Path::new),
+            Some(path.as_path())
+        );
+        assert!(db
+            .resume_entries("none", Some(&path))?
+            .iter()
+            .any(|r| r.conversation.id == *id));
+    }
+    drop((sessions, db));
+    let conn = rusqlite::Connection::open(root.path().join("global.db"))?;
+    conn.execute(
+        "UPDATE conversations SET workspace_path=?1 WHERE id IN (?2,?3)",
+        rusqlite::params![project.to_str(), fork, clear],
+    )?;
+    conn.pragma_update(None, "user_version", 14)?;
+    drop(conn);
+    let upgrade = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "fork_and_clear_remain_visible_in_the_worktree_picker",
+        ])
+        .env("I46_WORKTREE_MIGRATION_ROOT", root.path())
+        .env("I46_FORK_ID", fork)
+        .env("I46_CLEAR_ID", clear)
+        .status()?;
+    assert!(upgrade.success());
+    Ok(())
+}
