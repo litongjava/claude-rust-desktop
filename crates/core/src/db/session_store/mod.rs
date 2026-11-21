@@ -6,6 +6,7 @@ mod delivery;
 mod global;
 mod history;
 mod repair;
+pub mod settings;
 mod state;
 pub use delivery::*;
 pub use history::*;

@@ -61,7 +61,7 @@ impl GlobalDb {
     }
 }
 
-fn local(c: &Connection, key: &str) -> Result<Option<String>> {
+pub(super) fn local(c: &Connection, key: &str) -> Result<Option<String>> {
     Ok(c.query_row(
         "SELECT value FROM peripheral_settings WHERE key=?1",
         [key],
@@ -69,7 +69,7 @@ fn local(c: &Connection, key: &str) -> Result<Option<String>> {
     )
     .optional()?)
 }
-fn set_local(c: &Connection, key: &str, value: &str) -> Result<()> {
+pub(super) fn set_local(c: &Connection, key: &str, value: &str) -> Result<()> {
     c.execute("INSERT INTO peripheral_settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",[key,value])?;
     Ok(())
 }
@@ -91,6 +91,16 @@ impl SessionRead<'_> {
         )?
         .map(|s| session_permission_mode::parse(&s))
         .transpose()
+    }
+    pub fn plan_returns_to_bypass(&self, bypass_available: bool) -> Result<bool> {
+        Ok(bypass_available
+            && self.agent_mode()? == Some(PermissionMode::PlanMode)
+            && local(
+                self.0,
+                &format!("plan.return-bypass.{}", session_id(self.0)?),
+            )?
+            .as_deref()
+                == Some("true"))
     }
     pub fn git_branch(&self) -> Result<Option<String>> {
         local(self.0, "git.branch")
@@ -124,11 +134,30 @@ impl SessionWrite<'_> {
         goal_proposals::save_state(self.0, self.1, state)
     }
     pub fn set_agent_mode(&self, mode: PermissionMode) -> Result<()> {
-        set_local(
-            self.0,
-            &format!("cli.permission-mode.{}", self.1),
-            session_permission_mode::name(mode),
-        )
+        self.set_agent_mode_from(mode, PermissionMode::AskPermissions, true)
+    }
+    /// Include the host's effective mode and capability when they differ from persisted state.
+    pub fn set_agent_mode_from(
+        &self,
+        mode: PermissionMode,
+        effective: PermissionMode,
+        bypass_available: bool,
+    ) -> Result<()> {
+        let key = format!("cli.permission-mode.{}", self.1);
+        if mode == PermissionMode::PlanMode {
+            let previous = local(self.0, &key)?;
+            if previous.as_deref() != Some("plan") {
+                let bypass = bypass_available
+                    && (effective == PermissionMode::BypassPermissions
+                        || previous.as_deref() == Some("bypass"));
+                set_local(
+                    self.0,
+                    &format!("plan.return-bypass.{}", self.1),
+                    if bypass { "true" } else { "false" },
+                )?;
+            }
+        }
+        set_local(self.0, &key, session_permission_mode::name(mode))
     }
     pub fn set_git_branch(&self, branch: Option<&str>) -> Result<()> {
         match branch {

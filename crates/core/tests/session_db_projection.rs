@@ -635,6 +635,26 @@ fn fix_plan_origin_survives_reentry_and_resume() -> Result<()> {
             |r| r.get(0),
         )?;
         assert_eq!(value, want);
+        assert_eq!(a.read(|r| r.plan_returns_to_bypass(true))?, want == "true");
+        assert!(!a.read(|r| r.plan_returns_to_bypass(false))?);
+        a.write(|w| {
+            w.set_agent_mode(PermissionMode::AskPermissions)?;
+            w.set_agent_mode_from(
+                PermissionMode::PlanMode,
+                PermissionMode::BypassPermissions,
+                false,
+            )
+        })?;
+        assert!(!a.read(|r| r.plan_returns_to_bypass(true))?);
+        a.write(|w| {
+            w.set_agent_mode(PermissionMode::AskPermissions)?;
+            w.set_agent_mode_from(
+                PermissionMode::PlanMode,
+                PermissionMode::BypassPermissions,
+                true,
+            )
+        })?;
+        assert!(a.read(|r| r.plan_returns_to_bypass(true))?);
     }
     Ok(())
 }
@@ -738,4 +758,120 @@ fn fix_global_decoder_releases_checkout_before_entering_session() -> Result<()> 
         }
         Ok(())
     })
+}
+
+#[test]
+fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
+    use deepseek_code_core::{permissions::rules::PermissionAction, super_agent::Role};
+    use settings::*;
+    let root = tempdir()?;
+    let workspace = root.path();
+    let prefs = Preferences {
+        effort: Some(Effort::High),
+        autocompact_percent: Some(80.try_into()?),
+        autocompact_off: false,
+        goal: Some(CliGoal {
+            text: "test".into(),
+            completed: false,
+            last_check: Some("pending".into()),
+        }),
+    };
+    let rules = std::collections::HashMap::from([("Read".to_owned(), PermissionAction::Allow)]);
+    let config = vec![None, Some("local settings".to_owned()), None];
+    let requests: Vec<LiveRequest> = serde_json::from_value(
+        json!([{"id":"r","startedAt":1234,"inputTokens":45,"prompt":"discard"}]),
+    )?;
+    let display = Display {
+        diff_staged: true,
+        ..Display::default()
+    };
+    let editor = Editor {
+        port: 5100,
+        workspace: workspace.into(),
+    };
+    let seen = vec![(workspace.join("AGENTS.md"), "digest".into())];
+    let progress = json!({"status":"completed","output_tokens":14})
+        .as_object()
+        .unwrap()
+        .clone();
+    {
+        let stores = Stores::open_for_test(workspace)?;
+        let a = stores.create(A, Default::default())?;
+        a.write(|w| {
+            w.set_setting(PREFERENCES, &prefs)?;
+            w.set_setting(PERMISSIONS, &rules)?;
+            w.set_setting(SESSION_START_CONTEXT, &"hook context".into())?;
+            w.set_setting(accepted_configuration(workspace), &config)?;
+            w.set_setting(
+                rejected_configuration(workspace),
+                &(config.clone(), "denied".into()),
+            )?;
+            w.set_setting(SEEN_INSTRUCTIONS, &seen)?;
+            w.set_setting(INSTRUCTIONS_BOUNDARY, &"boundary".into())?;
+            w.set_setting(DISPLAY, &display)?;
+            w.set_setting(EDITOR, &editor)?;
+            w.set_setting(ROLE, &Role::Router)?;
+            w.set_setting(AGENT_DESCRIPTION, &"worker".into())?;
+            w.set_setting(
+                MICROCOMPACT,
+                &Microcompact {
+                    boundary: "m".into(),
+                    through: 11,
+                },
+            )?;
+            w.set_setting(CHILD_PROGRESS, &progress)?;
+            w.set_setting(ENTERED_WORKTREE, &EnteredWorktree { created: false })?;
+            w.set_setting(LIVE_REQUESTS, &requests)
+        })?;
+        assert!(a
+            .write::<()>(|w| {
+                w.clear_setting(PREFERENCES)?;
+                bail!("roll back")
+            })
+            .is_err());
+    }
+    let stores = Stores::open_for_test(workspace)?;
+    stores.open_session(A)?.read(|r| {
+        assert_eq!(r.setting(PREFERENCES)?, Some(prefs));
+        assert_eq!(r.setting(PERMISSIONS)?, Some(rules));
+        assert_eq!(
+            r.setting(SESSION_START_CONTEXT)?.as_deref(),
+            Some("hook context")
+        );
+        assert_eq!(
+            r.setting(accepted_configuration(workspace))?,
+            Some(config.clone())
+        );
+        assert!(r
+            .setting(accepted_configuration(&workspace.join("other")))?
+            .is_none());
+        assert_eq!(
+            r.setting(rejected_configuration(workspace))?,
+            Some((config, "denied".into()))
+        );
+        assert_eq!(r.setting(SEEN_INSTRUCTIONS)?, Some(seen));
+        assert_eq!(
+            r.setting(INSTRUCTIONS_BOUNDARY)?.as_deref(),
+            Some("boundary")
+        );
+        assert_eq!(r.setting(DISPLAY)?, Some(display));
+        assert_eq!(r.setting(EDITOR)?, Some(editor));
+        assert_eq!(r.setting(AGENT_DESCRIPTION)?.as_deref(), Some("worker"));
+        assert_eq!(r.setting(ROLE)?, Some(Role::Router));
+        assert_eq!(r.setting(MICROCOMPACT)?.unwrap().through, 11);
+        assert_eq!(r.setting(CHILD_PROGRESS)?, Some(progress));
+        assert!(!r.setting(ENTERED_WORKTREE)?.unwrap().created);
+        let accounting = r.setting(LIVE_REQUESTS)?.unwrap();
+        assert_eq!(accounting, requests);
+        assert!(serde_json::to_value(accounting)?[0].get("prompt").is_none());
+        Ok(())
+    })?;
+    let b = stores.create("another", Default::default())?;
+    assert!(b.read(|r| r.setting(PERMISSIONS))?.is_none());
+    stores.open_session(A)?.write(|w| w.clear_setting(EDITOR))?;
+    assert!(stores
+        .open_session(A)?
+        .read(|r| r.setting(EDITOR))?
+        .is_none());
+    Ok(())
 }
