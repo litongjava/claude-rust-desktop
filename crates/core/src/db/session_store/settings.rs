@@ -17,7 +17,7 @@ pub struct Setting<T> {
     value: PhantomData<fn() -> T>,
 }
 impl<T> Setting<T> {
-    const fn new(name: &'static str) -> Self {
+    pub(super) const fn new(name: &'static str) -> Self {
         Self {
             name: Cow::Borrowed(name),
             legacy: None,
@@ -71,6 +71,7 @@ impl SessionWrite<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
+    Off,
     Low,
     Medium,
     High,
@@ -161,14 +162,23 @@ pub struct EnteredWorktree {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_boundary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<serde_json::Value>,
 }
 

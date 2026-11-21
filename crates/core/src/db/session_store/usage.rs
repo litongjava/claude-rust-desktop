@@ -254,3 +254,13 @@ impl super::SessionRepository<'_> {
         })
     }
 }
+
+impl super::SessionRepository<'_> {
+    pub fn cost(&self, config: &crate::config::AppConfig) -> Result<serde_json::Value> {
+        self.read(|conn, id| crate::services::usage::cost_snapshot(conn, id, config))
+    }
+
+    pub fn current_usage(&self) -> Result<Option<serde_json::Value>> {
+        self.read(crate::services::statusline_setup::current_usage)
+    }
+}

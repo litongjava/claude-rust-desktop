@@ -1,7 +1,7 @@
 //! Recorded usage, configured and built-in list price estimates. Unknown prices or
 //! missing provider counters remain unknown; they are never reported as free.
 use super::anthropic_auth as auth;
-use crate::{config::AppConfig, db::DbManager};
+use crate::{config::AppConfig, db::session_store::SessionAccess};
 use anyhow::{ensure, Context, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -109,8 +109,8 @@ pub async fn plan(root: &Path) -> Result<Option<PlanUsage>> {
     Ok(Some(read_plan(request).await?))
 }
 
-pub fn session_cost(db: &DbManager, session: &str, config: &AppConfig) -> Result<Value> {
-    db.with_conn(|conn| cost_snapshot(conn, session, config))?
+pub fn session_cost(db: &impl SessionAccess, session: &str, config: &AppConfig) -> Result<Value> {
+    db.select_session(session)?.cost(config)
 }
 
 pub(crate) fn cost_snapshot(conn: &rusqlite::Connection, session: &str, config: &AppConfig) -> Result<Value> {

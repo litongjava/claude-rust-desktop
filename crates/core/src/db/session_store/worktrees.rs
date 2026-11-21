@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 impl SessionRepository<'_> {
+    pub fn workspace_project(&self) -> Result<Option<crate::db::project_repo::ProjectRow>> {
+        self.directory_snapshot(crate::native_engine::workspace::conversation_project)
+    }
+
     pub(super) fn directory_snapshot<T>(
         &self,
         body: impl FnOnce(&Connection, &str) -> Result<T>,
@@ -238,5 +242,19 @@ mod tests {
             extra.canonicalize()?.to_str()
         );
         Ok(())
+    }
+}
+
+impl super::Stores {
+    pub fn workspace_roots(&self,scope:&crate::services::workspace_files::Scope) -> Result<Vec<crate::services::workspace_files::Root>> {
+        let root=self.data_dir().join("workspaces");
+        if let Some(id)=scope.conversation_id.as_deref() {
+            use super::SessionAccess;
+            return self.select_session(id)?.directory_snapshot(|c,_| crate::services::workspace_files::roots(c,&root,scope));
+        }
+        self.global().read(|c| {
+            let snapshot=c.unchecked_transaction()?;
+            crate::services::workspace_files::roots(&snapshot,&root,scope)
+        })
     }
 }

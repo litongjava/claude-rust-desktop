@@ -195,7 +195,7 @@ impl ExecutorHistory {
         })
     }
 
-    pub(crate) fn publish_title(&self, title: &str) -> Result<bool> {
+    pub fn publish_title(&self, title: &str) -> Result<bool> {
         match self {
             Self::Session(s) => {
                 let _guard = s.stores.key_lock(&s.key, false, false)?;

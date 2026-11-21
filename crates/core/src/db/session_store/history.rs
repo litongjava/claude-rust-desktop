@@ -252,6 +252,15 @@ impl SessionRead<'_> {
     pub fn turn(&self, id: &str) -> Result<Option<turn_repo::TurnRecord>> {
         Ok(turn_repo::get_turn(self.0, id)?)
     }
+    pub fn message_turn(&self, message: &str) -> Result<Option<turn_repo::TurnRecord>> {
+        Ok(turn_repo::get_message_turn(self.0, message)?)
+    }
+
+    pub fn recent_failed_tools(&self) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+        let mut query = self.0.prepare("SELECT t.name,t.input,t.output FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE t.is_error=1 ORDER BY m.sort_order DESC,m.rowid DESC,t.sort_order DESC,t.rowid DESC LIMIT 200")?;
+        let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn segments(&self, id: &str) -> Result<Vec<String>> {
         Ok(turn_repo::turn_messages(self.0, id)?)
     }
@@ -755,5 +764,46 @@ impl SessionRead<'_> {
             Ok(metrics)
         })
         .transpose()
+    }
+}
+
+pub struct TranscriptExcerpt {
+    pub role: String,
+    pub text: String,
+    pub tools: Vec<(String, Option<String>, Option<String>, bool)>,
+}
+
+impl SessionRead<'_> {
+    pub fn occurrence_content(&self, message: &str, provider_id: &str, display: &str) -> Result<Option<Value>> {
+        let id = stream_occurrence_id(message, provider_id);
+        Ok(self.mcp(&id, display)?.map(|(content, _, _)| content))
+    }
+
+    pub fn changed_lines(&self) -> Result<(i64,i64)> {
+        Ok(self.0.query_row("SELECT COALESCE(SUM(json_extract(output,'$.file_change.added')),0), COALESCE(SUM(json_extract(output,'$.file_change.removed')),0) FROM tool_calls WHERE json_valid(output) AND is_error=0", [], |r| Ok((r.get(0)?,r.get(1)?)))?)
+    }
+
+    pub fn output_tokens(&self) -> Result<i64> {
+        let mut query=self.0.prepare("SELECT id,output_tokens FROM model_requests WHERE output_tokens IS NOT NULL")?;
+        let mut counts=query.query_map([],|r| Ok((r.get::<_, String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<std::collections::HashMap<_,_>>>()?;
+        for live in self.setting(super::settings::LIVE_REQUESTS)?.unwrap_or_default() {
+            if let (Some(id),Some(tokens))=(live.id, live.output_tokens) { counts.insert(id,i64::try_from(tokens).unwrap_or(i64::MAX)); }
+        }
+        Ok(counts.into_values().fold(0i64,i64::saturating_add))
+    }
+
+    pub fn transcript_tail(&self) -> Result<Vec<TranscriptExcerpt>> {
+        let mut messages=self.0.prepare("SELECT id,role,substr(content,-65536) FROM (SELECT id,role,content,sort_order,rowid AS sequence FROM messages ORDER BY sort_order DESC,rowid DESC LIMIT 20) ORDER BY sort_order,sequence")?;
+        let mut calls=self.0.prepare("SELECT name,substr(input,1,8192),substr(output,-16384),is_error FROM (SELECT name,input,output,is_error,sort_order,rowid AS sequence FROM tool_calls WHERE message_id=?1 ORDER BY sort_order DESC,rowid DESC LIMIT 30) ORDER BY sort_order,sequence")?;
+        let mut rows=messages.query([])?;
+        let mut tail=Vec::new();
+        while let Some(row)=rows.next()? {
+            let role:String=row.get(1)?;
+            let tools=if role=="assistant" {
+                calls.query_map([row.get::<_,String>(0)?], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
+            } else { Vec::new() };
+            tail.push(TranscriptExcerpt { role, text:row.get(2)?, tools });
+        }
+        Ok(tail)
     }
 }

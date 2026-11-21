@@ -51,3 +51,11 @@ impl Stores {
             .unwrap_or(Ok(false))
     }
 }
+
+impl super::SessionDb {
+    pub(crate) fn validate_peer_endpoint(&self)->Result<()>{
+        let _guard=self.stores.key_lock(&self.key,false,false)?;
+        self.check_directory()?;
+        self.stores.global().read(|c|session_messages::project(c,self.stores.data_dir(),self.id()).map(drop))
+    }
+}

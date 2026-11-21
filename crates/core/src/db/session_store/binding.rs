@@ -182,3 +182,18 @@ impl ClearBinding {
         Ok(())
     }
 }
+
+impl super::Stores {
+    pub fn observed_binding(&self,id:&str)->Result<store::Observed>{
+        self.global().read_directory_row(id,|c|store::read(c,id).map(Some))?.context("Session not found")
+    }
+    pub fn binding_notice(&self,id:&str,requester:&str)->Result<Option<(u64,String,String,bool)>> {
+        self.global().read_directory_row(id,|c|store::frontend_failure(c,id,requester))
+    }
+    pub fn acknowledge_binding(&self,id:&str,requester:&str,generation:u64)->Result<()> {
+        self.global().write("acknowledge binding notice",id,false,|tx|store::acknowledge(tx,id,requester,generation))
+    }
+    pub fn release_binding_requester(&self,requester:&str)->Result<()> {
+        self.global().connection(OpenFlags::SQLITE_OPEN_READ_WRITE,|c|store::release_requester(c,requester))
+    }
+}

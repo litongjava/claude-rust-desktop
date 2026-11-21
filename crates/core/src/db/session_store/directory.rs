@@ -166,7 +166,7 @@ impl Stores {
         let _guards = self
             .resolved_key(&key)?
             .ok_or_else(|| anyhow::anyhow!("Session unavailable"))?;
-        self.global().write("rename session",id,false,|c| {
+        self.global().write_with_deadline("session name update",id,false,crate::db::STARTUP_WRITE_DEADLINE,|c| {
             anyhow::ensure!(c.execute("UPDATE conversations SET title=?1, metadata_revision=metadata_revision+1,
                 updated_at=CASE WHEN julianday(updated_at)>=julianday(?2) THEN updated_at ELSE ?2 END WHERE id=?3",
                 rusqlite::params![title,chrono::Utc::now().to_rfc3339(),id])?==1,"Session unavailable");
