@@ -67,12 +67,44 @@ async fn native_and_bridge_share_conversation_history() {
         .any(|row| row.id == id));
     db.open_session(id)
         .unwrap()
-        .write(|w| w.append("assistant", "saved answer"))
+        .write(|w| {
+            let id = w.append("assistant", "saved answer")?;
+            w.attachment(
+                "file-id",
+                &id,
+                "notes.txt",
+                "text",
+                "text/plain",
+                17,
+                "upload",
+            )
+        })
         .unwrap();
     let messages = commands::native_get_messages(native(), id.into())
         .await
         .unwrap();
     assert_eq!(messages[0].content, "saved answer");
+    let attachments = messages[0].attachments.as_ref().expect("stored attachment");
+    assert_eq!(attachments.len(), 1);
+    let file = &attachments[0];
+    assert_eq!(
+        (
+            &*file.file_id,
+            &*file.file_name,
+            &*file.file_type,
+            &*file.mime_type,
+            file.size,
+            file.source.as_deref()
+        ),
+        (
+            "file-id",
+            "notes.txt",
+            "text",
+            "text/plain",
+            17,
+            Some("upload")
+        )
+    );
     commands::native_delete_conversation(native(), id.into())
         .await
         .unwrap();

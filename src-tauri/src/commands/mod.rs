@@ -31,7 +31,7 @@ use crate::mcp::states as mcp_states;
 use crate::mcp::states::McpState;
 use crate::native_engine::engine_core::ChatRequest as NativeChatRequest;
 use crate::native_engine::provider_manager::{Provider, ProviderManager};
-use crate::native_engine::session_manager::{Conversation, Message, ToolCallRecord};
+use crate::native_engine::session_manager::{Attachment, Conversation, Message, ToolCallRecord};
 use crate::permissions::{DangerousTool, PermissionMode};
 use crate::slash_commands::{SlashCommand, SlashCommandRegistry};
 use crate::cost_tracker::{CostSummary, CostTracker, SessionCost};
@@ -415,6 +415,22 @@ pub async fn native_get_messages<R: tauri::Runtime>(
                             is_error: Some(call.is_error),
                         })
                         .collect::<Vec<_>>();
+                    let attachments = r
+                        .attachments(&m.id)?
+                        .into_iter()
+                        .map(|a| {
+                            Ok::<_, anyhow::Error>(Attachment {
+                                file_id: a.id,
+                                file_name: a.name.unwrap_or_default(),
+                                file_type: a.kind.unwrap_or_default(),
+                                mime_type: a.mime.unwrap_or_default(),
+                                size: a.size.unwrap_or_default().try_into()?,
+                                source: a.source,
+                                gh_repo: None,
+                                gh_ref: None,
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(Message {
                         id: m.id,
                         conversation_id: m.conversation_id,
@@ -424,7 +440,7 @@ pub async fn native_get_messages<R: tauri::Runtime>(
                         tool_calls: (!calls.is_empty()).then_some(calls),
                         is_compact_boundary: m.is_compact_boundary,
                         engine_uuid_synced: false,
-                        attachments: None,
+                        attachments: (!attachments.is_empty()).then_some(attachments),
                         research: None,
                     })
                 })
