@@ -145,6 +145,11 @@ impl SessionRepository<'_> {
         }
         Ok(name.into())
     }
+    pub(crate) fn permission_rules(&self)->Result<std::collections::HashMap<String,crate::permissions::rules::PermissionAction>> {
+        let key=self.preference_key(&super::settings::PERMISSIONS)?;
+        let raw=self.read(|c,_|super::state::local(c,&key))?;
+        Ok(raw.map(|s|serde_json::from_str(&s)).transpose().context("Stored session permission rules are invalid")?.unwrap_or_default())
+    }
     pub fn preference<T: serde::de::DeserializeOwned>(
         &self,
         key: super::settings::Setting<T>,

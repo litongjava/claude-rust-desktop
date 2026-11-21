@@ -21,18 +21,30 @@ impl Stores {
             .transpose()
     }
 
+    pub(crate) fn job_history(&self,session:&str,address:Option<&super::HistoryAddress>)->Result<ExecutorHistory>{
+        let address=address.context("ToolScript job has no session incarnation")?;
+        anyhow::ensure!(address.session==session,"ToolScript job belongs to another session");
+        Ok(ExecutorHistory::Session(self.resume_history(address)?))
+    }
     pub fn executor_history(&self, id: &str) -> Result<ExecutorHistory> {
         Ok(ExecutorHistory::Session(self.open_session(id)?))
     }
 }
 
 impl DbManager {
+    pub(crate) fn job_history(self:&Arc<Self>,session:&str,address:Option<&super::HistoryAddress>)->Result<ExecutorHistory>{
+        anyhow::ensure!(address.is_none(),"ToolScript job belongs to another data store");
+        self.executor_history(session)
+    }
     pub fn executor_history(self: &Arc<Self>, id: &str) -> Result<ExecutorHistory> {
         Ok(ExecutorHistory::Shared(self.clone(), id.into()))
     }
 }
 
 impl ExecutorHistory {
+    pub(crate) fn address(&self)->Option<super::HistoryAddress>{
+        match self {Self::Session(s)=>Some(s.address()), Self::Shared(..)=>None}
+    }
     pub fn id(&self) -> &str {
         match self {
             Self::Session(session) => session.id(),

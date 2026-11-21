@@ -94,6 +94,8 @@ pub(super) fn save_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// credential. A session-bound launch hands its owner a separate frozen binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub history:Option<crate::db::session_store::HistoryAddress>,
     pub id: String,
     pub session: String,
     pub workspace: String,
@@ -963,7 +965,8 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
     // The durable snapshot is read *before* the first call, never after one
     // already ran with a stale admission snapshot. Any required source that
     // cannot be read or parsed fails the job instead of dropping a stored deny.
-    let mut snapshot = read_permission_snapshot(&data_dir, &workspace, &db, &spec.session)?;
+    let history=db.job_history(&spec.session,spec.history.as_ref())?;
+    let mut snapshot = read_permission_snapshot(&data_dir, &workspace, &history, &spec.session)?;
     snapshot.mode = Some(
         snapshot
             .mode
@@ -986,7 +989,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
         spec.reasoning.clone(),
     )
     .with_conv_id(spec.session.clone())
-    .with_executor_history(db.executor_history(&spec.session)?)?
+    .with_executor_history(history.clone())?
     .with_parent_message_id_option(spec.assistant_id.clone())
     .with_durable_super_agent(crate::super_agent::crp::ToolRuntime {
         db: db.clone(),
@@ -1026,7 +1029,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
     let persist = spec
         .assistant_id
         .as_ref()
-        .map(|assistant| (data_dir.clone(), spec.session.clone(), assistant.clone()));
+        .map(|assistant| (history.clone(), assistant.clone()));
     let consumer_log = log_path.clone();
     let consumer_failure = persistence_error.clone();
     let consumer_cancel = cancellation.clone();
@@ -1073,9 +1076,9 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
                 fail(format!("Could not write the job log: {error}"));
             }
             tool_history::apply_event(&mut rows, &mut origins, &mut arguments, &event);
-            if let Some((data_dir, session, assistant)) = &persist {
+            if let Some((history, assistant)) = &persist {
                 if let Err(error) =
-                    flush_rows(data_dir, session, assistant, &rows, &origins, &mut flushed)
+                    flush_rows(history, assistant, &rows, &origins, &mut flushed)
                 {
                     fail(format!("Could not persist nested tool history: {error:#}"));
                 }
@@ -1100,7 +1103,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
         let workspace = workspace.clone();
         let session = spec.session.clone();
         let token = cancellation.clone();
-        let db = db.clone();
+        let db = history;
         let failure = policy_error.clone();
         let log_path = log_path.clone();
         tokio::spawn(async move {
@@ -1416,28 +1419,7 @@ fn resolve_provider(
     Ok(provider)
 }
 
-fn stored_session_rules_with(
-    db: &crate::db::DbManager,
-    session: &str,
-) -> Result<HashMap<String, crate::permissions::rules::PermissionAction>> {
-    let value = db.with_conn(|conn| -> Result<Option<String>> {
-        let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = statement.query([format!("cli.permissions.{session}")])?;
-        Ok(rows
-            .next()?
-            .map(|row| row.get::<_, String>(0))
-            .transpose()?)
-    })??;
-    match value {
-        // An unreadable rule set is a hard failure: defaulting to "no rules"
-        // would silently drop stored deny rules and widen authority.
-        Some(value) => {
-            Ok(serde_json::from_str(&value)
-                .context("Stored session permission rules are invalid")?)
-        }
-        None => Ok(HashMap::new()),
-    }
-}
+
 
 /// One strict read of every durable permission source a job depends on.
 ///
@@ -1456,7 +1438,7 @@ struct PermissionSnapshot {
 fn read_permission_snapshot(
     data_dir: &Path,
     workspace: &Path,
-    db: &crate::db::DbManager,
+    db: &impl crate::db::session_store::SessionAccess,
     session: &str,
 ) -> Result<PermissionSnapshot> {
     // One parse of each source feeds the merge. The lenient CLI loader cannot
@@ -1468,7 +1450,7 @@ fn read_permission_snapshot(
     let mut rules = loaded.rules;
     // A failure to read stored rules must fail the job, not silently drop a
     // deny rule and run with wider authority.
-    let stored = stored_session_rules_with(db, session)
+    let stored = db.select_session(session)?.permission_rules()
         .context("Reading the session permission rules for the ToolScript job")?;
     for (pattern, action) in stored {
         // A stored deny always wins; everything else follows the stored rules.
@@ -1524,7 +1506,7 @@ pub(super) fn refresh_approval_policy(
     apply_permission_snapshot(
         permissions,
         &spec.session,
-        read_permission_snapshot(root, Path::new(&spec.workspace), &db, &spec.session)?,
+        read_permission_snapshot(root, Path::new(&spec.workspace), &db.job_history(&spec.session,spec.history.as_ref())?, &spec.session)?,
     )
 }
 
@@ -1602,41 +1584,17 @@ fn render(event: &EngineEvent) -> String {
 /// Persists every observed nested row that has an origin. Row + origin are one
 /// transaction; repeating this is idempotent.
 fn flush_rows(
-    data_dir: &Path,
-    session: &str,
-    assistant: &str,
-    rows: &[crate::db::message_repo::ToolCallRow],
-    origins: &ToolOrigins,
-    flushed: &mut std::collections::HashSet<String>,
-) -> Result<()> {
-    let paths = crate::runtime::RuntimePaths::new(data_dir.to_path_buf())?;
-    let db = paths.open_database()?;
-    db.with_conn(|conn| -> Result<()> {
-        for row in rows {
-            let Some((parent, sequence)) = origins.get(&row.id) else {
-                continue;
-            };
-            if flushed.contains(&row.id) && row.output.is_none() {
-                continue;
-            }
-            let qualified = format!("{assistant}:{}", row.id);
-            let parent = format!("{assistant}:{parent}");
-            crate::db::message_repo::save_nested_tool_row(
-                conn,
-                assistant,
-                &crate::db::message_repo::ToolCallRow {
-                    id: qualified,
-                    message_id: assistant.to_owned(),
-                    ..row.clone()
-                },
-                &parent,
-                *sequence as i64,
-            )?;
-            flushed.insert(row.id.clone());
-        }
-        Ok(())
-    })??;
-    let _ = session;
+    history:&crate::db::session_store::ExecutorHistory,
+    assistant:&str,rows:&[crate::db::message_repo::ToolCallRow],origins:&ToolOrigins,
+    flushed:&mut std::collections::HashSet<String>,
+)->Result<()>{
+    let pending:Vec<_>=rows.iter().filter(|r|origins.contains_key(&r.id) && (!flushed.contains(&r.id)||r.output.is_some())).cloned().collect();
+    if !pending.is_empty(){
+        history.save_segment(assistant,crate::db::session_store::SegmentUpdate {
+            tools:&pending,origins:Some(origins),..Default::default()
+        })?;
+        flushed.extend(pending.into_iter().map(|r|r.id));
+    }
     Ok(())
 }
 
@@ -1674,6 +1632,7 @@ mod j1_tests {
 
     fn spec(directory: &Path) -> JobSpec {
         JobSpec {
+            history:None,
             id: directory
                 .file_name()
                 .unwrap()
@@ -2170,6 +2129,33 @@ mod j2_tests {
         );
         // No durable mode row: absent, not a failure.
         assert_eq!(snapshot.mode, None);
+    }
+
+    #[test]
+    fn detached_job_policy_and_nested_history_keep_the_launch_incarnation() -> Result<()> {
+        use crate::db::session_store::{Stores, settings::PERMISSIONS};
+        let root=tempfile::tempdir()?;
+        let stores=Stores::open(root.path())?;
+        let selected=stores.create("original",Default::default())?;
+        let message=selected.write(|w|{
+            w.set_setting(PERMISSIONS,&HashMap::from([("Bash".into(),crate::permissions::rules::PermissionAction::Deny)]))?;
+            w.append("assistant","")
+        })?;
+        let address=selected.address();
+        let history=stores.job_history(selected.id(),Some(&address))?;
+        assert_eq!(read_permission_snapshot(root.path(),root.path(),&history,selected.id())?.rules.get("Bash"),Some(&crate::permissions::rules::PermissionAction::Deny));
+        let mut flushed=Default::default();
+        let mut origins=ToolOrigins::new();
+        origins.insert("nested".into(),("parent".into(),0));
+        let rows=[crate::db::message_repo::ToolCallRow{id:"nested".into(),message_id:message.clone(),name:"Read".into(),input:None,output:Some("done".into()),is_error:false,sort_order:0}];
+        flush_rows(&history,&message,&rows,&origins,&mut flushed)?;
+        selected.delete()?;
+        stores.create("original",Default::default())?;
+        assert!(stores.job_history("original",Some(&address)).is_err());
+        assert!(stores.job_history("original",None).is_err());
+        assert!(read_permission_snapshot(root.path(),root.path(),&history,"original").is_err());
+        assert!(flush_rows(&history,&message,&rows,&origins,&mut flushed).is_err());
+        Ok(())
     }
 
     #[test]

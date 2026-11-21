@@ -1969,6 +1969,7 @@ impl ToolLoopExecutor {
             .map(|manager| manager.get_mode())
             .unwrap_or(crate::permissions::PermissionMode::AskPermissions);
         let spec = crate::native_engine::toolscript_job::JobSpec {
+            history:self.executor_history.as_ref().and_then(ExecutorHistory::address),
             id: String::new(),
             session: session.clone(),
             workspace: self.workspace_cwd.clone(),
