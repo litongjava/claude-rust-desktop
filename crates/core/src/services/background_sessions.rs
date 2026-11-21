@@ -135,17 +135,19 @@ impl JobOwners {
         )
     }
 
-    pub(crate) fn target(
+    pub(crate) fn report(
         &self,
         root: &Path,
         job: &Job,
         stores: &crate::db::session_store::Stores,
-    ) -> Result<Option<crate::db::session_store::SessionDb>> {
+    ) -> Result<Option<String>> {
         use super::session_worker::{job_child, JobChild};
         match job_child(root, job)? {
-            Some(JobChild::Bound { id, incarnation }) => stores.selected_child(&id, &incarnation),
+            Some(JobChild::Bound { id, incarnation }) => {
+                stores.recorded_assistant_report(&id, &incarnation)
+            }
             Some(JobChild::Legacy(_)) => Ok(None),
-            None => stores.selected_child(&job.session_id, &self.execution),
+            None => stores.recorded_assistant_report(&job.session_id, &self.execution),
         }
     }
 }
@@ -1567,12 +1569,7 @@ pub fn collect_completed(
             .find(|event| event["type"] == "result")
             .and_then(|event| event["result"].as_str().map(str::to_owned));
         let result = if execution_session != job.session_id {
-            owners
-                .target(root, &job, &store.db)?
-                .map(|s| s.read(|r| r.last_assistant_report()))
-                .transpose()?
-                .flatten()
-                .or(result)
+            owners.report(root, &job, &store.db)?.or(result)
         } else if job.session_id == parent {
             Some(if job.status == "completed" {
                 "The worker completed and stored its answer directly in this session. This notice does not duplicate that answer.".to_owned()

@@ -328,12 +328,7 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     }
     let owners = crate::services::background_sessions::JobOwners::load(root, job).ok()??;
     let stores = crate::db::session_store::Stores::open(root).ok()?;
-    owners
-        .target(root, job, &stores)
-        .ok()??
-        .read(|r| r.last_assistant_report())
-        .ok()
-        .flatten()
+    owners.report(root, job, &stores).ok().flatten()
 }
 
 /// Head of a string on a UTF-8 character boundary.

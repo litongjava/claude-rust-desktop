@@ -115,6 +115,34 @@ impl Stores {
             .transpose()
     }
 
+    pub(crate) fn recorded_assistant_report(
+        &self,
+        id: &str,
+        incarnation: &str,
+    ) -> Result<Option<String>> {
+        let read = || -> Result<Option<String>> {
+            let Some(shard) = self.selected_child(id, incarnation)? else {
+                return Ok(None);
+            };
+            shard.read(|r| r.last_assistant_report())
+        };
+        match read() {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                // Retirement can win between directory selection and the shard read.
+                // Only a confirmed directory change permits the saved-result fallback.
+                let current = self
+                    .global()
+                    .read_directory_row(id, |c| super::directory::one(c, id))?;
+                if current.is_some_and(|entry| entry.incarnation == incarnation) {
+                    Err(error)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     fn child_result(
         &self,
         parent: &SessionDb,
