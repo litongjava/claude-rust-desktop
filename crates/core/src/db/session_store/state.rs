@@ -7,6 +7,7 @@ use crate::services::{
 use rusqlite::params;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy)]
 pub enum GlobalSetting<'a> {
@@ -207,34 +208,44 @@ impl SessionDb {
             before == stamp(file.metadata()?)? && before == stamp(path.metadata()?)?,
             "File changed during read"
         );
+        let digest = Sha256::digest(&bytes);
         self.write_named("record file read",|w|{
-            w.0.execute("INSERT INTO file_read_stamps VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET modified_ns=excluded.modified_ns,size=excluded.size WHERE modified_ns<>excluded.modified_ns OR size<>excluded.size",
-                params![path.as_os_str().as_encoded_bytes(),before.0,before.1])?;
+            w.0.execute("INSERT INTO file_read_stamps(path,modified_ns,size,digest) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET modified_ns=excluded.modified_ns,size=excluded.size,digest=excluded.digest WHERE modified_ns<>excluded.modified_ns OR size<>excluded.size OR digest IS NOT excluded.digest",
+                params![path.as_os_str().as_encoded_bytes(),before.0,before.1,&digest[..]])?;
             Ok(())
         })?;
         Ok(bytes)
     }
     pub fn check_file_write(&self, path: &Path) -> Result<()> {
         layout::allow_entry()?;
-        self.read(|r| {
-            let path = match path.canonicalize() {
-                Ok(p) => p,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let expected =
-                r.0.query_row(
-                    "SELECT modified_ns,size FROM file_read_stamps WHERE path=?1",
-                    [path.as_os_str().as_encoded_bytes()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?
-                .context("File has not been read yet")?;
-            ensure!(
-                expected == stamp(path.metadata()?)?,
-                "File has been modified since read"
-            );
-            Ok(())
-        })
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self.read(|_| Ok(())),
+            Err(e) => return Err(e.into()),
+        };
+        let (modified, size, digest): (String, String, Option<Vec<u8>>) = self.read(|r| {
+            r.0.query_row(
+                "SELECT modified_ns,size,digest FROM file_read_stamps WHERE path=?1",
+                [path.as_os_str().as_encoded_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .context("File has not been read yet")
+        })?;
+        let expected = (modified, size);
+        let mut file = std::fs::File::open(&path)?;
+        ensure!(
+            expected == stamp(file.metadata()?)?,
+            "File has been modified since read"
+        );
+        let mut hash = Sha256::new();
+        std::io::copy(&mut file, &mut hash)?;
+        ensure!(
+            digest.as_deref() == Some(&hash.finalize()[..])
+                && expected == stamp(file.metadata()?)?
+                && expected == stamp(path.metadata()?)?,
+            "File has been modified since read"
+        );
+        Ok(())
     }
 }

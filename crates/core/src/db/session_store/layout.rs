@@ -248,6 +248,8 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
 
 fn install_session_v4(c: &Connection) -> Result<()> {
     c.execute_batch(include_str!("projection.sql"))?;
+    // A legacy timestamp cannot attest to bytes read before the upgrade.
+    c.execute_batch("ALTER TABLE file_read_stamps ADD COLUMN digest BLOB")?;
     Ok(())
 }
 
@@ -394,7 +396,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
             "Missing required session summary index or trigger"
         );
         &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_dirty request_count input_tokens output_tokens total_tokens"),
-          ("request_metric_deltas","direction input output total")]
+          ("file_read_stamps","digest"), ("request_metric_deltas","direction input output total")]
     } else {
         &[]
     };
