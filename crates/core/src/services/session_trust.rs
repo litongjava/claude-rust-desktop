@@ -62,7 +62,7 @@ pub fn repair(
     let _claim = super::background_sessions::SessionClaim::acquire(data_root, id, &uuid::Uuid::new_v4().to_string())
         .context("Cannot repair trust while a session worker owns this session; stop its tasks and shut down the worker first")?;
     ensure!(
-        !super::background_sessions::list(data_root, None)?
+        !super::background_sessions::possible_executions(data_root, id)?
             .iter()
             .any(|job| job.session_id == id
                 && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")),

@@ -1202,7 +1202,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             input.as_ref().unwrap().set_effort(Some(session_commands::model_label(&session).await));
             let (agent_paths, agent_db, agent_session) = (paths.clone(), session.store.db.clone(), session.id.clone());
             input.as_ref().unwrap().set_agent_rows(Box::new(move || background_commands::running_agents(&agent_paths, &agent_db, &agent_session)));
-            let agent_context = services::context(&paths)?;
+            let agent_context = session.hook_service_context();
             input.as_ref().unwrap().set_subagents(agent_context.clone(), session.id.clone());
             input.as_ref().unwrap().set_agent_details(Box::new(move |id| background_commands::agent_execution(&agent_context, id)));
             let (todo_paths, todo_session) = (paths.clone(), session.id.clone());
@@ -1331,7 +1331,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                                     }
                                     continue 'repl;
                                 }
-                                for prompt in due { session.store.db.open_session(&session.id)?.enqueue_cli_notification(&prompt)?; }
+                                for prompt in due { session.selected_session()?.enqueue_cli_notification(&prompt)?; }
                             }
                             Ok(_) => {}
                             Err(error) => command_eprintln!("Scheduled jobs: {error:#}"),
@@ -1359,7 +1359,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     // A background agent waiting for approval asks here, as in the
                     // reference CLI, once the input is empty.
                     if !session.waiting_for_continue() && !composer.is_pending()
-                        && background_commands::agent_question(&paths, &session.id).is_some()
+                        && background_commands::agent_question(&paths, &session).is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         if let Err(error) = background_commands::answer_agent_question(&paths, &session) { command_eprintln!("Agent question: {error:#}"); }
                         continue 'repl;

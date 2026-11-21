@@ -1,6 +1,5 @@
 //! SDK control requests that act on session resources: MCP servers, plugins,
 //! background tasks and recorded file checkpoints.
-use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{bail, ensure, Context, Result};
 use deepseek_code_core::{db::message_repo, services::checkpoints};
@@ -103,10 +102,7 @@ pub fn latest_user_message(
     session: &Session,
     delivered: &std::collections::HashSet<String>,
 ) -> Result<Option<String>> {
-    let messages = session
-        .store
-        .db
-        .select_session(&session.id)?.messages()?;
+    let messages = session.selected_session()?.repository().messages()?;
     Ok(messages
         .into_iter()
         .rev()

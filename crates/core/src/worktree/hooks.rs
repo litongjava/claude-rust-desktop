@@ -216,7 +216,7 @@ pub fn status(db: &impl SessionAccess, session: &str) -> Result<Option<Value>> {
 /// Read-only preflight: run before shutting down an idle worker, then recheck at release.
 pub fn ensure_idle(root: &Path, session: &str) -> Result<()> {
     ensure!(
-        !crate::services::background_sessions::list(root, None)?
+        !crate::services::background_sessions::possible_executions(root, session)?
             .iter()
             .any(|job| job.session_id == session
                 && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")),

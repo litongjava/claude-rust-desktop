@@ -1,7 +1,6 @@
 //! Local REPL commands use the same stores as Desktop and never call a model.
 #[cfg(test)]
 use crate::fixture_sql::FixtureSql;
-use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Result};
 use deepseek_code_core::{
@@ -93,7 +92,7 @@ pub fn save_completion(session: &Session) -> Result<()> {
     let Some(status) = status else {
         return Ok(());
     };
-    let messages = session.store.db.select_session(&session.id)?.messages()?;
+    let messages = session.selected_session()?.repository().messages()?;
     if let Some(message) = messages.last().filter(|m| m.role == "assistant") {
         let directory = session.paths.data_dir.join("turn-completions");
         std::fs::create_dir_all(&directory)?;
@@ -751,7 +750,7 @@ pub async fn handle(
         }
         "/context" => {
             ensure!(argument.trim().is_empty(), "Usage: /context");
-            let rows = session.store.db.open_session(&session.id)?.read(|r| r.messages())?;
+            let rows = session.selected_session()?.read(|r| r.messages())?;
             let start = rows
                 .iter()
                 .rposition(|row| row.is_compact_boundary)
@@ -765,7 +764,7 @@ pub async fn handle(
         "/role" => {
             use deepseek_code_core::super_agent::Role;
             let current =
-                deepseek_code_core::super_agent::role::load(&session.store.db, &session.id)?;
+                deepseek_code_core::super_agent::role::load(&session.selected_session()?, &session.id)?;
             let wanted = argument.trim();
             if wanted.is_empty() {
                 command_eprintln!(

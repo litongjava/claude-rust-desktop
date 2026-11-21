@@ -1,5 +1,4 @@
 //! CLI rendering of read-only shared runtime observations.
-use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Result};
 use deepseek_code_core::services::{
@@ -96,7 +95,7 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         .filter(|row| row["installed"] == true)
         .count();
     let live = crate::session_commands::live_requests(session)?;
-    let (_,input,output) = session.store.db.select_session(&session.id)?.usage_totals(&live)?;
+    let (_,input,output) = session.selected_session()?.repository().usage_totals(&live)?;
     let boundary = deepseek_code_core::services::context_usage::latest_boundary(
         &session.store.db,
         &session.id,

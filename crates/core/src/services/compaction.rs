@@ -534,8 +534,7 @@ pub fn prepare_part(db: &crate::db::session_store::Stores, id: &str, message: &s
 
 pub fn commit_part(db: &crate::db::session_store::Stores, id: &str, message: &str, part: Part, prepared: PreparedPart, summary: &str) -> Result<(String,usize)> {
     ensure!(!summary.trim().is_empty() && summary.chars().count() <= 32_000, "Empty or oversized summary");
-    let source=db.open_session(id)?;
-    ensure!(source.incarnation()==prepared.incarnation, "Summary source was replaced");
+    let source=db.open_recorded(id, &prepared.incarnation).context("Summary source was replaced")?;
     let branch=uuid::Uuid::new_v4().to_string();
     source.branch(&branch,crate::db::session_store::Branch::Summary { message, part, fingerprint:&prepared.fingerprint, text:summary.trim() })?;
     Ok((branch,prepared.count))

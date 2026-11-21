@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 impl SessionDb {
     pub(crate) fn router_stores(&self) -> Stores {
-        let mut stores = self.stores.clone();
+        let mut stores = self.scoped_stores();
         stores.router = Some(self.address());
         stores
     }
@@ -54,19 +54,17 @@ impl TaskDatabase for Stores {
         };
         let members = self.global().read(|c| {
             let mut q = c.prepare(&format!(
-                "SELECT coder_session_id,reviewer_session_id FROM {table} WHERE {predicate}"
+                "SELECT m.session_id,m.incarnation FROM (SELECT * FROM {table} WHERE {predicate}) t
+                 JOIN sa_member_sessions m ON m.task_id=t.task_id
+                 AND ((m.role='coder' AND m.session_id=t.coder_session_id)
+                   OR (m.role='reviewer' AND m.session_id=t.reviewer_session_id))
+                 JOIN conversations c ON c.id=m.session_id AND c.incarnation=m.incarnation"
             ))?;
             let mut cursor = q.query([value])?;
             let mut members = BTreeMap::new();
             while let Some(row) = cursor.next()? {
-                for col in 0..2 {
-                    if let Some(id) = row
-                        .get::<_, Option<String>>(col)?
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        members.insert(layout::storage_key(&id)?, id);
-                    }
-                }
+                let id: String = row.get(0)?;
+                members.insert(layout::storage_key(&id)?, (id, row.get::<_, String>(1)?));
             }
             Ok(members)
         })?;
@@ -74,10 +72,7 @@ impl TaskDatabase for Stores {
         if !members.is_empty() {
             fence.locks.push(self.namespace()?);
         }
-        for (key, id) in members {
-            let Some(incarnation) = self.global().incarnation(&id, &key)? else {
-                continue;
-            };
+        for (key, (id, incarnation)) in members {
             let path = self.root.path.join("session-locks").join(&key);
             let lock = std::fs::File::options()
                 .read(true)

@@ -21,6 +21,7 @@ impl ProgressGuard {
     fn finish(&mut self, status: &str) {
         self.finished = true;
         let _ = self.sender.try_send(EngineEvent::AgentProgress {
+            address: None,
             session_id: self.id.clone(),
             agent_type: "deep-research".into(),
             status: status.into(),
@@ -286,6 +287,7 @@ impl ToolLoopExecutor {
         let _ = self
             .event_tx
             .send(EngineEvent::AgentProgress {
+                address: None,
                 session_id: guard.run.id.clone(),
                 agent_type: "deep-research".into(),
                 status: format!("phase:{phase}"),

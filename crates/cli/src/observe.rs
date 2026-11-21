@@ -57,18 +57,18 @@ pub struct Observer {
 /// Whether some process holds execution ownership, whether a managed worker or
 /// a direct print/json run. This only probes the lease; it never acquires it.
 pub fn execution_lease_active(session: &Session) -> Result<bool> {
-    session.store.db.select_session(&session.id)?.execution_active(&session.paths.data_dir)
+    session.selected_session()?.repository().execution_active(&session.paths.data_dir)
 }
 
 /// The truthful resume notice for a turn owned elsewhere.
 pub fn running_notice(session: &Session) -> Result<String> {
-    let turn = session.store.db.select_session(&session.id)?.running_turn()?;
+    let turn = session.selected_session()?.repository().running_turn()?;
     Ok(running_notice_for(turn.as_ref()))
 }
 
 /// Whether the last turn ended because its owner disappeared.
 pub fn latest_interrupted(session: &Session) -> Result<bool> {
-    let latest = session.store.db.select_session(&session.id)?.latest_turn()?;
+    let latest = session.selected_session()?.repository().latest_turn()?;
     Ok(latest.is_some_and(|turn| turn.interrupted()))
 }
 

@@ -1,7 +1,7 @@
 //! CLI worktrees use the shared Desktop conversation binding and resolver.
 use crate::{args::Cli, session::Session};
 use anyhow::{Context, Result};
-use deepseek_code_core::{db::session_store::SessionAccess, worktree::session as worktrees};
+use deepseek_code_core::worktree::session as worktrees;
 
 pub fn validate(cli: &Cli, source: &std::path::Path) -> Result<()> {
     if let Some(name) = &cli.worktree {
@@ -44,7 +44,7 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
         eprintln!("Hook worktree: {}. Retained on exit; /worktree status, detach or remove manages this binding.",session.workspace.display());
         return Ok(());
     }
-    let owner = session.store.db.select_session(&session.id)?;
+    let owner = session.selected_session()?.repository();
     let prepared = worktrees::prepare_named(&source, (!name.is_empty()).then_some(name.as_str()))?;
     let saved = owner
         .bind_prepared_worktree(&source, &prepared)

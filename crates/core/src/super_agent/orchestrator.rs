@@ -97,6 +97,11 @@ impl Orchestrator {
     /// Task stores derived by the watcher, launcher and cleanup inherit this identity.
     pub(super) fn router_pass(&self, router: &str) -> Result<(Self, impl Drop)> {
         let selected = self.context.db.open_session(router)?;
+        self.selected_router_pass(&selected)
+    }
+
+    fn selected_router_pass(&self, selected: &crate::db::session_store::SessionDb) -> Result<(Self, impl Drop)> {
+        let selected = self.context.db.resume_history(&selected.address())?;
         let guard = selected.hold_incarnation()?;
         let mut pass = self.clone();
         pass.context.db = std::sync::Arc::new(selected.router_stores());
@@ -152,6 +157,11 @@ impl Orchestrator {
     pub async fn tick_watched(&self, router_session: &str) -> Result<TickReport> {
         let (pass, _guard) = self.router_pass(router_session)?;
         pass.tick_watched_selected(router_session).await
+    }
+
+    pub async fn tick_watched_session(&self, router: &crate::db::session_store::SessionDb) -> Result<TickReport> {
+        let (pass, _guard) = self.selected_router_pass(router)?;
+        pass.tick_watched_selected(router.id()).await
     }
 
     async fn tick_watched_selected(&self, router_session: &str) -> Result<TickReport> {

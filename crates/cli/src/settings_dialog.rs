@@ -94,7 +94,7 @@ fn usage_rows(session: &Session, paths: &RuntimePaths) -> Result<Vec<String>> {
         let seconds = ms / 1000;
         if seconds < 60 { format!("{seconds}s") } else { format!("{}m {}s", seconds / 60, seconds % 60) }
     };
-    let (added, removed) = session.store.db.open_session(&session.id)?.read(|r| r.changed_lines())?;
+    let (added, removed) = session.selected_session()?.read(|r| r.changed_lines())?;
     let wall = crate::terminal::STARTED.get().map_or(0, |started| started.elapsed().as_millis() as i64);
     let cost = match billing["total_usd"].as_f64() {
         Some(total) if billing["unpriced_requests"].as_i64().unwrap_or(0) == 0 => format!("${total:.4}"),

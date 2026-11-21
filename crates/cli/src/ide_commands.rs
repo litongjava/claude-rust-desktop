@@ -5,7 +5,7 @@ use deepseek_code_core::{
     permissions::{PermissionLevel, PermissionScope, ToolPermission},
     services::ide,
 };
-use deepseek_code_core::db::session_store::{SessionAccess,settings::{Editor,EDITOR}};
+use deepseek_code_core::db::session_store::settings::{Editor,EDITOR};
 
 async fn connect(session: &Session, port: Option<u16>) -> Result<()> {
     let editors = ide::discover(&ide::lock_directory()?, &session.workspace)?;
@@ -36,7 +36,7 @@ async fn connect(session: &Session, port: Option<u16>) -> Result<()> {
 /// Restoring a port is never enough to trust a stale process: rediscover the
 /// lockfile, verify its workspace, and complete the real MCP handshake again.
 pub async fn restore(session: &Session) -> Result<()> {
-    let choice = session.store.db.select_session(&session.id)?.preference(EDITOR)?;
+    let choice = session.selected_session()?.repository().preference(EDITOR)?;
     let status = session.ide.status().await;
     let Some(choice) = choice.filter(|choice| {
         session
@@ -96,12 +96,12 @@ pub async fn handle(session: &Session, argument: &str) -> Result<bool> {
             connect(session, port).await?;
             let state = session.ide.status().await;
             let editor = state.editor.context("IDE did not connect")?;
-            session.store.db.select_session(&session.id)?.set_preference(EDITOR,Some(&Editor {port:editor.port,workspace:session.workspace.canonicalize()?}))?;
+            session.selected_session()?.repository().set_preference(EDITOR,Some(&Editor {port:editor.port,workspace:session.workspace.canonicalize()?}))?;
             command_eprintln!("Connected to {} on port {} ({} tools).",editor.name,editor.port,session.ide.tools().await.len());
         },
         "disconnect" => {
             ensure!(words.len() == 1, "Usage: /ide disconnect");
-            session.store.db.select_session(&session.id)?.set_preference(EDITOR,None)?;
+            session.selected_session()?.repository().set_preference(EDITOR,None)?;
             session.ide.disconnect().await;
             command_eprintln!("IDE disconnected.");
         },
@@ -186,11 +186,11 @@ async fn pick(session: &Session) -> Result<()> {
     match editors.get(choice) {
         Some(editor) => {
             connect(session, Some(editor.port)).await?;
-            session.store.db.select_session(&session.id)?.set_preference(EDITOR,Some(&Editor { port: editor.port, workspace: session.workspace.canonicalize()? }))?;
+            session.selected_session()?.repository().set_preference(EDITOR,Some(&Editor { port: editor.port, workspace: session.workspace.canonicalize()? }))?;
             command_eprintln!("  \u{23bf}  Connected to {}.", editor.name);
         }
         None => {
-            session.store.db.select_session(&session.id)?.set_preference(EDITOR,None)?;
+            session.selected_session()?.repository().set_preference(EDITOR,None)?;
             session.ide.disconnect().await;
             command_eprintln!("  \u{23bf}  Disconnected from IDE.");
         }

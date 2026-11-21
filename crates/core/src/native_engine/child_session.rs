@@ -193,6 +193,8 @@ pub(crate) async fn prepare_child_session(
         "Data directory must be absolute"
     );
 
+    let resume_pair = spawn.resume_session.as_deref().map(|child| context.db.worker_pair(&spawn.parent_session_id, child)).transpose()?;
+    let _resume_guard = resume_pair.as_ref().map(|pair| pair.hold(&context.db)).transpose()?;
     let parent = require_session(&context, &spawn.parent_session_id, "Parent session")?;
     ensure!(!parent.archived, "Parent session is archived");
     ensure!(
@@ -367,7 +369,10 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
-    let owners = context.db.worker_pair(&spawn.parent_session_id,&session_id)?;
+    let owners = match resume_pair {
+        Some(pair) => pair,
+        None => context.db.worker_pair(&spawn.parent_session_id, &session_id)?,
+    };
     let workspace = match &spawn.workspace {
         ChildWorkspace::Directory(_) => requested_workspace
             .clone()

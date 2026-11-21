@@ -172,29 +172,23 @@ impl Frontend {
         workspace: &Path,
         permissions: &PermissionManager,
     ) -> Result<bool> {
-        let policy = if approved {
-            let condition =
-                self.db
-                    .select_session(&self.session)?
-                    .inspect_proposal(|conn| -> Result<_> {
-                        Ok(read(conn, &self.session)?
-                            .pending
-                            .filter(|p| p.id == id && !p.approved)
-                            .map(|p| p.condition))
-                    })?;
-            let Some(condition) = condition else {
+        let owner = self.db.select_session(&self.session)?;
+        let approval = if approved {
+            let pending = owner.inspect_proposal(|conn| -> Result<_> {
+                Ok(read(conn, &self.session)?
+                    .pending
+                    .filter(|p| p.id == id && !p.approved))
+            })?;
+            let Some(pending) = pending else {
                 return Ok(false);
             };
-            Some(review_policy(
-                permissions,
-                &self.session,
-                workspace,
-                &condition,
-            )?)
+            let policy = review_policy(permissions, &self.session, workspace, &pending.condition)?;
+            let guard = bind_proposal_source(root, &self.session, &owner, &pending)
+                .context("The proposing task was cancelled or failed")?;
+            Some((pending, policy, guard))
         } else {
             None
         };
-        let owner = self.db.select_session(&self.session)?;
         let trust = if approved {
             owner.proposal_project_trust()?
         } else {
@@ -216,13 +210,14 @@ impl Frontend {
             else {
                 return Ok(false);
             };
-            if approved {
+            if let Some((pending, policy, _source)) = &approval {
                 ensure!(
-                    source_job_allows_activation(root, &self.session, proposal),
+                    proposal.source_job == pending.source_job
+                        && source_job_allows_activation(root, &self.session, proposal),
                     "The proposing task was cancelled or failed"
                 );
                 ensure!(
-                    policy == Some(permissions.policy_snapshot()),
+                    *policy == permissions.policy_snapshot(),
                     "ProposeGoal tool policy changed"
                 );
                 guard(
@@ -468,6 +463,30 @@ pub fn propose(
     })
 }
 
+// Acquire participant locks before opening the proposal write transaction.
+fn bind_proposal_source(
+    root: &Path,
+    session: &str,
+    owner: &crate::db::session_store::SessionRepository<'_>,
+    proposal: &Proposal,
+) -> Result<Option<impl Drop>> {
+    let Some(id) = &proposal.source_job else {
+        return Ok(None);
+    };
+    let job = super::background_sessions::get(root, id)?;
+    ensure!(
+        job.id == *id && job.session_id == session,
+        "Proposing session changed"
+    );
+    if let Some(selected) = owner.selected_shard() {
+        return Ok(Some(super::background_sessions::hold_attachment(
+            root, &job, selected,
+        )?));
+    }
+    super::background_sessions::authorize_attachment(root, &job, session)?;
+    Ok(None)
+}
+
 // Persist the originating job so a killed/detached worker cannot leave consent
 // for a later unrelated turn to consume. Successful detached work remains valid.
 fn source_job_allows_activation(root: &Path, session: &str, proposal: &Proposal) -> bool {
@@ -476,7 +495,7 @@ fn source_job_allows_activation(root: &Path, session: &str, proposal: &Proposal)
     };
     super::background_sessions::get(root, id).is_ok_and(|job| {
         job.session_id == session
-            && super::session_worker::job_execution_session(root, &job)
+            && super::session_worker::recorded_job_target(root, &job)
                 .is_ok_and(|target| target == session)
             && matches!(job.status.as_str(), "starting" | "running" | "completed")
             && !root
@@ -527,6 +546,7 @@ fn activate_at_boundary(
     let Some(pending) = pending else {
         return Ok(None);
     };
+    let source = bind_proposal_source(root, session, &owner, &pending);
     let policy = review_policy(permissions, session, workspace, &pending.condition);
     let trust = owner.proposal_project_trust()?;
     owner.edit_proposal(crate::db::STARTUP_WRITE_DEADLINE,|conn, state| {
@@ -546,7 +566,7 @@ fn activate_at_boundary(
         }) {
             return Ok(None);
         }
-        if !source_job_allows_activation(root, session, proposal)
+        if source.is_err() || proposal.source_job != pending.source_job || !source_job_allows_activation(root, session, proposal)
             || !policy
                 .as_ref()
                 .is_ok_and(|snapshot| *snapshot == permissions.policy_snapshot())

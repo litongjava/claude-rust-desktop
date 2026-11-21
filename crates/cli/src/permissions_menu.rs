@@ -1,6 +1,5 @@
 //! /permissions as in the reference CLI: Recently denied, Allow, Ask, Deny,
 //! Auto mode and Workspace tabs switched with ←/→, each with its rules.
-use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use crate::terminal::picker::{text_input, Entry, Key, Picked, Picker};
 use anyhow::Result;
@@ -28,7 +27,7 @@ fn action(tab: usize) -> Option<PermissionAction> {
 
 /// Tool calls rejected or denied in this session, newest first.
 fn recently_denied(session: &Session) -> Result<Vec<Entry>> {
-    let rows = session.store.db.open_session(&session.id)?.read(|r| r.recent_failed_tools())?;
+    let rows = session.selected_session()?.read(|r| r.recent_failed_tools())?;
     let mut entries = Vec::new();
     for (name, input, output) in rows {
             let output = output.unwrap_or_default();
@@ -115,7 +114,7 @@ pub async fn run(session: &mut Session) -> Result<()> {
             _ => {
                 let mut entries = vec![Entry { title: "Add directory\u{2026}".into(), detail: String::new() }];
                 entries.push(Entry { title: session.workspace.display().to_string(), detail: "working directory".into() });
-                let folders = session.store.db.select_session(&session.id)?.workspace_project()?;
+                let folders = session.selected_session()?.repository().workspace_project()?;
                 for folder in folders.map(|project| project.folders).unwrap_or_default() {
                     if std::path::Path::new(&folder.path) != session.workspace {
                         entries.push(Entry { title: folder.path, detail: "added directory".into() });

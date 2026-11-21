@@ -177,7 +177,10 @@ pub async fn handle(
                 .split_once(char::is_whitespace)
                 .unwrap_or((argument, ""));
             match verb {
-                "" => command_eprintln!("{}", active_agents_text(paths, &session.id)?),
+                "" => command_eprintln!(
+                    "{}",
+                    active_agents_for(paths, &session.selected_session()?)?
+                ),
                 "definitions" if rest.trim().is_empty() => {
                     for agent in
                         deepseek_code_core::services::agents::list(&crate::services::context(paths)?)?
@@ -205,6 +208,8 @@ pub async fn handle(
                     command_println!("{}: {}", agent.id, agent.description);
                 }
             } else {
+                let owner = session.selected_session()?;
+                let _owner = owner.hold_incarnation()?;
                 let peers = peer_sessions(
                     &session.store,
                     &paths.data_dir,
@@ -220,6 +225,8 @@ pub async fn handle(
                         let mut observed=peers.clone();
                         for peer in &mut observed {
                             let id=peer["id"].as_str().unwrap_or_default();
+                            let peer_session = session.store.db.open_recorded(id,peer["incarnation"].as_str().context("Missing peer incarnation")?)?;
+                            let _peer = peer_session.hold_incarnation()?;
                             let runtime=deepseek_code_core::services::session_worker::runtime_status(&paths.data_dir,id).await;
                             peer["worker"]=serde_json::to_value(runtime)?;
                         }
@@ -295,18 +302,34 @@ pub(crate) fn peer_sessions(
 }
 
 /// Show runtime activity, not merely saved agent definitions or old session rows.
+#[cfg(test)]
 pub(crate) fn active_agents_text(paths: &RuntimePaths, current: &str) -> Result<String> {
+    active_agents_for(paths, &paths.open_database()?.open_session(current)?)
+}
+
+pub(crate) fn active_agents_for(
+    paths: &RuntimePaths,
+    owner: &deepseek_code_core::db::session_store::SessionDb,
+) -> Result<String> {
+    let _owner = owner.hold_incarnation()?;
+    let current = owner.id();
     use deepseek_code_core::services::{background_sessions, session_messages};
     let context = crate::services::context(paths)?;
     let peers = session_messages::session_peers(&context, current)?;
-    let jobs = background_sessions::list(&paths.data_dir, None)?;
+
     let mut rows = Vec::new();
     for peer in peers {
         let id = peer["id"].as_str().unwrap_or_default();
+        let peer_session = context.db.open_recorded(
+            id,
+            peer["incarnation"]
+                .as_str()
+                .context("Missing peer incarnation")?,
+        )?;
+        let _peer = peer_session.hold_incarnation()?;
+        let jobs = background_sessions::executing_in_session(&paths.data_dir, &peer_session)?;
         let job = jobs.iter().find(|job| {
-            job.session_id == id
-                && background_sessions::authorize_attachment(&paths.data_dir, job, id).is_ok()
-                && matches!(job.status.as_str(), "starting" | "running")
+            matches!(job.status.as_str(), "starting" | "running")
         });
         if peer["receiver_active"] != true && job.is_none() {
             continue;

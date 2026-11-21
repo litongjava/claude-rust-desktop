@@ -1,5 +1,4 @@
 //! Explicit, previewable code/conversation rewind without destroying the source transcript.
-use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
@@ -104,10 +103,7 @@ async fn apply(action: &str, id: &str, paths: &RuntimePaths, session: &mut Sessi
         );
     }
     let target = if action == "conversation" || action == "both" {
-        let messages = session
-            .store
-            .db
-            .select_session(&session.id)?.messages()?;
+        let messages = session.selected_session()?.repository().messages()?;
         let index = messages
             .iter()
             .position(|message| message.id == checkpoint.message_id)
@@ -144,10 +140,7 @@ async fn pick(paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
         command_eprintln!("No checkpoints captured for this session. Checkpoints are created around turns in supported Git worktrees.");
         return Ok(true);
     }
-    let messages = session
-        .store
-        .db
-        .select_session(&session.id)?.messages()?;
+    let messages = session.selected_session()?.repository().messages()?;
     let mut entries: Vec<Entry> = saved
         .iter()
         .map(|checkpoint| {

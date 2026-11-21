@@ -42,7 +42,7 @@ fn key(parent: &str, session: &str) -> Result<String> {
     Ok(format!("{}{session}", prefix(parent)?))
 }
 fn active<D>(context: &ServiceContext<D>, session: &str) -> Result<Option<jobs::Job>> {
-    Ok(jobs::list(&context.paths.data_dir, None)?
+    Ok(jobs::possible_executions(&context.paths.data_dir, session)?
         .into_iter()
         .find(|job| {
             job.session_id == session

@@ -67,9 +67,11 @@ impl WorkerPair {
 
 impl WorkerDirectory for Stores {
     fn worker_pair(&self, parent: &str, child: &str) -> Result<WorkerPair> {
-        let (p,c) = self.global().read(|conn| Ok(conn.query_row("SELECT p.incarnation,c.incarnation
+        let (p,c): (String,String) = self.global().read(|conn| Ok(conn.query_row("SELECT p.incarnation,c.incarnation
             FROM conversations p,conversations c WHERE p.id=?1 AND c.id=?2 AND p.archived=0 AND c.archived=0",
             [parent,child], |r| Ok((r.get(0)?,r.get(1)?)))?))?;
+        self.check_selected(parent, &p)?;
+        self.check_selected(child, &c)?;
         Ok(WorkerPair {
             parent: parent.into(),
             child: child.into(),
@@ -218,6 +220,27 @@ impl WorkerDirectory for DbManager {
 }
 
 impl Stores {
+    pub(crate) fn hold_job_participants(
+        &self,
+        parent: (&str, &str),
+        execution: (&str, &str),
+        child: Option<&(String, String)>,
+    ) -> Result<Vec<std::fs::File>> {
+        let mut keys = vec![
+            super::layout::storage_key(parent.0)?,
+            super::layout::storage_key(execution.0)?,
+        ];
+        if let Some((id, _)) = child {
+            keys.push(super::layout::storage_key(id)?);
+        }
+        keys.sort();
+        keys.dedup();
+        let guards =
+            self.group_access(keys.iter().map(|k| (k.as_str(), false, false)).collect())?;
+        self.check_job_participants(parent, execution, child)?;
+        Ok(guards)
+    }
+
     pub(crate) fn check_job_participants(
         &self,
         parent: (&str, &str),

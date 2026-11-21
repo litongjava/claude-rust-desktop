@@ -186,7 +186,7 @@ async fn run_case(cancel: bool, team: bool) {
                 session_id,
                 agent_type,
                 status,
-                tool_name,
+                tool_name, ..
             } = &event
             {
                 progress.push((

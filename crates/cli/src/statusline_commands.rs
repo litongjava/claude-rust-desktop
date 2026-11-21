@@ -168,8 +168,7 @@ pub async fn payload(session: &Session) -> Result<Value> {
     let usage = crate::display_commands::usage(session)?;
     let selected = session.selected_provider().await?;
     let title = session.store.resume(&session.id)?.title;
-    use deepseek_code_core::db::session_store::SessionAccess;
-    let history = session.store.db.select_session(&session.id)?;
+    let history = session.selected_session()?.repository();
     let current = history.current_usage()?;
     let project = history.workspace_project()?;
         let project_dir = project

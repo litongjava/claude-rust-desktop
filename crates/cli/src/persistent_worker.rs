@@ -155,8 +155,7 @@ pub async fn run_from_env() -> Result<bool> {
     let worker = service::read_worker(&dir)?;
     let selected = if worker.root.join("global.db").try_exists()? {
         Some(
-            deepseek_code_core::db::session_store::Stores::open(&worker.root)?
-                .open_session(&worker.session_id)?,
+            service::worker_session(&worker)?,
         )
     } else {
         None
@@ -452,7 +451,9 @@ async fn execute(
     );
     let paths = RuntimePaths::new(worker.root.clone())?;
     if !stamped {
-        let db = paths.open_database()?;
+        let owner = service::worker_session(worker)?;
+        let _owner = owner.hold_incarnation()?;
+        let db = owner.scoped_stores();
         let observed = crate::worker_binding::observe_worker(&paths, &db, &worker.session_id, Some(&binding), || {
             let mut selection = crate::config::select(&cli, &paths, cli.model.as_deref(), cli.provider.as_deref())?;
             selection.apply_worker_model_snapshot(false)?;
@@ -461,7 +462,7 @@ async fn execute(
         if observed.generation != 0 {
             cli.discard_binding_options();
         }
-        binding.track_session(db.open_session(&worker.session_id)?);
+        binding.track_session(owner.clone());
         binding.restore(observed)?;
     }
     let snapshot = binding.read().context("Missing worker binding")?;

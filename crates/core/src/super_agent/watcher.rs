@@ -315,6 +315,14 @@ async fn watch_member(
     let Some(session) = member.session_id.as_deref() else {
         return Ok(());
     };
+    // The member slot can outlive the session it names. Fence the recorded
+    // incarnation through inspection, stop requests, lease probes and resume.
+    let incarnation = host
+        .context
+        .db
+        .recorded_task_member(&task.task_id, role, session)?;
+    let member_session = host.context.db.open_recorded(session, &incarnation)?;
+    let _member = member_session.hold_incarnation()?;
     let store = TaskStore::from_context(&host.context);
     let key = format!(
         "super-agent.watcher.{}.{}.{}",
@@ -549,7 +557,9 @@ async fn watch_member(
         return Ok(());
     }
     if !processes_gone(&job)
-        || host.context.db.select_session(session)?.execution_active(&host.context.paths.data_dir)?
+        || member_session
+            .repository()
+            .execution_active(&host.context.paths.data_dir)?
     {
         if !terminal {
             if !recovery.stop_requested {
@@ -579,7 +589,7 @@ async fn watch_member(
         Ok(claim) => claim,
         Err(_) => return Ok(()),
     };
-    let lease = host.context.db.open_session(session)?.acquire_execution()?;
+    let lease = member_session.acquire_execution()?;
     if recovery.prompt.is_none() {
         let observation = reconcile_git(task, &pending)?;
         let checkpoints =

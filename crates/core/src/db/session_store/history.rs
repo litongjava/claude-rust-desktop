@@ -586,12 +586,7 @@ impl super::Stores {
             self.global().uuid == address.store,
             "Execution store changed"
         );
-        let session = self.open_session(&address.session)?;
-        ensure!(
-            session.incarnation == address.incarnation,
-            "Execution incarnation changed"
-        );
-        Ok(session)
+        self.open_recorded(&address.session, &address.incarnation)
     }
 }
 #[derive(Debug, PartialEq)]

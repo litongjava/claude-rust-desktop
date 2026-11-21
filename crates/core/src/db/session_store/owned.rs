@@ -47,7 +47,20 @@ impl<D: SessionAccess> SessionAccess for Arc<D> {
     }
 }
 
+impl SessionDb {
+    pub fn repository(&self) -> SessionRepository<'static> {
+        SessionRepository(Backend::Admitted(self.clone()))
+    }
+}
+
 impl SessionRepository<'_> {
+    pub(crate) fn selected_shard(&self) -> Option<&SessionDb> {
+        match &self.0 {
+            Backend::Admitted(shard) => Some(shard),
+            Backend::Shared(_, _) => None,
+        }
+    }
+
     pub(super) fn read<T>(&self, body: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
         match &self.0 {
             Backend::Admitted(s) => s.read(|r| body(r.0, s.id())),

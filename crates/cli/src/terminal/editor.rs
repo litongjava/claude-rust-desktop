@@ -87,7 +87,7 @@ pub struct PromptEditor {
     background_counter: Option<Box<dyn Fn() -> (usize, usize) + Send>>,
     /// Rows for running background agents at a width, shown above the editor.
     subagent_context: Option<(deepseek_code_core::services::ServiceContext, String)>,
-    agent_details: Option<Box<dyn Fn(&str) -> String + Send>>,
+    agent_details: Option<Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>>,
     agent_rows: Option<Box<dyn Fn() -> Vec<crate::background_commands::Agent> + Send>>,
     /// The model and reasoning effort, at the right of the footer.
     effort: Option<String>,
@@ -1104,7 +1104,7 @@ impl PromptEditor {
         self.subagent_context = Some((context, session));
     }
 
-    pub fn set_agent_details(&mut self, details: Box<dyn Fn(&str) -> String + Send>) {
+    pub fn set_agent_details(&mut self, details: Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>) {
         self.agent_details = Some(details);
     }
 
@@ -1229,9 +1229,9 @@ impl PromptEditor {
             .unwrap_or_else(std::time::Instant::now);
         let mut agents: Vec<String> = Vec::new();
         let mut agent_records = Vec::<crate::background_commands::Agent>::new();
-        let mut agent_click: Option<(String, std::time::Instant)> = None;
+        let mut agent_click: Option<(crate::background_commands::HistoryAddress, std::time::Instant)> = None;
         let mut subagents: Option<crate::terminal::subagents::View> = None;
-        let mut agent_detail: Option<String> = None;
+        let mut agent_detail: Option<crate::background_commands::HistoryAddress> = None;
         let mut agent_preview = String::new();
         let mut agent_scroll = 0usize;
         let mut selection_size = None;
@@ -1867,7 +1867,7 @@ impl PromptEditor {
                             mouse.row as usize,
                             agent_records.len(),
                         ) {
-                            let id = agent_records[index].session_id.clone();
+                            let id = agent_records[index].address.clone();
                             if agent_click.as_ref().is_some_and(|(old, at)| {
                                 old == &id && at.elapsed() < std::time::Duration::from_millis(500)
                             }) {

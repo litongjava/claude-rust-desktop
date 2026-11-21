@@ -111,6 +111,7 @@ static ROOTS: LazyLock<Mutex<HashMap<PathBuf, RootSlot>>> = LazyLock::new(Defaul
 pub struct Stores {
     root: Arc<Root>,
     fault: Option<Arc<Fault>>,
+    selected: Option<HistoryAddress>,
     router: Option<HistoryAddress>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,7 +178,7 @@ impl Stores {
                 }
             })
         };
-        let stores = Self { root, fault: None, router: None };
+        let stores = Self { root, fault: None, selected: None, router: None };
         let initialized = stores.root.repair.get().is_some();
         if !initialized {
             drop(stores.namespace()?);
@@ -236,6 +237,7 @@ impl Stores {
         Self {
             root: self.root.clone(),
             fault: Some(Arc::new(fault)),
+            selected: self.selected.clone(),
             router: self.router.clone(),
         }
     }
@@ -344,8 +346,20 @@ impl Stores {
     }
 
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
-        self.open_current_session(id, None)?
+        let expected = self.selected.as_ref().filter(|a| a.session == id).map(|a| a.incarnation.as_str());
+        self.open_current_session(id, expected)?
             .context("Session unavailable")
+    }
+
+    pub fn open_recorded(&self, id: &str, incarnation: &str) -> Result<SessionDb> {
+        self.check_selected(id, incarnation)?;
+        self.open_current_session(id, Some(incarnation))?
+            .context("Session incarnation changed")
+    }
+
+    fn check_selected(&self, id: &str, incarnation: &str) -> Result<()> {
+        ensure!(self.selected.as_ref().is_none_or(|a| a.session != id || a.incarnation == incarnation), "Selected session incarnation changed");
+        Ok(())
     }
 
     fn open_current_session(&self, id: &str, expected: Option<&str>) -> Result<Option<SessionDb>> {
@@ -422,6 +436,13 @@ pub struct SessionDb {
 }
 
 impl SessionDb {
+    /// Preserve the initiating shard when a service also needs directory access.
+    pub fn scoped_stores(&self) -> Stores {
+        let mut stores = self.stores.clone();
+        stores.selected = Some(self.address());
+        stores
+    }
+
     pub(crate) fn new_message_id(&self) -> String {
         crate::db::transcript::MessageIds::new(self.incarnation()).issue()
     }

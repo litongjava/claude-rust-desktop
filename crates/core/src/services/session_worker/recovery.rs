@@ -259,7 +259,7 @@ pub(super) fn repair(root: &Path, session: &str) -> Result<bool> {
         )?;
     }
     // Only foreground turns belong to this worker. Detached agents are independent.
-    for mut job in jobs::list(root, None)? {
+    for mut job in jobs::executing_in(root, session)? {
         if job.session_id == session && job.foreground && job.finished_ms.is_none() {
             let path = jobs::directory(root, &job.id)?.join("state.json");
             let backup = path.with_file_name("state.before-recovery.json");

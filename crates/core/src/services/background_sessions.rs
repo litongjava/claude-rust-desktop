@@ -192,19 +192,47 @@ pub fn authorize_attachment(root: &Path, job: &Job, session: &str) -> Result<()>
         );
         return Ok(());
     };
-    let child = match super::session_worker::job_child(root, job)? {
-        Some(super::session_worker::JobChild::Bound { id, incarnation }) => Some((id, incarnation)),
-        Some(super::session_worker::JobChild::Legacy(_)) => {
-            anyhow::bail!("Owned child has no recorded incarnation")
-        }
-        None => None,
-    };
+    let child = super::session_worker::bound_child_for_job(root, job)?;
     let stores = crate::db::session_store::Stores::open(root)?;
     stores.check_job_participants(
         (&job.parent_session_id, &owners.parent),
         (&job.session_id, &owners.execution),
         child.as_ref(),
     )
+}
+
+/// Keep every recorded participant live across an interactive read or control.
+pub fn hold_attachment(
+    root: &Path,
+    job: &Job,
+    selected: &crate::db::session_store::SessionDb,
+) -> Result<impl Drop> {
+    ensure!(
+        selected.id() == job.session_id || selected.id() == job.parent_session_id,
+        "Task belongs to another session"
+    );
+    let stores = crate::db::session_store::Stores::open(root)?;
+    let owners = JobOwners::load(root, job)?.context("Task lacks recorded participants")?;
+    let child = super::session_worker::bound_child_for_job(root, job)?;
+    let guards = stores.hold_job_participants(
+        (&job.parent_session_id, &owners.parent),
+        (&job.session_id, &owners.execution),
+        child.as_ref(),
+    )?;
+    stores.resume_history(&selected.address())?;
+    Ok(guards)
+}
+
+pub fn hold_owned_attachment(
+    root: &Path,
+    job: &Job,
+    selected: &crate::db::session_store::SessionDb,
+) -> Result<impl Drop> {
+    ensure!(
+        selected.id() == job.parent_session_id,
+        "Task belongs to another session"
+    );
+    hold_attachment(root, job, selected)
 }
 
 /// Durable view of a reserved job, used by hosts that reconcile after a crash.
@@ -1055,6 +1083,10 @@ fn supervise(dir: &Path, job: &mut Job) -> Result<Option<std::process::Child>> {
 }
 
 pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
+    list_matching(root, |job| parent.is_none_or(|id| authorize_job(root, job, id).is_ok()))
+}
+
+fn list_matching(root: &Path, include: impl Fn(&Job) -> bool) -> Result<Vec<Job>> {
     let directory = root.join("background-tasks");
     if !directory.exists() {
         return Ok(Vec::new());
@@ -1086,27 +1118,52 @@ pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
             }
             Err(error) => return Err(error),
         };
-        if parent.map_or(true, |id| authorize_job(root, &job, id).is_ok()) {
+        if include(&job) {
             jobs.push(published(&entry.path(), job)?);
         }
     }
     jobs.sort_by_key(|job| job.started_ms);
     Ok(jobs)
 }
+/// Conservative liveness checks must also block on an active legacy job with
+/// a missing owner marker, while ignoring other sessions' publication files.
+pub(crate) fn possible_executions(root: &Path, session: &str) -> Result<Vec<Job>> {
+    list_matching(root, |job| job.session_id == session)
+}
+
 /// Jobs whose parent and execution targets still match this CLI view.
 pub fn owned_jobs(root: &Path, parent: &str) -> Result<Vec<Job>> {
-    Ok(list(root, None)?
-        .into_iter()
-        .filter(|job| authorize_owned_attachment(root, job, parent).is_ok())
-        .collect())
+    list_matching(root, |job| authorize_owned_attachment(root, job, parent).is_ok())
+}
+
+pub fn owned_by_session(root: &Path, parent: &crate::db::session_store::SessionDb) -> Result<Vec<Job>> {
+    let _guard = parent.hold_incarnation()?;
+    owned_jobs(root, parent.id())
+}
+
+pub fn executing_in_session(root: &Path, session: &crate::db::session_store::SessionDb) -> Result<Vec<Job>> {
+    let _guard = session.hold_incarnation()?;
+    executing_in(root, session.id())
 }
 
 /// Jobs that can currently execute in the selected session.
 pub fn executing_in(root: &Path, session: &str) -> Result<Vec<Job>> {
-    Ok(list(root, None)?
-        .into_iter()
-        .filter(|job| job.session_id == session && authorize_attachment(root, job, session).is_ok())
-        .collect())
+    list_matching(root, |job| job.session_id == session && authorize_attachment(root, job, session).is_ok())
+}
+
+/// Select the recorded execution endpoint for an interactive parent operation.
+pub fn owned_execution(root: &Path, parent: &crate::db::session_store::SessionDb, job: &Job) -> Result<crate::db::session_store::SessionDb> {
+    ensure!(job.parent_session_id == parent.id(), "Task belongs to another parent");
+    participant_execution(root, parent, job)
+}
+
+pub fn participant_execution(root: &Path, participant: &crate::db::session_store::SessionDb, job: &Job) -> Result<crate::db::session_store::SessionDb> {
+    let _guard = participant.hold_incarnation()?;
+    let owners = JobOwners::load(root, job)?.context("Task lacks recorded participants")?;
+    let stores = crate::db::session_store::Stores::open(root)?;
+    stores.resume_history(&participant.address())?;
+    authorize_attachment(root, job, participant.id())?;
+    stores.open_recorded(&job.session_id, &owners.execution)
 }
 
 pub fn get(root: &Path, id: &str) -> Result<Job> {
@@ -1605,7 +1662,7 @@ pub fn collect_completed(
         if owner.has_worker_report(&message_id)? {
             continue;
         }
-        let execution_session = super::session_worker::job_execution_session(root, &job)?;
+        let execution_session = super::session_worker::recorded_job_target(root, &job)?;
         let (output, errors) = output(root, &job.id)?;
         let result = output
             .lines()

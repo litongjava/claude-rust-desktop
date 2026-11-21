@@ -850,12 +850,26 @@ impl QueryEngine {
         // Every submission owns the session for its whole attempt. A host that
         // already acquired (CLI, SDK, Desktop SSE) shares that same `Arc`; an
         // independent caller is refused here, before any turn work.
-        let execution_lease = match execution_lease {
-            Some(lease) => Some(lease),
-            None => Some(Arc::new(self.db_manager.open_session(&request.conversation_id)?.acquire_execution()?)),
+        let lease = match execution_lease {
+            Some(lease) => lease,
+            None => Arc::new(
+                self.db_manager
+                    .open_session(&request.conversation_id)?
+                    .acquire_execution()?,
+            ),
         };
+        let address = lease
+            .address
+            .as_ref()
+            .context("Execution lacks a recorded session")?;
+        anyhow::ensure!(
+            address.session == request.conversation_id,
+            "Execution session changed"
+        );
+        let selected = self.db_manager.resume_history(address)?;
+        let execution_lease = Some(lease);
         let applied_compaction = crate::services::compaction::apply_persisted_boundary(
-            &self.db_manager,
+            &selected,
             &request.conversation_id,
             &mut request.messages,
         )?;
@@ -884,7 +898,7 @@ impl QueryEngine {
             .to_path_buf();
         let plugin_context = crate::services::ServiceContext {
             paths: crate::runtime::RuntimePaths::new(plugin_root)?,
-            db: self.db_manager.clone(),
+            db: Arc::new(selected.scoped_stores()),
             credentials: Arc::new(crate::services::EnvironmentCredentials),
         };
         if let Some(router) =
@@ -1502,7 +1516,7 @@ impl QueryEngine {
         // Super Agent identity is durable, so a resumed session keeps its role
         // and a task member keeps its member tools. A stale call is rejected at
         // execution even when the schema no longer offers it.
-        let super_agent_role = crate::super_agent::role::load(&self.db_manager, &conv_id)?;
+        let super_agent_role = crate::super_agent::role::load(&selected, &conv_id)?;
         let data_dir = self
             .workspaces_dir
             .parent()
@@ -1526,7 +1540,7 @@ impl QueryEngine {
         } else {
             None
         };
-        let history = self.db_manager.executor_history(&conv_id)?;
+        let history = crate::db::session_store::ExecutorHistory::Session(selected);
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,

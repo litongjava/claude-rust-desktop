@@ -1620,6 +1620,19 @@ impl Launcher {
         if let Some(reason) = self.delivery_binding_mismatch(&operation, &operation.job_id)? {
             return Err(anyhow!("{reason}"));
         }
+        let child = if let Some(job) = &job {
+            self.recorded_launch_child(task, &operation.session_id, job)?
+        } else {
+            let incarnation = self.context.db.recorded_task_member(
+                &task.task_id,
+                member,
+                &operation.session_id,
+            )?;
+            self.context
+                .db
+                .open_recorded(&operation.session_id, &incarnation)?
+        };
+        let _child = child.hold_incarnation()?;
         // Only now may truthful observation be persisted.
         let status = job.as_ref().map(|job| job.status.clone());
         if status != operation.last_job_status {
@@ -1763,12 +1776,25 @@ impl Launcher {
             .db.save_task_state(&launch_key(task_id, &record.role), record)
     }
 
+    fn recorded_launch_child(
+        &self,
+        task: &TaskRecord,
+        session: &str,
+        job: &background_sessions::Job,
+    ) -> Result<crate::db::session_store::SessionDb> {
+        ensure!(job.session_id == session, "Reserved child session changed");
+        let router = self.context.db.open_session(&task.router_session_id)?;
+        background_sessions::owned_execution(&self.context.paths.data_dir, &router, job)
+    }
+
     fn adopt_session(
         &self,
         draft: &LaunchDraft<'_>,
         operation: &LaunchOperation,
         job: &background_sessions::Job,
     ) -> Result<()> {
+        let child = self.recorded_launch_child(draft.task, &operation.session_id, job)?;
+        let _child = child.hold_incarnation()?;
         let row = self.context.db.conversation_metadata(&operation.session_id)?;
         let row = row.with_context(|| {
             format!(

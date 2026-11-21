@@ -201,7 +201,7 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
 async fn launch_rule_display(session: &Session) -> Result<String> {
     use deepseek_code_core::services::{background_sessions as jobs, session_worker};
     use std::fmt::Write;
-    let active = jobs::executing_in(&session.paths.data_dir, &session.id)?
+    let active = jobs::executing_in_session(&session.paths.data_dir, &session.selected_session()?)?
         .into_iter()
         .find(|job| {
             job.session_id == session.id

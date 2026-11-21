@@ -129,11 +129,13 @@ pub async fn handle(
     if command != "/batch" {
         return Ok(false);
     }
+    let parent = session.selected_session()?;
+    let _guard = parent.hold_incarnation()?;
     let argument = argument.trim();
     let mut words = argument.split_whitespace();
     match words.next() {
         None | Some("list") => {
-            for batch in batch::list(&paths.data_dir, &session.id)? {
+            for batch in batch::list(&paths.data_dir, &parent)? {
                 display(&batch);
             }
             if argument.is_empty() {
@@ -143,7 +145,7 @@ pub async fn handle(
         Some("show" | "cancel" | "logs") => {
             let action = argument.split_whitespace().next().unwrap();
             let id = words.next().context("A batch ID is required")?;
-            let state = batch::get(&paths.data_dir, id)?;
+            let state = batch::get(&paths.data_dir, id, &parent)?;
             ensure!(
                 state.parent_session_id == session.id,
                 "Resume the batch's originating session to manage it"
@@ -151,7 +153,7 @@ pub async fn handle(
             match action {
                 "cancel" => {
                     ensure!(words.next().is_none(), "Usage: /batch cancel ID");
-                    batch::cancel(&paths.data_dir, id)?;
+                    batch::cancel(&paths.data_dir, id, &parent)?;
                     command_eprintln!("Cancellation requested; inspect /batch show {id} for confirmed completion.");
                 }
                 "logs" => {
@@ -172,10 +174,10 @@ pub async fn handle(
                         .as_deref()
                         .context("This worker has not started")?;
                     let record = background_sessions::get(&paths.data_dir, job)?;
-                    background_sessions::authorize_owned_attachment(
+                    let _participants = background_sessions::hold_owned_attachment(
                         &paths.data_dir,
                         &record,
-                        &session.id,
+                        &session.selected_session()?,
                     )?;
                     let (output, error) = background_sessions::output(&paths.data_dir, job)?;
                     command_println!("{output}");
@@ -191,7 +193,7 @@ pub async fn handle(
             let id = words.next().context(
                 "Usage: /batch run ID [--concurrency N] [--permission-mode MODE] [--publish]",
             )?;
-            let state = batch::get(&paths.data_dir, id)?;
+            let state = batch::get(&paths.data_dir, id, &parent)?;
             ensure!(
                 state.parent_session_id == session.id,
                 "Resume the batch's originating session before running it"
@@ -219,6 +221,7 @@ pub async fn handle(
             let batch = batch::start(
                 &paths.data_dir,
                 id,
+                &parent,
                 launch,
                 concurrency,
                 publish,
@@ -286,7 +289,7 @@ pub async fn handle(
             );
             display(&batch::create(
                 &paths.data_dir,
-                &session.id,
+                &parent,
                 &workspace,
                 instruction,
                 proposal,

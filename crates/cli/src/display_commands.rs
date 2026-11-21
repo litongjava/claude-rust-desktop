@@ -2,20 +2,20 @@
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
-use deepseek_code_core::db::session_store::{SessionAccess, settings::DISPLAY};
+use deepseek_code_core::db::session_store::settings::DISPLAY;
 use serde_json::{json, Value};
 use std::path::Path;
 
 pub use deepseek_code_core::db::session_store::settings::Display as Settings;
 
 pub fn load(session: &Session) -> Result<Settings> {
-    let mut settings = session.store.db.select_session(&session.id)?.preference(DISPLAY)?.unwrap_or_default();
+    let mut settings = session.selected_session()?.repository().preference(DISPLAY)?.unwrap_or_default();
     if let Some(global) = deepseek_code_core::services::statusline_setup::load(&session.paths.data_dir)? { settings.statusline = global.command; }
     Ok(settings)
 }
 
 fn save(session: &Session, settings: &Settings) -> Result<()> {
-    session.store.db.select_session(&session.id)?.set_preference(DISPLAY,Some(settings))?;
+    session.selected_session()?.repository().set_preference(DISPLAY,Some(settings))?;
     crate::terminal::style::configure(&settings.theme, &settings.color);
     Ok(())
 }
@@ -359,7 +359,7 @@ pub async fn handle(
 }
 
 pub fn usage(session: &Session) -> Result<Value> {
-    Ok(session.store.db.select_session(&session.id)?.usage_totals(&[])?.0)
+    Ok(session.selected_session()?.repository().usage_totals(&[])?.0)
 }
 
 /// Quotes group arguments; backslashes remain literal for Windows paths.

@@ -297,21 +297,28 @@ async fn interrupt_keeps_the_steered_frame_for_the_next_turn() {
 #[tokio::test]
 async fn replay_user_messages_emits_the_steered_envelope_on_delivery() {
     for anthropic in [false, true] {
-        let server = Server::start(anthropic, Mode::SlowTool).await;
+        let server = Server::start(anthropic, Mode::ShellApproval).await;
         let root = tempfile::tempdir().unwrap();
         let mut client = Client::start(
             root.path(),
             &server,
-            &["--allowed-tools", STEER_TOOL, "--replay-user-messages"],
+            &["--permission-mode", "ask", "--replay-user-messages"],
         );
-        let mut first = user("Run the slow probe");
+        let mut first = user("Run the shell probe");
         first["uuid"] = json!("first-user-uuid");
         client.send(first).await;
         assert_eq!(client.frame("user").await["uuid"], "first-user-uuid");
-        client.frame("tool_start").await;
+        // The permission response and steering frame share an ordered input stream.
+        // Keep the tool pending until the SDK has accepted the steering frame.
+        let permission = client.frame("control_request").await;
+        assert_eq!(permission["request"]["tool_name"], STEER_TOOL);
         let mut steer = user("REPLAY_STEER_SENTINEL");
         steer["uuid"] = json!("steer-user-uuid");
         client.send(steer).await;
+        client.send(json!({
+            "type":"control_response",
+            "response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":"allow"}}
+        })).await;
         let mut frames = Vec::new();
         loop {
             let frame = client.next_frame().await;

@@ -123,7 +123,7 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
         named.push(session.id.clone());
     }
     let engine = session.side_engine();
-    let Ok(shard) = session.store.db.open_session(&session.id) else { return; };
+    let Ok(shard) = session.selected_session() else { return; };
     let history = deepseek_code_core::db::session_store::ExecutorHistory::Session(shard);
     let (id, provider, model) = (
         session.id.clone(),

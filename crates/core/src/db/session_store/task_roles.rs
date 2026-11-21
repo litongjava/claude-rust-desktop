@@ -40,6 +40,20 @@ impl SessionRepository<'_> {
     }
 }
 
+impl Stores {
+    pub(crate) fn recorded_task_member(
+        &self,
+        task: &str,
+        role: MemberRole,
+        id: &str,
+    ) -> Result<String> {
+        self.global().read(|conn| {
+            Ok(conn.query_row("SELECT incarnation FROM sa_member_sessions WHERE task_id=?1 AND role=?2 AND session_id=?3",
+                [task, role.as_str(), id], |row| row.get(0))?)
+        })
+    }
+}
+
 pub trait TaskMembership {
     fn member_session(&self, id: &str) -> Result<Option<(String, MemberRole)>>;
 }

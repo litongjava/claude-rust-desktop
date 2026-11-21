@@ -198,7 +198,7 @@ pub async fn handle(
                         parts.next().is_none(),
                         "Usage: /tasks [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]; /workflows [list|show NAME|run NAME [ARGS]|cancel ID]"
                     );
-                    let jobs = background_sessions::owned_jobs(&paths.data_dir, &session.id)?
+                    let jobs = background_sessions::owned_by_session(&paths.data_dir, &session.selected_session()?)?
                         .into_iter()
                         .filter(|job| workflow_matches(&job.status, filter))
                         .collect::<Vec<_>>();
@@ -282,7 +282,7 @@ pub async fn handle(
                         return Ok(Outcome::Handled);
                     }
                     let job = background_sessions::get(&paths.data_dir, id)?;
-                    background_sessions::authorize_owned_attachment(&paths.data_dir, &job, &session.id)?;
+                    let _participants = background_sessions::hold_owned_attachment(&paths.data_dir, &job, &session.selected_session()?)?;
                     let (output, errors) = background_sessions::output(&paths.data_dir, id)?;
                     let output = output.lines().map(|line| {
                         serde_json::from_str::<serde_json::Value>(line).ok()
@@ -392,7 +392,11 @@ pub(crate) async fn live_tasks(session: &Session, prompt: &str) -> Result<String
             return Ok(safe_output(&format!("Shell {id} · {}\n{}\n{}", output["status"].as_str().unwrap_or("unknown"), output["stdout"].as_str().unwrap_or_default(), output["stderr"].as_str().unwrap_or_default())));
         }
         let job = background_sessions::get(&paths.data_dir, id)?;
-        background_sessions::authorize_owned_attachment(&paths.data_dir, &job, &session.id)?;
+        let _participants = background_sessions::hold_owned_attachment(
+            &paths.data_dir,
+            &job,
+            &session.selected_session()?,
+        )?;
         let (output, errors) = background_sessions::output(&paths.data_dir, id)?;
         return Ok(safe_output(&format!("Task {id} · {}\n{output}\n{errors}", job.status)));
     }
@@ -400,7 +404,7 @@ pub(crate) async fn live_tasks(session: &Session, prompt: &str) -> Result<String
     for shell in shells {
         lines.push(format!("- {} · {}\n  /tasks show {}", shell["subject"].as_str().unwrap_or("Background command"), shell["status"].as_str().unwrap_or("unknown"), shell["id"].as_str().unwrap_or_default()));
     }
-    for job in background_sessions::owned_jobs(&paths.data_dir, &session.id)? {
+    for job in background_sessions::owned_by_session(&paths.data_dir, &session.selected_session()?)? {
         if !job.foreground {
             lines.push(format!("- {} · {}\n  /tasks show {}", job.title.lines().next().unwrap_or("Agent"), job.status, job.id));
         }
@@ -494,13 +498,13 @@ async fn tasks_menu(paths: &RuntimePaths, session: &Session) -> Result<()> {
                 // CLI's agent view.
                 let key = details("Task details", &rows, &format!("{back}t to view transcript \u{b7} Esc/Enter/Space to close \u{b7} x to stop"), &['x', 't'])?;
                 if key == Some('t') {
-                    let child = session.store.db.open_session(&job.session_id)?;
+                    let child = background_sessions::owned_execution(&paths.data_dir, &session.selected_session()?, job)?;
                     let transcript = {
                         let _selected = child.hold_incarnation()?;
-                        background_sessions::authorize_owned_attachment(
+                        let _participants = background_sessions::hold_owned_attachment(
                             &paths.data_dir,
                             job,
-                            &session.id,
+                            &session.selected_session()?,
                         )?;
                         crate::repl::transcript_of(session, child.id())?
                     };
@@ -532,7 +536,7 @@ fn active_tasks(paths: &RuntimePaths, session: &Session) -> Result<Vec<Task>> {
             .map(Task::Monitor),
     );
     tasks.extend(
-        background_sessions::owned_jobs(&paths.data_dir, &session.id)?
+        background_sessions::owned_by_session(&paths.data_dir, &session.selected_session()?)?
             .into_iter()
             .filter(|job| !job.foreground && matches!(job.status.as_str(), "starting" | "running" | "unresponsive"))
             .map(Task::Job),
@@ -642,10 +646,12 @@ pub(crate) fn todo_items(paths: &RuntimePaths, session: &str) -> Vec<(String, St
         .collect()
 }
 
+pub(crate) use deepseek_code_core::db::session_store::HistoryAddress;
+
 /// One background agent started by this session.
 #[derive(Clone)]
 pub(crate) struct Agent {
-    pub session_id: String,
+    pub address: HistoryAddress,
     pub agent_type: String,
     pub description: String,
     pub started_ms: u64,
@@ -653,22 +659,17 @@ pub(crate) struct Agent {
     pub tokens_estimated: bool,
 }
 
-fn child_output_tokens(
-    context: &deepseek_code_core::services::ServiceContext,
-    session: &str,
-) -> i64 {
-    context.db.open_session(session).and_then(|s| s.read(|r| r.output_tokens())).unwrap_or_default()
-}
-
 /// This session's background agents that are still running.
 pub(crate) fn running_agents(
     paths: &RuntimePaths,
-    _db: &impl deepseek_code_core::db::session_store::SessionAccess,
+    db: &impl deepseek_code_core::db::session_store::SessionAccess,
     session: &str,
 ) -> Vec<Agent> {
     let Ok(context) = crate::services::context(paths) else {
         return Vec::new();
     };
+    let Ok(parent) = db.select_session(session).and_then(|r| context.db.open_recorded(session, r.observation_identity())) else { return Vec::new(); };
+    let Ok(_parent) = parent.hold_incarnation() else { return Vec::new(); };
     let Ok(jobs) = background_sessions::owned_jobs(&paths.data_dir, session) else {
         return Vec::new();
     };
@@ -679,10 +680,10 @@ pub(crate) fn running_agents(
                 .db.background_agent(&job.id)
                 .ok()
                 .flatten()?;
-            let output_tokens = child_output_tokens(&context, &job.session_id);
-            background_sessions::authorize_owned_attachment(&paths.data_dir, &job, session).ok()?;
+            let child = background_sessions::owned_execution(&paths.data_dir, &parent, &job).ok()?;
+            let output_tokens = child.read(|r| r.output_tokens()).ok()?;
             Some(Agent {
-                session_id: job.session_id.clone(),
+                address: child.address(),
                 agent_type: record["agent_type"].as_str().unwrap_or("general").to_owned(),
                 description: record["description"].as_str().unwrap_or(&job.title).to_owned(),
                 started_ms: job.started_ms,
@@ -707,9 +708,12 @@ pub(crate) fn mark_answered(request: &str) {
 
 /// A question one of this session's background agents is waiting on:
 /// its job, description and the question.
-pub(crate) fn agent_question(paths: &RuntimePaths, session: &str) -> Option<(String, String, background_sessions::PendingQuestion)> {
+pub(crate) fn agent_question(paths: &RuntimePaths, frontend: &Session) -> Option<(String, String, background_sessions::PendingQuestion)> {
     let context = crate::services::context(paths).ok()?;
-    for job in background_sessions::owned_jobs(&paths.data_dir, session).ok()? {
+    let parent = frontend.selected_session().ok()?;
+    let _parent = parent.hold_incarnation().ok()?;
+    let session = parent.id();
+    for job in background_sessions::owned_by_session(&paths.data_dir, &parent).ok()? {
         if !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") {
             continue;
         }
@@ -743,7 +747,7 @@ pub(crate) fn agent_approval(workspace: &std::path::Path, description: &str, que
 /// Asks a background agent's question at the prompt and sends the answer.
 pub(crate) fn answer_agent_question(paths: &RuntimePaths, session: &Session) -> Result<bool> {
     use crate::terminal::picker::{Entry, Picker};
-    let Some((job, description, question)) = agent_question(paths, &session.id) else { return Ok(false) };
+    let Some((job, description, question)) = agent_question(paths, session) else { return Ok(false) };
     let (lines, heading, options) = agent_approval(&session.workspace, &description, &question);
     let body = crate::terminal::change_view::plain(&lines);
     let entries: Vec<Entry> = options.iter().map(|option| Entry { title: option.clone(), detail: String::new() }).collect();
@@ -758,34 +762,34 @@ pub(crate) fn answer_agent_question(paths: &RuntimePaths, session: &Session) -> 
 /// Read the child task's own usage and description.
 pub(crate) fn foreground_agent(
     context: &deepseek_code_core::services::ServiceContext,
-    id: &str,
+    address: &HistoryAddress,
     kind: &str,
 ) -> Option<Agent> {
-    let record = context
-        .child_progress(&id)
-        .ok()
-        .flatten()?;
-    let description = context
-        .child_description(&id)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| kind.into());
-    let started_ms = chrono::DateTime::parse_from_rfc3339(record["started_at"].as_str()?)
+    use deepseek_code_core::db::session_store::settings::{CHILD_PROGRESS, AGENT_DESCRIPTION};
+    let child = context.db.resume_history(address).ok()?;
+    let repo = child.repository();
+    let record = repo.preference(CHILD_PROGRESS).ok()??;
+    let description = repo.preference(AGENT_DESCRIPTION).ok()?.unwrap_or_else(|| kind.into());
+    let started_ms = chrono::DateTime::parse_from_rfc3339(record.get("started_at")?.as_str()?)
         .ok()?
         .timestamp_millis()
         .max(0) as u64;
-    let output_tokens = child_output_tokens(context, id);
-    let output_tokens = record["output_tokens"]
-        .as_i64()
+    let output_tokens = child.read(|r| r.output_tokens()).ok()?;
+    let output_tokens = record
+        .get("output_tokens")
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0)
         .max(output_tokens);
     Some(Agent {
-        session_id: id.into(),
+        address: address.clone(),
         agent_type: kind.into(),
         description,
         started_ms,
         output_tokens: if output_tokens > 0 { output_tokens } else { -1 },
-        tokens_estimated: record["output_tokens_estimated"] == true,
+        tokens_estimated: record
+            .get("output_tokens_estimated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -1161,7 +1165,7 @@ pub(crate) fn notification_text(text: &str) -> Option<String> {
 fn shell_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for task in deepseek_code_core::tools::background_shell::collect_finished(&session.paths.data_dir, &session.id)? {
-        session.store.db.open_session(&session.id)?.enqueue_cli_notification(&task.notification())?;
+        session.selected_session()?.enqueue_cli_notification(&task.notification())?;
         notices.push(format!("\u{25cf} {}", task.summary()));
     }
     Ok(notices)
@@ -1172,7 +1176,7 @@ fn shell_notifications(session: &Session) -> Result<Vec<String>> {
 fn monitor_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for event in deepseek_code_core::tools::monitor::collect_events(&session.paths.data_dir, &session.id)? {
-        session.store.db.open_session(&session.id)?.enqueue_cli_notification(&event.notification())?;
+        session.selected_session()?.enqueue_cli_notification(&event.notification())?;
         notices.push(format!("\u{25cf} {}", event.summary()));
     }
     Ok(notices)
@@ -1217,7 +1221,7 @@ fn agent_notice(session: &Session, report: String) -> Result<String> {
             summary.push_str(&safe_output(reason).chars().take(400).collect::<String>());
         }
     }
-    session.store.db.open_session(&session.id)?.enqueue_cli_notification(
+    session.selected_session()?.enqueue_cli_notification(
         &format!("{}\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>{summary}</summary>\n<result>See the background task report for this task above.</result>\n</task-notification>", deepseek_code_core::tools::background_shell::NOTIFICATION_START),
     )?;
     Ok(format!("\u{25cf} {summary}"))
@@ -1610,7 +1614,7 @@ mod agent_row_tests {
         let started = chrono::Utc::now().timestamp_millis() as u64 - 13_000;
         let rows = agent_rows(
             &[Agent {
-                session_id: "fixture".into(),
+                address: crate::background_commands::HistoryAddress {session: "fixture".into(), store: String::new(), incarnation: String::new()},
                 agent_type: "general".into(),
                 description: "Find the logging code".into(),
                 started_ms: started,
@@ -1628,7 +1632,7 @@ mod agent_row_tests {
     fn agent_columns_preserve_usage_with_wide_text_and_small_windows() {
         use unicode_width::UnicodeWidthStr;
         let agent = Agent {
-            session_id: "fixture".into(),
+            address: crate::background_commands::HistoryAddress {session: "fixture".into(), store: String::new(), incarnation: String::new()},
             agent_type: "explore".into(),
             description: "检索数据库定义和注册中心".repeat(10),
             started_ms: chrono::Utc::now().timestamp_millis() as u64 - 66_000,
@@ -1661,7 +1665,7 @@ mod agent_row_tests {
         }
         context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"started_at":"2026-11-01T00:00:00Z"})).unwrap();
         context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Locate registry code").unwrap();
-        let agent = foreground_agent(&context, "child", "explore").unwrap();
+        let agent = foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "explore").unwrap();
         assert_eq!(agent.description, "Locate registry code");
         assert_eq!(agent.output_tokens, 1500);
         context
@@ -1673,15 +1677,34 @@ mod agent_row_tests {
             )
             .unwrap();
         assert_eq!(
-            foreground_agent(&context, "child", "explore")
+            foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "explore")
                 .unwrap()
                 .output_tokens,
             1700
         );
         context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"started_at":"2026-11-01T00:00:00Z","output_tokens":1900,"output_tokens_estimated":true})).unwrap();
-        let estimated = foreground_agent(&context, "child", "explore").unwrap();
+        let estimated = foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "explore").unwrap();
         assert!(agent_rows(&[estimated], 120)[1].contains("~1.9k tokens"));
-        assert!(foreground_agent(&context, "missing", "explore").is_none());
+        assert!(foreground_agent(&context, &HistoryAddress {session:"missing".into(), ..context.db.open_session("child").unwrap().address()}, "explore").is_none());
+        let original = context.db.open_session("child").unwrap();
+        let address = original.address();
+        original.delete().unwrap();
+        context.db.create("child", Default::default()).unwrap();
+        context
+            .db
+            .seed_preference(
+                "child",
+                deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
+                &serde_json::json!({"status":"replacement","started_at":"2026-11-01T00:00:00Z"}),
+            )
+            .unwrap();
+        assert!(foreground_agent(&context, &address, "explore").is_none());
+        assert!(!agent_execution(&context, &address).contains("replacement"));
+        assert!(agent_execution(
+            &context,
+            &context.db.open_session("child").unwrap().address()
+        )
+        .contains("replacement"));
     }
 
 }
@@ -1689,23 +1712,29 @@ mod agent_row_tests {
 /// Read only the selected child's execution, never the parent's transcript.
 pub(crate) fn agent_execution(
     context: &deepseek_code_core::services::ServiceContext,
-    id: &str,
+    address: &HistoryAddress,
 ) -> String {
-    crate::terminal::markdown::plain_rendered(&agent_transcript(context, id).all().join("\n"))
+    crate::terminal::markdown::plain_rendered(&agent_transcript(context, address).all().join("\n"))
 }
 
 pub(crate) fn agent_transcript(
     context: &deepseek_code_core::services::ServiceContext,
-    id: &str,
+    address: &HistoryAddress,
 ) -> crate::terminal::scrollback::Scrollback {
     let mut transcript = crate::terminal::agent_transcript::Transcript::default();
-    if let Ok(Some(value)) = context.child_progress(&id) {
+    let Ok(child) = context.db.resume_history(address) else { return transcript.history; };
+    let Ok(_guard) = child.hold_incarnation() else { return transcript.history; };
+    let id = child.id();
+    if let Ok(Some(value)) = child.repository().preference(deepseek_code_core::db::session_store::settings::CHILD_PROGRESS) {
         transcript.note(&format!(
             "Status: {}",
-            value["status"].as_str().unwrap_or("unknown")
+            value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
-    match context.db.open_session(id).and_then(|s| s.read(|r| r.transcript_tail())) {
+    match child.read(|r| r.transcript_tail()) {
         Ok(messages) => for message in messages {
             if message.role == "user" { transcript.user(&message.text); }
             if message.role == "assistant" {

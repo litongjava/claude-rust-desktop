@@ -524,7 +524,7 @@ pub(super) async fn start_authorized_chat(
                         "total_count": total_count,
                     }))
                 }
-                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name, .. } => {
                     Some(serde_json::json!({
                         "type": "agent_progress",
                         "session_id": session_id,

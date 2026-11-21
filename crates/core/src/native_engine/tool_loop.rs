@@ -141,6 +141,7 @@ pub enum EngineEvent {
     },
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
+        address: Option<crate::db::session_store::HistoryAddress>,
         session_id: String,
         agent_type: String,
         status: String,
@@ -2896,6 +2897,11 @@ impl ToolLoopExecutor {
         self,
         runtime: crate::super_agent::crp::ToolRuntime,
     ) -> anyhow::Result<Self> {
+        let mut runtime = runtime;
+        if let Some(ExecutorHistory::Session(session)) = &self.executor_history {
+            anyhow::ensure!(session.id() == runtime.session_id, "Role session changed");
+            runtime.db = Arc::new(session.scoped_stores());
+        }
         let role = crate::super_agent::role::load(&runtime.db, &runtime.session_id)?;
         let member = crate::super_agent::role::membership(&runtime.db, &runtime.session_id)?
             .map(|(_, role)| role);

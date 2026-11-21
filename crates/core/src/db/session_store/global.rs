@@ -184,7 +184,7 @@ impl GlobalDb {
         let stores = super::Stores {
             root: self.root.upgrade().expect("global belongs to a live root"),
             fault: None,
-            router: None,
+            selected: None, router: None,
         };
         let Some(_locks) = stores.resolved_key(&key)? else {
             return Ok(None);

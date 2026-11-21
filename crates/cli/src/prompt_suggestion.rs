@@ -89,7 +89,7 @@ pub(crate) struct Ghost {
 
 impl Ghost {
     pub fn load(session: &crate::session::Session) -> Option<Self> {
-        let db = session.store.db.open_session(&session.id).ok()?;
+        let db = session.selected_session().ok()?;
         let saved = SavedSuggestion::load_from(&db).ok()??;
         Some(Self {
             db,

@@ -31,7 +31,7 @@ impl Stores {
         let mut values = Vec::new();
         for entry in entries {
             let row = entry.conversation;
-            values.push(json!({"id":row.id,"title":row.title,"current":row.id==id,"receiver_active":session_messages::receiver_active_by_key(root,&entry.incarnation)?,"saved":true}));
+            values.push(json!({"id":row.id,"title":row.title,"incarnation":entry.incarnation,"current":row.id==id,"receiver_active":session_messages::receiver_active_by_key(root,&entry.incarnation)?,"saved":true}));
         }
         if family {
             values.sort_by_key(|row| {

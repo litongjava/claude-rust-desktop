@@ -151,12 +151,7 @@ impl Stores {
 
     /// An enumerated row can be deleted and its logical ID reused before selection.
     pub fn open_listed(&self, row: &DirectoryEntry) -> Result<SessionDb> {
-        let s = self.open_session(&row.conversation.id)?;
-        anyhow::ensure!(
-            s.incarnation() == row.incarnation,
-            "Listed session was replaced"
-        );
-        Ok(s)
+        self.open_recorded(&row.conversation.id, &row.incarnation)
     }
 }
 

@@ -130,7 +130,7 @@ pub(crate) fn recall_queued(
     input: &mut Option<TerminalInput>,
     shown: &[String],
 ) -> Result<Vec<String>> {
-    let mut recalled = session.store.db.open_session(&session.id)?.recall_cli_prompts()?;
+    let mut recalled = session.selected_session()?.recall_cli_prompts()?;
     if let Some(input) = input.as_mut() {
         recalled.extend(input.take_prompts(shown));
     }
@@ -479,10 +479,14 @@ impl Session {
     }
 
     pub(crate) async fn use_worker_binding(&mut self, binding: &deepseek_code_core::native_engine::session_binding::SessionBinding) -> Result<()> {
-        binding.track_session(self.store.db.open_session(&self.id)?);
+        binding.track_session(self.selected_session()?);
         self.binding = binding.initialized()?;
         self.providers.lock().await.binding = binding.clone();
         Ok(())
+    }
+
+    pub(crate) fn selected_session(&self) -> Result<deepseek_code_core::db::session_store::SessionDb> {
+        self.binding.selected_session(&self.id)
     }
 
     pub(crate) fn binding_state(&self) -> Arc<deepseek_code_core::native_engine::session_binding::BindingSnapshot> {
@@ -892,7 +896,9 @@ impl Session {
                 binding
             }
         };
-        binding.track_session(store.db.open_session(&id)?);
+        let selected = store.db.open_session(&id)?;
+        let store = SessionStore::new(Arc::new(selected.scoped_stores()));
+        binding.track_session(selected);
         let mut manager = ProviderManager::in_memory(Vec::new(), paths.data_dir.join("providers.json"));
         manager.binding = binding.clone();
 
@@ -1095,16 +1101,18 @@ impl Session {
         };
         // Read under the old id, before the commit below.
         let mut state = (*self.binding.read().context("Missing session binding")?).clone();
-        let next=self.store.db.open_session(&self.id)?.clear_with_provider(&id, &state, configuration.as_ref()).context("Clear did not apply")?;
+        let next=self.selected_session()?.clear_with_provider(&id, &state, configuration.as_ref()).context("Clear did not apply")?;
         state.generation=1;
         let target=deepseek_code_core::native_engine::session_binding::SessionBinding::default();
         let policy=self.store.db.request_recording_policy(&self.id);
         if let Some(policy)=policy { next.set_recording_policy(policy); }
+        let next_store = SessionStore::new(Arc::new(next.scoped_stores()));
         target.track_session(next);
         target.install(state)?;
         self.end_hooks("clear").await;
         self.binding = target.initialized()?;
         self.providers.lock().await.binding = target;
+        self.store = next_store;
         self.id = id.clone();
         self.waiting_for_continue
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1212,6 +1220,7 @@ impl Session {
         if let Some(policy) = policy {
             shard.set_recording_policy(policy);
         }
+        self.store = SessionStore::new(Arc::new(shard.scoped_stores()));
         self.id = id.to_owned();
         drop(guard);
         self.waiting_for_continue
@@ -1370,7 +1379,7 @@ impl Session {
         .is_none()
         {
             if let Some(job) =
-                deepseek_code_core::services::background_sessions::executing_in(&self.paths.data_dir, &self.id)?
+                deepseek_code_core::services::background_sessions::executing_in_session(&self.paths.data_dir, &self.selected_session()?)?
                     .into_iter()
                     .find(|job| {
                         job.session_id == self.id
@@ -2259,7 +2268,7 @@ impl Session {
         )?
         .with_workspace(&self.workspace);
         progress.restore_numbers(self)?;
-        progress.set_shell_context(&self.paths.data_dir, &self.id);
+        progress.set_session_context(&self.paths.data_dir, self.selected_session()?);
         if progress.is_live() {
             progress.set_model_label(&crate::session_commands::model_label(self).await);
             progress.set_pinned_prompt(prompt);
@@ -2307,7 +2316,7 @@ impl Session {
         let mut sdk_messages = if cli.output_format == OutputFormat::StreamJson {
             Some(
             crate::sdk_messages::Translator::new(&self.id, cli.include_partial_messages)
-                .with_database(self.store.db.open_session(&self.id)?))
+                .with_database(self.selected_session()?))
         } else { None };
         // num_turns and permission_denials for the json result, as stream-json reports them.
         let (mut model_rounds, mut round_open, mut denials) = (0u32, false, Vec::<Value>::new());
@@ -2369,7 +2378,7 @@ impl Session {
                                     // As in the reference CLI the model reads it after its next
                                     // tool results, or as the next prompt.
                                     crate::images::share(&self.id, &prompt);
-                                    self.store.db.open_session(&self.id)?.enqueue_cli_prompt(&prompt)?;
+                                    self.selected_session()?.enqueue_cli_prompt(&prompt)?;
                                     pending_inputs.push(prompt);
                                     progress.queued(pending_inputs.clone());
                                 }
@@ -2461,7 +2470,7 @@ impl Session {
                         observed_plan_boundary = Some(boundary_id);
                         progress.notice("Planning context cleared. The approved plan starts a fresh context in this session; prior messages remain archived.");
                     },
-                    EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => progress.agent_progress(&session_id, &agent_type, &status, tool_name.as_deref()),
+                    EngineEvent::AgentProgress { session_id, address, agent_type, status, tool_name } => progress.agent_progress(address, &session_id, &agent_type, &status, tool_name.as_deref()),
                     EngineEvent::Usage(value) => { progress.reported_usage(&value); },
                     EngineEvent::Error(message) => { progress.clear(); error = Some(message); },
                     EngineEvent::MessageStop { full_text, stop_reason } => {
@@ -2653,7 +2662,7 @@ impl Session {
                                         progress.styled_lines(crate::terminal::plan_view::rejected(&plan, width));
                                     }
                                     if let Some(note) = &decision.note {
-                                        self.store.db.open_session(&self.id)?.enqueue_cli_prompt(note)?;
+                                        self.selected_session()?.enqueue_cli_prompt(note)?;
                                     }
                                     self.engine.resume_with_answer(&request_id, decision.engine).await?;
                                     plan_mode_after = decision.mode.map(|mode| (tool_use_id.clone(), mode));
@@ -3719,12 +3728,14 @@ pub(crate) fn event_json_with(event: &EngineEvent, summaries: bool) -> Option<Va
         EngineEvent::Usage(usage) => json!({"type":"usage","usage":usage}),
         EngineEvent::MessageStart { model } => json!({"type":"message_start","model":model}),
         EngineEvent::AgentProgress {
+            address,
             session_id,
             agent_type,
             status,
             tool_name,
         } => {
             let mut value = json!({"type":"agent_progress","session_id":session_id,"agent_type":agent_type,"status":status,"tool_name":tool_name});
+            if let Some(address) = address { value["address"] = json!(address); }
             if summaries {
                 value["summary"] = json!(match tool_name {
                     Some(tool) => format!("{agent_type}: {status} ({tool})"),
@@ -4460,6 +4471,7 @@ mod event_tests {
     #[test]
     fn agent_progress_summaries_are_opt_in() {
         let event = EngineEvent::AgentProgress {
+            address: None,
             session_id: "child-42".into(),
             agent_type: "reviewer".into(),
             status: "running".into(),
@@ -4478,6 +4490,7 @@ mod event_tests {
     #[test]
     fn agent_progress_json_preserves_real_session_status() {
         let value = event_json(&EngineEvent::AgentProgress {
+            address: None,
             session_id: "child-42".into(),
             agent_type: "reviewer".into(),
             status: "tool_failed".into(),

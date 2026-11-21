@@ -137,7 +137,7 @@ enum Message {
     Background(usize, usize),
     BackgroundCounter(Box<dyn Fn() -> (usize, usize) + Send>),
     Subagents(deepseek_code_core::services::ServiceContext, String),
-    AgentDetails(Box<dyn Fn(&str) -> String + Send>),
+    AgentDetails(Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>),
     AgentRows(Box<dyn Fn() -> Vec<crate::background_commands::Agent> + Send>),
     Todos(Box<dyn Fn() -> Vec<(String, String)> + Send>),
     Vim(bool),
@@ -393,7 +393,7 @@ impl TerminalInput {
         let _ = self.requests.send(Message::Subagents(context, session));
     }
 
-    pub fn set_agent_details(&self, details: Box<dyn Fn(&str) -> String + Send>) {
+    pub fn set_agent_details(&self, details: Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>) {
         let _ = self.requests.send(Message::AgentDetails(details));
     }
 

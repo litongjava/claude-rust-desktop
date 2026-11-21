@@ -154,7 +154,7 @@ async fn single_turn(
         history,
     )?.with_workspace(&session.workspace);
     display.restore_numbers(session)?;
-    display.set_shell_context(root, &session.id);
+    display.set_session_context(root, session.selected_session()?);
     display.set_pinned_prompt(prompt);
     display.set_model_label(&crate::session_commands::model_label(session).await);
     if display.is_live() {
@@ -229,7 +229,7 @@ fn activate_goal_proposal(session: &Session, job: &str) -> Result<Option<String>
 /// Attach to durable events only: never submit or recreate a worker request.
 pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
     let job = jobs::get(&session.paths.data_dir, id)?;
-    jobs::authorize_attachment(&session.paths.data_dir, &job, &session.id)?;
+    let _participants = jobs::hold_attachment(&session.paths.data_dir, &job, &session.selected_session()?)?;
     let workspace = session.store.workspace(&job.session_id, &session.paths.data_dir.join("workspaces"))?;
     let mut display = TurnDisplay::new(
         true,
@@ -238,7 +238,7 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
         Vec::new(),
     )?.with_workspace(&workspace);
     display.restore_numbers(session)?;
-    display.set_shell_context(&session.paths.data_dir, &job.session_id);
+    display.set_session_context(&session.paths.data_dir, jobs::participant_execution(&session.paths.data_dir, &session.selected_session()?, &job)?);
     display.set_model_label(&crate::session_commands::model_label(session).await);
     display.notice(&format!(
         "Attached to task {id}. Esc cancels; Ctrl+B or /background detaches without restarting."
@@ -262,7 +262,11 @@ fn is_main_execution(root: &std::path::Path, job: &jobs::Job, session: &str) -> 
 }
 
 pub(crate) fn cancel_job(session: &Session, id: &str) -> Result<()> {
-    jobs::authorize_attachment(&session.paths.data_dir, &jobs::get(&session.paths.data_dir, id)?, &session.id)?;
+    let _participants = jobs::hold_attachment(
+        &session.paths.data_dir,
+        &jobs::get(&session.paths.data_dir, id)?,
+        &session.selected_session()?,
+    )?;
     let job = jobs::cancel(&session.paths.data_dir, id)?;
     let execution_session = deepseek_code_core::services::session_worker::job_execution_session(
         &session.paths.data_dir,
@@ -283,7 +287,8 @@ async fn present(
     sync_plan_mode: bool,
     proposal_frontend: Option<&deepseek_code_core::services::goal_proposals::Frontend>,
 ) -> Result<()> {
-    jobs::authorize_attachment(&session.paths.data_dir, job, &session.id)?;
+    let _participants =
+        jobs::hold_attachment(&session.paths.data_dir, job, &session.selected_session()?)?;
     let root = &session.paths.data_dir;
     let result = observe(session, &job.id, &job.parent_session_id, input, display, sync_plan_mode, proposal_frontend).await;
     let still_running = result.is_err()
@@ -506,7 +511,7 @@ async fn observe(
                     display.set_activity("Working");
                 }
                 if pending.is_none() && plain_pending.is_none() && agent_pending.is_none() && question.is_none() {
-                    if let (Some(live), Some((job, description, agent))) = (&display.live, crate::background_commands::agent_question(&session.paths, &session.id)) {
+                    if let (Some(live), Some((job, description, agent))) = (&display.live, crate::background_commands::agent_question(&session.paths, session)) {
                         let (lines, heading, options) = crate::background_commands::agent_approval(&session.workspace, &description, &agent);
                         agent_pending = Some((job, agent.request_id.clone(), live.choice(lines, heading, options)));
                     }
@@ -709,7 +714,7 @@ async fn observe(
                                     // As in the reference CLI the running turn reads it after its
                                     // next tool results; unread messages become the next prompt.
                                     crate::images::share(&session.id, &prompt);
-                                    session.store.db.open_session(&session.id)?.enqueue_cli_prompt(&prompt)?;
+                                    session.selected_session()?.enqueue_cli_prompt(&prompt)?;
                                     queued_inputs.push(prompt);
                                     display.queued(queued_inputs.clone());
                                 } else {
@@ -953,6 +958,7 @@ fn render(display: &mut TurnDisplay, event: &Value) {
             event["is_error"].as_bool().unwrap_or(false),
         ),
         "agent_progress" => display.agent_progress(
+            serde_json::from_value(event["address"].clone()).ok(),
             text("session_id"),
             text("agent_type"),
             text("status"),
@@ -1218,6 +1224,7 @@ mod failure_tests {
         source_job.id = source_id.clone(); source_job.status = "running".into(); source_job.finished_ms = None;
         source_job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
         std::fs::write(source_directory.join("state.json"), serde_json::to_vec(&source_job).unwrap()).unwrap();
+        record_fixture_owners(&paths, &source_job);
         session.store.db.shard_sql(&parent, |conn| -> anyhow::Result<()> {
             let key = format!("session.goal-proposals.{parent}");
             let text: String = conn.query_row("SELECT value FROM peripheral_settings WHERE key=?1", [&key], |row| row.get(0))?;

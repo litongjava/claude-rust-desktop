@@ -153,10 +153,7 @@ pub fn execute_live(
                 let to = alias.map_or(to, |job| job.session_id.as_str());
                 let message = if let Some(job) = alias {
                     let sender = context.db.open_session(session)?;
-                    let target = context.db.open_session(to)?;
-                    crate::services::background_sessions::authorize_owned_attachment(
-                        root, job, session,
-                    )?;
+                    let target = crate::services::background_sessions::owned_execution(root, &sender, job)?;
                     sender.send_peer_message(
                         &target,
                         &uuid::Uuid::new_v4().to_string(),

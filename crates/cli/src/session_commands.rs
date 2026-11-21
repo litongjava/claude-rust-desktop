@@ -97,11 +97,11 @@ pub async fn step_effort(session: &Session, up: bool) -> Result<String> {
 pub fn save_live_requests(session: &Session, snapshots: &[Value]) -> Result<()> {
     let requests = snapshots.iter().cloned().map(serde_json::from_value)
         .collect::<serde_json::Result<Vec<settings::LiveRequest>>>()?;
-    session.store.db.select_session(&session.id)?.set_preference(settings::LIVE_REQUESTS, Some(&requests))
+    session.selected_session()?.repository().set_preference(settings::LIVE_REQUESTS, Some(&requests))
 }
 
 pub fn live_requests(session: &Session) -> Result<Vec<Value>> {
-    let requests = session.store.db.select_session(&session.id)?.preference(settings::LIVE_REQUESTS)?.unwrap_or_default();
+    let requests = session.selected_session()?.repository().preference(settings::LIVE_REQUESTS)?.unwrap_or_default();
     Ok(requests.into_iter().map(serde_json::to_value).collect::<serde_json::Result<_>>()?)
 }
 
@@ -224,7 +224,7 @@ pub async fn handle(
                     .workspace(&session.id, &paths.data_dir.join("workspaces"))?;
                 command_eprintln!("Working directory: {}", workspace.display());
                 if command == "/add-dir" {
-                    if let Some(project) = session.store.db.select_session(&session.id)?.workspace_project()? {
+                    if let Some(project) = session.selected_session()?.repository().workspace_project()? {
                         for folder in project.folders { command_eprintln!("  {}", folder.path); }
                     }
                 }
@@ -358,7 +358,7 @@ pub fn is_goal_clear(argument: &str) -> bool {
 }
 
 fn ensure_goal_allowed(session: &Session) -> Result<()> {
-    session.store.db.select_session(&session.id)?.workspace_project()?;
+    session.selected_session()?.repository().workspace_project()?;
     for path in [
         session.paths.data_dir.join("settings.json"),
         session.workspace.join(".claude/settings.json"),
@@ -436,7 +436,7 @@ pub async fn live_inspection(session: &Session, prompt: &str) -> Option<String> 
             .unwrap_or_else(|error| format!("{error:#}")));
     }
     if prompt.trim() == "/agents" {
-        return Some(crate::extended_commands::active_agents_text(&session.paths, &session.id)
+        return Some(session.selected_session().and_then(|owner| crate::extended_commands::active_agents_for(&session.paths, &owner))
             .unwrap_or_else(|error| format!("Agents: {error:#}")));
     }
     if prompt.trim() == "/subagents" {
@@ -715,7 +715,7 @@ fn parse_goal_verdict(text: &str) -> Result<GoalVerdict> {
 
 /// Messages and estimated tokens since the last compact boundary.
 pub fn active_history(session: &Session) -> Result<(usize, usize)> {
-    let (messages,bytes) = session.store.db.select_session(&session.id)?.active_history_size()?;
+    let (messages,bytes) = session.selected_session()?.repository().active_history_size()?;
     Ok((messages,bytes.div_ceil(3)))
 }
 
@@ -779,10 +779,10 @@ fn clear_tool_results(messages: &mut [Value]) {
 /// context window, large tool results older than the last few messages are
 /// replaced with a placeholder. The saved transcript is unchanged.
 pub fn microcompact(session: &Session, history: &mut [Value], window: Option<u32>) -> Result<()> {
-    let rows = session.store.db.select_session(&session.id)?.messages()?;
+    let rows = session.selected_session()?.repository().messages()?;
     let boundary = rows.iter().rev().find(|row| row.is_compact_boundary).map(|row| row.id.clone()).unwrap_or_default();
     use deepseek_code_core::db::session_store::settings::{Microcompact, MICROCOMPACT};
-    let repository = session.store.db.select_session(&session.id)?;
+    let repository = session.selected_session()?.repository();
     let mut state = repository.preference(MICROCOMPACT)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
     let len = history.len();
     clear_tool_results(&mut history[..state.through.min(len)]);
@@ -812,14 +812,14 @@ pub fn is_context_overflow(error: &anyhow::Error) -> bool {
 /// (with nothing changed) when there is no earlier conversation to compact.
 pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepseek_code_core::db::turn_repo::TurnTimer) -> Result<bool> {
     use deepseek_code_core::db::message_repo;
-    let rows = session.store.db.select_session(&session.id)?.messages()?;
+    let rows = session.selected_session()?.repository().messages()?;
     let start = rows.iter().rposition(|row| row.is_compact_boundary).unwrap_or(0);
     let Some(index) = rows.iter().rposition(|row| row.role == "user") else { return Ok(false) };
     if rows[index].content != prompt || index <= start + 1 {
         return Ok(false);
     }
     crate::compaction::notice("Context limit reached; compacting the conversation and retrying…");
-    session.store.db.open_session(&session.id)?.write(|w| w.rewind_failed_attempt(&rows[index].id,&turn.record().turn_id))?;
+    session.selected_session()?.write(|w| w.rewind_failed_attempt(&rows[index].id,&turn.record().turn_id))?;
     turn.clear_segment();
     compact_automatic(session, "", None).await?;
     Ok(true)
@@ -830,7 +830,7 @@ pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepse
 pub async fn prepare_turn(session: &Session, context_window: Option<u32>, lease: Option<std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>>) -> Result<()> {
     // A request the model queued is honored before this prompt even when the
     // history is below the automatic threshold. It is consumed exactly once.
-    let shard=session.store.db.open_session(&session.id)?;
+    let shard=session.selected_session()?;
     if let Some(lease)=lease {
         let claim=shard.delivery_under_lease(lease)?.claim_compaction()?;
         if let Some(claim)=claim {

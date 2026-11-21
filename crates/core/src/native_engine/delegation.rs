@@ -212,6 +212,7 @@ impl ChildState {
 
     fn progress(&self, status: &str, tool_name: Option<String>) -> EngineEvent {
         EngineEvent::AgentProgress {
+            address: self.history.address(),
             session_id: self.value["session_id"].as_str().unwrap_or_default().into(),
             agent_type: self.value["agent_type"].as_str().unwrap_or_default().into(),
             status: status.into(),

@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub id: String,
+    address: Option<crate::background_commands::HistoryAddress>,
     pub label: String,
     pub current: bool,
 }
@@ -26,6 +27,8 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
         let Some(id) = peer["id"].as_str() else {
             continue;
         };
+        let child = context.db.open_recorded(id, peer["incarnation"].as_str().ok_or_else(|| anyhow::anyhow!("Missing peer incarnation"))?)?;
+        let _guard = child.hold_incarnation()?;
         let record = context
             .child_progress(&id)?
             .or_else(|| background.remove(id));
@@ -52,6 +55,7 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
             )
         };
         entries.push(Entry {
+            address: Some(child.address()),
             id: id.into(),
             label: label.chars().filter(|ch| !ch.is_control()).collect(),
             current: id == session,
@@ -65,6 +69,7 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
     });
     if entries.is_empty() {
         entries.push(Entry {
+            address: None,
             id: session.into(),
             label: "Main [default]".into(),
             current: true,
@@ -79,6 +84,7 @@ pub(crate) struct View {
     entries: Vec<Entry>,
     selected: usize,
     watching: bool,
+    watched: Option<crate::background_commands::HistoryAddress>,
     scroll: usize,
     text: String,
     history: super::scrollback::Scrollback,
@@ -93,6 +99,7 @@ impl View {
     pub(crate) fn new(context: ServiceContext, session: String) -> Self {
         let entries = entries(&context, &session).unwrap_or_else(|error| {
             vec![Entry {
+                address: None,
                 id: session.clone(),
                 label: format!("Main · {error}"),
                 current: true,
@@ -104,6 +111,7 @@ impl View {
             entries,
             selected: 0,
             watching: false,
+            watched: None,
             scroll: 0,
             text: String::new(),
             history: Default::default(),
@@ -125,6 +133,7 @@ impl View {
         if self.entries[self.selected].current {
             return true;
         }
+        self.watched = self.entries[self.selected].address.clone();
         self.watching = true;
         self.scroll = 0;
         self.text.clear();
@@ -216,10 +225,10 @@ impl View {
                     .unwrap_or(0);
                 self.entries = entries;
             }
-            if self.watching {
+            if let Some(address) = self.watched.as_ref().filter(|_| self.watching) {
                 let history = crate::background_commands::agent_transcript(
                     &self.context,
-                    &self.entries[self.selected].id,
+                    address,
                 );
                 let text = history.all().join("\n");
                 if text != self.text {
@@ -390,7 +399,7 @@ mod tests {
         ))));
         assert!(view.watching);
         assert_eq!(view.entries[view.selected].id, child);
-        let body = crate::background_commands::agent_execution(&context, &child);
+        let body = crate::background_commands::agent_execution(&context, &context.db.open_session(&child).unwrap().address());
         assert!(body.contains(&format!(
             "{} CHILD_USER_SENTINEL",
             crate::terminal::prompt_glyph()
@@ -436,7 +445,7 @@ mod tests {
         editor.set_subagents(context, parent);
         editor.set_agent_rows(Box::new(|| {
             vec![crate::background_commands::Agent {
-                session_id: "fixture-background".into(),
+                address: crate::background_commands::HistoryAddress {session: "fixture-background".into(), store: String::new(), incarnation: String::new()},
                 agent_type: "general".into(),
                 description: "RUNNING_BACKGROUND_SENTINEL".into(),
                 started_ms: chrono::Utc::now().timestamp_millis() as u64,
