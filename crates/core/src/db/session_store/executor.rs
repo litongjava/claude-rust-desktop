@@ -14,6 +14,11 @@ pub enum ExecutorHistory {
 }
 
 impl Stores {
+    pub(crate) fn listed_history(&self, id: &str) -> Result<Option<ExecutorHistory>> {
+        self.global().read_directory_row(id, |c| super::directory::one(c, id))?
+            .map(|row| self.open_listed(&row).map(ExecutorHistory::Session)).transpose()
+    }
+
     pub fn executor_history(&self, id: &str) -> Result<ExecutorHistory> {
         Ok(ExecutorHistory::Session(self.open_session(id)?))
     }

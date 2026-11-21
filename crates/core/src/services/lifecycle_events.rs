@@ -25,22 +25,26 @@ pub(crate) fn transcript(root: &Path, session: &str) -> Result<PathBuf> {
     snapshot(root, session, None)
 }
 
+pub(crate) fn snapshot_path(root: &Path, session: &str, history: Option<&crate::db::session_store::ExecutorHistory>) -> PathBuf {
+    if let Some(crate::db::session_store::ExecutorHistory::Session(s)) = history {
+        root.join("hook-transcripts").join(format!("{}.jsonl",s.incarnation()))
+    } else {
+        transcript_path(root, session)
+    }
+}
+
 pub(crate) fn snapshot(root:&Path, session:&str, bound:Option<&crate::db::session_store::ExecutorHistory>) -> Result<PathBuf> {
-    use crate::db::session_store::{ExecutorHistory,Stores};
+    use crate::db::session_store::Stores;
     let selected;
     let history = if let Some(bound) = bound {
         anyhow::ensure!(bound.id()==session,"Hook session does not match its bound history");
         Some(bound)
     } else if root.join("global.db").try_exists()? {
         let stores = Stores::open(root)?;
-        selected = stores.global().conversation(session)?
-            .map(|_|stores.executor_history(session)).transpose()?;
+        selected = stores.listed_history(session)?;
         selected.as_ref()
     } else { None };
-    let path = match history {
-        Some(ExecutorHistory::Session(s)) => root.join("hook-transcripts").join(format!("{}.jsonl",s.incarnation())),
-        _ => transcript_path(root,session),
-    };
+    let path = snapshot_path(root, session, history);
     let directory = root.join("hook-transcripts");
     std::fs::create_dir_all(&directory)?;
     let mut snapshot = tempfile::NamedTempFile::new_in(&directory)?;

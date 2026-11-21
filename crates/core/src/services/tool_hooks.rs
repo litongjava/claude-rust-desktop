@@ -594,7 +594,12 @@ impl HookRunner {
             match super::lifecycle_events::snapshot(root,session,history) {
                 Ok(path) => path,
                 Err(error) => {
-                    let path = super::lifecycle_events::transcript_path(root,session);
+                    // An unavailable split snapshot must never expose an older incarnation's file.
+                    let path = if history.is_none() && root.join("global.db").exists() {
+                        root.join("hook-transcripts").join(format!("unavailable-{}",uuid::Uuid::new_v4()))
+                    } else {
+                        super::lifecycle_events::snapshot_path(root, session, history)
+                    };
                     tracing::warn!(session_id = session, transcript_path = %path.display(),
                         "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
                     path
