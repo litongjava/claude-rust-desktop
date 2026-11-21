@@ -89,3 +89,13 @@ impl SessionRepository<'_> {
         }
     }
 }
+
+impl SessionRepository<'_> {
+    pub(crate) fn pending_tool_inputs(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        self.read(|c,id|{
+            let mut q=c.prepare("SELECT t.id,t.name,t.input FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.output IS NULL ORDER BY m.sort_order,m.rowid,t.sort_order,t.rowid")?;
+            let rows=q.query_map([id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+}

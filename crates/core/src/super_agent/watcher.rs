@@ -1,7 +1,7 @@
 //! One bounded Router-host supervision pass. No scheduler or UI lives here.
 //! Recovery never replays a stored tool command. It resumes the same member
 //! through Launcher/child_session after durable ownership and Git checks.
-use crate::db::session_store::TaskState;
+use crate::db::session_store::{SessionAccess,TaskState};
 use super::{
     model::*, orchestrator::Orchestrator, role::MemberRole, state::StatePolicy, store::TaskStore,
 };
@@ -764,9 +764,8 @@ fn waiting_reason(
     {
         return Ok(Some("waiting for user/permission/plan answer".into()));
     }
-    let pending: bool = host.context.db.with_conn(|conn| conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM permission_approvals WHERE conversation_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM sa_approvals WHERE task_id=?2 AND status='PENDING')",
-        [&job.session_id, &task.task_id], |r| r.get(0)))??;
+    let pending=!host.context.db.select_session(&job.session_id)?.pending_approvals()?.is_empty()
+        || TaskStore::from_context(&host.context).approvals(&task.task_id)?.iter().any(|approval|approval.status==ApprovalStatus::Pending);
     Ok(pending.then(|| "waiting for approval".into()))
 }
 
@@ -790,11 +789,7 @@ impl PendingTool {
     }
 }
 fn pending_tools(host: &Orchestrator, session: &str) -> Result<Vec<PendingTool>> {
-    let rows = host.context.db.with_conn(|conn| -> Result<Vec<(String,String,Option<String>)>> {
-        let mut stmt = conn.prepare("SELECT t.id,t.name,t.input FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.output IS NULL ORDER BY m.sort_order,m.rowid,t.sort_order,t.rowid")?;
-        let rows = stmt.query_map([session], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })??;
+    let rows=host.context.db.select_session(session)?.pending_tool_inputs()?;
     rows.into_iter()
         .map(|(id, name, input)| {
             // tool_calls has no exact start timestamp. A persisted first-observed

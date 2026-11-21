@@ -202,3 +202,99 @@ impl Stores {
         Ok(Some(page(&inv, rows, &status, true, offset, limit)))
     }
 }
+
+impl super::ExecutorHistory {
+    pub(crate) fn review_children(&self) -> Result<Vec<(Invocation, Option<Self>)>> {
+        match self {
+            Self::Session(s) => s
+                .saved_invocations()?
+                .into_iter()
+                .map(|(inc, inv)| {
+                    let handle = s
+                        .stores
+                        .selected_child(&inv.child_session_id, &inc)?
+                        .map(Self::Session);
+                    Ok((inv, handle))
+                })
+                .collect(),
+            Self::Shared(db, id) => {
+                let rows = db.with_conn(|c| subagents::list_invocations(c, id, None))??;
+                rows.into_iter()
+                    .map(|inv| {
+                        let handle = db.executor_history(&inv.child_session_id)?;
+                        Ok((inv, Some(handle)))
+                    })
+                    .collect()
+            }
+        }
+    }
+    pub(crate) fn review_metadata(&self) -> Result<crate::db::conversation_repo::ConversationRow> {
+        use anyhow::Context;
+        match self {
+            Self::Session(s) => {
+                let _locks = s.stores.key_lock(&s.key, false, false)?;
+                s.check_directory()?;
+                s.stores.global().read(|c| {
+                    Ok(super::directory::one(c, s.id())?
+                        .context("Session not found")?
+                        .conversation)
+                })
+            }
+            Self::Shared(db, id) => db.conversation_metadata(id)?.context("Session not found"),
+        }
+    }
+    pub(crate) fn review_counts(&self) -> Result<(i64, i64)> {
+        self.read(|c,id|{
+            let counts=c.query_row("SELECT (SELECT count(*) FROM messages WHERE conversation_id=?1),
+                (SELECT count(*) FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1)",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            Ok(counts)
+        })
+    }
+    pub(crate) fn review_messages(
+        &self,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<
+        Vec<(
+            crate::db::message_repo::MessageRow,
+            Vec<crate::db::message_repo::ToolCallRow>,
+        )>,
+    > {
+        use crate::db::message_repo;
+        self.read(|c,id|{
+            let snapshot=if c.is_autocommit(){Some(c.unchecked_transaction()?)}else{None};
+            let c=snapshot.as_deref().unwrap_or(c);
+            let mut q=c.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages
+                WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order,rowid LIMIT ?3")?;
+            let mut rows=q.query(rusqlite::params![id,cursor,limit])?;
+            let mut found=Vec::new();
+            while let Some(r)=rows.next()?{let message=message_repo::row_to_message(r)?;let calls=message_repo::get_tool_calls_for_message(c,&message.id)?;found.push((message,calls));}
+            Ok(found)
+        })
+    }
+}
+impl Stores {
+    pub(crate) fn review_coder(
+        &self,
+        task: &str,
+        id: &str,
+    ) -> Result<Option<super::ExecutorHistory>> {
+        use rusqlite::OptionalExtension;
+        let inc=self.global().read(|c|Ok(c.query_row("SELECT c.incarnation FROM sa_coder_history h JOIN conversations c ON c.id=h.session_id AND c.incarnation=h.incarnation WHERE h.task_id=?1 AND c.id=?2",[task,id],|r|r.get::<_,String>(0)).optional()?))?;
+        Ok(match inc {
+            Some(inc) => self
+                .selected_child(id, &inc)?
+                .map(super::ExecutorHistory::Session),
+            None => None,
+        })
+    }
+}
+impl DbManager {
+    pub(crate) fn review_coder(
+        self: &std::sync::Arc<Self>,
+        _task: &str,
+        id: &str,
+    ) -> Result<Option<super::ExecutorHistory>> {
+        self.executor_history(id).map(Some)
+    }
+}
