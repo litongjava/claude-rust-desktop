@@ -372,28 +372,36 @@ impl Stores {
             incarnation,
         };
         let path = self.sessions().join(&handle.key).join("session.db");
-        let old = {
-            let _permit = Permits::take(1);
-            layout::needs_upgrade(&path, SESSION)?
+        let inspect = || {
+            handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+                Ok(c.query_row(
+                    "SELECT content_revision FROM manifest WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
         };
-        if old {
-            drop(locks);
-            // An enclosing operation may still hold a shared guard on this key.
-            locks = layout::without_lifecycle_wait(|| self.key_lock(&handle.key, true, false))
-                .map_err(|error| {
-                    if error.is::<layout::LifecycleBusy>() {
-                        error.context(format!("Session {id} is busy; retry the format upgrade"))
-                    } else {
-                        error
-                    }
-                })?;
-            handle.check_directory()?;
-            handle.upgrade_locked()?;
-        }
+        let revision = match inspect() {
+            Err(error) if error.is::<layout::SessionNeedsUpgrade>() => {
+                drop(locks);
+                // An enclosing operation may still hold a shared guard on this key.
+                locks = layout::without_lifecycle_wait(|| self.key_lock(&handle.key, true, false))
+                    .map_err(|error| {
+                        if error.is::<layout::LifecycleBusy>() {
+                            error.context(format!("Session {id} is busy; retry the format upgrade"))
+                        } else {
+                            error
+                        }
+                    })?;
+                handle.check_directory()?;
+                handle.upgrade_locked()?;
+                inspect()?
+            }
+            result => result?,
+        };
         let _locks = locks;
         drop(admission::open(&path)?);
-        handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
-        handle.try_project_current();
+        handle.try_project_current(revision);
         Ok(Some(handle))
     }
 }
@@ -435,7 +443,50 @@ pub struct SessionDb {
     incarnation: String,
 }
 
+/// Keep SQLite attached to the WAL between the writes of one executing turn.
+/// There is no open transaction. Dropping the last connection checkpoints normally.
+pub(crate) struct TurnWal {
+    _connection: Connection,
+    _permit: Permits,
+    _lease: Arc<crate::services::session_messages::ExecutionLease>,
+}
+
 impl SessionDb {
+    pub(crate) fn hold_turn_wal(
+        &self,
+        lease: Arc<crate::services::session_messages::ExecutionLease>,
+    ) -> Result<Option<TurnWal>> {
+        // At most four active turns retain a connection. Leave twelve of the
+        // sixteen process-wide permits for concurrent transactions and forks.
+        Permits::try_with_reserve(12)
+            .map(|permit| self.open_turn_wal(lease, permit))
+            .transpose()
+    }
+
+    fn open_turn_wal(
+        &self,
+        lease: Arc<crate::services::session_messages::ExecutionLease>,
+        permit: Permits,
+    ) -> Result<TurnWal> {
+        ensure!(
+            lease.address.as_ref() == Some(&self.address()),
+            "Turn WAL requires the session's execution lease"
+        );
+        let path = self.stores.sessions().join(&self.key).join("session.db");
+        let conn = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        verify_manifest(
+            &conn,
+            self.stores.global().store_uuid(),
+            &self.id,
+            &self.incarnation,
+        )?;
+        Ok(TurnWal {
+            _connection: conn,
+            _permit: permit,
+            _lease: lease,
+        })
+    }
+
     /// Preserve the initiating shard when a service also needs directory access.
     pub fn scoped_stores(&self) -> Stores {
         let mut stores = self.stores.clone();
@@ -692,6 +743,30 @@ mod tests {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?)
+    }
+
+    #[test]
+    fn turn_writes_share_the_wal_until_execution_finishes() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let stores = Stores::open(tmp.path())?;
+        let session = stores.create("turn", Default::default())?;
+        let lease = Arc::new(session.acquire_execution()?);
+        let wal = stores.sessions().join(&session.key).join("session.db-wal");
+        let guard = session.open_turn_wal(lease, Permits::take(1))?;
+        session.write(|tx| tx.append("assistant", "saved"))?;
+        assert!(std::fs::metadata(&wal)?.len() > 32);
+        assert_eq!(
+            session.read(|tx| tx.last_assistant_report())?.as_deref(),
+            Some("saved")
+        );
+        drop(guard);
+        assert!(!wal.exists());
+        assert_eq!(
+            session.read(|tx| tx.last_assistant_report())?.as_deref(),
+            Some("saved")
+        );
+        session.delete()?;
+        Ok(())
     }
 
     #[test]

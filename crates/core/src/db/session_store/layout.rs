@@ -215,12 +215,19 @@ pub(super) fn file_identity(path: &Path) -> Result<(u64, u64)> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Session schema version {0} requires an upgrade")]
+pub(super) struct SessionNeedsUpgrade(i32);
+
 /// Bounded checks for an admitted incarnation. Schema edits invalidate the
 /// cached format check. Unsealed external history edits require revalidation.
 pub(super) fn session_header(c: &Connection) -> Result<(i64, Option<[u8; 16]>)> {
     let (app,version,mode,schema):(i32,i32,String,i64)=c.query_row(
         "SELECT application_id,user_version,journal_mode,schema_version FROM pragma_application_id,pragma_user_version,pragma_journal_mode,pragma_schema_version", [],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    if app == SESSION && (1..SESSION_VERSION).contains(&version) {
+        return Err(SessionNeedsUpgrade(version).into());
+    }
     ensure!(
         app == SESSION && version == SESSION_VERSION && mode == "wal",
         "Unsupported session header"
@@ -948,8 +955,11 @@ static RELEASED: Condvar = Condvar::new();
 pub(super) struct Permits(usize);
 impl Permits {
     pub(super) fn try_one() -> Option<Self> {
+        Self::try_with_reserve(0)
+    }
+    pub(super) fn try_with_reserve(reserve: usize) -> Option<Self> {
         let mut free = AVAILABLE.lock().unwrap();
-        if *free == 0 {
+        if *free <= reserve {
             return None;
         }
         *free -= 1;

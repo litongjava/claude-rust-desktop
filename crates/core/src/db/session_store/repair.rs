@@ -220,7 +220,7 @@ impl SessionDb {
         Ok(SummaryCheck::Publish(history::projection(&tx)?))
     }
 
-    pub(super) fn try_project_current(&self) {
+    pub(super) fn try_project_current(&self, revision: i64) {
         let result = (|| {
             let published = self.stores.global().read(|c| {
                 Ok(c.query_row(
@@ -229,6 +229,9 @@ impl SessionDb {
                     |r| r.get::<_, i64>(0),
                 )?)
             })?;
+            if revision <= published {
+                return Ok(());
+            }
             if let SummaryCheck::Publish(p) = self.summary_under_lock(published)? {
                 self.stores
                     .global()

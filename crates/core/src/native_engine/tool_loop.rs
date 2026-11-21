@@ -3831,11 +3831,25 @@ impl ToolLoopExecutor {
             self.publish_context_reset(boundary_id).await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
-        let turn_delivery = if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
-            let lease = self.execution_lease.clone().context("Turn delivery requires execution ownership")?;
-            Some(std::sync::Arc::new(std::sync::Mutex::new(shard.delivery_under_lease(lease)?)))
-        } else { None };
-        self.turn_delivery = turn_delivery.as_ref().map(std::sync::Arc::downgrade).unwrap_or_default();
+        let (_turn_wal, turn_delivery) =
+            if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
+                let lease = self
+                    .execution_lease
+                    .clone()
+                    .context("Turn delivery requires execution ownership")?;
+                let wal = shard.hold_turn_wal(lease.clone())?;
+                let delivery = shard.delivery_under_lease(lease)?;
+                (
+                    wal,
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(delivery))),
+                )
+            } else {
+                (None, None)
+            };
+        self.turn_delivery = turn_delivery
+            .as_ref()
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         self.message_deliveries = 0;
         self.child_resumes.store(0, Ordering::Relaxed);
         if self.require_pending_peer_message {
