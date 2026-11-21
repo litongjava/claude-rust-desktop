@@ -1003,3 +1003,33 @@ fn document_previews_and_import_backups_resolve_immutable_bodies() -> Result<()>
     assert!(magic_docs::previews(&ctx,root.path())?.is_empty());
     Ok(())
 }
+
+#[test]
+fn team_sync_preserves_a_concurrent_edit_and_resolves_its_referenced_conflict() -> Result<()> {
+    use deepseek_code_core::{db::session_store::TeamCatalog,services::team::{TeamConfig,TeamMemory,SyncResponse}};
+    let temp=tempfile::tempdir()?;
+    let stores=Stores::open(temp.path())?;
+    let team="design";
+    stores.bind_team(&TeamConfig{team:team.into(),endpoint:"http://localhost:1".into(),credential:"private".into()})?;
+    let mut memory=TeamMemory{id:"m".into(),title:"title".into(),content:"original".into(),tags:vec![],revision:0,deleted:false};
+    stores.put_memory(team,&memory,false)?;
+    let old=stores.team_request(team)?;
+    assert_eq!(old.changes[0].memory.content,"original");
+    memory.content="edited while syncing".into();
+    stores.put_memory(team,&memory,true)?;
+    let mut accepted=old.changes;
+    accepted[0].memory.revision=1;
+    stores.team_response(team,0,&SyncResponse{cursor:1,changes:vec![],accepted,conflicts:vec![]})?;
+    let next=stores.team_request(team)?;
+    assert_eq!(next.changes[0].memory.content,memory.content);
+    let mut remote=memory.clone();
+    remote.revision=2;
+    remote.content="received".into();
+    stores.team_response(team,1,&SyncResponse{cursor:2,changes:vec![remote.clone()],accepted:vec![],conflicts:vec![]})?;
+    let conflicts=stores.conflicts(team)?;
+    assert_eq!(conflicts[0].remote,remote);
+    stores.resolve_conflict(team,&memory.id,false)?;
+    assert_eq!(stores.memories(team,false)?,vec![remote]);
+    assert!(stores.team_request(team)?.changes.is_empty());
+    Ok(())
+}

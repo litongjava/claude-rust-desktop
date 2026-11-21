@@ -50,6 +50,8 @@ mod im_permissions;
 pub use im_permissions::{ImPermissionChange, ImPermissions};
 pub mod magic;
 mod documents;
+mod team;
+pub use team::TeamCatalog;
 pub use documents::{DocumentCatalog,DocumentImport};
 mod projects;
 pub use projects::{ProjectEdit,Projects};
