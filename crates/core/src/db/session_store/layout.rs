@@ -12,7 +12,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-pub(super) const GLOBAL_VERSION: i32 = 9;
+pub(super) const GLOBAL_VERSION: i32 = 10;
 pub(super) const SESSION_VERSION: i32 = 8;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
@@ -270,7 +270,8 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                 tx.execute_batch(include_str!("global_v6.sql"))?;
                 tx.execute_batch(include_str!("global_v7.sql"))?;
                 tx.execute_batch(include_str!("global_v8.sql"))?;
-        tx.execute_batch(include_str!("global_v9.sql"))?;
+                tx.execute_batch(include_str!("global_v9.sql"))?;
+                tx.execute_batch(include_str!("global_v10.sql"))?;
             }
             tx.pragma_update(None, "user_version", schema_version(kind))?;
             Ok(())
@@ -617,6 +618,7 @@ pub(super) fn initialize(
         tx.execute_batch(include_str!("global_v7.sql"))?;
         tx.execute_batch(include_str!("global_v8.sql"))?;
         tx.execute_batch(include_str!("global_v9.sql"))?;
+        tx.execute_batch(include_str!("global_v10.sql"))?;
     }
     populate(&tx)?;
     if kind == SESSION {
