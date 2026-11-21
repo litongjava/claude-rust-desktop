@@ -874,7 +874,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/{command_output_summary,bash_test_summary,model_tool_output}.rs`、`tools/{bash_process,background_shell}.rs` 的捕获与分页、`config/command_output.rs` 和 CLI 的摘要设置：执行下面“长命令输出摘要”的模型请求、设置和捕获回归。
 - `runtime.rs`、`db/message_repo.rs`（发给模型的历史）：D2、E5，以及 SDK 测试
 - `db/mod.rs`（`write_tx`）：`cargo test --locked -p deepseek-code-core --lib db::write_tx`（重试、非争用不重试、超时报 label、失败不留半行）与 `cargo test --locked -p deepseek-code-core --test session_concurrency`。真实争用复验：用 `VACUUM INTO` 复制数据库，`DEEPSEEK_CODE_DATA_DIR` 指向副本，另一个进程 `BEGIN IMMEDIATE` 占锁 8 秒，期间跑一轮带工具调用的请求，确认回合完成、日志有重试告警、工具行与快照完整；再占锁 40 秒，确认回合以带 label 的错误结束（不是裸 `database is locked`），且没有半成品工具行。
-- 启动争用：在已初始化的 `global.db` 上持有写锁，覆盖模型与提供商切换、标题、项目目录回写、Git 工作树绑定和空闲执行租约。运行 `startup_contention_tests`、`git_worktree_binding_waits_for_writer_after_init`、`projectless_code_resume_waits_for_another_writer`。会话创建和单会话写锁竞争见 `session_concurrency`，多进程首次启动见 `session_db_lifecycle`。
+- 启动争用：在已初始化的 `global.db` 上持有写锁，覆盖模型与提供商切换、标题、项目目录回写、Git 工作树绑定和空闲执行租约。运行 `startup_contention_tests`、`git_worktree_binding_waits_for_writer_after_init`。运行 `cargo test --locked -p deepseek-code-core --lib projectless_code_resume_resolves_during_another_directory_write`，确认无项目会话在另一个目录写事务持锁时仍能解析。会话创建和单会话写锁竞争见 `session_concurrency`，多进程首次启动见 `session_db_lifecycle`。
 - `db/message_repo.rs` 的请求快照去重（`request_blobs` / `*Ref`）：`cargo test --locked -p deepseek-code-core --lib db::message_repo`（同头只存一份、往返字段一致、旧内联行可读、缺 blob 不伪造、不修改调用方数据）、`cargo test --locked -p deepseek-code-core --test compaction_status_regressions` 与 `cargo test --locked -p deepseek-code-cli --bin dcl status_commands_tests`。历史数据不会自动回填：要缩小现有库需另跑一次性回填脚本并 `VACUUM`，验证方法是回填前后比较 `requests_json` 总字节、`request_blobs` 行数，并抽 3 条消息确认 `get_request_snapshots` 往返一致。
 - `services/input_queue.rs`：B、E4，以及“第十一轮：SDK 回合内引导”的全部自动用例
 - `sdk.rs`（SDK stream-json 输入与回合控制）：E6、SDK 全套，以及“第十一轮：SDK 回合内引导”
@@ -1029,7 +1029,7 @@ env -u DEEPSEEK_CODE_BACKGROUND_CONTROL -u DEEPSEEK_CODE_BACKGROUND_JOB \
 - `an_empty_drain_does_not_take_the_writer_lock`：第二个真实 SQLite 连接持有 `BEGIN IMMEDIATE` 时，空收件箱轮询不等待写者、不报错。空收件箱的授权检查在只读快照中完成，仍验证消费者 generation 以及 `project()`/`resolve_workspace` 的归档、Code 模式、项目信任和来源映射。
 - `an_empty_inbox_still_enforces_project_authorization`：空收件箱下分别归档会话、改成非 Code 模式、撤销项目信任且 generation 不变，三种情况都必须像旧路径一样拒绝，且不消费任何消息。
 - `a_pending_drain_defers_under_a_held_writer_and_delivers_once_after_release`：有排队消息但写者被占用时，轮询在限定时间内返回空；队列行保持 `queued`，`consumer_generation`/`committed_at` 保持空，历史为空。释放写者后同一条消息只投递一次，状态变为 `context_committed`，历史恰好一行，再轮询为空。
-- `a_late_acknowledgement_failure_rolls_back_the_whole_poll_unit`：在消息行插入和会话计数增加之后、`session_inbox` 确认更新时让触发器失败；整个轮询事务必须回滚（历史为空、`message_count` 不变、队列状态/generation/时间戳不变）。移除触发器后恰好投递一次。早期的 `BEFORE INSERT` 失败用例保留，覆盖更早的中断点。
+- 运行 `cargo test --locked -p deepseek-code-core --lib a_late_acknowledgement_failure_recovers_one_durable_receipt`。在分片投递提交后让目录中的 `session_inbox` 确认更新失败。历史中仍有一条消息，队列状态为 `claimed`，保留 generation，提交时间为空。移除触发器并重放，状态应变为 `context_committed`，历史仍为一条，目录消息数只增加一次，再次轮询返回空。
 - `a_nonbusy_drain_failure_names_the_operation_and_keeps_the_queue`：非竞争错误（`RAISE(ABORT)`，扩展码 1811）仍向上传播，消息保持 `queued`，后续轮询只投递一次。
 - `a_revoked_consumer_is_refused_and_the_queue_survives`：消费者被撤销时轮询拒绝，队列不丢失；新消费者只投递一次。
 - `the_poll_restores_the_borrowed_connection_timeout_on_success_and_unwind`：借用连接原来的 `busy_timeout`（例如 7000ms）在成功、错误和 panic 展开后都恢复为原值，不留下 250ms 或全局放宽的超时。
