@@ -926,7 +926,7 @@ fn fix_round_supported_format_checks_columns_tables_and_live_seal() {
     }
     for change in [
         "DROP TABLE message_user_content",
-        "ALTER TABLE messages DROP COLUMN thinking",
+        "DROP TRIGGER transcript_thinking_insert; DROP TRIGGER transcript_thinking_update; DROP TRIGGER transcript_thinking_delete; ALTER TABLE messages DROP COLUMN thinking",
         "UPDATE manifest SET sealed_operation=''",
         "UPDATE manifest SET sealed_operation='bogus'",
     ] {
