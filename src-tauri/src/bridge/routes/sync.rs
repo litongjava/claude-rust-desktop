@@ -22,41 +22,7 @@ struct SyncProviderPayload {
     enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncConversationPayload {
-    id: String,
-    title: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    workspace_path: Option<String>,
-    project_id: Option<String>,
-    #[serde(default, alias = "workspace_mode")]
-    workspace_mode: Option<crate::db::conversation_repo::WorkspaceMode>,
-    #[serde(default)]
-    research_mode: bool,
-    #[serde(default)]
-    pinned: bool,
-    #[serde(default)]
-    archived: bool,
-    created_at: String,
-    updated_at: String,
-    message_count: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncMessagePayload {
-    id: String,
-    conversation_id: String,
-    role: String,
-    content: String,
-    thinking: Option<String>,
-    created_at: String,
-    #[serde(default)]
-    is_compact_boundary: bool,
-    sort_order: i64,
-}
+use deepseek_code_core::db::{message_repo::MessageRow, session_store::SyncHeader};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,9 +32,9 @@ struct SyncPushRequest {
     #[serde(default)]
     providers: Vec<SyncProviderPayload>,
     #[serde(default)]
-    conversations: Vec<SyncConversationPayload>,
+    conversations: Vec<SyncHeader>,
     #[serde(default)]
-    messages_per_conversation: HashMap<String, Vec<SyncMessagePayload>>,
+    messages_per_conversation: HashMap<String, Vec<MessageRow>>,
     #[serde(default)]
     deleted_provider_ids: Vec<String>,
     #[serde(default)]
@@ -110,35 +76,30 @@ async fn sync_push(
                     let models: Vec<crate::config::ModelConfig> = sync_p
                         .models
                         .iter()
-                        .map(|m| {
-                            crate::config::ModelConfig {
-                                id: m
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                name: m
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                enabled: m
-                                    .get("enabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true),
-                                max_tokens: m
-                                    .get("maxTokens")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32),
-                                supports_vision: true,
-                                supports_text: true,
-                                api: None,
-                                supports_tools: true,
-                                supports_streaming: true,
-                                context_window: None,
-                                cost_per_1k_input: None,
-                                cost_per_1k_output: None,
-                            }
+                        .map(|m| crate::config::ModelConfig {
+                            id: m
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            name: m
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            enabled: m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                            max_tokens: m
+                                .get("maxTokens")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32),
+                            supports_vision: true,
+                            supports_text: true,
+                            api: None,
+                            supports_tools: true,
+                            supports_streaming: true,
+                            context_window: None,
+                            cost_per_1k_input: None,
+                            cost_per_1k_output: None,
                         })
                         .collect();
 
@@ -185,155 +146,27 @@ async fn sync_push(
     }
 
     let db = state.db_manager.clone();
-    for conv in &req.conversations {
-        let id = conv.id.clone();
-        let id_for_err = id.clone();
-        let title = conv.title.clone();
-        let model = conv.model.clone();
-        let provider = conv.provider.clone();
-        let workspace_path = conv.workspace_path.clone();
-        let project_id = conv.project_id.clone();
-        let workspace_mode = conv.workspace_mode;
-        let research_mode = conv.research_mode;
-        let pinned = conv.pinned;
-        let archived = conv.archived;
-        let created_at = conv.created_at.clone();
-        let updated_at = conv.updated_at.clone();
-        let message_count = conv.message_count;
-        let db_clone = db.clone();
-
-        let conv_result = tokio::task::spawn_blocking(move || {
-            db_clone.with_conn(|conn| {
-                let existing = crate::db::conversation_repo::get_conversation(conn, &id)?;
-                if existing.is_none() {
-                    crate::db::conversation_repo::insert_conversation(
-                        conn,
-                        &id,
-                        title.as_deref(),
-                        model.as_deref(),
-                        provider.as_deref(),
-                        workspace_path.as_deref(),
-                        project_id.as_deref(),
-                        research_mode,
-                        pinned,
-                        archived,
-                        &created_at,
-                        &updated_at,
-                        message_count,
-                    )?;
-                    crate::db::conversation_repo::set_workspace_mode(conn, &id, workspace_mode.unwrap_or_default().as_str())
-                } else if let Some(ex) = existing {
-                    if updated_at > ex.updated_at {
-                        conn.execute(
-                            "UPDATE conversations SET title=?1, model=?2, provider=?3, workspace_path=?4, project_id=?5, research_mode=?6, pinned=?7, archived=?8, created_at=?9, updated_at=?10, message_count=?11 WHERE id=?12",
-                            rusqlite::params![
-                                title.as_deref(),
-                                model.as_deref(),
-                                provider.as_deref(),
-                                workspace_path.as_deref(),
-                                project_id.as_deref(),
-                                research_mode as i64, pinned as i64, archived as i64,
-                                &created_at, &updated_at, message_count,
-                                &id,
-                            ],
-                        )?;
-                        if let Some(mode) = workspace_mode {
-                            crate::db::conversation_repo::set_workspace_mode(conn, &id, mode.as_str())?;
-                        }
-                    }
-                    Ok(())
-                } else {
-                    Ok(())
-                }
-            })
-        }).await;
-
-        match conv_result {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(db_err))) => {
-                tracing::error!("Sync DB error for conversation {}: {:?}", id_for_err, db_err);
-            }
-            Ok(Err(conn_err)) => {
-                tracing::error!("Sync Conn error for conversation {}: {:?}", id_for_err, conn_err);
-            }
-            Err(join_err) => {
-                tracing::error!("Sync Join error for conversation {}: {:?}", id_for_err, join_err);
-            }
+    let mut buckets = req.messages_per_conversation;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        for header in req.conversations {
+            let messages = buckets.remove(&header.id).unwrap_or_default();
+            db.sync_conversation(&header.id, Some(&header), &messages)?;
         }
-    }
-
-    for (conv_id, messages) in &req.messages_per_conversation {
-        for msg in messages {
-            let msg_id = msg.id.clone();
-            let msg_id_for_err = msg_id.clone();
-            let cid = conv_id.clone();
-            let role = msg.role.clone();
-            let content = msg.content.clone();
-            let thinking = msg.thinking.clone();
-            let created_at = msg.created_at.clone();
-            let is_compact_boundary = msg.is_compact_boundary;
-            let sort_order = msg.sort_order;
-            let db_clone = db.clone();
-
-            let msg_result = tokio::task::spawn_blocking(move || {
-                db_clone.with_conn(|conn| {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO messages (id, conversation_id, role, content, thinking, created_at, is_compact_boundary, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![
-                            &msg_id, &cid, &role, &content,
-                            thinking.as_deref(),
-                            &created_at,
-                            is_compact_boundary as i64,
-                            sort_order,
-                        ],
-                    )?;
-                    Ok::<_, anyhow::Error>(())
-                })
-            }).await;
-
-            match msg_result {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(db_err))) => {
-                    tracing::error!("Sync DB error for message {}: {:?}", msg_id_for_err, db_err);
-                }
-                Ok(Err(conn_err)) => {
-                    tracing::error!("Sync Conn error for message {}: {:?}", msg_id_for_err, conn_err);
-                }
-                Err(join_err) => {
-                    tracing::error!("Sync Join error for message {}: {:?}", msg_id_for_err, join_err);
-                }
-            }
+        for (id, messages) in buckets {
+            db.sync_conversation(&id, None, &messages)?;
         }
-    }
-
-    for deleted_id in &req.deleted_conversation_ids {
-        let id = deleted_id.clone();
-        let db_clone = db.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            db_clone.with_conn(|conn| {
-                crate::db::conversation_repo::delete_conversation(conn, &id)
-            })
-        }).await;
-
-        match result {
-            Ok(Ok(Ok(()))) => {
-                deepseek_code_core::prompt::forget_session_files(
-                    state.data_dir.as_ref(),
-                    deleted_id,
-                );
-                tracing::info!("Sync Deleted conversation: {}", deleted_id);
-            }
-            Ok(Ok(Err(db_err))) => {
-                tracing::error!("Sync DB error for delete conversation {}: {:?}", deleted_id, db_err);
-            }
-            Ok(Err(conn_err)) => {
-                tracing::error!("Sync Conn error for delete conversation {}: {:?}", deleted_id, conn_err);
-            }
-            Err(join_err) => {
-                tracing::error!("Sync Join error for delete conversation {}: {:?}", deleted_id, join_err);
-            }
+        for id in req.deleted_conversation_ids {
+            db.sync_delete(&id)?;
+            deepseek_code_core::prompt::forget_session_files(state.data_dir.as_ref(), &id);
         }
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|error| {
+        tracing::error!(%error, "Sync push failed");
+        StatusCode::CONFLICT
+    })?;
 
     let server_timestamp = chrono::Utc::now().to_rfc3339();
     tracing::info!("Sync Push complete at {}", server_timestamp);
@@ -385,55 +218,24 @@ async fn sync_pull(
     drop(manager);
 
     let db = state.db_manager.clone();
-    let conversations_result = tokio::task::spawn_blocking({
-        let db = db.clone();
-        move || db.conversations()
-    })
-    .await;
-
-    let conversations = match conversations_result {
-        Ok(Ok(convs)) => convs,
-        _ => {
-            tracing::error!("Sync Failed to list conversations");
-            vec![]
-        }
-    };
-
-    let mut messages_per_conversation: HashMap<String, Vec<serde_json::Value>> =
-        HashMap::new();
-
-    for conv in &conversations {
-        let conv_id = conv.id.clone();
-        let conv_id_for_closure = conv_id.clone();
-        let db_clone = db.clone();
-        let msgs_result = tokio::task::spawn_blocking(move || {
-            db_clone.with_conn(|conn| {
-                crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_for_closure)
-            })
-        })
-        .await;
-
-        if let Ok(Ok(Ok(msgs))) = msgs_result {
-            let msg_jsons: Vec<serde_json::Value> = msgs
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "id": m.id,
-                        "conversation_id": m.conversation_id,
-                        "role": m.role,
-                        "content": m.content,
-                        "thinking": m.thinking,
-                        "created_at": m.created_at,
-                        "is_compact_boundary": m.is_compact_boundary,
-                        "sort_order": m.sort_order,
-                    })
-                })
-                .collect();
-            if !msg_jsons.is_empty() {
-                messages_per_conversation.insert(conv_id, msg_jsons);
+    let (conversations, messages_per_conversation) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let conversations = db.conversations()?;
+            let mut messages = HashMap::new();
+            for conversation in &conversations {
+                let rows = db.sync_messages(&conversation.id)?;
+                if !rows.is_empty() {
+                    messages.insert(conversation.id.clone(), rows);
+                }
             }
-        }
-    }
+            Ok((conversations, messages))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::error!(%error, "Sync pull failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let conv_jsons: Vec<serde_json::Value> = conversations
         .iter()

@@ -22,7 +22,9 @@ pub use usage::{CorpusUsage, DailyUsage};
 mod layout;
 mod lifecycle;
 pub use global::GlobalDb;
-pub use lifecycle::{Branch, CreateOptions, FirstMessage, ImportResult, Phase, ProjectSelection};
+pub use lifecycle::{
+    Branch, CreateOptions, FirstMessage, ImportResult, Phase, ProjectSelection, SyncHeader,
+};
 
 use anyhow::{ensure, Context, Result};
 use layout::{lock_keys, storage_key, Permits, SESSION};
@@ -229,13 +231,7 @@ impl Stores {
             drop(locks);
             locks = self.key_lock(&handle.key, true, false)?;
             handle.check_directory()?;
-            let _permit = Permits::take(1);
-            if layout::needs_upgrade(&path, SESSION)? {
-                let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                verify_manifest(&c, self.global().store_uuid(), id, &handle.incarnation)?;
-                drop(c);
-                layout::upgrade(&path, SESSION)?;
-            }
+            handle.upgrade_locked()?;
         }
         let _locks = locks;
         handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
@@ -291,6 +287,23 @@ impl SessionDb {
             current.as_deref() == Some(&self.incarnation),
             "Session incarnation is no longer visible"
         );
+        Ok(())
+    }
+    // Requires exclusive lifecycle access to the current incarnation.
+    fn upgrade_locked(&self) -> Result<()> {
+        let path = self.stores.sessions().join(&self.key).join("session.db");
+        let _permit = Permits::take(1);
+        if layout::needs_upgrade(&path, SESSION)? {
+            let c = layout::open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            verify_manifest(
+                &c,
+                self.stores.global().store_uuid(),
+                &self.id,
+                &self.incarnation,
+            )?;
+            drop(c);
+            layout::upgrade(&path, SESSION)?;
+        }
         Ok(())
     }
     fn connection_under_lock<T>(

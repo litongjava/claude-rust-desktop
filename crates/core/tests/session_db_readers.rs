@@ -404,7 +404,7 @@ fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() 
     let choice = |id: &str| {
         BindingSnapshot {
         provider_id:id.into(),model:"m".into(),generation:0,observation_only:false,environment:Default::default(),
-        providers:vec![serde_json::from_value(json!({"id":id,"name":id,"enabled":true,"api_format":"openai","api_key":"fixture","base_url":"http://localhost","models":[{"id":"m","name":"model","enabled":true}]})).unwrap()],
+        providers:vec![serde_json::from_value(json!({"id":id,"name":id,"enabled":true,"api_format":"openai","api_key":"fixture","base_url":"http://localhost","models":[{"id":"m","name":"model","enabled":true,"supports_web_search":false}]})).unwrap()],
     }
     };
     let mut original = choice("a");
@@ -455,5 +455,65 @@ fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() 
     let fresh = stores.create("bound", Default::default())?;
     assert_eq!(fresh.observe_provider()?.generation, 0);
     assert!(active.ensure_current().is_err());
+    Ok(())
+}
+
+#[test]
+fn sync_buckets_replay_after_content_commit_and_fence_retired_sessions() -> Result<()> {
+    use deepseek_code_core::db::{
+        message_repo::MessageRow,
+        session_store::{Phase, SyncHeader},
+    };
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let header: SyncHeader = serde_json::from_value(serde_json::json!({
+        "id":"remote","title":"From phone","pinned":true,"createdAt":"2026-01-01T00:00:00Z",
+        "updatedAt":"2026-01-02T00:00:00Z"
+    }))?;
+    let row: MessageRow = serde_json::from_value(serde_json::json!({
+        "id":"message","conversationId":"remote","role":"user","content":"first",
+        "createdAt":"2026-01-01T00:00:00Z","sortOrder":0
+    }))?;
+    stores.sync_conversation("remote", Some(&header), std::slice::from_ref(&row))?;
+    let g = stores.global().conversation("remote")?.unwrap();
+    assert!(g.pinned);
+    assert_eq!(g.message_count, 1);
+    let mut edit = row.clone();
+    edit.content = "remote edit".into();
+    let fault = stores.with_fault_hook(|phase| {
+        anyhow::ensure!(
+            phase != Phase::SyncContent,
+            "interrupted before acknowledgement"
+        );
+        Ok(())
+    });
+    assert!(fault
+        .sync_conversation("remote", None, std::slice::from_ref(&edit))
+        .is_err());
+    assert_eq!(stores.sync_messages("remote")?[0].content, "remote edit");
+    let mut local = row.clone();
+    local.content = "later local edit".into();
+    stores.sync_conversation("remote", None, std::slice::from_ref(&local))?;
+    stores.sync_conversation("remote", None, std::slice::from_ref(&edit))?;
+    assert_eq!(
+        stores.sync_messages("remote")?[0].content,
+        "later local edit"
+    );
+    let mut invalid = row.clone();
+    invalid.role = "assistant".into();
+    let mut insert = row.clone();
+    insert.id = "never committed".into();
+    assert!(stores
+        .sync_conversation("remote", None, &[insert, invalid])
+        .is_err());
+    assert_eq!(stores.sync_messages("remote")?.len(), 1);
+    assert!(stores
+        .sync_conversation("someone-else", None, std::slice::from_ref(&row))
+        .is_err());
+    stores.sync_delete("remote")?;
+    assert!(stores
+        .sync_conversation("remote", Some(&header), &[row])
+        .is_err());
+    assert!(stores.global().conversation("remote")?.is_none());
     Ok(())
 }

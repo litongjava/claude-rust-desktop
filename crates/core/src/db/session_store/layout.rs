@@ -12,8 +12,8 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-pub(super) const GLOBAL_VERSION: i32 = 6;
-pub(super) const SESSION_VERSION: i32 = 6;
+pub(super) const GLOBAL_VERSION: i32 = 7;
+pub(super) const SESSION_VERSION: i32 = 7;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -256,7 +256,10 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                 if version < 5 {
                     tx.execute_batch(include_str!("session_v5.sql"))?;
                 }
-                tx.execute_batch(include_str!("session_v6.sql"))?;
+                if version < 6 {
+                    tx.execute_batch(include_str!("session_v6.sql"))?;
+                }
+                tx.execute_batch(include_str!("session_v7.sql"))?;
                 tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
             }
             if kind == GLOBAL {
@@ -264,6 +267,7 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                     install_global_v5(tx)?;
                 }
                 tx.execute_batch(include_str!("global_v6.sql"))?;
+                tx.execute_batch(include_str!("global_v7.sql"))?;
             }
             tx.pragma_update(None, "user_version", schema_version(kind))?;
             Ok(())
@@ -487,6 +491,13 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     } else {
         &[]
     };
+    let sync: &[(&str, &str)] = if expected < 7 {
+        &[]
+    } else if kind == GLOBAL {
+        &[("sync_publications", "id digest incarnation")]
+    } else {
+        &[("sync_receipts", "digest content_revision metadata_revision")]
+    };
     for &(table, required) in tables
         .iter()
         .chain(added)
@@ -494,6 +505,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         .chain(v4)
         .chain(shared)
         .chain(bindings)
+        .chain(sync)
     {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
@@ -580,10 +592,12 @@ pub(super) fn initialize(
         install_session_v4(&tx)?;
         tx.execute_batch(include_str!("session_v5.sql"))?;
         tx.execute_batch(include_str!("session_v6.sql"))?;
+        tx.execute_batch(include_str!("session_v7.sql"))?;
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;
         tx.execute_batch(include_str!("global_v6.sql"))?;
+        tx.execute_batch(include_str!("global_v7.sql"))?;
     }
     populate(&tx)?;
     if kind == SESSION {

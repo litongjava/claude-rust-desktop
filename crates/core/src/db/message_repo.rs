@@ -143,12 +143,16 @@ pub fn load_trajectory_blobs(conn: &Connection, snapshot: &mut serde_json::Value
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRow {
     pub id: String,
+    #[serde(alias = "conversationId")]
     pub conversation_id: String,
     pub role: String,
     pub content: String,
     pub thinking: Option<String>,
+    #[serde(alias = "createdAt")]
     pub created_at: String,
+    #[serde(default, alias = "isCompactBoundary")]
     pub is_compact_boundary: bool,
+    #[serde(alias = "sortOrder")]
     pub sort_order: i64,
 }
 

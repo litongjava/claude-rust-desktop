@@ -1,5 +1,7 @@
 mod copy;
+mod sync;
 pub(super) use copy::workspace;
+pub use sync::SyncHeader;
 mod import;
 use super::layout::{self, canonical_uuid, durable_move, storage_key, sync_dir, Permits, SESSION};
 use super::{verify_manifest, SessionDb, Stores};
@@ -35,6 +37,7 @@ pub enum Phase {
     Removed,
     Retired,
     ForkSnapshot,
+    SyncContent,
     DeliveryClaimed,
     DeliveryCommitted,
     DeliveryAcknowledged,
@@ -77,6 +80,8 @@ struct Metadata {
     research: bool,
     created: String,
     project: Option<Project>,
+    #[serde(default)]
+    sync: Option<sync::SyncPublication>,
 }
 #[derive(Serialize, Deserialize, PartialEq)]
 enum Project {
@@ -252,6 +257,7 @@ enum Seed<'a> {
     New,
     Fork(&'a SessionDb, Branch<'a>),
     Import(&'a import::LegacySession),
+    Sync(sync::SyncSeed<'a>),
 }
 
 impl Stores {
@@ -301,7 +307,17 @@ impl Stores {
             research: options.research,
             created: match seed {
                 Seed::Import(s) => s.created_at.clone(),
+                Seed::Sync(s) => s.header.created_at.clone(),
                 _ => chrono::Utc::now().to_rfc3339(),
+            },
+            sync: match seed {
+                Seed::Sync(s) => Some(sync::SyncPublication {
+                    digest: s.digest.into(),
+                    workspace_path: s.header.workspace_path.clone(),
+                    pinned: s.header.pinned,
+                    archived: s.header.archived,
+                }),
+                _ => None,
             },
             project: options
                 .project
@@ -400,6 +416,7 @@ impl Stores {
                             .is_some_and(|s| s.provider_selection.is_some()),
                     )?,
                     Seed::Import(session) => session.populate(tx)?,
+                    Seed::Sync(s) => s.populate(tx)?,
                 }
                 self.step(Phase::BeforeSeal)
             })?;
@@ -702,6 +719,14 @@ impl Stores {
         tx.execute("INSERT INTO conversations(id,storage_key,incarnation,title,model,provider,workspace_path,project_id,
             workspace_mode,research_mode,created_at,updated_at,message_count,content_revision,first_prompt,latest_prompt,transcript_bytes,last_turn_status,git_branch,request_count,input_tokens,output_tokens,total_tokens)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",params![op.id,op.key,op.incarnation,meta.title,meta.model,meta.provider,workspace,project,meta.mode,meta.research,meta.created,p.activity,p.count,p.revision,p.first_prompt,p.latest_prompt,p.transcript_bytes,p.status,p.git_branch,p.request_count,p.input_tokens,p.output_tokens,p.total_tokens])?;
+        if let Some(sync) = &meta.sync {
+            tx.execute("UPDATE conversations SET pinned=?1,archived=?2,workspace_path=coalesce(?3,workspace_path) WHERE id=?4",
+                params![sync.pinned,sync.archived,sync.workspace_path,op.id])?;
+            tx.execute(
+                "INSERT INTO sync_publications VALUES(?1,?2,?3)",
+                [&op.id, &sync.digest, &op.incarnation],
+            )?;
+        }
         if let Some(saved) = &meta.source {
             let source = &saved.id;
             let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2 AND metadata_revision=?3)",params![source,saved.incarnation,saved.revision],|r|r.get(0))?;
