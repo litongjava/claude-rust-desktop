@@ -280,3 +280,91 @@ impl crate::db::DbManager {
         })?
     }
 }
+
+impl ExecutorHistory {
+    pub(crate) fn inherit_child_authority(&self, parent: &Self) -> Result<()> {
+        match (self, parent) {
+            (Self::Shared(db, child), Self::Shared(other, owner)) => {
+                ensure!(
+                    db.data_dir() == other.data_dir(),
+                    "Child belongs to another store"
+                );
+                crate::services::permission_authority::inherit(db, owner, child)
+            }
+            (Self::Session(child), Self::Session(owner)) => {
+                ensure!(
+                    child.stores.global().store_uuid() == owner.stores.global().store_uuid()
+                        && child.stores.data_dir() == owner.stores.data_dir()
+                        && child.id() != owner.id(),
+                    "Child belongs to another store or session"
+                );
+                let _locks = child
+                    .stores
+                    .group_access(vec![(&child.key, false, false), (&owner.key, false, false)])?;
+                child.check_directory()?;
+                owner.check_directory()?;
+                ensure!(
+                    child.stores.child_of(owner.id(), child.id())?,
+                    "Child execution parent changed"
+                );
+                let authority=owner.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,|c| {
+                    let mut query=c.prepare("SELECT source,origin_id,content_json FROM session_permission_authority WHERE conversation_id=?1 ORDER BY id")?;
+                    let rows=query.query_map([owner.id()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                })?;
+                child.write_locked("refresh child authority",|w|{
+                    let mut insert=w.0.prepare_cached("INSERT OR IGNORE INTO session_permission_authority(conversation_id,source,origin_id,content_json) VALUES(?1,?2,?3,?4)")?;
+                    for (source,id,content) in &authority{insert.execute(params![child.id(),source,id,content])?;}
+                    Ok(())
+                })
+            }
+            _ => anyhow::bail!("Child belongs to another store"),
+        }
+    }
+}
+
+impl SessionRepository<'_> {
+    pub(crate) fn has_worker_report(&self, report: &str) -> Result<bool> {
+        self.read(|c, id| {
+            Ok(
+                c.prepare_cached("SELECT 1 FROM messages WHERE conversation_id=?1 AND id=?2")?
+                    .exists([id, report])?,
+            )
+        })
+    }
+    pub(crate) fn record_worker_report(&self, report: &str, text: &str) -> Result<bool> {
+        self.write("record finished worker report", |c, id| {
+            if message_repo::get_message(c, report)?.is_some() {
+                return Ok(false);
+            }
+            let order = c.query_row(
+                "SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            let now = chrono::Utc::now().to_rfc3339();
+            message_repo::insert_message(c, report, id, "system", text, None, &now, false, order)?;
+            if matches!(self.0, Backend::Shared(..)) {
+                crate::db::conversation_repo::increment_message_count(c, id)?;
+                crate::db::conversation_repo::update_conversation_timestamp(c, id, &now)?;
+            }
+            Ok(true)
+        })
+    }
+}
+
+impl ExecutorHistory {
+    pub(crate) fn save_research_run(
+        &self,
+        run: &crate::services::deep_research::Run,
+    ) -> Result<()> {
+        ensure!(
+            self.id() == run.parent_session_id,
+            "Research run belongs to another session"
+        );
+        let encoded = serde_json::to_string(run)?;
+        self.child_repo().write("save research workflow", |c, _| {
+            super::state::set_local(c, &format!("workflow.{}", run.id), &encoded)
+        })
+    }
+}

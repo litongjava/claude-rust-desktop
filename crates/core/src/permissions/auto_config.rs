@@ -138,15 +138,15 @@ impl AutoConfig {
     }
 }
 
-pub fn load(context: &ServiceContext) -> Result<AutoConfig> {
-    let config = context.setting::<AutoConfig>(KEY)?.unwrap_or_default();
+pub fn load<D:crate::db::session_store::GlobalPreferences>(context: &ServiceContext<D>) -> Result<AutoConfig> {
+    let config = context.db.global_preference::<AutoConfig>(crate::db::session_store::GlobalSetting::MachinePreference(KEY))?.unwrap_or_default();
     config.validate()?;
     Ok(config)
 }
 
-pub fn save(context: &ServiceContext, config: &AutoConfig) -> Result<()> {
+pub fn save<D:crate::db::session_store::GlobalPreferences>(context: &ServiceContext<D>, config: &AutoConfig) -> Result<()> {
     config.validate()?;
-    context.save_setting(KEY, config)
+    context.db.save_global_preference(crate::db::session_store::GlobalSetting::MachinePreference(KEY), config)
 }
 
 #[cfg(test)]

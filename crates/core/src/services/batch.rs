@@ -615,10 +615,11 @@ fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
                 let session = store.create(&worker.worktree, &launch.model, &launch.provider)?;
                 // A stronger explicitly selected mode never erases existing deny
                 // rules or agent tool restrictions from the originating session.
-                store.db.with_conn(|conn| conn.execute(
-                    "INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    [format!("cli.permissions.{session}"),format!("cli.permissions.{}",batch.parent_session_id)]
-                ))??;
+                use crate::db::session_store::{settings::PERMISSIONS,SessionAccess};
+                let parent=store.db.select_session(&batch.parent_session_id)?;
+                if let Some(rules)=parent.preference(PERMISSIONS)? {
+                    store.db.select_session(&session)?.set_preference(PERMISSIONS,Some(&rules))?;
+                }
                 if let Some(agent) =
                     super::agents::for_session(&store.db, &batch.parent_session_id)?
                 {

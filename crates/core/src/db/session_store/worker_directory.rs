@@ -275,3 +275,80 @@ impl<D: super::shared::DirectoryRepository> WorkspaceDirectory for D {
         })
     }
 }
+
+impl Stores {
+    pub(crate) fn register_background_agent(
+        &self,
+        job: &str,
+        record: &serde_json::Value,
+    ) -> Result<()> {
+        let text = |key: &str| {
+            record[key]
+                .as_str()
+                .context("Missing background registration field")
+        };
+        self.global().write("register background agent",job,false,|tx|{
+            ensure!(tx.execute("INSERT INTO background_agents(job,parent_incarnation,child_incarnation,agent_type,description,started_at)
+                SELECT ?1,p.incarnation,c.incarnation,?4,?5,?6 FROM child_owners o
+                JOIN conversations p ON p.incarnation=o.parent_incarnation JOIN conversations c ON c.incarnation=o.child_incarnation
+                WHERE p.id=?2 AND c.id=?3 AND json_extract(o.record,'$.job_id')=?1",params![job,text("parent")?,text("session_id")?,text("agent_type")?,text("description")?,text("started_at")?])?==1,"Background worker registration changed");
+            Ok(())
+        })
+    }
+    pub fn background_agents(
+        &self,
+        job: Option<&str>,
+        child: Option<&str>,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        self.global().read(|c|{
+            let mut q=c.prepare("SELECT a.job,p.id,c.id,a.agent_type,a.description,a.started_at FROM background_agents a
+                JOIN conversations p ON p.incarnation=a.parent_incarnation JOIN conversations c ON c.incarnation=a.child_incarnation
+                WHERE (?1 IS NULL OR a.job=?1) AND (?2 IS NULL OR c.id=?2) ORDER BY a.started_at,a.job")?;
+            let rows=q.query_map(params![job,child],|r|Ok((r.get(0)?,serde_json::json!({"parent":r.get::<_,String>(1)?,"session_id":r.get::<_,String>(2)?,"agent_type":r.get::<_,String>(3)?,"description":r.get::<_,String>(4)?,"started_at":r.get::<_,String>(5)?}))))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+    pub fn background_agent(&self, job: &str) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .background_agents(Some(job), None)?
+            .pop()
+            .map(|(_, r)| r))
+    }
+}
+impl DbManager {
+    pub(crate) fn register_background_agent(
+        &self,
+        job: &str,
+        record: &serde_json::Value,
+    ) -> Result<()> {
+        save_shared(
+            self,
+            &format!("background-agent.{job}"),
+            &serde_json::to_string(record)?,
+        )
+    }
+    pub fn background_agents(
+        &self,
+        job: Option<&str>,
+        child: Option<&str>,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let rows=self.with_conn(|c|->rusqlite::Result<Vec<(String,String)>>{
+            let mut q=c.prepare("SELECT substr(key,18),value FROM peripheral_settings WHERE key LIKE 'background-agent.%' AND (?1 IS NULL OR key='background-agent.'||?1) ORDER BY rowid")?;
+            let rows=q.query_map([job],|r|Ok((r.get(0)?,r.get(1)?)))?;rows.collect()
+        })??;
+        let mut result = Vec::new();
+        for (job, raw) in rows {
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            if child.is_none_or(|c| value["session_id"] == c) {
+                result.push((job, value));
+            }
+        }
+        Ok(result)
+    }
+    pub fn background_agent(&self, job: &str) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .background_agents(Some(job), None)?
+            .pop()
+            .map(|(_, r)| r))
+    }
+}

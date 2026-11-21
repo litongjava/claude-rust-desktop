@@ -16,18 +16,9 @@ pub(crate) struct Entry {
 pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result<Vec<Entry>> {
     let peers = deepseek_code_core::services::session_messages::session_peers(context, session)?;
     let mut background = std::collections::HashMap::new();
-    context.db.with_conn(|conn| -> anyhow::Result<()> {
-        let mut query = conn
-            .prepare("SELECT value FROM peripheral_settings WHERE key LIKE 'background-agent.%'")?;
-        for raw in query.query_map([], |row| row.get::<_, String>(0))? {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw?) {
-                if let Some(id) = value["session_id"].as_str() {
-                    background.insert(id.to_owned(), value);
-                }
-            }
-        }
-        Ok(())
-    })??;
+    for (_,value) in context.db.background_agents(None,None)? {
+        if let Some(id)=value["session_id"].as_str(){ background.insert(id.to_owned(),value); }
+    }
     let mut entries = Vec::new();
     for peer in peers {
         let Some(id) = peer["id"].as_str() else {

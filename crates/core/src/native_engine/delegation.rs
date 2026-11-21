@@ -515,8 +515,9 @@ impl ToolLoopExecutor {
             .map_err(|_| anyhow::anyhow!("Owned child resume budget exhausted"))?;
         // Original provider/model, tool bounds, permissions and hooks stay with this executor.
         // Only event routing and durable transcript are refreshed for the current owner turn.
+        let child_history=entry.executor.executor_history.clone().context("Missing retained child history")?;
         entry.executor.execution_lease =
-            context.db.executor_history(id)?.execution_lease()?
+            child_history.execution_lease()?
             .map(std::sync::Arc::new);
         let current: Value = context
             .child_progress(&id)?
@@ -527,7 +528,11 @@ impl ToolLoopExecutor {
         );
         // Refresh verified owner constraints on every resume, without promoting
         // the model-generated resume prompt or peer inbox data to user authority.
-        crate::services::permission_authority::inherit(&context.db, &parent, id)?;
+        let parent_history=match self.executor_history.clone() {
+            Some(history)=>history,
+            None=>context.db.executor_history(&parent)?,
+        };
+        child_history.inherit_child_authority(&parent_history)?;
         let sessions = SessionStore::new(context.db.clone());
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;
@@ -900,8 +905,8 @@ impl ToolLoopExecutor {
             },
         )
         .await?;
-        context.save_setting(
-            &format!("background-agent.{}", handle.job_id),
+        context.db.register_background_agent(
+            &handle.job_id,
             &json!({"agent_type":handle.agent_type,"description":handle.description,"parent":parent,"session_id":handle.session_id,"started_at":chrono::Utc::now().to_rfc3339()}),
         )?;
         Ok(json!({

@@ -767,7 +767,7 @@ mod tests {
                 std::fs::write(directory.join("cancel"), b"cancel").unwrap();
             }
             update(&f.db, &f.session, |_, state| {
-                state.pending.as_mut().unwrap().source_job = Some(id);
+                state.pending.as_mut().unwrap().source_job = Some(id.clone());
                 Ok(())
             })
             .unwrap();

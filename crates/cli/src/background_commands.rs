@@ -680,7 +680,7 @@ pub(crate) fn running_agents(
         .filter(|job| matches!(job.status.as_str(), "starting" | "running"))
         .filter_map(|job| {
             let record = context
-                .setting::<serde_json::Value>(&format!("background-agent.{}", job.id))
+                .db.background_agent(&job.id)
                 .ok()
                 .flatten()?;
             let output_tokens = child_output_tokens(&context, &job.session_id);
@@ -716,7 +716,7 @@ pub(crate) fn agent_question(paths: &RuntimePaths, session: &str) -> Option<(Str
         if !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") {
             continue;
         }
-        let Some(record) = context.setting::<serde_json::Value>(&format!("background-agent.{}", job.id)).ok().flatten() else { continue };
+        let Some(record) = context.db.background_agent(&job.id).ok().flatten() else { continue };
         if let Ok(Some(question)) = background_sessions::pending_question(&paths.data_dir, &job.id, session) {
             if ANSWERED.lock().unwrap_or_else(|error| error.into_inner()).contains(&question.request_id) {
                 continue;
@@ -1203,7 +1203,7 @@ fn agent_notice(session: &Session, report: String) -> Result<String> {
         return Ok(report);
     };
     let context = crate::services::context(&session.paths)?;
-    let Some(record) = context.setting::<serde_json::Value>(&format!("background-agent.{id}"))? else {
+    let Some(record) = context.db.background_agent(id)? else {
         return Ok(report);
     };
     let status = report.lines().find_map(|line| line.strip_prefix("Status: ")).unwrap_or("completed");
@@ -1727,17 +1727,7 @@ pub(crate) fn agent_transcript(
     }
     // A detached worker commits its assistant row at turn completion. Its bounded
     // event tail provides tool progress while that row is still in memory.
-    let job_ids = context.db.with_conn(|conn| -> anyhow::Result<Vec<String>> {
-        let mut statement = conn.prepare("SELECT key,value FROM peripheral_settings WHERE key LIKE 'background-agent.%'")?;
-        let mut ids = Vec::new();
-        for row in statement.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?)))? {
-            let (key, raw) = row?;
-            if serde_json::from_str::<serde_json::Value>(&raw).is_ok_and(|value| value["session_id"] == id) {
-                if let Some(key) = key.strip_prefix("background-agent.") { ids.push(key.to_owned()); }
-            }
-        }
-        Ok(ids)
-    }).ok().and_then(Result::ok).unwrap_or_default();
+    let job_ids=context.db.background_agents(None,Some(id)).unwrap_or_default().into_iter().map(|(job,_)|job);
     for job_id in job_ids {
         if let Ok(job) = background_sessions::get(&context.paths.data_dir, &job_id) {
             if job.session_id != id || !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") { continue; }

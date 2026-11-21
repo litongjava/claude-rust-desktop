@@ -1460,6 +1460,7 @@ pub fn collect_completed(
     root: &Path,
     parent: &str,
 ) -> Result<Vec<String>> {
+    let owner=store.db.select_session(parent)?;
     let mut notices = Vec::new();
     for job in list(root, Some(parent))? {
         if job.session_id == parent
@@ -1474,11 +1475,7 @@ pub fn collect_completed(
             continue;
         }
         let message_id = format!("background-report:{}:{}", parent, job.id);
-        let exists = store
-            .db
-            .with_conn(|conn| crate::db::message_repo::get_message(conn, &message_id))??
-            .is_some();
-        if exists {
+        if owner.has_worker_report(&message_id)? {
             continue;
         }
         let execution_session = super::session_worker::job_execution_session(root, &job)?;
@@ -1518,36 +1515,7 @@ pub fn collect_completed(
         });
         let excerpt: String = body.chars().take(16384).collect();
         let report = format!("[Background task report]\nTask: {}\nSource session: {}\nStatus: {}\nTitle: {}\n\n{}{}\n[End background task report]", job.id, execution_session, job.status, job.title, excerpt, if excerpt.len()<body.len() { "\n[Excerpt truncated; use /tasks show for details.]" } else { "" });
-        let inserted = store.db.with_conn(|conn| -> Result<bool> {
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            if crate::db::message_repo::get_message(&tx, &message_id)?.is_some() {
-                return Ok(false);
-            }
-            let order: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?1",
-                [parent],
-                |row| row.get(0),
-            )?;
-            let now = chrono::Utc::now().to_rfc3339();
-            crate::db::message_repo::insert_message(
-                &tx,
-                &message_id,
-                parent,
-                "system",
-                &report,
-                None,
-                &now,
-                false,
-                order,
-            )?;
-            crate::db::conversation_repo::increment_message_count(&tx, parent)?;
-            crate::db::conversation_repo::update_conversation_timestamp(&tx, parent, &now)?;
-            tx.commit()?;
-            Ok(true)
-        })??;
+        let inserted=owner.record_worker_report(&message_id,&report)?;
         if inserted {
             notices.push(report);
         }
