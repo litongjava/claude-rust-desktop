@@ -103,12 +103,19 @@ impl Stores {
             // edits and projection updates can still run alongside this reader.
             let row = self.global().read(|c| super::directory::one(c, id))?
                 .context("Conversation retired")?;
-            let messages = shard.read(|r| r.enriched_messages())?;
+            let (messages, projection) = shard.read(|r| Ok((r.enriched_messages()?, r.projection()?)))?;
             let unchanged = self.global().read(|c| Ok(c.query_row(
                 "SELECT metadata_revision=?2 AND content_revision=?3 FROM conversations WHERE id=?1",
                 rusqlite::params![id, row.metadata_revision, row.content_revision], |r| r.get::<_, bool>(0)
             )?))?;
-            if unchanged { return Ok((Some(row.conversation), messages)); }
+            if !unchanged { continue; }
+            let mut conversation = row.conversation;
+            if projection.revision > row.content_revision {
+                conversation.message_count = projection.count;
+                conversation.title = super::directory::display_title(row.stored_title, projection.first_prompt.as_deref());
+                conversation.updated_at = super::history::latest_activity(&conversation.updated_at, &projection.activity).to_owned();
+            }
+            return Ok((Some(conversation), messages));
         }
     }
 

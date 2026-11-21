@@ -25,6 +25,7 @@ pub struct DirectoryEntry {
     pub last_turn_status: Option<String>,
     pub content_revision: i64,
     pub(super) metadata_revision: i64,
+    pub(super) stored_title: Option<String>,
 }
 const FIELDS: &str = "SELECT id, title, model, provider, workspace_path, project_id,
     research_mode, pinned, archived, created_at, updated_at, message_count, workspace_mode,
@@ -32,19 +33,21 @@ const FIELDS: &str = "SELECT id, title, model, provider, workspace_path, project
     content_revision, coalesce((SELECT b.parent_incarnation FROM conversation_private_workspace_bindings b
         WHERE b.child_id=conversations.id AND conversations.project_id IS NULL),incarnation),metadata_revision
     FROM conversations";
+pub(super) fn display_title(stored: Option<String>, first_prompt: Option<&str>) -> Option<String> {
+    if stored.as_deref().is_none_or(|title| title.trim().is_empty() || title.eq_ignore_ascii_case("CLI session")) {
+        first_prompt.map(str::to_owned).or(stored)
+    } else {
+        stored
+    }
+}
+
 fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
     let mut conversation = row_to_conversation(row)?;
     let first_prompt: Option<String> = row.get(14)?;
-    if conversation
-        .title
-        .as_deref()
-        .is_none_or(|title| title.trim().is_empty() || title.eq_ignore_ascii_case("CLI session"))
-    {
-        if let Some(prompt) = &first_prompt {
-            conversation.title = Some(prompt.clone());
-        }
-    }
+    let stored_title = conversation.title.take();
+    conversation.title = display_title(stored_title.clone(), first_prompt.as_deref());
     Ok(DirectoryEntry {
+        stored_title,
         conversation,
         incarnation: row.get(13)?,
         first_prompt,

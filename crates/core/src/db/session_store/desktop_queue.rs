@@ -110,7 +110,9 @@ impl Stores {
         let session = self.open_listed(&row)?;
         let lease = session.acquire_execution()?;
         session.settle_abandoned(&lease)?;
-        Ok((lease, false))
+        let options = super::conversations::first_chat_options(model, first)?;
+        let sealed_first = session.consume_sealed_first(options.first_message.as_ref())?;
+        Ok((lease, sealed_first))
     }
     pub fn existing_chat_lease(&self, id: &str) -> Result<ExecutionLease> {
         self.open_session(id)?.acquire_execution()

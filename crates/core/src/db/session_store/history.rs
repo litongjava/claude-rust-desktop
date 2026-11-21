@@ -121,7 +121,7 @@ impl Projection {
 
 // Compare instants including offsets and sub-millisecond precision. Keep the
 // original representation of the winning timestamp (including imported text).
-fn latest_activity<'a>(existing: &'a str, incoming: &'a str) -> &'a str {
+pub(super) fn latest_activity<'a>(existing: &'a str, incoming: &'a str) -> &'a str {
     if chrono::DateTime::parse_from_rfc3339(existing).ok()
         >= chrono::DateTime::parse_from_rfc3339(incoming).ok()
     {

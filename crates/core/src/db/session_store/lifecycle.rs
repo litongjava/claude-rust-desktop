@@ -268,6 +268,29 @@ enum Seed<'a> {
     Sync(sync::SyncSeed<'a>),
 }
 
+impl FirstMessage {
+    fn digest(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.text, &self.typed))?)))
+    }
+}
+
+impl SessionDb {
+    /// A sealed chat can be published by any recovery reader before its submitter retries.
+    /// Consume the receipt under the execution lease. Ordinary identical later prompts append.
+    pub(super) fn consume_sealed_first(&self, first: Option<&FirstMessage>) -> Result<bool> {
+        let Some(first) = first else { return Ok(false); };
+        let key = format!("first-chat-receipt.{}", self.incarnation());
+        let Some(saved) = self.read(|r| super::state::local(r.0, &key))? else { return Ok(false); };
+        let matches = saved == first.digest()?;
+        self.write_named("consume sealed first chat", |w| {
+            ensure!(w.0.execute("DELETE FROM peripheral_settings WHERE key=?1 AND value=?2", [&key, &saved])? == 1, "First chat receipt changed");
+            Ok(())
+        })?;
+        Ok(matches)
+    }
+}
+
 impl Stores {
     pub fn create(&self, id: &str, options: CreateOptions) -> Result<SessionDb> {
         let key = storage_key(id)?;
@@ -286,11 +309,13 @@ impl Stores {
         let incarnation = Uuid::new_v4().to_string();
         let mut lease = ExecutionLease::acquire(self.data_dir(), &incarnation)?
             .context("Invalid execution incarnation")?;
+        let first = options.first_message.clone();
         let shard = self.create_locked(id, options, Seed::Chat(&incarnation), None)?;
         lease.address = Some(shard.address());
         drop(locks);
         lease.lifecycle = self.key_lock(&key, false, false)?;
         shard.check_directory()?;
+        shard.consume_sealed_first(first.as_ref())?;
         Ok(lease)
     }
 
@@ -496,6 +521,9 @@ impl Stores {
                         crate::services::permission_authority::Source::User,
                         &content,
                     )?;
+                    if matches!(seed, Seed::Chat(_)) {
+                        super::state::set_local(tx, &format!("first-chat-receipt.{}", op.incarnation), &first.digest()?)?;
+                    }
                     let message = crate::db::transcript::MessageIds::new(&op.incarnation).issue();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
