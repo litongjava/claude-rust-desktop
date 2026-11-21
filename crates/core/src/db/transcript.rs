@@ -38,14 +38,16 @@ impl MessageIds {
         uuid::Uuid::from_bytes(bytes).to_string()
     }
 
-    fn accepts(&self, id: &str) -> bool {
-        let Ok(uuid) = uuid::Uuid::parse_str(id.strip_prefix("notice-").unwrap_or(id)) else {
-            return true;
-        };
+    fn foreign_owner_key(&self, id: &str) -> Option<String> {
+        let (prefix, raw) = id
+            .strip_prefix("notice-")
+            .map_or(("", id), |raw| ("notice-", raw));
+        let uuid = uuid::Uuid::parse_str(raw).ok()?;
         let bytes = uuid.as_bytes();
-        uuid.get_version_num() != 8
-            || bytes[0] != 0xdc
-            || bytes[10..] == self.check_bytes(&bytes[..10])
+        (uuid.get_version_num() == 8
+            && bytes[0] == 0xdc
+            && bytes[10..] != self.check_bytes(&bytes[..10]))
+        .then(|| format!("{prefix}{}", uuid.simple()))
     }
 }
 
@@ -114,13 +116,14 @@ pub fn replace_messages(
         anyhow::ensure!(retained.insert(msg_id.clone()), "Duplicate message ID");
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let previous = super::message_repo::get_message(tx, &msg_id)?;
+        let foreign_key = owner.foreign_owner_key(&msg_id);
         anyhow::ensure!(
             ["conversation_id", "conversationId"].into_iter().all(|key| {
                 msg.get(key).and_then(|v| v.as_str()).is_none_or(|source| source == id)
             })
-                && (previous.is_some() || owner.accepts(&msg_id) || tx.query_row(
+                && (previous.is_some() || foreign_key.is_none() || tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM removed_message_owners WHERE id=?1 AND role=?2)",
-                    rusqlite::params![msg_id,role], |r|r.get::<_,bool>(0))?),
+                    rusqlite::params![foreign_key,role], |r|r.get::<_,bool>(0))?),
             "Message ID belongs to a different conversation"
         );
         if let Some(previous) = &previous {

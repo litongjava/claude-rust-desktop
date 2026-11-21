@@ -712,8 +712,10 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
     let a = stores.open_session(A)?;
     assert_eq!(a.address().incarnation, inc);
     assert_eq!(a.read(|r| r.messages())?[0].content, "old");
-    a.save_mcp("assistant", "new", &wire(), false)?;
+    // The v10 migration publishes the refreshed prompt projection once.
     assert_eq!(a.read(|r| r.projection())?.revision, 2);
+    a.save_mcp("assistant", "new", &wire(), false)?;
+    assert_eq!(a.read(|r| r.projection())?.revision, 3);
     assert_eq!(fs::read_to_string(locks.join(".initialized"))?, store);
     Ok(())
 }

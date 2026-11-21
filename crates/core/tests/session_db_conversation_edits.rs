@@ -153,3 +153,33 @@ fn combined_detail_matches_the_committed_edit() -> Result<()> {
         writer.join().unwrap()
     })
 }
+
+#[test]
+fn imported_owner_accepts_all_uuid_spellings_on_restore() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let a = Stores::open(source.path())?;
+    a.create("shared", Default::default())?
+        .write(|w| w.append("user", "received"))?;
+    let mut rows = a.sync_messages("shared")?;
+    let uuid = uuid::Uuid::parse_str(&rows[0].id)?;
+    for prefix in ["", "notice-"] {
+        for spelling in [
+            uuid.to_string().to_uppercase(),
+            uuid.simple().to_string(),
+            uuid.braced().to_string(),
+            uuid.urn().to_string(),
+        ] {
+            let destination = tempfile::tempdir()?;
+            let b = Stores::open(destination.path())?;
+            let shard = b.create("shared", Default::default())?;
+            rows[0].id = format!("{prefix}{spelling}");
+            b.sync_conversation("shared", None, &rows)?;
+            let mut snapshot = b.conversation_detail("shared")?.1;
+            shard.edit_conversation(&json!({"messages":[]}))?;
+            snapshot[0]["id"] = json!(format!("{prefix}{uuid}"));
+            shard.edit_conversation(&json!({"messages":snapshot}))?;
+            assert_eq!(b.conversation_detail("shared")?.1[0]["content"], "received");
+        }
+    }
+    Ok(())
+}
