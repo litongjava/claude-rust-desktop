@@ -30,16 +30,7 @@ fn executor(
         },
     )
     .unwrap();
-    context
-        .db
-        .with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO conversations(id,created_at,updated_at) VALUES('auto-session','','')",
-                [],
-            )
-        })
-        .unwrap()
-        .unwrap();
+    context.db.create("auto-session", Default::default()).unwrap();
     crate::services::permission_authority::record_user(
         &context.db,
         "auto-session",

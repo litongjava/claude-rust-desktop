@@ -133,8 +133,8 @@ async fn ordinary_stop_hooks_and_goal_checks_consume_one_session_budget() {
     use crate::services::session_goals as goals;
     let root = tempfile::tempdir().unwrap();
     write_hook(root.path(), "Stop", "exit 2");
-    let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
-    db.init().unwrap();
+    let db = Arc::new(crate::db::session_store::Stores::open(root.path()).unwrap());
+    for id in ["parent", "child"] { db.create(id, Default::default()).unwrap(); }
     let goal = goals::set(&db, "parent", "Finish the task").unwrap();
     for _ in 0..3 {
         assert_eq!(
@@ -174,8 +174,8 @@ async fn stop_hook_prevent_continuation_pauses_goal_before_outer_evaluation() {
         format!("printf '%s' '{output}'")
     };
     write_hook(root.path(), "Stop", &command);
-    let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
-    db.init().unwrap();
+    let db = Arc::new(crate::db::session_store::Stores::open(root.path()).unwrap());
+    for id in ["parent", "child"] { db.create(id, Default::default()).unwrap(); }
     let goal = goals::set(&db, "parent", "Keep working").unwrap();
     let mut parent = executor(root.path())
         .with_conv_id("parent".into())

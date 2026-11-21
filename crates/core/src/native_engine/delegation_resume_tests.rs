@@ -201,7 +201,7 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
     assert_ne!(result["backgrounded"], true);
     let retained = registry.lock().unwrap();
     let progress = context
-        .setting::<Value>(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(progress["preview"], "child complete");
@@ -227,7 +227,7 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
     assert_eq!(api.requests.lock().unwrap().len(), 2);
     context
         .db
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE conversation_worktrees SET source_path=?1 WHERE conversation_id=?2",
                 rusqlite::params![context.paths.data_dir.to_string_lossy(), child],
@@ -264,7 +264,7 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         let retained = registry.lock().unwrap();
         let entry = retained.get(&child).unwrap();
         assert!(entry.executor.messages.is_empty());
-        assert!(entry.executor.message_inbox.is_none());
+        assert!(entry.executor.turn_delivery.upgrade().is_none());
         assert!(entry.executor.execution_lease.is_none());
     }
     let mut next = owner(&context, &parent, &cwd, &a, registry.clone());
@@ -309,7 +309,7 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         1
     );
     let resumed: Value = context
-        .setting(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(resumed["status"], "completed");
@@ -348,8 +348,8 @@ async fn retained_child_keeps_its_launch_binding_and_new_children_use_the_owner_
     assert_eq!(*first.keys.lock().unwrap(), ["Bearer local-first", "Bearer local-first"]);
     assert_eq!(*second.keys.lock().unwrap(), ["Bearer local-second"]);
     // A retained transport does not grant a stale owner a new admission.
-    context.db.with_conn(crate::native_engine::session_binding::store::schema).unwrap().unwrap();
-    binding.track(&context.db, &parent);
+
+    binding.track_session(context.db.open_session(&parent).unwrap());
     let error = host.resume_owned_child(child["session_id"].as_str().unwrap(), Some("stale owner"), false)
         .await.unwrap_err();
     assert!(error.to_string().contains("Provider binding changed"));
@@ -407,7 +407,7 @@ async fn resume_cancellation_releases_ownership_and_never_automatically_restarts
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     let saved: Value = context
-        .setting(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(saved["status"], "cancelled");
@@ -453,7 +453,7 @@ async fn foreign_owner_changed_policy_changed_trust_and_lost_configuration_make_
         .unwrap_err()
         .to_string()
         .contains("needs_resume"));
-    context.db.with_conn(|conn|conn.execute("UPDATE project_folders SET trusted=0 WHERE project_id=(SELECT project_id FROM conversations WHERE id=?1)",[&child])).unwrap().unwrap();
+    context.db.fixture_directory(|conn|conn.execute("UPDATE project_folders SET trusted=0 WHERE project_id=(SELECT project_id FROM conversations WHERE id=?1)",[&child])).unwrap().unwrap();
     assert!(first
         .resume_owned_child(&child, Some("trust revoked"), false)
         .await
@@ -609,7 +609,7 @@ fn private_session_execution_lease_rejects_other_engine_until_drop() {
     let (_temp, context, _store, parent, _cwd) = fixture();
     context
         .db
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE conversations SET workspace_mode='chat',project_id=NULL WHERE id=?1",
                 [&parent],

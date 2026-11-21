@@ -967,8 +967,7 @@ pub(crate) fn super_agent_runtime_fixture(
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(session_dir).unwrap();
-    let db = crate::db::DbManager::new(data.join(crate::runtime::DATABASE_FILE)).unwrap();
-    db.init().unwrap();
+    let db = crate::db::session_store::Stores::open(&data).unwrap();
     let db = Arc::new(db);
     let session = crate::runtime::SessionStore::new(db.clone())
         .create(session_dir, "fixture", "fixture")

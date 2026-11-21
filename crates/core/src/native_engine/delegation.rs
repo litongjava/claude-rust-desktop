@@ -1901,7 +1901,7 @@ fn child_usage_accumulates_requests_without_counting_repeated_snapshots_or_paren
     assert_eq!(state.value["output_tokens_estimated"], false);
     let count = context
         .db
-        .with_conn(|conn| {
+        .fixture_shard(&id, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM model_requests WHERE conversation_id=?1",
                 [&id],

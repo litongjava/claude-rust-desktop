@@ -245,7 +245,7 @@ fn persist(dones: &[Done]) -> Vec<(String, String, String, String, bool)> {
     let assistant = store.append(&session, "assistant", "").unwrap();
     context
         .db
-        .with_conn(|conn| -> anyhow::Result<()> {
+        .fixture_shard(&session, |conn| -> anyhow::Result<()> {
             for (index, done) in dones.iter().enumerate() {
                 crate::db::message_repo::insert_tool_call(
                     conn,
@@ -264,7 +264,7 @@ fn persist(dones: &[Done]) -> Vec<(String, String, String, String, bool)> {
         .unwrap();
     let rows = context
         .db
-        .with_conn(|conn| crate::db::message_repo::get_tool_calls_for_message(conn, &assistant))
+        .fixture_shard(&session, |conn| crate::db::message_repo::get_tool_calls_for_message(conn, &assistant))
         .unwrap()
         .unwrap();
     rows.into_iter()

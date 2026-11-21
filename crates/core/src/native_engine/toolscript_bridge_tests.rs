@@ -140,7 +140,7 @@ fn persist(root: &Path, parent: &str, events: &[EngineEvent]) -> (String, String
     }
     context
         .db
-        .with_conn(|conn| -> anyhow::Result<()> {
+        .fixture_shard(&session, |conn| -> anyhow::Result<()> {
             crate::db::message_repo::insert_tool_call(
                 conn,
                 &format!("{assistant}:{parent}"),
@@ -261,7 +261,7 @@ async fn sequential_calls_execute_real_tools_and_persist_after_reopen() {
     let store = crate::runtime::SessionStore::new(reopened.db.clone());
     reopened
         .db
-        .with_conn(|conn| {
+        .fixture_shard(&session, |conn| {
             let rows = crate::db::message_repo::get_tool_calls_for_message(conn, &assistant)?;
             let origins = crate::db::message_repo::get_tool_origins_for_message(conn, &assistant)?;
             assert_eq!(rows.len(), 5, "parent + four nested rows");
@@ -318,7 +318,7 @@ async fn repeated_calls_and_replayed_events_keep_distinct_rows() {
     assert_ne!(seen.dones[0].id, seen.dones[1].id);
 
     // Replaying the same completion must not add a row.
-    let (_session, assistant) = persist(root, "parent-repeat", &events);
+    let (session, assistant) = persist(root, "parent-repeat", &events);
     let context = crate::services::session_messages::context(&root.join("data")).unwrap();
     let mut rows = Vec::new();
     let mut origins = ToolOrigins::new();
@@ -331,7 +331,7 @@ async fn repeated_calls_and_replayed_events_keep_distinct_rows() {
     }
     context
         .db
-        .with_conn(|conn| {
+        .fixture_shard(&session, |conn| {
             save(conn, "fixture", &assistant, "", &rows, &origins)?;
             let rows = crate::db::message_repo::get_tool_calls_for_message(conn, &assistant)?;
             assert_eq!(rows.len(), 3, "parent + two calls, no duplicate");

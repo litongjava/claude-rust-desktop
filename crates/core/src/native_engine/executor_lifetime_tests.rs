@@ -120,22 +120,12 @@ impl Fixture {
     }
 
     fn active(&self) -> bool {
-        crate::services::session_messages::execution_active(&self.paths.data_dir, &self.id)
+        self.store.db.open_session(&self.id).and_then(|s| crate::services::session_messages::execution_active(&self.paths.data_dir, s.incarnation()))
             .expect("execution probe")
     }
 
     fn stored_messages(&self) -> i64 {
-        self.store
-            .db
-            .with_conn(|conn| {
-                Ok::<i64, anyhow::Error>(conn.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-                    [&self.id],
-                    |row| row.get(0),
-                )?)
-            })
-            .unwrap()
-            .unwrap()
+        self.store.history(&self.id).unwrap().len() as i64
     }
 }
 

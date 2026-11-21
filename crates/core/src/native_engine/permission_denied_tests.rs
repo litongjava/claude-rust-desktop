@@ -154,7 +154,7 @@ async fn permission_denied_retry_on_both_protocols_and_owned_children_reclassifi
                 axum::serve(listener, app).await.unwrap();
             });
             let provider=ResolvedProvider{provider:serde_json::from_value(json!({"id":"fixture","name":"Fixture","base_url":endpoint,"api_key":"fixture-only","api_format":format,"models":[],"enabled":true})).unwrap(),model:serde_json::from_value(json!({"id":"fixture","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap()};
-            context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('fixture','','')",[])).unwrap().unwrap();
+            context.db.create("fixture", Default::default()).unwrap();
             crate::services::permission_authority::record_user(
                 &context.db,
                 "fixture",
@@ -304,16 +304,7 @@ async fn permission_denied_provenance_excludes_static_asks_failures_and_stale_re
             },
         )
         .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                conn.execute(
-                    "INSERT INTO conversations(id,created_at,updated_at) VALUES('fixture','','')",
-                    [],
-                )
-            })
-            .unwrap()
-            .unwrap();
+        context.db.create("fixture", Default::default()).unwrap();
         crate::services::permission_authority::record_user(
             &context.db,
             "fixture",

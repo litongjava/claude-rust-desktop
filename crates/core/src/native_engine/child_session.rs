@@ -978,7 +978,7 @@ mod tests {
         assert!(!error.to_string().is_empty());
         let children: Vec<String> = context
             .db
-            .with_conn(|conn| -> Result<Vec<String>> {
+            .fixture_directory(|conn| -> Result<Vec<String>> {
                 let mut statement = conn.prepare("SELECT id FROM conversations WHERE id <> ?1")?;
                 let ids = statement
                     .query_map([&parent], |row| row.get::<_, String>(0))?
@@ -1058,7 +1058,7 @@ mod tests {
     fn conversation_count(context: &ServiceContext) -> i64 {
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
             })
             .unwrap()
@@ -1086,7 +1086,7 @@ mod tests {
         let parent = sessions.create(temp.path(), "fixture", "fixture").unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute("UPDATE conversations SET archived=1 WHERE id=?1", [&parent])
             })
             .unwrap()

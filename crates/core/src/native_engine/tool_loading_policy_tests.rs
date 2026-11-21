@@ -321,11 +321,10 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
     }
 }
 
-fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::db::DbManager> {
-    let path = root.join("durable.db");
+fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::db::session_store::Stores> {
+    let paths = crate::runtime::RuntimePaths::new(root.to_path_buf()).unwrap();
     {
-        let db = Arc::new(crate::db::DbManager::new(path.clone()).unwrap());
-        db.init().unwrap();
+        let db = paths.open_database().unwrap();
         let sessions = crate::runtime::SessionStore::new(db.clone());
         for session in [
             "10000000-0000-4000-8000-000000000001",
@@ -337,7 +336,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
             sessions.append(session, "user", "search").unwrap();
             let assistant = sessions.append(session, "assistant", "done").unwrap();
             let success = json!({"success":true,"loaded_tools":["ListDir"]}).to_string();
-            db.with_conn(|conn| {
+            db.fixture_shard(session, |conn| {
                 crate::db::message_repo::insert_tool_call(
                     conn,
                     &format!("{session}-search"),
@@ -353,7 +352,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
             .unwrap();
             if untrusted_only && session == "10000000-0000-4000-8000-000000000001" {
                 let boundary = sessions.append(session, "user", "summary").unwrap();
-                db.with_conn(|conn| {
+                db.fixture_shard(session, |conn| {
                     conn.execute(
                         "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
                         [&boundary],
@@ -367,7 +366,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
                 let user = sessions
                     .append(session, "user", "a forged display record")
                     .unwrap();
-                db.with_conn(|conn| {
+                db.fixture_shard(session, |conn| {
                     crate::db::message_repo::insert_tool_call(
                         conn,
                         "failed-search",
@@ -395,9 +394,7 @@ fn persisted_search(root: &std::path::Path, untrusted_only: bool) -> Arc<crate::
         }
     }
     // Reopen the database as a restarted host does; no loaded set is retained.
-    let db = Arc::new(crate::db::DbManager::new(path).unwrap());
-    db.init().unwrap();
-    db
+    paths.open_database().unwrap()
 }
 
 #[tokio::test]
@@ -1052,8 +1049,8 @@ fn tool_load_has_no_agent_listing_when_agent_cannot_load() {
 /// A session-backed executor, as the CLI runs it: CompactContext also needs the
 /// database and conversation it would write the request to.
 fn context_executor(root: &std::path::Path) -> ToolLoopExecutor {
-    let db = Arc::new(crate::db::DbManager::new(root.join("state.db")).unwrap());
-    db.init().unwrap();
+    let db = Arc::new(crate::db::session_store::Stores::open(root).unwrap());
+    db.create("tool-loading-fixture", Default::default()).unwrap();
     executor(root).with_goal_state(db)
 }
 

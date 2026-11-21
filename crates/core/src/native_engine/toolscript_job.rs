@@ -2081,15 +2081,18 @@ mod j2_tests {
     use super::*;
 
     /// A data directory with the real schema the job opens.
-    fn database(root: &Path) -> std::sync::Arc<crate::db::DbManager> {
+    fn database(root: &Path) -> std::sync::Arc<crate::db::session_store::Stores> {
         crate::runtime::RuntimePaths::new(root.to_path_buf())
             .unwrap()
             .open_database()
             .unwrap()
     }
 
-    fn set_durable(db: &crate::db::DbManager, key: &str, value: &str) {
-        db.with_conn(|conn| {
+    fn set_durable(db: &crate::db::session_store::Stores, key: &str, value: &str) {
+        let (name,id) = key.rsplit_once('.').unwrap();
+        db.create(id, Default::default()).unwrap();
+        let key = if name == "cli.permissions" {name} else {key};
+        db.fixture_shard(id, |conn| {
             conn.execute(
                 "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2194,6 +2197,7 @@ mod j2_tests {
         let workspace = root.path().join("workspace");
         fs::create_dir_all(&workspace).unwrap();
         let db = database(root.path());
+        db.create("s3", Default::default()).unwrap();
         assert!(read_permission_snapshot(root.path(), &workspace, &db, "s3").is_ok());
         fs::write(root.path().join("settings.json"), "{\"permissions\": ").unwrap();
         let error = read_permission_snapshot(root.path(), &workspace, &db, "s3")

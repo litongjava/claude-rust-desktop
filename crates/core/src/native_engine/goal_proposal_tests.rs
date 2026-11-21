@@ -4,8 +4,8 @@ use super::*;
 async fn goal_proposals_are_local_main_session_only_and_return_without_waiting() {
     crate::config::OrchestrationConfig::init_global().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(crate::db::DbManager::new(root.path().join("state.db")).unwrap());
-    db.init().unwrap();
+    let db = Arc::new(crate::db::session_store::Stores::open(root.path()).unwrap());
+
     let session = crate::runtime::SessionStore::new(db.clone())
         .create(root.path(), "fixture", "fixture")
         .unwrap();

@@ -1399,7 +1399,7 @@ mod tests {
         save_metadata(temp.path(), occurrence, &CommandMetadata::Shell(capture)).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&id, |conn| {
                 crate::db::message_repo::insert_tool_call(
                     conn,
                     &row_id,
@@ -1471,7 +1471,7 @@ mod tests {
         );
         let stored = store
             .db
-            .with_conn(|conn| crate::db::message_repo::get_tool_calls_for_message(conn, &assistant))
+            .fixture_shard(&id, |conn| crate::db::message_repo::get_tool_calls_for_message(conn, &assistant))
             .unwrap()
             .unwrap();
         assert_eq!(stored[0].output.as_deref(), Some(raw.as_str()));

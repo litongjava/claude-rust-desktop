@@ -1984,7 +1984,7 @@ mod tests {
         let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(session, |conn| {
                 crate::db::message_repo::insert_message(
                     conn,
                     id,

@@ -328,7 +328,7 @@ mod tests {
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
         let store = SessionStore::new(paths.open_database().unwrap());
         let session = store.create(root.path(), "mock", "mock").unwrap();
-        let mut turn = TurnTimer::start(store.db.clone(), &session).unwrap();
+        let mut turn = store.db.start_turn_timer(&session).unwrap();
         let origin = SuggestionTurn::begin(
             store.db.clone(),
             &session,
@@ -432,7 +432,7 @@ mod tests {
             let paths = RuntimePaths::new(root.path().join("data")).unwrap();
             let store = SessionStore::new(paths.open_database().unwrap());
             let session = store.create(root.path(), model, "groq-fixture").unwrap();
-            let mut turn = TurnTimer::start(store.db.clone(), &session).unwrap();
+            let mut turn = store.db.start_turn_timer(&session).unwrap();
             let origin = SuggestionTurn::begin(
                 store.db.clone(),
                 &session,
