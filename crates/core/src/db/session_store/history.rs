@@ -240,6 +240,10 @@ impl SessionRead<'_> {
                 })?;
         crate::db::transcript::enriched_messages(self.0, &id)
     }
+    pub fn last_assistant_report(&self) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT content FROM messages WHERE role='assistant' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1", [], |row| row.get(0)).optional()?)
+    }
+
     pub fn messages(&self) -> Result<Vec<messages::MessageRow>> {
         let id: String = self
             .0
@@ -684,12 +688,23 @@ impl SessionWrite<'_> {
         )
     }
     pub fn rewind_from(&self, message: &str) -> Result<()> {
+        self.remove_tail(message,None)
+    }
+
+    /// The retry will allocate a fresh segment under the original live turn.
+    pub fn rewind_failed_attempt(&self, message:&str, turn:&str)->Result<()> {
+        ensure!(self.0.prepare("SELECT 1 FROM execution_turns WHERE id=?1 AND conversation_id=?2 AND status='running'")?.exists([turn,self.1])?,
+            "Compaction retry lost the active turn");
+        self.remove_tail(message,Some(turn))
+    }
+
+    fn remove_tail(&self,message:&str,retained_turn:Option<&str>)->Result<()> {
         let order: i64 = self.0.query_row(
             "SELECT sort_order FROM messages WHERE id=?1",
             [message],
             |r| r.get(0),
         )?;
-        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order>=?1) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order<?1)", [order])?;
+        self.0.execute("DELETE FROM execution_turns WHERE id IS NOT ?2 AND id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order>=?1) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order<?1)", params![order,retained_turn])?;
         self.0
             .execute("DELETE FROM messages WHERE sort_order>=?1", [order])?;
         self.2.set(true);

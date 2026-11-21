@@ -356,13 +356,7 @@ mod tests {
         assert!(last_reported_request(&store.db, &child, "model")
             .unwrap()
             .is_none());
-        store
-            .db
-            .fixture_shard(&parent, |conn| {
-                conn.execute("DELETE FROM messages WHERE conversation_id=?1", [&parent])
-            })
-            .unwrap()
-            .unwrap();
+        store.db.open_session(&parent).unwrap().write(|w|w.replace_messages(&[])).unwrap();
         assert!(last_request(&store.db, &parent).unwrap().is_none());
     }
 

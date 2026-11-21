@@ -819,7 +819,7 @@ pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepse
         return Ok(false);
     }
     crate::compaction::notice("Context limit reached; compacting the conversation and retrying…");
-    session.store.db.open_session(&session.id)?.write(|w| w.rewind_from(&rows[index].id))?;
+    session.store.db.open_session(&session.id)?.write(|w| w.rewind_failed_attempt(&rows[index].id,&turn.record().turn_id))?;
     turn.clear_segment();
     compact_automatic(session, "", None).await?;
     Ok(true)

@@ -196,6 +196,11 @@ impl Stores {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_history_write<T>(&self,id:&str,mut body:impl FnMut(&Connection)->Result<T>)->Result<T>{
+        self.open_session(id)?.write(|w|body(w.0))
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.root.path
     }

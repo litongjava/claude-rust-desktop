@@ -327,23 +327,10 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     if !terminal_status(&job.status) {
         return None;
     }
-    if !root.join(crate::runtime::DATABASE_FILE).exists() {
-        return None;
-    }
     let execution = crate::services::session_worker::job_execution_session(root, job).ok()?;
-    let conn = rusqlite::Connection::open_with_flags(
-        root.join(crate::runtime::DATABASE_FILE),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    conn.query_row(
-        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC, rowid DESC LIMIT 1",
-        [&execution],
-        |row| row.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    if !root.join("global.db").is_file() { return None; }
+    let stores = crate::db::session_store::Stores::open(root).ok()?;
+    stores.open_session(&execution).ok()?.read(|r| r.last_assistant_report()).ok().flatten()
 }
 
 /// Head of a string on a UTF-8 character boundary.
@@ -1709,8 +1696,10 @@ mod tests {
         // open beyond the wait deadline plus a short bounded read. The job's
         // own status is still reported; only the supplementary report remains
         // unavailable.
-        let lock =
-            rusqlite::Connection::open(root.path().join(crate::runtime::DATABASE_FILE)).unwrap();
+        let child=job["session_id"].as_str().unwrap();
+        let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
+        stores.create(child,Default::default()).unwrap();
+        let lock=rusqlite::Connection::open_with_flags(root.path().join("sessions").join(child).join("session.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
         lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let started = tokio::time::Instant::now();
         let value = execute_for_session_async(
@@ -1743,8 +1732,10 @@ mod tests {
             .as_millis() as u64;
         let job = json!({"id":id,"foreground":false,"parent_session_id":session,"session_id":uuid::Uuid::new_v4().to_string(),"title":"Review changes","status":"running","supervisor_pid":null,"child_pid":null,"started_ms":now,"heartbeat_ms":now,"finished_ms":null,"exit_code":null,"error":null});
         std::fs::write(dir.join("state.json"), job.to_string()).unwrap();
-        let lock =
-            rusqlite::Connection::open(root.path().join(crate::runtime::DATABASE_FILE)).unwrap();
+        let child=job["session_id"].as_str().unwrap();
+        let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
+        stores.create(child,Default::default()).unwrap();
+        let lock=rusqlite::Connection::open_with_flags(root.path().join("sessions").join(child).join("session.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
         lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
         // timeout:0 still reads the snapshot, bounded by a short read deadline.
         let started = tokio::time::Instant::now();
@@ -1982,23 +1973,9 @@ mod tests {
     fn insert_assistant(root: &Path, session: &str, id: &str, text: &str, order: i64) {
         let paths = crate::runtime::RuntimePaths::new(root.to_path_buf()).unwrap();
         let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
-        store
-            .db
-            .fixture_shard(session, |conn| {
-                crate::db::message_repo::insert_message(
-                    conn,
-                    id,
-                    session,
-                    "assistant",
-                    text,
-                    None,
-                    "2026-01-01T00:00:00Z",
-                    false,
-                    order,
-                )
-            })
-            .unwrap()
-            .unwrap();
+        store.db.fixture_history_write(session, |conn| crate::db::message_repo::insert_message(
+            conn,id,session,"assistant",text,None,"2026-01-01T00:00:00Z",false,order
+        )).unwrap();
     }
 
     fn set_job_status(root: &Path, id: &str, status: &str) {
