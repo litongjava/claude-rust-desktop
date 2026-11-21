@@ -349,3 +349,44 @@ fn approval_decisions_require_the_selected_shard_or_one_unique_match() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn runtime_resolves_new_resume_clear_and_child_under_one_root() -> Result<()> {
+    use deepseek_code_core::runtime::{RuntimePaths, SessionStore};
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(root.path().join("data"))?;
+    let sentinel = paths.data_dir.join("deepseek_code.db");
+    std::fs::create_dir_all(&paths.data_dir)?;
+    std::fs::write(&sentinel, b"existing user history")?;
+    let store = SessionStore::new(std::sync::Arc::new(paths.open_stores()?));
+    let id = store.create(root.path(), "model", "provider")?;
+    assert!(store
+        .create_with_id(root.path(), "other", "provider", &id)
+        .is_err());
+    let message = store.append_hook_user(&id, "startup")?;
+    let shard = store.db.open_session(&id)?;
+    assert_eq!(
+        shard.read(|s| s.message_metadata(&message))?.unwrap()["type"],
+        "hook"
+    );
+    assert!(shard.read(|s| s.authority())?.is_empty());
+    store.append_user_content(
+        &id,
+        "question",
+        &json!([{"type":"text","text":"first input"}]),
+    )?;
+    assert_eq!(store.history(&id)?[1]["content"], "question");
+    assert_eq!(store.resume(&id)?.model.as_deref(), Some("model"));
+    assert_eq!(store.latest(root.path())?.unwrap().id, id);
+    let child = store.derive_owned_child(&id, &paths.data_dir.join("workspaces"), root.path())?;
+    assert_eq!(
+        store.workspace(&child, &paths.data_dir.join("workspaces"))?,
+        root.path()
+    );
+    let cleared = store.clear(&id)?;
+    assert!(store.history(&cleared)?.is_empty());
+    assert_eq!(store.history(&store.fork(&id)?)?.len(), 2);
+    assert_eq!(std::fs::read(&sentinel)?, b"existing user history");
+    Ok(())
+}

@@ -200,9 +200,18 @@ pub fn default_permissions() -> Arc<PermissionManager> {
 const SESSION_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sessions use the same project trust, Code prompt and SQLite schema as Desktop.
-pub struct SessionStore {
-    pub db: Arc<DbManager>,
+pub struct SessionStore<D = DbManager> {
+    pub db: Arc<D>,
 }
+
+impl<D> SessionStore<D> {
+    pub fn new(db: Arc<D>) -> Self {
+        Self { db }
+    }
+}
+
+#[path = "runtime_sessions.rs"]
+mod sessions;
 
 #[cfg(test)]
 mod identity_tests {
@@ -284,10 +293,7 @@ pub(crate) fn replay_history(
     Ok((history, boundary))
 }
 
-impl SessionStore {
-    pub fn new(db: Arc<DbManager>) -> Self {
-        Self { db }
-    }
+impl SessionStore<DbManager> {
 
     pub fn create(&self, workspace: &Path, model: &str, provider: &str) -> Result<String> {
         self.create_with_id(workspace, model, provider, &uuid::Uuid::new_v4().to_string())
