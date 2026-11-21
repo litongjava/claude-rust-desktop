@@ -1,8 +1,8 @@
 //! Requests are delivered to an existing manager, never a temporary replacement process.
 use super::McpServerManager;
+use crate::db::session_store::McpControl;
 use crate::services::{EnvironmentCredentials, ServiceContext};
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::{sync::Arc, time::Duration};
 fn now() -> i64 {
@@ -55,13 +55,14 @@ impl Drop for Host {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        let _ = self
-            .context
-            .db
-            .with_conn(|c| c.execute("DELETE FROM mcp_hosts WHERE id=?1", [&self.id]));
+        let _ = self.context.db.remove_mcp_host(&self.id);
     }
 }
-async fn serve(context: &ServiceContext, id: &str, manager: &McpServerManager) -> Result<()> {
+async fn serve(
+    context: &ServiceContext<impl McpControl>,
+    id: &str,
+    manager: &McpServerManager,
+) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut last_heartbeat: Option<tokio::time::Instant> = None;
     let mut last_servers_json = String::new();
@@ -90,28 +91,15 @@ async fn serve(context: &ServiceContext, id: &str, manager: &McpServerManager) -
 }
 
 fn write_request_result(
-    context: &ServiceContext,
+    context: &ServiceContext<impl McpControl>,
     request: &str,
     error: &Option<String>,
 ) -> Result<usize> {
-    Ok(context.db.with_conn(|c| {
-        c.execute(
-            "UPDATE mcp_requests SET state=?1,error=?2 WHERE id=?3",
-            params![
-                if error.is_some() {
-                    "failed"
-                } else {
-                    "completed"
-                },
-                error,
-                request
-            ],
-        )
-    })??)
+    context.db.report_mcp_restart(request, error.as_deref())
 }
 
 async fn tick_once(
-    context: &ServiceContext,
+    context: &ServiceContext<impl McpControl>,
     id: &str,
     manager: &McpServerManager,
     last_heartbeat: &mut Option<tokio::time::Instant>,
@@ -130,7 +118,9 @@ async fn tick_once(
     let heartbeat_due = *last_servers_json != servers_json
         || last_heartbeat.is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
     if heartbeat_due {
-        context.db.with_conn(|c|c.execute("INSERT INTO mcp_hosts(id,pid,expires_at,servers) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at,servers=excluded.servers",params![id,std::process::id(),now()+30,servers_json]))??;
+        context
+            .db
+            .heartbeat_mcp(id, std::process::id(), now() + 30, &servers_json)?;
         *last_heartbeat = Some(tokio::time::Instant::now());
         *last_servers_json = servers_json;
     }
@@ -140,12 +130,7 @@ async fn tick_once(
             return Err(write_error);
         }
     }
-    let request:Option<(String,String)>=context.db.with_conn(|c|c.query_row("SELECT id,server FROM mcp_requests WHERE host=?1 AND state='pending' AND expires_at>?2 ORDER BY rowid LIMIT 1",params![id,now()],|r|Ok((r.get(0)?,r.get(1)?))).optional())??;
-    if let Some((request, server)) = request {
-        let claimed=context.db.with_conn(|c|c.execute("UPDATE mcp_requests SET state='running' WHERE id=?1 AND state='pending' AND expires_at>?2",params![request,now()]))??;
-        if claimed != 1 {
-            return Ok(());
-        }
+    if let Some((request, server)) = context.db.claim_mcp_restart(id, now())? {
         let result = if servers.contains(&server) {
             match tokio::time::timeout(Duration::from_secs(20), manager.restart_server(&server))
                 .await
@@ -164,19 +149,12 @@ async fn tick_once(
     }
     Ok(())
 }
-pub fn hosts(context: &ServiceContext) -> Result<Vec<HostStatus>> {
-    context.db.with_conn(|c| -> Result<_> {
-        let mut s =
-            c.prepare("SELECT id,pid,servers FROM mcp_hosts WHERE expires_at>?1 ORDER BY id")?;
-        let rows = s.query_map([now()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, u32>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, pid, servers) = row?;
+pub fn hosts(context: &ServiceContext<impl McpControl>) -> Result<Vec<HostStatus>> {
+    context
+        .db
+        .mcp_advertisements(now())?
+        .into_iter()
+        .map(|(id, pid, servers)| {
             Ok(HostStatus {
                 id,
                 pid,
@@ -184,9 +162,12 @@ pub fn hosts(context: &ServiceContext) -> Result<Vec<HostStatus>> {
             })
         })
         .collect()
-    })?
 }
-pub async fn restart(context: &ServiceContext, server: &str, host: Option<&str>) -> Result<String> {
+pub async fn restart(
+    context: &ServiceContext<impl McpControl>,
+    server: &str,
+    host: Option<&str>,
+) -> Result<String> {
     let matches: Vec<_> = hosts(context)?
         .into_iter()
         .filter(|h| host.is_none_or(|id| id == h.id) && h.servers.iter().any(|s| s == server))
@@ -198,16 +179,12 @@ pub async fn restart(context: &ServiceContext, server: &str, host: Option<&str>)
     );
     let id = uuid::Uuid::new_v4().to_string();
     let host = &matches[0].id;
-    context.db.with_conn(|c|c.execute("INSERT INTO mcp_requests(id,host,server,expires_at,state) VALUES(?1,?2,?3,?4,'pending')",params![id,host,server,now()+25]))??;
+    context
+        .db
+        .request_mcp_restart(&id, host, server, now() + 25)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(27);
     loop {
-        let (state, error): (String, Option<String>) = context.db.with_conn(|c| {
-            c.query_row(
-                "SELECT state,error FROM mcp_requests WHERE id=?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-        })??;
+        let (state, error) = context.db.mcp_restart_status(&id)?;
         if state == "completed" {
             return Ok(host.clone());
         }
@@ -225,11 +202,12 @@ pub async fn restart(context: &ServiceContext, server: &str, host: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    type ServiceContext = crate::services::ServiceContext<crate::db::session_store::Stores>;
     use crate::runtime::RuntimePaths;
 
     fn fixture() -> (tempfile::TempDir, ServiceContext) {
         let temp = tempfile::tempdir().unwrap();
-        let context = ServiceContext::open(
+        let context = ServiceContext::from_stores(
             RuntimePaths::new(temp.path().to_path_buf()).unwrap(),
             Arc::new(EnvironmentCredentials),
         )
@@ -238,18 +216,7 @@ mod tests {
     }
 
     fn host_row(context: &ServiceContext, id: &str) -> Option<(i64, String)> {
-        context
-            .db
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT expires_at,servers FROM mcp_hosts WHERE id=?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-            })
-            .unwrap()
-            .unwrap()
+        context.db.mcp_advertisement(id).unwrap()
     }
 
     async fn wait_for_host_row(context: &ServiceContext, id: &str) -> (i64, String) {
@@ -304,7 +271,7 @@ mod tests {
         let task = spawn_host(&context, manager, &id);
         let first = wait_for_host_row(&context, &id).await;
 
-        let path = temp.path().join(crate::runtime::DATABASE_FILE);
+        let path = temp.path().join("global.db");
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(path).unwrap();
@@ -334,27 +301,11 @@ mod tests {
         let request = uuid::Uuid::new_v4().to_string();
         context
             .db
-            .with_conn(|c| {
-                c.execute(
-                    "INSERT INTO mcp_requests(id,host,server,expires_at,state) VALUES(?1,?2,?3,?4,'pending')",
-                    params![request, id, "missing", now() + 25],
-                )
-            })
-            .unwrap()
+            .request_mcp_restart(&request, &id, "missing", now() + 25)
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let state = loop {
-            let state: String = context
-                .db
-                .with_conn(|c| {
-                    c.query_row(
-                        "SELECT state FROM mcp_requests WHERE id=?1",
-                        [&request],
-                        |r| r.get(0),
-                    )
-                })
-                .unwrap()
-                .unwrap();
+            let (state, _) = context.db.mcp_restart_status(&request).unwrap();
             if state != "pending" {
                 break state;
             }
