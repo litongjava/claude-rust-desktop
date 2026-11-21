@@ -59,6 +59,7 @@ impl GlobalDb {
         nonblocking: bool,
         body: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        layout::allow_entry()?;
         let mut slot = if nonblocking {
             self.pool
                 .try_get()
@@ -105,7 +106,7 @@ impl GlobalDb {
             |r| r.get(0),
         )?;
         ensure!(store == self.uuid, "Global store identity changed");
-        body(conn)
+        layout::with_checkout("global checkout", || body(conn))
     }
 
     pub(super) fn read<T>(&self, body: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {

@@ -33,6 +33,7 @@ struct Root {
     repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
     repair_cursor: Mutex<String>,
     verified: Mutex<HashMap<String, Arc<Mutex<Option<VerifiedShard>>>>>,
+    upgraded_directory: bool,
     migrating: std::sync::atomic::AtomicBool,
 }
 static ROOTS: LazyLock<Mutex<HashMap<PathBuf, Weak<Root>>>> = LazyLock::new(Default::default);
@@ -58,12 +59,13 @@ impl Stores {
             if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
                 root
             } else {
-                let uuid = layout::open_root(&path)?;
+                let (uuid, upgraded_directory) = layout::open_root(&path)?;
                 let mut global = GlobalDb::new(&path, uuid)?;
                 let root = Arc::new_cyclic(|weak| {
                     global.root = weak.clone();
                     Root {
                         global,
+                        upgraded_directory,
                         repair: Default::default(),
                         repair_cursor: Default::default(),
                         verified: Default::default(),

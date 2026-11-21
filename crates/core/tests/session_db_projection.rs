@@ -341,6 +341,22 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
     Ok(())
 }
 
+fn remove_v4_features(c: &Connection) -> Result<()> {
+    c.execute_batch(
+        "DROP TRIGGER cancel_rewound_compaction; DROP TABLE compaction_cancellations;
+        ALTER TABLE compaction_request DROP COLUMN target_message;
+        ALTER TABLE file_read_stamps DROP COLUMN digest;
+        DROP INDEX projection_prompt_order",
+    )?;
+    for name in ["message", "typed", "request"] {
+        for action in ["insert", "update", "delete"] {
+            c.execute_batch(&format!("DROP TRIGGER projection_{name}_{action}"))?;
+        }
+    }
+    c.execute_batch("DROP TABLE projection_state; DROP TABLE request_metric_deltas")?;
+    Ok(())
+}
+
 #[test]
 fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
     let root = tempdir()?;
@@ -363,15 +379,8 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
                 c.execute_batch(&format!("DROP TRIGGER context_search_{owner}_{operation}"))?;
             }
         }
-        c.execute_batch("DROP TRIGGER cancel_rewound_compaction; DROP TABLE compaction_cancellations; DROP INDEX projection_prompt_order")?;
-        for name in ["message", "typed", "request"] {
-            for action in ["insert", "update", "delete"] {
-                c.execute_batch(&format!("DROP TRIGGER projection_{name}_{action}"))?;
-            }
-        }
+        remove_v4_features(&c)?;
         for table in [
-            "projection_state",
-            "request_metric_deltas",
             "context_search_chunks",
             "context_search_sources",
             "message_metadata",
@@ -740,6 +749,10 @@ fn fix_global_decoder_releases_checkout_before_entering_session() -> Result<()> 
     let a = s.create(A, Default::default())?;
     s.global()
         .set_setting(GlobalSetting::MachinePreference("test"), &"value")?;
+    let nested = s
+        .global()
+        .with_read_for_test(|| a.read(|r| r.git_branch()))?;
+    assert!(nested.unwrap_err().to_string().contains("global checkout"));
     let barrier = Arc::new(Barrier::new(4));
     std::thread::scope(|scope| {
         let workers = (0..4)
@@ -873,5 +886,86 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
         .open_session(A)?
         .read(|r| r.setting(EDITOR))?
         .is_none());
+    Ok(())
+}
+
+#[test]
+fn shard_replacement_with_the_same_incarnation_requires_verification() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let session = stores.create(
+        A,
+        CreateOptions {
+            first_message: Some(FirstMessage {
+                text: "first".into(),
+                typed: Some(json!(["test"])),
+            }),
+            ..Default::default()
+        },
+    )?;
+    let dir = root.path().join("sessions").join(A);
+    let path = dir.join("session.db");
+    session.read(|r| r.initial_message())?;
+    let key = std::fs::File::open(root.path().join("session-locks").join(A))?;
+    key.lock()?;
+    let replacement = dir.join("replacement.db");
+    {
+        let old = Connection::open(&path)?;
+        let cookie: i64 = old.pragma_query_value(None, "schema_version", |r| r.get(0))?;
+        old.execute("VACUUM INTO ?1", [replacement.to_str().unwrap()])?;
+        let copy = Connection::open(&replacement)?;
+        copy.execute_batch(
+            "PRAGMA journal_mode=WAL;
+            UPDATE message_user_content SET content_json=cast(content_json AS BLOB);
+            UPDATE projection_state SET history_dirty=0",
+        )?;
+        copy.pragma_update(None, "schema_version", cookie)?;
+    }
+    std::fs::rename(&replacement, &path)?;
+    drop(key);
+    assert!(session
+        .read(|_| Ok(()))
+        .unwrap_err()
+        .to_string()
+        .contains("decoding initial message"));
+    Ok(())
+}
+
+#[test]
+fn upgrading_p3_stamps_requires_rereading_and_binds_pending_requests() -> Result<()> {
+    let root = tempdir()?;
+    let path = root.path().join("tracked");
+    std::fs::write(&path, b"first")?;
+    let target = {
+        let stores = Stores::open_for_test(root.path())?;
+        let s = stores.create(A, Default::default())?;
+        s.read_tracked_file(&path)?;
+        s.write(|w| {
+            w.append("user", "first")?;
+            let target = w.append("assistant", "second")?;
+            w.request_compaction("pending", 50, 100)?;
+            Ok(target)
+        })?
+    };
+    let db = root.path().join("sessions").join(A).join("session.db");
+    {
+        let c = Connection::open(&db)?;
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        remove_v4_features(&c)?;
+        c.execute_batch("PRAGMA user_version=3; COMMIT")?;
+    }
+    let stores = Stores::open_for_test(root.path())?;
+    let s = stores.open_session(A)?;
+    assert!(s.check_file_write(&path).is_err());
+    s.read_tracked_file(&path)?;
+    s.check_file_write(&path)?;
+    let owner = s.delivery_owner()?;
+    let claim = owner.claim_compaction()?.unwrap();
+    s.write(|w| w.rewind_from(&target))?;
+    assert_eq!(
+        s.read(|r| r.compaction_cancellation(claim.request_id()))?
+            .as_deref(),
+        Some("target removed by rewind")
+    );
     Ok(())
 }

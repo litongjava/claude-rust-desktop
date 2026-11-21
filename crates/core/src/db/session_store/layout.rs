@@ -40,25 +40,28 @@ pub(super) fn is_storage_key(key: &str) -> bool {
         })
 }
 
-thread_local! { static IN_SESSION_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static STORE_CALLBACK: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 
 pub(super) fn allow_entry() -> Result<()> {
-    ensure!(
-        !IN_SESSION_CALLBACK.get(),
-        "Cannot enter a store operation from a session transaction callback"
-    );
+    if let Some(held) = STORE_CALLBACK.get() {
+        anyhow::bail!("Cannot enter a store operation from a {held}");
+    }
     Ok(())
 }
 
 pub(super) fn callback<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_checkout("session transaction callback", body)
+}
+
+pub(super) fn with_checkout<T>(held: &'static str, body: impl FnOnce() -> Result<T>) -> Result<T> {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
-            IN_SESSION_CALLBACK.set(false);
+            STORE_CALLBACK.set(None);
         }
     }
     allow_entry()?;
-    IN_SESSION_CALLBACK.set(true);
+    STORE_CALLBACK.set(Some(held));
     let _reset = Reset;
     body()
 }
@@ -388,15 +391,14 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         let objects: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE
              (type='index' AND tbl_name='messages' AND name='projection_prompt_order') OR
-             (type='trigger' AND tbl_name IN ('messages','message_user_content','model_requests')
-              AND name IN ('projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_insert',
-                           'projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_update',
-                           'projection_' || CASE tbl_name WHEN 'messages' THEN 'message' WHEN 'model_requests' THEN 'request' ELSE 'typed' END || '_delete'))", [], |r|r.get(0))?;
+             (type='trigger' AND (
+                (tbl_name='messages' AND name IN ('projection_message_insert','projection_message_update','projection_message_delete','cancel_rewound_compaction'))
+                OR (tbl_name='model_requests' AND name IN ('projection_request_insert','projection_request_update','projection_request_delete'))
+                OR (tbl_name='message_user_content' AND name IN ('projection_typed_insert','projection_typed_update','projection_typed_delete'))))", [], |r|r.get(0))?;
         ensure!(
-            objects == 10,
+            objects == 11,
             "Missing required session summary index or trigger"
         );
-        ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name='messages' AND name='cancel_rewound_compaction')", [], |r|r.get::<_,bool>(0))?, "Missing compaction rewind trigger");
         &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_dirty request_count input_tokens output_tokens total_tokens"),
           ("compaction_request","target_message"), ("compaction_cancellations","id reason"), ("file_read_stamps","digest"), ("request_metric_deltas","direction input output total")]
     } else {
@@ -516,7 +518,7 @@ pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
     sync_dir(path.parent().unwrap())
 }
 
-pub(super) fn open_root(root: &Path) -> Result<String> {
+pub(super) fn open_root(root: &Path) -> Result<(String, bool)> {
     let path = root.join("global.db");
     let stage = root.join(".global-staging");
     let locks = root.join("session-locks");
@@ -620,6 +622,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             sync_dir(root)?;
         }
     }
+    let mut upgraded = false;
     if global_version(&path)? < GLOBAL_VERSION {
         let _guard = lock_existing(&locks.join(".directory"), true)?;
         if global_version(&path)? < GLOBAL_VERSION {
@@ -635,6 +638,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
             );
             drop(c);
             upgrade(&path, GLOBAL)?;
+            upgraded = true;
         }
     }
     let uuid = read_global_uuid(&path, GLOBAL_VERSION)?;
@@ -642,7 +646,7 @@ pub(super) fn open_root(root: &Path) -> Result<String> {
         fs::read_to_string(&marker)? == uuid,
         "Global store UUID changed"
     );
-    Ok(uuid)
+    Ok((uuid, upgraded))
 }
 
 fn global_version(path: &Path) -> Result<i32> {

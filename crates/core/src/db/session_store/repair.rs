@@ -11,18 +11,8 @@ const INTERVAL: Duration = Duration::from_secs(2);
 impl Stores {
     pub(super) fn start_projection_repair(&self) {
         self.root.repair.get_or_init(|| {
-            // G invalidates pre-summary directory rows on upgrade. Finish that
-            // one-time format migration before exposing its new summary fields.
-            let old_rows = self.global().read(|c| {
-                let mut s=c.prepare("SELECT id,storage_key,incarnation FROM conversations WHERE content_revision=-1")?;
-                let rows=s.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-            });
-            if let Ok(rows)=old_rows {
-                for (id,key,incarnation) in rows {
-                    let s=SessionDb {stores:self.clone(),id,key,incarnation};
-                    if let Err(error)=s.upgrade_for_repair(){tracing::debug!(%error,"Session migration postponed");}
-                }
+            if self.root.upgraded_directory {
+                self.migrate_directory_summaries();
             }
             self.try_repair_page();
             let root = Arc::downgrade(&self.root);
@@ -35,6 +25,34 @@ impl Stores {
             });
             stop
         });
+    }
+
+    // Only the process which upgraded G performs this one-time backfill.
+    // If interrupted, the ordinary rotating pass discovers remaining old shards.
+    fn migrate_directory_summaries(&self) {
+        let old_rows = self.global().read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id,storage_key,incarnation FROM conversations WHERE content_revision=-1",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        });
+        match old_rows {
+            Ok(rows) => {
+                for (id, key, incarnation) in rows {
+                    let session = SessionDb {
+                        stores: self.clone(),
+                        id,
+                        key,
+                        incarnation,
+                    };
+                    if let Err(error) = session.upgrade_for_repair() {
+                        tracing::debug!(%error,"Session migration postponed");
+                    }
+                }
+            }
+            Err(error) => tracing::debug!(%error,"Directory migration postponed"),
+        }
     }
 
     fn try_repair_page(&self) {
