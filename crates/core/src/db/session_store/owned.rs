@@ -8,8 +8,8 @@ use std::sync::Arc;
 pub trait SessionAccess {
     fn select_session<'a>(&'a self, id: &'a str) -> Result<SessionRepository<'a>>;
 }
-pub struct SessionRepository<'a>(Backend<'a>);
-enum Backend<'a> {
+pub struct SessionRepository<'a>(pub(super) Backend<'a>);
+pub(super) enum Backend<'a> {
     Admitted(SessionDb),
     Shared(&'a DbManager, &'a str),
 }

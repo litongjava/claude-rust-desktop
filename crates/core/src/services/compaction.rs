@@ -130,8 +130,10 @@ fn legacy_marked(conn: &rusqlite::Connection, session: &str) -> Result<bool> {
 /// Successful compactions committed by this session. A session from before
 /// the counter existed reports only what it can prove; a branch that copied an
 /// ancestor's boundaries never claims them as its own.
-pub fn count(db: &DbManager, session: &str) -> Result<CompactionCount> {
-    db.with_conn(|conn| -> Result<CompactionCount> {
+pub fn count(db: &impl crate::db::session_store::SessionAccess, session: &str) -> Result<CompactionCount> {
+    db.select_session(session)?.compaction_total()
+}
+pub(crate) fn legacy_count(conn: &rusqlite::Connection, session: &str) -> Result<CompactionCount> {
         let (own, inherited) = boundary_attribution(conn, session)?;
         Ok(match saved_count(conn, session)? {
             // An explicit counter (including a branch's initial zero) is
@@ -143,7 +145,6 @@ pub fn count(db: &DbManager, session: &str) -> Result<CompactionCount> {
             None if inherited == 0 => CompactionCount::Exact(own),
             None => CompactionCount::LegacyAfterUpgrade(own),
         })
-    })?
 }
 
 /// A committed compaction's report, available to a caller that cancels while
@@ -216,11 +217,12 @@ impl CompactionTracker {
 }
 
 pub struct PreparedCompaction {
-    conversation_id: String,
+    pub(crate) incarnation: Option<String>,
+    pub(crate) conversation_id: String,
     /// SHA-256 of the history at planning time; only equality matters.
-    fingerprint: String,
-    transcript: String,
-    count: usize,
+    pub(crate) fingerprint: String,
+    pub(crate) transcript: String,
+    pub(crate) count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,25 +296,13 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
     ))
 }
 
-pub fn prepare(db: &DbManager, id: &str) -> Result<PreparedCompaction> {
-    db.with_conn(|conn| {
-        let conversation =
-            conversation_repo::get_conversation(conn, id)?.context("Session not found")?;
-        ensure!(!conversation.archived, "Session is archived");
-        let (fingerprint, transcript, count) = fingerprint(conn, id)?;
-        ensure!(count >= 2, "Not enough messages to compact");
-        Ok(PreparedCompaction {
-            conversation_id: id.into(),
-            fingerprint,
-            transcript,
-            count,
-        })
-    })?
+pub fn prepare(db: &impl crate::db::session_store::SessionAccess, id: &str) -> Result<PreparedCompaction> {
+    db.select_session(id)?.prepare_compaction()
 }
 
 /// Commit only a completed summary of an unchanged transcript. Original rows remain intact.
 pub fn commit(
-    db: &DbManager,
+    db: &impl crate::db::session_store::SessionAccess,
     prepared: PreparedCompaction,
     summary: &str,
 ) -> Result<CompactionResult> {
@@ -320,7 +310,7 @@ pub fn commit(
 }
 
 fn commit_with_context(
-    db: &DbManager,
+    db: &impl crate::db::session_store::SessionAccess,
     prepared: PreparedCompaction,
     generated: &GeneratedSummary,
     session_context: Option<&str>,
@@ -330,20 +320,11 @@ fn commit_with_context(
         !summary.trim().is_empty() && summary.chars().count() <= 32_000,
         "Empty or oversized compaction summary"
     );
-    // The whole commit is atomic and retried on transient contention; the body
-    // only reads its arguments and writes rows, so a retry starts from scratch.
-    db.with_conn(|conn| {
-        crate::db::write_tx(
-            conn,
-            "commit compaction",
-            std::time::Duration::from_secs(30),
-            |tx| commit_locked(tx, &prepared, generated, session_context),
-        )
-    })?
+    db.select_session(&prepared.conversation_id)?.commit_compaction(&prepared, generated, session_context)
 }
 
-fn commit_locked(
-    tx: &rusqlite::Transaction<'_>,
+pub(crate) fn commit_locked(
+    tx: &rusqlite::Connection,
     prepared: &PreparedCompaction,
     generated: &GeneratedSummary,
     session_context: Option<&str>,

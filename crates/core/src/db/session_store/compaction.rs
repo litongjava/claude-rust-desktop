@@ -108,9 +108,9 @@ impl SessionRead<'_> {
     }
 }
 
-impl DeliveryOwner {
-    fn check_compaction_session(&self) -> Result<()> {
-        let s = &self.session;
+impl SessionDb {
+    fn require_active_compaction(&self) -> Result<()> {
+        let s = self;
         let archived: bool = s.stores.global().read(|c| {
             Ok(c.query_row(
                 "SELECT archived FROM conversations WHERE id=?1 AND incarnation=?2",
@@ -121,13 +121,14 @@ impl DeliveryOwner {
         ensure!(!archived, "Session is archived");
         Ok(())
     }
-
+}
+impl DeliveryOwner {
     /// The execution lease is the claim. Leave the request durable until the
     /// boundary commits so a replacement worker can resume the same work.
     pub fn claim_compaction(&self) -> Result<Option<CompactionClaim>> {
         layout::allow_entry()?;
         let s = &self.session;
-        self.check_compaction_session()?;
+        s.require_active_compaction()?;
         let candidate = s.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
             let request = tx
@@ -182,7 +183,7 @@ impl DeliveryOwner {
     ) -> Result<String> {
         layout::allow_entry()?;
         let s = &self.session;
-        self.check_compaction_session()?;
+        s.require_active_compaction()?;
         ensure!(s.incarnation == claim.incarnation, "Wrong compaction owner");
         ensure!(
             !summary.text.trim().is_empty() && summary.text.chars().count() <= 32_000,
@@ -197,22 +198,165 @@ impl DeliveryOwner {
                 compaction::fingerprint(w.0, w.1)?.0 == claim.fingerprint,
                 "Session changed during compaction"
             );
-            let content = format!(
-                "[Conversation summary — earlier transcript retained in session history]\n{}",
-                summary.text.trim()
-            );
-            let message = w.append("user", &content)?;
-            if let Some(native) = &summary.native {
-                w.native_boundary(&message, native)?;
-            } else {
-                w.0.execute(
-                    "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
-                    [&message],
-                )?;
-                w.0.execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
-            }
-            w.0.execute("DELETE FROM compaction_checkpoint", [])?;
-            Ok(message)
+            w.commit_summary(summary)
         })
     }
+}
+
+impl SessionRepository<'_> {
+    pub(crate) fn compaction_total(&self) -> Result<compaction::CompactionCount> {
+        match &self.0 {
+            owned::Backend::Admitted(shard) => shard.read(|r| {
+                Ok(compaction::CompactionCount::Exact(
+                    r.compaction_count()?.try_into()?,
+                ))
+            }),
+            owned::Backend::Shared(_, _) => self.read(compaction::legacy_count),
+        }
+    }
+
+    pub(crate) fn prepare_compaction(&self) -> Result<compaction::PreparedCompaction> {
+        let incarnation = match &self.0 {
+            owned::Backend::Admitted(shard) => Some(shard.incarnation().to_owned()),
+            owned::Backend::Shared(_, _) => None,
+        };
+        if let owned::Backend::Admitted(shard) = &self.0 {
+            shard.require_active_compaction()?;
+        }
+        self.read(|c, id| {
+            if incarnation.is_none() {
+                let row = crate::db::conversation_repo::conversation_metadata(c, id)?
+                    .context("Session not found")?;
+                ensure!(!row.archived, "Session is archived");
+            }
+            let (fingerprint, transcript, count) = compaction::fingerprint(c, id)?;
+            ensure!(count >= 2, "Not enough messages to compact");
+            Ok(compaction::PreparedCompaction {
+                incarnation,
+                conversation_id: id.into(),
+                fingerprint,
+                transcript,
+                count,
+            })
+        })
+    }
+
+    pub(crate) fn commit_compaction(
+        &self,
+        prepared: &compaction::PreparedCompaction,
+        generated: &compaction::GeneratedSummary,
+        context: Option<&str>,
+    ) -> Result<compaction::CompactionResult> {
+        match &self.0 {
+            owned::Backend::Shared(_, _) => {
+                ensure!(prepared.incarnation.is_none(), "Compaction store changed");
+                self.write("commit compaction", |c, _| {
+                    compaction::commit_locked(c, prepared, generated, context)
+                })
+            }
+            owned::Backend::Admitted(s) => {
+                ensure!(
+                    prepared.incarnation.as_deref() == Some(s.incarnation()),
+                    "Compaction session was replaced"
+                );
+                let _locks = s.stores.key_lock(&s.key, false, false)?;
+                s.require_active_compaction()?;
+                s.write_locked("commit compaction", |w| {
+                    ensure!(
+                        compaction::fingerprint(w.0, w.1)?.0 == prepared.fingerprint,
+                        "Session changed during compaction; retry after the active turn finishes"
+                    );
+                    let message_id = w.commit_summary(generated)?;
+                    if let Some(context) = context {
+                        state::set_local(
+                            w.0,
+                            &crate::services::session_hooks::key(w.1),
+                            &serde_json::to_string(context)?,
+                        )?;
+                    }
+                    Ok(compaction::CompactionResult {
+                        message_id,
+                        summarized_messages: prepared.count,
+                        warnings: Vec::new(),
+                        summary_path: None,
+                        export_error: None,
+                        duration_ms: 0,
+                    })
+                })
+            }
+        }
+    }
+}
+
+impl SessionWrite<'_> {
+    fn commit_summary(&self, summary: &compaction::GeneratedSummary) -> Result<String> {
+        let content = format!(
+            "[Conversation summary — earlier transcript retained in session history]\n{}",
+            summary.text.trim()
+        );
+        let message = self.append("user", &content)?;
+        if let Some(native) = &summary.native {
+            self.native_boundary(&message, native)?;
+        } else {
+            self.0.execute(
+                "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
+                [&message],
+            )?;
+            self.0
+                .execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
+        }
+        self.0.execute("DELETE FROM compaction_checkpoint", [])?;
+        Ok(message)
+    }
+}
+
+impl SessionRepository<'_> {
+    pub(crate) fn checkpoint_fragments(
+        &self,
+        fingerprint: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        self.read(|c, id| match &self.0 {
+            owned::Backend::Admitted(_) => {
+                let mut q = c.prepare_cached(
+                    "SELECT request_key,summary FROM compaction_checkpoint WHERE fingerprint=?1",
+                )?;
+                let rows = q.query_map([fingerprint], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            }
+            owned::Backend::Shared(_, _) => Ok(legacy_fragments(c, id, fingerprint)?),
+        })
+    }
+    pub(crate) fn save_checkpoint_fragment(
+        &self,
+        fingerprint: &str,
+        request: &str,
+        summary: &str,
+    ) -> Result<()> {
+        self.write("save completed summary", |c,id| match &self.0 {
+            owned::Backend::Admitted(_) => {
+                c.execute("INSERT INTO compaction_checkpoint VALUES(?1,?2,?3)
+                  ON CONFLICT(fingerprint,request_key) DO UPDATE SET summary=excluded.summary WHERE summary<>excluded.summary",
+                  [fingerprint,request,summary])?;
+                Ok(())
+            }
+            owned::Backend::Shared(_,_) => {
+                let mut completed=legacy_fragments(c,id,fingerprint)?;
+                completed.insert(request.into(),summary.into());
+                let raw=serde_json::to_string(&compaction::checkpoint::Saved{ fingerprint:fingerprint.into(), completed })?;
+                state::set_local(c,&format!("compaction.checkpoint.{id}"), &raw)
+            }
+        })
+    }
+}
+
+fn legacy_fragments(
+    c: &Connection,
+    id: &str,
+    fingerprint: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(state::local(c, &format!("compaction.checkpoint.{id}"))?
+        .and_then(|raw| serde_json::from_str::<compaction::checkpoint::Saved>(&raw).ok())
+        .filter(|s| s.fingerprint == fingerprint)
+        .map(|s| s.completed)
+        .unwrap_or_default())
 }

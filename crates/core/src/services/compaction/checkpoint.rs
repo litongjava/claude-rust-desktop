@@ -1,7 +1,10 @@
 //! Completed summary requests are reusable; only compaction::commit installs history.
-use crate::{db::DbManager, native_engine::provider_manager::ResolvedProvider};
+use crate::{
+    db::session_store::{RecordingPolicies, SessionAccess, SessionRepository},
+    native_engine::provider_manager::ResolvedProvider,
+};
 use anyhow::Result;
-use rusqlite::OptionalExtension;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -25,13 +28,13 @@ pub(crate) fn config_fingerprint(provider: &ResolvedProvider, system: &str) -> S
 }
 
 #[derive(Serialize, Deserialize)]
-struct Saved {
-    fingerprint: String,
-    completed: BTreeMap<String, String>,
+pub(crate) struct Saved {
+    pub(crate) fingerprint: String,
+    pub(crate) completed: BTreeMap<String, String>,
 }
 
 pub(crate) struct Checkpoint<'a> {
-    db: &'a DbManager,
+    repo: SessionRepository<'a>,
     pub session: &'a str,
     pub options: crate::native_engine::request_options::RequestOptions,
     saved: Saved,
@@ -39,7 +42,7 @@ pub(crate) struct Checkpoint<'a> {
 
 impl<'a> Checkpoint<'a> {
     pub fn open(
-        db: &'a DbManager,
+        db: &'a (impl SessionAccess + RecordingPolicies),
         session: &'a str,
         provider: &ResolvedProvider,
         system: &str,
@@ -51,23 +54,14 @@ impl<'a> Checkpoint<'a> {
         // Version 3 separates that request key from the configuration domain so
         // unchanged fragments survive a later turn; earlier layouts are dropped.
         let fingerprint = config_fingerprint(provider, system);
-        let value: Option<String> = db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [key(session)],
-                |r| r.get(0),
-            )
-            .optional()
-        })??;
-        let saved = value
-            .and_then(|v| serde_json::from_str::<Saved>(&v).ok())
-            .filter(|v| v.fingerprint == fingerprint)
-            .unwrap_or_else(|| Saved {
-                fingerprint,
-                completed: BTreeMap::new(),
-            });
+        let repo = db.select_session(session)?;
+        let completed = repo.checkpoint_fragments(&fingerprint)?;
+        let saved = Saved {
+            fingerprint,
+            completed,
+        };
         Ok(Self {
-            db,
+            repo,
             session,
             saved,
             options: crate::native_engine::request_options::RequestOptions::from_db(
@@ -91,9 +85,9 @@ impl<'a> Checkpoint<'a> {
     }
 
     pub fn save(&mut self, request: String, summary: String) -> Result<()> {
+        self.repo
+            .save_checkpoint_fragment(&self.saved.fingerprint, &request, &summary)?;
         self.saved.completed.insert(request, summary);
-        let value = serde_json::to_string(&self.saved)?;
-        self.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key(self.session), value]))??;
         Ok(())
     }
 }

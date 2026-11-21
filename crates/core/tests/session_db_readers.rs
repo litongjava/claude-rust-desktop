@@ -816,3 +816,25 @@ fn service_heartbeats_read_through_a_busy_directory_and_stop_on_request() -> any
     assert_eq!((status[0].state.as_str(), status[0].completed), ("stopped",1));
     Ok(())
 }
+
+#[test]
+fn manual_compaction_binds_the_prepared_transcript_to_its_incarnation() -> Result<()> {
+    use deepseek_code_core::services::compaction::{commit, count, prepare, CompactionCount};
+    let dir = tempfile::tempdir()?;
+    let stores = Stores::open(dir.path())?;
+    let session = stores.create("compact", Default::default())?;
+    session.write(|w| { w.append("user", "Task")?; w.append("assistant", "Progress")?; Ok(()) })?;
+    let prepared = prepare(&stores, session.id())?;
+    session.set_archived(true)?;
+    assert!(commit(&stores, prepared, "Summary").is_err());
+    session.set_archived(false)?;
+    let stale = prepare(&stores, session.id())?;
+    let saved = commit(&stores, prepare(&stores, session.id())?, "Summary")?;
+    assert_eq!(saved.summarized_messages, 2);
+    assert_eq!(count(&stores, session.id())?, CompactionCount::Exact(1));
+    session.delete()?;
+    let replacement = stores.create("compact", Default::default())?;
+    assert!(commit(&stores, stale, "Stale summary").is_err());
+    assert!(replacement.read(|r| r.messages())?.is_empty());
+    Ok(())
+}
