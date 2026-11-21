@@ -99,3 +99,28 @@ impl SessionRepository<'_> {
         })
     }
 }
+
+impl super::Stores {
+    /// Resolve a former coder through the recorded task membership. A missing
+    /// live shard is an error. An absent directory row with a recorded identity
+    /// still has an execution lock that can be checked without opening history.
+    pub(crate) fn former_coder_retired(&self, task: &str, id: &str) -> Result<bool> {
+        let incarnations = self.global().read(|c| {
+            let mut q = c.prepare(
+                "SELECT incarnation FROM sa_coder_history WHERE task_id=?1 AND session_id=?2",
+            )?;
+            let rows = q.query_map([task, id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?;
+        if incarnations.is_empty() || self.global().conversation(id)?.is_some() {
+            return Ok(false);
+        }
+        for inc in incarnations {
+            ensure!(
+                !session_messages::execution_active(self.data_dir(), &inc)?,
+                "Former coder {id} still owns an active execution"
+            );
+        }
+        Ok(true)
+    }
+}

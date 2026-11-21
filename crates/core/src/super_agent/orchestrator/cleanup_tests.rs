@@ -23,8 +23,25 @@ fn cleanup_events(f: &TwoRepoDeliveryFixture) -> usize {
         .count()
 }
 
+// The host retries a busy evidence lock on its next tick. Let transient
+// contention clear before asserting which durable job blocks cleanup.
+async fn cleanup_observation(
+    f: &TwoRepoDeliveryFixture,
+) -> crate::super_agent::orchestrator::TickReport {
+    let host = f.orchestrator();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let report = host.tick(&f.router).await.unwrap();
+        let busy = matches!(report.warnings.as_slice(), [warning] if warning.contains("is busy; retry the decision"));
+        if !busy || tokio::time::Instant::now() >= deadline {
+            return report;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn cleanup_pending(f: &TwoRepoDeliveryFixture, reason: &str) {
-    let report = f.orchestrator().tick(&f.router).await.unwrap();
+    let report = cleanup_observation(f).await;
     assert!(
         report
             .warnings
@@ -897,7 +914,7 @@ async fn cleanup_unknown_jobs_are_filtered_by_readable_identity() {
             };
             std::fs::write(directory.join("state.json"), &bytes).unwrap();
             if relation == "unrelated" {
-                let report = f.orchestrator().tick(&f.router).await.unwrap();
+                let report = cleanup_observation(&f).await;
                 assert!(report.warnings.is_empty(), "{report:?}");
                 assert_eq!(cleanup_events(&f), 1);
                 assert!(!f.repos[0].worktree.exists());
@@ -955,4 +972,34 @@ async fn cleanup_pending_warning_is_deduplicated_and_changes_are_reported() {
         std::fs::read(repo.worktree_path.join("user.txt")).unwrap(),
         b"keep me"
     );
+}
+
+#[tokio::test]
+async fn cleanup_finishes_after_retirement_of_a_previous_coder() {
+    let f = cleanup_fixture(1).await;
+    let current = f.task().coder.session_id.unwrap();
+    let former = uuid::Uuid::new_v4().to_string();
+    let old = f.context.db.create(&former, Default::default()).unwrap();
+    f.store()
+        .set_sessions(&f.task_id, Some(&former), None)
+        .unwrap();
+    f.store()
+        .replace_coder_session(&f.task_id, &current)
+        .unwrap();
+    let host = f.orchestrator();
+    let shard = f.data.join("sessions").join(&former).join("session.db");
+    let backup = shard.with_extension("fixture");
+    std::fs::rename(&shard, &backup).unwrap();
+    assert!(crate::super_agent::cleanup::cleanup_completed(
+        &host.launcher(),
+        &f.task_id,
+        &host.policy()
+    )
+    .is_err());
+    assert!(f.task().repositories[0].worktree_path.is_dir());
+    std::fs::rename(backup, shard).unwrap();
+    old.delete().unwrap();
+    crate::super_agent::cleanup::cleanup_completed(&host.launcher(), &f.task_id, &host.policy())
+        .unwrap();
+    assert_eq!(cleanup_events(&f), 1);
 }

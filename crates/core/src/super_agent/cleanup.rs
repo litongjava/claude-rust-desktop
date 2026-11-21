@@ -574,7 +574,13 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
     let mut sessions = BTreeSet::new();
     sessions.extend(task.coder.session_id.clone());
     sessions.extend(task.reviewer.session_id.clone());
-    sessions.extend(task.coder.previous_session_ids.clone());
+    let mut historical_coders = Vec::new();
+    historical_coders.extend(
+        task.coder
+            .previous_session_ids
+            .iter()
+            .map(|id| (&task.task_id, id)),
+    );
     sessions.extend(task.reviewer.previous_session_ids.clone());
     // Child tasks can have their own Coder/Reviewer and durable launch receipts.
     // A terminal task flag alone is not proof those processes have stopped.
@@ -621,7 +627,13 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
                 }
                 sessions.extend(child.coder.session_id.clone());
                 sessions.extend(child.reviewer.session_id.clone());
-                sessions.extend(child.coder.previous_session_ids.clone());
+                historical_coders.extend(
+                    child
+                        .coder
+                        .previous_session_ids
+                        .iter()
+                        .map(|id| (&child.task_id, id)),
+                );
                 sessions.extend(child.reviewer.previous_session_ids.clone());
                 task_ids.insert(child.task_id.clone());
                 changed = true;
@@ -631,9 +643,17 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
             break;
         }
     }
+    let mut retired = BTreeSet::new();
+    for (task_id, id) in historical_coders {
+        if !sessions.contains(id) && context.db.former_coder_retired(task_id, id)? {
+            retired.insert(id.clone());
+        }
+        sessions.insert(id.clone());
+    }
     let mut parents=sessions.iter().cloned().collect::<Vec<_>>();
     while let Some(parent)=parents.pop(){
         for (session,owner) in context.db.child_jobs(&parent)? {
+            retired.remove(&session);
             if sessions.insert(session.clone()) {
                 let id=owner.job_id.as_deref().context("Descendant has no proven job identity")?;
                 require_stopped(&context.paths.data_dir,id,&session,Some(&parent))?;
@@ -647,10 +667,11 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
     let workspaces=context.db.workspace_sessions()?;
     for (session, workspace) in workspaces {
         if Path::new(&workspace).starts_with(worktree) {
+            retired.remove(&session);
             sessions.insert(session);
         }
     }
-    for session in &sessions {
+    for session in sessions.difference(&retired) {
         ensure!(
             !context.db.select_session(session)?.execution_active(&context.paths.data_dir)?,
             "Session {session} still owns an active execution"
