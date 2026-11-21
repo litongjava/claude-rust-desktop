@@ -150,6 +150,7 @@ mod tests {
             Arc::new(super::super::EnvironmentCredentials),
         )
         .unwrap();
+        context.db.create("session", Default::default()).unwrap();
         (dir, context)
     }
     fn configure(root: &Path, hooks: serde_json::Value) {

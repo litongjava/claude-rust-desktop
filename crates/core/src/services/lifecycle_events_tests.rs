@@ -364,7 +364,7 @@ async fn unmatched_hooks_and_callbacks_never_materialize_transcripts() {
     }}).to_string()).unwrap();
     // Any attempt to query this database would fail. Matching only uses memory.
     std::fs::write(
-        root.path().join(crate::runtime::DATABASE_FILE),
+        root.path().join("global.db"),
         "not a database",
     )
     .unwrap();
@@ -392,7 +392,7 @@ async fn unmatched_hooks_and_callbacks_never_materialize_transcripts() {
     }
     assert!(!root.path().join("hook-transcripts").exists());
     assert_eq!(
-        std::fs::read_to_string(root.path().join(crate::runtime::DATABASE_FILE)).unwrap(),
+        std::fs::read_to_string(root.path().join("global.db")).unwrap(),
         "not a database"
     );
 }

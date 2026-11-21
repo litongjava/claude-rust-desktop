@@ -331,29 +331,13 @@ mod tests {
             if boundary_first {
                 commit_boundary(&context, &id, "approved plan").unwrap();
             }
-            // Same transaction/order helper as Desktop final save, without a reset event.
-            context
-                .db
-                .fixture_shard(&id, |conn| -> Result<()> {
-                    let tx = crate::db::write_transaction(conn)?;
-                    let (order, archive) = final_response_order(&tx, &id, None)?;
-                    assert_eq!(archive, boundary_first);
-                    crate::db::message_repo::insert_message(
-                        &tx,
-                        "old-response",
-                        &id,
-                        "assistant",
-                        "OLD_DESKTOP_SECRET",
-                        None,
-                        "now",
-                        false,
-                        order,
-                    )?;
-                    tx.commit()?;
-                    Ok(())
-                })
-                .unwrap()
-                .unwrap();
+            let assistant=sessions.append(&id,"assistant","").unwrap();
+            let save = || context.db.executor_history(&id).unwrap().save_segment(&assistant, crate::db::session_store::SegmentUpdate {
+                placement:crate::db::session_store::SegmentPlacement::Final { observed_boundary:None },
+                text:Some("OLD_DESKTOP_SECRET"),
+                ..Default::default()
+            });
+            save().unwrap();
             if !boundary_first {
                 commit_boundary(&context, &id, "approved plan").unwrap();
             }
@@ -366,21 +350,8 @@ mod tests {
             assert!(!serde_json::to_string(&history)
                 .unwrap()
                 .contains("OLD_DESKTOP_SECRET"));
-            context
-                .db
-                .fixture_shard(&id, |conn| {
-                    conn.execute(
-                        "UPDATE peripheral_settings SET value='invalid metadata' WHERE key=?1",
-                        [format!("plan.context_boundary.{id}")],
-                    )
-                })
-                .unwrap()
-                .unwrap();
-            assert!(context
-                .db
-                .fixture_shard(&id, |conn| final_response_order(conn, &id, None))
-                .unwrap()
-                .is_err());
+            context.db.fixture_shard(&id, |c|c.execute("UPDATE messages SET is_compact_boundary=0 WHERE id IN (SELECT message_id FROM approved_plan_boundaries)", [])).unwrap().unwrap();
+            assert!(save().is_err());
         }
     }
     #[test]
@@ -397,7 +368,7 @@ mod tests {
         manager.set_mode(crate::permissions::PermissionMode::PlanMode);
         assert!(commit_approved_boundary(&context, &id, "plan", &manager, stale).is_err());
         assert!(latest_boundary(&context.db, &id).unwrap().is_none());
-        context.db.fixture_shard(&id, |conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
+        context.db.fixture_shard(&id, |conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON approved_plan_boundaries BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
         assert!(
             commit_approved_boundary(&context, &id, "plan", &manager, manager.mode_snapshot())
                 .is_err()

@@ -74,7 +74,8 @@ fn team_model_context_is_project_and_team_scoped() {
         credential: "SECRET_ENV_NAME".into(),
     };
     context.save_global_setting(GlobalSetting::TeamConfiguration("team-sync"), &config).unwrap();
-    context.db.directory_sql(|c|c.execute("INSERT INTO team_memories(team,id,title,content,tags,deleted,revision,dirty,mutation) VALUES('team-a','m','Shared','Team fact','[]',0,1,0,'x')",[])).unwrap().unwrap();
+    use deepseek_code_core::db::session_store::TeamCatalog;
+    context.db.put_memory("team-a",&team::TeamMemory{id:"m".into(),title:"Shared".into(),content:"Team fact".into(),tags:vec![],deleted:false,revision:1},false).unwrap();
     assert!(team::model_context(&context, &a).unwrap().is_empty());
     team::configure_model_context(&context, &a, true).unwrap();
     let result = team::model_context(&context, &a).unwrap();

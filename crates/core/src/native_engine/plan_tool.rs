@@ -509,6 +509,7 @@ mod tests {
         for name in ["EnterPlanMode"] {
             for answer in [Some("yes"), Some("no"), None] {
                 let root = tempfile::tempdir().unwrap();
+                crate::services::session_messages::context(root.path()).unwrap().db.create("child",Default::default()).unwrap();
                 let parent = crate::runtime::default_permissions();
                 parent.set_mode(PermissionMode::AskPermissions);
                 parent.set_session_rules(
@@ -864,6 +865,7 @@ mod tests {
         for denied in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let context = crate::services::session_messages::context(root.path()).unwrap();
+            for id in ["parent-session","file-session"] {context.db.create(id,Default::default()).unwrap();}
             let parent = crate::runtime::default_permissions();
             session_permission_mode::set(
                 &context.db,

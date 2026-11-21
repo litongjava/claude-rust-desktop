@@ -410,7 +410,7 @@ mod tests {
         let (_temp, paths, store, source) = fixture();
         let session = store.create(&source, "fixture", "fixture").unwrap();
         let (holder, release) = crate::db::test_support::hold_write_lock(
-            paths.data_dir.join(crate::runtime::DATABASE_FILE),
+            paths.data_dir.join("global.db"),
         );
         let releaser =
             crate::db::test_support::release_after(release, holder, Duration::from_secs(6));

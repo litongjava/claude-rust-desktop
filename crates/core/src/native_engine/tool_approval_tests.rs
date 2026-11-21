@@ -1045,6 +1045,7 @@ async fn router_tool_visibility_and_execution_guard_are_enforced_at_runtime() {
     // Members get their own tools only, and only their report kinds.
     let coder_dir = temp.path().join("coder");
     let (_coder_data, coder_runtime, coder) = super_agent_runtime_fixture(&coder_dir);
+    coder_runtime.db.create(&router,Default::default()).unwrap();
     crate::super_agent::role::set(&coder_runtime.db, &router, crate::super_agent::Role::Router)
         .unwrap();
     let store = coder_runtime.store();

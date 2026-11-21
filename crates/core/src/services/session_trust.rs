@@ -296,7 +296,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let error = repair(&store.db, &paths.data_dir, &id, &[source]).unwrap_err();
-        assert!(error.to_string().contains("source folder changed"));
+        assert!(format!("{error:#}").contains("source folder changed"));
         assert_eq!(inspect(&store.db, &id).unwrap().id, original.id);
         assert!(!paths
             .data_dir

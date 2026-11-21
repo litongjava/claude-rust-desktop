@@ -272,7 +272,7 @@ mod tests {
         }
         context
             .db
-            .fixture_shard(&session, |conn| {
+            .fixture_history_write(&session, |conn| {
                 crate::db::message_repo::insert_message(
                     conn,
                     "boundary",
@@ -285,7 +285,6 @@ mod tests {
                     1,
                 )
             })
-            .unwrap()
             .unwrap();
         for _ in 0..2 {
             instructions(
@@ -315,6 +314,7 @@ mod tests {
     async fn settings_change_is_audited_once_and_cannot_remove_its_guard() {
         let dir = tempfile::tempdir().unwrap();
         let context = super::super::session_messages::context(dir.path()).unwrap();
+        context.db.create("session",Default::default()).unwrap();
         let script = dir.path().join("guard.cjs");
         std::fs::write(&script, r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>{fs.appendFileSync('config-events.jsonl',JSON.stringify(JSON.parse(s))+'\n');console.log(JSON.stringify({decision:'block',reason:'fixture rejection'}))});"#).unwrap();
         let settings = dir.path().join("settings.json");

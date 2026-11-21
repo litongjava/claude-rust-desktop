@@ -302,6 +302,7 @@ async fn summary_fragments_merges_and_truncation_recovery_keep_session_headers()
             .unwrap()
             .open_database()
             .unwrap();
+        db.create("Original-Compaction-Session", Default::default()).unwrap();
         let mut checkpoint =
             Checkpoint::open(&db, "Original-Compaction-Session", &p, "Summarize").unwrap();
         let input = (0..30_000)

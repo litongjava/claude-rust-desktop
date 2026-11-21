@@ -188,7 +188,7 @@ async fn approval_choices_preserve_rules_cancel_waiters_and_rollback_failed_boun
             )]),
         );
         if choice == "db_failure" {
-            context.db.fixture_shard(&session, |c|c.execute_batch("CREATE TRIGGER fail_boundary BEFORE INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN SELECT RAISE(ABORT,'fixture write failed'); END;")).unwrap().unwrap();
+            context.db.fixture_shard(&session, |c|c.execute_batch("CREATE TRIGGER fail_boundary BEFORE INSERT ON approved_plan_boundaries BEGIN SELECT RAISE(ABORT,'fixture write failed'); END;")).unwrap().unwrap();
         }
         let waiters = executor.answer_waiters.clone();
         let input = json!({"plan":"# approved fixture plan"});

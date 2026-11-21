@@ -163,18 +163,20 @@ mod tests {
     fn set_waits_for_another_writer_instead_of_failing() {
         use std::time::{Duration, Instant};
         let (_temp, db) = fixture();
-        let path = db.data_dir().join(crate::runtime::DATABASE_FILE);
+        let session=uuid::Uuid::new_v4().to_string();
+        db.create(&session,Default::default()).unwrap();
+        let path = db.data_dir().join("sessions").join(&session).join("session.db");
         let (holder, release) = crate::db::test_support::hold_write_lock(path);
         let releaser =
             crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
         let started = Instant::now();
-        set(&db, "session", Role::Router).unwrap();
+        set(&db, &session, Role::Router).unwrap();
         assert!(
             started.elapsed() >= Duration::from_secs(5),
             "set returned after {:?}",
             started.elapsed()
         );
         releaser.join().unwrap();
-        assert_eq!(load(&db, "session").unwrap(), Role::Router);
+        assert_eq!(load(&db, &session).unwrap(), Role::Router);
     }
 }

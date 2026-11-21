@@ -154,7 +154,7 @@ mod tests {
     fn a_request_below_thirty_percent_is_refused() {
         let (_temp, store, id) = fixture();
         let error = request(&store.db, &id, "Keep the pending tests", 20, 100).unwrap_err();
-        assert!(error.to_string().contains("at least 30%"), "{error}");
+        assert!(format!("{error:#}").contains("at least 30%"), "{error}");
         assert!(finish_request(&store, &id).unwrap().is_none());
     }
 
@@ -183,7 +183,7 @@ mod tests {
             .append(&id, "user", "First message after compaction")
             .unwrap();
         let error = request(&store.db, &id, "Keep the next task", 50, 100).unwrap_err();
-        assert!(error.to_string().contains("compacted recently"), "{error}");
+        assert!(format!("{error:#}").contains("compacted recently"), "{error}");
         store
             .append(&id, "user", "Second message after compaction")
             .unwrap();
