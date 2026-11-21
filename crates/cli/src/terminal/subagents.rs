@@ -34,9 +34,9 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
             continue;
         };
         let record = context
-            .setting::<serde_json::Value>(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .or_else(|| background.remove(id));
-        let description = context.setting::<String>(&format!("agent-description.{id}"))?;
+        let description = context.child_description(&id)?;
         let kind = record
             .as_ref()
             .and_then(|v| v["agent_type"].as_str())

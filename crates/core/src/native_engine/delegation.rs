@@ -480,7 +480,7 @@ impl ToolLoopExecutor {
             .context("Runtime unavailable")?;
         let context = crate::services::session_messages::context(root)?;
         let saved: Value = context
-            .setting(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .context("Child ownership record unavailable; needs_resume")?;
         ensure!(
             saved["parent_session_id"] == parent,
@@ -539,7 +539,7 @@ impl ToolLoopExecutor {
             context.db.executor_history(id)?.execution_lease()?
             .map(std::sync::Arc::new);
         let current: Value = context
-            .setting(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .context("Child ownership disappeared")?;
         ensure!(
             current["parent_session_id"] == parent && current["status"] == "completed",
@@ -731,7 +731,7 @@ impl ToolLoopExecutor {
                 .context("Runtime unavailable")?;
             let context = crate::services::session_messages::context(root)?;
             let saved: Value = context
-                .setting(&format!("delegation.{id}"))?
+                .child_progress(&id)?
                 .context("Child ownership record unavailable")?;
             ensure!(
                 saved["parent_session_id"].as_str() == self.conv_id.as_deref(),
@@ -1171,10 +1171,7 @@ impl ToolLoopExecutor {
         } else {
             agents::bind(&context.db, &id, &definition)?;
         }
-        context.save_setting(
-            &format!("agent-description.{id}"),
-            &input["description"].as_str().unwrap_or(prompt),
-        )?;
+        context.set_child_description(&id,input["description"].as_str().unwrap_or(prompt))?;
         sessions.append(&id, "user", prompt)?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         let mut system = format!(

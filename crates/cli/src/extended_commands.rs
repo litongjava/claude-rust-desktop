@@ -309,7 +309,7 @@ pub(crate) fn active_agents_text(paths: &RuntimePaths, current: &str) -> Result<
             continue;
         }
         let delegation = context
-            .setting::<Value>(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .unwrap_or_default();
         let title = delegation["description"]
             .as_str()

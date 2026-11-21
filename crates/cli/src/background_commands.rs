@@ -765,11 +765,11 @@ pub(crate) fn foreground_agent(
     kind: &str,
 ) -> Option<Agent> {
     let record = context
-        .setting::<serde_json::Value>(&format!("delegation.{id}"))
+        .child_progress(&id)
         .ok()
         .flatten()?;
     let description = context
-        .setting::<String>(&format!("agent-description.{id}"))
+        .child_description(&id)
         .ok()
         .flatten()
         .unwrap_or_else(|| kind.into());
@@ -1698,7 +1698,7 @@ pub(crate) fn agent_transcript(
     id: &str,
 ) -> crate::terminal::scrollback::Scrollback {
     let mut transcript = crate::terminal::agent_transcript::Transcript::default();
-    if let Ok(Some(value)) = context.setting::<serde_json::Value>(&format!("delegation.{id}")) {
+    if let Ok(Some(value)) = context.child_progress(&id) {
         transcript.note(&format!(
             "Status: {}",
             value["status"].as_str().unwrap_or("unknown")

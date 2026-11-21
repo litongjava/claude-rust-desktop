@@ -68,3 +68,23 @@ impl ExecutorHistory {
         })
     }
 }
+
+impl<D: super::SessionAccess> crate::services::ServiceContext<D> {
+    pub fn child_progress(&self, id: &str) -> Result<Option<Value>> {
+        self.db
+            .select_session(id)?
+            .preference(super::settings::CHILD_PROGRESS)
+            .map(|progress| progress.map(Value::Object))
+    }
+    pub fn child_description(&self, id: &str) -> Result<Option<String>> {
+        self.db
+            .select_session(id)?
+            .preference(super::settings::AGENT_DESCRIPTION)
+    }
+    pub(crate) fn set_child_description(&self, id: &str, description: &str) -> Result<()> {
+        self.db.select_session(id)?.set_preference(
+            super::settings::AGENT_DESCRIPTION,
+            Some(&description.to_owned()),
+        )
+    }
+}

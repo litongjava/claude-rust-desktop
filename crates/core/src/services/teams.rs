@@ -533,7 +533,7 @@ pub fn classify_peers(
             }
         }
         if context
-            .setting::<serde_json::Value>(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .is_some()
         {
             peer["kind"] = serde_json::json!("subagent");
