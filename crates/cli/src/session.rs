@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::{ExecutorHistory, SegmentUpdate};
 use crate::terminal::input::TerminalInput;
 use crate::{
     args::{Cli, OutputFormat, PermissionModeArg},
@@ -1930,20 +1931,9 @@ impl Session {
         if !recovery_requests.is_empty() {
             recovery_requests.extend(completion.requests.iter().cloned());
             let segment = turn.ensure_segment()?;
-            self.store.db.with_conn(|conn| {
-                deepseek_code_core::db::write_tx(
-                    conn,
-                    "persist recovery requests",
-                    std::time::Duration::from_secs(30),
-                    |tx| {
-                        message_repo::save_request_snapshots(
-                            tx,
-                            &segment,
-                            &json!(recovery_requests),
-                        )
-                    },
-                )
-            })??;
+            turn.history().save_segment(&segment,SegmentUpdate {
+                snapshots: Some(&json!(recovery_requests)), ..Default::default()
+            })?;
         }
         let record = turn.finish(status)?;
         drop(turn_lease);
@@ -2026,6 +2016,7 @@ impl Session {
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
+        let history = turn.history();
         // Captures the signal count synchronously, before any await. A Ctrl-C
         // delivered while an event is being handled is therefore still seen by
         // the next wait, instead of becoming that wait's baseline.
@@ -2347,7 +2338,7 @@ impl Session {
                     _ = refresh.tick() => {
                         progress.tick();
                         if background_transcript {
-                            best_effort_live_write("transcript", live_transcript.flush(&self.store.db, &self.id, &assistant_id, &text, &thinking_text, &tools));
+                            best_effort_live_write("transcript", live_transcript.flush(&history, &assistant_id, &text, &thinking_text, &tools));
                         }
                         if interactive_display {
                             for notice in crate::background_commands::collect_completed(self)? { progress.notice(&notice); }
@@ -2438,7 +2429,7 @@ impl Session {
                 live_transcript.observe(&event, &mut tools);
                 if background_transcript {
                     if matches!(&event, EngineEvent::ToolUseStart { .. } | EngineEvent::ToolUseDone { .. } | EngineEvent::PipelineToolResult { .. } | EngineEvent::ToolPermission { .. } | EngineEvent::AskUser { .. }) {
-                        best_effort_live_write("transcript", live_transcript.flush(&self.store.db, &self.id, &assistant_id, &text, &thinking_text, &tools));
+                        best_effort_live_write("transcript", live_transcript.flush(&history, &assistant_id, &text, &thinking_text, &tools));
                     }
                 }
                 match event {
@@ -2463,7 +2454,7 @@ impl Session {
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
                     EngineEvent::ContextReset { session_id, boundary_id } if session_id == self.id => {
                         deepseek_code_core::services::plan_approval::archive_segment(&self.store.db, &self.id, &boundary_id, Some(&assistant_id), &text, &thinking_text, &tools, &snapshots)?;
-                        save_queued_turn_inputs(&self.store.db, &assistant_id, &tools, &queued_inputs_by_tool)?;
+                        history.save_segment_inputs(&assistant_id, &tools, &queued_inputs_by_tool)?;
                         assistant_id = turn.new_segment()?;
                         text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
                         if background_transcript { live_transcript = BackgroundTranscript::default(); separate_text = false; }
@@ -2719,15 +2710,10 @@ impl Session {
                             if let Some(tool) = tools.last() {
                                 let inputs = queued_inputs_by_tool.entry(tool.id.clone()).or_default();
                                 inputs.push(delivered.clone());
-                                self.store.db.with_conn(|conn| -> Result<()> {
-                                    let tx = deepseek_code_core::db::write_transaction(conn)?;
-                                    let call_id = format!("{assistant_id}:{}", tool.id);
-                                    message_repo::update_message_content(&tx, &assistant_id, &text)?;
-                                    message_repo::insert_tool_call(&tx, &call_id, &assistant_id, &tool.name, tool.input.as_deref(), tool.output.as_deref(), tool.is_error, tool.sort_order)?;
-                                    deepseek_code_core::services::input_queue::save_delivered(&tx, &call_id, inputs)?;
-                                    tx.commit()?;
-                                    Ok(())
-                                })??;
+                                history.save_segment(&assistant_id, SegmentUpdate {
+                                    text: Some(&text), tools: std::slice::from_ref(tool),
+                                    inputs: Some(&queued_inputs_by_tool), ..Default::default()
+                                })?;
                             }
                             let text = delivered.text;
                             if let Some(index) = pending_inputs.iter().position(|pending| *pending == text) { pending_inputs.remove(index); }
@@ -2849,8 +2835,7 @@ impl Session {
                             &tools,
                             &snapshots,
                         )?;
-                        save_queued_turn_inputs(
-                            &self.store.db,
+                        history.save_segment_inputs(
                             &assistant_id,
                             &tools,
                             &queued_inputs_by_tool,
@@ -2898,9 +2883,7 @@ impl Session {
                 live_transcript.dirty = true;
                 best_effort_live_write(
                     "transcript",
-                    live_transcript.flush(
-                        &self.store.db,
-                        &self.id,
+                    live_transcript.flush(&history,
                         &assistant_id,
                         &text,
                         &thinking_text,
@@ -2924,8 +2907,7 @@ impl Session {
                     &tools,
                     &snapshots,
                 )?;
-                save_queued_turn_inputs(
-                    &self.store.db,
+                history.save_segment_inputs(
                     &assistant_id,
                     &tools,
                     &queued_inputs_by_tool,
@@ -2973,55 +2955,13 @@ impl Session {
         if !completed && error.is_none() {
             error = Some("Incomplete response".into());
         }
-        {
-            let message_id = assistant_id;
-            self.store.db.with_conn(|conn| -> Result<()> {
-                deepseek_code_core::db::write_tx(
-                    conn,
-                    "persist turn results",
-                    std::time::Duration::from_secs(30),
-                    |tx| {
-                        message_repo::update_message_content(tx, &message_id, &text)?;
-                        if !thinking_text.is_empty() {
-                            tx.execute(
-                                "UPDATE messages SET thinking = ?1 WHERE id = ?2",
-                                [&thinking_text, &message_id],
-                            )?;
-                        }
-                        for tool in &tools {
-                            let call_id = format!("{message_id}:{}", tool.id);
-                            message_repo::insert_tool_call(
-                                tx,
-                                &call_id,
-                                &message_id,
-                                &tool.name,
-                                tool.input.as_deref(),
-                                tool.output.as_deref(),
-                                tool.is_error,
-                                tool.sort_order,
-                            )?;
-                            if let Some(duration) = tool_durations.get(&tool.id) {
-                                message_repo::set_tool_duration(tx, &call_id, *duration)?;
-                            }
-                            if let Some(inputs) = queued_inputs_by_tool.get(&tool.id) {
-                                deepseek_code_core::services::input_queue::save_delivered(
-                                    tx, &call_id, inputs,
-                                )?;
-                            }
-                            if let Some(notes) = approval_notes.get(&tool.id) {
-                                message_repo::set_tool_call_note(
-                                    tx,
-                                    &call_id,
-                                    &notes.join("\n\n"),
-                                )?;
-                            }
-                        }
-                        message_repo::save_request_snapshots(tx, &message_id, &json!(snapshots))?;
-                        Ok(())
-                    },
-                )
-            })??;
-        }
+        history.save_segment(&assistant_id, SegmentUpdate {
+            text: Some(&text),
+            thinking: (!thinking_text.is_empty()).then_some(thinking_text.as_str()),
+            tools: &tools, origins: Some(&live_transcript.origins),
+            durations: Some(&tool_durations), inputs: Some(&queued_inputs_by_tool),
+            notes: Some(&approval_notes), snapshots: Some(&json!(snapshots)),
+        })?;
         best_effort_live_write(
             "request",
             crate::session_commands::save_live_requests(self, &[]),
@@ -3183,29 +3123,6 @@ impl Session {
         }
         Ok(())
     }
-}
-
-fn save_queued_turn_inputs(
-    db: &deepseek_code_core::db::DbManager,
-    assistant_id: &str,
-    tools: &[message_repo::ToolCallRow],
-    inputs: &std::collections::HashMap<
-        String,
-        Vec<deepseek_code_core::services::input_queue::DeliveredInput>,
-    >,
-) -> Result<()> {
-    db.with_conn(|conn| -> Result<()> {
-        for tool in tools {
-            if let Some(inputs) = inputs.get(&tool.id) {
-                deepseek_code_core::services::input_queue::save_delivered(
-                    conn,
-                    &format!("{assistant_id}:{}", tool.id),
-                    inputs,
-                )?;
-            }
-        }
-        Ok(())
-    })?
 }
 
 fn is_turn_cancel_error(error: &anyhow::Error) -> bool {
@@ -3439,32 +3356,17 @@ impl BackgroundTranscript {
 
     fn flush(
         &mut self,
-        db: &deepseek_code_core::db::DbManager,
-        session_id: &str,
+        history: &ExecutorHistory,
         assistant_id: &str,
         text: &str,
         thinking: &str,
         tools: &[message_repo::ToolCallRow],
     ) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        db.with_conn(|conn| -> Result<()> {
-            message_repo::update_message_content(conn, assistant_id, text)?;
-            conn.execute(
-                "UPDATE messages SET thinking = ?1 WHERE id = ?2",
-                [thinking, assistant_id],
-            )?;
-            deepseek_code_core::services::tool_history::save(
-                conn,
-                session_id,
-                assistant_id,
-                text,
-                tools,
-                &self.origins,
-            )?;
-            Ok(())
-        })??;
+        if !self.dirty { return Ok(()); }
+        history.save_live_segment(assistant_id, SegmentUpdate {
+            text: Some(text), thinking: Some(thinking), tools,
+            origins: Some(&self.origins), ..Default::default()
+        })?;
         self.dirty = false;
         Ok(())
     }
@@ -3526,10 +3428,12 @@ mod background_transcript_tests {
     #[test]
     fn worker_snapshot_retains_full_text_thinking_and_updates_one_tool() {
         let temp = tempfile::tempdir().unwrap();
-        let context = deepseek_code_core::services::session_messages::context(temp.path()).unwrap();
-        let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
+        let stores=Arc::new(RuntimePaths::new(temp.path().to_owned()).unwrap().open_stores().unwrap());
+        let store=deepseek_code_core::runtime::SessionStore::new(stores.clone());
         let session = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&session, "assistant", "").unwrap();
+        let shard = stores.open_session(&session).unwrap();
+        let history = ExecutorHistory::Session(shard.clone());
         let mut live = BackgroundTranscript::default();
         let mut tools = Vec::new();
         let text = "full text ".repeat(2000);
@@ -3541,32 +3445,20 @@ mod background_transcript_tests {
             },
             &mut tools,
         );
-        live.flush(
-            &context.db,
-            &session,
+        live.flush(&history,
             &assistant,
             &text,
             "private reasoning",
             &tools,
         )
         .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                let message = message_repo::get_message(conn, &assistant)
-                    .unwrap()
-                    .unwrap();
+        shard.read(|r| {
+                let message=r.messages()?.into_iter().find(|m|m.id==assistant).unwrap();
                 assert_eq!(message.content, text);
-                let thinking: String = conn
-                    .query_row(
-                        "SELECT thinking FROM messages WHERE id=?1",
-                        [&assistant],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(thinking, "private reasoning");
-                let calls = message_repo::get_tool_calls_for_message(conn, &assistant).unwrap();
+                assert_eq!(message.thinking.as_deref(),Some("private reasoning"));
+                let calls = r.tools(&assistant)?;
                 assert_eq!(calls[0].input.as_deref(), Some("{\"path\":"));
+                Ok(())
             })
             .unwrap();
         let done = EngineEvent::ToolUseDone {
@@ -3578,9 +3470,7 @@ mod background_transcript_tests {
         };
         live.observe(&done, &mut tools);
         live.observe(&done, &mut tools);
-        live.flush(
-            &context.db,
-            &session,
+        live.flush(&history,
             &assistant,
             &text,
             "private reasoning",
@@ -3588,13 +3478,12 @@ mod background_transcript_tests {
         )
         .unwrap();
         assert!(!live.dirty);
-        context
-            .db
-            .with_conn(|conn| {
-                let calls = message_repo::get_tool_calls_for_message(conn, &assistant).unwrap();
+        shard.read(|r| {
+                let calls = r.tools(&assistant)?;
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, format!("{assistant}:call"));
                 assert_eq!(calls[0].output.as_deref(), Some("complete"));
+                Ok(())
             })
             .unwrap();
     }
@@ -3602,10 +3491,12 @@ mod background_transcript_tests {
     #[test]
     fn five_occurrences_persist_five_rows_and_a_mirror_updates_one() {
         let temp = tempfile::tempdir().unwrap();
-        let context = deepseek_code_core::services::session_messages::context(temp.path()).unwrap();
-        let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
+        let stores=Arc::new(RuntimePaths::new(temp.path().to_owned()).unwrap().open_stores().unwrap());
+        let store=deepseek_code_core::runtime::SessionStore::new(stores.clone());
         let session = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&session, "assistant", "").unwrap();
+        let shard = stores.open_session(&session).unwrap();
+        let history = ExecutorHistory::Session(shard.clone());
         let mut live = BackgroundTranscript::default();
         let mut tools = Vec::new();
         for index in 0..5 {
@@ -3650,12 +3541,10 @@ mod background_transcript_tests {
             },
             &mut tools,
         );
-        live.flush(&context.db, &session, &assistant, "", "", &tools)
+        live.flush(&history, &assistant, "", "", &tools)
             .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                let calls = message_repo::get_tool_calls_for_message(conn, &assistant).unwrap();
+        shard.read(|r| {
+                let calls = r.tools(&assistant)?;
                 assert_eq!(calls.len(), 5);
                 assert_eq!(
                     calls[0].input.as_deref(),
@@ -3666,6 +3555,7 @@ mod background_transcript_tests {
                     calls[3].input.as_deref(),
                     Some(r#"{"file_path":"file-3.txt"}"#)
                 );
+                Ok(())
             })
             .unwrap();
     }
@@ -3673,10 +3563,12 @@ mod background_transcript_tests {
     #[test]
     fn legacy_missing_input_completion_keeps_the_start_input() {
         let temp = tempfile::tempdir().unwrap();
-        let context = deepseek_code_core::services::session_messages::context(temp.path()).unwrap();
-        let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
+        let stores=Arc::new(RuntimePaths::new(temp.path().to_owned()).unwrap().open_stores().unwrap());
+        let store=deepseek_code_core::runtime::SessionStore::new(stores.clone());
         let session = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&session, "assistant", "").unwrap();
+        let shard = stores.open_session(&session).unwrap();
+        let history = ExecutorHistory::Session(shard.clone());
         let mut live = BackgroundTranscript::default();
         let mut tools = Vec::new();
         live.observe(
@@ -3699,17 +3591,16 @@ mod background_transcript_tests {
             },
             &mut tools,
         );
-        live.flush(&context.db, &session, &assistant, "", "", &tools)
+        live.flush(&history, &assistant, "", "", &tools)
             .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                let calls = message_repo::get_tool_calls_for_message(conn, &assistant).unwrap();
+        shard.read(|r| {
+                let calls = r.tools(&assistant)?;
                 assert_eq!(calls.len(), 1);
                 assert_eq!(
                     calls[0].input.as_deref(),
                     Some(r#"{"command":"printf 'RICH_INPUT'"}"#)
                 );
+                Ok(())
             })
             .unwrap();
     }
@@ -3717,10 +3608,12 @@ mod background_transcript_tests {
     #[test]
     fn mirrored_pipeline_completion_updates_one_row_with_the_changed_input() {
         let temp = tempfile::tempdir().unwrap();
-        let context = deepseek_code_core::services::session_messages::context(temp.path()).unwrap();
-        let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
+        let stores=Arc::new(RuntimePaths::new(temp.path().to_owned()).unwrap().open_stores().unwrap());
+        let store=deepseek_code_core::runtime::SessionStore::new(stores.clone());
         let session = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&session, "assistant", "").unwrap();
+        let shard = stores.open_session(&session).unwrap();
+        let history = ExecutorHistory::Session(shard.clone());
         let mut live = BackgroundTranscript::default();
         let mut tools = Vec::new();
         live.observe(
@@ -3759,18 +3652,17 @@ mod background_transcript_tests {
             },
             &mut tools,
         );
-        live.flush(&context.db, &session, &assistant, "", "", &tools)
+        live.flush(&history, &assistant, "", "", &tools)
             .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                let calls = message_repo::get_tool_calls_for_message(conn, &assistant).unwrap();
+        shard.read(|r| {
+                let calls = r.tools(&assistant)?;
                 assert_eq!(calls.len(), 1);
                 assert_eq!(
                     calls[0].input.as_deref(),
                     Some(r#"{"command":"printf 'REVISED'"}"#)
                 );
                 assert_eq!(calls[0].output.as_deref(), Some("REVISED"));
+                Ok(())
             })
             .unwrap();
     }
@@ -3778,34 +3670,38 @@ mod background_transcript_tests {
     #[test]
     fn flush_keeps_dirty_when_the_database_is_busy() {
         let temp = tempfile::tempdir().unwrap();
-        let context = deepseek_code_core::services::session_messages::context(temp.path()).unwrap();
-        let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
+        let stores=Arc::new(RuntimePaths::new(temp.path().to_owned()).unwrap().open_stores().unwrap());
+        let store=deepseek_code_core::runtime::SessionStore::new(stores.clone());
         let session = store.create(temp.path(), "fixture", "fixture").unwrap();
         let assistant = store.append(&session, "assistant", "").unwrap();
+        let shard = stores.open_session(&session).unwrap();
+        let history = ExecutorHistory::Session(shard.clone());
         let mut live = BackgroundTranscript::default();
         let mut tools = Vec::new();
         live.observe(&EngineEvent::Text("streamed".into()), &mut tools);
         // Hold the writer like another process mid-checkpoint would.
-        let blocker = rusqlite::Connection::open(
-            temp.path().join(deepseek_code_core::runtime::DATABASE_FILE),
-        )
-        .unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert!(live
-            .flush(&context.db, &session, &assistant, "streamed", "", &tools)
-            .is_err());
-        assert!(live.dirty, "a failed flush must retry on the next tick");
-        blocker.execute_batch("COMMIT").unwrap();
-        live.flush(&context.db, &session, &assistant, "streamed", "", &tools)
+        std::thread::scope(|scope| {
+            let (entered,ready)=std::sync::mpsc::sync_channel(1);
+            let (release,wait)=std::sync::mpsc::sync_channel(1);
+            let writer=shard.clone();
+            scope.spawn(move ||writer.write(|_|{
+                entered.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                Ok(())
+            }).unwrap());
+            ready.recv().unwrap();
+            let saved=live.flush(&history,&assistant,"streamed","",&tools);
+            release.send(()).unwrap();
+            assert!(saved.is_err());
+            assert!(live.dirty, "a failed flush must retry on the next tick");
+        });
+        live.flush(&history, &assistant, "streamed", "", &tools)
             .unwrap();
         assert!(!live.dirty);
-        context
-            .db
-            .with_conn(|conn| {
-                let message = message_repo::get_message(conn, &assistant)
-                    .unwrap()
-                    .unwrap();
+        shard.read(|r| {
+                let message=r.messages()?.into_iter().find(|m|m.id==assistant).unwrap();
                 assert_eq!(message.content, "streamed");
+                Ok(())
             })
             .unwrap();
     }

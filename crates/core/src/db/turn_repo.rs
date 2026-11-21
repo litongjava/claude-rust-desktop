@@ -256,6 +256,14 @@ impl TurnTimer {
         })
     }
 
+    pub fn history(&self) -> super::session_store::ExecutorHistory {
+        use super::session_store::ExecutorHistory;
+        match &self.store {
+            TurnStore::Shared(db, id) => ExecutorHistory::Shared(db.clone(), id.clone()),
+            TurnStore::Session(shard) => ExecutorHistory::Session(shard.clone()),
+        }
+    }
+
     pub fn record(&self) -> &TurnRecord {
         &self.record
     }

@@ -10,6 +10,8 @@ pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod executor;
+mod segment;
+pub use segment::SegmentUpdate;
 pub use executor::ExecutorHistory;
 mod global;
 mod global_format;
@@ -388,12 +390,20 @@ impl SessionDb {
     fn write_locked<T>(
         &self,
         label: &str,
+        body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.write_locked_with_deadline(label,WRITE_DEADLINE,body)
+    }
+    fn write_locked_with_deadline<T>(
+        &self,
+        label: &str,
+        deadline: Duration,
         mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
     ) -> Result<T> {
         let binding = self.binding_control()?;
         let start = Instant::now();
         let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            crate::db::write_tx(c, label, WRITE_DEADLINE, |tx| {
+            crate::db::write_tx(c, label, deadline, |tx| {
                 let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
                 let writer=SessionWrite(tx,&self.id,false.into(),binding.pending);
                 let result=layout::callback(|| body(&writer))?;
