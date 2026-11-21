@@ -9,7 +9,63 @@ pub enum Rewind<'a> {
     Tail(i64),
 }
 
+fn validate_chat(c: &rusqlite::Connection, id: &str) -> Result<()> {
+    if let Some(row) = conversations::conversation_metadata(c, id)? {
+        anyhow::ensure!(
+            row.workspace_mode != "code"
+                || row.project_id.as_deref().is_some_and(|s| !s.is_empty()),
+            "Select a project before sending messages in Code mode"
+        );
+        crate::native_engine::workspace::conversation_project(c, id)?;
+    }
+    Ok(())
+}
+
 impl Stores {
+    pub fn validate_chat_project(&self, id: &str) -> Result<()> {
+        self.global().read(|c| {
+            let tx = c.unchecked_transaction()?;
+            validate_chat(&tx, id)
+        })
+    }
+    pub fn admit_chat_message(&self, id: &str, model: &str, content: Option<&Value>) -> Result<()> {
+        let content = content.filter(|v| v.as_str() != Some(""));
+        let row = self.global().read_directory_row(id, |c| {
+            let tx = c.unchecked_transaction()?;
+            validate_chat(&tx, id)?;
+            super::directory::one(&tx, id)
+        })?;
+        match row {
+            Some(entry) => {
+                let shard = self.open_listed(&entry)?;
+                if let Some(content) = content {
+                    let message = uuid::Uuid::new_v4().to_string();
+                    shard.write(|w| w.append_user(&message, content))?;
+                }
+            }
+            None => {
+                let first_message = content
+                    .map(|value| -> Result<_> {
+                        let (text, normalized) = messages::prepare_user_message(value)?;
+                        Ok(super::FirstMessage {
+                            text,
+                            typed: normalized.is_array().then_some(normalized),
+                        })
+                    })
+                    .transpose()?;
+                self.create(
+                    id,
+                    CreateOptions {
+                        model: Some(model.into()),
+                        first_message,
+                        ..Default::default()
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_conversation(
         &self,
         id: &str,
@@ -81,6 +137,28 @@ impl Stores {
     }
 }
 impl crate::db::DbManager {
+    pub fn validate_chat_project(&self, id: &str) -> Result<()> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            validate_chat(&tx, id)
+        })?
+    }
+    pub fn admit_chat_message(&self, id: &str, model: &str, content: Option<&Value>) -> Result<()> {
+        self.with_conn(|c|crate::db::write_tx(c,"admit chat user message",super::WRITE_DEADLINE,|tx|{
+            validate_chat(tx,id)?;
+            let now=chrono::Utc::now().to_rfc3339();
+            if conversations::conversation_metadata(tx,id)?.is_none(){
+                conversations::insert_conversation(tx,id,None,Some(model),None,None,None,false,false,false,&now,&now,0)?;
+            }
+            if let Some(content)=content.filter(|v|v.as_str()!=Some("")) {
+                let order=tx.query_row("SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",[id],|r|r.get(0))?;
+                messages::save_user_message(tx,&uuid::Uuid::new_v4().to_string(),id,content,&now,order)?;
+            }
+            tx.execute("UPDATE conversations SET message_count=(SELECT count(*) FROM messages WHERE conversation_id=?1),updated_at=?2 WHERE id=?1",[id,&now])?;
+            Ok(())
+        }))?
+    }
+
     pub fn create_conversation(
         &self,
         id: &str,

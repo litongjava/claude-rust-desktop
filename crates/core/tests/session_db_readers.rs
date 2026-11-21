@@ -719,3 +719,28 @@ fn retiring_worker_retains_its_own_and_its_project_childs_inbox() -> Result<()> 
     assert!(child_owner.next_peer()?.is_none());
     Ok(())
 }
+
+#[test]
+fn first_bridge_message_is_published_with_typed_history_and_chat_authority() -> Result<()> {
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let blocks = json!([{"type":"text","text":"typed hello"}]);
+    stores.admit_chat_message("chat", "model", Some(&blocks))?;
+    let shard = stores.open_session("chat")?;
+    shard.read(|r| {
+        let messages = r.messages()?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "typed hello");
+        assert_eq!(r.user_content(&messages[0].id)?, blocks);
+        assert_eq!(r.authority()?.len(), 1);
+        Ok(())
+    })?;
+    stores.admit_chat_message("chat", "model", Some(&json!("second")))?;
+    assert_eq!(shard.read(|r| r.messages())?.len(), 2);
+    assert!(stores
+        .admit_chat_message("invalid", "model", Some(&json!({"type":"text"})))
+        .is_err());
+    assert!(stores.global().conversation("invalid")?.is_none());
+    Ok(())
+}

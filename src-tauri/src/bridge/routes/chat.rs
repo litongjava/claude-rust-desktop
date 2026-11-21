@@ -57,24 +57,10 @@ pub(super) async fn start_chat(
     // Reject invalid Code/project requests before persisting messages or invoking a model.
     let db = state.db_manager.clone();
     let project_conversation_id = req.conversation_id.clone();
-    let project_check = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
-        (|| -> anyhow::Result<_> {
-            let conversation =
-                crate::db::conversation_repo::get_conversation(conn, &project_conversation_id)?;
-            if let Some(conversation) = conversation {
-                anyhow::ensure!(
-                    conversation.workspace_mode != "code"
-                        || conversation.project_id.as_deref().is_some_and(|id| !id.is_empty()),
-                    "Select a project before sending messages in Code mode"
-                );
-            }
-            crate::native_engine::workspace::conversation_project(conn, &project_conversation_id)
-        })()
-    })).await;
-    match project_check {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(error))) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error.to_string()}))).into_response(),
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not validate conversation project"}))).into_response(),
+    match tokio::task::spawn_blocking(move ||db.validate_chat_project(&project_conversation_id)).await {
+        Ok(Ok(()))=>{},
+        Ok(Err(error))=>return (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+        Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":"Could not validate conversation project"}))).into_response(),
     }
 
     // The backend keeps this lease for the whole turn; the engine shares it
@@ -123,34 +109,8 @@ pub(super) async fn start_chat(
         }
         let user_content = if queued.is_some() { None } else { user_content };
         let model_save = model.clone();
-        let saved = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let tx = deepseek_code_core::db::write_transaction(conn)?;
-                let now = chrono::Utc::now().to_rfc3339();
-                if crate::db::conversation_repo::get_conversation(&tx, &conv_id_save)?.is_none() {
-                    crate::db::conversation_repo::insert_conversation(
-                        &tx, &conv_id_save, None, Some(&model_save), None, None, None,
-                        false, false, false, &now, &now, 0,
-                    )?;
-                }
-                if let Some(content) = user_content.filter(|c| c.as_str() != Some("")) {
-                    let sort_order: i64 = tx.query_row(
-                        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?1",
-                        rusqlite::params![conv_id_save], |row| row.get(0),
-                    )?;
-                    crate::db::message_repo::save_user_message(
-                        &tx, &uuid::Uuid::new_v4().to_string(), &conv_id_save, &content, &now, sort_order,
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1), updated_at = ?2 WHERE id = ?1",
-                    rusqlite::params![conv_id_save, now],
-                )?;
-                tx.commit()?;
-                Ok::<(), anyhow::Error>(())
-            })
-        }).await;
-        if !matches!(saved, Ok(Ok(Ok(())))) {
+        let saved=tokio::task::spawn_blocking(move || db.admit_chat_message(&conv_id_save,&model_save,user_content.as_ref())).await;
+        if !matches!(saved,Ok(Ok(()))) {
             tracing::error!("Could not persist user content: {:?}", saved);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"Could not save user message"}))).into_response();
         }

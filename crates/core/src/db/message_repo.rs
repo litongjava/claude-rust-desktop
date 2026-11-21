@@ -196,15 +196,7 @@ pub fn insert_message(
     Ok(())
 }
 
-/// Save display text and durable multimodal content inside the caller's transaction.
-pub fn save_user_message(
-    conn: &Connection,
-    id: &str,
-    conversation_id: &str,
-    content: &serde_json::Value,
-    created_at: &str,
-    sort_order: i64,
-) -> Result<()> {
+pub(super) fn prepare_user_message(content:&serde_json::Value)->Result<(String,serde_json::Value)> {
     // Keep ordinary text (including historical empty messages) compatible.
     let normalized = if content.is_string() {
         content.clone()
@@ -229,6 +221,19 @@ pub fn save_user_message(
             .collect::<Vec<_>>()
             .join("\n"),
     };
+    Ok((display,normalized))
+}
+
+/// Save display text and durable multimodal content inside the caller's transaction.
+pub fn save_user_message(
+    conn: &Connection,
+    id: &str,
+    conversation_id: &str,
+    content: &serde_json::Value,
+    created_at: &str,
+    sort_order: i64,
+) -> Result<()> {
+    let (display,normalized)=prepare_user_message(content)?;
     let changed = conn.execute(
         "INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'user', ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET content = excluded.content, sort_order = excluded.sort_order WHERE messages.conversation_id = excluded.conversation_id AND messages.role = 'user'",
         params![id, conversation_id, display, created_at, sort_order],
