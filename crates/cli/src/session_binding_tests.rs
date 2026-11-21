@@ -293,6 +293,11 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
         .switch_with_effort(&paths, Some(selection(256)), Some(Some("low")))
         .await
         .unwrap();
+    // A fresh reader applies the effort committed with the binding generation.
+    use deepseek_code_core::db::session_store::settings::{Effort, PREFERENCES};
+    let reopened = paths.open_database().unwrap().open_session(&winner.id).unwrap();
+    let preferences = reopened.read(|r| r.setting(PREFERENCES)).unwrap().unwrap();
+    assert_eq!(preferences.effort, Some(Effort::Low));
     let updated: serde_json::Value = serde_json::from_str(&value()).unwrap();
     assert_eq!(
         updated,

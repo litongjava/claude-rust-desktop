@@ -4,14 +4,16 @@ use crate::{
     db::DbManager,
     super_agent::{role::MemberRole, Role},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use std::sync::Arc;
 
 impl SessionRepository<'_> {
     pub(crate) fn role(&self) -> Result<Role> {
         match &self.0 {
-            Backend::Admitted(s) => s.read(|r| Ok(r.setting(settings::ROLE)?.unwrap_or_default())),
+            Backend::Admitted(s) => s.read(|r| {
+                Ok(r.setting(settings::ROLE).context("Unknown role in session settings")?.unwrap_or_default())
+            }),
             Backend::Shared(_, _) => self.read(|c, id| {
                 match super::state::local(c, &format!("super-agent.role.{id}"))?.as_deref() {
                     None | Some("") => Ok(Role::Agent),
