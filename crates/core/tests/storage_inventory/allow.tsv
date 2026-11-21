@@ -90,6 +90,8 @@ crates/core/src/tools/tasks.rs	Connection::open	8	1002dc0d39e631cae47ea57c1fad53
 crates/core/src/worktree/session.rs	Connection::open	1	5a83b8af97489da936018e98dda7bbb38394d93706dee7bc436b7aa06cd56ab1	Colocated session repository fixture
 crates/core/tests/agent_import.rs	Connection::open	1	8ec869ecc1192224c2e178deb28514185f00a0327a66e3de14222dd8941a1bd4	agent_import integration or repository fixture
 crates/core/tests/context_compression_utf8.rs	Connection::open	1	09573b6b113b5a27c6f0551091463558d33394fc78dc4ce203f48844a890689b	context_compression_utf8 integration or repository fixture
+crates/core/tests/first_chat_recovery.rs	Connection::open	1	acd314d6d3b48ee0837a650994ab8f11aedfd94fa18f9aa635a508c1c32fae12	Migration fixture opens its temporary shard to recreate the v11 receipt format.
+crates/core/tests/first_chat_recovery.rs	peripheral_settings	1	a5171b8c7c0c3c176f5127d3e4d1beb574307af7765bedbd1ffc627a77934aa4	Migration fixture seeds the digest-only v11 receipt before reopening the shard.
 crates/core/tests/scheduled_prompts.rs	Connection::open	1	924c148587f1992956162241fa3906edd5f2e07266c8f50b8073c0fb1d696195	scheduled_prompts integration or repository fixture
 crates/core/tests/session_concurrency.rs	Connection::open	1	e373254f1d65ebceb8806e6523743eb6e0a975dcc1b05ed9198a90fce348d9fa	session_concurrency integration or repository fixture
 crates/core/tests/session_db_conversation_edits.rs	Connection::open	1	6e79af0040f8c677f7fec9322ca5fd3fd14d6f5da0d4e6b69e69cb4056ed748d	Temporary global trigger for combined-edit failure injection

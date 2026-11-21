@@ -105,7 +105,7 @@ impl Stores {
             .read_directory_row(id, |c| super::directory::one(c, id))?;
         let Some(row) = row else {
             let options = super::conversations::first_chat_options(model, first)?;
-            return Ok((self.create_chat_with_lease(id, options)?, true));
+            return self.create_chat_with_lease(id, options);
         };
         let session = self.open_listed(&row)?;
         let lease = session.acquire_execution()?;

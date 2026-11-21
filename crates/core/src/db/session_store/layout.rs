@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 pub(super) const GLOBAL_VERSION: i32 = 15;
-pub(super) const SESSION_VERSION: i32 = 11;
+pub(super) const SESSION_VERSION: i32 = 12;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -270,6 +270,20 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
             }
             if kind == SESSION && version < 11 {
                 tx.execute_batch(include_str!("session_v11.sql"))?;
+            }
+            if kind == SESSION && version < 12 {
+                tx.execute_batch(include_str!("session_v12.sql"))?;
+                // V11 saved only a digest. The seal records the original timestamp and
+                // order. A removed shard-issued message makes that identity ambiguous.
+                tx.execute_batch("INSERT INTO first_chat_receipts(message_id,digest)
+                    SELECT m.id,s.value FROM manifest f JOIN peripheral_settings s
+                      ON s.key='first-chat-receipt.' || f.incarnation
+                    JOIN messages m ON m.conversation_id=f.id AND m.created_at=f.created_at
+                      AND m.sort_order=0 AND m.role='user'
+                    WHERE NOT EXISTS(SELECT 1 FROM removed_message_owners)
+                    AND (SELECT count(*) FROM messages WHERE sort_order=0)=1;
+                    DELETE FROM peripheral_settings WHERE key=(
+                        SELECT 'first-chat-receipt.' || incarnation FROM manifest);")?;
             }
             if kind == GLOBAL {
                 if version < 5 {
@@ -565,6 +579,11 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     } else {
         &[]
     };
+    let receipts: &[(&str, &str)] = if kind == SESSION && expected >= 12 {
+        &[("first_chat_receipts", "message_id digest")]
+    } else {
+        &[]
+    };
     for &(table, required) in tables
         .iter()
         .chain(added)
@@ -580,6 +599,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         .chain(registrations)
         .chain(edits)
         .chain(removed)
+        .chain(receipts)
     {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
@@ -670,6 +690,7 @@ pub(super) fn initialize(
         tx.execute_batch(include_str!("session_v9.sql"))?;
         tx.execute_batch(include_str!("session_v10.sql"))?;
         tx.execute_batch(include_str!("session_v11.sql"))?;
+        tx.execute_batch(include_str!("session_v12.sql"))?;
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;

@@ -31,3 +31,104 @@ fn first_chat_recovery() -> Result<()> {
     assert!(!sealed_again);
     Ok(())
 }
+
+const RETRY: &str = "00000000-0000-4000-8000-000000000046";
+
+fn submit(stores: &Stores, prompt: &str) -> Result<bool> {
+    let content = json!(prompt);
+    let (_lease, sealed) = stores.admit_chat_execution(RETRY, "model", Some(&content))?;
+    if !sealed {
+        stores.admit_chat_message(RETRY, "model", Some(&content))?;
+    }
+    Ok(sealed)
+}
+
+fn recover_first(stores: &Stores) -> Result<()> {
+    let fault = stores.with_fault_hook(|phase| {
+        ensure!(
+            phase != Phase::BeforePublishCommit,
+            "recoverable publication failure"
+        );
+        Ok(())
+    });
+    assert!(submit(&fault, "A").is_err());
+    assert_eq!(texts(stores)?, [json!("A")]);
+    Ok(())
+}
+
+fn texts(stores: &Stores) -> Result<Vec<serde_json::Value>> {
+    Ok(stores
+        .conversation_detail(RETRY)?
+        .1
+        .into_iter()
+        .map(|m| m["content"].clone())
+        .collect())
+}
+
+#[test]
+fn rewind_then_resubmit_restores_one_prompt() -> Result<()> {
+    use deepseek_code_core::db::session_store::Rewind;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    recover_first(&stores)?;
+    stores.rewind_messages(RETRY, Rewind::Tail(1))?;
+    let sealed = submit(&stores, "A")?;
+    assert_eq!(texts(&stores)?, [json!("A")]);
+    assert!(!sealed);
+    Ok(())
+}
+
+#[test]
+fn intervening_submission_preserves_pending_retry() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    recover_first(&stores)?;
+    assert!(!submit(&stores, "B")?);
+    let sealed = submit(&stores, "A")?;
+    assert_eq!(texts(&stores)?, [json!("A"), json!("B")]);
+    assert!(sealed);
+    assert!(!submit(&stores, "A")?);
+    assert_eq!(texts(&stores)?, [json!("A"), json!("B"), json!("A")]);
+    Ok(())
+}
+
+#[test]
+fn replacing_the_sealed_message_with_identical_text_clears_its_receipt() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    recover_first(&stores)?;
+    stores.open_session(RETRY)?.edit_conversation(&json!({
+        "messages": [{"id":"replacement", "role":"user", "content":"A"}]
+    }))?;
+    assert!(!submit(&stores, "A")?);
+    assert_eq!(texts(&stores)?, [json!("A"), json!("A")]);
+    Ok(())
+}
+
+#[test]
+fn upgrade_binds_a_legacy_receipt_to_the_surviving_sealed_message() -> Result<()> {
+    for rewind in [false, true] {
+        let root = tempfile::tempdir()?;
+        let stores = Stores::open(root.path())?;
+        recover_first(&stores)?;
+        drop(stores);
+        let shard = rusqlite::Connection::open(
+            root.path().join("sessions").join(RETRY).join("session.db"),
+        )?;
+        shard.execute_batch("INSERT INTO peripheral_settings SELECT 'first-chat-receipt.' || incarnation,digest FROM manifest,first_chat_receipts;
+            DROP TRIGGER first_chat_text_edit; DROP TRIGGER first_chat_typed_insert;
+            DROP TRIGGER first_chat_typed_edit; DROP TRIGGER first_chat_typed_delete;
+            DROP TABLE first_chat_receipts; PRAGMA user_version=11;")?;
+        if rewind {
+            // V11 rewind kept the now-orphaned digest.
+            shard.execute_batch(
+                "DELETE FROM messages; UPDATE manifest SET message_count=0,content_revision=2",
+            )?;
+        }
+        drop(shard);
+        let stores = Stores::open(root.path())?;
+        assert_eq!(submit(&stores, "A")?, !rewind);
+        assert_eq!(texts(&stores)?, [json!("A")]);
+    }
+    Ok(())
+}

@@ -280,14 +280,24 @@ impl SessionDb {
     /// Consume the receipt under the execution lease. Ordinary identical later prompts append.
     pub(super) fn consume_sealed_first(&self, first: Option<&FirstMessage>) -> Result<bool> {
         let Some(first) = first else { return Ok(false); };
-        let key = format!("first-chat-receipt.{}", self.incarnation());
-        let Some(saved) = self.read(|r| super::state::local(r.0, &key))? else { return Ok(false); };
-        let matches = saved == first.digest()?;
+        let digest = first.digest()?;
+        let pending = self.read(|r| Ok(r.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM first_chat_receipts WHERE digest=?1)",
+            [&digest], |row| row.get::<_, bool>(0),
+        )?))?;
+        if !pending {
+            return Ok(false);
+        }
+        let typed = first.typed.as_ref().map(serde_json::to_string).transpose()?;
         self.write_named("consume sealed first chat", |w| {
-            ensure!(w.0.execute("DELETE FROM peripheral_settings WHERE key=?1 AND value=?2", [&key, &saved])? == 1, "First chat receipt changed");
-            Ok(())
-        })?;
-        Ok(matches)
+            Ok(w.0.execute(
+                "DELETE FROM first_chat_receipts WHERE digest=?1 AND message_id IN (
+                    SELECT m.id FROM messages m LEFT JOIN message_user_content t ON t.message_id=m.id
+                    WHERE m.id=first_chat_receipts.message_id AND m.role='user'
+                      AND m.content=?2 AND t.content_json IS ?3)",
+                params![digest, first.text, typed],
+            )? == 1)
+        })
     }
 }
 
@@ -302,7 +312,7 @@ impl Stores {
         &self,
         id: &str,
         options: CreateOptions,
-    ) -> Result<crate::services::session_messages::ExecutionLease> {
+    ) -> Result<(crate::services::session_messages::ExecutionLease, bool)> {
         use crate::services::session_messages::ExecutionLease;
         let key = storage_key(id)?;
         let locks = self.group_access(vec![(&key, true, true)])?;
@@ -315,8 +325,8 @@ impl Stores {
         drop(locks);
         lease.lifecycle = self.key_lock(&key, false, false)?;
         shard.check_directory()?;
-        shard.consume_sealed_first(first.as_ref())?;
-        Ok(lease)
+        let sealed = shard.consume_sealed_first(first.as_ref())?;
+        Ok((lease, sealed))
     }
 
     pub fn feishu_conversation(&self,chat:&str,title:Option<String>)->Result<super::im::FeishuChatMapping> {
@@ -521,9 +531,6 @@ impl Stores {
                         crate::services::permission_authority::Source::User,
                         &content,
                     )?;
-                    if matches!(seed, Seed::Chat(_)) {
-                        super::state::set_local(tx, &format!("first-chat-receipt.{}", op.incarnation), &first.digest()?)?;
-                    }
                     let message = crate::db::transcript::MessageIds::new(&op.incarnation).issue();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
@@ -531,6 +538,12 @@ impl Stores {
                         tx.execute(
                             "INSERT INTO message_user_content VALUES(?1,?2)",
                             params![message, serde_json::to_string(typed)?],
+                        )?;
+                    }
+                    if matches!(seed, Seed::Chat(_)) {
+                        tx.execute(
+                            "INSERT INTO first_chat_receipts(message_id,digest) VALUES(?1,?2)",
+                            params![message, first.digest()?],
                         )?;
                     }
                 }
