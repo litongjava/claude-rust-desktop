@@ -106,3 +106,4 @@ crates/core/tests/session_db_resume_parity.rs	Connection::open	4	86697b952156048
 crates/core/tests/support/session_sql.rs	Connection::open	1	7439f4f54f862e02509d4a0e97407507877c82334e1930807f73b6fd3cd23342	Fixture SQL opens existing files only and validates the selected shard identity
 src-tauri/tests/conversation_images_bridge.rs	Connection::open	1	06ef95e4704a8b311beb4a172f2d6bea2da032abb79f9596d78ea363b1fc1a90	conversation_images_bridge integration or repository fixture
 crates/core/tests/detail_projection.rs	Connection::open	1	82a50157dac6b63a662a88a06217dc2818b6136a29acc08f2170cb5c783c2a5b	Test-only directory writer holds projection publication busy while the shard commits.
+crates/core/tests/session_db_lifecycle/child_upgrade.rs	Connection::open	1	d4a97814ef97e89db44dc410642ae010cd753e99f06c6fc14b89d08a303365c2	Reconstruct and inspect the old child shard in the bounded format upgrade fixture.

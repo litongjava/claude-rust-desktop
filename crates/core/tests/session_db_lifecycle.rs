@@ -12,6 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+#[path = "session_db_lifecycle/child_upgrade.rs"]
+mod child_upgrade;
+
 const ID: &str = "12345678-abcd-4abc-89ef-123456789abc";
 const CHILD_ENV: &str = "I46_LIFECYCLE_CHILD_DIR";
 const WAIT: Duration = Duration::from_secs(20);
@@ -711,6 +714,9 @@ fn subprocess() -> Result<()> {
         Ok(())
     };
     match mode.as_str() {
+        "resume-old-child" | "contended-upgrade" => {
+            child_upgrade::run(&s, &root, mode == "contended-upgrade")?;
+        }
         "nested-archive" => {
             let h = s.open_session(ID)?;
             h.write(|_| {

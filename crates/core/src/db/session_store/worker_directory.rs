@@ -35,6 +35,15 @@ pub trait WorkerDirectory: SessionAccess {
 }
 
 impl WorkerPair {
+    pub(crate) fn hold_for_resume(&self, stores: &Stores) -> Result<impl Drop> {
+        let (_, parent, child) = self.recorded_identities()?;
+        // Opening an old shard needs its exclusive lifecycle lock. Upgrade each
+        // recorded incarnation separately, then verify both under the shared pair.
+        stores.open_recorded(&self.parent, parent)?;
+        stores.open_recorded(&self.child, child)?;
+        self.hold(stores)
+    }
+
     pub(crate) fn hold(&self, stores: &Stores) -> Result<impl Drop> {
         let parent = super::layout::storage_key(&self.parent)?;
         let child = super::layout::storage_key(&self.child)?;
@@ -45,11 +54,14 @@ impl WorkerPair {
         Ok(guards)
     }
 
-    fn verify<'a>(&'a self, stores: &Stores, tx: &Connection) -> Result<(&'a str, &'a str)> {
-        let (store, parent, child) = self
-            .identities
+    fn recorded_identities(&self) -> Result<&(String, String, String)> {
+        self.identities
             .as_ref()
-            .context("Worker registration lacks a shard identity")?;
+            .context("Worker registration lacks a shard identity")
+    }
+
+    fn verify<'a>(&'a self, stores: &Stores, tx: &Connection) -> Result<(&'a str, &'a str)> {
+        let (store, parent, child) = self.recorded_identities()?;
         ensure!(
             store == stores.global().store_uuid(),
             "Worker data root changed"
@@ -59,7 +71,7 @@ impl WorkerPair {
             params![self.parent,self.child,parent,child], |r| r.get(0))?;
         ensure!(
             current,
-            "Worker session retired or archived during registration"
+            "Parent or child session incarnation changed or was archived during registration"
         );
         Ok((parent, child))
     }

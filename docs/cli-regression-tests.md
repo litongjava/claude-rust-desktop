@@ -1046,6 +1046,7 @@ env -u DEEPSEEK_CODE_BACKGROUND_CONTROL -u DEEPSEEK_CODE_BACKGROUND_JOB \
 - `cargo test --locked -p deepseek-code-cli --test super_agent_child`：真实 `dcl` 子进程加本地模型 mock（不连接真实服务）。子进程用 Bash 工具把 `pwd` 写入临时文件，验证首次和 `--resume` 后都在准备的工作目录；`conversations.workspace_path` 记录该目录；父工作目录没有子进程写入；旧的 Job 已完成、没有重复的活动子进程；尝试把已有子会话移到另一个目录会被拒绝。
 - `cargo test --locked -p deepseek-code-core --lib native_engine::child_session`：抽取后的启动/继续逻辑 7 项，覆盖无效父会话、归档父会话、启动失败不写成功状态、重新使用同一会话和拒绝更换工作目录。
 - `cargo test --locked -p deepseek-code-core --lib native_engine::tool_loop::delegation` 与 `cargo test --locked -p deepseek-code-core --test delegation`：原有 Agent 委派和后台子会话行为不变（分别 22 与 4 项）。
+- `cargo test --locked -p deepseek-code-core --test session_db_lifecycle child_upgrade::`：父会话持有执行租约时，恢复 v11 子会话必须完成升级并到达启动步骤；已有共享锁时，直接升级必须返回可重试错误，释放锁后重试成功。两个场景均在有超时和回收机制的子进程中运行。
 - 非 Git 快照场景包含在 `super_agent::isolation`：用户自己的 `manifest.json`、文件与目录互换、可执行权限、快照目录位于源目录内或其符号链接别名的拒绝、损坏或缺失 payload 时先校验后恢复（当前文件保持不变）、被跳过条目（依赖目录等）在清单中如实记录而不是声称已保护。
 - 当前无法自动化的部分：真实多仓库任务的合并与清理、Router 与 `/crp` 交互、Desktop 角色切换、Windows 上的路径与符号链接行为，均在后续轮次实现并单独验收。
 

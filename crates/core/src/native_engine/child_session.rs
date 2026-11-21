@@ -193,8 +193,15 @@ pub(crate) async fn prepare_child_session(
         "Data directory must be absolute"
     );
 
-    let resume_pair = spawn.resume_session.as_deref().map(|child| context.db.worker_pair(&spawn.parent_session_id, child)).transpose()?;
-    let _resume_guard = resume_pair.as_ref().map(|pair| pair.hold(&context.db)).transpose()?;
+    let resume_pair = spawn
+        .resume_session
+        .as_deref()
+        .map(|child| context.db.worker_pair(&spawn.parent_session_id, child))
+        .transpose()?;
+    let _resume_guard = resume_pair
+        .as_ref()
+        .map(|pair| pair.hold_for_resume(&context.db))
+        .transpose()?;
     let parent = require_session(&context, &spawn.parent_session_id, "Parent session")?;
     ensure!(!parent.archived, "Parent session is archived");
     ensure!(

@@ -388,7 +388,15 @@ impl Stores {
         };
         if old {
             drop(locks);
-            locks = self.key_lock(&handle.key, true, false)?;
+            // An enclosing operation may still hold a shared guard on this key.
+            locks = layout::without_lifecycle_wait(|| self.key_lock(&handle.key, true, false))
+                .map_err(|error| {
+                    if error.is::<layout::LifecycleBusy>() {
+                        error.context(format!("Session {id} is busy; retry the format upgrade"))
+                    } else {
+                        error
+                    }
+                })?;
             handle.check_directory()?;
             handle.upgrade_locked()?;
         }
