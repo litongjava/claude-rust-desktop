@@ -80,3 +80,16 @@ async fn native_and_bridge_share_conversation_history() {
     serving.abort();
     let _ = serving.await;
 }
+
+#[tokio::test]
+async fn native_list_uses_private_child_workspace_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let db = RuntimePaths::new(root.path().into()).unwrap().open_database().unwrap();
+    let owner = db.create("owner", Default::default()).unwrap();
+    let workspace = owner.workspace().unwrap();
+    owner.derive_owned_child("child", &workspace).unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    let rows = commands::native_list_conversations(app.handle().clone()).await.unwrap();
+    assert_eq!(rows.iter().find(|r| r.id == "child").unwrap().workspace_path, workspace);
+}

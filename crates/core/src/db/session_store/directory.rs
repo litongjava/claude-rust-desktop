@@ -17,6 +17,7 @@ pub struct DirectoryFilter<'a> {
 pub struct DirectoryEntry {
     pub conversation: ConversationRow,
     pub incarnation: String,
+    pub workspace_incarnation: String,
     pub first_prompt: Option<String>,
     pub latest_prompt: Option<String>,
     pub git_branch: Option<String>,
@@ -27,7 +28,9 @@ pub struct DirectoryEntry {
 const FIELDS: &str = "SELECT id, title, model, provider, workspace_path, project_id,
     research_mode, pinned, archived, created_at, updated_at, message_count, workspace_mode,
     incarnation, first_prompt, latest_prompt, git_branch, transcript_bytes, last_turn_status,
-    content_revision FROM conversations";
+    content_revision, coalesce((SELECT b.parent_incarnation FROM conversation_private_workspace_bindings b
+        WHERE b.child_id=conversations.id AND conversations.project_id IS NULL),incarnation)
+    FROM conversations";
 fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
     let mut conversation = row_to_conversation(row)?;
     let first_prompt: Option<String> = row.get(14)?;
@@ -49,6 +52,7 @@ fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
         transcript_bytes: row.get(17)?,
         last_turn_status: row.get(18)?,
         content_revision: row.get(19)?,
+        workspace_incarnation: row.get(20)?,
     })
 }
 

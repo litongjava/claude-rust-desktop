@@ -364,7 +364,7 @@ pub async fn native_list_conversations<R: tauri::Runtime>(
             .global()
             .list_sessions(Default::default())?
             .into_iter()
-            .map(|entry| native_conversation(entry.conversation, root.join(entry.incarnation)))
+            .map(|entry| native_conversation(entry.conversation, root.join(entry.workspace_incarnation)))
             .collect())
     })
     .await

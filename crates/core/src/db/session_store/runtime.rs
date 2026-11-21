@@ -36,7 +36,7 @@ impl Stores {
 
     pub fn resume_code(&self, id: &str) -> Result<(SessionDb, ConversationRow)> {
         let shard = self.open_session(id)?;
-        let metadata = shard.code_metadata()?;
+        let (metadata, _) = shard.code_selection()?;
         Ok((shard, metadata))
     }
 
@@ -66,7 +66,7 @@ impl Stores {
 }
 
 impl SessionDb {
-    fn code_metadata(&self) -> Result<ConversationRow> {
+    pub fn code_selection(&self) -> Result<(ConversationRow, std::path::PathBuf)> {
         let _guard = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
         self.stores.global().read(|c| {
@@ -80,11 +80,11 @@ impl SessionDb {
             );
             ensure!(!row.archived, "Session is archived");
             crate::native_engine::workspace::conversation_project(&tx, self.id())?;
+            let path = super::lifecycle::workspace(&tx, &self.stores.root.path.join("workspaces"), self.id())?;
             if row.project_id.is_none() {
-                let path = super::lifecycle::workspace(&tx, &self.stores.root.path.join("workspaces"), self.id())?;
                 row.workspace_path = Some(path.to_string_lossy().into_owned());
             }
-            Ok(row)
+            Ok((row, path))
         })
     }
 }

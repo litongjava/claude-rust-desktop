@@ -1174,6 +1174,13 @@ impl Session {
         self.end_hooks("other").await;
         let admission = async {
             let guard = shard.hold_incarnation()?;
+            let (_, admitted_workspace) = shard.code_selection()
+                .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
+            let prepared = if lifecycle_owned && workspace != admitted_workspace {
+                Some(self.prepare_start_hooks(id, &admitted_workspace).await?)
+            } else {
+                prepared
+            };
             let state =
                 crate::worker_binding::observe_row(paths, id, shard.observe_provider()?, candidate)
                     .await?;
@@ -1184,9 +1191,9 @@ impl Session {
                 &self.permissions,
                 mode,
             )?;
-            Ok::<_, anyhow::Error>((target, guard))
+            Ok::<_, anyhow::Error>((target, guard, admitted_workspace, prepared))
         }.await;
-        let (target, guard) = match admission {
+        let (target, guard, workspace, prepared) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
                 if lifecycle_owned { self.finish_committed_start_hooks("resume").await; }
@@ -4773,6 +4780,17 @@ mod event_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn resume_rejects_target_replaced_during_end_hook() -> Result<()> {
+        resume_during_end_hook(true).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resume_installs_workspace_rebound_during_end_hook() -> Result<()> {
+        resume_during_end_hook(false).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn resume_during_end_hook(replace: bool) -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (paths, cli, _) = lc_fixture(dir.path(), true);
         let store = SessionStore::new(paths.open_database()?);
@@ -4798,20 +4816,32 @@ mod event_tests {
                 }
             })
             .await?;
-            store.db.open_session(&second)?.delete()?;
-            store.create_with_id(&workspaces[2], "fixture", "fixture", &second)?;
+            if replace {
+                store.db.open_session(&second)?.delete()?;
+                store.create_with_id(&workspaces[2], "fixture", "fixture", &second)?;
+            } else {
+                let other = store.create(&workspaces[2], "fixture", "fixture")?;
+                let project = store.db.resume_code(&other)?.1.project_id.unwrap();
+                store.db.open_session(&second)?.edit_conversation(&json!({"project_id":project}))?;
+            }
             std::fs::write(release, "")?;
             Ok::<_, anyhow::Error>(())
         };
-        let (resume, replace) = tokio::join!(session.resume_saved(&paths, &second), change);
-        replace?;
-        assert!(resume.is_err());
-        assert_eq!(session.id, first);
-        assert_eq!(session.workspace, workspaces[0]);
-        assert!(
-            deepseek_code_core::services::session_permission_mode::load(&store.db, &second)?
-                .is_none()
-        );
+        let (resume, changed) = tokio::join!(session.resume_saved(&paths, &second), change);
+        changed?;
+        if replace {
+            assert!(resume.is_err());
+            assert_eq!(session.id, first);
+            assert_eq!(session.workspace, workspaces[0]);
+            assert!(
+                deepseek_code_core::services::session_permission_mode::load(&store.db, &second)?
+                    .is_none()
+            );
+        } else {
+            resume?;
+            assert_eq!(session.id, second);
+            assert_eq!(session.workspace, workspaces[2]);
+        }
         session.close_coordination().await;
         Ok(())
     }
