@@ -86,7 +86,7 @@ crates/core/src/tools/monitor_completion.rs	Connection::open	1	0be7acd37e776769f
 crates/core/src/tools/plan_import.rs	Connection::open	14	6b4b29b931044aa29edd9c06f3635eaa32560b1f48e0859d4608619c2003fa53	Explicit standalone task database import and rollback fixtures
 crates/core/src/tools/scheduled.rs	Connection::open	2	e3615be898f929a49a84e1e4b0d9bd6dd60847c24710aebf957f48f963bbfe1f	Standalone schedule database
 crates/core/src/tools/shell_notifications.rs	Connection::open	2	39d779925e891ce29f7339360c1f9cd84e26c4c2f530d467ca47478e6bcba5c9	Standalone task notification database
-crates/core/src/tools/tasks.rs	Connection::open	7	7a12ad6908712334395f507f8ac7590c0bbc1f340823476fb73c1db9c966d2f0	Standalone task records and session writer contention fixtures
+crates/core/src/tools/tasks.rs	Connection::open	8	1002dc0d39e631cae47ea57c1fad53bc67429d47addcde81a2cbb4679d7cf40d	Standalone task records and temporary WAL contention fixtures
 crates/core/src/worktree/session.rs	Connection::open	1	5a83b8af97489da936018e98dda7bbb38394d93706dee7bc436b7aa06cd56ab1	Colocated session repository fixture
 crates/core/tests/agent_import.rs	Connection::open	1	8ec869ecc1192224c2e178deb28514185f00a0327a66e3de14222dd8941a1bd4	agent_import integration or repository fixture
 crates/core/tests/context_compression_utf8.rs	Connection::open	1	09573b6b113b5a27c6f0551091463558d33394fc78dc4ce203f48844a890689b	context_compression_utf8 integration or repository fixture

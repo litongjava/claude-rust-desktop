@@ -1761,7 +1761,10 @@ mod tests {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )
         .unwrap();
-        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // In WAL, BEGIN EXCLUSIVE alone only excludes other writers.
+        // Exclusive connection locking holds the database file against readers too.
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
         let started = tokio::time::Instant::now();
         let value = execute_for_session_async(
             "TaskGet",
@@ -1773,10 +1776,48 @@ mod tests {
         .unwrap();
         let elapsed = started.elapsed();
         lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
         assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         assert_eq!(value["status"], "completed");
         assert_eq!(value["retrieval_status"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn background_job_task_get_reads_committed_report_during_a_wal_write() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let job = job_fixture(root.path(), &session, "completed", Some("committed report"));
+        let path = root
+            .path()
+            .join("sessions")
+            .join(&session)
+            .join("session.db");
+        let writer = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        let journal: String = writer
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        writer
+            .execute_batch(
+                "BEGIN EXCLUSIVE; UPDATE messages SET content='uncommitted' WHERE role='assistant'",
+            )
+            .unwrap();
+        let result = execute_for_session_async(
+            "TaskGet",
+            json!({"task_id":job,"block":true,"timeout":400}),
+            root.path(),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["retrieval_status"], "success");
+        assert_eq!(result["stdout"], "committed report");
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
