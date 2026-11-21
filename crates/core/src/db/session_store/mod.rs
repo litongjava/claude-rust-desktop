@@ -6,6 +6,8 @@ mod directory;
 pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter};
 mod delivery;
+mod executor;
+pub use executor::ExecutorHistory;
 mod global;
 mod global_format;
 mod history;

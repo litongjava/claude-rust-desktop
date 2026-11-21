@@ -1670,6 +1670,7 @@ impl QueryEngine {
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
+        .with_executor_history(self.db_manager.executor_history(&conv_id)?)?
         .with_durable_super_agent(crate::super_agent::crp::ToolRuntime {
             db: self.db_manager.clone(),
             data_dir,

@@ -211,14 +211,23 @@ impl SessionDb {
         transport: &Value,
         failed: bool,
     ) -> Result<String> {
-        let id = stream_occurrence_id(message, provider_id);
         let output = McpOutput::from_transport(transport)?;
         let display = output.display();
-        self.write_named("save MCP output", |tx| {
-            output.save(tx.0, &self.id, &id, &display, failed)?;
-            Ok(())
-        })?;
+        self.save_mcp_output(message, provider_id, &output, &display, failed)?;
         Ok(display)
+    }
+    pub(super) fn save_mcp_output(
+        &self,
+        message: &str,
+        provider_id: &str,
+        output: &McpOutput,
+        display: &str,
+        failed: bool,
+    ) -> Result<()> {
+        let id = stream_occurrence_id(message, provider_id);
+        self.write_named("save MCP output", |tx| {
+            output.save(tx.0, &self.id, &id, display, failed)
+        })
     }
 }
 

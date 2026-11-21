@@ -986,6 +986,8 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
         spec.reasoning.clone(),
     )
     .with_conv_id(spec.session.clone())
+    .with_executor_history(db.executor_history(&spec.session)?)?
+    .with_parent_message_id_option(spec.assistant_id.clone())
     .with_durable_super_agent(crate::super_agent::crp::ToolRuntime {
         db: db.clone(),
         data_dir: data_dir.clone(),

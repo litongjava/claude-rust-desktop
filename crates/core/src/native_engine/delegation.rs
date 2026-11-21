@@ -1237,8 +1237,8 @@ impl ToolLoopExecutor {
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
         .with_context_reminders(self.context_reminders.clone())
-        .with_transcript_db(context.db.clone())
         .with_conv_id(id.clone())
+        .with_executor_history(context.db.executor_history(&id)?)?
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())
         .with_permission_host(self.permission_host_available)

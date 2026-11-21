@@ -1,3 +1,4 @@
+use crate::db::session_store::ExecutorHistory;
 #[cfg(test)]
 #[path = "auto_permission_tests.rs"]
 mod auto_permission_tests;
@@ -312,6 +313,7 @@ pub struct ToolLoopExecutor {
     /// persists them. A ToolScript job uses it to write nested history
     /// records independently of the parent's ended turn.
     parent_message_id: Option<String>,
+    executor_history: Option<ExecutorHistory>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     permission_mailbox: crate::native_engine::permission_response::Mailbox,
     permission_interrupted: Arc<std::sync::Mutex<Option<String>>>,
@@ -347,7 +349,6 @@ pub struct ToolLoopExecutor {
     stop_hook_active: bool,
     stop_hook_blocks: u64,
     goal_db: Option<Arc<crate::db::DbManager>>,
-    transcript_db: Option<Arc<crate::db::DbManager>>,
     skill_shell_active: bool,
     /// Deep-research children read pages as text: their quotes are checked
     /// against the fetched source, not against a model's answer about it.
@@ -1624,6 +1625,7 @@ impl ToolLoopExecutor {
             streaming_tool_args: HashMap::new(),
             conv_id: None,
             parent_message_id: None,
+            executor_history: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
             permission_mailbox: Default::default(),
             permission_interrupted: Arc::new(std::sync::Mutex::new(None)),
@@ -1654,7 +1656,6 @@ impl ToolLoopExecutor {
             stop_hook_active: false,
             stop_hook_blocks: 0,
             goal_db: None,
-            transcript_db: None,
             skill_shell_active: false,
             raw_web_fetch: false,
             pending_user_skill: None,
@@ -1714,12 +1715,6 @@ impl ToolLoopExecutor {
     pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
         self.goal_db = Some(db);
         // Session-backed tools enter the catalog once storage is bound.
-        self.builtin_names.take();
-        self
-    }
-
-    fn with_transcript_db(mut self, db: Arc<crate::db::DbManager>) -> Self {
-        self.transcript_db = Some(db);
         self.builtin_names.take();
         self
     }
@@ -2188,31 +2183,17 @@ impl ToolLoopExecutor {
     /// Desktop may submit display-only history. The durable tool row binds an
     /// assistant call to its result, independently of that display history.
     fn restore_persisted_loaded_tools(&mut self) -> Result<()> {
-        let (Some(db), Some(session)) = (&self.goal_db, self.conv_id.as_deref()) else {
+        let Some(history) = self.session_search_storage() else {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let loaded = db
-            .with_conn(|conn| -> Result<_> {
-                let mut query = conn.prepare(
-                    "SELECT t.output FROM tool_calls t JOIN messages m ON m.id=t.message_id
-                 WHERE m.conversation_id=?1 AND m.role='assistant'
-                   AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
-                   AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
-                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)
-                 ORDER BY m.sort_order ASC, t.sort_order ASC",
-                )?;
-                let results = query.query_map([session], |row| row.get::<_, String>(0))?;
-                let mut loaded = LoadedTools::default();
-                for result in results {
-                    Self::absorb_loaded(&result?, &mut loaded);
-                }
-                Ok(loaded)
-            })
-            .and_then(|result| result)
-            .map_err(|error| {
-                crate::db::write_boundary_context("restore loaded tools", session, started, error)
-            })?;
+        let results = history.loaded_tool_results().map_err(|error| {
+            crate::db::write_boundary_context("restore loaded tools",history.id(),started,error)
+        })?;
+        let mut loaded = LoadedTools::default();
+        for output in results {
+            Self::absorb_loaded(&output, &mut loaded);
+        }
         self.loaded_tools.extend(loaded.order);
         Ok(())
     }
@@ -2843,18 +2824,12 @@ impl ToolLoopExecutor {
         let Some(mut content) = content else {
             return Ok(None);
         };
-        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
+        if let Some(history) = self.session_search_storage() {
             let started = std::time::Instant::now();
-            db.with_conn(|conn| content.save(conn, session, id, display, failed))
-                .and_then(|result| result)
-                .map_err(|error| {
-                    crate::db::write_boundary_context(
-                        "save MCP tool output",
-                        session,
-                        started,
-                        error,
-                    )
-                })?;
+            history.save_mcp(self.parent_message_id.as_deref(), id, &content, display, failed)
+                .map_err(|error| crate::db::write_boundary_context(
+                    "save MCP tool output", history.id(), started, error,
+                ))?;
         }
         // Images and structured blocks must remain real provider content. Only
         // plain text can use the existing spill/preview representation.
@@ -2879,6 +2854,9 @@ impl ToolLoopExecutor {
     }
 
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
+        if self.executor_history.as_ref().is_some_and(|h| h.id() != conv_id) {
+            self.executor_history = None;
+        }
         self.conv_id = Some(conv_id);
         self.builtin_names.take();
         self
@@ -3543,8 +3521,18 @@ impl ToolLoopExecutor {
             && self.conv_id.is_some()
     }
 
-    fn session_search_storage(&self) -> Option<(&Arc<crate::db::DbManager>, &str)> {
-        self.transcript_db.as_ref().or(self.goal_db.as_ref()).zip(self.conv_id.as_deref())
+    fn session_search_storage(&self) -> Option<ExecutorHistory> {
+        self.executor_history.clone().or_else(|| {
+            let db = self.goal_db.as_ref()?;
+            Some(ExecutorHistory::Shared(db.clone(), self.conv_id.clone()?))
+        })
+    }
+
+    pub fn with_executor_history(mut self, history: ExecutorHistory) -> Result<Self> {
+        anyhow::ensure!(self.conv_id.as_deref() == Some(history.id()), "Executor transcript belongs to another session");
+        self.executor_history = Some(history);
+        self.builtin_names.take();
+        Ok(self)
     }
 
     pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
@@ -3948,10 +3936,8 @@ impl ToolLoopExecutor {
         }
         // MCP discovery is a live external exchange, so execution ownership and
         // authority checks must succeed before any SDK/stdio server is contacted.
-        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
-            db.with_conn(|conn| {
-                super::mcp_output::restore_history(&mut self.messages, conn, session)
-            })??;
+        if let Some(history) = self.session_search_storage() {
+            history.restore(&mut self.messages)?;
         }
         Box::pin(self.refresh_mcp_tools()).await?;
         // A tool loaded earlier in this session stays available; the current
@@ -4801,11 +4787,9 @@ impl ToolLoopExecutor {
 
         if tool_name == crate::tools::context_search::NAME {
             let result = match self.session_search_storage() {
-                Some((db, session)) => {
-                    let (db, session, input) = (db.clone(), session.to_owned(), tool_input.clone());
-                    tokio::task::spawn_blocking(move || {
-                        crate::tools::context_search::execute(&db, &session, input)
-                    })
+                Some(history) => {
+                    let input = tool_input.clone();
+                    tokio::task::spawn_blocking(move || history.search(input))
                     .await
                     .context("ContextSearch could not finish")
                     .and_then(|result| result)
