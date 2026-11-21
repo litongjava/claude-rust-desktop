@@ -494,3 +494,229 @@ fn replacing_anonymous_snapshot_metrics_preserves_independent_requests() -> Resu
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn syscall_read_bytes(path: &str) -> Result<u64> {
+    let io = std::fs::read_to_string(path)?;
+    Ok(io
+        .lines()
+        .find_map(|l| l.strip_prefix("rchar: "))
+        .unwrap()
+        .parse()?)
+}
+
+#[cfg(target_os = "linux")]
+fn large_private_sidecar(stores: &Stores) -> Result<SessionDb> {
+    let a = stores.create(
+        A,
+        CreateOptions {
+            first_message: Some(FirstMessage {
+                text: "private".into(),
+                typed: Some(json!([{"type":"image","data":"a".repeat(8 << 20)}])),
+            }),
+            ..Default::default()
+        },
+    )?;
+    a.write(|w| {
+        w.approve_plan("boundary")?;
+        w.append("assistant", "public needle")
+    })?;
+    Ok(a)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let a = large_private_sidecar(&stores)?;
+    let start = syscall_read_bytes("/proc/thread-self/io")?;
+    let page: Value = serde_json::from_str(&a.context_search(
+        json!({"query":"needle","role":"assistant","range":"after","regex":true}),
+    )?)?;
+    let bytes = syscall_read_bytes("/proc/thread-self/io")? - start;
+    assert_eq!(page["matches"].as_array().unwrap().len(), 1);
+    eprintln!("filtered checkout and search read {bytes} bytes");
+    assert!(
+        bytes < 4 << 20,
+        "read {bytes} bytes outside the selected range"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fix_idle_rotation_reads_only_bounded_summary_state() -> Result<()> {
+    const NAME: &str = "fix_idle_rotation_reads_only_bounded_summary_state";
+    if std::env::var_os("I46_IDLE_PROJECTION_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", NAME, "--nocapture"])
+            .env("I46_IDLE_PROJECTION_CHILD", "1")
+            .status()?;
+        assert!(status.success());
+        return Ok(());
+    }
+    let root = tempdir()?;
+    let stores = Stores::open_for_test(root.path())?;
+    let a = large_private_sidecar(&stores)?;
+    let g = Connection::open(root.path().join("global.db"))?;
+    g.execute_batch("BEGIN IMMEDIATE")?;
+    a.write(|w| w.append("user", "idle repair"))?;
+    g.execute_batch("COMMIT")?;
+    drop(a);
+    let before = syscall_read_bytes("/proc/self/io")?;
+    std::thread::sleep(std::time::Duration::from_millis(4700));
+    let bytes = syscall_read_bytes("/proc/self/io")? - before;
+    assert_eq!(stores.global().summary(A)?.unwrap().count, 4);
+    eprintln!("stale and current repair passes read {bytes} bytes");
+    assert!(bytes < 4 << 20, "maintenance read {bytes} bytes");
+    Ok(())
+}
+
+#[test]
+fn fix_overflowing_usage_publishes_and_forks() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let a = s.create(A, Default::default())?;
+    let m = a.write(|w| {
+        let m = w.append("assistant","response")?;
+        w.snapshots(&m,&json!([{"id":"big","inputTokens":i64::MAX,"outputTokens":10},{"id":"small","inputTokens":7}]))?;
+        Ok(m)
+    })?;
+    let fork = a.branch("large-usage", Branch::Full)?;
+    for id in [A, fork.id()] {
+        let p = s.global().summary(id)?.unwrap();
+        assert_eq!(
+            (
+                p.request_count,
+                p.input_tokens,
+                p.output_tokens,
+                p.total_tokens
+            ),
+            (2, i64::MAX, 10, i64::MAX)
+        );
+    }
+    a.write(|w| w.snapshots(&m, &json!([{"id":"small","inputTokens":7}])))?;
+    assert_eq!(s.global().summary(A)?.unwrap().total_tokens, 7);
+    Ok(())
+}
+
+#[test]
+fn fix_plan_origin_survives_reentry_and_resume() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    for (id, origin, want) in [
+        (A, PermissionMode::BypassPermissions, "true"),
+        (
+            "20000000-1234-4234-9234-123456789abc",
+            PermissionMode::AskPermissions,
+            "false",
+        ),
+    ] {
+        let a = s.create(id, Default::default())?;
+        a.write(|w| {
+            w.set_agent_mode(origin)?;
+            w.set_agent_mode(PermissionMode::PlanMode)
+        })?;
+        s.open_session(id)?
+            .write(|w| w.set_agent_mode(PermissionMode::PlanMode))?;
+        let c = Connection::open(root.path().join("sessions").join(id).join("session.db"))?;
+        let value: String = c.query_row(
+            "SELECT value FROM peripheral_settings WHERE key=?1",
+            [format!("plan.return-bypass.{id}")],
+            |r| r.get(0),
+        )?;
+        assert_eq!(value, want);
+    }
+    Ok(())
+}
+
+#[test]
+fn fix_same_size_and_timestamp_restore_requires_another_read() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let path = root.path().join("tracked");
+    std::fs::write(&path, b"first")?;
+    let modified = path.metadata()?.modified()?;
+    assert_eq!(
+        s.create(A, Default::default())?.read_tracked_file(&path)?,
+        b"first"
+    );
+    let a = s.open_session(A)?;
+    std::fs::write(&path, b"later")?;
+    std::fs::File::open(&path)?.set_modified(modified)?;
+    assert!(a.check_file_write(&path).is_err());
+    assert_eq!(a.read_tracked_file(&path)?, b"later");
+    a.check_file_write(&path)
+}
+
+#[test]
+fn fix_rewound_compaction_target_stays_cancelled() -> Result<()> {
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let a = s.create(A, Default::default())?;
+    let tail = a.write(|w| {
+        w.append("user", "first")?;
+        let target = w.append("assistant", "target")?;
+        w.request_compaction("old instructions", 50, 100)?;
+        Ok(target)
+    })?;
+    let owner = a.delivery_owner()?;
+    let stale = owner.claim_compaction()?.unwrap();
+    a.write(|w| w.rewind_from(&tail))?;
+    assert!(owner
+        .finish_compaction(&stale, &"stale summary".into())
+        .is_err());
+    drop(owner);
+    assert!(s
+        .open_session(A)?
+        .delivery_owner()?
+        .claim_compaction()?
+        .is_none());
+    a.write(|w| w.append("assistant", "unrelated"))?;
+    assert!(a.delivery_owner()?.claim_compaction()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn fix_global_decoder_releases_checkout_before_entering_session() -> Result<()> {
+    use serde::{Deserialize, Deserializer};
+    use std::sync::{Arc, Barrier};
+    thread_local! { static CONTEXT: std::cell::RefCell<Option<(SessionDb, Arc<Barrier>)>> = const {std::cell::RefCell::new(None)}; }
+    struct Decoder;
+    impl<'de> Deserialize<'de> for Decoder {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            let _ = String::deserialize(d)?;
+            CONTEXT.with_borrow(|ctx| {
+                let (a, barrier) = ctx.as_ref().unwrap();
+                barrier.wait();
+                a.read(|r| r.git_branch())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self)
+            })
+        }
+    }
+    let root = tempdir()?;
+    let s = Stores::open_for_test(root.path())?;
+    let a = s.create(A, Default::default())?;
+    s.global()
+        .set_setting(GlobalSetting::MachinePreference("test"), &"value")?;
+    let barrier = Arc::new(Barrier::new(4));
+    std::thread::scope(|scope| {
+        let workers = (0..4)
+            .map(|_| {
+                let context = (a.clone(), barrier.clone());
+                let g = s.global();
+                scope.spawn(move || {
+                    CONTEXT.set(Some(context));
+                    g.setting::<Decoder>(GlobalSetting::MachinePreference("test"))
+                        .map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap()?;
+        }
+        Ok(())
+    })
+}
