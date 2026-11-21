@@ -57,41 +57,46 @@ pub(super) fn one(c: &rusqlite::Connection, id: &str) -> Result<Option<Directory
         .optional()?)
 }
 
+pub(super) fn list(
+    conn: &rusqlite::Connection,
+    filter: DirectoryFilter<'_>,
+) -> Result<Vec<DirectoryEntry>> {
+    let mut sql = String::from(FIELDS);
+    let mut conditions = Vec::new();
+    let mut args = Vec::<Value>::new();
+    for (predicate, value) in [
+        ("project_id=?", filter.project),
+        ("workspace_path=?", filter.workspace),
+        ("workspace_mode=?", filter.mode),
+        ("id<>?", filter.exclude),
+    ] {
+        if let Some(value) = value {
+            conditions.push(predicate);
+            args.push(value.to_owned().into());
+        }
+    }
+    for (predicate, value) in [("archived=?", filter.archived), ("pinned=?", filter.pinned)] {
+        if let Some(value) = value {
+            conditions.push(predicate);
+            args.push(i64::from(value).into());
+        }
+    }
+    if filter.nonempty {
+        conditions.push("message_count>0");
+    }
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+    sql.push_str(" ORDER BY updated_at DESC,id");
+
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args), entry)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
 impl GlobalDb {
     pub fn list_sessions(&self, filter: DirectoryFilter<'_>) -> Result<Vec<DirectoryEntry>> {
-        let mut sql = String::from(FIELDS);
-        let mut conditions = Vec::new();
-        let mut args = Vec::<Value>::new();
-        for (predicate, value) in [
-            ("project_id=?", filter.project),
-            ("workspace_path=?", filter.workspace),
-            ("workspace_mode=?", filter.mode),
-            ("id<>?", filter.exclude),
-        ] {
-            if let Some(value) = value {
-                conditions.push(predicate);
-                args.push(value.to_owned().into());
-            }
-        }
-        for (predicate, value) in [("archived=?", filter.archived), ("pinned=?", filter.pinned)] {
-            if let Some(value) = value {
-                conditions.push(predicate);
-                args.push(i64::from(value).into());
-            }
-        }
-        if filter.nonempty {
-            conditions.push("message_count>0");
-        }
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
-        sql.push_str(" ORDER BY updated_at DESC,id");
-        self.read(|conn| {
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(params_from_iter(args), entry)?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
-        })
+        self.read(|c| list(c, filter))
     }
     pub fn conversation(&self, id: &str) -> Result<Option<ConversationRow>> {
         self.read_directory_row(id, |c| Ok(one(c, id)?.map(|r| r.conversation)))

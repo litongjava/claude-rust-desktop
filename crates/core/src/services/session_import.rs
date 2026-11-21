@@ -27,79 +27,126 @@ pub struct Report {
     pub project_id: String,
     pub sessions: Vec<String>,
 }
-pub fn import(
-    context: &ServiceContext,
+pub trait SessionImport {
+    fn import_sessions(
+        &self,
+        paths: &crate::runtime::RuntimePaths,
+        source: &Path,
+        workspace: &Path,
+        preview: bool,
+        target_project: Option<&str>,
+    ) -> Result<Report>;
+}
+
+pub fn import<D: SessionImport>(
+    context: &ServiceContext<D>,
     source: &Path,
     workspace: &Path,
     preview: bool,
 ) -> Result<Report> {
     import_into_project(context, source, workspace, preview, None)
 }
-pub fn import_into_project(
-    context: &ServiceContext,
+
+pub fn import_into_project<D: SessionImport>(
+    context: &ServiceContext<D>,
     source: &Path,
     workspace: &Path,
     preview: bool,
     target_project: Option<&str>,
 ) -> Result<Report> {
-    let root = std::fs::canonicalize(workspace)?;
-    ensure!(root.is_dir(), "Project directory required");
-    let source = std::fs::canonicalize(source)?;
-    let mut files = if source.is_dir() {
-        std::fs::read_dir(&source)?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect::<Vec<_>>()
-    } else {
-        vec![source]
-    };
-    files.sort();
-    ensure!(
-        !files.is_empty() && files.len() <= 1000,
-        "Choose 1..1000 session JSON files"
-    );
-    let mut bytes = 0;
-    let mut sessions = Vec::new();
-    let mut ids = std::collections::HashSet::new();
-    for file in files {
-        bytes += std::fs::metadata(&file)?.len();
-        ensure!(bytes <= 25 * 1024 * 1024, "Session archive exceeds 25 MiB");
-        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
-        let session: Session = serde_json::from_value(raw.clone())?;
-        ensure!(
-            !session.id.is_empty() && session.id.len() <= 256 && ids.insert(session.id.clone()),
-            "Empty, oversized or duplicate session ID"
-        );
-        chrono::DateTime::parse_from_rfc3339(&session.created_at)?;
-        chrono::DateTime::parse_from_rfc3339(&session.updated_at)?;
-        ensure!(
-            session.messages.len() <= 10000,
-            "Session exceeds 10000 messages"
-        );
-        for message in &session.messages {
-            ensure!(
-                matches!(message.role.as_str(), "user" | "assistant" | "system"),
-                "Unsupported legacy message role {}; import requires complete text sessions",
-                message.role
-            );
-            chrono::DateTime::parse_from_rfc3339(&message.timestamp)?;
-        }
-        sessions.push((file, session, raw.to_string()));
+    context
+        .db
+        .import_sessions(&context.paths, source, workspace, preview, target_project)
+}
+
+impl SessionImport for crate::db::session_store::Stores {
+    fn import_sessions(
+        &self,
+        _: &crate::runtime::RuntimePaths,
+        source: &Path,
+        workspace: &Path,
+        preview: bool,
+        target_project: Option<&str>,
+    ) -> Result<Report> {
+        let result = self.import_json_into_project(source, workspace, preview, target_project)?;
+        Ok(Report {
+            imported: result.imported.len(),
+            skipped: result.skipped.len(),
+            preview,
+            backup: result
+                .backup
+                .map(|path| path.to_string_lossy().into_owned()),
+            project_id: result.project_id,
+            sessions: result.imported,
+        })
     }
-    let backup = if preview {
-        None
-    } else {
-        let directory = context.paths.data_dir.join("backups");
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("sessions-{}.sqlite3", uuid::Uuid::new_v4()));
-        context
-            .db
-            .with_conn(|c| c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]))??;
-        Some(path.to_string_lossy().into_owned())
-    };
-    context.db.with_conn(|c|->Result<_>{
+}
+
+impl SessionImport for crate::db::DbManager {
+    fn import_sessions(
+        &self,
+        paths: &crate::runtime::RuntimePaths,
+        source: &Path,
+        workspace: &Path,
+        preview: bool,
+        target_project: Option<&str>,
+    ) -> Result<Report> {
+        let root = std::fs::canonicalize(workspace)?;
+        ensure!(root.is_dir(), "Project directory required");
+        let source = std::fs::canonicalize(source)?;
+        let mut files = if source.is_dir() {
+            std::fs::read_dir(&source)?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .collect::<Vec<_>>()
+        } else {
+            vec![source]
+        };
+        files.sort();
+        ensure!(
+            !files.is_empty() && files.len() <= 1000,
+            "Choose 1..1000 session JSON files"
+        );
+        let mut bytes = 0;
+        let mut sessions = Vec::new();
+        let mut ids = std::collections::HashSet::new();
+        for file in files {
+            bytes += std::fs::metadata(&file)?.len();
+            ensure!(bytes <= 25 * 1024 * 1024, "Session archive exceeds 25 MiB");
+            let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let session: Session = serde_json::from_value(raw.clone())?;
+            ensure!(
+                !session.id.is_empty() && session.id.len() <= 256 && ids.insert(session.id.clone()),
+                "Empty, oversized or duplicate session ID"
+            );
+            chrono::DateTime::parse_from_rfc3339(&session.created_at)?;
+            chrono::DateTime::parse_from_rfc3339(&session.updated_at)?;
+            ensure!(
+                session.messages.len() <= 10000,
+                "Session exceeds 10000 messages"
+            );
+            for message in &session.messages {
+                ensure!(
+                    matches!(message.role.as_str(), "user" | "assistant" | "system"),
+                    "Unsupported legacy message role {}; import requires complete text sessions",
+                    message.role
+                );
+                chrono::DateTime::parse_from_rfc3339(&message.timestamp)?;
+            }
+            sessions.push((file, session, raw.to_string()));
+        }
+        let backup = if preview {
+            None
+        } else {
+            let directory = paths.data_dir.join("backups");
+            std::fs::create_dir_all(&directory)?;
+            let path = directory.join(format!("sessions-{}.sqlite3", uuid::Uuid::new_v4()));
+            self.with_conn(|c| c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]))??;
+            Some(path.to_string_lossy().into_owned())
+        };
+        self.with_conn(|c|->Result<_>{
         let tx=crate::db::write_transaction(&c)?;tx.execute("UPDATE peripheral_migrations SET version=version WHERE version=8",[])?;
         let project=project_repo::list_projects(&tx)?.into_iter().find(|p|target_project.is_none_or(|id|p.id==id)&&!p.is_archived&&p.workspace_path.as_deref().and_then(|p|std::fs::canonicalize(p).ok()).as_ref()==Some(&root)&&!p.folders.is_empty()&&p.folders.iter().all(|f|f.trusted));
         let project_id=if let Some(project)=project {project.id}else {
@@ -121,4 +168,5 @@ pub fn import_into_project(
         }
         if preview {tx.rollback()?;}else{tx.commit()?;}Ok(report)
     })?
+    }
 }

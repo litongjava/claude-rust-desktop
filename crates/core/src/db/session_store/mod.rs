@@ -12,6 +12,8 @@ mod global;
 mod global_format;
 mod history;
 mod im;
+mod projects;
+pub use projects::{ProjectEdit,Projects};
 mod repair;
 mod runtime;
 pub mod settings;

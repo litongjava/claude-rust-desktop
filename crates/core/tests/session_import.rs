@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::{ProjectEdit, Projects};
 use deepseek_code_core::{
     runtime::RuntimePaths,
     services::{session_import, team, EnvironmentCredentials, ServiceContext},
@@ -11,7 +12,7 @@ fn session_import_previews_backs_up_preserves_and_rolls_back_conflicts() {
     std::fs::create_dir(&root).unwrap();
     let source = dir.path().join("sessions");
     std::fs::create_dir(&source).unwrap();
-    let context = ServiceContext::open(
+    let context = ServiceContext::from_stores(
         RuntimePaths::new(dir.path().join("data")).unwrap(),
         Arc::new(EnvironmentCredentials),
     )
@@ -25,16 +26,8 @@ fn session_import_previews_backs_up_preserves_and_rolls_back_conflicts() {
             .imported,
         1
     );
-    assert!(context
-        .db
-        .conversations().unwrap()
-        .is_empty());
-    assert!(context
-        .db
-        .with_conn(deepseek_code_core::db::project_repo::list_projects)
-        .unwrap()
-        .unwrap()
-        .is_empty());
+    assert!(context.db.conversations().unwrap().is_empty());
+    assert!(context.db.projects().unwrap().is_empty());
     let report = session_import::import(&context, &source, &root, false).unwrap();
     assert!(std::path::Path::new(&report.backup.unwrap()).exists());
     let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
@@ -124,38 +117,29 @@ fn concurrent_hosts_initialize_and_write_shared_schema() {
 
 #[test]
 fn desktop_import_preserves_exact_selected_project() {
-    use deepseek_code_core::db::project_repo;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     std::fs::create_dir(&root).unwrap();
     let root = std::fs::canonicalize(root).unwrap();
-    let context = ServiceContext::open(
+    let context = ServiceContext::from_stores(
         RuntimePaths::new(dir.path().join("data")).unwrap(),
         Arc::new(EnvironmentCredentials),
     )
     .unwrap();
     for id in ["first", "selected"] {
+        let folders = vec![root.to_string_lossy().to_string()];
         context
             .db
-            .with_conn(|c| -> anyhow::Result<()> {
-                let path = root.to_string_lossy().into_owned();
-                project_repo::insert_project(
-                    c,
-                    id,
-                    id,
-                    None,
-                    None,
-                    Some(&path),
-                    false,
-                    "2025-01-01T00:00:00Z",
-                    "2025-01-01T00:00:00Z",
-                )?;
-                project_repo::set_folders(c, id, &[path.clone()])?;
-                project_repo::trust_folders(c, id, &[path])?;
-                Ok(())
-            })
-            .unwrap()
+            .create_project(
+                id,
+                &ProjectEdit {
+                    name: Some(id.into()),
+                    folders: Some(folders.clone()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
+        context.db.trust_project(id, &folders).unwrap();
     }
     let file = dir.path().join("old.json");
     std::fs::write(&file,json!({"id":"exact","name":"Exact project","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","messages":[]}).to_string()).unwrap();

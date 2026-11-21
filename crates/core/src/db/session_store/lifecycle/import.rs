@@ -39,6 +39,7 @@ impl LegacySession {
 }
 #[derive(Debug)]
 pub struct ImportResult {
+    pub project_id: String,
     pub imported: Vec<String>,
     pub skipped: Vec<String>,
     pub backup: Option<PathBuf>,
@@ -345,6 +346,7 @@ impl Stores {
             self.group_access(keys.iter().map(|k| (k.as_str(), true, true)).collect())?
         };
         let mut result = ImportResult {
+            project_id: String::new(),
             imported: vec![],
             skipped: vec![],
             backup: None,
@@ -407,6 +409,12 @@ impl Stores {
         for (session, _, _) in &selected {
             self.check_destination(&session.id)?;
         }
+        result.project_id = match &plan {
+            Project::Selected { id, .. } => id.clone(),
+            // Preview historically returns a proposed ID with no visible project.
+            Project::NewWorkspace(_) if preview => Uuid::new_v4().to_string(),
+            Project::NewWorkspace(_) => String::new(),
+        };
         if preview || selected.is_empty() {
             return Ok(result);
         }
@@ -455,6 +463,13 @@ impl Stores {
             self.build(op, meta, None, Seed::Import(s))?;
         }
         self.finish_batch(&batch)?;
+        result.project_id = self.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT project_id FROM legacy_session_imports WHERE id=?1",
+                [&result.imported[0]],
+                |r| r.get(0),
+            )?)
+        })?;
         Ok(result)
     }
 }

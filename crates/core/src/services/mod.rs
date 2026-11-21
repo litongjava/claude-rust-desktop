@@ -82,11 +82,15 @@ impl Credentials for EnvironmentCredentials {
     }
 }
 
-#[derive(Clone)]
-pub struct ServiceContext {
+pub struct ServiceContext<D = DbManager> {
     pub paths: RuntimePaths,
-    pub db: Arc<DbManager>,
+    pub db: Arc<D>,
     pub credentials: Arc<dyn Credentials>,
+}
+impl<D> Clone for ServiceContext<D> {
+    fn clone(&self) -> Self {
+        Self { paths:self.paths.clone(), db:self.db.clone(), credentials:self.credentials.clone() }
+    }
 }
 impl ServiceContext {
     pub fn open(paths: RuntimePaths, credentials: Arc<dyn Credentials>) -> Result<Self> {
@@ -129,6 +133,13 @@ impl ServiceContext {
             .context("Saving session setting")
         })??;
         Ok(())
+    }
+}
+
+impl ServiceContext<crate::db::session_store::Stores> {
+    pub fn from_stores(paths:RuntimePaths, credentials:Arc<dyn Credentials>) -> Result<Self> {
+        let db=Arc::new(paths.open_stores()?);
+        Ok(Self{paths,db,credentials})
     }
 }
 
