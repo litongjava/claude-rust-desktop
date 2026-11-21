@@ -167,29 +167,24 @@ pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<S
 /// time as work time. The caller must first establish that no process holds the
 /// execution lease.
 pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
-    let next = |conn: &Connection| {
-        conn.query_row(
-            "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running' LIMIT 1",
-            [conversation_id],
-            read_record,
-        ).optional()
-    };
+    if running_turn(conn, conversation_id)?.is_none() {
+        return Ok(Vec::new());
+    }
+    super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE, |tx| {
+        settle_interrupted_in(tx, conversation_id)
+    }).context("Settling interrupted turn")
+}
+
+pub(crate) fn settle_interrupted_in(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
     let mut settled = Vec::new();
-    while next(conn)?.is_some() {
-        // Re-select under the writer lock. Another connection may have
-        // finished the observed turn or published a different one.
-        let record = super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE, |tx| {
-            let Some(mut record) = next(tx)? else { return Ok(None) };
-            tx.execute(
-                "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
-                [&record.turn_id],
-            )?;
-            record.status = TurnStatus::Cancelled;
-            record.ended_at = None;
-            record.elapsed_ms = None;
-            Ok(Some(record))
-        }).context("Settling interrupted turn")?;
-        let Some(record) = record else { break };
+    while let Some(mut record) = running_turn(conn, conversation_id)? {
+        conn.execute(
+            "UPDATE execution_turns SET ended_at=NULL,elapsed_ms=NULL,status='cancelled' WHERE id=?1 AND status='running'",
+            [&record.turn_id],
+        )?;
+        record.ended_at = None;
+        record.elapsed_ms = None;
+        record.status = TurnStatus::Cancelled;
         settled.push(record);
     }
     Ok(settled)
