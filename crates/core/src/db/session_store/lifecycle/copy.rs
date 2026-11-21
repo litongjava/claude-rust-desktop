@@ -40,7 +40,8 @@ fn private_owner(c: &Connection, id: &str) -> Result<(String, String)> {
         JOIN conversations o ON o.id=coalesce(b.parent_id,s.id)
           AND o.incarnation=coalesce(b.parent_incarnation,s.incarnation)
         WHERE s.id=?1 AND s.project_id IS NULL AND o.project_id IS NULL
-          AND o.workspace_mode=s.workspace_mode AND (b.child_id IS NULL OR o.archived=0)",
+          AND o.workspace_mode=s.workspace_mode AND (b.child_id IS NULL OR o.archived=0)
+          AND NOT EXISTS (SELECT 1 FROM conversation_private_workspace_bindings WHERE child_id=o.id)",
         [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )

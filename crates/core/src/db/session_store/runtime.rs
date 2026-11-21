@@ -76,7 +76,7 @@ impl SessionDb {
         self.check_directory()?;
         self.stores.global().read(|c| {
             let tx = c.unchecked_transaction()?;
-            let row = super::directory::one(&tx, self.id())?
+            let mut row = super::directory::one(&tx, self.id())?
                 .context("Session not found")?
                 .conversation;
             ensure!(
@@ -85,6 +85,10 @@ impl SessionDb {
             );
             ensure!(!row.archived, "Session is archived");
             crate::native_engine::workspace::conversation_project(&tx, self.id())?;
+            if row.project_id.is_none() {
+                let path = super::lifecycle::workspace(&tx, &self.stores.root.path.join("workspaces"), self.id())?;
+                row.workspace_path = Some(path.to_string_lossy().into_owned());
+            }
             Ok(row)
         })
     }

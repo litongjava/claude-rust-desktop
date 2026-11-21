@@ -300,10 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn projectless_code_resume_waits_for_another_writer() {
+    fn projectless_code_resume_resolves_during_another_directory_write() {
         use crate::{
             db::test_support,
-            runtime::{RuntimePaths, SessionStore, DATABASE_FILE},
+            runtime::{RuntimePaths, SessionStore},
         };
         let root = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
@@ -311,7 +311,7 @@ mod tests {
         let id = store.create(root.path(), "model", "provider").unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
                     [&id],
@@ -320,7 +320,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join(DATABASE_FILE));
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join("global.db"));
         let releaser =
             test_support::release_after(release, holder, std::time::Duration::from_secs(6));
         let private = store
@@ -332,7 +332,7 @@ mod tests {
             paths
                 .data_dir
                 .join("workspaces")
-                .join(&id)
+                .join(store.db.open_session(&id).unwrap().incarnation())
                 .canonicalize()
                 .unwrap()
         );
@@ -343,8 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn projectless_resume_keeps_a_project_assigned_while_the_write_retries() {
-        use crate::runtime::{RuntimePaths, SessionStore, DATABASE_FILE};
+    fn projectless_resume_observes_the_committed_assignment_on_next_lookup() {
+        use crate::runtime::{RuntimePaths, SessionStore};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -354,7 +354,7 @@ mod tests {
         let id = store.create(root.path(), "model", "provider").unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
                     [&id],
@@ -369,7 +369,7 @@ mod tests {
         let project_path = project_dir.to_string_lossy().into_owned();
         store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 project_repo::insert_project(
                     conn,
                     "project",
@@ -388,15 +388,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // The first attempt waits out SQLite's five-second busy timeout. When
-        // the holder finally commits, it also commits the project assignment,
-        // so the retry must observe the new binding instead of writing the
-        // private path it decided on earlier.
+        // The first read sees the previous snapshot. The next lookup must
+        // observe the assignment and never overwrite it with a private path.
         let (locked_tx, locked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let id_for_holder = id.clone();
         let path_for_holder = project_path.clone();
-        let db_path = paths.data_dir.join(DATABASE_FILE);
+        let db_path = paths.data_dir.join("global.db");
         let holder = std::thread::spawn(move || {
             let conn = Connection::open(db_path).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -417,8 +415,10 @@ mod tests {
         });
 
         let workspaces = paths.data_dir.join("workspaces");
-        let resolved = store.workspace(&id, &workspaces).unwrap();
+        let private = store.workspace(&id, &workspaces).unwrap();
+        assert!(private.starts_with(&workspaces));
         releaser.join().unwrap();
+        let resolved = store.workspace(&id, &workspaces).unwrap();
 
         assert_eq!(
             std::fs::canonicalize(&resolved).unwrap(),
@@ -427,7 +427,7 @@ mod tests {
         );
         let (project_id, workspace_path) = store
             .db
-            .with_conn(|conn| -> Result<(Option<String>, Option<String>)> {
+            .fixture_directory(|conn| -> Result<(Option<String>, Option<String>)> {
                 Ok(conn.query_row(
                     "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
                     [&id],
@@ -442,7 +442,7 @@ mod tests {
             Some(project_path.as_str()),
             "the private path must not replace the committed project path"
         );
-        assert_ne!(resolved, workspaces.join(&id).canonicalize().unwrap());
+        assert_ne!(resolved, private);
     }
 
     #[test]
@@ -526,8 +526,7 @@ mod tests {
             let second = root.path().join("second");
             std::fs::create_dir(&first).unwrap();
             std::fs::create_dir(&second).unwrap();
-            let db = crate::db::DbManager::new(root.path().join("db.sqlite")).unwrap();
-            db.init().unwrap();
+            let db = crate::db::session_store::Stores::open(root.path()).unwrap();
             let store = crate::runtime::SessionStore::new(std::sync::Arc::new(db));
             let parent = store.create(&first, "model", "provider").unwrap();
             let member = store.create(&first, "model", "provider").unwrap();
@@ -547,7 +546,7 @@ mod tests {
         fn resolve(&self, id: &str) -> PathBuf {
             self.store
                 .db
-                .with_conn(|conn| resolve_workspace(conn, &self.workspaces, id, None))
+                .fixture_directory(|conn| resolve_workspace(conn, &self.workspaces, id, None))
                 .unwrap()
                 .unwrap()
                 .0
@@ -556,7 +555,7 @@ mod tests {
         fn project_id(&self, id: &str) -> String {
             self.store
                 .db
-                .with_conn(|conn| -> Result<String> {
+                .fixture_directory(|conn| -> Result<String> {
                     Ok(conn.query_row(
                         "SELECT project_id FROM conversations WHERE id=?1",
                         [id],
@@ -570,7 +569,7 @@ mod tests {
         fn project(&self, id: &str) -> project_repo::ProjectRow {
             self.store
                 .db
-                .with_conn(|conn| -> Result<Option<project_repo::ProjectRow>> {
+                .fixture_directory(|conn| -> Result<Option<project_repo::ProjectRow>> {
                     project_repo::get_project(conn, id)
                 })
                 .unwrap()
@@ -581,7 +580,7 @@ mod tests {
         fn conversation(&self, id: &str) -> (Option<String>, Option<String>) {
             self.store
                 .db
-                .with_conn(|conn| -> Result<(Option<String>, Option<String>)> {
+                .fixture_directory(|conn| -> Result<(Option<String>, Option<String>)> {
                     Ok(conn.query_row(
                         "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
                         [id],
@@ -601,7 +600,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "UPDATE projects SET instructions=?1 WHERE id=?2",
                     params!["keep these project instructions", shared],
@@ -618,7 +617,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap()
             .unwrap();
 
@@ -670,7 +669,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -706,7 +705,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
@@ -726,7 +725,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -770,7 +769,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -805,7 +804,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace_with(
                     conn,
                     fixture._root.path(),
@@ -850,7 +849,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
@@ -869,7 +868,7 @@ mod tests {
         let error = fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap()
             .unwrap_err();
         assert!(
@@ -892,7 +891,7 @@ mod tests {
             fixture
                 .store
                 .db
-                .with_conn(|conn| -> Result<i64> {
+                .fixture_directory(|conn| -> Result<i64> {
                     Ok(
                         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                             row.get(0)
@@ -909,7 +908,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute_batch(&format!(
                     "CREATE TRIGGER fail_conversation_update BEFORE UPDATE ON conversations \
                      WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
@@ -922,7 +921,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap();
         assert!(result.is_err(), "the forced failure must propagate");
         assert_eq!(

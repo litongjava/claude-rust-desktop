@@ -1,6 +1,5 @@
 use super::*;
 use crate::{
-    db::conversation_repo,
     native_engine::{engine_core::ReasoningMode, provider_manager::ResolvedProvider},
     services::teams,
 };
@@ -33,35 +32,9 @@ async fn executor(
         Arc::new(EnvironmentCredentials),
     )
     .unwrap();
-    context
-        .db
-        .with_conn(|conn| -> Result<()> {
-            conversation_repo::insert_conversation(
-                conn,
-                parent,
-                None,
-                Some("fixture"),
-                Some("fixture"),
-                root.to_str(),
-                None,
-                false,
-                false,
-                false,
-                "now",
-                "now",
-                0,
-            )?;
-            Ok(())
-        })
-        .unwrap()
-        .unwrap();
-    let private_root = root.join("private-root");
-    let cwd = context
-        .db
-        .with_conn(|conn| {
-            crate::native_engine::workspace::resolve_workspace(conn, &private_root, parent, None)
-        })
-        .unwrap()
+    context.db.create(parent, crate::db::session_store::CreateOptions { model: Some("fixture".into()), provider: Some("fixture".into()), ..Default::default() }).unwrap();
+    let private_root = context.paths.data_dir.join("workspaces");
+    let cwd = context.db.engine_workspace(&private_root, parent, None)
         .unwrap()
         .0;
     std::fs::create_dir_all(&cwd).unwrap();

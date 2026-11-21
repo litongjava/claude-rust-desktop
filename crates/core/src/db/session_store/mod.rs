@@ -180,6 +180,22 @@ impl Stores {
         host
     }
 
+    /// Inspect or corrupt directory-owned records in a fixture.
+    #[cfg(test)]
+    pub(crate) fn fixture_directory<T>(&self, body: impl FnOnce(&Connection) -> T) -> Result<T> {
+        self.global().connection(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| Ok(body(c)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_shard<T>(&self, id: &str, body: impl FnOnce(&Connection) -> T) -> Result<T> {
+        let session = self.open_session(id)?;
+        let _guard = self.key_lock(&session.key, false, false)?;
+        session.check_directory()?;
+        session.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            layout::callback(|| Ok(body(c)))
+        })
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.root.path
     }
