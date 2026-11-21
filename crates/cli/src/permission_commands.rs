@@ -2,7 +2,7 @@
 use crate::session::Session;
 use anyhow::{Context, Result};
 use crate::terminal::tool_view::Remember;
-use deepseek_code_core::{db::DbManager, native_engine::permission_response::Commit, permissions::rules::PermissionAction};
+use deepseek_code_core::{db::session_store::{SessionAccess,settings::PERMISSIONS}, native_engine::permission_response::Commit, permissions::rules::PermissionAction};
 use std::collections::HashMap;
 
 /// Saves the session's rules and applies them at once.
@@ -16,21 +16,12 @@ pub fn load(session: &Session) -> Result<HashMap<String, PermissionAction>> {
     load_rules(&session.store.db, &session.id)
 }
 
-fn load_rules(db: &DbManager, session: &str) -> Result<HashMap<String, PermissionAction>> {
-    db.with_conn(|conn| -> Result<_> {
-        let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = statement.query([format!("cli.permissions.{session}")])?;
-        Ok(match rows.next()? {
-            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
-            None => HashMap::new(),
-        })
-    })?
+fn load_rules(db: &impl SessionAccess, session: &str) -> Result<HashMap<String, PermissionAction>> {
+    Ok(db.select_session(session)?.preference(PERMISSIONS)?.unwrap_or_default())
 }
 
-fn save(db: &DbManager, session: &str, rules: &HashMap<String, PermissionAction>) -> Result<()> {
-    let value = serde_json::to_string(rules)?;
-    db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("cli.permissions.{session}"), value]))??;
-    Ok(())
+fn save(db: &impl SessionAccess, session: &str, rules: &HashMap<String, PermissionAction>) -> Result<()> {
+    db.select_session(session)?.set_preference(PERMISSIONS,Some(rules))
 }
 
 /// The approval prompt's session choice, published by the engine only after

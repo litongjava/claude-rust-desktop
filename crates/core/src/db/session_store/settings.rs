@@ -12,7 +12,7 @@ use std::{
 };
 
 pub struct Setting<T> {
-    name: Cow<'static, str>,
+    pub(super) name: Cow<'static, str>,
     value: PhantomData<fn() -> T>,
 }
 impl<T> Setting<T> {

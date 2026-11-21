@@ -112,6 +112,53 @@ impl SessionRepository<'_> {
 }
 
 impl SessionRepository<'_> {
+    fn preference_key<T>(&self, key: &super::settings::Setting<T>) -> Result<String> {
+        let name = key.name.as_ref();
+        anyhow::ensure!(
+            matches!(
+                name,
+                "cli.display"
+                    | "cli.ide"
+                    | "cli.permissions"
+                    | "cli.session"
+                    | "cli.live-requests"
+                    | "microcompact"
+            ),
+            "Expected a CLI preference"
+        );
+        Ok(match &self.0 {
+            Backend::Admitted(_) => name.into(),
+            Backend::Shared(_, id) => format!("{name}.{id}"),
+        })
+    }
+
+    pub fn preference<T: serde::de::DeserializeOwned>(
+        &self,
+        key: super::settings::Setting<T>,
+    ) -> Result<Option<T>> {
+        let name = self.preference_key(&key)?;
+        let raw = self.read(|c, _| super::state::local(c, &name))?;
+        Ok(raw
+            .map(|v| serde_json::from_str::<Option<T>>(&v))
+            .transpose()?
+            .flatten())
+    }
+    pub fn set_preference<T: serde::Serialize>(
+        &self,
+        key: super::settings::Setting<T>,
+        value: Option<&T>,
+    ) -> Result<()> {
+        let name = self.preference_key(&key)?;
+        let value = value.map(serde_json::to_string).transpose()?;
+        self.write("save session preference", |c, _| match &value {
+            Some(value) => super::state::set_local(c, &name, value),
+            None => {
+                c.execute("DELETE FROM peripheral_settings WHERE key=?1", [&name])?;
+                Ok(())
+            }
+        })
+    }
+
     pub fn messages(&self) -> Result<Vec<crate::db::message_repo::MessageRow>> {
         self.read(crate::db::message_repo::get_messages_by_conversation)
     }

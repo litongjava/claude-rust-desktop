@@ -2,57 +2,20 @@
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
-use serde::{Deserialize, Serialize};
+use deepseek_code_core::db::session_store::{SessionAccess, settings::DISPLAY};
 use serde_json::{json, Value};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Settings {
-    pub theme: String,
-    pub color: String,
-    pub focus: bool,
-    pub output_style: String,
-    pub statusline: Option<String>,
-    pub tui: String,
-    pub diff_panel: bool,
-    pub diff_staged: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: "dark".into(),
-            color: "default".into(),
-            focus: false,
-            output_style: "default".into(),
-            tui: "default".into(),
-            statusline: None,
-            diff_panel: false,
-            diff_staged: false,
-        }
-    }
-}
+pub use deepseek_code_core::db::session_store::settings::Display as Settings;
 
 pub fn load(session: &Session) -> Result<Settings> {
-    let mut settings = session.store.db.with_conn(|conn| -> Result<Settings> {
-        let mut stmt = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = stmt.query([format!("cli.display.{}", session.id)])?;
-        Ok(match rows.next()? {
-            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
-            None => Settings::default(),
-        })
-    })??;
+    let mut settings = session.store.db.select_session(&session.id)?.preference(DISPLAY)?.unwrap_or_default();
     if let Some(global) = deepseek_code_core::services::statusline_setup::load(&session.paths.data_dir)? { settings.statusline = global.command; }
     Ok(settings)
 }
 
 fn save(session: &Session, settings: &Settings) -> Result<()> {
-    let value = serde_json::to_string(settings)?;
-    session.store.db.with_conn(|conn| conn.execute(
-        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [format!("cli.display.{}", session.id), value],
-    ))??;
+    session.store.db.select_session(&session.id)?.set_preference(DISPLAY,Some(settings))?;
     crate::terminal::style::configure(&settings.theme, &settings.color);
     Ok(())
 }

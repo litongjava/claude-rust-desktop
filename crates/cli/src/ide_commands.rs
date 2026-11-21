@@ -5,17 +5,7 @@ use deepseek_code_core::{
     permissions::{PermissionLevel, PermissionScope, ToolPermission},
     services::ide,
 };
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-struct Choice {
-    port: u16,
-    workspace: std::path::PathBuf,
-}
-
-fn key(session: &Session) -> String {
-    format!("cli.ide.{}", session.id)
-}
+use deepseek_code_core::db::session_store::{SessionAccess,settings::{Editor,EDITOR}};
 
 async fn connect(session: &Session, port: Option<u16>) -> Result<()> {
     let editors = ide::discover(&ide::lock_directory()?, &session.workspace)?;
@@ -46,8 +36,7 @@ async fn connect(session: &Session, port: Option<u16>) -> Result<()> {
 /// Restoring a port is never enough to trust a stale process: rediscover the
 /// lockfile, verify its workspace, and complete the real MCP handshake again.
 pub async fn restore(session: &Session) -> Result<()> {
-    let context = crate::services::context(&session.paths)?;
-    let choice = context.setting::<Option<Choice>>(&key(session))?.flatten();
+    let choice = session.store.db.select_session(&session.id)?.preference(EDITOR)?;
     let status = session.ide.status().await;
     let Some(choice) = choice.filter(|choice| {
         session
@@ -85,9 +74,8 @@ pub async fn handle(session: &Session, argument: &str) -> Result<bool> {
     if words.first().is_some_and(|s| s == "lsp") {
         return Ok(false);
     }
-    let context = crate::services::context(&session.paths)?;
     if words.is_empty() && crate::terminal::picker::available() {
-        return pick(session, &context).await.map(|()| true);
+        return pick(session).await.map(|()| true);
     }
     match words.first().map(String::as_str).unwrap_or("status") {
         "status" => {
@@ -108,12 +96,12 @@ pub async fn handle(session: &Session, argument: &str) -> Result<bool> {
             connect(session, port).await?;
             let state = session.ide.status().await;
             let editor = state.editor.context("IDE did not connect")?;
-            context.save_setting(&key(session), &Some(Choice {port:editor.port,workspace:session.workspace.canonicalize()?}))?;
+            session.store.db.select_session(&session.id)?.set_preference(EDITOR,Some(&Editor {port:editor.port,workspace:session.workspace.canonicalize()?}))?;
             command_eprintln!("Connected to {} on port {} ({} tools).",editor.name,editor.port,session.ide.tools().await.len());
         },
         "disconnect" => {
             ensure!(words.len() == 1, "Usage: /ide disconnect");
-            context.save_setting(&key(session), &Option::<Choice>::None)?;
+            session.store.db.select_session(&session.id)?.set_preference(EDITOR,None)?;
             session.ide.disconnect().await;
             command_eprintln!("IDE disconnected.");
         },
@@ -165,7 +153,7 @@ pub async fn handle(session: &Session, argument: &str) -> Result<bool> {
 /// `/ide` as in the reference CLI: the editors running this workspace to
 /// choose from, or a short note when there are none. `/ide status` keeps
 /// the detailed report.
-async fn pick(session: &Session, context: &deepseek_code_core::services::ServiceContext) -> Result<()> {
+async fn pick(session: &Session) -> Result<()> {
     use crate::terminal::picker::{Entry, Picker};
     let editors: Vec<ide::Editor> = ide::discover(&ide::lock_directory()?, &session.workspace)?
         .into_iter()
@@ -198,11 +186,11 @@ async fn pick(session: &Session, context: &deepseek_code_core::services::Service
     match editors.get(choice) {
         Some(editor) => {
             connect(session, Some(editor.port)).await?;
-            context.save_setting(&key(session), &Some(Choice { port: editor.port, workspace: session.workspace.canonicalize()? }))?;
+            session.store.db.select_session(&session.id)?.set_preference(EDITOR,Some(&Editor { port: editor.port, workspace: session.workspace.canonicalize()? }))?;
             command_eprintln!("  \u{23bf}  Connected to {}.", editor.name);
         }
         None => {
-            context.save_setting(&key(session), &Option::<Choice>::None)?;
+            session.store.db.select_session(&session.id)?.set_preference(EDITOR,None)?;
             session.ide.disconnect().await;
             command_eprintln!("  \u{23bf}  Disconnected from IDE.");
         }
