@@ -37,7 +37,13 @@ pub fn save_invocation(context: &ServiceContext, invocation: &Invocation) -> Res
             && !invocation.attempt_id.is_empty(),
         "Subagent invocation identity is incomplete"
     );
-    context.save_setting(&invocation.key(), invocation)
+    context
+        .db
+        .executor_history(&invocation.parent_session_id)?
+        .save_invocation(
+            &context.db.executor_history(&invocation.child_session_id)?,
+            invocation,
+        )
 }
 
 /// Insertion order preserves distinct attempts even when a child is resumed.
@@ -77,6 +83,45 @@ pub fn authoritative_status(
     if matches!(
         invocation.status.as_str(),
         "completed" | "failed" | "cancelled"
+    ) || invocation.mode == "background"
+    {
+        return status_with_progress(
+            root,
+            invocation,
+            None,
+            &invocation.parent_session_id,
+            &invocation.child_session_id,
+        );
+    }
+    let saved: Option<String> = conn
+        .query_row(
+            "SELECT value FROM peripheral_settings WHERE key=?1",
+            [format!("delegation.{}", invocation.child_session_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let saved = saved
+        .map(|value| serde_json::from_str::<Value>(&value))
+        .transpose()?;
+    status_with_progress(
+        root,
+        invocation,
+        saved.as_ref(),
+        &invocation.parent_session_id,
+        &invocation.child_session_id,
+    )
+}
+
+pub(crate) fn status_with_progress(
+    root: &Path,
+    invocation: &Invocation,
+    saved: Option<&Value>,
+    parent_lock: &str,
+    child_lock: &str,
+) -> Result<String> {
+    if matches!(
+        invocation.status.as_str(),
+        "completed" | "failed" | "cancelled"
     ) {
         return Ok(invocation.status.clone());
     }
@@ -90,18 +135,7 @@ pub fn authoritative_status(
                 .unwrap_or_else(|| "unknown".into()),
         );
     }
-    let saved: Option<String> = conn
-        .query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [format!("delegation.{}", invocation.child_session_id)],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let saved = saved
-        .map(|value| serde_json::from_str::<Value>(&value))
-        .transpose()?;
     let status = saved
-        .as_ref()
         .filter(|value| {
             value["parent_session_id"] == invocation.parent_session_id
                 && value["session_id"] == invocation.child_session_id
@@ -111,10 +145,9 @@ pub fn authoritative_status(
     // Persisted activity is not evidence that its owner survived a host restart.
     // Absence of an OS execution lease means unknown, never inferred completion.
     if status == "running" || invocation.status == "starting" {
-        let child_active =
-            super::session_messages::execution_active(root, &invocation.child_session_id)?;
+        let child_active = super::session_messages::execution_active(root, child_lock)?;
         let starting_owner_active = invocation.status == "starting"
-            && super::session_messages::execution_active(root, &invocation.parent_session_id)?;
+            && super::session_messages::execution_active(root, parent_lock)?;
         if !child_active {
             return Ok(if starting_owner_active {
                 "starting"

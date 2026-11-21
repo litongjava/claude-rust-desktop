@@ -20,6 +20,7 @@ mod desktop_queue;
 mod executor;
 mod engine;
 mod children;
+mod child_reader;
 mod recording;
 pub use recording::RecordingPolicies;
 mod segment;

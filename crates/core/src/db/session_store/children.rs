@@ -12,6 +12,48 @@ impl ExecutorHistory {
             Self::Shared(db, id) => SessionRepository(Backend::Shared(db, id)),
         }
     }
+    pub(crate) fn invocation_message(&self, requested: Option<&str>) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        self.read(|c, id| {
+            let selected = c
+                .query_row(
+                    "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant'
+                AND (?2 IS NULL OR id=?2) ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+                    params![id, requested],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            // Shared-store clients historically allowed an association before the first segment.
+            if selected.is_none() && requested.is_none() && matches!(self, Self::Shared(..)) {
+                return Ok(String::new());
+            }
+            selected.context("Invocation parent assistant segment is missing")
+        })
+    }
+
+    pub(crate) fn save_invocation(
+        &self,
+        child: &ExecutorHistory,
+        row: &crate::services::subagents::Invocation,
+    ) -> Result<()> {
+        ensure!(
+            self.id() == row.parent_session_id && child.id() == row.child_session_id,
+            "Child invocation owner changed"
+        );
+        match (self, child) {
+            (Self::Session(parent), Self::Session(child)) => parent
+                .write_named("save child invocation", |w| {
+                    w.child_invocation(&child.address(), row)
+                }),
+            (Self::Shared(..), Self::Shared(..)) => {
+                let raw = serde_json::to_string(row)?;
+                self.child_repo().write("save child invocation", |c, _| {
+                    super::state::set_local(c, &row.key(), &raw)
+                })
+            }
+            _ => anyhow::bail!("Child uses another history store"),
+        }
+    }
     pub(crate) fn save_child_state(&self, value: &Value) -> Result<()> {
         let progress = value
             .as_object()

@@ -5,6 +5,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+#[cfg(test)]
 use deepseek_code_core::services::subagents;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,72 +41,15 @@ async fn list(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let root = crate::commands::app_data_dir().map_err(internal)?;
     let result = tokio::task::spawn_blocking(move || {
         state
             .db_manager
-            .with_conn(|conn| -> anyhow::Result<Value> {
-                let tx = conn.unchecked_transaction()?;
-                let mut invocations = subagents::list_invocations(&tx, &parent, None)?;
-                let mut seen = std::collections::HashSet::new();
-                for invocation in invocations.iter_mut().rev() {
-                    if seen.insert(invocation.child_session_id.clone()) {
-                        invocation.status =
-                            subagents::authoritative_status(&tx, &root, invocation)?;
-                    }
-                }
-                invocations.retain(|invocation| {
-                    query
-                        .tool_use_id
-                        .as_deref()
-                        .is_none_or(|tool| invocation.tool_use_id == tool)
-                });
-                Ok(json!({"invocations": invocations}))
-            })?
+            .invocation_list(&parent, query.tool_use_id.as_deref())
     })
     .await
     .map_err(internal)?
     .map_err(internal)?;
     Ok(Json(result))
-}
-
-fn snapshot(
-    conn: &rusqlite::Connection,
-    root: &std::path::Path,
-    parent: &str,
-    child: &str,
-    offset: usize,
-    limit: usize,
-) -> anyhow::Result<Option<Value>> {
-    let tx = conn.unchecked_transaction()?;
-    let Some(mut invocation) = subagents::list_invocations(&tx, parent, None)?
-        .into_iter()
-        .rev()
-        .find(|invocation| invocation.child_session_id == child)
-    else {
-        return Ok(None);
-    };
-    let parent_exists = crate::db::conversation_repo::get_conversation(&tx, parent)?.is_some();
-    let child_exists = crate::db::conversation_repo::get_conversation(&tx, child)?.is_some();
-    let status = if child_exists {
-        subagents::authoritative_status(&tx, root, &invocation)?
-    } else {
-        "missing".into()
-    };
-    invocation.status = status.clone();
-    let messages = super::conversations::enriched_messages(&tx, child)?;
-    let mut result = json!({"invocation":invocation,"messages":messages,"status":status,"parent_exists":parent_exists});
-    let cursor = subagents::snapshot_cursor(&result);
-    let count = messages.len();
-    let end = offset.saturating_add(limit).min(count);
-    result["messages"] = json!(messages
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>());
-    result["next_offset"] = if end < count { json!(end) } else { Value::Null };
-    result["cursor"] = json!(cursor);
-    Ok(Some(result))
 }
 
 async fn transcript(
@@ -119,11 +63,10 @@ async fn transcript(
             Json(json!({"error":"limit must be between 1 and 1000"})),
         ));
     }
-    let root = crate::commands::app_data_dir().map_err(internal)?;
     let result = tokio::task::spawn_blocking(move || {
         state
             .db_manager
-            .with_conn(|conn| snapshot(conn, &root, &parent, &child, query.offset, query.limit))?
+            .invocation_page(&parent, &child, query.offset, query.limit)
     })
     .await
     .map_err(internal)?
@@ -144,79 +87,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_history_pages_share_cursor_and_validate_persisted_parent() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::db::schema::SCHEMA_SQL).unwrap();
-        deepseek_code_core::services::migrate(&conn).unwrap();
-        for id in ["parent", "child", "other"] {
-            crate::db::conversation_repo::insert_conversation(
-                &conn, id, None, None, None, None, None, false, false, false, "now", "now", 0,
-            )
-            .unwrap();
-        }
+    fn full_history_pages_share_cursor_and_validate_persisted_parent() -> anyhow::Result<()> {
+        use deepseek_code_core::db::{message_repo::ToolCallRow, session_store::Stores};
+        let root = tempfile::tempdir()?;
+        let stores = Stores::open(root.path())?;
+        let parent = stores.create("parent", Default::default())?;
+        let child = stores.create("child", Default::default())?;
+        stores.create("other", Default::default())?;
         let invocation = subagents::Invocation {
-            parent_session_id: "parent".into(),
-            parent_message_id: "parent-message".into(),
+            parent_session_id: parent.id().into(),
+            parent_message_id: parent.write(|w| w.append("assistant", "launch"))?,
             tool_use_id: "call".into(),
-            child_session_id: "child".into(),
+            child_session_id: child.id().into(),
             attempt_id: "attempt".into(),
             mode: "foreground".into(),
             status: "running".into(),
             description: "same label".into(),
         };
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-            [
-                invocation.key(),
-                serde_json::to_string(&invocation).unwrap(),
-            ],
-        )
-        .unwrap();
-        for i in 0..125 {
-            crate::db::message_repo::insert_message(
-                &conn,
-                &format!("message-{i}"),
-                "child",
-                "assistant",
-                &"x".repeat(9000),
-                Some("complete thinking"),
-                "now",
-                false,
-                i,
-            )
-            .unwrap();
-        }
-        for i in 0..35 {
-            crate::db::message_repo::insert_tool_call(
-                &conn,
-                &format!("message-0:tool-{i}"),
-                "message-0",
-                "Read",
-                Some("{}"),
-                Some("full output"),
-                false,
-                i,
-            )
-            .unwrap();
-        }
-        crate::db::message_repo::insert_tool_call(
-            &conn,
-            "message-0:pending",
-            "message-0",
-            "Read",
-            Some("{}"),
-            None,
+        parent.write(|w| w.child_invocation(&child.address(), &invocation))?;
+        let first_id = child.write(|w| {
+            let mut first = String::new();
+            for i in 0..125 {
+                let message = w.append("assistant", &"x".repeat(9000))?;
+                if i == 0 {
+                    first = message;
+                }
+            }
+            Ok(first)
+        })?;
+        let display = child.save_mcp(
+            &first_id,
+            "tool-0",
+            &json!({"content":[{"type":"image","mimeType":"image/png","data":"YWJj"}]}),
             false,
-            35,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO mcp_tool_outputs(conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) VALUES('child','message-0:tool-0','[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"YWJj\"}}]','{}','full output',0)", []).unwrap();
-        let root = std::path::Path::new(".");
-        let first = snapshot(&conn, root, "parent", "child", 0, 100)
-            .unwrap()
-            .unwrap();
-        let second = snapshot(&conn, root, "parent", "child", 100, 100)
-            .unwrap()
+        )?;
+        child.write(|w| {
+            for i in 0..36 {
+                w.tool(
+                    &ToolCallRow {
+                        id: format!("{first_id}:tool-{i}"),
+                        message_id: first_id.clone(),
+                        name: "Read".into(),
+                        input: Some("{}".into()),
+                        output: if i == 0 {
+                            Some(display.clone())
+                        } else if i == 35 {
+                            None
+                        } else {
+                            Some("full output".into())
+                        },
+                        is_error: false,
+                        sort_order: i,
+                    },
+                    None,
+                )?;
+            }
+            Ok(())
+        })?;
+        let first = stores.invocation_page("parent", "child", 0, 100)?.unwrap();
+        let second = stores
+            .invocation_page("parent", "child", 100, 100)?
             .unwrap();
         assert_eq!(first["messages"].as_array().unwrap().len(), 100);
         assert_eq!(second["messages"].as_array().unwrap().len(), 25);
@@ -237,26 +167,17 @@ mod tests {
         assert!(second["next_offset"].is_null());
         assert_eq!(first["cursor"], second["cursor"]);
         assert_eq!(first["status"], "unknown");
-        assert!(snapshot(&conn, root, "other", "child", 0, 100)
-            .unwrap()
-            .is_none());
-        conn.execute("DELETE FROM conversations WHERE id='parent'", [])
-            .unwrap();
-        let orphan = snapshot(&conn, root, "parent", "child", 0, 100)
-            .unwrap()
-            .unwrap();
-        assert_eq!(orphan["parent_exists"], false);
-        assert_eq!(orphan["messages"].as_array().unwrap().len(), 100);
-        assert_ne!(orphan["cursor"], first["cursor"]);
-        conn.execute("DELETE FROM messages WHERE conversation_id='child'", [])
-            .unwrap();
-        conn.execute("DELETE FROM conversations WHERE id='child'", [])
-            .unwrap();
-        assert_eq!(
-            snapshot(&conn, root, "parent", "child", 0, 100)
-                .unwrap()
-                .unwrap()["status"],
-            "missing"
-        );
+        assert!(stores.invocation_page("other", "child", 0, 100)?.is_none());
+        child.delete()?;
+        stores
+            .create("child", Default::default())?
+            .write(|w| w.append("assistant", "replacement history"))?;
+        let missing = stores.invocation_page("parent", "child", 0, 100)?.unwrap();
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["messages"], json!([]));
+        assert_ne!(missing["cursor"], first["cursor"]);
+        parent.delete()?;
+        assert!(stores.invocation_page("parent", "child", 0, 100)?.is_none());
+        Ok(())
     }
 }

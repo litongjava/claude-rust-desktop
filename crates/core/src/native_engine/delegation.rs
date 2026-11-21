@@ -659,6 +659,7 @@ impl ToolLoopExecutor {
             child,
             input["description"].as_str().unwrap_or("Agent"),
             tool_use_id,
+            self.parent_message_id.as_deref(),
             mode,
         )
     }
@@ -907,6 +908,7 @@ impl ToolLoopExecutor {
                 executable_override: None,
                 invocation: tool_use_id.map(|tool_use_id| {
                     crate::native_engine::child_session::ChildInvocation {
+                        parent_message_id:self.parent_message_id.clone(),
                         tool_use_id: tool_use_id.into(),
                         description: description.clone(),
                         mode: "background".into(),

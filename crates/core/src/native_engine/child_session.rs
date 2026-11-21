@@ -40,6 +40,7 @@ pub struct ChildLaunchConfig {
 
 #[derive(Debug, Clone)]
 pub struct ChildInvocation {
+    pub parent_message_id: Option<String>,
     pub tool_use_id: String,
     pub description: String,
     pub mode: String,
@@ -575,6 +576,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
             &session_id,
             &invocation.description,
             Some(&invocation.tool_use_id),
+            invocation.parent_message_id.as_deref(),
             &invocation.mode,
         )?,
         None => None,
@@ -713,57 +715,55 @@ pub(crate) fn child_cli_arguments(
 }
 
 pub(crate) struct InvocationGuard {
-    context: ServiceContext,
-    key: String,
-    value: Value,
+    parent:crate::db::session_store::ExecutorHistory,
+    child:crate::db::session_store::ExecutorHistory,
+    invocation:subagents::Invocation,
 }
 
 impl InvocationGuard {
     pub(crate) fn finish(&mut self, result: &Result<Value>) -> Result<()> {
-        self.value["status"] = json!(match result {
+        self.invocation.status=match result {
             Ok(value) if value["backgrounded"] == true => "running",
             Ok(_) => "completed",
             Err(_) => "failed",
-        });
-        self.context.save_setting(&self.key, &self.value)
+        }.into();
+        self.parent.save_invocation(&self.child,&self.invocation)
     }
 }
 
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
-        if self.value["status"] == "starting" {
-            self.value["status"] = json!("cancelled");
-            let _ = self.context.save_setting(&self.key, &self.value);
+        if self.invocation.status=="starting" {
+            self.invocation.status="cancelled".into();
+            let _=self.parent.save_invocation(&self.child,&self.invocation);
         }
     }
 }
 
-/// Records an Agent-tool invocation so the parent transcript can show which
-/// child it started. Super Agent launches have no tool-use row and skip this.
 pub(crate) fn record_child_invocation(
     context: &ServiceContext,
     parent: &str,
     child: &str,
     description: &str,
     tool_use_id: Option<&str>,
+    parent_message: Option<&str>,
     mode: &str,
 ) -> Result<Option<InvocationGuard>> {
-    let Some(tool_use_id) = tool_use_id else {
-        return Ok(None);
+    let Some(tool_use_id)=tool_use_id else{return Ok(None)};
+    let parent=context.db.executor_history(parent)?;
+    let child=context.db.executor_history(child)?;
+    let invocation=subagents::Invocation {
+        parent_session_id:parent.id().into(),
+        parent_message_id:parent.invocation_message(parent_message)?,
+        tool_use_id:tool_use_id.into(),
+        child_session_id:child.id().into(),
+        attempt_id:uuid::Uuid::new_v4().to_string(),
+        mode:mode.into(),
+        status:"starting".into(),
+        description:description.into(),
     };
-    let parent_message_id = context.db.with_conn(|conn| -> Result<String> {
-        use rusqlite::OptionalExtension;
-        Ok(conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC, rowid DESC LIMIT 1", [parent], |row| row.get(0)).optional()?.unwrap_or_default())
-    })??;
-    let attempt_id = uuid::Uuid::new_v4().to_string();
-    let key = format!("subagent_invocation:{parent}:{tool_use_id}:{attempt_id}");
-    let value = json!({"parent_session_id":parent,"parent_message_id":parent_message_id,"tool_use_id":tool_use_id,"child_session_id":child,"attempt_id":attempt_id,"mode":mode,"status":"starting","description":description});
-    context.save_setting(&key, &value)?;
-    Ok(Some(InvocationGuard {
-        context: context.clone(),
-        key,
-        value,
-    }))
+    parent.save_invocation(&child,&invocation)?;
+    Ok(Some(InvocationGuard{parent,child,invocation}))
 }
 
 /// The matching standalone CLI for this host. Desktop may not be beside an
