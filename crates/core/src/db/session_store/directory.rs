@@ -61,6 +61,14 @@ pub(super) fn list(
     conn: &rusqlite::Connection,
     filter: DirectoryFilter<'_>,
 ) -> Result<Vec<DirectoryEntry>> {
+    list_ordered(conn, filter, false)
+}
+
+fn list_ordered(
+    conn: &rusqlite::Connection,
+    filter: DirectoryFilter<'_>,
+    descending_id: bool,
+) -> Result<Vec<DirectoryEntry>> {
     let mut sql = String::from(FIELDS);
     let mut conditions = Vec::new();
     let mut args = Vec::<Value>::new();
@@ -95,6 +103,9 @@ pub(super) fn list(
         sql.push_str(&conditions.join(" AND "));
     }
     sql.push_str(" ORDER BY updated_at DESC,id");
+    if descending_id {
+        sql.push_str(" DESC");
+    }
 
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(args), entry)?;
@@ -103,6 +114,20 @@ pub(super) fn list(
 impl GlobalDb {
     pub fn list_sessions(&self, filter: DirectoryFilter<'_>) -> Result<Vec<DirectoryEntry>> {
         self.read(|c| list(c, filter))
+    }
+    pub(super) fn continuation_candidates(&self) -> Result<Vec<DirectoryEntry>> {
+        self.read(|c| {
+            list_ordered(
+                c,
+                DirectoryFilter {
+                    mode: Some("code"),
+                    archived: Some(false),
+                    nonempty: true,
+                    ..Default::default()
+                },
+                true,
+            )
+        })
     }
     pub fn conversation(&self, id: &str) -> Result<Option<ConversationRow>> {
         self.read_directory_row(id, |c| Ok(one(c, id)?.map(|r| r.conversation)))

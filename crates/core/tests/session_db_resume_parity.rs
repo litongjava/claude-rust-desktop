@@ -96,3 +96,24 @@ fn fork_and_clear_remain_visible_in_the_worktree_picker() -> Result<()> {
     assert!(upgrade.success());
     Ok(())
 }
+
+#[test]
+fn continue_selects_the_greater_id_on_tied_activity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let db = Stores::open(root.path())?;
+    let sessions = SessionStore::new(Arc::new(db));
+    let ids = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    ];
+    for id in ids {
+        sessions.create_with_id(root.path(), "model", "provider", id)?;
+        sessions.append(id, "user", "tie")?;
+    }
+    rusqlite::Connection::open(root.path().join("global.db"))?.execute(
+        "UPDATE conversations SET updated_at='2030-01-01T00:00:00Z' WHERE id IN (?1,?2)",
+        ids,
+    )?;
+    assert_eq!(sessions.latest(root.path())?.unwrap().id, ids[1]);
+    Ok(())
+}

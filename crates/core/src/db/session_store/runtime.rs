@@ -1,5 +1,5 @@
 //! Resolve the same project and history for interactive hosts, SDKs and workers.
-use super::{CreateOptions, DirectoryFilter, ProjectSelection, SessionDb, SessionWrite, Stores};
+use super::{CreateOptions, ProjectSelection, SessionDb, SessionWrite, Stores};
 use crate::db::conversation_repo::ConversationRow;
 use anyhow::{ensure, Context, Result};
 use rusqlite::params;
@@ -45,12 +45,7 @@ impl Stores {
             .canonicalize()
             .context("Project directory is unavailable")?;
         ensure!(workspace.is_dir(), "Project path must be a directory");
-        let rows = self.global().list_sessions(DirectoryFilter {
-            mode: Some("code"),
-            archived: Some(false),
-            nonempty: true,
-            ..Default::default()
-        })?;
+        let rows = self.global().continuation_candidates()?;
         for row in rows {
             // Worktrees and private children can have a different directory from
             // the project's main path. Only an eligible selection opens history.
