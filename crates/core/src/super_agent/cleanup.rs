@@ -77,6 +77,17 @@ pub(crate) fn run(
     policy: &StatePolicy,
     hook: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    crate::db::session_store::without_lifecycle_wait(|| {
+        run_cleanup(launcher, task_id, policy, hook)
+    })
+}
+
+fn run_cleanup(
+    launcher: &Launcher,
+    task_id: &str,
+    policy: &StatePolicy,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let context = &launcher.context;
     let store = TaskStore::from_context(context);
     let task = store

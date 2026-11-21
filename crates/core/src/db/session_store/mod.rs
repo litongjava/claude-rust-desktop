@@ -78,6 +78,7 @@ pub use history::*;
 pub use state::{GlobalPreferences, GlobalSetting};
 pub use usage::{CorpusUsage, DailyUsage};
 mod layout;
+pub(crate) use layout::without_lifecycle_wait;
 mod lifecycle;
 pub use global::GlobalDb;
 pub use lifecycle::{

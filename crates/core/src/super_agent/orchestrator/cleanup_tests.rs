@@ -1211,3 +1211,78 @@ async fn cleanup_excludes_foreground_workspace_admission() {
     .unwrap();
     assert!(!path.exists());
 }
+
+#[tokio::test]
+async fn cleanup_releases_fences_when_participant_is_busy() -> anyhow::Result<()> {
+    use std::{fs::File, sync::mpsc, time::Duration};
+    let f = cleanup_fixture(1).await;
+    let wt = f.task().repositories.remove(0).worktree_path;
+    let first = "00000000-0000-4000-8000-000000000001";
+    let last = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    f.context.db.create_code_session(&wt, "m", "p", first)?;
+    let outside = f.checkout_target(0);
+    let executing = f.context.db.create_code_session(&outside, "m", "p", last)?;
+    let lease = executing.acquire_execution()?;
+
+    // Pause a two-key publisher after taking its first key. The running second
+    // session must still be able to publish work while the first key is held.
+    let key = File::options()
+        .read(true)
+        .write(true)
+        .open(f.data.join("session-locks").join(first))?;
+    key.try_lock()?;
+    let host = f.orchestrator();
+    let task = f.task_id.clone();
+    let (tx, rx) = mpsc::channel();
+    let cleaner = std::thread::spawn(move || {
+        let result =
+            crate::super_agent::cleanup::run(&host.launcher(), &task, &host.policy(), &mut |_| {
+                Ok(())
+            });
+        let _ = tx.send(result);
+    });
+    let result = rx.recv_timeout(Duration::from_secs(3));
+    // Break the old wait cycle even on failure, before joining the worker.
+    drop(key);
+    cleaner.join().unwrap();
+    let error = result
+        .expect("cleanup waited for a busy lifecycle lock")
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("busy"), "{error:#}");
+    assert!(wt.join("base.txt").exists());
+    drop(crate::services::background_sessions::job_publication_fence(
+        &f.data, true,
+    )?);
+    drop(f.context.db.hold_worktree_removal(&wt)?);
+
+    let archives = tempfile::tempdir()?;
+    for id in [first, last] {
+        std::fs::write(
+            archives.path().join(format!("{id}.json")),
+            serde_json::to_vec(
+                &json!({"id":id,"name":"Import","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","messages":[]}),
+            )?,
+        )?;
+    }
+    let db = f.context.db.clone();
+    let (tx, rx) = mpsc::channel();
+    let importer = std::thread::spawn(move || {
+        let _ = tx.send(db.import_json(archives.path(), &outside, false));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(4));
+    drop(lease);
+    importer.join().unwrap();
+    let error = result
+        .expect("batch import waited indefinitely")
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("busy"), "{error:#}");
+    let host = f.orchestrator();
+    crate::super_agent::cleanup::run(
+        &host.launcher(),
+        &f.task_id,
+        &host.policy(),
+        &mut |_| Ok(()),
+    )?;
+    assert!(!wt.exists());
+    Ok(())
+}

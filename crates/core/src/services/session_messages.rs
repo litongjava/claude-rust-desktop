@@ -579,6 +579,18 @@ impl ExecutionLease {
     /// same lock, so a second top-level turn is rejected before it can start a
     /// turn record or a model request.
     pub fn acquire(root: &Path, session: &str) -> Result<Option<Self>> {
+        Self::acquire_with(root, session, crate::fs::try_lock_briefly)
+    }
+
+    pub(crate) fn try_acquire(root: &Path, session: &str) -> Result<Option<Self>> {
+        Self::acquire_with(root, session, crate::fs::try_lock_file)
+    }
+
+    fn acquire_with(
+        root: &Path,
+        session: &str,
+        lock: fn(&File) -> std::result::Result<(), std::fs::TryLockError>,
+    ) -> Result<Option<Self>> {
         if uuid::Uuid::parse_str(session).is_err() {
             return Ok(None);
         }
@@ -593,8 +605,7 @@ impl ExecutionLease {
             .write(true)
             .open(directory.join(format!("{session}.lock")))?;
         // A real owner holds the lock for a whole turn, so the short retry only absorbs momentary holds such as an execution_active probe or a forked descriptor; two overlapping turns still cannot both run.
-        crate::fs::try_lock_briefly(&file)
-            .context("Session is already executing in another owner")?;
+        lock(&file).context("Session is already executing in another owner")?;
         #[cfg(test)]
         lock_observer::inspect(&file);
         Ok(Some(Self {

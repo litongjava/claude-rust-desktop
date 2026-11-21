@@ -87,16 +87,53 @@ fn read_archive(source: &Path) -> Result<Vec<(LegacySession, String)>> {
     Ok(result)
 }
 impl Stores {
+    // The caller supplies storage-key order. An unsuccessful attempt drops its
+    // entire prefix before sleeping, including when replaying a pending batch.
+    fn lock_batch_keys(&self, keys: &[(&str, bool, bool)]) -> Result<Vec<fs::File>> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let attempt = layout::without_lifecycle_wait(|| {
+                let mut guards = Vec::new();
+                for &(key, exclusive, allocate) in keys {
+                    guards.extend(self.key_lock(key, exclusive, allocate)?);
+                }
+                Ok(guards)
+            });
+            match attempt {
+                Err(e) if e.is::<layout::LifecycleBusy>() && layout::lifecycle_wait_allowed() => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(e).context("Session batch is busy; retry the operation");
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub(in crate::db::session_store) fn group_access(
         &self,
+        keys: Vec<(&str, bool, bool)>,
+    ) -> Result<Vec<fs::File>> {
+        let bounded = keys.len() > 1;
+        self.group_access_with(keys, bounded)
+    }
+
+    fn group_access_with(
+        &self,
         mut keys: Vec<(&str, bool, bool)>,
+        bounded: bool,
     ) -> Result<Vec<fs::File>> {
         keys.sort_by_key(|k| k.0);
         loop {
-            let mut guards = Vec::new();
-            for &(key, exclusive, allocate) in &keys {
-                guards.extend(self.key_lock(key, exclusive, allocate)?);
-            }
+            let guards = match keys.as_slice() {
+                &[(key, exclusive, allocate)] if !bounded => {
+                    self.key_lock(key, exclusive, allocate)?
+                }
+                keys => self.lock_batch_keys(keys)?,
+            };
             let mut batch = None;
             for &(key, _, _) in &keys {
                 batch = self.batch_for(key)?;
@@ -162,11 +199,11 @@ impl Stores {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(k)
         })?;
-        let mut guards = Vec::new();
         for key in &keys {
             ensure!(layout::is_storage_key(key), "Invalid import key");
-            guards.extend(self.key_lock(key, true, false)?);
         }
+        let keys: Vec<_> = keys.iter().map(|key| (key.as_str(), true, false)).collect();
+        let _guards = self.lock_batch_keys(&keys)?;
         self.finish_batch(batch)
     }
     fn finish_batch(&self, batch: &str) -> Result<()> {
@@ -344,7 +381,10 @@ impl Stores {
         let _guards = if preview {
             Vec::new()
         } else {
-            self.group_access(keys.iter().map(|k| (k.as_str(), true, true)).collect())?
+            self.group_access_with(
+                keys.iter().map(|k| (k.as_str(), true, true)).collect(),
+                true,
+            )?
         };
         let mut result = ImportResult {
             project_id: String::new(),

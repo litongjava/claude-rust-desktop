@@ -120,7 +120,7 @@ impl super::Stores {
         if self.published_incarnation_matches(id, incarnation)? {
             self.open_current_session(id, Some(incarnation))?;
         }
-        session_messages::ExecutionLease::acquire(self.data_dir(), incarnation)
+        session_messages::ExecutionLease::try_acquire(self.data_dir(), incarnation)
             .with_context(|| format!("Session {id} still owns an active execution"))?
             .context("Invalid participant incarnation")
     }

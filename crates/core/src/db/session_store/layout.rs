@@ -66,6 +66,31 @@ pub(super) fn with_checkout<T>(held: &'static str, body: impl FnOnce() -> Result
     body()
 }
 
+// Cleanup and multi-key admission must also cover locks taken indirectly by
+// namespace checks, edit recovery and shard upgrades on the same call stack.
+thread_local! {
+    static TRY_LIFECYCLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn without_lifecycle_wait<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TRY_LIFECYCLE.set(self.0);
+        }
+    }
+    let _restore = Restore(TRY_LIFECYCLE.replace(true));
+    body()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session lifecycle lock is busy: {0}")]
+pub(super) struct LifecycleBusy(std::path::PathBuf);
+
+pub(super) fn lifecycle_wait_allowed() -> bool {
+    !TRY_LIFECYCLE.get()
+}
+
 pub(super) fn lock_existing(path: &Path, exclusive: bool) -> Result<File> {
     allow_entry()?;
     let file = File::options()
@@ -73,6 +98,20 @@ pub(super) fn lock_existing(path: &Path, exclusive: bool) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("Opening lifecycle lock {}", path.display()))?;
+    if !lifecycle_wait_allowed() {
+        let result = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        return match result {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => Err(LifecycleBusy(path.into()).into()),
+            Err(fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("Locking {}", path.display()))
+            }
+        };
+    }
     if exclusive {
         file.lock()
     } else {
