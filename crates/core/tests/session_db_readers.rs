@@ -968,3 +968,38 @@ fn desktop_recovers_ack_before_dispatch_and_starts_only_the_receipted_turn() -> 
     assert_eq!(session.read(|r|Ok(r.messages()?.len()))?,2);
     Ok(())
 }
+
+#[test]
+fn document_previews_and_import_backups_resolve_immutable_bodies() -> Result<()> {
+    use deepseek_code_core::{
+        db::session_store::DocumentCatalog,
+        runtime::RuntimePaths,
+        services::{EnvironmentCredentials,ServiceContext,magic_docs::{self,Preview}},
+    };
+    let root=tempfile::tempdir()?;
+    let paths=RuntimePaths::new(root.path().join("data"))?;
+    let ctx=ServiceContext::from_stores(paths,std::sync::Arc::new(EnvironmentCredentials))?;
+    let path=root.path().join("design.md");
+    let original="# MAGIC DOC: design\nOld body".to_owned();
+    let proposed="# MAGIC DOC: design\nNew body".to_owned();
+    std::fs::write(&path,&original)?;
+    let doc=magic_docs::check(&ctx,root.path(),&path)?;
+    ctx.db.save_preview(&Preview{id:"p".into(),document_id:doc.id.clone(),original:original.clone(),proposed:proposed.clone(),diff:String::new()})?;
+    ctx.db.record_input(&doc.id,"private source material")?;
+    assert!(!ctx.db.input_changed(&doc.id,"private source material")?);
+    assert_eq!(magic_docs::previews(&ctx,root.path())?[0].proposed,proposed);
+    let archive=root.path().join("archive.json");
+    std::fs::write(&archive,"[]")?;
+    let backup=magic_docs::import_legacy(&ctx,root.path(),&archive,false)?.backup.unwrap();
+    let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(&backup)?)?;
+    assert_eq!(manifest["blobs"].as_array().unwrap().len(),3);
+    for digest in manifest["blobs"].as_array().unwrap(){
+        assert!(std::path::Path::new(&backup).parent().unwrap().join("global-blobs").join(digest.as_str().unwrap()).is_file());
+    }
+    let permissions=deepseek_code_core::runtime::default_permissions();
+    permissions.set_mode(deepseek_code_core::permissions::PermissionMode::AcceptEdits);
+    magic_docs::apply(&ctx,root.path(),"p",&permissions)?;
+    assert_eq!(std::fs::read_to_string(path)?,proposed);
+    assert!(magic_docs::previews(&ctx,root.path())?.is_empty());
+    Ok(())
+}

@@ -1,5 +1,5 @@
 //! Plugin payloads are immutable. G serializes catalog changes using their digest.
-use super::{layout, shared::DirectoryRepository, Stores, WRITE_DEADLINE};
+use super::{shared::DirectoryRepository, Stores, WRITE_DEADLINE};
 use crate::{db::DbManager, services::plugins::Bundle};
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, OptionalExtension};
@@ -38,64 +38,12 @@ impl Payloads for Stores {
         Ok(serde_json::from_value(self.payload(reference)?)?)
     }
     fn backup(&self, root: &Path) -> Result<PathBuf> {
-        ensure!(
-            root.canonicalize()? == self.data_dir(),
-            "Plugin backup data root changed"
-        );
-        let backups = root.join("backups");
-        std::fs::create_dir_all(&backups)?;
-        let staged = tempfile::tempdir_in(&backups)?;
-        let db = staged.path().join("global.db");
-        self.directory_read(|c| {
-            c.execute("VACUUM INTO ?1", [db.to_string_lossy().as_ref()])?;
-            Ok(())
-        })?;
-        std::fs::File::options().write(true).open(&db)?.sync_all()?;
-        let refs = {
-            let c = layout::open(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            let mut q =
-                c.prepare("SELECT DISTINCT bundle FROM installed_plugins ORDER BY bundle")?;
-            let rows = q.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let blobs = staged.path().join("global-blobs");
-        std::fs::create_dir(&blobs)?;
-        for digest in &refs {
-            use sha2::{Digest, Sha256};
-            ensure!(
-                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
-                "Invalid plugin digest"
-            );
-            let bytes = std::fs::read(root.join("global-blobs").join(digest))?;
-            ensure!(
-                format!("{:x}", Sha256::digest(&bytes)) == *digest,
-                "Plugin backup digest mismatch"
-            );
-            let path = blobs.join(digest);
-            std::fs::write(&path, bytes)?;
-            std::fs::File::options()
-                .write(true)
-                .open(path)?
-                .sync_all()?;
-        }
-        layout::sync_dir(&blobs)?;
-        let manifest = staged.path().join("manifest.json");
-        std::fs::write(
-            &manifest,
-            serde_json::to_vec(
-                &serde_json::json!({"database":"global.db","tables":["installed_plugins"],"blobs":refs,"session_shards":[]}),
-            )?,
-        )?;
-        std::fs::File::options()
-            .write(true)
-            .open(&manifest)?
-            .sync_all()?;
-        layout::sync_dir(staged.path())?;
-        let dest = backups.join(format!("plugins-{}", uuid::Uuid::new_v4()));
-        layout::durable_move(staged.path(), &dest)?;
-        layout::sync_dir(&backups)?;
-        layout::sync_dir(root)?;
-        Ok(dest.join("manifest.json"))
+        self.backup_catalog(
+            root,
+            "plugins",
+            &["installed_plugins"],
+            "SELECT DISTINCT bundle FROM installed_plugins ORDER BY bundle",
+        )
     }
 }
 impl Payloads for DbManager {
