@@ -28,6 +28,8 @@ pub use segment::{SegmentPlacement, SegmentUpdate};
 pub use executor::ExecutorHistory;
 mod global;
 mod shared;
+mod leases;
+pub use leases::ServiceLeases;
 mod schedules;
 pub use schedules::Schedules;
 mod mcp_control;

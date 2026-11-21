@@ -1,14 +1,10 @@
 //! SQLite leases are shared across processes; network work never holds a DB lock.
 use super::ServiceContext;
+use crate::db::session_store::ServiceLeases;
 use anyhow::{ensure, Result};
-use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
-
-const LEASE_SECONDS: i64 = 15;
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
 
 #[derive(Debug, Serialize)]
 pub struct ServiceStatus {
@@ -20,87 +16,47 @@ pub struct ServiceStatus {
 }
 
 pub struct Lease {
-    context: ServiceContext,
+    db: Arc<dyn ServiceLeases>,
     pub name: String,
     owner: String,
 }
 impl Lease {
-    pub fn acquire(context: &ServiceContext, name: &str) -> Result<Self> {
+    pub fn acquire<D: ServiceLeases + 'static>(
+        context: &ServiceContext<D>,
+        name: &str,
+    ) -> Result<Self> {
         let owner = uuid::Uuid::new_v4().to_string();
-        let count = context.db.with_conn(|c| c.execute(
-            "INSERT INTO service_leases(name,owner,pid,expires_at,state) VALUES(?1,?2,?3,?4,'running')
-            ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,pid=excluded.pid,expires_at=excluded.expires_at,
-            stop_requested=0,state='running',error=NULL WHERE service_leases.expires_at<=?5",
-            params![name,owner,std::process::id(),now()+LEASE_SECONDS,now()]))??;
-        ensure!(
-            count == 1,
-            "Service {name} is already running in another host"
-        );
+        context.db.acquire_lease(name, &owner)?;
         Ok(Self {
-            context: context.clone(),
+            db: context.db.clone(),
             name: name.into(),
             owner,
         })
     }
     pub fn renew(&self) -> Result<bool> {
-        let count = self.context.db.with_conn(|c| c.execute(
-            "UPDATE service_leases SET expires_at=?1 WHERE name=?2 AND owner=?3 AND stop_requested=0 AND expires_at>?4",
-            params![now()+LEASE_SECONDS,self.name,self.owner,now()]))??;
-        Ok(count == 1)
+        self.db.renew_lease(&self.name, &self.owner)
     }
     pub fn record(&self, error: Option<&str>) -> Result<()> {
-        self.context.db.with_conn(|c| {
-            c.execute(
-            "UPDATE service_leases SET error=?1,completed=completed+?2 WHERE name=?3 AND owner=?4",
-            params![error,if error.is_none() {1} else {0},self.name,self.owner])
-        })??;
-        Ok(())
+        self.db.record_lease(&self.name, &self.owner, error)
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = self.context.db.with_conn(|c| c.execute(
-            "UPDATE service_leases SET expires_at=0,state='stopped',stop_requested=0 WHERE name=?1 AND owner=?2",
-            params![self.name,self.owner]));
+        if let Err(err) = self.db.release_lease(&self.name, &self.owner) {
+            tracing::warn!("Could not release service lease {}: {err}", self.name);
+        }
     }
 }
-
-pub fn status(context: &ServiceContext) -> Result<Vec<ServiceStatus>> {
-    context.db.with_conn(|c| -> Result<_> {
-        let mut stmt = c.prepare("SELECT name,pid,state,error,completed,expires_at,stop_requested FROM service_leases ORDER BY name")?;
-        let rows = stmt.query_map([], |r| {
-            let state: String = r.get(2)?;
-            let expiry: i64 = r.get(5)?;
-            let stop: bool = r.get(6)?;
-            Ok(ServiceStatus {name:r.get(0)?,pid:r.get(1)?,
-                state:if expiry <= now() && state == "running" {"expired".into()} else if stop {"stopping".into()} else {state},
-                error:r.get(3)?,completed:r.get(4)?})
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })?
+pub fn status(context: &ServiceContext<impl ServiceLeases>) -> Result<Vec<ServiceStatus>> {
+    context.db.service_status()
 }
-
-pub fn stop(context: &ServiceContext, name: &str) -> Result<()> {
-    let count = context.db.with_conn(|c| c.execute(
-        "UPDATE service_leases SET stop_requested=1 WHERE name=?1 AND expires_at>?2 AND state='running'", params![name,now()]))??;
-    ensure!(count == 1, "Service {name} is not running");
-    Ok(())
+pub fn stop(context: &ServiceContext<impl ServiceLeases>, name: &str) -> Result<()> {
+    context.db.stop_lease(name)
 }
-
-pub async fn wait_stopped(context: &ServiceContext, name: &str) -> Result<()> {
+pub async fn wait_stopped(context: &ServiceContext<impl ServiceLeases>, name: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let running: bool = context
-            .db
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT expires_at>?2 AND state='running' FROM service_leases WHERE name=?1",
-                    params![name, now()],
-                    |r| r.get(0),
-                )
-                .optional()
-            })??
-            .unwrap_or(false);
+        let running = context.db.lease_running(name)?;
         if !running {
             return Ok(());
         }

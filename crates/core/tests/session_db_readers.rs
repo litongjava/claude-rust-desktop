@@ -793,3 +793,26 @@ fn h5_tokens_resolve_only_the_issuing_incarnation_and_expire_with_it() -> Result
     assert!(stores.authorize_h5("token")?.is_none());
     Ok(())
 }
+
+#[test]
+fn service_heartbeats_read_through_a_busy_directory_and_stop_on_request() -> anyhow::Result<()> {
+    use deepseek_code_core::services::{lifecycle, EnvironmentCredentials, ServiceContext};
+    use deepseek_code_core::runtime::RuntimePaths;
+    let dir = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(dir.path().to_owned())?;
+    let host = ServiceContext::from_stores(paths.clone(), std::sync::Arc::new(EnvironmentCredentials))?;
+    let controller = ServiceContext::from_stores(paths, std::sync::Arc::new(EnvironmentCredentials))?;
+    let lease = lifecycle::Lease::acquire(&host, "sync")?;
+    assert!(lifecycle::Lease::acquire(&controller, "sync").is_err());
+    let blocker = rusqlite::Connection::open_with_flags(dir.path().join("global.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    blocker.execute_batch("BEGIN IMMEDIATE")?;
+    assert!(lease.renew()?);
+    blocker.execute_batch("ROLLBACK")?;
+    lease.record(None)?;
+    lifecycle::stop(&controller, "sync")?;
+    assert!(!lease.renew()?);
+    drop(lease);
+    let status = lifecycle::status(&controller)?;
+    assert_eq!((status[0].state.as_str(), status[0].completed), ("stopped",1));
+    Ok(())
+}
