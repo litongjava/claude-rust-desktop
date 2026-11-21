@@ -348,6 +348,7 @@ mod tests {
         check_configuration(&context, dir.path(), "session")
             .await
             .unwrap();
+        context.db.create("other-session", Default::default()).unwrap();
         check_configuration(&context, dir.path(), "other-session")
             .await
             .unwrap();

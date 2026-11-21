@@ -865,7 +865,7 @@ mod tests {
         for denied in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let context = crate::services::session_messages::context(root.path()).unwrap();
-            for id in ["parent-session","file-session"] {context.db.create(id,Default::default()).unwrap();}
+            context.db.create("parent-session", Default::default()).unwrap();
             let parent = crate::runtime::default_permissions();
             session_permission_mode::set(
                 &context.db,
