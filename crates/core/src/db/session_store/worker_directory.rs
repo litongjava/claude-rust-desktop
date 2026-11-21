@@ -246,32 +246,29 @@ impl Stores {
         })
     }
 
-    pub(crate) fn child_jobs(&self, parent: &str) -> Result<Vec<(String, ChildOwnership)>> {
-        let rows = self.global().read(|c| {
+    pub(crate) fn recorded_child_jobs(
+        &self,
+        parent: &str,
+        incarnation: &str,
+    ) -> Result<Vec<(String, String, ChildOwnership)>> {
+        self.global().read(|c| {
             let mut q = c.prepare(
-                "SELECT child.id,owner.record,p.id FROM child_owners owner
-                JOIN conversations child ON child.incarnation=owner.child_incarnation
-                LEFT JOIN conversations p ON p.incarnation=owner.parent_incarnation
-                WHERE json_extract(owner.record,'$.parent_session_id')=?1",
+                "SELECT child.id, child.incarnation, owner.record FROM child_owners owner
+                 JOIN conversations child ON child.incarnation=owner.child_incarnation
+                 WHERE owner.parent_incarnation=?1",
             )?;
-            let rows = q.query_map([parent], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })?;
-        rows.into_iter()
-            .map(|(id, raw, p)| {
+            let mut rows = q.query([incarnation])?;
+            let mut jobs = Vec::new();
+            while let Some(row) = rows.next()? {
+                let owner: ChildOwnership = serde_json::from_str(&row.get::<_, String>(2)?)?;
                 ensure!(
-                    p.as_deref() == Some(parent),
-                    "Descendant's recorded owner was retired"
+                    owner.parent_session_id == parent,
+                    "Descendant has conflicting parent identity"
                 );
-                Ok((id, serde_json::from_str(&raw)?))
-            })
-            .collect()
+                jobs.push((row.get(0)?, row.get(1)?, owner));
+            }
+            Ok(jobs)
+        })
     }
 }
 impl DbManager {

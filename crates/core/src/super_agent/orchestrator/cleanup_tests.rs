@@ -998,7 +998,68 @@ async fn cleanup_finishes_after_retirement_of_a_previous_coder() {
     .is_err());
     assert!(f.task().repositories[0].worktree_path.is_dir());
     std::fs::rename(backup, shard).unwrap();
+    use crate::db::session_store::WorkerDirectory;
+    let child = uuid::Uuid::new_v4().to_string();
+    f.context.db.create(&child, Default::default()).unwrap();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let owner = crate::native_engine::child_session::ChildOwnership {
+        parent_session_id: former.clone(),
+        agent_type: "general".into(),
+        description: "historical child".into(),
+        mode: "background".into(),
+        status: "completed".into(),
+        job_id: Some(job_id.clone()),
+        created_at: "fixture".into(),
+        updated_at: "fixture".into(),
+        last_error: None,
+    };
+    f.context
+        .db
+        .save_child_owner(&f.context.db.worker_pair(&former, &child).unwrap(), &owner)
+        .unwrap();
+    let job_dir = f.data.join("background-tasks").join(&job_id);
+    std::fs::create_dir(&job_dir).unwrap();
+    let state = json!({"id":job_id,"session_id":child,"parent_session_id":former,
+        "title":"descendant","status":"completed","started_ms":1,"heartbeat_ms":1,"finished_ms":2,"exit_code":0});
+    std::fs::write(job_dir.join("state.json"), state.to_string()).unwrap();
     old.delete().unwrap();
+    let replacement = f.context.db.create(&former, Default::default()).unwrap();
+    let _replacement_lease = replacement.acquire_execution().unwrap();
+    // A live job of the replacement is unrelated. An unfinished job of the
+    // surviving child still blocks this cleanup even after its parent retires.
+    let other_job = uuid::Uuid::new_v4().to_string();
+    let directory = f.data.join("background-tasks").join(&other_job);
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(
+        directory.join("session-owners.json"),
+        json!({
+            "parent":replacement.incarnation(), "execution":replacement.incarnation()
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("state.json"),
+        json!({
+            "id":other_job, "session_id":former, "parent_session_id":former, "status":"running",
+            "title":"unrelated", "started_ms":1, "heartbeat_ms":1
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut live_child = state.clone();
+    live_child["status"] = json!("running");
+    live_child["finished_ms"] = Value::Null;
+    std::fs::write(job_dir.join("state.json"), live_child.to_string()).unwrap();
+    let error = crate::super_agent::cleanup::cleanup_completed(
+        &host.launcher(),
+        &f.task_id,
+        &host.policy(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains(&job_id), "{error:#}");
+    assert!(f.task().repositories[0].worktree_path.is_dir());
+    std::fs::write(job_dir.join("state.json"), state.to_string()).unwrap();
     crate::super_agent::cleanup::cleanup_completed(&host.launcher(), &f.task_id, &host.policy())
         .unwrap();
     assert_eq!(cleanup_events(&f), 1);

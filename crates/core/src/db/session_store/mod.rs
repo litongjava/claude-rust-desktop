@@ -344,12 +344,21 @@ impl Stores {
     }
 
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
+        self.open_current_session(id, None)?
+            .context("Session unavailable")
+    }
+
+    fn open_current_session(&self, id: &str, expected: Option<&str>) -> Result<Option<SessionDb>> {
         let key = storage_key(id)?;
-        let mut locks = self.resolved_key(&key)?.context("Session unavailable")?;
-        let incarnation = self
-            .global()
-            .incarnation(id, &key)?
-            .context("Session unavailable")?;
+        let Some(mut locks) = self.resolved_key(&key)? else {
+            return Ok(None);
+        };
+        let Some(incarnation) = self.global().incarnation(id, &key)? else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|expected| expected != incarnation) {
+            return Ok(None);
+        }
         let handle = SessionDb {
             stores: self.clone(),
             id: id.into(),
@@ -371,7 +380,7 @@ impl Stores {
         drop(admission::open(&path)?);
         handle.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |_| Ok(()))?;
         handle.try_project_current();
-        Ok(handle)
+        Ok(Some(handle))
     }
 }
 

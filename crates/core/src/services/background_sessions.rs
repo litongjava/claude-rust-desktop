@@ -99,7 +99,7 @@ pub struct Job {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct JobOwners {
     pub(crate) parent: String,
-    execution: String,
+    pub(crate) execution: String,
 }
 
 impl JobOwners {
@@ -108,7 +108,11 @@ impl JobOwners {
     }
 
     pub(crate) fn load(root: &Path, job: &Job) -> Result<Option<Self>> {
-        match fs::read(Self::path(root, job)?) {
+        Self::load_for_id(root, &job.id)
+    }
+
+    pub(crate) fn load_for_id(root: &Path, id: &str) -> Result<Option<Self>> {
+        match fs::read(directory(root, id)?.join("session-owners.json")) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),

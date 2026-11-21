@@ -569,7 +569,7 @@ fn validate_worktree(repo: &RepoTarget) -> Result<()> {
 }
 
 fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
-    use crate::db::session_store::{SessionAccess,WorkspaceDirectory};
+    use crate::db::session_store::WorkspaceDirectory;
     let context = &launcher.context;
     let mut sessions = BTreeSet::new();
     sessions.extend(task.coder.session_id.clone());
@@ -643,43 +643,49 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
             break;
         }
     }
-    let mut retired = BTreeSet::new();
+    let mut participants = BTreeSet::new();
     for (task_id, id) in historical_coders {
-        if !sessions.contains(id) && context.db.former_coder_retired(task_id, id)? {
-            retired.insert(id.clone());
+        let recorded = context.db.former_coder_incarnations(task_id, id)?;
+        if recorded.is_empty() {
+            // Older tasks can lack history. Require a readable live session.
+            sessions.insert(id.clone());
         }
-        sessions.insert(id.clone());
+        participants.extend(recorded.into_iter().map(|inc| (id.clone(), inc)));
     }
-    let mut parents=sessions.iter().cloned().collect::<Vec<_>>();
-    while let Some(parent)=parents.pop(){
-        for (session,owner) in context.db.child_jobs(&parent)? {
-            retired.remove(&session);
-            if sessions.insert(session.clone()) {
-                let id=owner.job_id.as_deref().context("Descendant has no proven job identity")?;
-                require_stopped(&context.paths.data_dir,id,&session,Some(&parent))?;
-                parents.push(session);
+    for id in sessions {
+        let incarnation = context.db.open_session(&id)?.incarnation().to_owned();
+        participants.insert((id, incarnation));
+    }
+    let mut parents: Vec<_> = participants.iter().cloned().collect();
+    while let Some((parent, incarnation)) = parents.pop() {
+        for (id, inc, owner) in context.db.recorded_child_jobs(&parent, &incarnation)? {
+            let job = owner
+                .job_id
+                .as_deref()
+                .context("Descendant has no proven job identity")?;
+            require_stopped(&context.paths.data_dir, job, &id, Some(&parent))?;
+            let child = (id, inc);
+            if participants.insert(child.clone()) {
+                parents.push(child);
             }
         }
     }
-    // Also cover unrelated sessions explicitly using this worktree and jobs
-    // absent from a launch receipt. Discovery must never silently skip damage.
+    // Worktree occupancy independently includes unrelated current incarnations.
     let worktree = &task.repositories[0].worktree_path;
-    let workspaces=context.db.workspace_sessions()?;
-    for (session, workspace) in workspaces {
+    for (id, workspace) in context.db.workspace_sessions()? {
         if Path::new(&workspace).starts_with(worktree) {
-            retired.remove(&session);
-            sessions.insert(session);
+            let incarnation = context.db.open_session(&id)?.incarnation().to_owned();
+            participants.insert((id, incarnation));
         }
     }
-    for session in sessions.difference(&retired) {
-        ensure!(
-            !context.db.select_session(session)?.execution_active(&context.paths.data_dir)?,
-            "Session {session} still owns an active execution"
-        );
+    for (id, incarnation) in &participants {
+        context
+            .db
+            .require_recorded_execution_stopped(id, incarnation)?;
     }
     let jobs = context.paths.data_dir.join("background-tasks");
     if jobs.try_exists()? {
-        for entry in fs::read_dir(jobs)? {
+        for entry in fs::read_dir(&jobs)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -695,7 +701,7 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
                         session_id: job.session_id.clone(),
                         parent_session_id: job.parent_session_id.clone(),
                     };
-                    if identity.is_related(&id, &sessions)? {
+                    if identity.is_related(&context.paths.data_dir, &id, &participants)? {
                         require_stopped(&context.paths.data_dir, &id, &job.session_id, None)?;
                     }
                 }
@@ -715,7 +721,7 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
                     })()
                     .with_context(|| format!("Job {id} has {detail}; cannot read identity to exclude a worktree occupant"))?;
                     ensure!(
-                        !identity.is_related(&id, &sessions)?,
+                        !identity.is_related(&context.paths.data_dir, &id, &participants)?,
                         "Related job {id} has {detail}; cannot prove it stopped"
                     );
                 }
@@ -733,14 +739,31 @@ struct BackgroundIdentity {
 }
 
 impl BackgroundIdentity {
-    fn is_related(&self, directory_id: &str, sessions: &BTreeSet<String>) -> Result<bool> {
+    fn is_related(
+        &self,
+        root: &Path,
+        directory_id: &str,
+        participants: &BTreeSet<(String, String)>,
+    ) -> Result<bool> {
         ensure!(
             self.id == directory_id
                 && !self.session_id.trim().is_empty()
                 && !self.parent_session_id.trim().is_empty(),
             "Job {directory_id} has missing/conflicting identity; cannot exclude a worktree occupant"
         );
-        Ok(sessions.contains(&self.session_id) || sessions.contains(&self.parent_session_id))
+        let matches_id = participants
+            .iter()
+            .any(|(id, _)| id == &self.session_id || id == &self.parent_session_id);
+        if !matches_id {
+            return Ok(false);
+        }
+        let Some(owners) = background_sessions::JobOwners::load_for_id(root, directory_id)? else {
+            return Ok(true);
+        };
+        Ok(
+            participants.contains(&(self.session_id.clone(), owners.execution))
+                || participants.contains(&(self.parent_session_id.clone(), owners.parent)),
+        )
     }
 }
 
