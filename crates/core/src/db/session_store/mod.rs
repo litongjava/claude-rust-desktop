@@ -16,6 +16,7 @@ pub use conversations::Rewind;
 pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
+mod desktop_queue;
 mod executor;
 mod engine;
 mod recording;

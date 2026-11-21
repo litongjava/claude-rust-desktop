@@ -61,13 +61,7 @@ pub(super) fn execution_lease(
     db: &DbManager,
     id: &str,
 ) -> anyhow::Result<deepseek_code_core::services::session_messages::ExecutionLease> {
-    let path: String =
-        db.with_conn(|conn| conn.query_row("PRAGMA database_list", [], |row| row.get(2)))??;
-    let path = std::path::Path::new(&path);
-    let root = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Queue needs a file-backed database"))?;
-    deepseek_code_core::services::session_messages::ExecutionLease::acquire(root, id)?
+    deepseek_code_core::services::session_messages::ExecutionLease::acquire(db.data_dir(), id)?
         .ok_or_else(|| anyhow::anyhow!("Session is executing in another process"))
 }
 
@@ -89,17 +83,6 @@ pub(super) async fn wait_for_release(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-}
-
-pub(super) fn remember(state: &AppState, req: &ChatRequest) -> anyhow::Result<()> {
-    let mut context = req.clone();
-    context.messages.clear();
-    state.db_manager.with_conn(|conn| -> anyhow::Result<()> {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS desktop_queue_context(session_id TEXT PRIMARY KEY,request_json TEXT NOT NULL)")?;
-        conn.execute("INSERT INTO desktop_queue_context VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET request_json=excluded.request_json",
-            rusqlite::params![req.conversation_id,serde_json::to_string(&context)?])?;
-        Ok(())
-    })?
 }
 
 pub(super) fn handoff(db: &DbManager, id: &str, item: &QueueItem) -> anyhow::Result<QueueItem> {
@@ -149,14 +132,7 @@ async fn dispatch(state: AppState, id: &str) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    let raw: String = state.db_manager.with_conn(|conn| {
-        conn.query_row(
-            "SELECT request_json FROM desktop_queue_context WHERE session_id=?1",
-            [id],
-            |r| r.get(0),
-        )
-    })??;
-    let mut req: ChatRequest = serde_json::from_str(&raw)?;
+    let mut req = state.db_manager.desktop_context(id)?;
     let format = {
         let config = state.config_manager.lock().await;
         let config = config

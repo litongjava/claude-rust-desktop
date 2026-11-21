@@ -5,3 +5,6 @@ crates/core/src/services/doctor.rs	deepseek_code.db	1	Untouched legacy-only sent
 crates/core/src/services/local_coordination/store.rs	Connection::open	5	Independent coordination registry and its fixtures
 crates/core/src/tools/coordination.rs	Connection::open	1	Coordination registry test
 crates/core/tests/session_db_lifecycle.rs	deepseek_code.db	3	Legacy-file sentinel assertions
+
+# Independent directory writer used to verify read-only service heartbeats.
+crates/core/tests/session_db_readers.rs	Connection::open	1

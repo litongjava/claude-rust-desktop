@@ -83,9 +83,11 @@ pub(super) async fn start_authorized_chat(
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
     let model = req.model.clone();
-    if let Err(error) = if h5 { Ok(()) } else { super::input_queue::remember(&state, &req) } {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-    }
+    let queue_context = (!h5).then(|| {
+        let mut context = req.clone();
+        context.messages.clear();
+        context
+    });
     let lifecycle_state = state.clone();
     let lifecycle_id = conv_id.clone();
     let messages = req.messages;
@@ -123,6 +125,11 @@ pub(super) async fn start_authorized_chat(
         if !matches!(saved,Ok(Ok(()))) {
             tracing::error!("Could not persist user content: {:?}", saved);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"Could not save user message"}))).into_response();
+        }
+    }
+    if let Some(context) = queue_context {
+        if let Err(error) = state.db_manager.remember_desktop_context(&context) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response();
         }
     }
     tracing::info!(module = "Chat", "[2/7] SQLite save COMPLETED");
