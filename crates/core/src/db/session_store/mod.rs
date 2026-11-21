@@ -395,6 +395,13 @@ impl SessionDb {
         crate::db::transcript::MessageIds::new(self.incarnation()).issue()
     }
 
+    /// Keep the selected directory identity live while a host installs its local state.
+    pub fn hold_incarnation(&self) -> Result<impl Drop> {
+        let locks = self.stores.key_lock(&self.key, false, false)?;
+        self.check_directory()?;
+        Ok(locks)
+    }
+
     pub fn incarnation(&self) -> &str {
         &self.incarnation
     }

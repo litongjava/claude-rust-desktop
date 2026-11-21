@@ -172,7 +172,10 @@ async fn resume_race_returns_an_error_and_keeps_the_source_handle() {
     let observed = (*destination.binding_state()).clone();
     destination.switch(&paths, selection(4096)).await.unwrap();
     let error = source
-        .prepare_resumed_binding(&destination.id, observed)
+        .prepare_resumed_binding(
+            &destination.store.db.open_session(&destination.id).unwrap(),
+            observed,
+        )
         .unwrap_err();
     assert!(error.to_string().contains("binding changed during refresh"));
     assert_eq!(source.binding_state().generation, 1);

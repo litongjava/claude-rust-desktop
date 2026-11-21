@@ -1115,26 +1115,33 @@ impl Session {
         Ok(id)
     }
 
-    fn prepare_resumed_binding(&self, id: &str, state: deepseek_code_core::native_engine::session_binding::BindingSnapshot) -> Result<deepseek_code_core::native_engine::session_binding::ActiveBinding> {
-        let target = if self.id == id { (*self.binding).clone() } else { Default::default() };
-        target.track_session(self.store.db.open_session(id)?);
+    fn prepare_resumed_binding(
+        &self,
+        shard: &deepseek_code_core::db::session_store::SessionDb,
+        state: deepseek_code_core::native_engine::session_binding::BindingSnapshot,
+    ) -> Result<deepseek_code_core::native_engine::session_binding::ActiveBinding> {
+        let target = if self.id == shard.id() {
+            (*self.binding).clone()
+        } else {
+            Default::default()
+        };
+        target.track_session(shard.clone());
         target.restore(state)?;
         target.initialized()
     }
 
     /// Validate the project and provider before replacing the current session.
     pub async fn resume_saved(&mut self, paths: &RuntimePaths, id: &str) -> Result<()> {
-        let saved = self
-            .store
-            .resume(id)
-            .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
-        let workspace = self
-            .store
-            .workspace(id, &paths.data_dir.join("workspaces"))
+        let (shard, saved) =
+            self.store.db.resume_code(id).map_err(|error| {
+                crate::session_trust::diagnose(&self.store.db, paths, id, error)
+            })?;
+        let workspace = shard
+            .workspace()
             .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
         let model = saved.model.context("Saved session has no model")?;
         let provider_id = saved.provider.context("Saved session has no provider")?;
-        let row = self.store.db.observed_binding(id)?;
+        let row = shard.observe_provider()?;
         let changing_provider = provider_id != self.binding_state().provider_id;
         let reload_catalog = changing_provider || (id != self.id && self.has_saved_providers);
         let candidate = if let Some(live) = crate::worker_binding::resident(paths, id, &row).await? {
@@ -1162,19 +1169,24 @@ impl Session {
             None
         };
         let policy = self.store.db.request_recording_policy(&self.id);
-        let recording_target=self.store.db.open_session(id)?;
         // SessionEnd can wait on a hook while another frontend changes the target.
         // Validate a separate populated handle before changing any live reference.
         self.end_hooks("other").await;
         let admission = async {
-            let state = crate::worker_binding::observe(paths, &self.store.db, id, candidate).await?;
-            let target = self.prepare_resumed_binding(id, state)?;
+            let guard = shard.hold_incarnation()?;
+            let state =
+                crate::worker_binding::observe_row(paths, id, shard.observe_provider()?, candidate)
+                    .await?;
+            let target = self.prepare_resumed_binding(&shard, state)?;
             deepseek_code_core::services::session_permission_mode::set(
-                &self.store.db, id, &self.permissions, mode,
+                &shard,
+                id,
+                &self.permissions,
+                mode,
             )?;
-            Ok::<_, anyhow::Error>(target)
+            Ok::<_, anyhow::Error>((target, guard))
         }.await;
-        let target = match admission {
+        let (target, guard) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
                 if lifecycle_owned { self.finish_committed_start_hooks("resume").await; }
@@ -1190,8 +1202,11 @@ impl Session {
         }
         self.workspace = workspace;
         self.auto_route = false;
-        if let Some(policy)=policy { recording_target.set_recording_policy(policy); }
+        if let Some(policy) = policy {
+            shard.set_recording_policy(policy);
+        }
         self.id = id.to_owned();
+        drop(guard);
         self.waiting_for_continue
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.replace_coordination().await;
@@ -4753,6 +4768,52 @@ mod event_tests {
         session.activate_coordination(prepared).await;
         assert!(session.coordination.is_some(), "the fixture registered");
         session
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resume_rejects_target_replaced_during_end_hook() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (paths, cli, _) = lc_fixture(dir.path(), true);
+        let store = SessionStore::new(paths.open_database()?);
+        let workspaces = ["first", "selected", "replacement"].map(|name| dir.path().join(name));
+        for workspace in &workspaces {
+            std::fs::create_dir(workspace)?;
+        }
+        let first = store.create(&workspaces[0], "fixture", "fixture")?;
+        let second = store.create(&workspaces[1], "fixture", "fixture")?;
+        let mut session = lc_open(&cli, &paths, &first, dir.path()).await;
+        session.lifecycle_owned = true;
+        let entered = dir.path().join("hook-entered");
+        let release = dir.path().join("hook-release");
+        std::fs::write(paths.data_dir.join("settings.json"), json!({
+            "localCoordination":{"enabled":true,"registry":true},
+            "hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":format!(
+                "touch '{}' && while [ ! -e '{}' ]; do sleep 0.02; done",entered.display(),release.display())}]}]}
+        }).to_string())?;
+        let change = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !entered.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            store.db.open_session(&second)?.delete()?;
+            store.create_with_id(&workspaces[2], "fixture", "fixture", &second)?;
+            std::fs::write(release, "")?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (resume, replace) = tokio::join!(session.resume_saved(&paths, &second), change);
+        replace?;
+        assert!(resume.is_err());
+        assert_eq!(session.id, first);
+        assert_eq!(session.workspace, workspaces[0]);
+        assert!(
+            deepseek_code_core::services::session_permission_mode::load(&store.db, &second)?
+                .is_none()
+        );
+        session.close_coordination().await;
+        Ok(())
     }
 
     /// A permission write for the target fails before the commit, so the old ID,

@@ -147,9 +147,17 @@ pub async fn observe(
     paths: &RuntimePaths,
     db: &Stores,
     id: &str,
+    local: BindingSnapshot,
+) -> Result<BindingSnapshot> {
+    observe_row(paths, id, db.observed_binding(id)?, local).await
+}
+
+pub(super) async fn observe_row(
+    paths: &RuntimePaths,
+    id: &str,
+    row: Observed,
     mut local: BindingSnapshot,
 ) -> Result<BindingSnapshot> {
-    let row = db.observed_binding(id)?;
     if row.pending.is_some() {
         eprintln!("Provider switch pending: the legacy worker continues its current job. Use /continue to observe.");
     }
