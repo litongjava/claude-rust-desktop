@@ -488,11 +488,17 @@ mod tests {
                 .write("inspect pragma", "test", publication, |tx| {
                     assert_eq!(
                         pragmas(tx)?,
-                        (if publication { 2 } else { 1 }, "wal".into(), 1, 5000)
+                        (if publication { 2 } else { 1 }, "wal".into(), 1, 0)
                     );
                     Ok(())
                 })?;
         }
+        // I34 sets busy_timeout to zero after acquiring the writer. The next
+        // checkout gets the normal acquisition budget back.
+        s.global().read(|c| {
+            assert_eq!(pragmas(c)?.3, 5000);
+            Ok(())
+        })?;
         let _permit = Permits::take(1);
         layout::initialize(&tmp.path().join("stage.db"), SESSION, |tx| {
             assert_eq!(pragmas(tx)?, (2, "wal".into(), 1, 5000));
@@ -500,7 +506,7 @@ mod tests {
         })?;
         drop(_permit);
         s.create("test", CreateOptions::default())?.write(|tx| {
-            assert_eq!(pragmas(tx.0)?, (1, "wal".into(), 1, 5000));
+            assert_eq!(pragmas(tx.0)?, (1, "wal".into(), 1, 0));
             Ok(())
         })
     }

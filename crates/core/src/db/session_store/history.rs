@@ -366,7 +366,11 @@ impl SessionWrite<'_> {
     }
     pub fn settle_interrupted(&self) -> Result<Vec<turn_repo::TurnRecord>> {
         self.2.set(true);
-        turn_repo::settle_interrupted_in(self.0, self.1)
+        let mut settled = Vec::new();
+        while let Some(turn) = turn_repo::settle_next(self.0, self.1)? {
+            settled.push(turn);
+        }
+        Ok(settled)
     }
     pub fn message_content(&self, id: &str, content: &str) -> Result<()> {
         messages::update_message_content(self.0, id, content)

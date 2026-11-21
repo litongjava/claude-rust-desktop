@@ -367,7 +367,10 @@ impl SessionDb {
                 )?)
             })?;
         if interrupted {
-            self.write_locked("settle interrupted execution", |tx| tx.settle_interrupted())?;
+            while self.write_locked("settle interrupted execution", |tx| {
+                tx.2.set(true);
+                crate::db::turn_repo::settle_next(tx.0, tx.1)
+            })?.is_some() {}
         }
         Ok(DeliveryOwner {
             session: self.clone(),

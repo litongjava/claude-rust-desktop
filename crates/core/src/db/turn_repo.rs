@@ -167,27 +167,28 @@ pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<S
 /// time as work time. The caller must first establish that no process holds the
 /// execution lease.
 pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
-    if running_turn(conn, conversation_id)?.is_none() {
-        return Ok(Vec::new());
-    }
-    super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE, |tx| {
-        settle_interrupted_in(tx, conversation_id)
-    }).context("Settling interrupted turn")
-}
-
-pub(crate) fn settle_interrupted_in(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
     let mut settled = Vec::new();
-    while let Some(mut record) = running_turn(conn, conversation_id)? {
-        conn.execute(
-            "UPDATE execution_turns SET ended_at=NULL,elapsed_ms=NULL,status='cancelled' WHERE id=?1 AND status='running'",
-            [&record.turn_id],
-        )?;
-        record.ended_at = None;
-        record.elapsed_ms = None;
-        record.status = TurnStatus::Cancelled;
-        settled.push(record);
+    while running_turn(conn, conversation_id)?.is_some() {
+        // Recheck the candidate after acquiring the writer. Commit each
+        // settlement so a later damaged row cannot undo earlier progress.
+        let turn = super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE,
+            |tx| settle_next(tx, conversation_id)).context("Settling interrupted turn")?;
+        let Some(turn) = turn else { break };
+        settled.push(turn);
     }
     Ok(settled)
+}
+
+pub(crate) fn settle_next(conn: &Connection, conversation_id: &str) -> Result<Option<TurnRecord>> {
+    let Some(mut record) = running_turn(conn, conversation_id)? else { return Ok(None) };
+    conn.execute(
+        "UPDATE execution_turns SET ended_at=NULL,elapsed_ms=NULL,status='cancelled' WHERE id=?1 AND status='running'",
+        [&record.turn_id],
+    )?;
+    record.ended_at = None;
+    record.elapsed_ms = None;
+    record.status = TurnStatus::Cancelled;
+    Ok(Some(record))
 }
 
 pub fn terminal_status(stop_reason: Option<&str>, failed: bool) -> TurnStatus {
