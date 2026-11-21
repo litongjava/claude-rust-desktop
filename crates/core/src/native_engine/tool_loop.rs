@@ -137,6 +137,7 @@ pub enum EngineEvent {
     ContextReset {
         session_id: String,
         boundary_id: String,
+        assistant_id: Option<String>,
     },
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
@@ -3528,6 +3529,20 @@ impl ToolLoopExecutor {
             && self.conv_id.is_some()
     }
 
+    async fn publish_context_reset(&mut self, boundary_id: String) -> Result<()> {
+        let sender = self.event_tx.clone();
+        let event = sender.reserve().await.map_err(|_| anyhow!("Planning event receiver closed"))?;
+        let next = match (self.session_search_storage(), self.parent_message_id.as_deref()) {
+            (Some(history), Some(previous)) => Some(history.rollover_segment(previous, &boundary_id)?),
+            _ => None,
+        };
+        self.parent_message_id = next.clone();
+        event.send(EngineEvent::ContextReset {
+            session_id: self.conv_id.clone().unwrap_or_default(), boundary_id, assistant_id: next,
+        });
+        Ok(())
+    }
+
     fn session_search_storage(&self) -> Option<ExecutorHistory> {
         self.executor_history.clone().or_else(|| {
             let db = self.goal_db.as_ref()?;
@@ -3872,13 +3887,7 @@ impl ToolLoopExecutor {
             self.context_boundary_id = Some(boundary_id.clone());
             self.applied_compaction = true;
             self.stop_hook_active = false;
-            let _ = self
-                .event_tx
-                .send(EngineEvent::ContextReset {
-                    session_id: self.conv_id.clone().unwrap_or_default(),
-                    boundary_id,
-                })
-                .await;
+            self.publish_context_reset(boundary_id).await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
         let inbox_owner = match (
@@ -6071,13 +6080,7 @@ impl ToolLoopExecutor {
                     full_text.clear();
                     self.messages.clear();
                     self.stop_hook_active = false;
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::ContextReset {
-                            session_id: self.conv_id.clone().unwrap_or_default(),
-                            boundary_id,
-                        })
-                        .await;
+                    self.publish_context_reset(boundary_id).await?;
                 }
             } else {
                 let incoming = if self
@@ -7036,13 +7039,7 @@ impl ToolLoopExecutor {
                     full_text.clear();
                     self.messages.clear();
                     self.stop_hook_active = false;
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::ContextReset {
-                            session_id: self.conv_id.clone().unwrap_or_default(),
-                            boundary_id,
-                        })
-                        .await;
+                    self.publish_context_reset(boundary_id).await?;
                 }
             } else {
                 let incoming = if self

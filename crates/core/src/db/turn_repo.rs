@@ -288,6 +288,14 @@ impl TurnTimer {
         self.message_id = None;
     }
 
+    pub fn resume_reset_segment(&mut self, reserved: Option<String>) -> Result<String> {
+        let Some(message) = reserved else { return self.new_segment() };
+        anyhow::ensure!(self.history().segment_belongs_to_turn(&message, &self.record.turn_id)?,
+            "Planning segment belongs to another turn");
+        self.message_id = Some(message.clone());
+        Ok(message)
+    }
+
     pub fn new_segment(&mut self) -> Result<String> {
         let id = match &self.store {
             TurnStore::Session(shard) => shard.write(|w| w.segment(&self.record.turn_id))?,

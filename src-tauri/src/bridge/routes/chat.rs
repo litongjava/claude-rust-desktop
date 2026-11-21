@@ -312,7 +312,7 @@ pub(super) async fn start_authorized_chat(
                 }
             }
             let event_data = match event {
-                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id } => {
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved } => {
                     if session_id == conv_id {
                         if let Err(error) = history.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&full_text), thinking: Some(""),
@@ -321,7 +321,7 @@ pub(super) async fn start_authorized_chat(
                             terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot archive planning context: {error:#}")}));
                             break;
                         }
-                        assistant_id = match turn.new_segment() {
+                        assistant_id = match turn.resume_reset_segment(reserved) {
                             Ok(id) => id,
                             Err(error) => {
                                 terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot create assistant segment: {error:#}")}));

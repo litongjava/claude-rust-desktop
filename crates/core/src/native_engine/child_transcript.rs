@@ -96,8 +96,8 @@ impl ChildTranscript {
     fn reduce(&mut self, event: EngineEvent) -> Result<Option<EngineEvent>> {
         let mut progress = None;
         match event {
-            EngineEvent::ContextReset { .. } => {
-                self.assistant_id = uuid::Uuid::new_v4().to_string();
+            EngineEvent::ContextReset { assistant_id, .. } => {
+                self.assistant_id = assistant_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 self.text.clear();
                 self.thinking.clear();
                 self.tools.clear();
@@ -336,6 +336,7 @@ mod tests {
         tx.try_send(EngineEvent::ContextReset {
             session_id: session.clone(),
             boundary_id: "boundary".into(),
+            assistant_id: None,
         })
         .unwrap();
         tx.try_send(EngineEvent::Thinking("after thinking".into()))

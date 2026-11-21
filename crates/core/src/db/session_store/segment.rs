@@ -115,6 +115,47 @@ impl SegmentUpdate<'_> {
 }
 
 impl ExecutorHistory {
+    /// Reserve the next assistant before the model can persist an MCP result for it.
+    pub(crate) fn rollover_segment(&self, previous: &str, boundary: &str) -> Result<String> {
+        use crate::db::turn_repo;
+        let next = uuid::Uuid::new_v4().to_string();
+        let insert = |c: &Connection, id: &str| -> Result<()> {
+            ensure!(c.prepare_cached("SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND role='assistant'")?
+                .exists([previous, id])?, "Previous assistant segment is missing");
+            ensure!(c.prepare_cached("SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND is_compact_boundary=1")?
+                .exists([boundary, id])?, "Planning boundary is missing");
+            c.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
+                VALUES(?1,?2,'assistant','',?3,(SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))",
+                params![next, id, chrono::Utc::now().to_rfc3339()])?;
+            if let Some(turn) = turn_repo::get_message_turn(c, previous)? {
+                ensure!(
+                    turn.status == turn_repo::TurnStatus::Running,
+                    "Turn has already ended"
+                );
+                turn_repo::link_message(c, &turn.turn_id, &next)?;
+            }
+            Ok(())
+        };
+        match self {
+            Self::Session(s) => s.write_named("advance planning segment", |w| {
+                insert(w.0, s.id())?;
+                w.2.set(true);
+                Ok(())
+            })?,
+            Self::Shared(db,id) => db.with_conn(|c| crate::db::write_tx(c,"advance planning segment",super::WRITE_DEADLINE,|tx|{
+                insert(tx, id)?;
+                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1", [id])?;
+                Ok(())
+            }))??,
+        }
+        Ok(next)
+    }
+
+    pub(crate) fn segment_belongs_to_turn(&self, message: &str, turn: &str) -> Result<bool> {
+        self.read(|c,id| Ok(c.prepare_cached("SELECT 1 FROM message_turns mt JOIN messages m ON mt.message_id=m.id
+            WHERE mt.message_id=?1 AND mt.turn_id=?2 AND m.conversation_id=?3 AND m.role='assistant'")?.exists([message,turn,id])?))
+    }
+
     pub fn save_segment(&self, message: &str, update: SegmentUpdate<'_>) -> Result<()> {
         self.save_segment_with_deadline(
             message,
@@ -210,5 +251,44 @@ impl ExecutorHistory {
     }
     pub fn last_request_number(&self) -> Result<i64> {
         self.read(|c,id|Ok(c.query_row("SELECT coalesce(max(request_number),0) FROM model_requests WHERE conversation_id=?1",[id],|r|r.get(0))?))
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::super::Stores;
+    use crate::db::turn_repo::TurnTimer;
+    use anyhow::Result;
+    use serde_json::json;
+
+    #[test]
+    fn reset_reserves_one_turn_segment_for_the_transport_and_host() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let shard = Stores::open(root.path())?.create("plan-turn", Default::default())?;
+        let mut turn = TurnTimer::in_session(shard.clone())?;
+        let previous = turn.ensure_segment()?;
+        let boundary = shard.write(|w| w.plan_marker("approved"))?;
+        let history = turn.history();
+        let next = history.rollover_segment(&previous, &boundary)?;
+        // The transport can finish before the host reads the reset event.
+        let display = shard.save_mcp(
+            &next,
+            "call",
+            &json!({"structuredContent":{"result":2}}),
+            false,
+        )?;
+        assert_eq!(turn.resume_reset_segment(Some(next.clone()))?, next);
+        shard.read(|r| {
+            assert_eq!(
+                r.segments(&turn.record().turn_id)?,
+                [previous.clone(), next.clone()]
+            );
+            assert!(r.mcp(&format!("{previous}:call"), &display)?.is_none());
+            assert_eq!(
+                r.mcp(&format!("{next}:call"), &display)?.unwrap().1["structuredContent"]["result"],
+                2
+            );
+            Ok(())
+        })
     }
 }

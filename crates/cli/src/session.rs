@@ -2443,13 +2443,13 @@ impl Session {
                         else { progress.thinking(); }
                     },
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
-                    EngineEvent::ContextReset { session_id, boundary_id } if session_id == self.id => {
+                    EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
                         })?;
-                        assistant_id = turn.new_segment()?;
+                        assistant_id = turn.resume_reset_segment(reserved)?;
                         text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
                         if background_transcript { live_transcript = BackgroundTranscript::default(); separate_text = false; }
                         observed_plan_boundary = Some(boundary_id);
@@ -2818,13 +2818,14 @@ impl Session {
                     EngineEvent::ContextReset {
                         session_id,
                         boundary_id,
+                        assistant_id: reserved,
                     } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
                         })?;
-                        assistant_id = turn.new_segment()?;
+                        assistant_id = turn.resume_reset_segment(reserved)?;
                         text.clear();
                         thinking_text.clear();
                         tools.clear();
@@ -3722,6 +3723,7 @@ pub(crate) fn event_json_with(event: &EngineEvent, summaries: bool) -> Option<Va
         EngineEvent::ContextReset {
             session_id,
             boundary_id,
+            ..
         } => json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id}),
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
         EngineEvent::QueuedInput(input) => {
