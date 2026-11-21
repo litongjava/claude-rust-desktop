@@ -451,7 +451,7 @@ fn steers_mid_turn(message: &UserMessage, session: &str) -> bool {
 /// Cancel the durable entries a host cancellation names, unless the engine
 /// already handed them to the running turn.
 fn cancel_steered(
-    db: &deepseek_code_core::db::DbManager,
+    db: &impl deepseek_code_core::db::session_store::SessionAccess,
     session: &str,
     steered: &mut Vec<SteeredFrame>,
     request: &Value,
@@ -486,7 +486,7 @@ fn cancel_steered(
 /// Discard frames the host can no longer continue: the turn is aborted and no
 /// later turn may inherit them.
 fn discard_steered(
-    db: &deepseek_code_core::db::DbManager,
+    db: &impl deepseek_code_core::db::session_store::SessionAccess,
     session: &str,
     steered: &mut Vec<SteeredFrame>,
 ) {
@@ -503,7 +503,7 @@ fn discard_steered(
 /// Delivered items keep their transcript row; leftovers become the next turn.
 /// Returns the (uuid, handoff message id) pairs the host can address later.
 fn reconcile_steered(
-    db: &deepseek_code_core::db::DbManager,
+    db: &impl deepseek_code_core::db::session_store::SessionAccess,
     session: &str,
     steered: &mut Vec<SteeredFrame>,
     queue: &mut VecDeque<UserMessage>,
@@ -511,17 +511,17 @@ fn reconcile_steered(
     if steered.is_empty() {
         return Ok(Vec::new());
     }
-    let states: HashMap<i64, QueueState> = input_queue::list(db, session)?
+    let states: HashMap<i64, _> = input_queue::list(db, session)?
         .into_iter()
-        .map(|item| (item.id, item.state))
+        .map(|item| (item.id, item))
         .collect();
     let mut delivered = Vec::new();
     let mut undelivered = Vec::new();
     for frame in steered.drain(..) {
-        match states.get(&frame.item_id) {
+        match states.get(&frame.item_id).map(|item|item.state) {
             Some(QueueState::Handoff) => {
-                if let Some(uuid) = frame.message.uuid.clone() {
-                    delivered.push((uuid, format!("queue-input-{}", frame.item_id)));
+                if let (Some(uuid), Some(effect)) = (frame.message.uuid.clone(), states[&frame.item_id].handoff_id.clone()) {
+                    delivered.push((uuid, effect));
                 }
             }
             Some(QueueState::Queued | QueueState::Claimed) => undelivered.push(frame),

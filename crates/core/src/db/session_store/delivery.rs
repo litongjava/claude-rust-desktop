@@ -71,18 +71,43 @@ pub struct Admission {
     pub id: i64,
     pub revision: i64,
     pub state: String,
+    request: String,
+    payload: String,
+    mode: String,
+    delivery: String,
+}
+const QUEUE_COLUMNS: &str = "id,revision,state,request_id,payload,mode,delivery_id";
+
+impl Admission {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            revision: row.get(1)?,
+            state: row.get(2)?,
+            request: row.get(3)?,
+            payload: row.get(4)?,
+            mode: row.get(5)?,
+            delivery: row.get(6)?,
+        })
+    }
+    fn resolve(self, session: &SessionDb) -> Result<input_queue::QueueItem> {
+        Ok(input_queue::QueueItem {
+            id: self.id,
+            revision: self.revision,
+            request_id: self.request,
+            session_id: session.id.clone(),
+            content: session.stores.payload(&self.payload)?,
+            mode: serde_json::from_value(Value::String(self.mode))?,
+            handoff_id: (self.state == "handoff").then_some(self.delivery),
+            state: serde_json::from_value(Value::String(self.state))?,
+        })
+    }
 }
 fn admission(c: &Connection, id: i64, session: &str) -> Result<Admission> {
     Ok(c.query_row(
-        "SELECT id,revision,state FROM session_input_queue WHERE id=?1 AND session_id=?2",
+        &format!("SELECT {QUEUE_COLUMNS} FROM session_input_queue WHERE id=?1 AND session_id=?2"),
         params![id, session],
-        |r| {
-            Ok(Admission {
-                id: r.get(0)?,
-                revision: r.get(1)?,
-                state: r.get(2)?,
-            })
-        },
+        Admission::read,
     )
     .optional()?
     .ok_or(QueueError::NotFound)?)
@@ -91,6 +116,92 @@ pub enum QueueEdit<'a> {
     Text(&'a str),
     Cancel,
     Steer,
+}
+impl super::SessionRepository<'_> {
+    pub(crate) fn enqueue_input(
+        &self,
+        request: &str,
+        content: Value,
+        mode: QueueMode,
+    ) -> Result<input_queue::QueueItem> {
+        match &self.0 {
+            super::owned::Backend::Shared(db, id) => {
+                input_queue::shared_enqueue(db, id, request, content, mode)
+            }
+            super::owned::Backend::Admitted(s) => s.enqueue(request, &content, mode)?.resolve(s),
+        }
+    }
+    pub(crate) fn list_inputs(&self) -> Result<Vec<input_queue::QueueItem>> {
+        match &self.0 {
+            super::owned::Backend::Shared(db, id) => input_queue::shared_list(db, id),
+            super::owned::Backend::Admitted(s) => s.queue_items(),
+        }
+    }
+    pub(crate) fn edit_input(
+        &self,
+        id: i64,
+        revision: i64,
+        edit: QueueEdit<'_>,
+    ) -> Result<input_queue::QueueItem> {
+        match &self.0 {
+            super::owned::Backend::Shared(db, session) => match edit {
+                QueueEdit::Text(text) => {
+                    input_queue::mutate(db, session, id, revision, "edit", Some(text))
+                }
+                QueueEdit::Cancel => input_queue::mutate(db, session, id, revision, "remove", None),
+                QueueEdit::Steer => input_queue::mutate(db, session, id, revision, "steer", None),
+            },
+            super::owned::Backend::Admitted(s) => s.edit_queue(id, revision, edit)?.resolve(s),
+        }
+    }
+    pub(crate) fn cancel_unclaimed_inputs(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<input_queue::QueueItem>> {
+        let s = match &self.0 {
+            super::owned::Backend::Shared(db, session) => {
+                return input_queue::shared_cancel_undelivered(db, session, ids)
+            }
+            super::owned::Backend::Admitted(s) => s,
+        };
+        let _guard = s.stores.key_lock(&s.key, false, false)?;
+        s.check_directory()?;
+        let rows = s
+            .stores
+            .global()
+            .write("cancel queued inputs", s.id(), false, |tx| {
+                let mut rows = Vec::new();
+                for id in ids {
+                    // A claimed row may already have a receipt while its G ack is pending.
+                    if tx.execute(
+                        "UPDATE session_input_queue SET state='cancelled',revision=revision+1
+                    WHERE session_id=?1 AND id=?2 AND state='queued'",
+                        params![s.id, id],
+                    )? == 1
+                    {
+                        rows.push(admission(tx, *id, s.id())?);
+                    }
+                }
+                Ok(rows)
+            })?;
+        rows.into_iter().map(|row| row.resolve(s)).collect()
+    }
+    pub(crate) fn inputs_paused(&self) -> Result<bool> {
+        match &self.0 {
+            super::owned::Backend::Shared(db, id) => input_queue::shared_is_paused(db, id),
+            super::owned::Backend::Admitted(s) => {
+                let _lock = s.stores.key_lock(&s.key, false, false)?;
+                s.check_directory()?;
+                s.stores.global().read(|c| paused(c, s.id()))
+            }
+        }
+    }
+    pub(crate) fn pause_inputs(&self, value: bool) -> Result<()> {
+        match &self.0 {
+            super::owned::Backend::Shared(db, id) => input_queue::shared_set_paused(db, id, value),
+            super::owned::Backend::Admitted(s) => s.pause_queue(value),
+        }
+    }
 }
 impl SessionDb {
     pub fn enqueue(&self, request: &str, content: &Value, mode: QueueMode) -> Result<Admission> {
@@ -146,38 +257,15 @@ impl SessionDb {
         let _guards = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
         let envelopes = self.stores.global().read(|c| {
-            let mut q = c.prepare("SELECT id,request_id,revision,payload,mode,state,delivery_id FROM session_input_queue WHERE session_id=?1 ORDER BY id")?;
-            let rows = q
-                .query_map([&self.id], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            let mut q = c.prepare(&format!(
+                "SELECT {QUEUE_COLUMNS} FROM session_input_queue WHERE session_id=?1 ORDER BY id"
+            ))?;
+            let rows = q.query_map([&self.id], Admission::read)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })?;
         envelopes
             .into_iter()
-            .map(
-                |(id, request_id, revision, hash, mode, state, delivery_id)| {
-                    Ok(input_queue::QueueItem {
-                        id,
-                        request_id,
-                        revision,
-                        session_id: self.id.clone(),
-                        content: self.stores.payload(&hash)?,
-                        mode: serde_json::from_value(Value::String(mode))?,
-                        handoff_id: (state == "handoff").then_some(delivery_id),
-                        state: serde_json::from_value(Value::String(state))?,
-                    })
-                },
-            )
+            .map(|item| item.resolve(self))
             .collect()
     }
     pub fn edit_queue(&self, id: i64, revision: i64, edit: QueueEdit<'_>) -> Result<Admission> {
@@ -190,11 +278,7 @@ impl SessionDb {
                 if item.revision != revision || item.state != "queued" {
                     return Err(QueueError::Conflict.into());
                 }
-                Ok(snap.query_row(
-                    "SELECT payload FROM session_input_queue WHERE session_id=?1 AND id=?2",
-                    params![self.id, id],
-                    |r| r.get(0),
-                )?)
+                Ok(item.payload)
             })?;
             let value = self.stores.payload(&before)?;
             if !value.is_string()

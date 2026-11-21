@@ -1,7 +1,7 @@
 //! Messages the user sends while a turn runs. As in the reference CLI, a
 //! running turn reads them after its next tool results; whatever is still
 //! queued when the turn ends becomes the next prompt.
-use crate::db::DbManager;
+use crate::db::{session_store::{QueueEdit,SessionAccess},DbManager};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -147,7 +147,10 @@ pub fn take_where(
 /// cancelled and returned in arrival order. A handed-off item was delivered and
 /// keeps its transcript row; an item another path already cancelled stays
 /// cancelled. Hosts use this to run leftovers as their next turn exactly once.
-pub fn cancel_undelivered(
+pub fn cancel_undelivered(db: &impl SessionAccess, session: &str, ids: &[i64]) -> Result<Vec<QueueItem>> {
+    db.select_session(session)?.cancel_unclaimed_inputs(ids)
+}
+pub(crate) fn shared_cancel_undelivered(
     db: &DbManager,
     session: &str,
     ids: &[i64],
@@ -299,7 +302,10 @@ fn text_only(content: &Value) -> bool {
 
 /// Content is stored in SQLite, including inline image bytes or already durable attachment references.
 /// Callers must materialize attachments before calling; transient blob URLs are rejected.
-pub fn enqueue(
+pub fn enqueue(db:&impl SessionAccess,session:&str,request_id:&str,content:Value,mode:QueueMode)->Result<QueueItem>{
+    db.select_session(session)?.enqueue_input(request_id,content,mode)
+}
+pub(crate) fn shared_enqueue(
     db: &DbManager,
     session: &str,
     request_id: &str,
@@ -340,7 +346,10 @@ pub fn enqueue(
 }
 
 /// Includes tombstones and handoffs for admission reconciliation and crash recovery.
-pub fn list(db: &DbManager, session: &str) -> Result<Vec<QueueItem>> {
+pub fn list(db:&impl SessionAccess,session:&str)->Result<Vec<QueueItem>>{
+    db.select_session(session)?.list_inputs()
+}
+pub(crate) fn shared_list(db: &DbManager, session: &str) -> Result<Vec<QueueItem>> {
     db.with_conn(|conn| -> Result<Vec<QueueItem>> {
         let mut stmt = conn.prepare(&format!("SELECT {ITEM_COLUMNS} FROM session_input_queue WHERE session_id=?1 AND request_id IS NOT NULL ORDER BY id"))?;
         let rows = stmt.query_map([session],read_item)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -348,7 +357,7 @@ pub fn list(db: &DbManager, session: &str) -> Result<Vec<QueueItem>> {
     })?
 }
 
-fn mutate(
+pub(crate) fn mutate(
     db: &DbManager,
     session: &str,
     id: i64,
@@ -376,19 +385,19 @@ fn mutate(
 }
 
 pub fn edit(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     id: i64,
     revision: i64,
     text: &str,
 ) -> Result<QueueItem> {
-    mutate(db, session, id, revision, "edit", Some(text))
+    db.select_session(session)?.edit_input(id,revision,QueueEdit::Text(text))
 }
-pub fn remove(db: &DbManager, session: &str, id: i64, revision: i64) -> Result<QueueItem> {
-    mutate(db, session, id, revision, "remove", None)
+pub fn remove(db: &impl SessionAccess, session: &str, id: i64, revision: i64) -> Result<QueueItem> {
+    db.select_session(session)?.edit_input(id,revision,QueueEdit::Cancel)
 }
-pub fn mark_steer(db: &DbManager, session: &str, id: i64, revision: i64) -> Result<QueueItem> {
-    mutate(db, session, id, revision, "steer", None)
+pub fn mark_steer(db: &impl SessionAccess, session: &str, id: i64, revision: i64) -> Result<QueueItem> {
+    db.select_session(session)?.edit_input(id,revision,QueueEdit::Steer)
 }
 pub fn claim(db: &DbManager, session: &str, id: i64, revision: i64) -> Result<QueueItem> {
     mutate(db, session, id, revision, "claim", None)
@@ -441,10 +450,16 @@ fn paused_conn(conn: &rusqlite::Connection, session: &str) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
-pub fn is_paused(db: &DbManager, session: &str) -> Result<bool> {
+pub fn is_paused(db:&impl SessionAccess,session:&str)->Result<bool>{
+    db.select_session(session)?.inputs_paused()
+}
+pub(crate) fn shared_is_paused(db: &DbManager, session: &str) -> Result<bool> {
     db.with_conn(|conn| paused_conn(conn, session))?
 }
-pub fn set_paused(db: &DbManager, session: &str, paused: bool) -> Result<()> {
+pub fn set_paused(db:&impl SessionAccess,session:&str,value:bool)->Result<()>{
+    db.select_session(session)?.pause_inputs(value)
+}
+pub(crate) fn shared_set_paused(db: &DbManager, session: &str, paused: bool) -> Result<()> {
     db.with_conn(|conn| -> Result<()> {
         conn.execute("INSERT INTO session_input_queue_control(session_id,paused) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET paused=excluded.paused",rusqlite::params![session,paused])?;
         Ok(())

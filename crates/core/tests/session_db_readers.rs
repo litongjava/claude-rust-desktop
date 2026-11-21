@@ -912,3 +912,30 @@ fn agent_fork_publishes_its_history_directive_and_execution_parent_together() ->
     assert!(stores.conversation_metadata("grandchild")?.is_none());
     Ok(())
 }
+
+#[test]
+fn host_queue_mutations_return_the_committed_payload_and_preserve_claims() -> Result<()> {
+    use deepseek_code_core::{db::session_store::Phase, services::input_queue::{self as queue,QueueMode,QueueState}};
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let shard = stores.create("chat",Default::default())?;
+    let content = serde_json::json!("first");
+    let first = queue::enqueue(&stores,shard.id(),"request",content.clone(),QueueMode::NextTurn)?;
+    let edited = queue::edit(&stores,shard.id(),first.id,first.revision,"edited")?;
+    assert_eq!(edited.content,"edited");
+    assert_eq!(queue::enqueue(&stores,shard.id(),"request",content,QueueMode::NextTurn)?,edited);
+    queue::set_paused(&stores,shard.id(),true)?;
+    assert!(queue::is_paused(&stores,shard.id())?);
+    queue::set_paused(&stores,shard.id(),false)?;
+    let interrupted=stores.with_fault_hook(|phase| {
+        anyhow::ensure!(phase!=Phase::DeliveryCommitted,"interrupted before ack");
+        Ok(())
+    });
+    assert!(interrupted.open_session(shard.id())?.delivery_owner()?.next_queue(QueueMode::NextTurn,None).is_err());
+    assert!(queue::cancel_undelivered(&stores,shard.id(),&[first.id])?.is_empty());
+    assert_eq!(queue::list(&stores,shard.id())?[0].state,QueueState::Claimed);
+    let effect=shard.delivery_owner()?.next_queue(QueueMode::NextTurn,None)?.unwrap();
+    assert!(!effect.applied);
+    assert_eq!(queue::list(&stores,shard.id())?[0].handoff_id.as_deref(),Some(effect.id.as_str()));
+    Ok(())
+}
