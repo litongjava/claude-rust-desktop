@@ -544,10 +544,7 @@ impl ToolLoopExecutor {
         // Original provider/model, tool bounds, permissions and hooks stay with this executor.
         // Only event routing and durable transcript are refreshed for the current owner turn.
         entry.executor.execution_lease =
-            crate::services::session_messages::ExecutionLease::acquire(
-                &context.paths.data_dir,
-                id,
-            )?
+            context.db.executor_history(id)?.execution_lease()?
             .map(std::sync::Arc::new);
         let current: Value = context
             .setting(&format!("delegation.{id}"))?
@@ -1513,10 +1510,7 @@ impl ToolLoopExecutor {
                 &child.workspace_cwd,
             )?;
             if child.execution_lease.is_none() {
-                child.execution_lease = crate::services::session_messages::ExecutionLease::acquire(
-                    &context.paths.data_dir,
-                    &id,
-                )?
+                child.execution_lease = context.db.executor_history(&id)?.execution_lease()?
                 .map(std::sync::Arc::new);
             }
             let state = ChildState {

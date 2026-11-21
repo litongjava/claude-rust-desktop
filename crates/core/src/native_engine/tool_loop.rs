@@ -3827,7 +3827,9 @@ impl ToolLoopExecutor {
         // this future or the outer task still releases it by dropping the
         // executor.
         if self.execution_lease.is_none() {
-            if let (Some(root), Some(session)) = (
+            if let Some(history) = &self.executor_history {
+                self.execution_lease = history.execution_lease()?.map(std::sync::Arc::new);
+            } else if let (Some(root), Some(session)) = (
                 self.search_config_path
                     .as_deref()
                     .and_then(std::path::Path::parent),

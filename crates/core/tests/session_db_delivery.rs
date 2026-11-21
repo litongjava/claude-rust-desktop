@@ -1329,3 +1329,24 @@ fn round2_partial_and_full_forks_preserve_snapshot_shapes() -> Result<()> {
     assert_eq!(prefix.read(|r| r.messages())?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn host_execution_lease_is_shared_for_handoff_and_fenced_to_the_shard() -> Result<()> {
+    use std::sync::Arc;
+    let root=tempdir()?;
+    let stores=Stores::open(root.path())?;
+    let source=stores.create("arbitrary/host:id",Default::default())?;
+    let other=stores.create("other",Default::default())?;
+    let lease=Arc::new(source.acquire_execution()?);
+    assert!(source.acquire_execution().is_err());
+    assert!(other.delivery_under_lease(lease.clone()).is_err());
+    let mut boundary=source.delivery_under_lease(lease.clone())?;
+    source.enqueue("r",&json!("queued"),QueueMode::NextTurn)?;
+    assert!(boundary.next_queue(QueueMode::NextTurn,None)?.unwrap().applied);
+    assert!(boundary.begin_generation()?.is_some());
+    drop(boundary);
+    assert!(source.acquire_execution().is_err());
+    drop(lease);
+    assert_eq!(source.settle_abandoned(&source.acquire_execution()?)?.len(),1);
+    Ok(())
+}

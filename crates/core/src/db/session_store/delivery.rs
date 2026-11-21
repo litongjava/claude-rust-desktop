@@ -420,12 +420,46 @@ impl SessionDb {
                 Ok(())
             })
     }
-    pub fn delivery_owner(&self) -> Result<DeliveryOwner> {
+    pub fn acquire_execution(&self) -> Result<ExecutionLease> {
         let locks = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
-        let lease = ExecutionLease::acquire(&self.stores.root.path, &self.incarnation)?
+        let mut lease = ExecutionLease::acquire(self.stores.data_dir(), &self.incarnation)?
             .context("Invalid execution incarnation")?;
-        let consumer = ExecutionLease::acquire_inbox(&self.stores.root.path, &self.incarnation)?;
+        lease.address = Some(self.address());
+        lease.lifecycle = locks;
+        Ok(lease)
+    }
+
+    pub fn delivery_owner(&self) -> Result<DeliveryOwner> {
+        let lease = std::sync::Arc::new(self.acquire_execution()?);
+        self.settle_abandoned(&lease)?;
+        self.delivery_under_lease(lease)
+    }
+
+    pub fn delivery_under_lease(
+        &self,
+        lease: std::sync::Arc<ExecutionLease>,
+    ) -> Result<DeliveryOwner> {
+        ensure!(
+            lease.address.as_ref() == Some(&self.address()),
+            "Execution lease belongs to another session"
+        );
+        let consumer = ExecutionLease::acquire_inbox(self.stores.data_dir(), &self.incarnation)?;
+        Ok(DeliveryOwner {
+            session: self.clone(),
+            _lease: lease,
+            _consumer: consumer,
+        })
+    }
+
+    pub fn settle_abandoned(
+        &self,
+        lease: &ExecutionLease,
+    ) -> Result<Vec<crate::db::turn_repo::TurnRecord>> {
+        ensure!(
+            lease.address.as_ref() == Some(&self.address()),
+            "Execution lease belongs to another session"
+        );
         // Possession of the execution lock proves the previous executor ended.
         // Preserve the cause (missing endpoint), and keep its generation receipt.
         let interrupted =
@@ -436,21 +470,16 @@ impl SessionDb {
                     |r| r.get::<_, bool>(0),
                 )?)
             })?;
+        let mut settled = Vec::new();
         if interrupted {
-            while self
-                .write_locked("settle interrupted execution", |tx| {
-                    tx.2.set(true);
-                    crate::db::turn_repo::settle_next(tx.0, tx.1)
-                })?
-                .is_some()
-            {}
+            while let Some(record) = self.write_locked("settle interrupted execution", |tx| {
+                tx.2.set(true);
+                crate::db::turn_repo::settle_next(tx.0, tx.1)
+            })? {
+                settled.push(record);
+            }
         }
-        Ok(DeliveryOwner {
-            session: self.clone(),
-            _lease: lease,
-            _consumer: consumer,
-            _locks: locks,
-        })
+        Ok(settled)
     }
 }
 fn paused(c: &Connection, id: &str) -> Result<bool> {
@@ -479,9 +508,8 @@ fn peer_projects(c: &Connection, root: &Path, from: &str, to: &str) -> Result<(S
 }
 pub struct DeliveryOwner {
     pub(super) session: SessionDb,
-    _lease: ExecutionLease,
+    _lease: std::sync::Arc<ExecutionLease>,
     _consumer: ExecutionLease,
-    _locks: Vec<fs::File>,
 }
 #[derive(Debug, PartialEq)]
 pub struct Handoff {

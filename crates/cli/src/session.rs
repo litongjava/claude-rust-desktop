@@ -37,23 +37,14 @@ pub fn terminal_input() -> TerminalInput {
 /// cannot settle concurrently; it is dropped before the caller displays
 /// anything and is not observation.
 fn settle_abandoned_turns(
-    paths: &RuntimePaths,
+    _paths: &RuntimePaths,
     store: &SessionStore,
     id: &str,
 ) -> Vec<deepseek_code_core::db::turn_repo::TurnRecord> {
-    use deepseek_code_core::services::session_messages;
-    if session_messages::execution_active(&paths.data_dir, id).unwrap_or(true) {
-        return Vec::new();
-    }
-    let Ok(Some(_lease)) = session_messages::ExecutionLease::acquire(&paths.data_dir, id) else {
-        return Vec::new();
-    };
-    store
-        .db
-        .with_conn(|conn| deepseek_code_core::db::turn_repo::settle_interrupted(conn, id))
-        .ok()
-        .and_then(|settled| settled.ok())
-        .unwrap_or_default()
+    let Ok(history)=store.db.executor_history(id) else {return Vec::new()};
+    let Ok(Some(lease))=history.execution_lease() else {return Vec::new()};
+    history.settle_abandoned(&lease).unwrap_or_default()
+
 }
 
 pub struct Session {
@@ -1864,7 +1855,7 @@ impl Session {
         // This is exclusive admission: a second top-level turn - from another
         // Session object, another thread or another process - is rejected here,
         // before any turn record, queued input or model request.
-        let turn_lease = match deepseek_code_core::services::session_messages::ExecutionLease::acquire(&self.paths.data_dir, &self.id) {
+        let turn_lease = match self.store.db.executor_history(&self.id)?.execution_lease() {
             Ok(lease) => lease.map(std::sync::Arc::new),
             Err(error) => return Err(error).context("This session is already executing in another process; observe or stop that turn first"),
         };

@@ -15,8 +15,10 @@ pub enum ExecutorHistory {
 
 impl Stores {
     pub(crate) fn listed_history(&self, id: &str) -> Result<Option<ExecutorHistory>> {
-        self.global().read_directory_row(id, |c| super::directory::one(c, id))?
-            .map(|row| self.open_listed(&row).map(ExecutorHistory::Session)).transpose()
+        self.global()
+            .read_directory_row(id, |c| super::directory::one(c, id))?
+            .map(|row| self.open_listed(&row).map(ExecutorHistory::Session))
+            .transpose()
     }
 
     pub fn executor_history(&self, id: &str) -> Result<ExecutorHistory> {
@@ -114,15 +116,39 @@ impl ExecutorHistory {
 
 /// Hook runners may select their session after their plugin configuration is loaded.
 pub trait HookSessions: super::RecordingPolicies + Send + Sync {
-    fn hook_history(self:Arc<Self>, id:&str) -> Result<Option<ExecutorHistory>>;
+    fn hook_history(self: Arc<Self>, id: &str) -> Result<Option<ExecutorHistory>>;
 }
 impl HookSessions for Stores {
-    fn hook_history(self:Arc<Self>, id:&str)->Result<Option<ExecutorHistory>> {
+    fn hook_history(self: Arc<Self>, id: &str) -> Result<Option<ExecutorHistory>> {
         self.listed_history(id)
     }
 }
 impl HookSessions for DbManager {
-    fn hook_history(self:Arc<Self>,id:&str)->Result<Option<ExecutorHistory>> {
+    fn hook_history(self: Arc<Self>, id: &str) -> Result<Option<ExecutorHistory>> {
         self.executor_history(id).map(Some)
+    }
+}
+
+impl ExecutorHistory {
+    pub fn execution_lease(
+        &self,
+    ) -> Result<Option<crate::services::session_messages::ExecutionLease>> {
+        match self {
+            Self::Session(s) => s.acquire_execution().map(Some),
+            Self::Shared(db, id) => {
+                crate::services::session_messages::ExecutionLease::acquire(db.data_dir(), id)
+            }
+        }
+    }
+    pub fn settle_abandoned(
+        &self,
+        lease: &crate::services::session_messages::ExecutionLease,
+    ) -> Result<Vec<crate::db::turn_repo::TurnRecord>> {
+        match self {
+            Self::Session(s) => s.settle_abandoned(lease),
+            Self::Shared(db, id) => {
+                db.with_conn(|c| crate::db::turn_repo::settle_interrupted(c, id))?
+            }
+        }
     }
 }

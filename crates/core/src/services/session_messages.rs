@@ -542,6 +542,8 @@ pub fn execution_active(root: &Path, session: &str) -> Result<bool> {
 /// Cross-engine/process execution ownership, including Desktop private sessions.
 pub struct ExecutionLease {
     file: File,
+    pub(crate) address: Option<crate::db::session_store::HistoryAddress>,
+    pub(crate) lifecycle: Vec<File>,
     /// The process that took the lease. A forked child inherits both the
     /// descriptor and this value, so its copy must not unlock an owner that is
     /// still alive in the parent.
@@ -560,6 +562,8 @@ impl ExecutionLease {
         crate::fs::try_lock_briefly(&file).context("Recipient already has a consumer")?;
         Ok(Self {
             file,
+            address: None,
+            lifecycle: Vec::new(),
             owner: std::process::id(),
         })
     }
@@ -587,6 +591,8 @@ impl ExecutionLease {
             .context("Session is already executing in another owner")?;
         Ok(Some(Self {
             file,
+            address: None,
+            lifecycle: Vec::new(),
             owner: std::process::id(),
         }))
     }
@@ -603,6 +609,12 @@ impl Drop for ExecutionLease {
             // Descriptor close still follows; report without panicking in Drop.
             tracing::warn!("Could not release session execution lock: {error}");
         }
+        for lock in &self.lifecycle {
+            if let Err(error) = crate::fs::unlock_file(lock) {
+                tracing::warn!("Could not release session lifecycle lock: {error}");
+            }
+        }
+
     }
 }
 
