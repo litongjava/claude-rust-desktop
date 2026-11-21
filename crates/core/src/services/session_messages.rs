@@ -379,7 +379,13 @@ fn lock_path(root: &Path, session: &str) -> Result<PathBuf> {
         .join("session-message-locks")
         .join(format!("{session}.lock")))
 }
-pub fn receiver_active(root: &Path, session: &str) -> Result<bool> {
+pub fn receiver_active(root:&Path,session:&str)->Result<bool>{
+    context(root)?.db.message_receiver_active(session)
+}
+impl crate::db::DbManager {
+    pub(crate) fn message_receiver_active(&self,session:&str)->Result<bool>{receiver_active_by_key(self.data_dir(),session)}
+}
+pub(crate) fn receiver_active_by_key(root: &Path, session: &str) -> Result<bool> {
     let path = lock_path(root, session)?;
     let file = match std::fs::OpenOptions::new()
         .read(true)
@@ -881,17 +887,24 @@ const INBOX_POLL_WRITE_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// Source-project matching includes managed worktrees. Runtime probing happens
 /// separately: saved records and receiver ownership are not an HTTP health test.
 pub fn peers(context: &ServiceContext, session: &str) -> Result<Vec<serde_json::Value>> {
-    context.db.with_conn(|conn|->Result<_>{
-        let source=project(conn,&context.paths.data_dir,session)?;let rows=conversation_repo::list_conversations(conn)?;let mut result=Vec::new();
-        for row in rows {if project(conn,&context.paths.data_dir,&row.id).is_ok_and(|p|p==source) {result.push(serde_json::json!({"id":row.id,"title":row.title,"current":row.id==session,"receiver_active":receiver_active(&context.paths.data_dir,&row.id)?,"saved":true}));}}
+    context.db.peers(session,false)
+}
+
+impl crate::db::DbManager {
+    fn peers(&self,session:&str,family:bool)->Result<Vec<serde_json::Value>>{
+        if family {return self.family_peers(session);}
+        let root=self.data_dir();
+        self.with_conn(|conn|->Result<_>{
+        let source=project(conn,root,session)?;let rows=conversation_repo::list_conversations(conn)?;let mut result=Vec::new();
+        for row in rows {if project(conn,root,&row.id).is_ok_and(|p|p==source) {result.push(serde_json::json!({"id":row.id,"title":row.title,"current":row.id==session,"receiver_active":receiver_active_by_key(root,&row.id)?,"saved":true}));}}
         Ok(result)
     })?
 }
 
-/// Session family only: ancestors, siblings and descendants, excluding unrelated saved sessions.
-pub fn session_peers(context: &ServiceContext, session: &str) -> Result<Vec<serde_json::Value>> {
-    context.db.with_conn(|conn| -> Result<_> {
-        let source = project(conn, &context.paths.data_dir, session)?;
+fn family_peers(&self,session:&str)->Result<Vec<serde_json::Value>>{
+    let root=self.data_dir();
+    self.with_conn(|conn| -> Result<_> {
+        let source = project(conn, root, session)?;
         let mut links = Vec::new();
         let mut query = conn.prepare("SELECT key,value FROM peripheral_settings WHERE key LIKE 'delegation.%' OR key LIKE 'background-agent.%'")?;
         for row in query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
@@ -911,15 +924,21 @@ pub fn session_peers(context: &ServiceContext, session: &str) -> Result<Vec<serd
         }
         let mut result = Vec::new();
         for id in members {
-            if project(conn, &context.paths.data_dir, &id).is_ok_and(|other| other == source) {
+            if project(conn, root, &id).is_ok_and(|other| other == source) {
                 if let Some(row) = conversation_repo::get_conversation(conn, &id)? {
-                    result.push(serde_json::json!({"id":id,"title":row.title,"current":id==session,"receiver_active":receiver_active(&context.paths.data_dir,&id)?,"saved":true}));
+                    result.push(serde_json::json!({"id":id,"title":row.title,"current":id==session,"receiver_active":receiver_active_by_key(root,&id)?,"saved":true}));
                 }
             }
         }
         result.sort_by_key(|row| (row["current"] != true, row["id"].as_str().unwrap_or_default().to_owned()));
         Ok(result)
     })?
+}
+
+}
+
+pub fn session_peers(context:&ServiceContext, session:&str)->Result<Vec<serde_json::Value>>{
+    context.db.peers(session,true)
 }
 
 /// Test-only observer for a lock the code has just acquired.

@@ -22,6 +22,7 @@ mod engine;
 mod children;
 mod child_reader;
 mod worker_directory;
+mod peers;
 pub(crate) use worker_directory::WorkspaceDirectory;
 pub use worker_directory::{WorkerDirectory, WorkerPair};
 mod recording;
