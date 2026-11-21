@@ -1,7 +1,4 @@
-use deepseek_code_core::db::{
-    message_repo,
-    turn_repo::{TurnStatus, TurnTimer},
-};
+use deepseek_code_core::db::turn_repo::TurnStatus;
 use deepseek_desktop_tauri_lib::{
     bridge::BridgeServer,
     runtime::{normalize_user_content, RuntimePaths, SessionStore},
@@ -340,18 +337,26 @@ async fn image_history_roundtrip() {
     assert_eq!(invalid_chat.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(get("/messages").await["messages"], history["messages"]);
 
-    // Corrupt JSON and invalid image bytes are local unavailable states, not empty history.
+    // A damaged image outside the manifest's first-row format check has a display fallback.
+    let damaged_image = store
+        .append_user_content(&conversation, "damaged image", &mixed)
+        .unwrap();
+    let corrupt_content = |id: &str, malformed: &str| {
+        let damage=rusqlite::Connection::open(dir.path().join("sessions").join(&conversation).join("session.db")).unwrap();
+        assert_eq!(damage.execute(
+            "UPDATE message_user_content SET content_json=?1 WHERE message_id=?2", [malformed, id]
+        ).unwrap(), 1);
+    };
     for malformed in [
         "not-json",
         r#"[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]"#,
     ] {
-        let damage=rusqlite::Connection::open(dir.path().join("sessions").join(&conversation).join("session.db")).unwrap();
-        damage.execute("UPDATE message_user_content SET content_json=?1 WHERE message_id=?2",rusqlite::params![malformed,cli_id]).unwrap();
-        drop(damage);
+        corrupt_content(&damaged_image, malformed);
         for suffix in ["", "/messages"] {
             let body = get(suffix).await;
             assert_eq!(
-                body["messages"][0]["content"][1]["type"],
+                body["messages"].as_array().unwrap().iter()
+                    .find(|m| m["id"] == damaged_image).unwrap()["content"][1]["type"],
                 "image_unavailable"
             );
             assert!(body["messages"].as_array().unwrap().len() >= 3);
@@ -479,6 +484,14 @@ async fn image_history_roundtrip() {
         })
         .await
         .expect("cancelled turn did not settle durably");
+    }
+
+    // A malformed first row fails the shard format check on both detail endpoints.
+    corrupt_content(&cli_id, "not-json");
+    for suffix in ["", "/messages"] {
+        let response = client.get(format!("{url}{suffix}"))
+            .header("x-api-key", &key).send().await.unwrap();
+        assert!(response.status().is_server_error());
     }
 
     server.abort();
