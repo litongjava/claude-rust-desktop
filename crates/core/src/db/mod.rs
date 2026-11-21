@@ -15,6 +15,7 @@ pub mod schema;
 pub mod session_store;
 pub mod task_repo;
 pub mod turn_repo;
+pub mod transcript;
 
 use anyhow::Result;
 use r2d2::Pool;

@@ -183,3 +183,49 @@ fn usage_reports_exact_prices_and_retains_healthy_sessions_when_one_is_missing()
     assert!(stores.usage(|| true).is_err());
     Ok(())
 }
+
+#[test]
+fn conversation_snapshot_preserves_typed_content_and_turns_and_rolls_back_bad_ids() -> Result<()> {
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let shard = stores.create("detail", Default::default())?;
+    let (turn, message) = shard.write(|s| {
+        let turn = s.start_turn()?;
+        let message = s.segment(&turn)?;
+        s.finish_turn(
+            &turn,
+            deepseek_code_core::db::turn_repo::TurnStatus::Cancelled,
+            42,
+        )?;
+        Ok((turn, message))
+    })?;
+    let prompt = json!([{"type":"text","text":"question"}]);
+    shard.write(|s| {
+        s.replace_messages(&[
+            json!({"id":"prompt","role":"user","content":prompt}),
+            json!({"id":message,"role":"assistant","content":"answer"}),
+        ])
+    })?;
+    assert!(shard
+        .write(|s| s.replace_messages(&[
+            json!({"id":"prompt","content":"changed"}),
+            json!({"id":"prompt"})
+        ]))
+        .is_err());
+    let rows = shard.read(|s| s.enriched_messages())?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["content"], prompt);
+    assert_eq!(rows[1]["turn"]["turnId"], turn);
+    assert_eq!(rows[1]["turn"]["status"], "cancelled");
+    assert_eq!(rows[1]["content"], "answer");
+    assert_eq!(
+        stores
+            .global()
+            .conversation("detail")?
+            .unwrap()
+            .message_count,
+        2
+    );
+    Ok(())
+}

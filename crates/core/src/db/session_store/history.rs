@@ -223,6 +223,14 @@ impl SessionDb {
 }
 
 impl SessionRead<'_> {
+    pub fn enriched_messages(&self) -> Result<Vec<Value>> {
+        let id: String =
+            self.0
+                .query_row("SELECT id FROM manifest WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })?;
+        crate::db::transcript::enriched_messages(self.0, &id)
+    }
     pub fn messages(&self) -> Result<Vec<messages::MessageRow>> {
         let id: String = self
             .0
@@ -279,6 +287,11 @@ impl SessionWrite<'_> {
             [],
             |r| r.get(0),
         )?)
+    }
+    pub fn replace_messages(&self, messages: &[Value]) -> Result<()> {
+        crate::db::transcript::replace_messages(self.0, self.1, messages)?;
+        self.2.set(true);
+        Ok(())
     }
     pub fn append(&self, role: &str, content: &str) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
