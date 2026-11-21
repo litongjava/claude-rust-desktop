@@ -7,6 +7,8 @@
 //! `cross_process_writer_feeds_an_owner_in_another_process`, because two
 //! simultaneous model owners of one session are correctly rejected by session
 //! ownership.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -642,7 +644,7 @@ struct StoredCall {
 }
 
 fn tool_call_rows(data: &std::path::Path, session: &str) -> Vec<StoredCall> {
-    let conn = rusqlite::Connection::open(data.join("deepseek_code.db")).unwrap();
+    let conn = fixture_sql::shard_connection(data,session).unwrap();
     conn.busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     let mut stmt = conn

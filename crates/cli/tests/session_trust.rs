@@ -1,4 +1,7 @@
 //! Trust recovery must work without a provider, Desktop, or a usable session.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     db::project_repo,
     runtime::{RuntimePaths, SessionStore},
@@ -28,7 +31,7 @@ fn startup_explains_and_explicit_command_repairs_without_model_credentials() {
     let original = deepseek_code_core::services::session_trust::inspect(&store.db, &id).unwrap();
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conn.execute(
                 "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                 [&original.id],
@@ -67,7 +70,7 @@ fn startup_explains_and_explicit_command_repairs_without_model_credentials() {
     assert!(store.resume(&id).is_ok());
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             assert!(
                 !project_repo::get_project(conn, &original.id)
                     .unwrap()
@@ -92,7 +95,7 @@ fn repeated_folder_arguments_and_worker_rejection_preserve_scope() {
     let original = deepseek_code_core::services::session_trust::inspect(&store.db, &id).unwrap();
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             project_repo::set_folders(
                 conn,
                 &original.id,

@@ -5,6 +5,8 @@
 //! One local mock provider serves the parent turn. The background Agent's
 //! child is pinned to a second model id on the same mock so its request can be
 //! answered separately; no external provider or credential is used.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -878,7 +880,7 @@ async fn background_agent_task_get_reports_real_child_progress_report_and_comple
 /// `MAX(sort_order)+1`, which is still later than this row.
 fn seed_prior_assistant_turn(data: &std::path::Path, session: &str, text: &str) {
     let mut conn =
-        rusqlite::Connection::open(data.join(deepseek_code_core::runtime::DATABASE_FILE)).unwrap();
+        fixture_sql::shard_connection(data,session).unwrap();
     conn.busy_timeout(Duration::from_secs(10)).unwrap();
     let mut attempts = 0;
     loop {
@@ -1212,11 +1214,7 @@ async fn background_agent_task_get_pages_while_a_prior_assistant_turn_exists() {
     // The seeded turn really was in the child session while the job ran, and it
     // really sorts before the current turn: history order is `sort_order`, not
     // `created_at`.
-    let conn = rusqlite::Connection::open(
-        fixture
-            .data
-            .join(deepseek_code_core::runtime::DATABASE_FILE),
-    )
+    let conn = fixture_sql::shard_connection(&fixture.data,child_session)
     .unwrap();
     let seeded: i64 = conn
         .query_row(

@@ -1,6 +1,9 @@
 //! ApplyPatch through the real CLI engine: dispatch, permissions, hooks,
 //! persistence and actual file bytes. A local OpenAI-compatible mock returns
 //! the tool calls; every assertion reads the real database and workspace.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 #[path = "support/tool_loading.rs"]
 mod tool_loading;
 
@@ -153,7 +156,7 @@ fn persisted_tool_calls(data: &Path, session: &str) -> Vec<message_repo::ToolCal
     let store = SessionStore::new(paths.open_database().unwrap());
     let messages = store
         .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, session))
+        .shard_sql(session, |conn| message_repo::get_messages_by_conversation(conn, session))
         .unwrap()
         .unwrap();
     let mut calls = Vec::new();
@@ -161,7 +164,7 @@ fn persisted_tool_calls(data: &Path, session: &str) -> Vec<message_repo::ToolCal
         calls.extend(
             store
                 .db
-                .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &message.id))
+                .shard_sql(session, |conn| message_repo::get_tool_calls_for_message(conn, &message.id))
                 .unwrap()
                 .unwrap(),
         );
@@ -207,8 +210,8 @@ fn session_id(output: &std::process::Output, data: &Path) -> String {
     let store = SessionStore::new(paths.open_database().unwrap());
     store
         .db
-        .with_conn(|conn| {
-            conn.query_row("SELECT id FROM sessions LIMIT 1", [], |row| row.get::<_, String>(0))
+        .directory_sql(|conn| {
+            conn.query_row("SELECT id FROM conversations LIMIT 1", [], |row| row.get::<_, String>(0))
                 .ok()
         })
         .unwrap()
@@ -592,11 +595,11 @@ fn create_resumed_session(env: &Env, rules: Value) -> String {
     let store = SessionStore::new(paths.open_database().unwrap());
     let id = store.create(&env.workspace, "fixture", "cli-runtime").unwrap();
     if rules.as_object().is_some_and(|rules| !rules.is_empty()) {
-        let key = format!("cli.permissions.{id}");
+        let key = "cli.permissions".to_owned();
         let value = rules.to_string();
         store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&id, |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO peripheral_settings(key,value) VALUES(?1,?2)",
                     [key, value],

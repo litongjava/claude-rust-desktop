@@ -1,4 +1,7 @@
 //! Two real workers exchange durable context while a model request is in flight.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 #[path = "support/tool_loading.rs"]
 mod tool_loading;
 
@@ -363,7 +366,7 @@ async fn managed_worktree_owned_child_can_message_parent_without_new_source_trus
     let project = store.resume(&parent).unwrap().project_id.unwrap();
     store
         .db
-        .with_conn(|conn| prepared.save(conn, &parent, &project, source.to_str().unwrap()))
+        .directory_sql(|conn| prepared.save(conn, &parent, &project, source.to_str().unwrap()))
         .unwrap()
         .unwrap();
     let state = Arc::new(Fixture {

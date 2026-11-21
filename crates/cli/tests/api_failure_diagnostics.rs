@@ -4,6 +4,9 @@
 //! billing endpoint or installed binary is used. The assertions compare the
 //! final CLI error, the HTTP attempts the server actually received and the
 //! session records persisted in SQLite, so the three cannot disagree silently.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -630,7 +633,7 @@ async fn execute(mut command: Command) -> Output {
 fn persisted_snapshots(data: &Path, session: &str) -> Vec<Value> {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<Value> {
+    db.shard_sql(session, |conn| -> anyhow::Result<Value> {
         let message: String = conn.query_row(
             "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC LIMIT 1",
             [session],
@@ -650,7 +653,7 @@ fn persisted_snapshots(data: &Path, session: &str) -> Vec<Value> {
 fn turn_rows(data: &Path, session: &str) -> Vec<(String, String)> {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<Vec<(String, String)>> {
+    db.shard_sql(session, |conn| -> anyhow::Result<Vec<(String, String)>> {
         let mut statement = conn.prepare(
             "SELECT id,status FROM execution_turns WHERE conversation_id=?1 ORDER BY started_at, rowid",
         )?;
@@ -684,7 +687,7 @@ fn turn_end_records(data: &Path, session: &str) -> Vec<Value> {
 fn turn_status(data: &Path, session: &str) -> String {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<String> {
+    db.shard_sql(session, |conn| -> anyhow::Result<String> {
         Ok(conn.query_row(
             "SELECT status FROM execution_turns WHERE conversation_id=?1 ORDER BY started_at DESC LIMIT 1",
             [session],
@@ -1052,7 +1055,7 @@ async fn a_completed_tool_is_not_rerun_after_a_stream_interruption() {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(project.data()).unwrap();
     let db = paths.open_database().unwrap();
     let content: String = db
-        .with_conn(|conn| -> anyhow::Result<String> {
+        .shard_sql(SESSION_MARKER, |conn| -> anyhow::Result<String> {
             Ok(conn.query_row(
                 "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC LIMIT 1",
                 [SESSION_MARKER],
@@ -2700,7 +2703,7 @@ async fn run_streaming_frames(
 fn stored_assistant(data: &Path, session: &str) -> (String, String) {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<(String, String)> {
+    db.shard_sql(session, |conn| -> anyhow::Result<(String, String)> {
         Ok(conn.query_row(
             "SELECT content, COALESCE(thinking,'') FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC LIMIT 1",
             [session],
@@ -2715,7 +2718,7 @@ fn stored_assistant(data: &Path, session: &str) -> (String, String) {
 fn tool_rows(data: &Path, session: &str) -> Vec<(String, String)> {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<Vec<(String, String)>> {
+    db.shard_sql(session, |conn| -> anyhow::Result<Vec<(String, String)>> {
         let mut statement = conn.prepare(
             "SELECT tc.name, COALESCE(tc.input,'') FROM tool_calls tc JOIN messages m ON m.id=tc.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order, tc.sort_order",
         )?;
@@ -2980,7 +2983,7 @@ const MIXED_FOLLOWUP: &str = "data: {\"id\":\"mock-2\",\"model\":\"fixture-model
 fn all_snapshots(data: &Path, session: &str) -> Vec<Value> {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<Vec<Value>> {
+    db.shard_sql(session, |conn| -> anyhow::Result<Vec<Value>> {
         let mut statement = conn.prepare(
             "SELECT mt.requests_json FROM message_trajectory mt JOIN messages m ON m.id=mt.message_id WHERE m.conversation_id=?1 AND m.role='assistant' ORDER BY m.sort_order",
         )?;

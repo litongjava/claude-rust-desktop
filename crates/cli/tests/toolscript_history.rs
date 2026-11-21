@@ -2,6 +2,8 @@
 //! No session/assistant/tool row is manufactured by the fixture.
 #![cfg(unix)]
 
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -51,10 +53,7 @@ async fn respond(
         requests.push(body);
         requests.len() - 1
     };
-    let conn = rusqlite::Connection::open_with_flags(
-        fixture.data.join("deepseek_code.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
+    let conn = fixture_sql::shard_connection(&fixture.data,&fixture.session)
     .unwrap();
     let assistants: usize = conn
         .query_row(
@@ -94,10 +93,7 @@ async fn respond(
 }
 
 fn snapshot(data: &Path, session: &str) -> Vec<Value> {
-    let conn = rusqlite::Connection::open_with_flags(
-        data.join("deepseek_code.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
+    let conn = fixture_sql::shard_connection(data,session)
     .unwrap();
     conn.busy_timeout(Duration::from_secs(5)).unwrap();
     let mut stmt = conn.prepare(

@@ -1,4 +1,7 @@
 //! Idle parking uses real worker IPC without ever submitting a model turn.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
     services::{
@@ -43,7 +46,7 @@ async fn idle_park_preserves_history_and_reports_worker_shutdown_honestly() {
     let project = deepseek_code_core::services::session_trust::inspect(&context.db, &parent).unwrap();
     context
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conn.execute(
                 "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                 [&project.id],

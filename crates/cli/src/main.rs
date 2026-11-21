@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 #[macro_use]
 mod terminal_output;
 mod request_attempts;

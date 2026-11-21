@@ -1,5 +1,8 @@
 //! A user frame that arrives during a stream-json turn steers that turn through
 //! the same durable input queue the REPL and Desktop use.
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use deepseek_code_core::native_engine::provider_manager::ApiFormat;
 use deepseek_code_core::services::input_queue::{QueueMode, QueueState};
@@ -359,7 +362,7 @@ async fn replay_user_messages_emits_the_steered_envelope_on_delivery() {
         let store = session_store(root.path());
         let rows = store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&session_id, |conn| {
                 deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session_id)
             })
             .unwrap()

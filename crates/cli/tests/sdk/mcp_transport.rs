@@ -442,8 +442,7 @@ async fn sdk_mcp_plan_defaults_to_read_only_and_explicit_restrictions_override_h
                 .create(root.path(), "fixture-model", "cli-runtime")
                 .unwrap();
             context
-                .save_setting(
-                    &format!("cli.permissions.{id}"),
+                .db.seed_preference(&id, deepseek_code_core::db::session_store::settings::PERMISSIONS,
                     &json!({"mcp__first__echo":"Deny"}),
                 )
                 .unwrap();

@@ -1,3 +1,6 @@
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -240,7 +243,7 @@ async fn interrupt_preserves_reported_usage_and_finalizes_each_turn_once() {
             let paths =
                 deepseek_code_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
             let db = paths.open_database().unwrap();
-            let rows = db.with_conn(|conn| {
+            let rows = db.shard_sql(result["session_id"].as_str().unwrap(), |conn| {
                 let mut stmt = conn.prepare("SELECT t.id,t.status,count(m.message_id) FROM execution_turns t LEFT JOIN message_turns m ON m.turn_id=t.id GROUP BY t.id")?;
                 let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, anyhow::Error>(rows)

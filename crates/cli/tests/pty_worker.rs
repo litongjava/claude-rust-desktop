@@ -1,6 +1,8 @@
 //! Linux PTY acceptance through local model HTTP, real CLI persistent workers,
 //! ordinary tool dispatch and durable per-call records. Never starts pty_owner directly.
 #![cfg(target_os = "linux")]
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
@@ -498,7 +500,7 @@ async fn model_pty_worker_resize_resume_timeout_paging_stop_and_records() {
         cursor = page["next_cursor"].clone();
     }
     assert_eq!(pages, text);
-    let db = rusqlite::Connection::open(h.data.join("deepseek_code.db")).unwrap();
+    let db = fixture_sql::shard_connection(&h.data,&h.host.session_id).unwrap();
     let mut stmt=db.prepare("SELECT tc.id,tc.name,tc.input,tc.output,tc.is_error FROM tool_calls tc JOIN messages m ON m.id=tc.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order,tc.sort_order").unwrap();
     let rows: Vec<(String, String, String, String, i64)> = stmt
         .query_map([&h.host.session_id], |r| {

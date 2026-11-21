@@ -1,4 +1,7 @@
 //! Standalone startup turns use local endpoints and isolated persistence.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -111,7 +114,7 @@ async fn print_initial_turn_once_before_caller_and_resume_only_uses_fresh_output
                     .unwrap();
             assert_eq!(authority.len(), if caller { 2 } else { 1 });
             assert!(!serde_json::to_string(&authority).unwrap().contains("HOOK_"));
-            let count: i64=context.db.with_conn(|c| c.query_row("SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'message-origin:%' AND value LIKE '%SessionStart%'",[],|r|r.get(0))).unwrap().unwrap();
+            let count: i64=context.db.shard_sql(&id, |c| c.query_row("SELECT COUNT(*) FROM message_metadata WHERE value LIKE '%SessionStart%'",[],|r|r.get(0))).unwrap().unwrap();
             assert_eq!(count, 1);
             server.abort();
         }

@@ -1,4 +1,7 @@
 //! Actual Git + CLI processes exercise source isolation and durable resume.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 #[path = "support/tool_loading.rs"]
 mod tool_loading;
 
@@ -243,7 +246,7 @@ async fn named_and_generated_worktrees_isolate_dirty_sources_and_resume_after_pr
     assert!(workspace.exists(), "exit must retain edits for resume");
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             let project = deepseek_code_core::native_engine::workspace::conversation_project(conn, &id)
                 .unwrap()
                 .unwrap();
@@ -283,7 +286,7 @@ async fn named_and_generated_worktrees_isolate_dirty_sources_and_resume_after_pr
     );
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             assert_eq!(
                 deepseek_code_core::native_engine::workspace::conversation_project(conn, &id)
                     .unwrap()
@@ -477,11 +480,7 @@ exit 1
         })
         .await
         .expect("Git did not reach post-checkout");
-        let holder = rusqlite::Connection::open(
-            paths
-                .data_dir
-                .join(deepseek_code_core::runtime::DATABASE_FILE),
-        )
+        let holder = rusqlite::Connection::open_with_flags(paths.data_dir.join("global.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         std::fs::write(common.join("writer-held"), "").unwrap();
@@ -497,7 +496,7 @@ exit 1
     let workspace = store.resume(&id).unwrap().workspace_path.unwrap();
     let binding = store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conn.query_row(
                 "SELECT path, branch FROM conversation_worktrees WHERE conversation_id=?1",
                 [&id],

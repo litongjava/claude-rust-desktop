@@ -4,6 +4,9 @@
 //! launches a real `dcl` Coder, whose mock model calls CrpSubmit(plan); the host
 //! requests approval; a second real `dcl` router turn answers it with CrpAnswer;
 //! the tick resumes the same Coder. Only a local mock endpoint is used.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
     services::{EnvironmentCredentials, ServiceContext},
@@ -295,7 +298,7 @@ async fn router_role_creates_launches_and_approves_a_real_task() {
     assert!(!first.is_empty());
     let tasks = context
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             let mut statement = conn.prepare("SELECT task_id,router_session_id FROM sa_tasks")?;
             let mut rows = Vec::new();
             let mut mapped = statement.query_map([], |row| {
@@ -501,12 +504,12 @@ async fn wait_for_jobs(
             let context = deepseek_code_core::services::session_messages::context(data).ok()?;
             let rows = context
                 .db
-                .with_conn(|conn| deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &job.session_id))
+                .shard_sql(&job.session_id, |conn| deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &job.session_id))
                 .ok()?
                 .ok()?;
             let calls = context
                 .db
-                .with_conn(|conn| -> anyhow::Result<Vec<(String, Option<String>, Option<String>, bool)>> {
+                .shard_sql(&job.session_id, |conn| -> anyhow::Result<Vec<(String, Option<String>, Option<String>, bool)>> {
                     let rows = deepseek_code_core::db::message_repo::get_messages_by_conversation(
                         conn,
                         &job.session_id,

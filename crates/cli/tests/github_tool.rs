@@ -7,6 +7,8 @@
 //! rule without ever starting `gh`. No call reaches GitHub.
 #![cfg(unix)]
 
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -319,7 +321,7 @@ struct StoredCall {
 
 /// The durable tool-call rows for one tool in one session.
 fn stored_calls(data: &std::path::Path, session: &str, tool: &str) -> Vec<StoredCall> {
-    let conn = rusqlite::Connection::open(data.join("deepseek_code.db")).unwrap();
+    let conn = fixture_sql::shard_connection(data,session).unwrap();
     conn.busy_timeout(Duration::from_secs(10)).unwrap();
     let mut stmt = conn
         .prepare(

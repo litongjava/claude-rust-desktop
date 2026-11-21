@@ -1,6 +1,9 @@
 //! A real CLI turn against a local model fixture: the model backgrounds a
 //! shell, then retrieves its output with TaskGet. The request bodies are
 //! inspected so the advertised catalog and the tool result are both verified.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -345,7 +348,7 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
         let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let raw = store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&id, |conn| {
                 conn.query_row(
                     "SELECT output FROM tool_calls WHERE name='Bash'",
                     [],

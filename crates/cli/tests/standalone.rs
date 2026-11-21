@@ -1,4 +1,7 @@
 //! Real executable + local model fixture. No Desktop, paid API or user config.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -157,7 +160,7 @@ fn assert_durable_turn(data: &Path, result: &Value, status: &str) {
     assert!(turn["endedAt"].as_str().is_some());
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_owned()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(result["session_id"].as_str().unwrap(), |conn| {
         let messages = deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, result["session_id"].as_str().unwrap()).unwrap();
         let saved = messages.iter().filter_map(|message| deepseek_code_core::db::turn_repo::get_message_turn(conn, &message.id).unwrap()).find(|record| record.turn_id == turn["turnId"].as_str().unwrap()).unwrap();
         assert_eq!(serde_json::to_value(saved).unwrap(), *turn);
@@ -573,11 +576,11 @@ async fn legacy_agent_import_preserves_allowlist_in_real_shared_engine() {
         "Read",
         deepseek_code_core::permissions::rules::PermissionAction::Confirm,
     )]);
-    db.with_conn(|conn| {
+    db.shard_sql(&id, |conn| {
         conn.execute(
             "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
             [
-                format!("cli.permissions.{id}"),
+                "cli.permissions".to_owned(),
                 serde_json::to_string(&rules).unwrap(),
             ],
         )
@@ -765,12 +768,12 @@ async fn a_queued_request_compacts_before_the_next_prompt_with_the_keep_text() {
         assert!(history.contains("SUMMARY_SENTINEL"), "{history}");
         assert!(!history.contains("ORIGINAL_SENTINEL"), "{history}");
     }
-    assert!(deepseek_code_core::services::compaction_requests::take(&store.db, id)
+    assert!(store.db.open_session(id).unwrap().delivery_owner().unwrap().claim_compaction()
         .unwrap()
         .is_none());
     let boundaries: i64 = store
         .db
-        .with_conn(|conn| {
+        .shard_sql(id, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1",
                 [id],
@@ -816,7 +819,7 @@ async fn manual_compact_clears_a_queued_request() {
         "{}",
         String::from_utf8_lossy(&compacted.stderr)
     );
-    assert!(deepseek_code_core::services::compaction_requests::take(&store.db, id)
+    assert!(store.db.open_session(id).unwrap().delivery_owner().unwrap().claim_compaction()
         .unwrap()
         .is_none());
     assert_eq!(fixture.requests.lock().unwrap().len(), 2);
@@ -1087,7 +1090,7 @@ async fn assert_cli_context_search(sdk: bool) {
         .unwrap()
         .open_database()
         .unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(id, |conn| {
         use deepseek_code_core::db::{message_repo, turn_repo};
         let message_id = hit["message_id"].as_str().unwrap();
         let original = message_repo::get_message(conn, message_id)
@@ -1140,27 +1143,11 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
     std::fs::create_dir(&data).unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     {
-        let path = data.join("deepseek_code.db");
-        let db = rusqlite::Connection::open(&path).unwrap();
-        // The base schema predates the search migration. Prove the pre-upgrade
-        // replay order before the real CLI opens and upgrades this file.
-        db.execute_batch(deepseek_code_core::db::schema::SCHEMA_SQL)
-            .unwrap();
-        // Create the same code session and trusted project as the CLI, using
-        // only the base schema. The resumed CLI will run the search migration.
-        let manager = deepseek_code_core::db::DbManager::new(path).unwrap();
-        deepseek_code_core::runtime::SessionStore::new(Arc::new(manager))
+        let stores=deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap().open_database().unwrap();
+        deepseek_code_core::runtime::SessionStore::new(stores.clone())
             .create_with_id(&project, "fixture-model", "cli-runtime", &session)
             .unwrap();
-        assert_eq!(
-            db.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name='context_search_sources'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
+        stores.shard_sql(&session, |db| {
         for (id, role, content, boundary) in [
             ("z-old", "user", "legacy-marker original", false),
             ("m-boundary", "user", "Stored summary", true),
@@ -1183,12 +1170,8 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(ids, ["z-old", "m-boundary", "a-reply"]);
-        // A checkout which already ran the earlier I16 version also upgrades
-        // with its ID-ordered index installed.
-        db.execute_batch(
-            "CREATE INDEX idx_context_search_messages ON messages(conversation_id,sort_order,id)",
-        )
-        .unwrap();
+        db.execute("UPDATE manifest SET message_count=3,content_revision=content_revision+1",[]).unwrap();
+        }).unwrap();
     }
 
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));

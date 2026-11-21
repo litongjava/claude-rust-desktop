@@ -1,7 +1,8 @@
 //! Direct fixture inspection and fault injection for a published test store.
 #![allow(dead_code)]
 use anyhow::{ensure, Result};
-use deepseek_code_core::db::session_store::Stores;
+use deepseek_code_core::db::session_store::{settings::Setting, SessionAccess, Stores};
+use serde::{de::DeserializeOwned, Serialize};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
@@ -11,13 +12,32 @@ fn existing(path: &Path) -> Result<Connection> {
     Ok(db)
 }
 
+pub fn shard_connection(root:&Path, id:&str)->Result<Connection>{
+    let stores=Stores::open(root)?;
+    existing(&stores.shard_path(id)?)
+}
+
 pub trait FixtureSql {
+    fn seed_preference<T: DeserializeOwned + Serialize>(&self, id: &str, key: Setting<T>, value: &impl Serialize) -> Result<()>;
+    fn fixture_preference<T: DeserializeOwned + Serialize>(&self, id: &str, key: Setting<T>) -> Result<Option<serde_json::Value>>;
+    fn pending_input(&self, id: &str, matches: impl Fn(&str) -> bool) -> Result<bool>;
     fn directory_sql<T>(&self, body: impl FnOnce(&Connection) -> T) -> Result<T>;
     fn shard_path(&self, id: &str) -> Result<PathBuf>;
     fn shard_sql<T>(&self, id: &str, body: impl FnOnce(&Connection) -> T) -> Result<T>;
 }
 
 impl FixtureSql for Stores {
+    fn seed_preference<T: DeserializeOwned + Serialize>(&self, id: &str, key: Setting<T>, value: &impl Serialize) -> Result<()> {
+        let value: T = serde_json::from_value(serde_json::to_value(value)?)?;
+        self.select_session(id)?.set_preference(key, Some(&value))
+    }
+    fn fixture_preference<T: DeserializeOwned + Serialize>(&self, id: &str, key: Setting<T>) -> Result<Option<serde_json::Value>> {
+        self.select_session(id)?.preference(key)?.map(serde_json::to_value).transpose().map_err(Into::into)
+    }
+    fn pending_input(&self, id: &str, matches: impl Fn(&str) -> bool) -> Result<bool> {
+        use deepseek_code_core::services::input_queue::QueueState;
+        Ok(self.open_session(id)?.queue_items()?.iter().any(|row| row.state == QueueState::Queued && row.content.as_str().is_some_and(&matches)))
+    }
     fn directory_sql<T>(&self, body: impl FnOnce(&Connection) -> T) -> Result<T> {
         let db = existing(&self.data_dir().join("global.db"))?;
         Ok(body(&db))

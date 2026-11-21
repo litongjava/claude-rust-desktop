@@ -1,6 +1,8 @@
 //! A live checkpoint copy is best effort: while another process holds the
 //! session database writer, a print-mode turn must still finish and print the
 //! model reply instead of failing the turn on SQLITE_BUSY.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -97,9 +99,9 @@ async fn print_turn_survives_a_busy_database_during_live_writes() {
     // The model request is in flight: hold the session database writer, like
     // another process did during the observed live checkpoint.
     arrived.await.unwrap();
-    let db_path = data.join("deepseek_code.db");
+    let blocker_conn = fixture_sql::shard_connection(&data,&id).unwrap();
     let blocker = std::thread::spawn(move || {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = blocker_conn;
         conn.busy_timeout(Duration::from_secs(10)).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         std::thread::sleep(Duration::from_secs(7));

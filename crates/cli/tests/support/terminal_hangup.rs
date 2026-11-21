@@ -1,5 +1,8 @@
 //! A Linux PTY exercises both kernel SIGHUP and descriptor-only hangup.
 
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::linux_terminal;
 use super::{poll_rows, rows_in, write_provider, write_settings, Lifecycle};
 use axum::{extract::State, routing::post, Json, Router};
@@ -113,7 +116,7 @@ async fn run(trigger: Trigger, controlling_terminal: bool, mid_turn: bool, scree
         let store = SessionStore::new(paths.open_database().unwrap());
         let status = store
             .db
-            .with_conn(|conn| latest_turn(conn, &session))
+            .shard_sql(&session, |conn| latest_turn(conn, &session))
             .unwrap()
             .unwrap()
             .unwrap();

@@ -1,6 +1,9 @@
 //! ApplyPatch across the real SDK control protocol: the standalone CLI process,
 //! the actual `control_request`/`control_response` frames and a local model
 //! fixture. These are protocol tests, not engine-mailbox simulations.
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use deepseek_code_core::{
     db::message_repo,
@@ -27,10 +30,10 @@ fn asked_session(root: &Path, confirm: &[&str]) -> String {
             .map(|path| (format!("Edit({path})"), json!("Confirm")))
             .collect(),
     );
-    let key = format!("cli.permissions.{id}");
+    let key = "cli.permissions".to_owned();
     store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO peripheral_settings(key,value) VALUES(?1,?2)",
                 [key.clone(), rules.to_string()],
@@ -40,7 +43,7 @@ fn asked_session(root: &Path, confirm: &[&str]) -> String {
         .unwrap();
     let stored: String = store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             conn.query_row(
                 "SELECT value FROM peripheral_settings WHERE key=?1",
                 [key],
@@ -164,7 +167,7 @@ pub(super) fn persisted_tool_calls(root: &Path, session: &str) -> Vec<message_re
     let store = SessionStore::new(paths.open_database().unwrap());
     let messages = store
         .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, session))
+        .shard_sql(session, |conn| message_repo::get_messages_by_conversation(conn, session))
         .unwrap()
         .unwrap();
     let mut calls = Vec::new();
@@ -172,7 +175,7 @@ pub(super) fn persisted_tool_calls(root: &Path, session: &str) -> Vec<message_re
         calls.extend(
             store
                 .db
-                .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &message.id))
+                .shard_sql(session, |conn| message_repo::get_tool_calls_for_message(conn, &message.id))
                 .unwrap()
                 .unwrap(),
         );

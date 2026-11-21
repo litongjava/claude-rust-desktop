@@ -1,4 +1,7 @@
 //! Public SDK cancellation must finalize every tool, not just ApplyPatch.
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use deepseek_code_core::{
     db::{message_repo, turn_repo},
@@ -21,7 +24,7 @@ pub(super) fn assert_cancelled_call(root: &Path, session: &str, occurrence: &str
         .open_database()
         .unwrap();
     let turn = db
-        .with_conn(|conn| turn_repo::get_message_turn(conn, &call.message_id))
+        .shard_sql(session, |conn| turn_repo::get_message_turn(conn, &call.message_id))
         .unwrap()
         .unwrap()
         .unwrap();

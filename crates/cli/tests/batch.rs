@@ -1,4 +1,7 @@
 //! Real detached CLI supervisors and workers against a local model fixture.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, routing::post, Router};
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
@@ -73,10 +76,10 @@ async fn exercise(cancel: bool) {
     let denied = r#"{"Bash":"Deny"}"#;
     store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&parent, |conn| {
             conn.execute(
                 "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [format!("cli.permissions.{parent}"), denied.into()],
+                ["cli.permissions".to_owned(), denied.into()],
             )
         })
         .unwrap()
@@ -185,10 +188,10 @@ async fn exercise(cancel: bool) {
         if let Some(session) = &worker.session_id {
             let value: String = store
                 .db
-                .with_conn(|conn| {
+                .shard_sql(session, |conn| {
                     conn.query_row(
                         "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("cli.permissions.{session}")],
+                        ["cli.permissions".to_owned()],
                         |row| row.get(0),
                     )
                 })
