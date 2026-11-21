@@ -78,7 +78,13 @@ pub async fn handle(
                 command_eprintln!("Copied session is ready; current session {} retained. /tasks sessions shows live worker state; /tasks stop-session {target} stops its idle worker.", session.id);
                 return Ok(Outcome::Handled);
             }
-            let child_id = session.store.fork(&session.id)?;
+            let _parent = session
+                .binding
+                .selected_session(&session.id)?
+                .hold_incarnation()?;
+            let child = session.store.fork_session(&session.id)?;
+            let _target = child.hold_incarnation()?;
+            let child_id = child.id().to_owned();
             copy_settings(session, &child_id)?;
             deepseek_code_core::services::permission_authority::record_user(&session.store.db, &child_id, &serde_json::json!(prompt))?;
             let workspace = session
@@ -192,7 +198,7 @@ pub async fn handle(
                         parts.next().is_none(),
                         "Usage: /tasks [list|running|completed|failed|show ID|attach ID|pending ID|answer ID REQUEST ANSWER|cancel ID|sessions|stop-session SESSION_ID|shutdown-worker]; /workflows [list|show NAME|run NAME [ARGS]|cancel ID]"
                     );
-                    let jobs = background_sessions::list(&paths.data_dir, Some(&session.id))?
+                    let jobs = background_sessions::owned_jobs(&paths.data_dir, &session.id)?
                         .into_iter()
                         .filter(|job| workflow_matches(&job.status, filter))
                         .collect::<Vec<_>>();
@@ -276,10 +282,7 @@ pub async fn handle(
                         return Ok(Outcome::Handled);
                     }
                     let job = background_sessions::get(&paths.data_dir, id)?;
-                    ensure!(
-                        job.parent_session_id == session.id,
-                        "Task belongs to another session"
-                    );
+                    background_sessions::authorize_owned_attachment(&paths.data_dir, &job, &session.id)?;
                     let (output, errors) = background_sessions::output(&paths.data_dir, id)?;
                     let output = output.lines().map(|line| {
                         serde_json::from_str::<serde_json::Value>(line).ok()
@@ -389,7 +392,7 @@ pub(crate) async fn live_tasks(session: &Session, prompt: &str) -> Result<String
             return Ok(safe_output(&format!("Shell {id} · {}\n{}\n{}", output["status"].as_str().unwrap_or("unknown"), output["stdout"].as_str().unwrap_or_default(), output["stderr"].as_str().unwrap_or_default())));
         }
         let job = background_sessions::get(&paths.data_dir, id)?;
-        ensure!(job.parent_session_id == session.id, "Task belongs to another session");
+        background_sessions::authorize_owned_attachment(&paths.data_dir, &job, &session.id)?;
         let (output, errors) = background_sessions::output(&paths.data_dir, id)?;
         return Ok(safe_output(&format!("Task {id} · {}\n{output}\n{errors}", job.status)));
     }
@@ -397,7 +400,7 @@ pub(crate) async fn live_tasks(session: &Session, prompt: &str) -> Result<String
     for shell in shells {
         lines.push(format!("- {} · {}\n  /tasks show {}", shell["subject"].as_str().unwrap_or("Background command"), shell["status"].as_str().unwrap_or("unknown"), shell["id"].as_str().unwrap_or_default()));
     }
-    for job in background_sessions::list(&paths.data_dir, Some(&session.id))? {
+    for job in background_sessions::owned_jobs(&paths.data_dir, &session.id)? {
         if !job.foreground {
             lines.push(format!("- {} · {}\n  /tasks show {}", job.title.lines().next().unwrap_or("Agent"), job.status, job.id));
         }
@@ -491,7 +494,17 @@ async fn tasks_menu(paths: &RuntimePaths, session: &Session) -> Result<()> {
                 // CLI's agent view.
                 let key = details("Task details", &rows, &format!("{back}t to view transcript \u{b7} Esc/Enter/Space to close \u{b7} x to stop"), &['x', 't'])?;
                 if key == Some('t') {
-                    crate::terminal::transcript_pager::view(&crate::repl::transcript_of(session, &job.session_id)?)?;
+                    let child = session.store.db.open_session(&job.session_id)?;
+                    let transcript = {
+                        let _selected = child.hold_incarnation()?;
+                        background_sessions::authorize_owned_attachment(
+                            &paths.data_dir,
+                            job,
+                            &session.id,
+                        )?;
+                        crate::repl::transcript_of(session, child.id())?
+                    };
+                    crate::terminal::transcript_pager::view(&transcript)?;
                     continue;
                 }
                 key
@@ -519,7 +532,7 @@ fn active_tasks(paths: &RuntimePaths, session: &Session) -> Result<Vec<Task>> {
             .map(Task::Monitor),
     );
     tasks.extend(
-        background_sessions::list(&paths.data_dir, Some(&session.id))?
+        background_sessions::owned_jobs(&paths.data_dir, &session.id)?
             .into_iter()
             .filter(|job| !job.foreground && matches!(job.status.as_str(), "starting" | "running" | "unresponsive"))
             .map(Task::Job),
@@ -535,7 +548,7 @@ async fn stop_task(paths: &RuntimePaths, session: &Session, task: &Task) -> Resu
             id
         }
         Task::Job(job) => {
-            background_sessions::cancel(&paths.data_dir, &job.id)?;
+            crate::worker_frontend::cancel_job(session, &job.id)?;
             job.id.clone()
         }
     };
@@ -656,7 +669,7 @@ pub(crate) fn running_agents(
     let Ok(context) = crate::services::context(paths) else {
         return Vec::new();
     };
-    let Ok(jobs) = background_sessions::list(&paths.data_dir, Some(session)) else {
+    let Ok(jobs) = background_sessions::owned_jobs(&paths.data_dir, session) else {
         return Vec::new();
     };
     jobs.into_iter()
@@ -667,6 +680,7 @@ pub(crate) fn running_agents(
                 .ok()
                 .flatten()?;
             let output_tokens = child_output_tokens(&context, &job.session_id);
+            background_sessions::authorize_owned_attachment(&paths.data_dir, &job, session).ok()?;
             Some(Agent {
                 session_id: job.session_id.clone(),
                 agent_type: record["agent_type"].as_str().unwrap_or("general").to_owned(),
@@ -695,7 +709,7 @@ pub(crate) fn mark_answered(request: &str) {
 /// its job, description and the question.
 pub(crate) fn agent_question(paths: &RuntimePaths, session: &str) -> Option<(String, String, background_sessions::PendingQuestion)> {
     let context = crate::services::context(paths).ok()?;
-    for job in background_sessions::list(&paths.data_dir, Some(session)).ok()? {
+    for job in background_sessions::owned_jobs(&paths.data_dir, session).ok()? {
         if !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") {
             continue;
         }
@@ -1709,7 +1723,7 @@ pub(crate) fn agent_transcript(
     let job_ids=context.db.background_agents(None,Some(id)).unwrap_or_default().into_iter().map(|(job,_)|job);
     for job_id in job_ids {
         if let Ok(job) = background_sessions::get(&context.paths.data_dir, &job_id) {
-            if job.session_id != id || !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") { continue; }
+            if background_sessions::authorize_attachment(&context.paths.data_dir, &job, id).is_err() || job.session_id != id || !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") { continue; }
             if let Ok((output, _)) = background_sessions::output(&context.paths.data_dir, &job_id) {
                 transcript.note(&format!("Live worker: {}", job.status));
                 transcript.events(&output, id);

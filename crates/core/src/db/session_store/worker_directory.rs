@@ -35,6 +35,16 @@ pub trait WorkerDirectory: SessionAccess {
 }
 
 impl WorkerPair {
+    pub(crate) fn hold(&self, stores: &Stores) -> Result<impl Drop> {
+        let parent = super::layout::storage_key(&self.parent)?;
+        let child = super::layout::storage_key(&self.child)?;
+        let guards = stores.group_access(vec![(&parent, false, false), (&child, false, false)])?;
+        stores
+            .global()
+            .read(|c| self.verify(stores, c).map(|_| ()))?;
+        Ok(guards)
+    }
+
     fn verify<'a>(&'a self, stores: &Stores, tx: &Connection) -> Result<(&'a str, &'a str)> {
         let (store, parent, child) = self
             .identities
@@ -208,6 +218,34 @@ impl WorkerDirectory for DbManager {
 }
 
 impl Stores {
+    pub(crate) fn check_job_participants(
+        &self,
+        parent: (&str, &str),
+        target: (&str, &str),
+        child: Option<&(String, String)>,
+    ) -> Result<()> {
+        self.global().read(|c| {
+            let snapshot = c.unchecked_transaction()?;
+            let mut visible = snapshot
+                .prepare_cached("SELECT 1 FROM conversations WHERE id=?1 AND incarnation=?2")?;
+            ensure!(
+                visible.exists([parent.0, parent.1])?,
+                "Task belongs to another session incarnation"
+            );
+            ensure!(
+                visible.exists([target.0, target.1])?,
+                "Task execution session has changed"
+            );
+            if let Some((id, incarnation)) = child {
+                ensure!(
+                    visible.exists([id, incarnation])?,
+                    "Owned child has changed"
+                );
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn child_jobs(&self, parent: &str) -> Result<Vec<(String, ChildOwnership)>> {
         let rows = self.global().read(|c| {
             let mut q = c.prepare(

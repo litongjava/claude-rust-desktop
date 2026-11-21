@@ -171,6 +171,12 @@ pub async fn handle(
                         .job_id
                         .as_deref()
                         .context("This worker has not started")?;
+                    let record = background_sessions::get(&paths.data_dir, job)?;
+                    background_sessions::authorize_owned_attachment(
+                        &paths.data_dir,
+                        &record,
+                        &session.id,
+                    )?;
                     let (output, error) = background_sessions::output(&paths.data_dir, job)?;
                     command_println!("{output}");
                     command_eprintln!("{error}");

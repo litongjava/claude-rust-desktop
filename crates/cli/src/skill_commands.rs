@@ -283,7 +283,13 @@ pub async fn prepare_invocation(
     if !fork {
         return Ok(PreparedInvocation::Inline(format!("Execute the explicitly selected skill below. Shell context has already been collected; do not execute it again.\n\n{expanded}")));
     }
-    let child_id = isolated_child(&session.store, &session.id, &context)?;
+    let _parent = session
+        .binding
+        .selected_session(&session.id)?
+        .hold_incarnation()?;
+    let child = isolated_child(&session.store, &session.id, &context)?;
+    let _target = child.hold_incarnation()?;
+    let child_id = child.id().to_owned();
     if let Some(agent) = &skill.agent {
         let mut definition = deepseek_code_core::services::agents::resolve(&context, agent)?;
         if let Some(parent) =
@@ -343,7 +349,7 @@ fn isolated_child(
     store: &deepseek_code_core::runtime::SessionStore,
     parent: &str,
     _context: &deepseek_code_core::services::ServiceContext,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<deepseek_code_core::db::session_store::SessionDb> {
     use deepseek_code_core::db::session_store::{settings, SessionAccess};
     let owner = store.db.open_session(parent)?;
     let child = uuid::Uuid::new_v4().to_string();
@@ -354,7 +360,7 @@ fn isolated_child(
         value.goal = None;
         preferences.set_preference(settings::PREFERENCES, Some(&value))?;
     }
-    Ok(child)
+    Ok(destination)
 }
 
 pub async fn load_for_workspace(
@@ -554,7 +560,10 @@ mod tests {
                 &serde_json::json!({"Bash(*)":"Deny"}),
             )
             .unwrap();
-        let child = isolated_child(&store, &parent, &context).unwrap();
+        let child = isolated_child(&store, &parent, &context)
+            .unwrap()
+            .id()
+            .to_owned();
         assert!(store.history(&child).unwrap().is_empty());
         assert_eq!(store.history(&parent).unwrap().len(), 1);
         let child_settings: serde_json::Value = context

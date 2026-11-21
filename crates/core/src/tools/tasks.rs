@@ -53,9 +53,7 @@ pub fn display_title(root: &Path, session: &str, input: &Value) -> Option<String
             .is_file()
     {
         let job = crate::services::background_sessions::get(root, id).ok()?;
-        if job.parent_session_id != session {
-            return None;
-        }
+        crate::services::background_sessions::authorize_job(root, &job, &session).ok()?;
         job.title
     } else {
         let db = rusqlite::Connection::open_with_flags(

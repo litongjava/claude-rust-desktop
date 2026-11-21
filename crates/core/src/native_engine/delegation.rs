@@ -29,6 +29,13 @@ pub(crate) struct OwnedChild {
 }
 
 impl OwnedChild {
+    pub(in crate::native_engine) fn retained_session(&self) -> Option<crate::db::session_store::SessionDb> {
+        match self.executor.executor_history.as_ref()? {
+            crate::db::session_store::ExecutorHistory::Session(shard) => Some(shard.clone()),
+            _ => None,
+        }
+    }
+
     pub(in crate::native_engine) fn binding_is_current(
         &self,
         manager: &crate::native_engine::provider_manager::ProviderManager,

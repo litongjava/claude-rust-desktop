@@ -526,6 +526,7 @@ fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
     let launch: WorkerLaunch = serde_json::from_slice(&fs::read(dir.join("launch.json"))?)?;
     let paths = crate::runtime::RuntimePaths::new(root.into())?;
     let store = crate::runtime::SessionStore::new(paths.open_database()?);
+    let selected = store.db.open_session(&batch.parent_session_id)?;
     loop {
         let cancelling = dir.join("cancel").exists();
         for index in 0..batch.workers.len() {
@@ -612,7 +613,15 @@ fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
                         &batch.base_commit,
                     ],
                 )?;
-                let session = store.create(&worker.worktree, &launch.model, &launch.provider)?;
+                let _parent = selected.hold_incarnation()?;
+                let session = uuid::Uuid::new_v4().to_string();
+                let target = store.db.create_code_session(
+                    &worker.worktree,
+                    &launch.model,
+                    &launch.provider,
+                    &session,
+                )?;
+                let _target = target.hold_incarnation()?;
                 // A stronger explicitly selected mode never erases existing deny
                 // rules or agent tool restrictions from the originating session.
                 use crate::db::session_store::{settings::PERMISSIONS,SessionAccess};

@@ -127,7 +127,7 @@ pub(crate) fn status_with_progress(
     }
     if invocation.mode == "background" {
         return Ok(
-            background_sessions::list(root, Some(&invocation.parent_session_id))?
+            background_sessions::owned_jobs(root, &invocation.parent_session_id)?
                 .into_iter()
                 .rev()
                 .find(|job| job.session_id == invocation.child_session_id)

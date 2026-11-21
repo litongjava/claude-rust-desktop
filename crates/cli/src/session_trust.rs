@@ -32,7 +32,7 @@ pub async fn quit_worker(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
     {
         return Ok(());
     }
-    for job in jobs::list(&paths.data_dir, None)? {
+    for job in jobs::executing_in(&paths.data_dir, id)? {
         if job.session_id == id && job.finished_ms.is_none() {
             jobs::cancel(&paths.data_dir, &job.id)?;
         }
@@ -79,7 +79,7 @@ pub async fn shutdown_worker(paths: &RuntimePaths, id: &str) -> anyhow::Result<(
         .filter_map(|task| task["id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
     active.extend(
-        deepseek_code_core::services::background_sessions::list(&paths.data_dir, None)?
+        deepseek_code_core::services::background_sessions::executing_in(&paths.data_dir, id)?
             .into_iter()
             .filter(|job| {
                 job.session_id == id
@@ -112,10 +112,11 @@ pub async fn stop_task(paths: &RuntimePaths, id: &str, task_id: &str) -> anyhow:
         .await?
     } else {
         let job = deepseek_code_core::services::background_sessions::get(&paths.data_dir, task_id)?;
-        anyhow::ensure!(
-            job.session_id == id || job.parent_session_id == id,
-            "Task belongs to another session"
-        );
+        deepseek_code_core::services::background_sessions::authorize_attachment(
+            &paths.data_dir,
+            &job,
+            id,
+        )?;
         serde_json::to_value(deepseek_code_core::services::background_sessions::cancel(
             &paths.data_dir,
             task_id,

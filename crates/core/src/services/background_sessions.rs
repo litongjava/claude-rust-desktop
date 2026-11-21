@@ -152,7 +152,7 @@ impl JobOwners {
     }
 }
 
-pub(crate) fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()> {
+pub fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()> {
     ensure!(
         job.parent_session_id == session,
         "Task belongs to another session"
@@ -167,6 +167,40 @@ pub(crate) fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+pub fn authorize_owned_attachment(root: &Path, job: &Job, parent: &str) -> Result<()> {
+    ensure!(
+        job.parent_session_id == parent,
+        "Task belongs to another session"
+    );
+    authorize_attachment(root, job, parent)
+}
+
+/// Interactive controls may address the parent or the execution session. Both
+/// endpoints and any separately recorded idle child must still be current.
+pub fn authorize_attachment(root: &Path, job: &Job, session: &str) -> Result<()> {
+    ensure!(job.parent_session_id == session || job.session_id == session, "Task belongs to another session");
+    let Some(owners) = JobOwners::load(root, job)? else {
+        ensure!(
+            !root.join("global.db").try_exists()?,
+            "Task has no recorded parent incarnation"
+        );
+        return Ok(());
+    };
+    let child = match super::session_worker::job_child(root, job)? {
+        Some(super::session_worker::JobChild::Bound { id, incarnation }) => Some((id, incarnation)),
+        Some(super::session_worker::JobChild::Legacy(_)) => {
+            anyhow::bail!("Owned child has no recorded incarnation")
+        }
+        None => None,
+    };
+    let stores = crate::db::session_store::Stores::open(root)?;
+    stores.check_job_participants(
+        (&job.parent_session_id, &owners.parent),
+        (&job.session_id, &owners.execution),
+        child.as_ref(),
+    )
 }
 
 /// Durable view of a reserved job, used by hosts that reconcile after a crash.
@@ -683,7 +717,7 @@ fn spawn_at(
             job.session_id == session,
             "Reserved background task {id} belongs to another child session"
         );
-        authorize_job(root, &job, parent)?;
+        authorize_attachment(root, &job, parent)?;
         let stored = launch_of(root, &id)?
             .with_context(|| format!("Reserved background task {id} has no launch record"))?;
         ensure!(
@@ -1048,13 +1082,29 @@ pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
             }
             Err(error) => return Err(error),
         };
-        if parent.map_or(true, |id| job.parent_session_id == id) {
+        if parent.map_or(true, |id| authorize_job(root, &job, id).is_ok()) {
             jobs.push(published(&entry.path(), job)?);
         }
     }
     jobs.sort_by_key(|job| job.started_ms);
     Ok(jobs)
 }
+/// Jobs whose parent and execution targets still match this CLI view.
+pub fn owned_jobs(root: &Path, parent: &str) -> Result<Vec<Job>> {
+    Ok(list(root, None)?
+        .into_iter()
+        .filter(|job| authorize_owned_attachment(root, job, parent).is_ok())
+        .collect())
+}
+
+/// Jobs that can currently execute in the selected session.
+pub fn executing_in(root: &Path, session: &str) -> Result<Vec<Job>> {
+    Ok(list(root, None)?
+        .into_iter()
+        .filter(|job| job.session_id == session && authorize_attachment(root, job, session).is_ok())
+        .collect())
+}
+
 pub fn get(root: &Path, id: &str) -> Result<Job> {
     let dir = directory(root, id)?;
     published(&dir, read_job(&dir)?)
@@ -1161,10 +1211,7 @@ pub struct PendingQuestion {
 
 pub fn pending_question(root: &Path, id: &str, parent: &str) -> Result<Option<PendingQuestion>> {
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     if !matches!(job.status.as_str(), "starting" | "running") {
         return Ok(None);
     }
@@ -1451,10 +1498,7 @@ async fn wait_for_answer(
 
 pub fn detach(root: &Path, id: &str, parent: &str) -> Result<()> {
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     fs::write(directory(root, id)?.join("detached"), b"detached")?;
     Ok(())
 }
@@ -1469,10 +1513,7 @@ pub fn events_since(
 ) -> Result<(Job, u64, Vec<serde_json::Value>)> {
     use std::io::{Seek, SeekFrom};
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     let path = directory(root, id)?.join("output.jsonl");
     if !path.exists() {
         return Ok((job, cursor, vec![]));

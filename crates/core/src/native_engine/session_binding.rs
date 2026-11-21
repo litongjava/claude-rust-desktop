@@ -194,6 +194,18 @@ impl SessionBinding {
         *self.authority.write().unwrap_or_else(|e| e.into_inner()) = Some(BindingAuthority::Session(session));
     }
 
+    pub fn selected_session(&self, id: &str) -> Result<crate::db::session_store::SessionDb> {
+        match self
+            .authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(BindingAuthority::Session(shard)) if shard.id() == id => Ok(shard.clone()),
+            _ => anyhow::bail!("Session binding has no matching shard"),
+        }
+    }
+
     fn check_generation(&self, expected: u64) -> Result<()> {
         ensure!(
             !self.read().is_some_and(|s| s.observation_only),

@@ -60,7 +60,9 @@ pub(crate) fn foreground_worker(session: &crate::session::Session) -> bool {
         .and_then(|id| id.to_str())
         .and_then(|id| jobs::get(&session.paths.data_dir, id).ok())
         .is_some_and(|job| {
-            job.foreground && job.parent_session_id == session.id && job.session_id == session.id
+            job.foreground
+                && job.session_id == session.id
+                && jobs::authorize_job(&session.paths.data_dir, &job, &session.id).is_ok()
         })
 }
 

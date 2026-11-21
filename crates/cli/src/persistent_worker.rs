@@ -125,6 +125,17 @@ async fn await_admission(
 #[path = "persistent_child.rs"]
 mod child;
 
+fn begin_selected_job(
+    worker: &Worker,
+    selected: Option<&deepseek_code_core::db::session_store::SessionDb>,
+    id: &str,
+    prompt: &str,
+    child: Option<&deepseek_code_core::db::session_store::SessionDb>,
+) -> Result<jobs::Job> {
+    let _owner = selected.map(|s| s.hold_incarnation()).transpose()?;
+    service::begin_job_with_target(worker, id, prompt, child)
+}
+
 pub async fn run_from_env() -> Result<bool> {
     let Some(value) = std::env::var_os(service::HOST_ENV) else {
         return Ok(false);
@@ -142,6 +153,14 @@ pub async fn run_from_env() -> Result<bool> {
     std::env::remove_var(service::SUPERVISOR_PID_ENV);
     let _lifetime = service::host_lifetime_lock(&dir)?;
     let worker = service::read_worker(&dir)?;
+    let selected = if worker.root.join("global.db").try_exists()? {
+        Some(
+            deepseek_code_core::db::session_store::Stores::open(&worker.root)?
+                .open_session(&worker.session_id)?,
+        )
+    } else {
+        None
+    };
     let _resource_sampler = crate::resource_sampling::start(&worker.root);
     crate::resource_sampling::session(&worker.session_id);
     ensure!(
@@ -208,7 +227,7 @@ pub async fn run_from_env() -> Result<bool> {
                     if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
                     if (turn_active && !idle_child_active.load(Ordering::Acquire)) || shell_active {idle=Instant::now();}
                     if !turn_active && !fatal.load(Ordering::Acquire) {
-                        if let Err(error) = child::start_pending(&worker, expected_binding.as_deref(), &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
+                        if let Err(error) = child::start_pending(&worker, selected.as_ref(), expected_binding.as_deref(), &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
                             eprintln!("Owned child wake unavailable: {error:#}");
                         }
                     }
@@ -318,7 +337,7 @@ pub async fn run_from_env() -> Result<bool> {
                                 continue;
                             }
                             *current_turn.lock().unwrap_or_else(|e|e.into_inner())=Some(id.clone());
-                            if let Err(error)=service::begin_job(&worker,&id,&prompt) {
+                            if let Err(error)=begin_selected_job(&worker,selected.as_ref(),&id,&prompt,None) {
                                 *current_turn.lock().unwrap_or_else(|e|e.into_inner())=None;
                                 active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
                             }

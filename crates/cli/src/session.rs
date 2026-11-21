@@ -780,7 +780,7 @@ impl Session {
         } else if let Some(settled) = settled {
             settled.active
         } else {
-            deepseek_code_core::services::background_sessions::list(&paths.data_dir, None)?
+            deepseek_code_core::services::background_sessions::executing_in(&paths.data_dir, &id)?
                 .into_iter()
                 .find(|job| {
                     job.session_id == id
@@ -1363,7 +1363,7 @@ impl Session {
         .is_none()
         {
             if let Some(job) =
-                deepseek_code_core::services::background_sessions::list(&self.paths.data_dir, None)?
+                deepseek_code_core::services::background_sessions::executing_in(&self.paths.data_dir, &self.id)?
                     .into_iter()
                     .find(|job| {
                         job.session_id == self.id

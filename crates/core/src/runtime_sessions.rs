@@ -38,16 +38,18 @@ impl SessionStore<Stores> {
         self.db.latest_code(workspace)
     }
     pub fn fork(&self, id: &str) -> Result<String> {
+        Ok(self.fork_session(id)?.id().to_owned())
+    }
+    pub fn fork_session(&self, id: &str) -> Result<SessionDb> {
         self.branch(id, Branch::Full)
     }
     pub fn clear(&self, id: &str) -> Result<String> {
-        self.branch(id, Branch::Clear)
+        Ok(self.branch(id, Branch::Clear)?.id().to_owned())
     }
-    fn branch(&self, id: &str, boundary: Branch<'_>) -> Result<String> {
+    fn branch(&self, id: &str, boundary: Branch<'_>) -> Result<SessionDb> {
         let (parent, _) = self.db.resume_code(id)?;
         let id = uuid::Uuid::new_v4().to_string();
-        parent.branch(&id, boundary)?;
-        Ok(id)
+        parent.branch(&id, boundary)
     }
     pub fn derive_owned_child(&self, id: &str, root: &Path, expected_cwd: &Path) -> Result<String> {
         let parent = self.session_in_root(id, root)?;

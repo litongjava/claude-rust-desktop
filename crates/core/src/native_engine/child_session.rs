@@ -524,6 +524,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
         mut ownership,
         owners,
     } = prepared;
+    let _owners = owners.hold(&context.db)?;
     ownership.status = "starting".into();
     ownership.updated_at = chrono::Utc::now().to_rfc3339();
     ownership.last_error = None;

@@ -148,22 +148,32 @@ pub fn execute_live(
             let content = message_content(&input)?;
             let Some(team) = teams::team_for_session(root, session)? else {
                 // Resolve only this sender's owned background task aliases.
-                let target = crate::services::background_sessions::list(root, Some(session))?
-                    .into_iter()
-                    .find(|job| job.id == to)
-                    .map(|job| job.session_id)
-                    .unwrap_or_else(|| to.to_owned());
-                let to = target.as_str();
-                let message = live::send(context, session, to, &content)?;
+                let jobs = crate::services::background_sessions::owned_jobs(root, session)?;
+                let alias = jobs.iter().find(|job| job.id == to);
+                let to = alias.map_or(to, |job| job.session_id.as_str());
+                let message = if let Some(job) = alias {
+                    let sender = context.db.open_session(session)?;
+                    let target = context.db.open_session(to)?;
+                    crate::services::background_sessions::authorize_owned_attachment(
+                        root, job, session,
+                    )?;
+                    sender.send_peer_message(
+                        &target,
+                        &uuid::Uuid::new_v4().to_string(),
+                        &content,
+                    )?
+                } else {
+                    live::send(context, session, to, &content)?
+                };
                 let active = live::receiver_active(root, to)?;
                 let open = context.db.session_present(to)?;
                 let mut result = json!({"message":message,"state":"queued","processed":false,
                     "to":to,"delivered":[delivered(None,to)]});
-                let name = crate::services::background_sessions::list(root, Some(session))?
-                    .into_iter()
+                let name = jobs
+                    .iter()
                     .find(|job| job.session_id == to)
-                    .map(|job| job.title)
-                    .unwrap_or_else(|| "Agent".into());
+                    .map(|job| job.title.as_str())
+                    .unwrap_or("Agent");
                 result["recipient_name"] = json!(name);
                 delivery(&mut result, active, open);
                 return Ok(result);
@@ -474,6 +484,7 @@ mod tests {
             error: None,
             launched: true,
         };
+        crate::services::background_sessions::JobOwners::publish(temp.path(), &job).unwrap();
         std::fs::write(
             directory.join("state.json"),
             serde_json::to_vec(&job).unwrap(),
@@ -494,6 +505,17 @@ mod tests {
             serde_json::json!({"operation":"send","to":task,"message":"unowned"})
         )
         .is_err());
+        context.db.open_session(&child).unwrap().delete().unwrap();
+        sessions
+            .create_with_id(temp.path(), "fixture", "fixture", &child)
+            .unwrap();
+        assert!(super::execute_live(
+            &context,
+            &parent,
+            serde_json::json!({"operation":"send","to":task,"message":"stale alias"})
+        )
+        .is_err());
+        assert!(live::inbox(&context, &child, false).unwrap().is_empty());
     }
 
     use super::*;

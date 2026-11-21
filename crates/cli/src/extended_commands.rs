@@ -305,6 +305,7 @@ pub(crate) fn active_agents_text(paths: &RuntimePaths, current: &str) -> Result<
         let id = peer["id"].as_str().unwrap_or_default();
         let job = jobs.iter().find(|job| {
             job.session_id == id
+                && background_sessions::authorize_attachment(&paths.data_dir, job, id).is_ok()
                 && matches!(job.status.as_str(), "starting" | "running")
         });
         if peer["receiver_active"] != true && job.is_none() {

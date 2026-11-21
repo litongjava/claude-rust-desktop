@@ -22,7 +22,7 @@ struct Fixture {
     fork_count: Arc<Mutex<usize>>,
     agent_result: Arc<Mutex<Option<Value>>>,
     nested_result: Arc<Mutex<Option<String>>>,
-    /// Answer the fork's first request with another fork call.
+    /// Load Agent in the child, then request a second fork.
     nested_fork: bool,
 }
 
@@ -84,6 +84,9 @@ async fn respond(
     let frames = if is_fork_request {
         match next(&fixture.fork_count) {
             0 if fixture.nested_fork => tool_call_frame(
+                "call-nested-load", "ToolLoad", &json!({"names":["Agent"]}),
+            ),
+            1 if fixture.nested_fork => tool_call_frame(
                 "call-nested-fork",
                 "Agent",
                 &json!({"description":"nested fork check","prompt":"nested directive","subagent_type":"fork"}),

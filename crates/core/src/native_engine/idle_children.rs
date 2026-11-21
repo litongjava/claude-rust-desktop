@@ -56,7 +56,7 @@ impl QueryEngine {
     }
 
     /// Inspect only runtimes already retained by this engine for this exact owner.
-    pub async fn pending_owned_child(&self, owner: &str) -> Result<Option<String>> {
+    pub async fn pending_owned_child(&self, owner: &str) -> Result<Option<crate::db::session_store::SessionDb>> {
         if self.active_turns.lock().await.contains_key(owner) {
             return Ok(None);
         }
@@ -74,7 +74,7 @@ impl QueryEngine {
                     && child.idle_ready
                     && child.owner_budget.load(Ordering::Acquire) < 8
             })
-            .map(|(id, _)| id.clone())
+            .filter_map(|(_, child)| child.retained_session())
             .collect::<Vec<_>>();
         if ids.is_empty() {
             return Ok(None);
@@ -87,17 +87,12 @@ impl QueryEngine {
             .parent()
             .context("Runtime directory missing")?
             .to_path_buf();
-        let context = ServiceContext {
-            paths: crate::runtime::RuntimePaths::new(root.clone())?,
-            db: self.db_manager.clone(),
-            credentials: std::sync::Arc::new(EnvironmentCredentials),
-        };
         if session_messages::receiver_active(&root, owner)? {
             return Ok(None);
         }
-        for id in ids {
-            if session_messages::pending_count(&context, &id)? > 0 {
-                return Ok(Some(id));
+        for selected in ids {
+            if selected.pending_peer_count()? > 0 {
+                return Ok(Some(selected));
             }
         }
         Ok(None)
@@ -141,7 +136,9 @@ impl QueryEngine {
             credentials: std::sync::Arc::new(EnvironmentCredentials),
         };
         let _owner_lease = self.db_manager.executor_history(owner)?.execution_lease()?;
-        let child_history = self.db_manager.executor_history(child)?;
+        let child_history = self.owned_children.lock().unwrap_or_else(|e| e.into_inner())
+            .get(child).and_then(|entry| entry.retained_session()).context("Missing retained child history")?;
+        let child_history = crate::db::session_store::ExecutorHistory::Session(child_history);
         let outcome: Result<Value> = async {
             ensure!(
                 session_messages::pending_count(&context, child)? > 0,

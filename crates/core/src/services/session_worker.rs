@@ -200,10 +200,7 @@ pub struct SettledSession {
 pub fn settle_session(root: &Path, session: &str) -> Result<SettledSession> {
     let recovered = recover_session(root, session)?;
     let mut active = None;
-    for job in jobs::list(root, None)? {
-        if job.session_id != session {
-            continue;
-        }
+    for job in jobs::executing_in(root, session)? {
         if !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") {
             continue;
         }
@@ -636,6 +633,15 @@ fn startup_failure(error: Option<&str>, dir: &Path) -> String {
 }
 
 pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
+    begin_job_with_target(worker, id, prompt, None)
+}
+
+pub fn begin_job_with_target(
+    worker: &Worker,
+    id: &str,
+    prompt: &str,
+    child: Option<&crate::db::session_store::SessionDb>,
+) -> Result<Job> {
     let active = directory(worker).join("active.json");
     if active.exists() {
         // A finished job's marker is stale: its owner is only about to remove it.
@@ -670,6 +676,9 @@ pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
         launched: true,
     };
     jobs::JobOwners::publish(&worker.root, &job)?;
+    if let Some(child) = child {
+        record_job_child(&worker.root, id, child)?;
+    }
     jobs::save(&dir.join("state.json"), &job)?;
     fs::File::create(dir.join("output.jsonl"))?;
     jobs::save(&active, &id)?;
@@ -1423,6 +1432,32 @@ mod active_marker_tests {
     }
     fn active(worker: &Worker) -> String {
         serde_json::from_slice(&fs::read(directory(worker).join("active.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn idle_job_records_the_child_selected_before_retirement() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let worker = prepare(root.path());
+        let stores = crate::db::session_store::Stores::open(root.path())?;
+        stores.create(&worker.session_id, Default::default())?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let retained = stores.create(&id, Default::default())?;
+        retained.delete()?;
+        let replacement = stores.create(&id, Default::default())?;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let job = begin_job_with_target(&worker, &job_id, "wake", Some(&retained))?;
+        let Some(JobChild::Bound {
+            id: target,
+            incarnation,
+        }) = job_child(root.path(), &job)?
+        else {
+            anyhow::bail!("Missing idle child identity");
+        };
+        assert_eq!(target, id);
+        assert_eq!(incarnation, retained.incarnation());
+        assert_ne!(incarnation, replacement.incarnation());
+        assert!(jobs::authorize_attachment(root.path(), &job, &worker.session_id).is_err());
+        Ok(())
     }
 
     #[test]
