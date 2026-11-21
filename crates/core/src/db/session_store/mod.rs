@@ -49,6 +49,8 @@ pub mod settings;
 mod state;
 mod usage;
 mod task;
+mod task_state;
+pub use task_state::TaskState;
 pub use delivery::*;
 pub use history::*;
 pub use state::{GlobalPreferences, GlobalSetting};

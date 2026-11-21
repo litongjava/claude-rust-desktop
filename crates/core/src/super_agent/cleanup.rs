@@ -2,6 +2,7 @@
 //! No inferred ownership from absence: a durable removal intent is required.
 //! External Git writers do not honor our lock; every destructive step therefore
 //! rechecks the assets, and Git itself must accept a non-forced removal.
+use crate::db::session_store::TaskState;
 use super::{
     delivery::{self, DeliveryPlan},
     launcher::Launcher,
@@ -175,7 +176,7 @@ pub(crate) fn run(
         ]))?)
     );
     let key = format!("super-agent.{operation_id}");
-    let mut operation = if let Some(saved) = context.setting::<Operation>(&key)? {
+    let mut operation = if let Some(saved) = context.db.task_state::<Operation>(&key)? {
         ensure!(
             saved.identity == identity && saved.operation_id == operation_id,
             "Cleanup operation identity changed; refusing to adopt assets"
@@ -222,7 +223,7 @@ pub(crate) fn run(
             branch_intent: false,
             branch_removed: false,
         };
-        context.save_setting(&key, &saved)?;
+        context.db.save_task_state(&key, &saved)?;
         saved
     };
     for (archive, suffix) in [
@@ -253,7 +254,7 @@ pub(crate) fn run(
         validate_worktree(repo)?;
         validate_branch(repo)?;
         operation.worktree_intent = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
         hook("before-worktree-remove")?;
         git(
             &repo.repo_root,
@@ -266,14 +267,14 @@ pub(crate) fn run(
         )?;
         hook("after-worktree-remove")?;
         operation.worktree_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     } else {
         ensure!(
             operation.worktree_intent,
             "Worktree missing without persisted removal intent"
         );
         operation.worktree_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     }
     let branch = branch_oid(repo)?;
     if operation.branch_removed {
@@ -291,7 +292,7 @@ pub(crate) fn run(
             "Task branch is checked out elsewhere"
         );
         operation.branch_intent = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
         hook("before-branch-delete")?;
         // -d normally compares against repo_root's HEAD, which need not be the
         // delivered target. Select the already verified target as the command's
@@ -314,14 +315,14 @@ pub(crate) fn run(
         )?;
         hook("after-branch-delete")?;
         operation.branch_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     } else {
         ensure!(
             operation.branch_intent,
             "Task branch missing without persisted removal intent"
         );
         operation.branch_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     }
     ensure!(
         !repo.worktree_path.try_exists()?

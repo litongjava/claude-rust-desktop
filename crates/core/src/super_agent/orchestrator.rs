@@ -6,6 +6,7 @@
 //! approval, and resumes the same Coder afterwards. Every step is keyed by a
 //! durable operation or marker, so repeated ticks cannot duplicate sessions,
 //! jobs or approvals.
+use crate::db::session_store::TaskState;
 use crate::native_engine::provider_manager::ResolvedProvider;
 use crate::services::ServiceContext;
 use crate::super_agent::config::{PlanApprovalPolicy, SuperAgentConfig};
@@ -209,8 +210,8 @@ impl Orchestrator {
                         )
                         .map_err(store_error)?;
                     let key = format!("super-agent.cleanup-pending.{}", task.task_id);
-                    if self.context.setting::<String>(&key)?.as_deref() != Some(reason.as_str()) {
-                        self.context.save_setting(&key, &reason)?;
+                    if self.context.db.task_state::<String>(&key)?.as_deref() != Some(reason.as_str()) {
+                        self.context.db.save_task_state(&key, &reason)?;
                         report
                             .warnings
                             .push(format!("{} cleanup PENDING: {reason}", task.task_id));
@@ -1626,10 +1627,10 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}.final-completion",
             task.task_id, task.spec_version, task.review_round
         );
-        let Some(marker) = self.context.setting::<serde_json::Value>(&key)? else {
+        let Some(marker) = self.context.db.task_state::<serde_json::Value>(&key)? else {
             // No resume was requested yet: ask the same Reviewer exactly once.
             let outcome = self.launcher().resume_finalizing_reviewer(task).await?;
-            self.context.save_setting(
+            self.context.db.save_task_state(
                 &key,
                 &serde_json::json!({
                     "session_id": outcome.session_id,
@@ -1919,14 +1920,14 @@ impl Orchestrator {
             "super-agent.resume.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self
             .launcher()
             .resume_coder(task, &coder_implementation_prompt(task), "implementation")
             .await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2018,11 +2019,11 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self.launcher().resume_reviewer(task).await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2280,7 +2281,7 @@ impl Orchestrator {
             "super-agent.resume-changes.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let issues: Vec<String> = changes.body["issues"]
@@ -2312,7 +2313,7 @@ impl Orchestrator {
             .launcher()
             .resume_coder(task, &instruction, "changes")
             .await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2345,13 +2346,13 @@ impl Orchestrator {
             task.task_id, task.spec_version, task.review_round
         );
         let baselines: Vec<crate::super_agent::integration::IntegrationBaseline> =
-            match self.context.setting::<serde_json::Value>(&baseline_key)? {
+            match self.context.db.task_state::<serde_json::Value>(&baseline_key)? {
                 Some(value) => serde_json::from_value(value)
                     .context("The stored integration baseline is invalid")?,
                 None => {
                     let captured = crate::super_agent::integration::capture_baseline(task)?;
                     self.context
-                        .save_setting(&baseline_key, &serde_json::to_value(&captured)?)?;
+                        .db.save_task_state(&baseline_key, &serde_json::to_value(&captured)?)?;
                     captured
                 }
             };
@@ -2362,7 +2363,7 @@ impl Orchestrator {
         );
         if self
             .context
-            .setting::<serde_json::Value>(&resume_key)?
+            .db.task_state::<serde_json::Value>(&resume_key)?
             .is_none()
         {
             let instruction = coder_integration_prompt(task, &baselines);
@@ -2370,7 +2371,7 @@ impl Orchestrator {
                 .launcher()
                 .resume_coder(task, &instruction, "integration")
                 .await?;
-            self.context.save_setting(
+            self.context.db.save_task_state(
                 &resume_key,
                 &serde_json::json!({
                     "session_id": outcome.session_id,
@@ -2519,11 +2520,11 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}.final-delivery",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self.launcher().resume_final_reviewer(task).await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,

@@ -11,6 +11,7 @@
 //! A host crash can therefore be reconciled by exact identity: an already
 //! started child is adopted, a never-started reservation continues with the
 //! same IDs, and ambiguous or damaged evidence blocks with the files preserved.
+use crate::db::session_store::TaskState;
 use crate::native_engine::child_session::{
     launch_prepared_child, prepare_child_session, ChildLaunchConfig, ChildSpawn, ChildWorkspace,
     PreparedChildLaunch,
@@ -855,7 +856,7 @@ impl Launcher {
     /// Durable stage of an initial or resume operation, for host gates and
     /// diagnostics. A completed operation is never started again.
     pub fn load_operation(&self, key: &str) -> Result<Option<LaunchOperation>> {
-        self.context.setting(key).map_err(Into::into)
+        self.context.db.task_state(key).map_err(Into::into)
     }
 
     pub fn operation_key(&self, task: &TaskRecord, member: MemberRole, kind: LaunchKind) -> String {
@@ -1287,20 +1288,7 @@ impl Launcher {
     }
 
     fn setting_rows(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let pattern = format!("{prefix}%");
-        let rows = self
-            .context
-            .db
-            .with_conn(|conn| -> Result<Vec<(String, String)>> {
-                let mut statement = conn.prepare(
-                    "SELECT key,value FROM peripheral_settings WHERE key LIKE ?1 ORDER BY key",
-                )?;
-                let rows = statement.query_map([pattern], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-            })??;
-        Ok(rows)
+        self.context.db.task_state_rows(prefix)
     }
 
     fn observe_member_job(&self, router: &str, receipt: MemberJobReceipt) -> MemberJobObservation {
@@ -1643,7 +1631,7 @@ impl Launcher {
         let status = job.as_ref().map(|job| job.status.clone());
         if status != operation.last_job_status {
             operation = self.update_operation(&key_of(&operation), |stored| {
-                stored.last_job_status = status;
+                stored.last_job_status = status.clone();
             })?;
         }
         if operation.state != "completed" {
@@ -1744,77 +1732,21 @@ impl Launcher {
     /// Atomically reserves the operation. Concurrent hosts receive the same
     /// durable record, so they cannot both create a session or a job.
     fn reserve_operation(&self, key: &str, candidate: LaunchOperation) -> Result<LaunchOperation> {
-        self.context
-            .db
-            .with_conn(|conn| -> Result<LaunchOperation> {
-                let tx = rusqlite::Transaction::new_unchecked(
-                    conn,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                let existing: Option<String> = tx
-                    .query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [key],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(value) = existing {
-                    let operation = serde_json::from_str(&value)
-                        .context("Stored launch operation is invalid")?;
-                    tx.commit()?;
-                    return Ok(operation);
-                }
-                let value = serde_json::to_string(&candidate)?;
-                tx.execute(
-                    "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                    [key, &value],
-                )?;
-                tx.commit()?;
-                Ok(candidate)
-            })?
+        self.context.db.reserve_task_state(key, candidate)
     }
 
     fn update_operation<F>(&self, key: &str, apply: F) -> Result<LaunchOperation>
     where
-        F: FnOnce(&mut LaunchOperation),
+        F: Fn(&mut LaunchOperation),
     {
-        self.context
-            .db
-            .with_conn(|conn| -> Result<LaunchOperation> {
-                let tx = rusqlite::Transaction::new_unchecked(
-                    conn,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                let value: Option<String> = tx
-                    .query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [key],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let value = value.context("Launch operation disappeared")?;
-                let mut operation: LaunchOperation =
-                    serde_json::from_str(&value).context("Stored launch operation is invalid")?;
-                let previous_state = operation.state.clone();
-                let previous_handle = operation.handle.clone();
-                apply(&mut operation);
-                // Durable stages only move forward and a recorded handle is never
-                // dropped, so concurrent recovery cannot downgrade a completed run.
-                if state_rank(&operation.state) < state_rank(&previous_state) {
-                    operation.state = previous_state;
-                }
-                if operation.handle.is_none() {
-                    operation.handle = previous_handle;
-                }
-                operation.updated_at = chrono::Utc::now().to_rfc3339();
-                let value = serde_json::to_string(&operation)?;
-                tx.execute(
-                    "UPDATE peripheral_settings SET value=?2 WHERE key=?1",
-                    [key, &value],
-                )?;
-                tx.commit()?;
-                Ok(operation)
-            })?
+        self.context.db.update_task_state(key, |operation: &mut LaunchOperation| {
+            let previous_state=operation.state.clone();
+            let previous_handle=operation.handle.clone();
+            apply(operation);
+            if state_rank(&operation.state)<state_rank(&previous_state) {operation.state=previous_state;}
+            if operation.handle.is_none(){operation.handle=previous_handle;}
+            operation.updated_at=chrono::Utc::now().to_rfc3339();
+        })
     }
 
     fn mark_state(&self, key: &str, state: &str) -> Result<()> {
@@ -1835,7 +1767,7 @@ impl Launcher {
 
     fn save_record(&self, task_id: &str, record: &LaunchRecord) -> Result<()> {
         self.context
-            .save_setting(&launch_key(task_id, &record.role), record)
+            .db.save_task_state(&launch_key(task_id, &record.role), record)
     }
 
     fn adopt_session(

@@ -1,6 +1,7 @@
 //! One bounded Router-host supervision pass. No scheduler or UI lives here.
 //! Recovery never replays a stored tool command. It resumes the same member
 //! through Launcher/child_session after durable ownership and Git checks.
+use crate::db::session_store::TaskState;
 use super::{
     model::*, orchestrator::Orchestrator, role::MemberRole, state::StatePolicy, store::TaskStore,
 };
@@ -319,7 +320,7 @@ async fn watch_member(
         task.spec_version,
         role.as_str()
     );
-    let mut ledger: RecoveryLedger = host.context.setting(&key)?.unwrap_or_default();
+    let mut ledger: RecoveryLedger = host.context.db.task_state(&key)?.unwrap_or_default();
     if let Some(recovery) = ledger
         .active
         .clone()
@@ -486,7 +487,7 @@ async fn watch_member(
             resumed_job: None,
             checkpoint_id: None,
         });
-        host.context.save_setting(&key, &ledger)?;
+        host.context.db.save_task_state(&key, &ledger)?;
     }
     let mut recovery = ledger.active.clone().context("Missing recovery journal")?;
     ensure!(
@@ -552,7 +553,7 @@ async fn watch_member(
             if !recovery.stop_requested {
                 recovery.stop_requested = true;
                 ledger.active = Some(recovery.clone());
-                host.context.save_setting(&key, &ledger)?;
+                host.context.db.save_task_state(&key, &ledger)?;
             }
             // Reissue the idempotent signal after a crash between intent and write.
             request_stop(&host.context.paths.data_dir, &job)?;
@@ -587,7 +588,7 @@ async fn watch_member(
             task.task_id, task.phase, task.spec_version, task.review_round, recovery.checkpoint_id, observation, serde_json::to_string(&pending)?
         ));
         ledger.active = Some(recovery.clone());
-        host.context.save_setting(&key, &ledger)?;
+        host.context.db.save_task_state(&key, &ledger)?;
     }
     // The shared resume path rechecks execution ownership. Keep the Router
     // lock across admission; the engine takes its own lifetime execution lease.
@@ -686,7 +687,7 @@ async fn finish_resume(
             }
             recovery.resumed_job = Some(outcome.job_id);
             ledger.active = Some(recovery);
-            host.context.save_setting(key, &ledger)?;
+            host.context.db.save_task_state(key, &ledger)?;
         }
         Ok(_) => {}
         Err(error) => {
@@ -699,7 +700,7 @@ async fn finish_resume(
             recovery.next_attempt_ms =
                 jobs::now().saturating_add(backoff_ms(host, recovery.launch_errors));
             ledger.active = Some(recovery.clone());
-            host.context.save_setting(key, &ledger)?;
+            host.context.db.save_task_state(key, &ledger)?;
             if recovery.launch_errors >= host.config.watcher.max_recovery_attempts {
                 block(
                     host,
@@ -813,11 +814,11 @@ fn pending_tools(host: &Orchestrator, session: &str) -> Result<Vec<PendingTool>>
             // deadline is conservative: never cancel a live tool early by using
             // the assistant message's older creation time as its start.
             let key = format!("super-agent.watcher-tool.{}", digest(&json!([session, id])));
-            let started = match host.context.setting::<u64>(&key)? {
+            let started = match host.context.db.task_state::<u64>(&key)? {
                 Some(t) => t,
                 None => {
                     let t = jobs::now();
-                    host.context.save_setting(&key, &t)?;
+                    host.context.db.save_task_state(&key, &t)?;
                     t
                 }
             };
