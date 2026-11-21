@@ -1,6 +1,7 @@
 //! EnterWorktree and ExitWorktree, as in the reference CLI. They reuse the
 //! session worktree binding behind `dcl --worktree` and `/worktree`, so the
 //! prompt, tools and later turns all resolve the same working directory.
+use crate::db::session_store::{SessionAccess,settings::{EnteredWorktree,ENTERED_WORKTREE}};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -33,9 +34,6 @@ pub fn is_worktree_tool(name: &str) -> bool {
     matches!(name, "EnterWorktree" | "ExitWorktree")
 }
 
-fn entered_key(session: &str) -> String {
-    format!("entered-worktree.{session}")
-}
 
 /// Returns the tool result and the session's new working directory.
 pub async fn execute(
@@ -75,7 +73,7 @@ pub async fn execute(
                     true,
                 ),
             };
-            context.save_setting(&entered_key(session), &json!({"created":created}))?;
+            context.db.select_session(session)?.set_preference(ENTERED_WORKTREE,Some(&EnteredWorktree{created}))?;
             Ok((
                 json!({"worktree_path":path,"content":format!("Switched to worktree {}. The session now works there; use ExitWorktree to return.", path.display())}),
                 path,
@@ -90,9 +88,7 @@ pub async fn execute(
             };
             let action = input["action"].as_str().context("action is required")?;
             let path = PathBuf::from(state["path"].as_str().unwrap_or_default());
-            let created = context
-                .setting::<Value>(&entered_key(session))?
-                .map_or(true, |entered| entered["created"] != false);
+            let created = context.db.select_session(session)?.preference(ENTERED_WORKTREE)?.is_none_or(|entered|entered.created);
             let source = match action {
                 "keep" => hooks::release(root, db, session, false).await?,
                 "remove" => {
@@ -116,7 +112,7 @@ pub async fn execute(
                 }
                 other => bail!("Unsupported action: {other}"),
             };
-            context.save_setting(&entered_key(session), &Value::Null)?;
+            context.db.select_session(session)?.set_preference(ENTERED_WORKTREE,None)?;
             Ok((
                 json!({"working_directory":source,"content":format!("Left the worktree ({action}). Working directory: {}", source.display())}),
                 source,

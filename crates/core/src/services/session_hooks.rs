@@ -1,4 +1,5 @@
 //! Host-owned session hooks; engine workers consume context without rerunning hooks.
+use crate::db::session_store::{SessionAccess,settings};
 use super::{
     tool_hooks::{HookEvent, HookRunner},
     ServiceContext,
@@ -11,9 +12,8 @@ pub(crate) fn key(session: &str) -> String {
     format!("session-start-context:{session}")
 }
 
-pub fn context(context: &ServiceContext, session: &str) -> Result<String> {
-    Ok(context
-        .setting::<String>(&key(session))?
+pub fn context(context: &ServiceContext<impl SessionAccess>, session: &str) -> Result<String> {
+    Ok(context.db.select_session(session)?.preference(settings::SESSION_START_CONTEXT)?
         .unwrap_or_default())
 }
 
@@ -58,9 +58,10 @@ pub async fn start_with_output(
     super::tool_hooks::agent::cancel_session(session);
     super::async_hooks::cancel_shared(&context.paths.data_dir, session).await;
     // Clear previous activation's context before running commands, including failures.
-    context.save_setting(&key(session), &"")?;
+    let repo=context.db.select_session(session)?;
+    repo.set_preference(settings::SESSION_START_CONTEXT,Some(&String::new()))?;
     let outcome = collect_output(context, workspace, session, source, model).await?;
-    context.save_setting(&key(session), &outcome.additional_context.join("\n"))?;
+    repo.set_preference(settings::SESSION_START_CONTEXT,Some(&outcome.additional_context.join("\n")))?;
     Ok(outcome)
 }
 

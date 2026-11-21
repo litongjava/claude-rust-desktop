@@ -1,7 +1,7 @@
 //! Short-lived repository selection for services whose public methods take a session ID.
 use super::{SessionDb, Stores};
 use crate::db::DbManager;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use rusqlite::Connection;
 use std::sync::Arc;
 
@@ -114,24 +114,28 @@ impl SessionRepository<'_> {
 impl SessionRepository<'_> {
     fn preference_key<T>(&self, key: &super::settings::Setting<T>) -> Result<String> {
         let name = key.name.as_ref();
-        anyhow::ensure!(
-            matches!(
-                name,
-                "cli.display"
-                    | "cli.ide"
-                    | "cli.permissions"
-                    | "cli.session"
-                    | "cli.live-requests"
-                    | "microcompact"
-            ),
-            "Expected a CLI preference"
-        );
-        Ok(match &self.0 {
-            Backend::Admitted(_) => name.into(),
-            Backend::Shared(_, id) => format!("{name}.{id}"),
-        })
+        if let Backend::Shared(_, id) = &self.0 {
+            let legacy = match name {
+                "cli.display" | "cli.ide" | "cli.permissions" | "cli.session"
+                | "cli.live-requests" | "microcompact" | "agent-description" | "fork-of" => {
+                    format!("{name}.{id}")
+                }
+                "delegation.progress" => format!("delegation.{id}"),
+                "session-start-context" | "lifecycle-instructions" => format!("{name}:{id}"),
+                "lifecycle-instructions.boundary" => {
+                    format!("lifecycle-instructions:{id}:boundary")
+                }
+                "entered-worktree" => format!("entered-worktree.{id}"),
+                _ => key
+                    .legacy
+                    .as_ref()
+                    .map(|suffix| format!("lifecycle-config:{id}:{suffix}"))
+                    .context("Unsupported session preference")?,
+            };
+            return Ok(legacy);
+        }
+        Ok(name.into())
     }
-
     pub fn preference<T: serde::de::DeserializeOwned>(
         &self,
         key: super::settings::Setting<T>,

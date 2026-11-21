@@ -270,7 +270,7 @@ impl SessionRepository<'_> {
                     if let Some(context) = context {
                         state::set_local(
                             w.0,
-                            &crate::services::session_hooks::key(w.1),
+                            "session-start-context",
                             &serde_json::to_string(context)?,
                         )?;
                     }
@@ -362,7 +362,9 @@ fn legacy_fragments(
 }
 
 impl SessionRepository<'_> {
-    pub(crate) fn latest_compact_content(&self) -> Result<Option<(String,Option<serde_json::Value>)>> {
+    pub(crate) fn latest_compact_content(
+        &self,
+    ) -> Result<Option<(String, Option<serde_json::Value>)>> {
         self.read(|c,id| {
             let join=match self.0 {
                 owned::Backend::Admitted(_) => "LEFT JOIN native_boundaries b ON b.message_id=m.id",
@@ -373,5 +375,11 @@ impl SessionRepository<'_> {
             let row=q.query_row([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?;
             row.map(|(text,native)|Ok((text,native.map(|s|serde_json::from_str(&s)).transpose()?))).transpose()
         })
+    }
+}
+
+impl SessionRepository<'_> {
+    pub(crate) fn latest_compact_message(&self) -> Result<Option<String>> {
+        self.read(|c,id|Ok(c.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",[id],|r|r.get(0)).optional()?))
     }
 }

@@ -13,12 +13,14 @@ use std::{
 
 pub struct Setting<T> {
     pub(super) name: Cow<'static, str>,
+    pub(super) legacy: Option<String>,
     value: PhantomData<fn() -> T>,
 }
 impl<T> Setting<T> {
     const fn new(name: &'static str) -> Self {
         Self {
             name: Cow::Borrowed(name),
+            legacy: None,
             value: PhantomData,
         }
     }
@@ -27,6 +29,11 @@ impl<T> Setting<T> {
         let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
         Self {
             name: Cow::Owned(format!("{name}.{digest:x}")),
+            legacy: Some(if name.ends_with(".rejected") {
+                format!("{}:rejected", workspace.display())
+            } else {
+                workspace.display().to_string()
+            }),
             value: PhantomData,
         }
     }

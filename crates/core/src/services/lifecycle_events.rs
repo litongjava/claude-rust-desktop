@@ -1,4 +1,5 @@
 //! Lifecycle dispatch shared by standalone hosts and the native engine.
+use crate::db::session_store::{SessionAccess,settings as saved};
 use super::{
     tool_hooks::{HookEvent, HookOutcome, HookRunner},
     ServiceContext,
@@ -92,7 +93,7 @@ pub async fn setup(
         text.push('\n');
         text.push_str(&additional);
     }
-    context.save_setting(&super::session_hooks::key(session), &text)?;
+    context.db.select_session(session)?.set_preference(saved::SESSION_START_CONTEXT,Some(&text))?;
     Ok(result.warnings)
 }
 
@@ -115,7 +116,7 @@ pub async fn check_configuration(
             workspace.join(".claude/settings.local.json"),
         ),
     ];
-    let key = format!("lifecycle-config:{session}:{}", workspace.display());
+    let repo=context.db.select_session(session)?;
     let mut current = Vec::new();
     for (_, path) in &sources {
         let text = match std::fs::read_to_string(path) {
@@ -125,15 +126,14 @@ pub async fn check_configuration(
         };
         current.push(text);
     }
-    let rejected_key = format!("{key}:rejected");
     if let Some((rejected, reason)) =
-        context.setting::<(Vec<Option<String>>, String)>(&rejected_key)?
+        repo.preference(saved::rejected_configuration(workspace))?
     {
         if rejected == current {
             anyhow::bail!("{reason}");
         }
     }
-    if let Some(previous) = context.setting::<Vec<Option<String>>>(&key)? {
+    if let Some(previous) = repo.preference(saved::accepted_configuration(workspace))? {
         if previous != current {
             let mut configs = super::plugins::command_hooks(context)?;
             for ((_, path), text) in sources.iter().zip(&previous) {
@@ -159,25 +159,19 @@ pub async fn check_configuration(
                     .await?;
                 if outcome.blocked {
                     let reason = format!("ConfigChange blocked {}: {}. Restore or correct the settings before continuing.", path.display(), outcome.reason);
-                    context.save_setting(&rejected_key, &(current, &reason))?;
+                    repo.set_preference(saved::rejected_configuration(workspace),Some(&(current, reason.clone())))?;
                     anyhow::bail!("{reason}");
                 }
             }
         } else {
-            context.save_setting(
-                &rejected_key,
-                &(Vec::<Option<String>>::new(), String::new()),
-            )?;
+            repo.set_preference(saved::rejected_configuration(workspace),None)?;
             return Ok(());
         }
     }
     // Validate before accepting, including event/type restrictions.
     HookRunner::load_with_plugins(context, workspace)?;
-    context.save_setting(
-        &rejected_key,
-        &(Vec::<Option<String>>::new(), String::new()),
-    )?;
-    context.save_setting(&key, &current)
+    repo.set_preference(saved::rejected_configuration(workspace),None)?;
+    repo.set_preference(saved::accepted_configuration(workspace), Some(&current))
 }
 
 pub async fn instructions(
@@ -186,16 +180,10 @@ pub async fn instructions(
     session: &str,
     files: &[(PathBuf, String)],
 ) -> Result<()> {
-    let key = format!("lifecycle-instructions:{session}");
-    let mut seen = context
-        .setting::<Vec<(PathBuf, String)>>(&key)?
-        .unwrap_or_default();
-    let boundary_key = format!("{key}:boundary");
-    let boundary = context.db.with_conn(|conn| {
-        use rusqlite::OptionalExtension;
-        conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1", [session], |row| row.get::<_, String>(0)).optional()
-    })??;
-    let previous_boundary = context.setting::<Option<String>>(&boundary_key)?.flatten();
+    let repo=context.db.select_session(session)?;
+    let mut seen=repo.preference(saved::SEEN_INSTRUCTIONS)?.unwrap_or_default();
+    let boundary=repo.latest_compact_message()?;
+    let previous_boundary=repo.preference(saved::INSTRUCTIONS_BOUNDARY)?;
     let compact = boundary.is_some() && boundary != previous_boundary;
     if compact {
         seen.clear();
@@ -229,10 +217,10 @@ pub async fn instructions(
         }
         seen.retain(|(loaded, _)| loaded != path);
         seen.push((path.clone(), fingerprint.clone()));
-        context.save_setting(&key, &seen)?;
+        repo.set_preference(saved::SEEN_INSTRUCTIONS,Some(&seen))?;
     }
-    context.save_setting(&key, &seen)?;
-    context.save_setting(&boundary_key, &boundary)?;
+    repo.set_preference(saved::SEEN_INSTRUCTIONS,Some(&seen))?;
+    repo.set_preference(saved::INSTRUCTIONS_BOUNDARY,boundary.as_ref())?;
     Ok(())
 }
 
