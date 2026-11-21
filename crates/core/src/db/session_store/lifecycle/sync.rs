@@ -95,7 +95,12 @@ pub(super) fn workspace(
     remote: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(project) = project else {
-        return Ok(remote.map(str::to_owned));
+        // A private child derives its directory from the local owner incarnation.
+        let private_child = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_private_workspace_bindings WHERE child_id=?1)",
+            [id], |row| row.get::<_, bool>(0),
+        )?;
+        return Ok(if private_child { None } else { remote.map(str::to_owned) });
     };
     let local = project_repo::require_trusted(c, project)?;
     ensure!(!local.is_archived, "Project is archived");

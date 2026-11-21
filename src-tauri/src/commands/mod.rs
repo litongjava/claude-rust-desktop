@@ -309,7 +309,7 @@ fn native_conversation(
         id: row.id,
         title: row.title,
         model: row.model.unwrap_or_default(),
-        workspace_path: row.workspace_path.map(Into::into).unwrap_or(workspace),
+        workspace_path: workspace,
         created_at: row.created_at,
         updated_at: row.updated_at,
         project_id: row.project_id,
@@ -364,7 +364,16 @@ pub async fn native_list_conversations<R: tauri::Runtime>(
             .global()
             .list_sessions(Default::default())?
             .into_iter()
-            .map(|entry| native_conversation(entry.conversation, root.join(entry.workspace_incarnation)))
+            .map(|entry| {
+                let private = root.join(&entry.workspace_incarnation);
+                // Older syncs could persist the sender's path for a private child.
+                let workspace = if entry.workspace_incarnation != entry.incarnation {
+                    private
+                } else {
+                    entry.conversation.workspace_path.as_ref().map(std::path::PathBuf::from).unwrap_or(private)
+                };
+                native_conversation(entry.conversation, workspace)
+            })
             .collect())
     })
     .await

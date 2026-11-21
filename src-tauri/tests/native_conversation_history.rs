@@ -116,12 +116,68 @@ async fn native_and_bridge_share_conversation_history() {
 #[tokio::test]
 async fn native_list_uses_private_child_workspace_binding() {
     let root = tempfile::tempdir().unwrap();
-    let db = RuntimePaths::new(root.path().into()).unwrap().open_database().unwrap();
+    let db = RuntimePaths::new(root.path().into())
+        .unwrap()
+        .open_database()
+        .unwrap();
     let owner = db.create("owner", Default::default()).unwrap();
     let workspace = owner.workspace().unwrap();
     owner.derive_owned_child("child", &workspace).unwrap();
     let app = tauri::test::mock_app();
     app.manage(db);
-    let rows = commands::native_list_conversations(app.handle().clone()).await.unwrap();
-    assert_eq!(rows.iter().find(|r| r.id == "child").unwrap().workspace_path, workspace);
+    let rows = commands::native_list_conversations(app.handle().clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == "child")
+            .unwrap()
+            .workspace_path,
+        workspace
+    );
+}
+
+#[tokio::test]
+async fn private_child_keeps_owner_workspace_after_newer_sync() {
+    let root = tempfile::tempdir().unwrap();
+    let db = RuntimePaths::new(root.path().into())
+        .unwrap()
+        .open_database()
+        .unwrap();
+    let owner = db.create("owner", Default::default()).unwrap();
+    let workspace = owner.workspace().unwrap();
+    let child = owner.derive_owned_child("child", &workspace).unwrap();
+    let header = serde_json::from_value(json!({
+        "id":"child", "title":"synced", "workspacePath":"/other-device/project",
+        "createdAt":"2026-01-10T00:00:00Z", "updatedAt":"2099-01-10T00:00:01Z"
+    }))
+    .unwrap();
+    db.sync_conversation("child", Some(&header), &[]).unwrap();
+    assert_eq!(
+        db.conversation_metadata("child")
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("synced")
+    );
+    assert!(db
+        .conversation_metadata("child")
+        .unwrap()
+        .unwrap()
+        .workspace_path
+        .is_none());
+    assert_eq!(child.workspace().unwrap(), workspace);
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    let rows = commands::native_list_conversations(app.handle().clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == "child")
+            .unwrap()
+            .workspace_path,
+        workspace
+    );
 }
