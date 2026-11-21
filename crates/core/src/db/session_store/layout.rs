@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 pub(super) const GLOBAL_VERSION: i32 = 15;
-pub(super) const SESSION_VERSION: i32 = 9;
+pub(super) const SESSION_VERSION: i32 = 10;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -249,10 +249,6 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                     install_session_v4(&tx)?;
                     super::history::flush_summary(&tx)?;
                 }
-                let previous: i64 =
-                    tx.query_row("SELECT transcript_bytes FROM projection_state", [], |r| {
-                        r.get(0)
-                    })?;
                 if version < 5 {
                     tx.execute_batch(include_str!("session_v5.sql"))?;
                 }
@@ -262,7 +258,15 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                 tx.execute_batch(include_str!("session_v7.sql"))?;
                 tx.execute_batch(include_str!("session_v9.sql"))?;
                 super::admission::install(path)?;
-                tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
+                if version < 10 {
+                    tx.execute_batch(include_str!("session_v10.sql"))?;
+                    tx.execute("UPDATE projection_state SET prompts_dirty=1", [])?;
+                    super::history::flush_summary(tx)?;
+                    tx.execute(
+                        "UPDATE manifest SET content_revision=content_revision+1",
+                        [],
+                    )?;
+                }
             }
             if kind == GLOBAL {
                 if version < 5 {
@@ -661,6 +665,7 @@ pub(super) fn initialize(
         tx.execute_batch(include_str!("session_v6.sql"))?;
         tx.execute_batch(include_str!("session_v7.sql"))?;
         tx.execute_batch(include_str!("session_v9.sql"))?;
+        tx.execute_batch(include_str!("session_v10.sql"))?;
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;

@@ -41,9 +41,25 @@ pub(super) fn flush_summary(c: &Connection) -> Result<()> {
     )?;
     if dirty {
         let first: Option<String> = c.query_row("SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1", [], |r|r.get(0)).optional()?;
-        c.execute("UPDATE projection_state SET first_prompt=?1,
-            latest_prompt=(SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
-            prompts_dirty=0,history_edit=NULL WHERE singleton=1", [first.as_deref().and_then(crate::db::conversation_repo::prompt_title)])?;
+        let latest: Option<String> = c
+            .query_row(
+                "SELECT content FROM messages WHERE role='user' ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.execute(
+            "UPDATE projection_state SET first_prompt=?1,latest_prompt=?2,
+            prompts_dirty=0,history_edit=NULL WHERE singleton=1",
+            params![
+                first
+                    .as_deref()
+                    .and_then(crate::db::conversation_repo::prompt_title),
+                latest
+                    .as_deref()
+                    .map(|text| text.lines().next().unwrap_or_default())
+            ],
+        )?;
     } else if history_dirty {
         c.execute(
             "UPDATE projection_state SET history_edit=NULL WHERE singleton=1",

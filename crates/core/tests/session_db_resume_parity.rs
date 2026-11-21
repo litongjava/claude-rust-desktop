@@ -141,3 +141,47 @@ fn default_fork_title_uses_the_displayed_source_title() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn latest_preview_uses_creation_time_after_import() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let db = Stores::open(root.path())?;
+    let id = "00000000-0000-4000-8000-000000000019";
+    let shard = db.create(id, Default::default())?;
+    let first_line = "recent ".repeat(18).trim_end().to_owned();
+    shard.write(|w| {
+        w.append("user", &format!("{first_line}\nsecond line"))?;
+        w.append("user", "last in transcript")?;
+        Ok(())
+    })?;
+    let mut rows = db.sync_messages(id)?;
+    rows[0].created_at = "2026-11-20T00:00:00Z".into();
+    rows[1].created_at = "2025-11-20T00:00:00Z".into();
+    db.sync_conversation(id, None, &rows)?;
+    let entry = db.resume_entries("other", None)?.pop().unwrap();
+    assert_eq!(entry.latest.as_deref(), Some(first_line.as_str()));
+    drop((shard, db));
+
+    let old = rusqlite::Connection::open(root.path().join("sessions").join(id).join("session.db"))?;
+    old.execute_batch(
+        "UPDATE projection_state SET latest_prompt='last in transcript'; PRAGMA user_version=9",
+    )?;
+    drop(old);
+    let global = rusqlite::Connection::open(root.path().join("global.db"))?;
+    global.execute(
+        "UPDATE conversations SET latest_prompt='last in transcript' WHERE id=?1",
+        [id],
+    )?;
+    drop(global);
+    let db = Stores::open(root.path())?;
+    db.open_session(id)?;
+    assert_eq!(
+        db.resume_entries("other", None)?
+            .pop()
+            .unwrap()
+            .latest
+            .as_deref(),
+        Some(first_line.as_str())
+    );
+    Ok(())
+}
