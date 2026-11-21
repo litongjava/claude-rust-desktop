@@ -2016,7 +2016,7 @@ impl Session {
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
-        let history = turn.history();
+        let transcript = turn.history();
         // Captures the signal count synchronously, before any await. A Ctrl-C
         // delivered while an event is being handled is therefore still seen by
         // the next wait, instead of becoming that wait's baseline.
@@ -2338,7 +2338,7 @@ impl Session {
                     _ = refresh.tick() => {
                         progress.tick();
                         if background_transcript {
-                            best_effort_live_write("transcript", live_transcript.flush(&history, &assistant_id, &text, &thinking_text, &tools));
+                            best_effort_live_write("transcript", live_transcript.flush(&transcript, &assistant_id, &text, &thinking_text, &tools));
                         }
                         if interactive_display {
                             for notice in crate::background_commands::collect_completed(self)? { progress.notice(&notice); }
@@ -2429,7 +2429,7 @@ impl Session {
                 live_transcript.observe(&event, &mut tools);
                 if background_transcript {
                     if matches!(&event, EngineEvent::ToolUseStart { .. } | EngineEvent::ToolUseDone { .. } | EngineEvent::PipelineToolResult { .. } | EngineEvent::ToolPermission { .. } | EngineEvent::AskUser { .. }) {
-                        best_effort_live_write("transcript", live_transcript.flush(&history, &assistant_id, &text, &thinking_text, &tools));
+                        best_effort_live_write("transcript", live_transcript.flush(&transcript, &assistant_id, &text, &thinking_text, &tools));
                     }
                 }
                 match event {
@@ -2453,7 +2453,7 @@ impl Session {
                     },
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
                     EngineEvent::ContextReset { session_id, boundary_id } if session_id == self.id => {
-                        history.save_segment(&assistant_id, SegmentUpdate {
+                        transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
@@ -2713,7 +2713,7 @@ impl Session {
                             if let Some(tool) = tools.last() {
                                 let inputs = queued_inputs_by_tool.entry(tool.id.clone()).or_default();
                                 inputs.push(delivered.clone());
-                                history.save_segment(&assistant_id, SegmentUpdate {
+                                transcript.save_segment(&assistant_id, SegmentUpdate {
                                     text: Some(&text), tools: std::slice::from_ref(tool),
                                     inputs: Some(&queued_inputs_by_tool), ..Default::default()
                                 })?;
@@ -2828,7 +2828,7 @@ impl Session {
                         session_id,
                         boundary_id,
                     } if session_id == self.id => {
-                        history.save_segment(&assistant_id, SegmentUpdate {
+                        transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
@@ -2876,7 +2876,7 @@ impl Session {
                 live_transcript.dirty = true;
                 best_effort_live_write(
                     "transcript",
-                    live_transcript.flush(&history,
+                    live_transcript.flush(&transcript,
                         &assistant_id,
                         &text,
                         &thinking_text,
@@ -2890,7 +2890,7 @@ impl Session {
             deepseek_code_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
         if latest_boundary != observed_plan_boundary {
             if let Some(boundary) = latest_boundary {
-                history.save_segment(&assistant_id, SegmentUpdate {
+                transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
@@ -2938,7 +2938,7 @@ impl Session {
         if !completed && error.is_none() {
             error = Some("Incomplete response".into());
         }
-        history.save_segment(&assistant_id, SegmentUpdate {
+        transcript.save_segment(&assistant_id, SegmentUpdate {
             text: Some(&text),
             thinking: (!thinking_text.is_empty()).then_some(thinking_text.as_str()),
             tools: &tools, origins: Some(&live_transcript.origins),
