@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::message_repo;
+use crate::services::lifecycle_events::NewSessionConfiguration;
 use rusqlite::{params_from_iter, types::Value};
 use serde_json::Value as Json;
 
@@ -139,7 +140,7 @@ impl SessionDb {
         })
     }
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
-        self.branch_at(destination, boundary, None, None)
+        self.branch_at(destination, boundary, None, None, None)
     }
     pub fn derive_owned_child(&self, destination: &str, expected_cwd: &Path) -> Result<SessionDb> {
         self.branch_at(
@@ -147,12 +148,14 @@ impl SessionDb {
             Branch::Child,
             Some(expected_cwd.canonicalize()?),
             None,
+            None,
         )
     }
     pub fn clear_with_provider(
         &self,
         destination: &str,
         snapshot: &crate::native_engine::session_binding::BindingSnapshot,
+        configuration: Option<&NewSessionConfiguration>,
     ) -> Result<SessionDb> {
         self.branch_at(
             destination,
@@ -161,6 +164,7 @@ impl SessionDb {
             Some(super::super::binding::ClearBinding::from_snapshot(
                 snapshot,
             )?),
+            configuration,
         )
     }
     fn branch_at(
@@ -169,6 +173,7 @@ impl SessionDb {
         boundary: Branch<'_>,
         expected_cwd: Option<PathBuf>,
         provider_selection: Option<super::super::binding::ClearBinding>,
+        configuration: Option<&NewSessionConfiguration>,
     ) -> Result<SessionDb> {
         let dest = storage_key(destination)?;
         ensure!(dest != self.key, "Source and destination must differ");
@@ -224,7 +229,7 @@ impl SessionDb {
         s.create_locked(
             destination,
             options,
-            Seed::Fork(self, boundary),
+            Seed::Fork(self, boundary, configuration),
             Some(Source {
                 id: self.id.clone(),
                 incarnation: self.incarnation.clone(),
@@ -547,6 +552,7 @@ pub(super) fn copy_snapshot(
     dst: &Connection,
     id: &str,
     boundary: Branch<'_>,
+    configuration: Option<&NewSessionConfiguration>,
     copy_preferences: bool,
 ) -> Result<()> {
     let path = source
@@ -563,6 +569,10 @@ pub(super) fn copy_snapshot(
         &source.id,
         &source.incarnation,
     )?;
+    if let Some(configuration) = configuration {
+        let key = super::super::settings::accepted_configuration(&configuration.workspace);
+        super::super::state::set_local(dst, &key.name, &serde_json::to_string(&configuration.files)?)?;
+    }
     if copy_preferences {
         for (key, value) in preference_snapshot(&tx, source.id(), id)? {
             super::super::state::set_local(dst, &key, &value)?;

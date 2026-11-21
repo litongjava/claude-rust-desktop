@@ -1085,14 +1085,17 @@ impl Session {
         let id = uuid::Uuid::new_v4().to_string();
         // Everything fallible runs before the commit: the target hooks are
         // preflighted while the old conversation still owns the lifecycle.
-        let prepared = if self.lifecycle_owned {
-            Some(self.prepare_start_hooks(&id, &self.workspace).await?)
+        let configuration = if self.lifecycle_owned {
+            let context = self.hook_service_context();
+            Some(deepseek_code_core::services::lifecycle_events::prepare_new_configuration(
+                &context, &self.workspace,
+            )?)
         } else {
             None
         };
         // Read under the old id, before the commit below.
         let mut state = (*self.binding.read().context("Missing session binding")?).clone();
-        let next=self.store.db.open_session(&self.id)?.clear_with_provider(&id,&state).context("Clear did not apply")?;
+        let next=self.store.db.open_session(&self.id)?.clear_with_provider(&id, &state, configuration.as_ref()).context("Clear did not apply")?;
         state.generation=1;
         let target=deepseek_code_core::native_engine::session_binding::SessionBinding::default();
         let policy=self.store.db.request_recording_policy(&self.id);
@@ -1106,7 +1109,7 @@ impl Session {
         self.waiting_for_continue
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.replace_coordination().await;
-        if prepared == Some(true) {
+        if configuration.is_some() {
             self.finish_committed_start_hooks("clear").await;
         }
         Ok(id)

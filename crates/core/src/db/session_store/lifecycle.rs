@@ -260,7 +260,7 @@ impl Intent {
 enum Seed<'a> {
     New,
     Feishu(&'a str),
-    Fork(&'a SessionDb, Branch<'a>),
+    Fork(&'a SessionDb, Branch<'a>, Option<&'a crate::services::lifecycle_events::NewSessionConfiguration>),
     Import(&'a import::LegacySession),
     Project(&'a Project, &'a crate::worktree::session::PreparedWorkspace),
     Sync(sync::SyncSeed<'a>),
@@ -483,11 +483,12 @@ impl Stores {
                 }
                 match seed {
                     Seed::New | Seed::Feishu(_) | Seed::Project(..) => {}
-                    Seed::Fork(source, boundary) => copy::copy_snapshot(
+                    Seed::Fork(source, boundary, configuration) => copy::copy_snapshot(
                         source,
                         tx,
                         &op.id,
                         boundary,
+                        configuration,
                         meta.source
                             .as_ref()
                             .is_some_and(|s| s.provider_selection.is_some()),

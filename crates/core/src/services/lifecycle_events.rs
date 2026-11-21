@@ -97,14 +97,16 @@ pub async fn setup(
     Ok(result.warnings)
 }
 
-/// Check before consuming changed settings. Keep the accepted hook definitions so a
-/// changed file cannot remove its own ConfigChange guard. A denied change fails closed
-/// until corrected; the original settings file is never rewritten.
-pub async fn check_configuration(
+/// The configuration baseline to seal with a new session before it becomes visible.
+pub struct NewSessionConfiguration {
+    pub(crate) workspace: PathBuf,
+    pub(crate) files: Vec<Option<String>>,
+}
+
+fn configuration_files(
     context: &ServiceContext,
     workspace: &Path,
-    session: &str,
-) -> Result<()> {
+) -> Result<([(&'static str, PathBuf); 3], Vec<Option<String>>)> {
     let sources = [
         (
             "user_settings",
@@ -116,7 +118,6 @@ pub async fn check_configuration(
             workspace.join(".claude/settings.local.json"),
         ),
     ];
-    let repo=context.db.select_session(session)?;
     let mut current = Vec::new();
     for (_, path) in &sources {
         let text = match std::fs::read_to_string(path) {
@@ -126,6 +127,36 @@ pub async fn check_configuration(
         };
         current.push(text);
     }
+    Ok((sources, current))
+}
+
+pub fn prepare_new_configuration(
+    context: &ServiceContext,
+    workspace: &Path,
+) -> Result<NewSessionConfiguration> {
+    let (sources, files) = configuration_files(context, workspace)?;
+    let mut configs = super::plugins::command_hooks(context)?;
+    for ((_, path), content) in sources.into_iter().zip(&files) {
+        if let Some(content) = content {
+            let value = serde_json::from_str(content.trim_start_matches('\u{feff}'))
+                .with_context(|| format!("Invalid hook settings: {}", path.display()))?;
+            configs.push((path, value));
+        }
+    }
+    HookRunner::from_configs(&context.paths.data_dir, workspace, configs)?;
+    Ok(NewSessionConfiguration { workspace: workspace.to_owned(), files })
+}
+
+/// Check before consuming changed settings. Keep the accepted hook definitions so a
+/// changed file cannot remove its own ConfigChange guard. A denied change fails closed
+/// until corrected; the original settings file is never rewritten.
+pub async fn check_configuration(
+    context: &ServiceContext,
+    workspace: &Path,
+    session: &str,
+) -> Result<()> {
+    let (sources, current) = configuration_files(context, workspace)?;
+    let repo = context.db.select_session(session)?;
     if let Some((rejected, reason)) =
         repo.preference(saved::rejected_configuration(workspace))?
     {
