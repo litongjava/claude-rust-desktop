@@ -1,6 +1,6 @@
 //! Nonblocking goal consent. A model proposal is never human authorization.
 use crate::{
-    db::DbManager,
+    db::session_store::{ExecutorHistory, HookSessions, SessionAccess},
     permissions::{PermissionContext, PermissionManager, PermissionMode, PermissionResult},
 };
 use anyhow::{ensure, Context, Result};
@@ -59,19 +59,12 @@ pub(crate) fn read(conn: &Connection, session: &str) -> Result<ProposalState> {
         .unwrap_or_default())
 }
 fn update<T>(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
-    f: impl FnOnce(&Connection, &mut State) -> Result<T>,
+    f: impl FnMut(&Connection, &mut State) -> Result<T>,
 ) -> Result<T> {
-    db.with_conn(|conn| update_conn(conn, session, f))?
-}
-fn update_conn<T>(conn: &Connection, session: &str, f: impl FnOnce(&Connection, &mut State) -> Result<T>) -> Result<T> {
-    let tx = crate::db::write_transaction(conn)?;
-    let mut state = read(&tx, session)?;
-    let result = f(&tx, &mut state)?;
-    save_state(&tx, session, &state)?;
-    tx.commit()?;
-    Ok(result)
+    db.select_session(session)?
+        .edit_proposal(crate::db::STARTUP_WRITE_DEADLINE, f)
 }
 pub(crate) fn save_state(conn: &Connection, session: &str, state: &ProposalState) -> Result<()> {
     conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value", [format!("session.goal-proposals.{session}"), serde_json::to_string(state)?])?;
@@ -99,13 +92,16 @@ fn prune(conn: &Connection, session: &str, state: &mut State) -> Result<()> {
 /// Only the actual local terminal owner constructs this lease. Worker and SDK
 /// processes cannot infer interactivity from inherited environment variables.
 pub struct Frontend {
-    db: Arc<DbManager>,
+    db: ExecutorHistory,
     session: String,
     id: String,
     heartbeat: AtomicI64,
 }
 impl Frontend {
-    pub fn acquire(db: Arc<DbManager>, session: &str) -> Result<Self> {
+    pub fn acquire(db: Arc<impl HookSessions>, session: &str) -> Result<Self> {
+        let db = db
+            .hook_history(session)?
+            .context("Goal frontend session is missing")?;
         let id = uuid::Uuid::new_v4().to_string();
         update(&db, session, |_, state| {
             ensure!(
@@ -128,45 +124,42 @@ impl Frontend {
     pub fn poll(&self) -> Result<Option<Proposal>> {
         let current = now();
         if current.saturating_sub(self.heartbeat.load(Ordering::Relaxed)) < 1_000 {
-            return self.db.with_conn(|conn| -> Result<Option<Proposal>> {
-                let state = read(conn, &self.session)?;
-                ensure!(
-                    state
-                        .frontend
-                        .as_ref()
-                        .is_some_and(|f| f.id == self.id && live(f)),
-                    "Goal proposal frontend ownership changed"
-                );
-                let Some(proposal) = state
-                    .pending
-                    .filter(|p| !p.approved && p.frontend == self.id)
-                else {
-                    return Ok(None);
-                };
-                Ok(
-                    (proposal.revision
+            return self.db.select_session(&self.session)?.inspect_proposal(
+                |conn| -> Result<Option<Proposal>> {
+                    let state = read(conn, &self.session)?;
+                    ensure!(
+                        state
+                            .frontend
+                            .as_ref()
+                            .is_some_and(|f| f.id == self.id && live(f)),
+                        "Goal proposal frontend ownership changed"
+                    );
+                    let Some(proposal) = state
+                        .pending
+                        .filter(|p| !p.approved && p.frontend == self.id)
+                    else {
+                        return Ok(None);
+                    };
+                    Ok((proposal.revision
                         == super::session_goals::revision_conn(conn, &self.session)?)
-                    .then_some(proposal),
-                )
-            })?;
+                    .then_some(proposal))
+                },
+            );
         }
-        let proposal = self.db.with_conn(|conn| -> Result<_> {
-            // A view heartbeat must not block event rendering for the normal write timeout.
-            let timeout: u64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-            conn.busy_timeout(std::time::Duration::from_millis(25))?;
-            let result = update_conn(conn, &self.session, |conn, state| {
+        let proposal = self.db.select_session(&self.session)?.edit_proposal(
+            std::time::Duration::from_millis(25),
+            |conn, state| {
                 // Expired consent must not be revived by a recovered heartbeat.
                 prune(conn, &self.session, state)?;
-                let frontend = state.frontend.as_mut().filter(|f| f.id == self.id)
+                let frontend = state
+                    .frontend
+                    .as_mut()
+                    .filter(|f| f.id == self.id)
                     .context("Goal proposal frontend ownership changed")?;
                 frontend.touched_ms = now();
                 Ok(state.pending.as_ref().filter(|p| !p.approved).cloned())
-            });
-            let restored = conn.busy_timeout(std::time::Duration::from_millis(timeout));
-            let value = result?;
-            restored?;
-            Ok(value)
-        })??;
+            },
+        )?;
         // Failed heartbeats remain due, including after the previous lease expires.
         self.heartbeat.store(now(), Ordering::Relaxed);
         Ok(proposal)
@@ -180,12 +173,15 @@ impl Frontend {
         permissions: &PermissionManager,
     ) -> Result<bool> {
         let policy = if approved {
-            let condition = self.db.with_conn(|conn| -> Result<_> {
-                Ok(read(conn, &self.session)?
-                    .pending
-                    .filter(|p| p.id == id && !p.approved)
-                    .map(|p| p.condition))
-            })??;
+            let condition =
+                self.db
+                    .select_session(&self.session)?
+                    .inspect_proposal(|conn| -> Result<_> {
+                        Ok(read(conn, &self.session)?
+                            .pending
+                            .filter(|p| p.id == id && !p.approved)
+                            .map(|p| p.condition))
+                    })?;
             let Some(condition) = condition else {
                 return Ok(false);
             };
@@ -198,7 +194,13 @@ impl Frontend {
         } else {
             None
         };
-        update(&self.db, &self.session, |conn, state| {
+        let owner = self.db.select_session(&self.session)?;
+        let trust = if approved {
+            owner.proposal_project_trust()?
+        } else {
+            None
+        };
+        owner.edit_proposal(crate::db::STARTUP_WRITE_DEADLINE, |conn, state| {
             prune(conn, &self.session, state)?;
             ensure!(
                 state
@@ -224,6 +226,7 @@ impl Frontend {
                     "ProposeGoal tool policy changed"
                 );
                 guard(
+                    trust,
                     conn,
                     &self.session,
                     root,
@@ -266,6 +269,7 @@ fn settings(path: &Path) -> Result<Value> {
     }
 }
 fn guard(
+    directory_trust: Option<bool>,
     conn: &Connection,
     session: &str,
     root: &Path,
@@ -279,7 +283,12 @@ fn guard(
             "The proposing task was cancelled"
         );
     }
-    crate::native_engine::workspace::conversation_project(conn, session)?;
+    match directory_trust {
+        Some(trusted) => ensure!(trusted, "Session project is no longer trusted"),
+        None => {
+            crate::native_engine::workspace::conversation_project(conn, session)?;
+        }
+    }
     let mode: Option<String> = conn
         .query_row(
             "SELECT value FROM peripheral_settings WHERE key=?1",
@@ -341,7 +350,7 @@ fn review_policy(
     Ok(policy)
 }
 pub fn available(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     root: &Path,
     workspace: &Path,
@@ -350,15 +359,20 @@ pub fn available(
     let Ok(policy) = review_policy(permissions, session, workspace, "") else {
         return false;
     };
-    db.with_conn(|conn| -> Result<bool> {
-        let state = read(conn, session)?;
-        Ok(permissions.policy_snapshot() == policy
-            && state.frontend.as_ref().is_some_and(live)
-            && guard(conn, session, root, workspace, permissions, "").is_ok())
-    })
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or(false)
+    let Ok(owner) = db.select_session(session) else {
+        return false;
+    };
+    let Ok(trust) = owner.proposal_project_trust() else {
+        return false;
+    };
+    owner
+        .inspect_proposal(|conn| {
+            let state = read(conn, session)?;
+            Ok(permissions.policy_snapshot() == policy
+                && state.frontend.as_ref().is_some_and(live)
+                && guard(trust, conn, session, root, workspace, permissions, "").is_ok())
+        })
+        .unwrap_or(false)
 }
 fn canonical_condition(condition: &str) -> Result<String> {
     let visible: String = condition.chars().filter(|c| !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') && (!c.is_control() || c.is_whitespace())).collect();
@@ -377,7 +391,7 @@ fn canonical_condition(condition: &str) -> Result<String> {
     Ok(visible)
 }
 pub fn propose(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     root: &Path,
     workspace: &Path,
@@ -395,13 +409,15 @@ pub fn propose(
         .transpose()?
         .unwrap_or(true);
     let policy = review_policy(permissions, session, workspace, &condition)?;
-    update(db, session, |conn, state| {
+    let owner = db.select_session(session)?;
+    let trust = owner.proposal_project_trust()?;
+    owner.edit_proposal(crate::db::STARTUP_WRITE_DEADLINE,|conn, state| {
         ensure!(
             permissions.policy_snapshot() == policy,
             "ProposeGoal tool policy changed"
         );
         prune(conn, session, state)?;
-        let always_ask = guard(conn, session, root, workspace, permissions, &condition)?;
+        let always_ask = guard(trust,conn, session, root, workspace, permissions, &condition)?;
         let frontend = state
             .frontend
             .as_ref()
@@ -474,7 +490,7 @@ fn source_job_allows_activation(root: &Path, session: &str, proposal: &Proposal)
 /// Consume a proven frontend approval exactly once at an execution boundary.
 /// This is the only path that converts a proposal into human authority.
 pub fn activate(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     root: &Path,
     workspace: &Path,
@@ -486,7 +502,7 @@ pub fn activate(
 /// A frontend may only complete consent originating from the job it observed.
 /// Missing source metadata is retained for compatibility with older proposals.
 pub fn activate_from_job(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     root: &Path,
     workspace: &Path,
@@ -497,21 +513,23 @@ pub fn activate_from_job(
 }
 
 fn activate_at_boundary(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     root: &Path,
     workspace: &Path,
     permissions: &PermissionManager,
     expected_job: Option<&str>,
 ) -> Result<Option<String>> {
-    let pending = db.with_conn(|conn| -> Result<_> {
+    let owner = db.select_session(session)?;
+    let pending = owner.inspect_proposal(|conn| -> Result<_> {
         Ok(read(conn, session)?.pending.filter(|p| p.approved))
-    })??;
+    })?;
     let Some(pending) = pending else {
         return Ok(None);
     };
     let policy = review_policy(permissions, session, workspace, &pending.condition);
-    update(db, session, |conn, state| {
+    let trust = owner.proposal_project_trust()?;
+    owner.edit_proposal(crate::db::STARTUP_WRITE_DEADLINE,|conn, state| {
         prune(conn, session, state)?;
         let Some(proposal) = state
             .pending
@@ -533,7 +551,7 @@ fn activate_at_boundary(
                 .as_ref()
                 .is_ok_and(|snapshot| *snapshot == permissions.policy_snapshot())
             || guard(
-                conn,
+                trust,conn,
                 session,
                 root,
                 workspace,
@@ -555,7 +573,7 @@ fn activate_at_boundary(
 
 /// A Stop hook may forbid every form of automatic continuation, including a
 /// proposal approved during the turn but not yet activated.
-pub fn discard(db: &DbManager, session: &str) -> Result<()> {
+pub fn discard(db: &impl SessionAccess, session: &str) -> Result<()> {
     update(db, session, |_, state| {
         state.pending = None;
         Ok(())
@@ -572,6 +590,7 @@ pub fn definition() -> crate::tools::ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbManager;
     use crate::{
         permissions::AuditLogger,
         runtime::SessionStore,
@@ -604,9 +623,14 @@ mod tests {
         assert!(!recovered.approved);
         assert!(frontend.heartbeat.load(Ordering::Relaxed) > 0);
         assert!(f.activate().unwrap().is_none());
-        let timeout: u64 = f.db.with_conn(|conn| conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))).unwrap().unwrap();
+        let timeout: u64 =
+            f.db.with_conn(|conn| conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)))
+                .unwrap()
+                .unwrap();
         assert_eq!(timeout, 5000);
-        assert!(!crate::db::is_contention(&anyhow::anyhow!("database is locked")));
+        assert!(!crate::db::is_contention(&anyhow::anyhow!(
+            "database is locked"
+        )));
     }
     #[test]
     fn recovered_heartbeat_cannot_revive_expired_consent() {

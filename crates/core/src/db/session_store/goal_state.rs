@@ -41,3 +41,52 @@ impl SessionRepository<'_> {
         self.read(|c, id| permission_authority::history_conn(c, id, limit))
     }
 }
+
+impl SessionRepository<'_> {
+    /// Read the proposal state and revision in a single snapshot.
+    pub(crate) fn inspect_proposal<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        self.read(|c, _| f(c))
+    }
+
+    pub(crate) fn edit_proposal<T>(
+        &self,
+        deadline: std::time::Duration,
+        mut change: impl FnMut(
+            &rusqlite::Connection,
+            &mut crate::services::goal_proposals::ProposalState,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        use super::owned::Backend;
+        let mut apply = |c: &rusqlite::Connection, id: &str| {
+            let mut state = crate::services::goal_proposals::read(c, id)?;
+            let result = change(c, &mut state)?;
+            crate::services::goal_proposals::save_state(c, id, &state)?;
+            Ok(result)
+        };
+        match &self.0 {
+            Backend::Admitted(s) => {
+                let _locks = s.stores.key_lock(&s.key, false, false)?;
+                s.write_locked_with_deadline("goal proposal", deadline, |w| apply(w.0, w.1))
+            }
+            Backend::Shared(db, id) => db.with_conn(|c| {
+                crate::db::write_tx(c, "goal proposal", deadline, |tx| apply(tx, id))
+            })?,
+        }
+    }
+
+    /// Directory trust is checked at admission; the selected incarnation cannot acquire
+    /// another session's consent. Shared-store transactions can check trust locally.
+    pub(crate) fn proposal_project_trust(&self) -> Result<Option<bool>> {
+        match &self.0 {
+            super::owned::Backend::Admitted(_) => self.directory_snapshot(|c, id| {
+                Ok(Some(
+                    crate::native_engine::workspace::conversation_project(c, id).is_ok(),
+                ))
+            }),
+            super::owned::Backend::Shared(..) => Ok(None),
+        }
+    }
+}
