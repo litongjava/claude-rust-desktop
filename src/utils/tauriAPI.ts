@@ -141,7 +141,7 @@ export const nativeEngineAPI = {
   },
 
   async createConversation(request: CreateConversationRequest): Promise<ConversationInfo> {
-    return invoke('native_create_conversation', { request });
+    return invoke('native_create_conversation', { model: request.model, title: request.title });
   },
 
   async listConversations(): Promise<ConversationInfo[]> {

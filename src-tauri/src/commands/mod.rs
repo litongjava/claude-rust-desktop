@@ -31,7 +31,7 @@ use crate::mcp::states as mcp_states;
 use crate::mcp::states::McpState;
 use crate::native_engine::engine_core::ChatRequest as NativeChatRequest;
 use crate::native_engine::provider_manager::{Provider, ProviderManager};
-use crate::native_engine::session_manager::{Conversation, Message, SessionManager};
+use crate::native_engine::session_manager::{Conversation, Message, ToolCallRecord};
 use crate::permissions::{DangerousTool, PermissionMode};
 use crate::slash_commands::{SlashCommand, SlashCommandRegistry};
 use crate::cost_tracker::{CostSummary, CostTracker, SessionCost};
@@ -301,71 +301,137 @@ pub async fn native_chat(
     Err("native_chat not implemented in commands".to_string())
 }
 
+fn native_conversation(
+    row: crate::db::conversation_repo::ConversationRow,
+    workspace: std::path::PathBuf,
+) -> Conversation {
+    Conversation {
+        id: row.id,
+        title: row.title,
+        model: row.model.unwrap_or_default(),
+        workspace_path: row.workspace_path.map(Into::into).unwrap_or(workspace),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        project_id: row.project_id,
+        research_mode: row.research_mode,
+        claude_session_id: None,
+        pending_resume_at: None,
+    }
+}
+
+async fn native_history<R: tauri::Runtime, T: Send + 'static>(
+    app: tauri::AppHandle<R>,
+    operation: impl FnOnce(&Stores) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    let db = app.state::<Arc<Stores>>().inner().clone();
+    tokio::task::spawn_blocking(move || operation(&db))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-pub async fn native_create_conversation(
-    app_handle: tauri::AppHandle,
+pub async fn native_create_conversation<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
     model: String,
     title: Option<String>,
 ) -> Result<Conversation, String> {
-    let session_state = app_handle.state::<Arc<Mutex<Option<SessionManager>>>>();
-    let mut session_guard = session_state.lock().await;
-    if let Some(session_mgr) = session_guard.as_mut() {
-        let conversation = session_mgr.create_conversation(model, title, false);
-        if let Err(e) = session_mgr.save() {
-            tracing::warn!(module = "Commands", "Failed to save session: {}", e);
-        }
-        Ok(conversation)
-    } else {
-        Err("SessionManager not initialized".to_string())
-    }
+    native_history(app_handle, move |db| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let shard = db.create(
+            &id,
+            crate::db::session_store::CreateOptions {
+                title,
+                model: Some(model),
+                ..Default::default()
+            },
+        )?;
+        let row = db
+            .conversation_metadata(&id)?
+            .ok_or_else(|| anyhow::anyhow!("Conversation retired"))?;
+        Ok(native_conversation(row, shard.workspace()?))
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn native_list_conversations(
-    app_handle: tauri::AppHandle,
+pub async fn native_list_conversations<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
 ) -> Result<Vec<Conversation>, String> {
-    let session_state = app_handle.state::<Arc<Mutex<Option<SessionManager>>>>();
-    let session_guard = session_state.lock().await;
-    if let Some(session_mgr) = session_guard.as_ref() {
-        Ok(session_mgr.list_conversations().to_vec())
-    } else {
-        Err("SessionManager not initialized".to_string())
-    }
+    native_history(app_handle, |db| {
+        let root = db.data_dir().join("workspaces");
+        Ok(db
+            .global()
+            .list_sessions(Default::default())?
+            .into_iter()
+            .map(|entry| native_conversation(entry.conversation, root.join(entry.incarnation)))
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn native_delete_conversation(
-    app_handle: tauri::AppHandle,
+pub async fn native_delete_conversation<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
     conversation_id: String,
 ) -> Result<(), String> {
-    let session_state = app_handle.state::<Arc<Mutex<Option<SessionManager>>>>();
-    let mut session_guard = session_state.lock().await;
-    if let Some(session_mgr) = session_guard.as_mut() {
-        session_mgr.delete_conversation(&conversation_id);
-        if let Err(e) = session_mgr.save() {
-            tracing::warn!(module = "Commands", "Failed to save session: {}", e);
-        }
-        if let Ok(data_dir) = app_data_dir() {
-            deepseek_code_core::prompt::forget_session_files(&data_dir, &conversation_id);
-        }
+    native_history(app_handle, move |db| {
+        db.sync_delete(&conversation_id)?;
+        deepseek_code_core::prompt::forget_session_files(db.data_dir(), &conversation_id);
         Ok(())
-    } else {
-        Err("SessionManager not initialized".to_string())
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn native_get_messages(
-    app_handle: tauri::AppHandle,
+pub async fn native_get_messages<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
-    let session_state = app_handle.state::<Arc<Mutex<Option<SessionManager>>>>();
-    let session_guard = session_state.lock().await;
-    if let Some(session_mgr) = session_guard.as_ref() {
-        Ok(session_mgr.get_messages(&conversation_id).into_iter().cloned().collect())
-    } else {
-        Err("SessionManager not initialized".to_string())
-    }
+    native_history(app_handle, move |db| {
+        if db.conversation_metadata(&conversation_id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        db.open_session(&conversation_id)?.read(|r| {
+            r.messages()?
+                .into_iter()
+                .map(|m| {
+                    let calls = r
+                        .tools(&m.id)?
+                        .into_iter()
+                        .map(|call| ToolCallRecord {
+                            id: call
+                                .id
+                                .strip_prefix(&format!("{}:", m.id))
+                                .unwrap_or(&call.id)
+                                .to_owned(),
+                            name: call.name,
+                            input: call
+                                .input
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or_else(|| serde_json::json!({})),
+                            output: call.output,
+                            is_error: Some(call.is_error),
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(Message {
+                        id: m.id,
+                        conversation_id: m.conversation_id,
+                        role: m.role,
+                        content: m.content,
+                        created_at: m.created_at,
+                        tool_calls: (!calls.is_empty()).then_some(calls),
+                        is_compact_boundary: m.is_compact_boundary,
+                        engine_uuid_synced: false,
+                        attachments: None,
+                        research: None,
+                    })
+                })
+                .collect()
+        })
+    })
+    .await
 }
 
 #[tauri::command]

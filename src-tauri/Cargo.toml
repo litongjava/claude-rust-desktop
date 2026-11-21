@@ -85,6 +85,7 @@ serde_yaml = "0.9"
 scraper = "0.24"
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 axum-test = "16"

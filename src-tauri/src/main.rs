@@ -5,7 +5,6 @@ use deepseek_desktop_tauri_lib::*;
 use bridge::BridgeServer;
 use native_engine::engine_core::NativeEngine;
 use native_engine::provider_manager::ProviderManager;
-use native_engine::session_manager::SessionManager;
 use mcp::McpServerManager;
 use permissions::PermissionManager;
 use tauri::Manager;
@@ -170,7 +169,6 @@ fn main() {
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<ProviderManager>>>)))
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<McpServerManager>>>)))
         .manage(Arc::new(std::sync::Mutex::new(None::<String>)))
-        .manage(Arc::new(Mutex::new(None::<SessionManager>)))
         .manage(Arc::new(Mutex::new(None::<Arc<PermissionManager>>)))
         .setup(move |app| {
             app.manage(commands::peripheral::PeripheralHost::default());
@@ -430,14 +428,6 @@ fn main() {
                 });
             }
 
-            // Initialize SessionManager
-            let sessions_path = data_dir.join("sessions.json");
-            let workspaces_dir = data_dir.join("workspaces");
-            let session_mgr = SessionManager::new(sessions_path, workspaces_dir);
-            tauri::async_runtime::block_on(async {
-                *app.state::<Arc<Mutex<Option<SessionManager>>>>().lock().await = Some(session_mgr);
-            });
-            tracing::info!(module = "SessionManager", "Initialized");
             let bridge_ready = Arc::new(Notify::new());
             let _bridge_ready_clone = bridge_ready.clone();
 
