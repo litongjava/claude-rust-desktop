@@ -264,7 +264,7 @@ fn default_timeout() -> u64 {
 #[derive(Default, Clone)]
 pub struct HookRunner {
     pub(crate) transcript_history: Option<crate::db::session_store::ExecutorHistory>,
-    recording_db: Option<std::sync::Arc<crate::db::DbManager>>,
+    recording_db: Option<std::sync::Arc<dyn crate::db::session_store::HookSessions>>,
     workspace: PathBuf,
     once_directory: PathBuf,
     hooks: Vec<ActiveHook>,
@@ -279,7 +279,7 @@ impl HookRunner {
         Self::load_with_configs(data_dir, workspace, Vec::new())
     }
 
-    pub fn load_with_plugins(context: &super::ServiceContext, workspace: &Path) -> Result<Self> {
+    pub fn load_with_plugins(context: &super::ServiceContext<impl crate::db::session_store::PluginCatalog + crate::db::session_store::HookSessions + 'static>, workspace: &Path) -> Result<Self> {
         Self::load_with_configs(
             &context.paths.data_dir,
             workspace,
@@ -589,7 +589,7 @@ impl HookRunner {
     ) -> Value {
         let path = cache.get_or_init(|| {
             let root = self.once_directory.parent().unwrap_or(&self.workspace);
-            let fallback = self.recording_db.as_ref().and_then(|db| db.executor_history(session).ok());
+            let fallback = if self.transcript_history.is_none() { self.recording_db.as_ref().and_then(|db| db.clone().hook_history(session).ok().flatten()) } else { None };
             let history = self.transcript_history.as_ref().or(fallback.as_ref());
             match super::lifecycle_events::snapshot(root,session,history) {
                 Ok(path) => path,

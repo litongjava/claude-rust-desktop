@@ -26,7 +26,7 @@ mod owned;
 mod goal_state;
 pub use owned::{SessionAccess,SessionRepository};
 pub use segment::{SegmentPlacement, SegmentUpdate};
-pub use executor::ExecutorHistory;
+pub use executor::{ExecutorHistory,HookSessions};
 mod global;
 mod shared;
 mod leases;

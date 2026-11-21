@@ -111,3 +111,18 @@ impl ExecutorHistory {
         }
     }
 }
+
+/// Hook runners may select their session after their plugin configuration is loaded.
+pub trait HookSessions: super::RecordingPolicies + Send + Sync {
+    fn hook_history(self:Arc<Self>, id:&str) -> Result<Option<ExecutorHistory>>;
+}
+impl HookSessions for Stores {
+    fn hook_history(self:Arc<Self>, id:&str)->Result<Option<ExecutorHistory>> {
+        self.listed_history(id)
+    }
+}
+impl HookSessions for DbManager {
+    fn hook_history(self:Arc<Self>,id:&str)->Result<Option<ExecutorHistory>> {
+        self.executor_history(id).map(Some)
+    }
+}

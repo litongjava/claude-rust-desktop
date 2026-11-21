@@ -41,7 +41,7 @@ impl RequestOptions {
         options
     }
 
-    pub fn from_db(db: &impl crate::db::session_store::RecordingPolicies, session: Option<&str>, purpose: &str) -> Self {
+    pub fn from_db(db: &(impl crate::db::session_store::RecordingPolicies + ?Sized), session: Option<&str>, purpose: &str) -> Self {
         let mut options = Self::for_session(session).with_purpose(purpose);
         if let Some(session) = session {
             let (policy, parent) = db.recording_policy_and_parent(session);
