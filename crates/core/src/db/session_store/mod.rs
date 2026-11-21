@@ -111,6 +111,7 @@ static ROOTS: LazyLock<Mutex<HashMap<PathBuf, RootSlot>>> = LazyLock::new(Defaul
 pub struct Stores {
     root: Arc<Root>,
     fault: Option<Arc<Fault>>,
+    router: Option<HistoryAddress>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
@@ -176,7 +177,7 @@ impl Stores {
                 }
             })
         };
-        let stores = Self { root, fault: None };
+        let stores = Self { root, fault: None, router: None };
         let initialized = stores.root.repair.get().is_some();
         if !initialized {
             drop(stores.namespace()?);
@@ -235,6 +236,7 @@ impl Stores {
         Self {
             root: self.root.clone(),
             fault: Some(Arc::new(fault)),
+            router: self.router.clone(),
         }
     }
     fn step(&self, phase: Phase) -> Result<()> {

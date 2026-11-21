@@ -4634,3 +4634,20 @@ mod two_repository_delivery {
     }
     include!("cleanup_tests.rs");
 }
+
+#[tokio::test]
+async fn router_pass_holds_selected_incarnation_during_launch_effects() {
+    let fixture = Fixture::new();
+    fixture.task();
+    let path = fixture.data.join("session-locks").join(&fixture.router);
+    let inspected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = inspected.clone();
+    let host = fixture.orchestrator(json!({})).with_gate(Arc::new(move |_| {
+        let file = std::fs::File::options().read(true).write(true).open(&path)?;
+        assert!(matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    host.tick_watched(&fixture.router).await.unwrap();
+    assert!(inspected.load(std::sync::atomic::Ordering::Relaxed));
+}

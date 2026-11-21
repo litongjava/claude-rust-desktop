@@ -131,7 +131,11 @@ pub async fn spawn_child_session(
     config: ChildLaunchConfig,
     spawn: ChildSpawn,
 ) -> Result<ChildHandle> {
-    let prepared = prepare_child_session(config, spawn).await?;
+    let context = ServiceContext::open(
+        RuntimePaths::new(spawn.data_dir.clone())?,
+        std::sync::Arc::new(EnvironmentCredentials),
+    )?;
+    let prepared = prepare_child_session(context, config, spawn).await?;
     launch_prepared_child(prepared)
 }
 
@@ -161,6 +165,7 @@ pub(crate) struct PreparedChildLaunch {
 /// launch. This function performs no external process side effect, so a host
 /// may stop after it and recover against the durable session identity.
 pub(crate) async fn prepare_child_session(
+    context: ServiceContext,
     mut config: ChildLaunchConfig,
     spawn: ChildSpawn,
 ) -> Result<PreparedChildLaunch> {
@@ -188,10 +193,6 @@ pub(crate) async fn prepare_child_session(
         "Data directory must be absolute"
     );
 
-    let context = ServiceContext::open(
-        RuntimePaths::new(spawn.data_dir.clone())?,
-        std::sync::Arc::new(EnvironmentCredentials),
-    )?;
     let parent = require_session(&context, &spawn.parent_session_id, "Parent session")?;
     ensure!(!parent.archived, "Parent session is archived");
     ensure!(

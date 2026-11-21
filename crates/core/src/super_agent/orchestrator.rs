@@ -57,6 +57,7 @@ enum DeliveryJobCheck {
     Blocked(TaskRecord),
 }
 
+#[derive(Clone)]
 pub struct Orchestrator {
     pub context: ServiceContext,
     pub config: SuperAgentConfig,
@@ -90,6 +91,16 @@ impl Orchestrator {
     pub fn with_gate(mut self, gate: crate::super_agent::launcher::LaunchGate) -> Self {
         self.gate = Some(gate);
         self
+    }
+
+    /// Keep non-database effects under the same lifecycle fence as task selection.
+    /// Task stores derived by the watcher, launcher and cleanup inherit this identity.
+    pub(super) fn router_pass(&self, router: &str) -> Result<(Self, impl Drop)> {
+        let selected = self.context.db.open_session(router)?;
+        let guard = selected.hold_incarnation()?;
+        let mut pass = self.clone();
+        pass.context.db = std::sync::Arc::new(selected.router_stores());
+        Ok((pass, guard))
     }
 
     fn policy(&self) -> StatePolicy {
@@ -139,6 +150,11 @@ impl Orchestrator {
     /// CLI/other Router hosts opt into one supervision pass before advancement.
     /// The host owns scheduling; this method never starts a resident loop.
     pub async fn tick_watched(&self, router_session: &str) -> Result<TickReport> {
+        let (pass, _guard) = self.router_pass(router_session)?;
+        pass.tick_watched_selected(router_session).await
+    }
+
+    async fn tick_watched_selected(&self, router_session: &str) -> Result<TickReport> {
         let Some(_lock) = crate::super_agent::watcher::lock_router(self, router_session)? else {
             return Ok(TickReport::default());
         };
@@ -164,7 +180,8 @@ impl Orchestrator {
     }
 
     pub async fn tick(&self, router_session: &str) -> Result<TickReport> {
-        self.tick_excluding(router_session, &Default::default())
+        let (pass, _guard) = self.router_pass(router_session)?;
+        pass.tick_excluding(router_session, &Default::default())
             .await
     }
 

@@ -1818,6 +1818,7 @@ impl Launcher {
             ));
         }
         prepare_child_session(
+            self.context.clone(),
             ChildLaunchConfig {
                 provider: self.provider.clone(),
                 permission_mode: if operation.permission_mode.is_empty() {

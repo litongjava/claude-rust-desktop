@@ -112,6 +112,10 @@ pub(crate) struct EvidenceFence {
     pub members: std::collections::BTreeMap<String, MemberEvidence>,
 }
 pub(crate) trait TaskDatabase {
+    fn router_address(&self) -> Option<&crate::db::session_store::HistoryAddress> {
+        None
+    }
+
     const ROUTED_TASKS: &'static str = "sa_tasks";
     fn task_read<T>(&self, f: impl FnOnce(&Connection) -> AnyResult<T>) -> AnyResult<T>;
     fn task_write<T>(
@@ -174,11 +178,12 @@ impl<D> Clone for TaskStore<D> {
 }
 impl<D: TaskDatabase> TaskStore<D> {
     pub fn new(db: Arc<D>, data_dir: PathBuf) -> Self {
-        Self {
-            db,
-            data_dir,
-            router: None,
-        }
+        let router = db.router_address().map(|address| RouterScope {
+            session: address.session.clone(),
+            incarnation: address.incarnation.clone(),
+            task: None,
+        });
+        Self { db, data_dir, router }
     }
     pub fn from_context(context: &crate::services::ServiceContext<D>) -> Self {
         Self::new(context.db.clone(), context.paths.data_dir.clone())

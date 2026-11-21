@@ -62,6 +62,8 @@ impl Drop for WatchLock {
 /// Hosts call this once per tick/notification. Different processes contend on
 /// the same OS lock; the durable ledger survives a host crash at every step.
 pub async fn watch_once(host: &Orchestrator, router: &str) -> Result<WatchReport> {
+    let (pass, _guard) = host.router_pass(router)?;
+    let host = &pass;
     let Some(_lock) = lock_router(host, router)? else {
         return Ok(WatchReport {
             deferred_tasks: TaskStore::from_context(&host.context)

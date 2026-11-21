@@ -20,7 +20,7 @@ impl Stores {
             std::thread::spawn(move || {
                 while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(INTERVAL) {
                     let Some(root) = root.upgrade() else { break };
-                    Stores { root, fault: None }.try_repair_page();
+                    Stores { root, fault: None, router: None }.try_repair_page();
                 }
             });
             stop

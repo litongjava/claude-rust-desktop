@@ -6,7 +6,19 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 use std::collections::BTreeMap;
 
+impl SessionDb {
+    pub(crate) fn router_stores(&self) -> Stores {
+        let mut stores = self.stores.clone();
+        stores.router = Some(self.address());
+        stores
+    }
+}
+
 impl TaskDatabase for Stores {
+    fn router_address(&self) -> Option<&super::HistoryAddress> {
+        self.router.as_ref()
+    }
+
     const ROUTED_TASKS: &'static str = "(SELECT t.* FROM sa_tasks t
         JOIN sa_member_sessions m ON m.task_id=t.task_id AND m.role='router' AND m.session_id=t.router_session_id
         JOIN conversations c ON c.id=m.session_id AND c.incarnation=m.incarnation)";
