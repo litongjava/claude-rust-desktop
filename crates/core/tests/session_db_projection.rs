@@ -342,6 +342,12 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
 }
 
 fn remove_v4_features(c: &Connection) -> Result<()> {
+    c.execute_batch("DROP INDEX idx_execution_turns_conversation")?;
+    for name in ["thinking", "tool"] {
+        for action in ["insert", "update", "delete"] {
+            c.execute_batch(&format!("DROP TRIGGER transcript_{name}_{action}"))?;
+        }
+    }
     c.execute_batch(
         "DROP TRIGGER cancel_rewound_compaction; DROP TABLE compaction_cancellations;
         ALTER TABLE compaction_request DROP COLUMN target_message;
