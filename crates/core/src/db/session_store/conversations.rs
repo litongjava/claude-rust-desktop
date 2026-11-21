@@ -21,6 +21,24 @@ fn validate_chat(c: &rusqlite::Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn first_chat_options(model: &str, content: Option<&Value>) -> Result<CreateOptions> {
+    let first_message = content
+        .filter(|v| v.as_str() != Some(""))
+        .map(|v| -> Result<_> {
+            let (text, normalized) = messages::prepare_user_message(v)?;
+            Ok(super::FirstMessage {
+                text,
+                typed: normalized.is_array().then_some(normalized),
+            })
+        })
+        .transpose()?;
+    Ok(CreateOptions {
+        model: Some(model.into()),
+        first_message,
+        ..Default::default()
+    })
+}
+
 impl Stores {
     pub fn validate_chat_project(&self, id: &str) -> Result<()> {
         self.global().read(|c| {
@@ -44,23 +62,7 @@ impl Stores {
                 }
             }
             None => {
-                let first_message = content
-                    .map(|value| -> Result<_> {
-                        let (text, normalized) = messages::prepare_user_message(value)?;
-                        Ok(super::FirstMessage {
-                            text,
-                            typed: normalized.is_array().then_some(normalized),
-                        })
-                    })
-                    .transpose()?;
-                self.create(
-                    id,
-                    CreateOptions {
-                        model: Some(model.into()),
-                        first_message,
-                        ..Default::default()
-                    },
-                )?;
+                self.create(id, first_chat_options(model, content)?)?;
             }
         }
         Ok(())

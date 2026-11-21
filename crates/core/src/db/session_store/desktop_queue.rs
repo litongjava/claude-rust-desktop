@@ -90,13 +90,27 @@ impl super::SessionRead<'_> {
 
 impl Stores {
     pub fn chat_execution_lease(&self, id: &str, model: &str) -> Result<ExecutionLease> {
-        if self.conversation_metadata(id)?.is_none() {
-            self.admit_chat_message(id, model, None)?;
-        }
-        let session = self.open_session(id)?;
+        Ok(self.admit_chat_execution(id, model, None)?.0)
+    }
+
+    /// Returns whether creation already persisted the first user message.
+    pub fn admit_chat_execution(
+        &self,
+        id: &str,
+        model: &str,
+        first: Option<&serde_json::Value>,
+    ) -> Result<(ExecutionLease, bool)> {
+        let row = self
+            .global()
+            .read_directory_row(id, |c| super::directory::one(c, id))?;
+        let Some(row) = row else {
+            let options = super::conversations::first_chat_options(model, first)?;
+            return Ok((self.create_chat_with_lease(id, options)?, true));
+        };
+        let session = self.open_listed(&row)?;
         let lease = session.acquire_execution()?;
         session.settle_abandoned(&lease)?;
-        Ok(lease)
+        Ok((lease, false))
     }
     pub fn existing_chat_lease(&self, id: &str) -> Result<ExecutionLease> {
         self.open_session(id)?.acquire_execution()

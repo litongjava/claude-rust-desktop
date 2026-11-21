@@ -274,6 +274,25 @@ impl Stores {
         self.create_locked(id, options, Seed::New, None)
     }
 
+    pub(super) fn create_chat_with_lease(
+        &self,
+        id: &str,
+        options: CreateOptions,
+    ) -> Result<crate::services::session_messages::ExecutionLease> {
+        use crate::services::session_messages::ExecutionLease;
+        let key = storage_key(id)?;
+        let locks = self.group_access(vec![(&key, true, true)])?;
+        let shard = self.create_locked(id, options, Seed::New, None)?;
+        // Reserve execution before releasing publication's exclusive lock.
+        let mut lease = ExecutionLease::acquire(self.data_dir(), shard.incarnation())?
+            .context("Invalid execution incarnation")?;
+        lease.address = Some(shard.address());
+        drop(locks);
+        lease.lifecycle = self.key_lock(&key, false, false)?;
+        shard.check_directory()?;
+        Ok(lease)
+    }
+
     pub fn feishu_conversation(&self,chat:&str,title:Option<String>)->Result<super::im::FeishuChatMapping> {
         if let Some(row)=self.feishu_mapping(chat)? {return Ok(row);}
         let id=uuid::Uuid::new_v4().to_string();

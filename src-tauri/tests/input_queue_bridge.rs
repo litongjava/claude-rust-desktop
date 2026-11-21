@@ -236,6 +236,26 @@ async fn durable_queue_roundtrip() {
         .error_for_status()
         .unwrap();
     assert!(queue::is_paused(&db, &id).unwrap());
+    // A rejected first request must leave the ID available for a sealed first turn.
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let first = |content: Value| {
+        client.post(format!("{base}/api/chat")).header("x-api-key",&key)
+        .json(&json!({"conversation_id":first_id,"messages":[{"role":"user","content":content}],"model":"fixture-model","provider_id":"fixture"}))
+    };
+    let invalid = first(json!({"invalid":"content"})).send().await.unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert!(db.conversation_metadata(&first_id).unwrap().is_none());
+    let content = json!([{"type":"text","text":"accepted first prompt"}]);
+    let accepted = first(content.clone()).send().await.unwrap();
+    assert!(accepted.status().is_success());
+    let _ = accepted.bytes().await.unwrap();
+    let (_, rows) = db.conversation_detail(&first_id).unwrap();
+    let users = rows
+        .iter()
+        .filter(|row| row["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["content"], content);
     server.abort();
     model.abort();
 }

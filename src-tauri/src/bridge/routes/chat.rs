@@ -74,11 +74,38 @@ pub(super) async fn start_authorized_chat(
         Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":"Could not validate conversation project"}))).into_response(),
     }
 
-    // The backend keeps this lease for the whole turn; the engine shares it
-    // without retaining a second reference that could outlive this release.
-    let execution_lease = match state.db_manager.chat_execution_lease(&req.conversation_id,&req.model) {
-        Ok(lease) => std::sync::Arc::new(lease),
-        Err(error) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    let user_content = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .cloned();
+    if let Some(content) = &user_content {
+        if !content.is_string() {
+            if let Err(error) = crate::runtime::normalize_user_content(content) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":error.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let user_content = if queued.is_some() { None } else { user_content };
+    let (execution_lease, sealed_first) = match state.db_manager.admit_chat_execution(
+        &req.conversation_id,
+        &req.model,
+        user_content.as_ref(),
+    ) {
+        Ok((lease, sealed)) => (std::sync::Arc::new(lease), sealed),
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+                .into_response()
+        }
     };
     let native_engine = state.native_engine.clone();
     let config_manager = state.config_manager.clone();
@@ -97,21 +124,9 @@ pub(super) async fn start_authorized_chat(
 
     // Save user messages to SQLite before starting the engine
     tracing::info!(module = "Chat", "[2/7] Starting SQLite save...");
-    {
+    if !sealed_first {
         let db = state.db_manager.clone();
         let conv_id_save = conv_id.clone();
-        // The request contains history; only append the current user turn.
-        let user_content = messages.iter().rev()
-            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-            .and_then(|m| m.get("content")).cloned();
-        if let Some(content) = &user_content {
-            if !content.is_string() {
-                if let Err(error) = crate::runtime::normalize_user_content(content) {
-                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-                }
-            }
-        }
-        let user_content = if queued.is_some() { None } else { user_content };
         let model_save = model.clone();
         let saved=tokio::task::spawn_blocking(move || db.admit_chat_message(&conv_id_save,&model_save,user_content.as_ref())).await;
         if !matches!(saved,Ok(Ok(()))) {
