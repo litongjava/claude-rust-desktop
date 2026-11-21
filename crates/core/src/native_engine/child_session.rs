@@ -293,29 +293,8 @@ pub(crate) async fn prepare_child_session(
             // A fork is a branch of this session: messages, tool calls and the
             // agent and worktree bindings are copied, so the child keeps the
             // parent's history instead of starting empty.
-            let child = context.db.with_conn(|conn| {
-                crate::db::conversation_repo::branch_conversation(
-                    conn,
-                    &spawn.parent_session_id,
-                    None,
-                    None,
-                )
-            })??;
-            context.db.with_conn(|conn| {
-                crate::db::conversation_repo::update_conversation_title(
-                    conn,
-                    &child,
-                    &format!("Fork: {description}"),
-                )
-            })??;
-            context.save_setting(
-                &format!("fork-of.{child}"),
-                &json!({"parent": spawn.parent_session_id}),
-            )?;
-            crate::services::permission_authority::record_user(
-                &context.db,
-                &child,
-                &json!(spawn.prompt),
+            let child = context.db.fork_agent(
+                &spawn.parent_session_id, &format!("Fork: {description}"), &spawn.prompt,
             )?;
             (child, false)
         }

@@ -889,3 +889,26 @@ fn worker_registration_fences_both_sides_of_an_ipc_wait() -> Result<()> {
     assert!(stores.child_owner("child")?.is_none());
     Ok(())
 }
+
+#[test]
+fn agent_fork_publishes_its_history_directive_and_execution_parent_together() -> Result<()> {
+    use deepseek_code_core::db::session_store::{Branch, settings::AGENT_FORK_PARENT};
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let parent = stores.create("parent", Default::default())?;
+    parent.write(|w| w.append("user", "original"))?;
+    let mode = Branch::AgentFork {title:"Fork: check history", directive:"check the boundary"};
+    let child = parent.branch("member", mode)?;
+    assert_eq!(child.workspace()?, parent.workspace()?);
+    assert_eq!(stores.conversation_metadata("member")?.unwrap().title.as_deref(), Some("Fork: check history"));
+    child.read(|r| {
+        assert_eq!(r.messages()?[0].content,"original");
+        assert_eq!(r.setting(AGENT_FORK_PARENT)?.as_deref(), Some("parent"));
+        Ok(())
+    })?;
+    let intent = deepseek_code_core::services::permission_authority::history(&child,child.id(),4096)?;
+    assert!(serde_json::to_string(&intent)?.contains("check the boundary"));
+    assert!(child.branch("grandchild", mode).is_err());
+    assert!(stores.conversation_metadata("grandchild")?.is_none());
+    Ok(())
+}

@@ -130,3 +130,46 @@ impl<D: super::SessionAccess> crate::services::ServiceContext<D> {
         )
     }
 }
+
+impl super::Stores {
+    pub(crate) fn fork_agent(&self, parent: &str, title: &str, directive: &str) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.open_session(parent)?
+            .branch(&id, super::Branch::AgentFork { title, directive })?;
+        Ok(id)
+    }
+    pub(crate) fn is_agent_fork(&self, session: &str) -> Result<bool> {
+        self.open_session(session)?
+            .read(|r| Ok(r.setting(super::settings::AGENT_FORK_PARENT)?.is_some()))
+    }
+}
+impl crate::db::DbManager {
+    pub(crate) fn fork_agent(&self, parent: &str, title: &str, directive: &str) -> Result<String> {
+        let id = self.branch_conversation(parent, None, None)?;
+        self.rename_session(&id, title)?;
+        self.with_conn(|c| {
+            crate::db::write_tx(
+                c,
+                "record agent fork",
+                crate::db::STARTUP_WRITE_DEADLINE,
+                |tx| {
+                    super::state::set_local(
+                        tx,
+                        &format!("fork-of.{id}"),
+                        &serde_json::json!({"parent":parent}).to_string(),
+                    )?;
+                    crate::services::permission_authority::record_conn(
+                        tx,
+                        &id,
+                        crate::services::permission_authority::Source::User,
+                        &serde_json::json!(directive),
+                    )
+                },
+            )
+        })??;
+        Ok(id)
+    }
+    pub(crate) fn is_agent_fork(&self, session: &str) -> Result<bool> {
+        self.with_conn(|c| Ok(super::state::local(c, &format!("fork-of.{session}"))?.is_some()))?
+    }
+}

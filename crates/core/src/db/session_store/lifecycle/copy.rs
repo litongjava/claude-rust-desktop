@@ -6,6 +6,10 @@ use serde_json::Value as Json;
 #[derive(Clone, Copy, Debug)]
 pub enum Branch<'a> {
     Full,
+    AgentFork {
+        title: &'a str,
+        directive: &'a str,
+    },
     Through {
         message: Option<&'a str>,
         index: Option<usize>,
@@ -145,7 +149,10 @@ impl SessionDb {
                 [&self.id],
                 |r| r.get(0),
             )?;
-            if matches!(boundary, Branch::Child | Branch::Clear) {
+            if matches!(
+                boundary,
+                Branch::Child | Branch::Clear | Branch::AgentFork { .. }
+            ) {
                 ensure!(!row.archived, "Archived execution source");
                 if row.project_id.is_none() {
                     private_owner(c, &self.id)?;
@@ -161,7 +168,9 @@ impl SessionDb {
             Ok((row, revision, binding(c, &self.id)?))
         })?;
         let options = CreateOptions {
-            title: Some(if matches!(boundary, Branch::Child | Branch::Clear) {
+            title: Some(if let Branch::AgentFork { title, .. } = boundary {
+                title.into()
+            } else if matches!(boundary, Branch::Child | Branch::Clear) {
                 "CLI session".into()
             } else {
                 format!(
@@ -184,7 +193,7 @@ impl SessionDb {
                 id: self.id.clone(),
                 incarnation: self.incarnation.clone(),
                 revision,
-                child: matches!(boundary, Branch::Child),
+                child: matches!(boundary, Branch::Child | Branch::AgentFork { .. }),
                 expected_cwd,
                 binding,
                 provider_selection,
@@ -325,7 +334,10 @@ impl Copier<'_> {
             "CREATE TEMP TABLE copied_ids(kind TEXT,old TEXT,new TEXT,PRIMARY KEY(kind,old))",
         )?;
         self.rows("session_agents", None, None, &[])?;
-        if matches!(boundary, Branch::Child | Branch::Full) {
+        if matches!(
+            boundary,
+            Branch::Child | Branch::Full | Branch::AgentFork { .. }
+        ) {
             self.rows("session_permission_authority", None, None, &[])?;
         }
         if matches!(boundary, Branch::Clear | Branch::Child) {
@@ -527,12 +539,25 @@ pub(super) fn copy_snapshot(
             }
         }
     }
+    if let Branch::AgentFork { directive, .. } = boundary {
+        ensure!(
+            super::super::state::local(&tx, "fork-of")?.is_none(),
+            "A fork cannot start another fork"
+        );
+        super::super::state::set_local(dst, "fork-of", &serde_json::to_string(source.id())?)?;
+        crate::services::permission_authority::record_conn(
+            dst,
+            id,
+            crate::services::permission_authority::Source::User,
+            &Json::String(directive.into()),
+        )?;
+    }
     source.stores.step(Phase::ForkSnapshot)?;
     Copier {
         src: &tx,
         dst,
         id,
-        keep_unresolved_origins: matches!(boundary, Branch::Full),
+        keep_unresolved_origins: matches!(boundary, Branch::Full | Branch::AgentFork { .. }),
     }
     .run(boundary)
 }

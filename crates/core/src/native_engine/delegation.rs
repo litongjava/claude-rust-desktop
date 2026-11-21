@@ -845,9 +845,7 @@ impl ToolLoopExecutor {
         let fork = is_fork(input);
         if fork {
             ensure!(
-                context
-                    .setting::<Value>(&format!("fork-of.{parent}"))?
-                    .is_none(),
+                !context.db.is_agent_fork(&parent)?,
                 "A fork cannot start another fork"
             );
         }
