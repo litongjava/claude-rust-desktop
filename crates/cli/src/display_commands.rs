@@ -359,11 +359,7 @@ pub async fn handle(
 }
 
 pub fn usage(session: &Session) -> Result<Value> {
-    session.store.db.with_conn(|conn| -> Result<Value> {
-        Ok(conn.query_row("SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(total_duration_ms) FROM model_requests WHERE conversation_id=?1", [&session.id], |row| {
-            Ok(json!({"session_id":session.id,"requests":row.get::<_,i64>(0)?,"input_tokens":row.get::<_,Option<i64>>(1)?,"output_tokens":row.get::<_,Option<i64>>(2)?,"cache_read_tokens":row.get::<_,Option<i64>>(3)?,"cache_write_tokens":row.get::<_,Option<i64>>(4)?,"duration_ms":row.get::<_,Option<i64>>(5)?}))
-        })?)
-    })?
+    Ok(session.store.db.select_session(&session.id)?.usage_totals(&[])?.0)
 }
 
 /// Quotes group arguments; backslashes remain literal for Windows paths.

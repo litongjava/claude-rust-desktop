@@ -1,6 +1,6 @@
 //! Local inspection of the last parent-session request; never prepares a new request.
 use crate::{
-    db::{message_repo, DbManager},
+    db::session_store::SessionAccess,
     native_engine::request_context::ContextUsage,
 };
 use anyhow::Result;
@@ -23,7 +23,7 @@ pub struct Boundary {
     pub created_at_ms: Option<i64>,
 }
 
-pub fn last_request(db: &DbManager, session: &str) -> Result<Option<LastRequest>> {
+pub fn last_request(db: &impl SessionAccess, session: &str) -> Result<Option<LastRequest>> {
     matching_request(db, session, |_| true)
 }
 
@@ -54,7 +54,7 @@ fn same_configuration(snapshot: &Value, model: &str, provider: Option<&str>) -> 
 /// proof, so a request that started before a boundary in the same millisecond
 /// is never mistaken for one that used the new context.
 pub fn last_request_for(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     boundary: Option<&str>,
     model: &str,
@@ -68,7 +68,7 @@ pub fn last_request_for(
 /// Last parent request that recorded this exact boundary and configuration.
 /// Kept for callers that only know the boundary id.
 pub fn last_request_since(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     boundary_id: &str,
 ) -> Result<Option<LastRequest>> {
@@ -78,34 +78,19 @@ pub fn last_request_since(
 }
 
 /// The latest successful compaction boundary, with its id and commit time.
-pub fn latest_boundary(db: &DbManager, session: &str) -> Result<Option<Boundary>> {
-    db.with_conn(|conn| -> Result<Option<Boundary>> {
-        use rusqlite::OptionalExtension;
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, created_at FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1",
-                [session],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(row.map(|(id, created)| Boundary {
-            id,
-            created_at_ms: chrono::DateTime::parse_from_rfc3339(&created)
-                .ok()
-                .map(|at| at.timestamp_millis()),
-        }))
-    })?
+pub fn latest_boundary(db: &impl SessionAccess, session: &str) -> Result<Option<Boundary>> {
+    db.select_session(session)?.context_boundary()
 }
 
 /// When the latest successful compaction boundary was committed, in
 /// milliseconds since the epoch. `None` before the first compaction.
-pub fn latest_boundary_ms(db: &DbManager, session: &str) -> Result<Option<i64>> {
+pub fn latest_boundary_ms(db: &impl SessionAccess, session: &str) -> Result<Option<i64>> {
     Ok(latest_boundary(db, session)?.and_then(|boundary| boundary.created_at_ms))
 }
 
 /// Last measured parent input, for a clearly labelled historical status fallback.
 pub fn last_reported_request(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     model: &str,
 ) -> Result<Option<LastRequest>> {
@@ -117,36 +102,11 @@ pub fn last_reported_request(
 }
 
 fn matching_request(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     accept: impl Fn(&Value) -> bool,
 ) -> Result<Option<LastRequest>> {
-    let snapshot = db.with_conn(|conn| -> Result<Option<Value>> {
-        let mut statement = conn.prepare(
-            "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC, m.rowid DESC",
-        )?;
-        let mut rows = statement.query([session])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let Ok(snapshots) = serde_json::from_str::<Value>(&raw) else {
-                // A corrupt row may hide a newer request. Do not report stale data.
-                return Ok(None);
-            };
-            let Some(items) = snapshots.as_array() else { return Ok(None); };
-            if let Some(snapshot) = items.iter().rev().find(|s| (s["source"] == "native_engine" || s.get("source").is_none()) && accept(s)) {
-                // Preserve unknown metadata on this request; never replace it
-                // with an older request merely because the old one has counts.
-                // Only the selected snapshot is expanded: restoring every row
-                // would multiply the status query's work.
-                let mut snapshot = snapshot.clone();
-                message_repo::load_trajectory_blobs(conn, &mut snapshot)?;
-                return Ok(Some(snapshot));
-            }
-            // Local workflows and failed pre-request turns can persist [].
-            // A row containing only side-query snapshots is not a parent request.
-        }
-        Ok(None)
-    })??;
+    let snapshot = db.select_session(session)?.matching_snapshot(accept)?;
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };

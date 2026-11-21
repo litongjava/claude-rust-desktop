@@ -1,4 +1,5 @@
 //! CLI rendering of read-only shared runtime observations.
+use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Result};
 use deepseek_code_core::services::{
@@ -94,26 +95,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         .iter()
         .filter(|row| row["installed"] == true)
         .count();
-    let usage = crate::display_commands::usage(session)?;
-    let mut input = session.store.db.with_conn(|conn| conn.query_row(
-        "SELECT COALESCE(SUM(CASE WHEN json_valid(usage_json) AND json_extract(usage_json,'$.input_tokens') IS NOT NULL AND json_extract(usage_json,'$.prompt_tokens') IS NULL THEN COALESCE(input_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0) ELSE COALESCE(input_tokens,0) END),0) FROM model_requests WHERE conversation_id=?1",
-        [&session.id], |row| row.get::<_, u64>(0),
-    ))??;
-    let mut output = usage["output_tokens"].as_u64().unwrap_or(0);
     let live = crate::session_commands::live_requests(session)?;
-    for snapshot in &live {
-        let saved = session.store.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM model_requests WHERE id=?1 AND conversation_id=?2)",
-                [snapshot["id"].as_str().unwrap_or_default(), &session.id],
-                |row| row.get::<_, bool>(0),
-            )
-        })??;
-        if !saved {
-            input = input.saturating_add(snapshot["inputTokens"].as_u64().unwrap_or(0));
-            output = output.saturating_add(snapshot["outputTokens"].as_u64().unwrap_or(0));
-        }
-    }
+    let (_,input,output) = session.store.db.select_session(&session.id)?.usage_totals(&live)?;
     let boundary = deepseek_code_core::services::context_usage::latest_boundary(
         &session.store.db,
         &session.id,
