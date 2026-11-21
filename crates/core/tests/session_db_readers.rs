@@ -275,6 +275,15 @@ fn im_threads_share_the_directory_without_owning_a_code_transcript() -> Result<(
         .is_empty());
     drop(stores);
     let stores = Stores::open(root.path())?;
+    use deepseek_code_core::db::session_store::ImCatalog;
+    let first = stores.save_im_config("feishu", "{}", "connected", "2026-01-01")?;
+    let second = stores.save_im_config("feishu", "{}", "error", "2026-01-02")?;
+    assert_eq!((first.id, first.created_at), (second.id, second.created_at));
+    stores.disconnect_im_platform("feishu", "2026-01-03")?;
+    assert_eq!(stores.im_configs()?[0].status, "disconnected");
+    assert_eq!(stores.im_stats(Some("feishu"))?.total_sessions, 2);
+    assert_eq!(stores.im_stats(Some("telegram"))?.total_sessions, 0);
+    assert!(stores.im_errors(None)?.is_empty());
     let threads = stores.im_threads()?;
     assert_eq!(threads.len(), 2);
     assert!(threads

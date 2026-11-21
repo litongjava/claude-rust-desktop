@@ -39,6 +39,8 @@ pub use mcp_control::McpControl;
 mod global_format;
 mod history;
 mod im;
+mod im_catalog;
+pub use im_catalog::ImCatalog;
 mod im_permissions;
 pub use im_permissions::{ImPermissionChange, ImPermissions};
 pub mod magic;

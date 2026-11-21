@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::db::DbManager;
+use crate::db::session_store::{ImCatalog, ImPermissions};
+use session_manager::ThreadHistory;
 
 pub use adapters::FeishuAdapter;
 pub use message_router::{
@@ -106,7 +107,7 @@ pub struct ImErrorLogInfo {
 }
 
 pub struct ImIntegrationManager {
-    db: Arc<DbManager>,
+    db: Arc<dyn ImCatalog>,
     connections: Mutex<HashMap<String, ImConnectionInfo>>,
     pub message_router: Arc<MessageRouter>,
     pub session_manager: Arc<SessionManager>,
@@ -115,7 +116,7 @@ pub struct ImIntegrationManager {
 }
 
 impl ImIntegrationManager {
-    pub fn new(db: Arc<DbManager>) -> Self {
+    pub fn new<D: ImCatalog + ThreadHistory + ImPermissions>(db: Arc<D>) -> Self {
         let message_router = Arc::new(MessageRouter::new());
         let session_manager = Arc::new(SessionManager::new(db.clone()));
         let permission_manager = Arc::new(PermissionManager::new(db.clone()));
@@ -138,12 +139,7 @@ impl ImIntegrationManager {
         self.session_manager.initialize().await?;
 
         let db = self.db.clone();
-        let configs: Vec<crate::db::im_config_repo::ImConfigRow> = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                crate::db::im_config_repo::list_im_configs(conn)
-            })?
-        })
-        .await??;
+        let configs = tokio::task::spawn_blocking(move || db.im_configs()).await??;
 
         let mut connections = self.connections.lock().await;
         for config in configs {
@@ -190,7 +186,6 @@ impl ImIntegrationManager {
         let platform_enum = ImPlatform::from_str(platform)
             .ok_or_else(|| anyhow::anyhow!("Unknown platform: {}", platform))?;
 
-        let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         let config_json = serde_json::to_string(&config)?;
 
@@ -199,54 +194,16 @@ impl ImIntegrationManager {
         let status = if validated { "connected" } else { "error" };
 
         let db = self.db.clone();
-        let id_clone = id.clone();
-        let platform_clone = platform.to_string();
-        let config_json_clone = config_json.clone();
-        let status_clone = status.to_string();
-        let now_clone = now.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let existing: Option<crate::db::im_config_repo::ImConfigRow> = db.with_conn(|conn| {
-                crate::db::im_config_repo::get_im_config_by_platform(conn, &platform_clone)
-            })??;
-            match existing {
-                Some(existing_row) => {
-                    db.with_conn(|conn| {
-                        crate::db::im_config_repo::update_im_config(
-                            conn,
-                            &existing_row.id,
-                            &config_json_clone,
-                            &status_clone,
-                            &now_clone,
-                        )
-                    })??;
-                    Ok(existing_row.id)
-                }
-                None => {
-                    db.with_conn(|conn| {
-                        crate::db::im_config_repo::insert_im_config(
-                            conn,
-                            &id_clone,
-                            &platform_clone,
-                            &config_json_clone,
-                            &status_clone,
-                            &now_clone,
-                            &now_clone,
-                        )
-                    })??;
-                    Ok(id_clone)
-                }
-            }
-        })
-        .await??;
+        let platform_owned = platform.to_owned();
+        let row = tokio::task::spawn_blocking(move || db.save_im_config(&platform_owned, &config_json, status, &now)).await??;
 
         let info = ImConnectionInfo {
-            id,
-            platform: platform.to_string(),
-            status: status.to_string(),
+            id: row.id,
+            platform: row.platform,
+            status: row.status,
             config,
-            created_at: now.clone(),
-            updated_at: now,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
         };
 
         self.connections.lock().await.insert(platform.to_string(), info.clone());
@@ -260,23 +217,7 @@ impl ImIntegrationManager {
         let platform_clone = platform.to_string();
         let now_clone = now.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let config: Option<crate::db::im_config_repo::ImConfigRow> = db.with_conn(|conn| {
-                crate::db::im_config_repo::get_im_config_by_platform(conn, &platform_clone)
-            })??;
-            if let Some(row) = config {
-                db.with_conn(|conn| {
-                    crate::db::im_config_repo::update_im_config_status(
-                        conn,
-                        &row.id,
-                        "disconnected",
-                        &now_clone,
-                    )
-                })??;
-            }
-            Ok(())
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || db.disconnect_im_platform(&platform_clone, &now_clone)).await??;
 
         if let Some(conn) = self.connections.lock().await.get_mut(platform) {
             conn.status = "disconnected".to_string();
@@ -507,80 +448,8 @@ impl ImIntegrationManager {
 
     pub async fn get_message_stats(&self, platform: Option<&str>) -> Result<ImMessageStatsResult> {
         let db = self.db.clone();
-        let platform_clone = platform.map(|s| s.to_string());
-
-        let stats = tokio::task::spawn_blocking(move || -> Result<ImMessageStatsResult> {
-            db.with_conn(|conn| {
-                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-                let total_messages: u64 = if let Some(ref p) = platform_clone {
-                    conn.query_row(
-                        "SELECT COALESCE(SUM(message_count), 0) FROM im_message_stats WHERE platform = ?1",
-                        rusqlite::params![p],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                } else {
-                    conn.query_row(
-                        "SELECT COALESCE(SUM(message_count), 0) FROM im_message_stats",
-                        [],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                };
-
-                let total_sessions: u64 = if let Some(ref p) = platform_clone {
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM im_sessions WHERE platform = ?1",
-                        rusqlite::params![p],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                } else {
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM im_sessions",
-                        [],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                };
-
-                let active_today: u64 = if let Some(ref p) = platform_clone {
-                    conn.query_row(
-                        "SELECT COALESCE(SUM(message_count), 0) FROM im_message_stats WHERE platform = ?1 AND date = ?2",
-                        rusqlite::params![p, today],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                } else {
-                    conn.query_row(
-                        "SELECT COALESCE(SUM(message_count), 0) FROM im_message_stats WHERE date = ?1",
-                        rusqlite::params![today],
-                        |row| row.get(0),
-                    ).unwrap_or(0)
-                };
-
-                let avg_response: f64 = if let Some(ref p) = platform_clone {
-                    conn.query_row(
-                        "SELECT COALESCE(AVG(avg_response_time), 0.0) FROM im_message_stats WHERE platform = ?1",
-                        rusqlite::params![p],
-                        |row| row.get(0),
-                    ).unwrap_or(0.0)
-                } else {
-                    conn.query_row(
-                        "SELECT COALESCE(AVG(avg_response_time), 0.0) FROM im_message_stats",
-                        [],
-                        |row| row.get(0),
-                    ).unwrap_or(0.0)
-                };
-
-                Ok(ImMessageStatsResult {
-                    platform: platform_clone,
-                    total_messages,
-                    total_sessions,
-                    active_today,
-                    avg_response_time_ms: avg_response as u64,
-                })
-            })?
-        })
-        .await??;
-
-        Ok(stats)
+        let platform = platform.map(str::to_owned);
+        tokio::task::spawn_blocking(move || db.im_stats(platform.as_deref())).await?
     }
 
     pub async fn set_permission_mode(&self, platform: &str, mode: PermissionMode) -> Result<()> {
@@ -609,44 +478,8 @@ impl ImIntegrationManager {
 
     pub async fn get_error_logs(&self, platform: Option<&str>) -> Result<Vec<ImErrorLogInfo>> {
         let db = self.db.clone();
-        let platform_clone = platform.map(|s| s.to_string());
-
-        let logs = tokio::task::spawn_blocking(move || -> Result<Vec<ImErrorLogInfo>> {
-            db.with_conn(|conn| {
-                let sql = if platform_clone.is_some() {
-                    "SELECT id, platform, error_type, error_message, stack_trace, created_at FROM im_error_logs WHERE platform = ?1 ORDER BY created_at DESC LIMIT 100"
-                } else {
-                    "SELECT id, platform, error_type, error_message, stack_trace, created_at FROM im_error_logs ORDER BY created_at DESC LIMIT 100"
-                };
-                let mut stmt = conn.prepare_cached(sql)?;
-
-                let params: Vec<&dyn rusqlite::ToSql> = if let Some(ref p) = platform_clone {
-                    vec![p]
-                } else {
-                    vec![]
-                };
-
-                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-                    Ok(ImErrorLogInfo {
-                        id: row.get(0)?,
-                        platform: row.get(1)?,
-                        error_type: row.get(2)?,
-                        error_message: row.get(3)?,
-                        stack_trace: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                })?;
-
-                let mut result = Vec::new();
-                for row in rows {
-                    result.push(row?);
-                }
-                Ok(result)
-            })?
-        })
-        .await??;
-
-        Ok(logs)
+        let platform = platform.map(str::to_owned);
+        tokio::task::spawn_blocking(move || db.im_errors(platform.as_deref())).await?
     }
 
     pub async fn connect_websocket_platform(
