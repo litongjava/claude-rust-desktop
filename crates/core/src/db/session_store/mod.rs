@@ -3,6 +3,8 @@ mod approvals;
 mod access;
 pub use access::{H5Session,HostAccess};
 mod agents;
+mod plugins;
+pub use plugins::{PluginCatalog,PluginInstall};
 pub use agents::AgentCatalog;
 mod admission;
 mod binding;

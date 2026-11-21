@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn legacy_preview_backup_execution_idempotence_conflict_and_disable() {
     let temp = tempfile::tempdir().unwrap();
-    let context = ServiceContext::open(
+    let context = ServiceContext::from_stores(
         RuntimePaths::new(temp.path().join("data")).unwrap(),
         Arc::new(EnvironmentCredentials),
     )
@@ -68,7 +68,7 @@ async fn legacy_preview_backup_execution_idempotence_conflict_and_disable() {
 #[test]
 fn unsupported_legacy_contracts_fail_without_installing() {
     let temp = tempfile::tempdir().unwrap();
-    let context = ServiceContext::open(
+    let context = ServiceContext::from_stores(
         RuntimePaths::new(temp.path().join("data")).unwrap(),
         Arc::new(EnvironmentCredentials),
     )

@@ -1,7 +1,7 @@
 //! Versioned JSON bundles. Installation never executes plugin code.
 use super::ServiceContext;
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, OptionalExtension};
+use crate::db::session_store::{PluginCatalog,PluginInstall};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -127,7 +127,7 @@ impl Bundle {
 
 /// Language servers from this application's plugins, then from plugins the
 /// user installed in Claude Code (`~/.claude/plugins`). Earlier entries win.
-pub fn all_language_servers(context: &ServiceContext) -> Result<Vec<Value>> {
+pub fn all_language_servers(context: &ServiceContext<impl PluginCatalog>) -> Result<Vec<Value>> {
     let mut servers = language_servers(context)?;
     if let Some(home) = dirs::home_dir() {
         servers.extend(claude_code::language_servers(&home.join(".claude")));
@@ -137,7 +137,7 @@ pub fn all_language_servers(context: &ServiceContext) -> Result<Vec<Value>> {
 
 /// Read active plugin language servers without starting processes or exposing
 /// credentials in the CLI's plugin list. The LSP manager starts them on demand.
-pub fn language_servers(context: &ServiceContext) -> Result<Vec<Value>> {
+pub fn language_servers(context: &ServiceContext<impl PluginCatalog>) -> Result<Vec<Value>> {
     let mut servers = Vec::new();
     for item in list(context)?.into_iter().filter(|item| item.enabled) {
         let bundle = enabled_bundle(context, &item.id)?;
@@ -189,7 +189,7 @@ pub async fn source(source: &str) -> Result<Bundle> {
     Ok(bundle)
 }
 pub async fn install(
-    context: &ServiceContext,
+    context: &ServiceContext<impl PluginCatalog>,
     from: &str,
     update: Option<&str>,
 ) -> Result<Installed> {
@@ -201,60 +201,14 @@ pub async fn install(
             "Update bundle ID differs from installed plugin"
         );
     }
-    let payload = serde_json::to_string(&bundle)?;
-    context.db.with_conn(|c| -> Result<()> {
-        let tx = crate::db::write_transaction(&c)?;
-        let current: Option<(String, bool)> = tx
-            .query_row(
-                "SELECT bundle,enabled FROM installed_plugins WHERE id=?1",
-                [&bundle.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match (update, current) {
-            (None, None) => {
-                tx.execute(
-                    "INSERT INTO installed_plugins(id,bundle,source,enabled) VALUES(?1,?2,?3,1)",
-                    params![bundle.id, payload, from],
-                )?;
-            }
-            (Some(_), Some((old, _))) => {
-                let old: Bundle = serde_json::from_str(&old)?;
-                ensure!(
-                    semver::Version::parse(&bundle.version)?
-                        > semver::Version::parse(&old.version)?,
-                    "Update must have a newer version"
-                );
-                tx.execute(
-                    "UPDATE installed_plugins SET bundle=?1,source=?2 WHERE id=?3",
-                    params![payload, from, bundle.id],
-                )?;
-            }
-            (None, Some(_)) => anyhow::bail!("Plugin already installed; use update"),
-            (Some(_), None) => anyhow::bail!("Plugin not installed"),
-        }
-        tx.commit()?;
-        Ok(())
-    })??;
+    context.db.save_plugin(&bundle,from,if update.is_some(){PluginInstall::Update}else{PluginInstall::New})?;
     list(context)?
         .into_iter()
         .find(|p| p.id == bundle.id)
         .context("Installed plugin missing")
 }
-pub fn list(context: &ServiceContext) -> Result<Vec<Installed>> {
-    context.db.with_conn(|c| -> Result<_> {
-        let mut stmt =
-            c.prepare("SELECT bundle,enabled,source FROM installed_plugins ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (raw, enabled, source) = r?;
-            let b: Bundle = serde_json::from_str(&raw)?;
+pub fn list(context: &ServiceContext<impl PluginCatalog>) -> Result<Vec<Installed>> {
+    context.db.plugins()?.into_iter().map(|(b,enabled,source)|{
             let capabilities = [
                 (!b.lsp_servers.is_empty(), "lsp"),
                 (!b.skill_paths.is_empty(), "skills"),
@@ -274,43 +228,17 @@ pub fn list(context: &ServiceContext) -> Result<Vec<Installed>> {
             })
         })
         .collect()
-    })?
 }
-pub fn enable(context: &ServiceContext, id: &str, enabled: bool) -> Result<()> {
-    ensure!(
-        context.db.with_conn(|c| c.execute(
-            "UPDATE installed_plugins SET enabled=?1 WHERE id=?2",
-            params![enabled, id]
-        ))?? == 1,
-        "Plugin not installed"
-    );
-    Ok(())
+pub fn enable(context: &ServiceContext<impl PluginCatalog>, id: &str, enabled: bool) -> Result<()> {
+    context.db.enable_plugin(id,enabled)
 }
-pub fn remove(context: &ServiceContext, id: &str) -> Result<()> {
-    ensure!(
-        context
-            .db
-            .with_conn(|c| c.execute("DELETE FROM installed_plugins WHERE id=?1", [id]))??
-            == 1,
-        "Plugin not installed"
-    );
-    Ok(())
+pub fn remove(context: &ServiceContext<impl PluginCatalog>, id:&str)->Result<()>{
+    context.db.remove_plugin(id)
 }
-fn enabled_bundle(context: &ServiceContext, id: &str) -> Result<Bundle> {
-    let raw: String = context
-        .db
-        .with_conn(|c| {
-            c.query_row(
-                "SELECT bundle FROM installed_plugins WHERE id=?1 AND enabled=1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-        })??
-        .context("Plugin is disabled or not installed")?;
-    Ok(serde_json::from_str(&raw)?)
+fn enabled_bundle(context:&ServiceContext<impl PluginCatalog>,id:&str)->Result<Bundle>{
+    context.db.active_plugin(id)
 }
-pub fn prompt_hooks(context: &ServiceContext) -> Result<String> {
+pub fn prompt_hooks(context: &ServiceContext<impl PluginCatalog>) -> Result<String> {
     let mut text = String::new();
     for item in list(context)?.into_iter().filter(|p| p.enabled) {
         let bundle = enabled_bundle(context, &item.id)?;
@@ -326,7 +254,7 @@ pub fn prompt_hooks(context: &ServiceContext) -> Result<String> {
 
 /// Callers must obtain the same execution permission as shell tools.
 pub async fn run(
-    context: &ServiceContext,
+    context: &ServiceContext<impl PluginCatalog>,
     id: &str,
     name: &str,
     input: Value,
