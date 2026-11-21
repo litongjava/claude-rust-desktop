@@ -1,5 +1,7 @@
 //! Interactive provider management. Credentials are stored inline, or read
 //! from the environment when the user names a variable.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::terminal::input::TerminalInput;
 use crate::{args::Cli, config, session::Session};
 use anyhow::{bail, ensure, Context, Result};
@@ -2503,7 +2505,7 @@ mod tests {
         session
             .store
             .db
-            .with_conn(|conn| {
+            .directory_sql(|conn| {
                 conn.execute_batch(
                     "CREATE TRIGGER refresh_switch_failure BEFORE UPDATE ON conversations \
                      BEGIN SELECT RAISE(ABORT, 'injected'); END;",
@@ -2530,7 +2532,7 @@ mod tests {
         session
             .store
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER refresh_switch_failure"))
+            .directory_sql(|conn| conn.execute_batch("DROP TRIGGER refresh_switch_failure"))
             .unwrap()
             .unwrap();
         session.close().await.unwrap();

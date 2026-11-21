@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use super::*;
 use serde_json::json;
 
@@ -23,13 +25,8 @@ impl Fixture {
             .join(&id)
             .join("state.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        context
-            .save_setting(
-                &format!("background-agent.{id}"),
-                &json!({"agent_type":"general","description":"ACTIVE_AGENT_SENTINEL"}),
-            )
-            .unwrap();
-        context.save_setting(&format!("delegation.{child}"), &json!({"parent_session_id":parent,"status":"running","description":"ACTIVE_AGENT_SENTINEL"})).unwrap();
+        context.db.directory_sql(|c|c.execute("INSERT INTO background_agents(job,parent_incarnation,child_incarnation,agent_type,description,started_at) SELECT ?1,p.incarnation,c.incarnation,'general','ACTIVE_AGENT_SENTINEL',datetime('now') FROM conversations p,conversations c WHERE p.id=?2 AND c.id=?3", (&id,&parent,&child))).unwrap().unwrap();
+        context.db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &json!({"parent_session_id":parent,"status":"running","description":"ACTIVE_AGENT_SENTINEL"})).unwrap();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let fixture = Self {
             _dir: dir,

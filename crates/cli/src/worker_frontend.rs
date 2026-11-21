@@ -1,5 +1,7 @@
 //! An attachable frontend for a turn owned by an independent supervisor/worker.
 //! Only the worker submits the prompt, executes tools, and persists the transcript.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::{
     args::Cli,
     session::Session,
@@ -1205,7 +1207,7 @@ mod failure_tests {
         source_job.id = source_id.clone(); source_job.status = "running".into(); source_job.finished_ms = None;
         source_job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
         std::fs::write(source_directory.join("state.json"), serde_json::to_vec(&source_job).unwrap()).unwrap();
-        session.store.db.with_conn(|conn| -> anyhow::Result<()> {
+        session.store.db.shard_sql(&parent, |conn| -> anyhow::Result<()> {
             let key = format!("session.goal-proposals.{parent}");
             let text: String = conn.query_row("SELECT value FROM peripheral_settings WHERE key=?1", [&key], |row| row.get(0))?;
             let mut value: Value = serde_json::from_str(&text)?;

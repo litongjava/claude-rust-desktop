@@ -1,4 +1,6 @@
 ﻿//! Background CLI sessions run in an independent supervisor process.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::{args::Cli, session::Session};
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
@@ -1271,7 +1273,7 @@ mod worker_config_tests {
         };
         let cli = Cli::parse_from(["dcl", "--print", "--permission-mode", "dont-ask"]);
         let notification = "<task-notification>RESUME_PENDING_REPORT</task-notification>";
-        input_queue::push(&store.db, &id, notification).unwrap();
+        store.db.open_session(&id).unwrap().enqueue_cli_notification(notification).unwrap();
         let mut session = Session::open(&cli, &paths, selection(), Some(&id))
             .await
             .unwrap();
@@ -1282,7 +1284,7 @@ mod worker_config_tests {
                 .unwrap());
         }
         assert!(requests.lock().unwrap().is_empty());
-        assert!(input_queue::any(&store.db, &id, is_notification).unwrap());
+        assert!(store.db.pending_input(&id, is_notification).unwrap());
         assert!(session
             .resume_saved(&paths, "missing-session")
             .await
@@ -1313,7 +1315,7 @@ mod worker_config_tests {
             .await
             .unwrap();
         assert!(!session.waiting_for_continue());
-        assert!(!input_queue::any(&store.db, &id, is_notification).unwrap());
+        assert!(!store.db.pending_input(&id, is_notification).unwrap());
         assert!(!wake_for_notifications(&cli, &mut session, &mut None)
             .await
             .unwrap());
@@ -1349,7 +1351,7 @@ mod worker_config_tests {
             .unwrap();
         assert!(!fresh.waiting_for_continue());
         fresh.workspace = dir.path().to_owned();
-        input_queue::push(&fresh.store.db, &fresh.id, notification).unwrap();
+        fresh.store.db.open_session(&fresh.id).unwrap().enqueue_cli_notification(notification).unwrap();
         assert!(wake_for_notifications(&cli, &mut fresh, &mut None)
             .await
             .unwrap());
@@ -1426,7 +1428,7 @@ mod worker_config_tests {
             "{lines:?}"
         );
         assert!(lines.iter().any(|line| line.contains("exited")), "{lines:?}");
-        assert!(input_queue::any(&session.store.db, &session.id, is_notification).unwrap());
+        assert!(session.store.db.pending_input(&session.id, is_notification).unwrap());
         let more = collect_completed(&session).unwrap();
         assert!(
             !more.iter().any(|line| line.contains("Monitor event")),
@@ -1632,15 +1634,23 @@ mod agent_row_tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().to_owned()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"started_at":"2026-11-01T00:00:00Z"})).unwrap();
-        context.save_setting("agent-description.child", &"Locate registry code").unwrap();
-        context.db.with_conn(|conn| conn.execute_batch("INSERT INTO conversations(id,created_at,updated_at) VALUES ('child','now','now'),('parent','now','now'); INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES ('m1','child','assistant','','now',0),('m2','parent','assistant','','now',0); INSERT INTO model_requests(id,message_id,conversation_id,output_tokens) VALUES ('r1','m1','child',1200),('r2','m1','child',300),('r3','m2','parent',99999);")).unwrap().unwrap();
+        for (session,requests) in [("child",vec![("r1",1200),("r2",300)]),("parent",vec![("r3",99999)])] {
+            context.db.create(session, Default::default()).unwrap();
+            context.db.shard_sql(session, |conn| -> rusqlite::Result<()> {
+                conn.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES ('m',?1,'assistant','','now',0)",[session])?;
+                for (id,tokens) in requests {
+                    conn.execute("INSERT INTO model_requests(id,message_id,conversation_id,output_tokens) VALUES (?1,'m',?2,?3)", (id,session,tokens))?;
+                }
+                Ok(())
+            }).unwrap().unwrap();
+        }
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"started_at":"2026-11-01T00:00:00Z"})).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Locate registry code").unwrap();
         let agent = foreground_agent(&context, "child", "explore").unwrap();
         assert_eq!(agent.description, "Locate registry code");
         assert_eq!(agent.output_tokens, 1500);
         context
-            .save_setting(
-                "cli.live-requests.child",
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::LIVE_REQUESTS,
                 &serde_json::json!([
                     {"id":"r1","outputTokens":1200}, {"id":"r4","outputTokens":200},
                     {"id":"r5","outputTokens":null}
@@ -1653,7 +1663,7 @@ mod agent_row_tests {
                 .output_tokens,
             1700
         );
-        context.save_setting("delegation.child", &serde_json::json!({"started_at":"2026-11-01T00:00:00Z","output_tokens":1900,"output_tokens_estimated":true})).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"started_at":"2026-11-01T00:00:00Z","output_tokens":1900,"output_tokens_estimated":true})).unwrap();
         let estimated = foreground_agent(&context, "child", "explore").unwrap();
         assert!(agent_rows(&[estimated], 120)[1].contains("~1.9k tokens"));
         assert!(foreground_agent(&context, "missing", "explore").is_none());

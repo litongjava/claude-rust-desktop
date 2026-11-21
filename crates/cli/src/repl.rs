@@ -1,4 +1,6 @@
 //! Local REPL commands use the same stores as Desktop and never call a model.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Result};
@@ -472,7 +474,7 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
     session
         .store
         .db
-        .with_conn(|conn| -> Result<()> {
+        .shard_sql(&id, |conn| -> Result<()> {
             message_repo::insert_message(
                 conn,
                 "answer",
@@ -527,7 +529,7 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
     session
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             message_repo::save_request_snapshots(conn, "answer", &serde_json::json!([snapshot]))
         })
         .unwrap()
@@ -924,7 +926,7 @@ mod tests {
         store.append(&id, "user", "Next turn").unwrap();
         let messages = store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&id, |conn| {
                 deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &id)
             })
             .unwrap()

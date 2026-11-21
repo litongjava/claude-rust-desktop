@@ -1,4 +1,6 @@
 //! Read-only session-family browser shared by idle and running terminal views.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use deepseek_code_core::services::ServiceContext;
 use std::{
@@ -330,9 +332,9 @@ mod tests {
         let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
         let child = store.fork(&parent).unwrap();
         let unrelated = store.fork(&parent).unwrap();
-        context.save_setting(&format!("delegation.{child}"), &serde_json::json!({"session_id":child,"parent_session_id":parent,"agent_type":"general","status":"completed","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"session_id":child,"parent_session_id":parent,"agent_type":"general","status":"completed","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting(&format!("agent-description.{child}"), &"Inspect child")
+            .db.seed_preference(&child, deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Inspect child")
             .unwrap();
         store.append(&child, "user", "CHILD_USER_SENTINEL").unwrap();
         let assistant = store
@@ -348,7 +350,7 @@ mod tests {
             .join("\n");
         context
             .db
-            .with_conn(|conn| {
+            .shard_sql(&child, |conn| {
                 deepseek_code_core::db::message_repo::insert_tool_call(
                     conn,
                     "child-tool",

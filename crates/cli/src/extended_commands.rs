@@ -1,4 +1,6 @@
 ﻿//! Local commands backed by the shared conversation store and OS clipboard.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
@@ -577,8 +579,7 @@ mod tests {
         let parent = store.create(dir.path(), "test", "cli-runtime").unwrap();
         let child = store.create(dir.path(), "test", "cli-runtime").unwrap();
         let unrelated = store.create(dir.path(), "test", "cli-runtime").unwrap();
-        crate::services::context(&paths).unwrap().save_setting(
-            &format!("delegation.{child}"),
+        crate::services::context(&paths).unwrap().db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
             &json!({"session_id":child,"parent_session_id":parent,"description":"Inspect resume","current_tool":"Read","status":"running"}),
         ).unwrap();
         // Persisted running metadata and an open terminal are not active execution.
@@ -617,8 +618,7 @@ mod tests {
         let unrelated = store.create(&project, "test", "cli-runtime").unwrap();
         crate::services::context(&paths)
             .unwrap()
-            .save_setting(
-                &format!("delegation.{child}"),
+            .db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
                 &json!({"session_id":child,"parent_session_id":parent}),
             )
             .unwrap();

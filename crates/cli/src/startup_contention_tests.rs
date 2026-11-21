@@ -2,7 +2,7 @@
 //! path, so it waits for another host's writer instead of failing at the
 //! pooled connection's 5 s busy_timeout.
 use super::*;
-use deepseek_code_core::runtime::DATABASE_FILE;
+
 use std::{thread, time::Duration};
 
 struct Fixture {
@@ -67,7 +67,7 @@ impl Fixture {
     }
 
     fn lock_writer(&self) -> rusqlite::Connection {
-        let holder = rusqlite::Connection::open(self.paths.data_dir.join(DATABASE_FILE)).unwrap();
+        let holder = rusqlite::Connection::open_with_flags(self.paths.data_dir.join("global.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         holder
     }
@@ -176,7 +176,7 @@ async fn explicit_model_change_reports_the_labelled_lock_error_after_the_deadlin
         "the binding write gave up before its retry budget: {elapsed:?}"
     );
     // No abandoned attempt may have published a generation or moved the selector.
-    let observed = crate::binding_store::observe(&fixture.store.db, &fixture.id).unwrap();
+    let observed = fixture.store.db.observed_binding(&fixture.id).unwrap();
     assert_eq!(observed.generation, 0);
     assert_eq!(observed.model, "old-model");
     assert_eq!(observed.provider, "old-provider");

@@ -1,4 +1,6 @@
 //! Discover only enabled, unambiguous skills that the shared engine can execute.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use deepseek_code_core::{runtime::RuntimePaths, skills::SkillsManager};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -546,28 +548,27 @@ mod tests {
         store
             .append(&parent, "user", "private parent history")
             .unwrap();
-        context.save_setting(&format!("cli.session.{parent}"), &serde_json::json!({"effort":"high","goal":{"text":"parent-only","completed":false}})).unwrap();
+        context.db.seed_preference(&parent, deepseek_code_core::db::session_store::settings::PREFERENCES, &serde_json::json!({"effort":"high","goal":{"text":"parent-only","completed":false}})).unwrap();
         context
-            .save_setting(
-                &format!("cli.permissions.{parent}"),
-                &serde_json::json!({"deny":["Bash(*)"]}),
+            .db.seed_preference(&parent, deepseek_code_core::db::session_store::settings::PERMISSIONS,
+                &serde_json::json!({"Bash(*)":"Deny"}),
             )
             .unwrap();
         let child = isolated_child(&store, &parent, &context).unwrap();
         assert!(store.history(&child).unwrap().is_empty());
         assert_eq!(store.history(&parent).unwrap().len(), 1);
         let child_settings: serde_json::Value = context
-            .setting(&format!("cli.session.{child}"))
+            .db.fixture_preference(&child, deepseek_code_core::db::session_store::settings::PREFERENCES)
             .unwrap()
             .unwrap();
         assert_eq!(child_settings["effort"], "high");
-        assert!(child_settings.get("goal").is_none());
+        assert!(child_settings["goal"].is_null());
         assert_eq!(
             context
-                .setting::<serde_json::Value>(&format!("cli.permissions.{child}"))
+                .db.fixture_preference(&child, deepseek_code_core::db::session_store::settings::PERMISSIONS)
                 .unwrap(),
             context
-                .setting::<serde_json::Value>(&format!("cli.permissions.{parent}"))
+                .db.fixture_preference(&parent, deepseek_code_core::db::session_store::settings::PERMISSIONS)
                 .unwrap()
         );
         store

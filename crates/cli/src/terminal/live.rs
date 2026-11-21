@@ -1,4 +1,6 @@
 //! One terminal owner while a model turn runs. The idle editor is inactive.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use super::change_view;
 use super::tool_view::Gathering;
 use crossterm::{
@@ -3385,9 +3387,10 @@ mod tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","preview":"CHILD_DETAIL_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","preview":"CHILD_DETAIL_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting("agent-description.child", &"Child fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Child fixture")
             .unwrap();
         let keys = temp.path().join("keys.json");
         let mut display = TurnDisplay::new(true, "ask", &keys, vec![]).unwrap();
@@ -3640,9 +3643,10 @@ mod tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","preview":"CHILD_EXECUTION_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","preview":"CHILD_EXECUTION_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting("agent-description.child", &"Inspect fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Inspect fixture")
             .unwrap();
         let mut display =
             TurnDisplay::new(true, "ask", &temp.path().join("keys.json"), vec![]).unwrap();
@@ -4932,7 +4936,7 @@ mod completion_tests {
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store.create(root.path(), "fixture", "fixture").unwrap();
         let session = crate::session::Session::open(&cli, &paths, selection, Some(&id)).await.unwrap();
-        session.store.db.with_conn(|conn| -> anyhow::Result<()> {
+        session.store.db.shard_sql(&session.id, |conn| -> anyhow::Result<()> {
             for (index, message) in ["answer-1", "answer-2"].iter().enumerate() {
                 message_repo::insert_message(conn, message, &id, "assistant", "", None, "2026-11-02T00:00:00Z", false, index as i64)?;
                 // Old records may repeat the provider raw id across messages.
@@ -5152,9 +5156,10 @@ mod mcp_started_tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":125,"output_tokens_estimated":true})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":125,"output_tokens_estimated":true})).unwrap();
         context
-            .save_setting("agent-description.child", &"Streaming fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Streaming fixture")
             .unwrap();
         let mut display = TurnDisplay::new(true, "plan", &keys, vec![]).unwrap();
         display.set_shell_context(temp.path(), "parent");
@@ -5166,7 +5171,7 @@ mod mcp_started_tests {
         let output = serde_json::json!([{"type":"text","text":"MCP_BODY_SENTINEL\nSecond body line\nThird body line\nFourth body line\nLAST_BODY_SENTINEL"}]).to_string();
         display.tool_finished("mcp-one", name, &input, &output, false);
         display.tool_finished("mcp-one", name, &input, &output, false);
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":1500,"output_tokens_estimated":false})).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":1500,"output_tokens_estimated":false})).unwrap();
         display.before_text("MCP_FIXTURE_DONE\n");
         std::thread::sleep(Duration::from_secs(24));
         display.agent_progress("child", "general", "completed", None);

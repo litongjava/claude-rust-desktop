@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use axum::{
     extract::State,
     response::{sse::Event, IntoResponse, Sse},
@@ -290,7 +292,7 @@ async fn fail_stream(screen_reader: bool, failure: DisplayFailure) {
     assert_eq!(assistant["content"].as_str().unwrap(), response_text());
     let turn = store
         .db
-        .with_conn(|c| latest_turn(c, session))
+        .shard_sql(session, |c| latest_turn(c, session))
         .unwrap()
         .unwrap()
         .unwrap();

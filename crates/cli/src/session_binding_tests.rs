@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use super::{Cli, RuntimePaths, Selection, Session};
 use crate::binding_store;
 use serde_json::json;
@@ -32,7 +34,7 @@ async fn restart_handoff_and_plain_observation_never_publish() {
     owner
         .store
         .db
-        .with_conn(|db| {
+        .directory_sql(|db| {
             db.execute_batch(
                 "CREATE TRIGGER reject_write BEFORE UPDATE OF provider,model ON conversations
          BEGIN SELECT RAISE(ABORT,'observer attempted binding write'); END;",
@@ -67,7 +69,7 @@ async fn restart_handoff_and_plain_observation_never_publish() {
         );
     }
     assert_eq!(
-        binding_store::observe(&owner.store.db, &owner.id)
+        owner.store.db.observed_binding(&owner.id)
             .unwrap()
             .generation,
         1
@@ -126,7 +128,7 @@ async fn rejected_clear_rolls_back_the_conversation_and_binding() {
     session
         .store
         .db
-        .with_conn(|db| {
+        .directory_sql(|db| {
             db.execute_batch(
                 "CREATE TRIGGER reject_clear BEFORE INSERT ON cli_binding_revisions
          BEGIN SELECT RAISE(ABORT,'clear binding rejected'); END;",
@@ -147,7 +149,7 @@ async fn rejected_clear_rolls_back_the_conversation_and_binding() {
             let count: u64 = session
                 .store
                 .db
-                .with_conn(|db| {
+                .directory_sql(|db| {
                     db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 })
                 .unwrap()
@@ -229,12 +231,12 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
         .await
         .unwrap();
     winner.switch(&paths, selection(4096)).await.unwrap();
-    let key = format!("cli.session.{}", winner.id);
+    let key = "cli.session";
     let settings = r#"{"effort":"high","autocompact_percent":70,"extra":true}"#;
     winner
         .store
         .db
-        .with_conn(|c| {
+        .shard_sql(&winner.id, |c| {
             c.execute(
                 "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
                 (&key, settings),
@@ -246,7 +248,7 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
         winner
             .store
             .db
-            .with_conn(|c| {
+            .shard_sql(&winner.id, |c| {
                 c.query_row(
                     "SELECT value FROM peripheral_settings WHERE key=?1",
                     [&key],
@@ -265,10 +267,10 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
     winner
         .store
         .db
-        .with_conn(|c| {
+        .shard_sql(&winner.id, |c| {
             c.execute_batch(
                 "CREATE TRIGGER reject_effort BEFORE UPDATE ON peripheral_settings
-        WHEN NEW.key LIKE 'cli.session.%' BEGIN SELECT RAISE(ABORT,'effort write rejected'); END;",
+        WHEN NEW.key='cli.session' BEGIN SELECT RAISE(ABORT,'effort write rejected'); END;",
             )
         })
         .unwrap()
@@ -278,7 +280,7 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
         .await
         .is_err());
     assert_eq!(
-        binding_store::observe(&winner.store.db, &winner.id)
+        winner.store.db.observed_binding(&winner.id)
             .unwrap()
             .generation,
         version
@@ -287,7 +289,7 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
     winner
         .store
         .db
-        .with_conn(|c| c.execute_batch("DROP TRIGGER reject_effort"))
+        .shard_sql(&winner.id, |c| c.execute_batch("DROP TRIGGER reject_effort"))
         .unwrap()
         .unwrap();
     picker
@@ -337,7 +339,7 @@ async fn unstamped_worker_adopts_the_authoritative_revision_without_publishing()
         Some(4096)
     );
     assert_eq!(
-        binding_store::observe(&owner.store.db, &owner.id)
+        owner.store.db.observed_binding(&owner.id)
             .unwrap()
             .generation,
         2
