@@ -12,6 +12,9 @@ pub struct DeliveredInput {
     pub text: String,
     pub content: Value,
     pub origin: String,
+    /// Identifies a user row already committed by a durable delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 impl DeliveredInput {
@@ -26,6 +29,7 @@ impl DeliveredInput {
         .map(Value::Array)
         .unwrap_or_else(|| json!(text));
         Self {
+            message_id: None,
             text,
             content,
             origin: if notification {

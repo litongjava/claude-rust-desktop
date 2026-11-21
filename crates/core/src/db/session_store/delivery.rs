@@ -656,7 +656,7 @@ pub struct DeliveryOwner {
     pub(super) session: SessionDb,
     _lease: std::sync::Arc<ExecutionLease>,
     _consumer: ExecutionLease,
-    live_handoffs: std::collections::HashSet<String>,
+    live_handoffs: std::collections::HashMap<String,String>,
 }
 #[derive(Debug, PartialEq)]
 pub struct Handoff {
@@ -664,6 +664,7 @@ pub struct Handoff {
     pub applied: bool,
 }
 struct Claim {
+    origin: String,
     id: String,
     hash: String,
     target: Option<String>,
@@ -789,8 +790,17 @@ impl DeliveryOwner {
                 authorize_queue(c, &s.id)?;
                 c.execute("UPDATE session_input_queue SET state='claimed',revision=revision+1,target=?2 WHERE id=?1", params![id, tool])?;
             }
-            Ok(Some(c.query_row("SELECT delivery_id,payload,target,revision FROM session_input_queue WHERE id=?1", [id], |r| {
+            Ok(Some(c.query_row("SELECT delivery_id,payload,target,revision,request_id FROM session_input_queue WHERE id=?1", [id], |r| {
+                let request: String = r.get(4)?;
+                let origin = if request.starts_with("internal-cli:notice:") {
+                    "task_notification".into()
+                } else if request.starts_with("internal-cli:prompt:") {
+                    "user".into()
+                } else {
+                    format!("queue-input-{id}")
+                };
                 Ok(Claim {
+                    origin,
                     id: r.get(0)?,
                     hash: r.get(1)?,
                     target: r.get(2)?,
@@ -853,6 +863,7 @@ impl DeliveryOwner {
                 .query_map([&s.id], |r| {
                     Ok((
                         Claim {
+                            origin:"peer".into(),
                             id: r.get(0)?,
                             hash: r.get(1)?,
                             target: None,
@@ -933,9 +944,7 @@ impl DeliveryOwner {
                 Err(error) if crate::db::is_contention(&error) => break,
                 Err(error) => return Err(error),
             };
-            if !self.live_handoffs.remove(&handoff.id) {
-                continue;
-            }
+            let Some(origin) = self.live_handoffs.remove(&handoff.id) else { continue; };
             let input = self.session.connection_under_lock(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 |c| {
@@ -952,7 +961,8 @@ impl DeliveryOwner {
                     Ok(Some(DeliveredInput {
                         text: row.content,
                         content,
-                        origin: format!("queue-input-{}",handoff.id),
+                        origin,
+                        message_id: Some(handoff.id.clone()),
                     }))
                 },
             )?;
@@ -1032,6 +1042,7 @@ impl DeliveryOwner {
                 } else if let Some(tool) = &claim.target {
                     let mut inputs = input_queue::load_delivered(tx.0, tool)?;
                     inputs.push(DeliveredInput {
+                        message_id: None,
                         text: payload.as_str().map(str::to_owned).unwrap_or_else(|| payload.to_string()),
                         content: payload.clone(),
                         origin: if claim.id.starts_with("notice-") {"task_notification"}else{"user"}.into(),
@@ -1070,7 +1081,7 @@ impl DeliveryOwner {
                 });
             }
             if live {
-                self.live_handoffs.insert(claim.id.clone());
+                self.live_handoffs.insert(claim.id.clone(),claim.origin.clone());
             }
             true
         };

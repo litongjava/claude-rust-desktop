@@ -241,7 +241,7 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
     assert_eq!(
         store
             .db
-            .fixture_shard(&id, |conn| crate::db::message_repo::get_message(conn, &delivered[0].origin))
+            .fixture_shard(&id, |conn| crate::db::message_repo::get_message(conn, delivered[0].message_id.as_deref().unwrap()))
             .unwrap()
             .unwrap()
             .unwrap()

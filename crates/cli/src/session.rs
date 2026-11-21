@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use deepseek_code_core::db::session_store::{ExecutorHistory, SegmentPlacement, SegmentUpdate};
 use crate::terminal::input::TerminalInput;
 use crate::{
@@ -2688,7 +2690,7 @@ impl Session {
                         // saved by the handoff, and the stream-json `queued_input`
                         // event reports its delivery; only input with no row of its
                         // own is attached to the preceding tool result.
-                        if !delivered.origin.starts_with("queue-input-") {
+                        if delivered.message_id.is_none() {
                             if let Some(tool) = tools.last() {
                                 let inputs = queued_inputs_by_tool.entry(tool.id.clone()).or_default();
                                 inputs.push(delivered.clone());
@@ -2834,7 +2836,7 @@ impl Session {
                     }
                     EngineEvent::QueuedInput(delivered) => {
                         // Durable deliveries already have their own transcript row.
-                        if !delivered.origin.starts_with("queue-input-") {
+                        if delivered.message_id.is_none() {
                             if let Some(tool) = tools.last() {
                                 queued_inputs_by_tool
                                     .entry(tool.id.clone())
@@ -4264,7 +4266,7 @@ mod event_tests {
             second
                 .store
                 .db
-                .with_conn(|conn| -> Result<i64> {
+                .shard_sql(&id, |conn| -> Result<i64> {
                     Ok(conn.query_row(
                         "SELECT COUNT(*) FROM execution_turns WHERE conversation_id=?1",
                         [&id],
@@ -4294,7 +4296,7 @@ mod event_tests {
             "the rejected turn must not create a turn record"
         );
         assert!(
-            !deepseek_code_core::services::input_queue::any(&second.store.db, &id, |text| {
+            !second.store.db.pending_input(&id, |text| {
                 text == "second task"
             })
             .unwrap(),
@@ -4377,7 +4379,7 @@ mod event_tests {
         let completed = session
             .store
             .db
-            .with_conn(|conn| -> Result<i64> {
+            .shard_sql(&id, |conn| -> Result<i64> {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM execution_turns WHERE conversation_id=?1 AND status='completed'",
                     [&id],
@@ -4649,7 +4651,7 @@ mod event_tests {
         session
             .store
             .db
-            .with_conn(|conn| {
+            .directory_sql(|conn| {
                 conn.execute(
                     "INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     rusqlite::params![
@@ -4799,7 +4801,7 @@ mod event_tests {
         session
             .store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&second, |conn| {
                 conn.execute_batch(&format!(
                     "CREATE TRIGGER lc_fixture_permission BEFORE INSERT ON peripheral_settings \
                      WHEN NEW.key='cli.permission-mode.{second}' \
@@ -4845,7 +4847,7 @@ mod event_tests {
         session
             .store
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER lc_fixture_permission"))
+            .shard_sql(&second, |conn| conn.execute_batch("DROP TRIGGER lc_fixture_permission"))
             .unwrap()
             .unwrap();
         session.resume_saved(&paths, &second).await.unwrap();
