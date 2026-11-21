@@ -234,3 +234,118 @@ fn conversation_snapshot_preserves_typed_content_and_turns_and_rolls_back_bad_id
     );
     Ok(())
 }
+
+#[test]
+fn im_threads_share_the_directory_without_owning_a_code_transcript() -> Result<()> {
+    use deepseek_code_core::im_integration::session_manager::{SessionContext, SessionMessage};
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let now = chrono::Utc::now();
+    let thread = SessionContext {
+        platform: "feishu".into(),
+        user_id: "user".into(),
+        chat_id: "chat".into(),
+        thread_id: Some("thread".into()),
+        created_at: now,
+        updated_at: now,
+        message_count: 1,
+        last_message_content: Some("preview".into()),
+        metadata: json!({"dispatch":"one"}),
+    };
+    let msg = SessionMessage {
+        id: "event-id".into(),
+        session_key: thread.thread_key(),
+        role: "user".into(),
+        content: "payload".repeat(20_000),
+        message_type: "text".into(),
+        timestamp: now,
+        raw_data: Some(json!({"body":"original"})),
+    };
+    stores.save_im_thread(&thread, Some(&msg))?;
+    stores.save_im_thread(&thread, Some(&msg))?;
+    let other = SessionContext {
+        thread_id: Some("another".into()),
+        ..thread.clone()
+    };
+    stores.save_im_thread(&other, None)?;
+    assert!(stores
+        .global()
+        .list_sessions(Default::default())?
+        .is_empty());
+    drop(stores);
+    let stores = Stores::open(root.path())?;
+    let threads = stores.im_threads()?;
+    assert_eq!(threads.len(), 2);
+    assert!(threads
+        .iter()
+        .all(|t| t.message_count == 1 && t.metadata == thread.metadata));
+    assert!(stores.im_messages(&other.thread_key(), 10)?.is_empty());
+    let found = stores.im_messages(&thread.thread_key(), 10)?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].content, msg.content);
+    assert_eq!(found[0].raw_data, msg.raw_data);
+    assert!(stores
+        .save_im_thread(
+            &thread,
+            Some(&SessionMessage {
+                content: "different".into(),
+                ..msg.clone()
+            })
+        )
+        .is_err());
+    stores.delete_im_thread(&thread.thread_key())?;
+    assert!(stores.im_messages(&thread.thread_key(), 10)?.is_empty());
+    assert_eq!(stores.im_threads()?[0].thread_key(), other.thread_key());
+    Ok(())
+}
+
+#[test]
+fn approval_decisions_require_the_selected_shard_or_one_unique_match() -> Result<()> {
+    use deepseek_code_core::db::permission_repo::PermissionApprovalRow;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    for session in ["one", "two"] {
+        stores.create(session, Default::default())?.write(|w| {
+            let message = w.append("assistant", "tool")?;
+            w.approval(&PermissionApprovalRow {
+                id: "request".into(),
+                conversation_id: session.into(),
+                message_id: message,
+                tool_name: "Read".into(),
+                action: "read".into(),
+                risk_level: "low".into(),
+                status: "pending".into(),
+                created_at: "now".into(),
+                user_decision: None,
+                decision_reason: None,
+                decided_at: None,
+            })
+        })?;
+    }
+    assert!(stores
+        .decide_approval(None, "request", "approved", None, "now")
+        .is_err());
+    stores.decide_approval(Some("one"), "request", "rejected", Some("declined"), "now")?;
+    let first = stores.open_session("one")?;
+    assert_eq!(
+        first
+            .read(|r| r.approval("request"))?
+            .unwrap()
+            .decision_reason
+            .as_deref(),
+        Some("declined")
+    );
+    let second = stores.open_session("two")?;
+    assert_eq!(
+        second.read(|r| r.approval("request"))?.unwrap().status,
+        "pending"
+    );
+    first.delete()?;
+    stores.decide_approval(None, "request", "approved", None, "later")?;
+    assert_eq!(
+        second.read(|r| r.approval("request"))?.unwrap().status,
+        "approved"
+    );
+    Ok(())
+}

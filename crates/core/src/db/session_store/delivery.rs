@@ -15,7 +15,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 impl Stores {
-    fn put_payload(&self, value: &Value) -> Result<String> {
+    pub(super) fn put_payload(&self, value: &Value) -> Result<String> {
         let bytes = serde_json::to_vec(value)?;
         let hash = digest(&bytes);
         let dir = self.root.path.join("global-blobs");
@@ -35,7 +35,7 @@ impl Stores {
         layout::sync_dir(&dir)?;
         Ok(hash)
     }
-    fn payload(&self, hash: &str) -> Result<Value> {
+    pub(super) fn payload(&self, hash: &str) -> Result<Value> {
         ensure!(
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "Invalid payload reference"

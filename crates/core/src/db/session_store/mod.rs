@@ -8,6 +8,7 @@ mod delivery;
 mod global;
 mod global_format;
 mod history;
+mod im;
 mod repair;
 pub mod settings;
 mod state;
