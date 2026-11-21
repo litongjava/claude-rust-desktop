@@ -517,3 +517,46 @@ fn sync_buckets_replay_after_content_commit_and_fence_retired_sessions() -> Resu
     assert!(stores.global().conversation("remote")?.is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn im_host_resumes_transport_threads_and_reads_only_their_messages() -> Result<()> {
+    use deepseek_code_core::im_integration::{
+        message_router::{MessageType, UnifiedMessage},
+        session_manager::SessionManager,
+    };
+    use std::sync::Arc;
+    let root = tempfile::tempdir()?;
+    let stores = Arc::new(Stores::open(root.path())?);
+    let host = SessionManager::new(stores.clone());
+    host.initialize().await?;
+    for thread in ["first", "second"] {
+        let event = UnifiedMessage {
+            platform: "feishu".into(),
+            user_id: "user".into(),
+            chat_id: "chat".into(),
+            thread_id: Some(thread.into()),
+            content: thread.into(),
+            message_type: MessageType::Text,
+            timestamp: chrono::Utc::now(),
+            raw_data: serde_json::json!({"thread":thread}),
+        };
+        host.get_or_create_session(&event).await?;
+        host.update_session(&event).await?;
+    }
+    drop(host);
+    let resumed = SessionManager::new(stores.clone());
+    resumed.initialize().await?;
+    for thread in ["first", "second"] {
+        let messages = resumed
+            .get_session_messages("feishu", "user", "chat", Some(thread), 10)
+            .await?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].raw_data.as_ref().unwrap()["thread"], thread);
+    }
+    resumed
+        .delete_session("feishu", "user", "chat", Some("first"))
+        .await?;
+    assert_eq!(resumed.list_sessions().await.len(), 1);
+    assert!(stores.conversations()?.is_empty());
+    Ok(())
+}

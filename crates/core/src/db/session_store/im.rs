@@ -117,3 +117,73 @@ impl Stores {
         })
     }
 }
+
+use crate::im_integration::session_manager::ThreadHistory;
+
+impl ThreadHistory for Stores {
+    fn im_threads(&self) -> Result<Vec<SessionContext>> {
+        self.im_threads()
+    }
+    fn save_im_thread(
+        &self,
+        thread: &SessionContext,
+        message: Option<&SessionMessage>,
+    ) -> Result<()> {
+        self.save_im_thread(thread, message)
+    }
+    fn im_messages(&self, thread: &str, limit: usize) -> Result<Vec<SessionMessage>> {
+        self.im_messages(thread, limit)
+    }
+    fn delete_im_thread(&self, thread: &str) -> Result<()> {
+        self.delete_im_thread(thread)
+    }
+}
+
+impl ThreadHistory for crate::db::DbManager {
+    fn im_threads(&self) -> Result<Vec<SessionContext>> {
+        self.with_conn(|c| -> Result<_> {
+            c.execute_batch("CREATE TABLE IF NOT EXISTS im_session_messages(id TEXT PRIMARY KEY, session_key TEXT NOT NULL REFERENCES im_sessions(session_key) ON DELETE CASCADE,
+                role TEXT NOT NULL,content TEXT NOT NULL,message_type TEXT NOT NULL,timestamp TEXT NOT NULL,raw_data TEXT);
+                CREATE INDEX IF NOT EXISTS idx_im_session_messages_session ON im_session_messages(session_key);
+                CREATE INDEX IF NOT EXISTS idx_im_session_messages_timestamp ON im_session_messages(timestamp);")?;
+            let mut q=c.prepare("SELECT platform,user_id,chat_id,thread_id,created_at,updated_at,message_count,last_message_content,metadata FROM im_sessions")?;
+            let rows=q.query_map([],|r| Ok(SessionContext{platform:r.get(0)?,user_id:r.get(1)?,chat_id:r.get(2)?,thread_id:r.get(3)?,created_at:r.get(4)?,
+                updated_at:r.get(5)?,message_count:r.get(6)?,last_message_content:r.get(7)?,metadata:r.get::<_,Option<String>>(8)?.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_else(||json!({}))}))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })?
+    }
+
+    fn save_im_thread(
+        &self,
+        thread: &SessionContext,
+        message: Option<&SessionMessage>,
+    ) -> Result<()> {
+        let key = thread.thread_key();
+        self.with_conn(|c| crate::db::write_tx(c,"save IM thread",super::WRITE_DEADLINE,|tx|{
+            tx.execute("INSERT INTO im_sessions(session_key,platform,user_id,chat_id,thread_id,created_at,updated_at,message_count,last_message_content,metadata)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at,
+                last_message_content=excluded.last_message_content,metadata=excluded.metadata,message_count=im_sessions.message_count+?11",
+                params![key,thread.platform,thread.user_id,thread.chat_id,thread.thread_id,thread.created_at.to_rfc3339(),thread.updated_at.to_rfc3339(),thread.message_count,thread.last_message_content,thread.metadata.to_string(),i64::from(message.is_some())])?;
+            if let Some(m)=message {
+                ensure!(m.session_key==key,"IM message belongs to a different thread");
+                tx.execute("INSERT INTO im_session_messages(id,session_key,role,content,message_type,timestamp,raw_data) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![m.id,key,m.role,m.content,m.message_type,m.timestamp.to_rfc3339(),m.raw_data.as_ref().map(Value::to_string)])?;
+            }
+            Ok(())
+        }))?
+    }
+    fn im_messages(&self, key: &str, limit: usize) -> Result<Vec<SessionMessage>> {
+        self.with_conn(|c| -> Result<_> {
+            let mut q=c.prepare("SELECT id,session_key,role,content,message_type,timestamp,raw_data FROM im_session_messages WHERE session_key=?1 ORDER BY timestamp DESC,id DESC LIMIT ?2")?;
+            let rows=q.query_map(params![key,i64::try_from(limit).unwrap_or(i64::MAX)],|r| Ok(SessionMessage{
+                id:r.get(0)?,session_key:r.get(1)?,role:r.get(2)?,content:r.get(3)?,message_type:r.get(4)?,timestamp:r.get(5)?,
+                raw_data:r.get::<_,Option<String>>(6)?.and_then(|s|serde_json::from_str(&s).ok())
+            }))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })?
+    }
+    fn delete_im_thread(&self, key: &str) -> Result<()> {
+        self.with_conn(|c| c.execute("DELETE FROM im_sessions WHERE session_key=?1", [key]))??;
+        Ok(())
+    }
+}
