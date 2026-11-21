@@ -1,12 +1,14 @@
 //! EnterWorktree and ExitWorktree, as in the reference CLI. They reuse the
 //! session worktree binding behind `dcl --worktree` and `/worktree`, so the
 //! prompt, tools and later turns all resolve the same working directory.
-use crate::db::session_store::{SessionAccess,settings::{EnteredWorktree,ENTERED_WORKTREE}};
+use crate::db::session_store::{
+    settings::{EnteredWorktree, ENTERED_WORKTREE},
+    SessionAccess, SessionRepository,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::db::DbManager;
 use crate::worktree::{hooks, session as worktrees};
 
 pub fn definitions() -> Vec<super::ToolDefinition> {
@@ -34,7 +36,6 @@ pub fn is_worktree_tool(name: &str) -> bool {
     matches!(name, "EnterWorktree" | "ExitWorktree")
 }
 
-
 /// Returns the tool result and the session's new working directory.
 pub async fn execute(
     name: &str,
@@ -47,40 +48,39 @@ pub async fn execute(
         crate::runtime::RuntimePaths::new(root.to_path_buf())?,
         std::sync::Arc::new(crate::services::EnvironmentCredentials),
     )?;
-    let db = &context.db;
+    let owner = context.db.select_session(session)?;
     match name {
         "EnterWorktree" => {
             ensure!(
-                hooks::status(db, session)?.is_none(),
+                owner.worktree_status()?.is_none(),
                 "This session is already in a worktree; use ExitWorktree first"
             );
             ensure!(
                 input["name"].is_null() || input["path"].is_null(),
                 "name and path are mutually exclusive"
             );
-            let project = db
-                .with_conn(|conn| {
-                    crate::native_engine::workspace::conversation_project(conn, session)
-                })??
-                .context("Worktrees require a trusted project")?;
+            owner.check_worktree_source(cwd)?;
             let (path, created) = match input["path"].as_str() {
-                Some(path) => (
-                    bind_existing(db, session, &project.id, cwd, Path::new(path))?,
-                    false,
-                ),
-                None => (
-                    create(db, session, &project.id, cwd, input["name"].as_str())?,
-                    true,
-                ),
+                Some(path) => {
+                    // Persist removal protection before making a caller-owned path visible.
+                    owner.set_preference(
+                        ENTERED_WORKTREE,
+                        Some(&EnteredWorktree { created: false }),
+                    )?;
+                    (bind_existing(&owner, cwd, Path::new(path))?, false)
+                }
+                None => (create(&owner, cwd, input["name"].as_str())?, true),
             };
-            context.db.select_session(session)?.set_preference(ENTERED_WORKTREE,Some(&EnteredWorktree{created}))?;
+            if created {
+                owner.set_preference(ENTERED_WORKTREE, Some(&EnteredWorktree { created }))?;
+            }
             Ok((
                 json!({"worktree_path":path,"content":format!("Switched to worktree {}. The session now works there; use ExitWorktree to return.", path.display())}),
                 path,
             ))
         }
         "ExitWorktree" => {
-            let Some(state) = hooks::status(db, session)? else {
+            let Some(state) = owner.worktree_status()? else {
                 return Ok((
                     json!({"content":"No worktree session is active; nothing was changed."}),
                     cwd.to_path_buf(),
@@ -88,9 +88,11 @@ pub async fn execute(
             };
             let action = input["action"].as_str().context("action is required")?;
             let path = PathBuf::from(state["path"].as_str().unwrap_or_default());
-            let created = context.db.select_session(session)?.preference(ENTERED_WORKTREE)?.is_none_or(|entered|entered.created);
+            let created = owner
+                .preference(ENTERED_WORKTREE)?
+                .is_none_or(|entered| entered.created);
             let source = match action {
-                "keep" => hooks::release(root, db, session, false).await?,
+                "keep" => hooks::release_bound(root, &owner, session, false).await?,
                 "remove" => {
                     ensure!(created, "This worktree was entered by path, so ExitWorktree will not remove it; use action \"keep\"");
                     let dirty =
@@ -99,7 +101,7 @@ pub async fn execute(
                         bail!("The worktree has uncommitted files; confirm with the user, then pass discard_changes: true to discard them:\n{dirty}");
                     }
                     if input["discard_changes"] == true {
-                        let source = hooks::release(root, db, session, false).await?;
+                        let source = hooks::release_bound(root, &owner, session, false).await?;
                         let repo = worktrees::git(&source, &["rev-parse", "--show-toplevel"])?;
                         worktrees::git(
                             Path::new(&repo),
@@ -107,12 +109,12 @@ pub async fn execute(
                         )?;
                         source
                     } else {
-                        hooks::release(root, db, session, true).await?
+                        hooks::release_bound(root, &owner, session, true).await?
                     }
                 }
                 other => bail!("Unsupported action: {other}"),
             };
-            context.db.select_session(session)?.set_preference(ENTERED_WORKTREE,None)?;
+            owner.set_preference(ENTERED_WORKTREE, None)?;
             Ok((
                 json!({"working_directory":source,"content":format!("Left the worktree ({action}). Working directory: {}", source.display())}),
                 source,
@@ -122,26 +124,9 @@ pub async fn execute(
     }
 }
 
-fn create(
-    db: &DbManager,
-    session: &str,
-    project: &str,
-    source: &Path,
-    name: Option<&str>,
-) -> Result<PathBuf> {
+fn create(owner: &SessionRepository<'_>, source: &Path, name: Option<&str>) -> Result<PathBuf> {
     let prepared = worktrees::prepare_named(source, name.filter(|n| !n.is_empty()))?;
-    let saved = db
-        .with_conn(|conn| -> Result<()> {
-            let transaction = crate::db::write_transaction(&conn)?;
-            prepared.save(&transaction, session, project, &source.to_string_lossy())?;
-            transaction.execute(
-                "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
-                [prepared.path.to_string_lossy().as_ref(), session],
-            )?;
-            transaction.commit()?;
-            Ok(())
-        })
-        .and_then(|result| result);
+    let saved = owner.bind_prepared_worktree(source, &prepared);
     if let Err(error) = saved {
         prepared.cleanup();
         return Err(error);
@@ -149,13 +134,7 @@ fn create(
     Ok(prepared.path.clone())
 }
 
-fn bind_existing(
-    db: &DbManager,
-    session: &str,
-    project: &str,
-    source: &Path,
-    path: &Path,
-) -> Result<PathBuf> {
+fn bind_existing(owner: &SessionRepository<'_>, source: &Path, path: &Path) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .with_context(|| format!("Worktree path does not exist: {}", path.display()))?;
@@ -175,13 +154,6 @@ fn bind_existing(
         "That path is the main checkout, not a worktree"
     );
     let branch = worktrees::git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    db.with_conn(|conn| -> Result<()> {
-        let transaction = crate::db::write_transaction(&conn)?;
-        transaction.execute("INSERT INTO conversation_worktrees (conversation_id, project_id, source_path, repo_path, path, branch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![session, project, source.to_string_lossy(), repo, path.to_string_lossy(), branch])?;
-        transaction.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2", [path.to_string_lossy().as_ref(), session])?;
-        transaction.commit()?;
-        Ok(())
-    })??;
+    owner.bind_worktree(source, Path::new(&repo), &path, &branch, None)?;
     Ok(path)
 }

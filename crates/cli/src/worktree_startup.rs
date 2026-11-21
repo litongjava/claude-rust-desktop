@@ -1,7 +1,7 @@
 //! CLI worktrees use the shared Desktop conversation binding and resolver.
 use crate::{args::Cli, session::Session};
 use anyhow::{Context, Result};
-use deepseek_code_core::worktree::session as worktrees;
+use deepseek_code_core::{db::session_store::SessionAccess, worktree::session as worktrees};
 
 pub fn validate(cli: &Cli, source: &std::path::Path) -> Result<()> {
     if let Some(name) = &cli.worktree {
@@ -26,13 +26,17 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
         return Ok(());
     };
     let source = session.workspace.clone();
-    if let Some(path) = crate::hook_progress::during(&session.id, true, deepseek_code_core::worktree::hooks::create(
-        &session.paths.data_dir,
-        &session.store.db,
+    if let Some(path) = crate::hook_progress::during(
         &session.id,
-        &source,
-        (!name.is_empty()).then_some(name.as_str()),
-    ))
+        true,
+        deepseek_code_core::worktree::hooks::create(
+            &session.paths.data_dir,
+            &session.store.db,
+            &session.id,
+            &source,
+            (!name.is_empty()).then_some(name.as_str()),
+        ),
+    )
     .await?
     {
         session.workspace = path;
@@ -40,37 +44,11 @@ pub async fn apply(cli: &Cli, session: &mut Session) -> Result<()> {
         eprintln!("Hook worktree: {}. Retained on exit; /worktree status, detach or remove manages this binding.",session.workspace.display());
         return Ok(());
     }
+    let owner = session.store.db.select_session(&session.id)?;
     let prepared = worktrees::prepare_named(&source, (!name.is_empty()).then_some(name.as_str()))?;
-    let saved = session
-        .store
-        .db
-        .with_conn(|conn| -> Result<()> {
-            deepseek_code_core::db::write_tx(
-                conn,
-                "session worktree binding",
-                deepseek_code_core::db::STARTUP_WRITE_DEADLINE,
-                |transaction| {
-                    let project: String = transaction.query_row(
-                        "SELECT project_id FROM conversations WHERE id=?1",
-                        [&session.id],
-                        |row| row.get(0),
-                    )?;
-                    prepared.save(
-                        &transaction,
-                        &session.id,
-                        &project,
-                        &source.to_string_lossy(),
-                    )?;
-                    transaction.execute(
-                        "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
-                        [prepared.path.to_string_lossy().as_ref(), &session.id],
-                    )?;
-                    Ok(())
-                },
-            )
-            .context("Binding session worktree")
-        })
-        .and_then(|result| result);
+    let saved = owner
+        .bind_prepared_worktree(&source, &prepared)
+        .context("Binding session worktree");
     if let Err(error) = saved {
         prepared.cleanup();
         return Err(error);
@@ -97,16 +75,23 @@ pub async fn handle(argument: &str, session: &mut Session) -> Result<()> {
                 .context("Source missing")?
                 .to_owned();
             hooks::ensure_idle(&session.paths.data_dir, &session.id)?;
-            deepseek_code_core::services::session_worker::shutdown(&session.paths.data_dir, &session.id)
-                .await?;
+            deepseek_code_core::services::session_worker::shutdown(
+                &session.paths.data_dir,
+                &session.id,
+            )
+            .await?;
             let previous = std::env::current_dir()?;
             std::env::set_current_dir(&source)?;
-            match crate::hook_progress::during(&session.id, true, hooks::release(
-                &session.paths.data_dir,
-                &session.store.db,
+            match crate::hook_progress::during(
                 &session.id,
-                action == "remove",
-            ))
+                true,
+                hooks::release(
+                    &session.paths.data_dir,
+                    &session.store.db,
+                    &session.id,
+                    action == "remove",
+                ),
+            )
             .await
             {
                 Ok(path) => {

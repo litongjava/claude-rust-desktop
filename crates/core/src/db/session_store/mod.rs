@@ -56,6 +56,7 @@ mod team;
 pub use team::TeamCatalog;
 pub use documents::{DocumentCatalog,DocumentImport};
 mod projects;
+mod worktrees;
 pub use projects::{ProjectEdit,Projects};
 mod repair;
 mod runtime;
