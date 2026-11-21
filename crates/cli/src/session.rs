@@ -1,4 +1,4 @@
-use deepseek_code_core::db::session_store::{ExecutorHistory, SegmentUpdate};
+use deepseek_code_core::db::session_store::{ExecutorHistory, SegmentPlacement, SegmentUpdate};
 use crate::terminal::input::TerminalInput;
 use crate::{
     args::{Cli, OutputFormat, PermissionModeArg},
@@ -2453,8 +2453,11 @@ impl Session {
                     },
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
                     EngineEvent::ContextReset { session_id, boundary_id } if session_id == self.id => {
-                        deepseek_code_core::services::plan_approval::archive_segment(&self.store.db, &self.id, &boundary_id, Some(&assistant_id), &text, &thinking_text, &tools, &snapshots)?;
-                        history.save_segment_inputs(&assistant_id, &tools, &queued_inputs_by_tool)?;
+                        history.save_segment(&assistant_id, SegmentUpdate {
+                            placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
+                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            snapshots: Some(&json!(snapshots)), ..Default::default()
+                        })?;
                         assistant_id = turn.new_segment()?;
                         text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
                         if background_transcript { live_transcript = BackgroundTranscript::default(); separate_text = false; }
@@ -2825,21 +2828,11 @@ impl Session {
                         session_id,
                         boundary_id,
                     } if session_id == self.id => {
-                        deepseek_code_core::services::plan_approval::archive_segment(
-                            &self.store.db,
-                            &self.id,
-                            &boundary_id,
-                            Some(&assistant_id),
-                            &text,
-                            &thinking_text,
-                            &tools,
-                            &snapshots,
-                        )?;
-                        history.save_segment_inputs(
-                            &assistant_id,
-                            &tools,
-                            &queued_inputs_by_tool,
-                        )?;
+                        history.save_segment(&assistant_id, SegmentUpdate {
+                            placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
+                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            snapshots: Some(&json!(snapshots)), ..Default::default()
+                        })?;
                         assistant_id = turn.new_segment()?;
                         text.clear();
                         thinking_text.clear();
@@ -2897,21 +2890,11 @@ impl Session {
             deepseek_code_core::services::plan_approval::latest_boundary(&self.store.db, &self.id)?;
         if latest_boundary != observed_plan_boundary {
             if let Some(boundary) = latest_boundary {
-                deepseek_code_core::services::plan_approval::archive_segment(
-                    &self.store.db,
-                    &self.id,
-                    &boundary,
-                    Some(&assistant_id),
-                    &text,
-                    &thinking_text,
-                    &tools,
-                    &snapshots,
-                )?;
-                history.save_segment_inputs(
-                    &assistant_id,
-                    &tools,
-                    &queued_inputs_by_tool,
-                )?;
+                history.save_segment(&assistant_id, SegmentUpdate {
+                            placement: SegmentPlacement::Before(&boundary), text: Some(&text), thinking: Some(&thinking_text),
+                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            snapshots: Some(&json!(snapshots)), ..Default::default()
+                        })?;
                 assistant_id = turn.new_segment()?;
                 text.clear();
                 thinking_text.clear();
@@ -2961,6 +2944,7 @@ impl Session {
             tools: &tools, origins: Some(&live_transcript.origins),
             durations: Some(&tool_durations), inputs: Some(&queued_inputs_by_tool),
             notes: Some(&approval_notes), snapshots: Some(&json!(snapshots)),
+            ..Default::default()
         })?;
         best_effort_live_write(
             "request",

@@ -33,7 +33,7 @@ impl ExecutorHistory {
         }
     }
 
-    fn read<T>(&self, f: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
+    pub(super) fn read<T>(&self, f: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
         match self {
             Self::Session(session) => session.read(|r| f(r.0, session.id())),
             Self::Shared(db, id) => db.with_conn(|c| f(c, id))?,

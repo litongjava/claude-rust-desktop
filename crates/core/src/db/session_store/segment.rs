@@ -10,8 +10,19 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Default, Clone, Copy)]
+pub enum SegmentPlacement<'a> {
+    #[default]
+    Current,
+    Before(&'a str),
+    Final {
+        observed_boundary: Option<&'a str>,
+    },
+}
+
 #[derive(Default)]
 pub struct SegmentUpdate<'a> {
+    pub placement: SegmentPlacement<'a>,
     pub text: Option<&'a str>,
     pub thinking: Option<&'a str>,
     pub tools: &'a [ToolCallRow],
@@ -31,6 +42,30 @@ impl SegmentUpdate<'_> {
             .exists([message, session])?,
             "Assistant segment no longer belongs to this session"
         );
+        let before = match self.placement {
+            SegmentPlacement::Current => None,
+            SegmentPlacement::Before(id) => Some(id.to_owned()),
+            SegmentPlacement::Final { observed_boundary } => {
+                let latest = if legacy {
+                    crate::services::plan_approval::latest_boundary_conn(c, session)?
+                } else {
+                    super::SessionRead(c).approved_plan_boundary()?
+                };
+                latest.filter(|id| Some(id.as_str()) != observed_boundary)
+            }
+        };
+        if let Some(before) = before {
+            let order:i64=c.query_row("SELECT sort_order FROM messages WHERE id=?1 AND conversation_id=?2 AND is_compact_boundary=1",[before.as_str(),session],|r|r.get(0))?;
+            c.execute(
+                "UPDATE messages SET sort_order=?1 WHERE id=?2",
+                params![
+                    order
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid boundary sort order"))?,
+                    message
+                ],
+            )?;
+        }
         if let Some(text) = self.text {
             messages::update_message_content(c, message, text)?;
         }
@@ -129,37 +164,51 @@ impl ExecutorHistory {
         }
     }
 
-    /// A boundary can archive a segment before its queued-input sidecars are flushed.
-    pub fn save_segment_inputs(
+    pub fn add_segment_input(
         &self,
         message: &str,
-        tools: &[ToolCallRow],
-        inputs: &HashMap<String, Vec<DeliveredInput>>,
+        tool: &str,
+        input: &DeliveredInput,
     ) -> Result<()> {
-        if inputs.is_empty() {
-            return Ok(());
-        }
+        let occurrence = format!("{message}:{tool}");
         let save = |c: &Connection| {
-            let mut found=c.prepare_cached("SELECT 1 FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE t.id=?1 AND m.id=?2 AND m.conversation_id=?3")?;
-            for tool in tools {
-                if let Some(inputs) = inputs.get(&tool.id) {
-                    let occurrence = format!("{message}:{}", tool.id);
-                    ensure!(
-                        found.exists(params![occurrence, message, self.id()])?,
-                        "Archived tool occurrence no longer belongs to this session"
-                    );
-                    input_queue::save_delivered(c, &occurrence, inputs)?;
-                }
-            }
-            Ok(())
+            ensure!(c.prepare_cached("SELECT 1 FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE t.id=?1 AND m.id=?2 AND m.conversation_id=?3")?
+                .exists(params![occurrence,message,self.id()])?,"Target tool occurrence is missing");
+            let mut prior = input_queue::load_delivered(c, &occurrence)?;
+            prior.push(input.clone());
+            input_queue::save_delivered(c, &occurrence, &prior)
         };
         match self {
-            Self::Session(s) => s.write_named("archive queued inputs", |w| save(w.0)),
+            Self::Session(s) => s.write_named("save delivered tool input", |w| save(w.0)),
             Self::Shared(db, _) => db.with_conn(|c| {
-                crate::db::write_tx(c, "archive queued inputs", super::WRITE_DEADLINE, |tx| {
-                    save(tx)
-                })
+                crate::db::write_tx(
+                    c,
+                    "save delivered tool input",
+                    super::WRITE_DEADLINE,
+                    |tx| save(tx),
+                )
             })?,
         }
+    }
+
+    pub fn latest_plan_boundary(&self) -> Result<Option<String>> {
+        match self {
+            Self::Session(s) => s.read(|r| r.approved_plan_boundary()),
+            Self::Shared(db, id) => crate::services::plan_approval::latest_boundary(db, id),
+        }
+    }
+    pub fn message_text(&self, message: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.read(|c, id| {
+            Ok(c.query_row(
+                "SELECT content FROM messages WHERE id=?1 AND conversation_id=?2",
+                [message, id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+    pub fn last_request_number(&self) -> Result<i64> {
+        self.read(|c,id|Ok(c.query_row("SELECT coalesce(max(request_number),0) FROM model_requests WHERE conversation_id=?1",[id],|r|r.get(0))?))
     }
 }

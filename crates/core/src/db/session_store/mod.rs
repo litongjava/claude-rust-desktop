@@ -11,7 +11,7 @@ pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod executor;
 mod segment;
-pub use segment::SegmentUpdate;
+pub use segment::{SegmentPlacement, SegmentUpdate};
 pub use executor::ExecutorHistory;
 mod global;
 mod global_format;
