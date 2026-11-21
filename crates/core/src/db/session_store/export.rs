@@ -1,4 +1,7 @@
 //! Version 1 logical backup. Only the tables listed here belong to the wire format.
+//! A transport result can commit before its running turn persists the tool call.
+//! Such an mcp_output retains its scoped tool_use_id and carries occurrence_pending=true.
+//! Once its tool_call is present in the snapshot the marker is omitted.
 mod references;
 
 use super::{layout, OpenMode, SessionDb, Stores};
@@ -194,6 +197,14 @@ impl<W: Write> Stream<W> {
                     read_field(db, source, row, column, field, &owner, record, &mut pending)?;
                 }
             }
+        }
+        if kind == "mcp_output" && db.prepare_cached(
+            "SELECT 1 FROM mcp_tool_outputs o WHERE o.rowid=?1
+             AND NOT EXISTS (SELECT 1 FROM tool_calls c WHERE c.id=o.tool_use_id)
+             AND EXISTS (SELECT 1 FROM execution_turns t JOIN message_turns m ON m.turn_id=t.id
+                         WHERE t.status='running' AND substr(o.tool_use_id,1,length(m.message_id)+1)=m.message_id||':')"
+        )?.exists([rowid])? {
+            record["occurrence_pending"] = json!(true);
         }
         if kind == "request_blob" {
             let body = &record["body"];

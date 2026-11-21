@@ -996,7 +996,7 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 ### 会话分库与 JSONL 导出
 
 1. 运行 `cargo test --locked -p deepseek-code-cli --test session_export`。空数据目录首次启动应创建 `global.db`、`session-locks/` 和 `sessions/`。已发布会话的历史位于 `sessions/<storage_key>/session.db`。核对生命周期目录、准入锁以及 SQLite 的 WAL/SHM 文件。另在启动前放入内容各异的 `deepseek_code.db`、`deepseek_code.db-wal`、`deepseek_code.db-shm`，启动并导出后逐一核对字节与修改时间。Linux 文件事件监视应记录零次打开、改名或删除。
-2. 用本地 OpenAI、Anthropic 服务分别生成会话，运行 `dcl sessions export <id>`。标准输出逐行解析 UTF-8 JSON，首行为 `deepseek-code.session` 的版本 1 头。核对归档标志、两种修订号、多模态内容、父子调用 ID、请求及按摘要去重的请求体。分支导出保留来源回合 ID，回退后只含保留下来的历史。
+2. 用本地 OpenAI、Anthropic 服务分别生成会话，运行 `dcl sessions export <id>`。标准输出逐行解析 UTF-8 JSON，首行为 `deepseek-code.session` 的版本 1 头。核对归档标志、两种修订号、多模态内容、父子调用 ID、请求及按摘要去重的请求体。运行中的回合先保存 MCP 返回值、再保存工具调用时，第一次导出的 `mcp_output` 应保留 `tool_use_id` 和结果，并带有 `occurrence_pending: true`。调用落盘后再次导出，同一 ID 应能关联到 `tool_call`，标记消失。分支导出保留来源回合 ID，回退后只含保留下来的历史。
 3. 保持回合运行，通过管道读到导出头后追加消息。该次导出只含快照内已提交的内容，运行中回合的状态为 `running`。按 owner、字段和索引连接大字段的 Base64 字节，核对长度和 SHA-256 后再解码文本。逐类统计末行之前的记录，并对其原始字节（含每行 LF）计算 SHA-256，与 `end` 核对。截断或校验失败的文件应判作不完整。
 4. 运行 `dcl sessions export <id> --output <file>`，核对成功后目标可读、标准输出为空。已有目标时应失败，错误写入标准错误，原文件保持原样。外部附件保留路径引用，导出内容包含原始用户输入与工具结果。
 

@@ -134,7 +134,9 @@ fn links(rows: &[Value]) {
             ("tool_use_id", "tool_call", "id"),
             ("request_id", "model_request", "id"),
         ] {
-            if !r[field].is_null() {
+            if field == "tool_use_id" && r["occurrence_pending"] == true {
+                assert!(!of(rows, kind).iter().any(|v| v[key] == r[field]));
+            } else if !r[field].is_null() {
                 assert!(
                     of(rows, kind).iter().any(|v| v[key] == r[field]),
                     "unresolved {field} on {r}"
@@ -735,4 +737,46 @@ fn reject_missing_request_blob() -> Result<()> {
 #[test]
 fn reject_mismatched_request_blob() -> Result<()> {
     check_bad_blob(false)
+}
+#[test]
+fn mark_transport_result_waiting_for_occurrence() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let store = Stores::open(root.path())?;
+    let s = store.create("early", Default::default())?;
+    let msg = s.write(|w| {
+        let turn = w.start_turn()?;
+        w.segment(&turn)
+    })?;
+    s.save_mcp(
+        &msg,
+        "soon",
+        &json!({"content":[{"type":"text","text":"early"}]}),
+        false,
+    )?;
+    let rows = decode(&stdout(root.path(), "early")?)?;
+    let result = of(&rows, "mcp_output")[0];
+    assert_eq!(result["tool_use_id"], format!("{msg}:soon"));
+    assert_eq!(result["occurrence_pending"], true);
+    assert!(of(&rows, "tool_call").is_empty());
+    links(&rows);
+    s.write(|w| {
+        w.tool(
+            &ToolCallRow {
+                id: format!("{msg}:soon"),
+                message_id: msg.clone(),
+                name: "early".into(),
+                input: None,
+                output: None,
+                is_error: false,
+                sort_order: 0,
+            },
+            None,
+        )
+    })?;
+    let linked = decode(&stdout(root.path(), "early")?)?;
+    links(&linked);
+    assert!(of(&linked, "mcp_output")[0]
+        .get("occurrence_pending")
+        .is_none());
+    Ok(())
 }
