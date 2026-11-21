@@ -117,3 +117,27 @@ fn continue_selects_the_greater_id_on_tied_activity() -> Result<()> {
     assert_eq!(sessions.latest(root.path())?.unwrap().id, ids[1]);
     Ok(())
 }
+
+#[test]
+fn default_fork_title_uses_the_displayed_source_title() -> Result<()> {
+    use deepseek_code_core::db::session_store::{Branch, CreateOptions};
+    let root = tempfile::tempdir()?;
+    let db = Stores::open(root.path())?;
+    let source = db.create(
+        "source",
+        CreateOptions {
+            title: Some("CLI session".into()),
+            ..Default::default()
+        },
+    )?;
+    source.write(|w| w.append("user", "Review the migration"))?;
+    source.branch("destination", Branch::Full)?;
+    assert_eq!(
+        db.conversation_metadata("destination")?
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Review the migration (branch)")
+    );
+    Ok(())
+}

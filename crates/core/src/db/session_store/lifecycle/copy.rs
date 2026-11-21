@@ -183,8 +183,9 @@ impl SessionDb {
         let (row, revision, binding) = s.global().read(|conn| {
             let snapshot = conn.unchecked_transaction()?;
             let c = &snapshot;
-            let row = crate::db::conversation_repo::conversation_metadata(c, &self.id)?
-                .context("Source unavailable")?;
+            let row = super::super::directory::one(c, &self.id)?
+                .context("Source unavailable")?
+                .conversation;
             let revision = c.query_row(
                 "SELECT metadata_revision FROM conversations WHERE id=?1",
                 [&self.id],
