@@ -30,16 +30,14 @@ impl<'a> GlobalSetting<'a> {
 impl GlobalDb {
     pub fn setting<T: DeserializeOwned>(&self, key: GlobalSetting<'_>) -> Result<Option<T>> {
         layout::allow_entry()?;
-        self.read(|c| {
-            let raw: Option<String> = c
-                .query_row(
-                    "SELECT value FROM global_settings WHERE domain=?1 AND name=?2",
-                    key.parts(),
-                    |r| r.get(0),
-                )
-                .optional()?;
-            raw.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
-        })
+        let raw: Option<String> = self.read(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM global_settings WHERE domain=?1 AND name=?2",
+                key.parts(),
+                |r| r.get(0),
+            ).optional()?)
+        })?;
+        raw.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
     }
     pub fn set_setting<T: Serialize>(&self, key: GlobalSetting<'_>, value: &T) -> Result<()> {
         layout::allow_entry()?;
