@@ -1,5 +1,6 @@
 //! Detached CLI jobs with an owning supervisor, durable results and liveness leases.
 //! Credentials are inherited through the environment, never serialized in job files.
+use crate::db::session_store::SessionAccess as _;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1491,9 +1492,7 @@ pub fn collect_completed(
         let result = if execution_session != job.session_id {
             store
                 .db
-                .with_conn(|conn| {
-                    crate::db::message_repo::get_messages_by_conversation(conn, &execution_session)
-                })??
+                .select_session(&execution_session)?.messages()?
                 .into_iter()
                 .rev()
                 .find(|message| message.role == "assistant" && !message.content.trim().is_empty())

@@ -387,9 +387,7 @@ fn registration(session: &Session, name: &str) -> Result<Registration> {
         session
             .store
             .db
-            .with_conn(|conn| {
-                deepseek_code_core::db::conversation_repo::get_conversation(conn, &session.id)
-            })??
+            .conversation_metadata(&session.id)?
             .and_then(|row| row.title)
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "DeepSeek Code session".into())

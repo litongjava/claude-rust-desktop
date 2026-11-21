@@ -94,8 +94,7 @@ async fn desktop_child_preserves_mode_and_reads_parent_private_files() {
         let child = result["session_id"].as_str().unwrap();
         let row = context
             .db
-            .with_conn(|conn| conversation_repo::get_conversation(conn, child))
-            .unwrap()
+            .conversation_metadata(child)
             .unwrap()
             .unwrap();
         assert_eq!(row.workspace_mode, mode);

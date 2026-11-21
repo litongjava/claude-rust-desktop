@@ -45,7 +45,7 @@ fn error(error: anyhow::Error) -> Response {
 }
 fn exists(db: &DbManager, id: &str) -> anyhow::Result<()> {
     if db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, id))??
+        .conversation_metadata(id)?
         .is_none()
     {
         return Err(QueueError::NotFound.into());

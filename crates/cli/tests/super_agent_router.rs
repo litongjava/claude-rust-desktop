@@ -401,8 +401,7 @@ async fn router_role_creates_launches_and_approves_a_real_task() {
     assert_ne!(phase_before, task.phase);
     let coder_row = context
         .db
-        .with_conn(|conn| deepseek_code_core::db::conversation_repo::get_conversation(conn, &coder))
-        .unwrap()
+        .conversation_metadata(&coder)
         .unwrap()
         .unwrap();
     let coder_workspace = PathBuf::from(coder_row.workspace_path.unwrap());

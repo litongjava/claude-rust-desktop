@@ -109,9 +109,7 @@ pub async fn list(context: &ServiceContext, parent: &str) -> Result<Vec<ParkedSt
         let worker =
             session_worker::runtime_status(&context.paths.data_dir, &record.session_id).await;
         let job = active(context, &record.session_id)?;
-        let saved = context.db.with_conn(|conn| {
-            crate::db::conversation_repo::get_conversation(conn, &record.session_id)
-        })??;
+        let saved = context.db.conversation_metadata(&record.session_id)?;
         let mode = session_permission_mode::load(&context.db, &record.session_id)?;
         let mode = match mode {
             Some(PermissionMode::BypassPermissions) | None => PermissionMode::AskPermissions,

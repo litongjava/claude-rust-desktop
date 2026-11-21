@@ -110,3 +110,28 @@ impl SessionRepository<'_> {
         }
     }
 }
+
+impl SessionRepository<'_> {
+    pub fn messages(&self) -> Result<Vec<crate::db::message_repo::MessageRow>> {
+        self.read(crate::db::message_repo::get_messages_by_conversation)
+    }
+
+    pub fn active_history_size(&self) -> Result<(usize, usize)> {
+        self.read(|c,id| {
+            let mut query=c.prepare_cached(
+                "WITH boundary AS (SELECT sort_order,rowid AS sequence FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC,rowid DESC LIMIT 1)
+                 SELECT length(CAST(m.content AS BLOB)),
+                    (SELECT coalesce(sum(length(CAST(t.name AS BLOB))+coalesce(length(CAST(t.input AS BLOB)),0)+coalesce(length(CAST(t.output AS BLOB)),0)),0)
+                     FROM tool_calls t WHERE t.message_id=m.id)
+                 FROM messages m WHERE m.conversation_id=?1 AND (NOT EXISTS(SELECT 1 FROM boundary) OR
+                     (m.sort_order,m.rowid)>=(SELECT sort_order,sequence FROM boundary))")?;
+            let mut rows=query.query([id])?;
+            let (mut count,mut size)=(0usize,0usize);
+            while let Some(row)=rows.next()? {
+                count+=1;
+                size=size.saturating_add(row.get(0)?).saturating_add(row.get(1)?);
+            }
+            Ok((count,size))
+        })
+    }
+}

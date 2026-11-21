@@ -425,7 +425,7 @@ impl Launcher {
         let workspace = self
             .context
             .db
-            .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, session))??
+            .conversation_metadata(session)?
             .context("Recovery session missing")?
             .workspace_path
             .context("Recovery workspace missing")?;
@@ -1844,9 +1844,7 @@ impl Launcher {
         operation: &LaunchOperation,
         job: &background_sessions::Job,
     ) -> Result<()> {
-        let row = self.context.db.with_conn(|conn| {
-            crate::db::conversation_repo::get_conversation(conn, &operation.session_id)
-        })??;
+        let row = self.context.db.conversation_metadata(&operation.session_id)?;
         let row = row.with_context(|| {
             format!(
                 "Background task {} has no reserved child session {}",

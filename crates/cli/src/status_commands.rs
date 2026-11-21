@@ -83,11 +83,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
     let title = session
         .store
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &session.id)
-        })
+        .conversation_metadata(&session.id)
         .ok()
-        .and_then(Result::ok)
         .flatten()
         .and_then(|row| row.title)
         .filter(|title| !title.trim().is_empty())

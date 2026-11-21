@@ -214,7 +214,7 @@ fn estimate_history(
 ) -> Result<Option<Estimate>> {
     let exists = store
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, session))??
+        .conversation_metadata(session)?
         .is_some();
     if !exists {
         return Ok(None);

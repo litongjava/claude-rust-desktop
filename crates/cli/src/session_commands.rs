@@ -1,4 +1,5 @@
 //! Interactive session settings persisted alongside the shared conversation.
+use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{db::DbManager, runtime::RuntimePaths};
@@ -769,28 +770,8 @@ fn parse_goal_verdict(text: &str) -> Result<GoalVerdict> {
 
 /// Messages and estimated tokens since the last compact boundary.
 pub fn active_history(session: &Session) -> Result<(usize, usize)> {
-    let rows = session.store.db.with_conn(|conn| {
-        deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)
-    })??;
-    let start = rows
-        .iter()
-        .rposition(|row| row.is_compact_boundary)
-        .unwrap_or(0);
-    let active = &rows[start..];
-    // Conservative byte-based estimate includes serialized tool results.
-    let bytes = session.store.db.with_conn(|conn| -> Result<usize> {
-        let mut bytes = 0usize;
-        for row in active {
-            bytes += row.content.len();
-            for tool in deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &row.id)? {
-                bytes += tool.name.len()
-                    + tool.input.as_deref().map_or(0, str::len)
-                    + tool.output.as_deref().map_or(0, str::len);
-            }
-        }
-        Ok(bytes)
-    })??;
-    Ok((active.len(), bytes.div_ceil(3)))
+    let (messages,bytes) = session.store.db.select_session(&session.id)?.active_history_size()?;
+    Ok((messages,bytes.div_ceil(3)))
 }
 
 /// The footer note the reference CLI shows once a fifth of the context budget
@@ -860,7 +841,7 @@ fn clear_tool_results(messages: &mut [Value]) {
 /// context window, large tool results older than the last few messages are
 /// replaced with a placeholder. The saved transcript is unchanged.
 pub fn microcompact(session: &Session, history: &mut [Value], window: Option<u32>) -> Result<()> {
-    let rows = session.store.db.with_conn(|conn| deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id))??;
+    let rows = session.store.db.select_session(&session.id)?.messages()?;
     let boundary = rows.iter().rev().find(|row| row.is_compact_boundary).map(|row| row.id.clone()).unwrap_or_default();
     let context = crate::services::context(&session.paths)?;
     let key = format!("microcompact.{}", session.id);
@@ -893,7 +874,7 @@ pub fn is_context_overflow(error: &anyhow::Error) -> bool {
 /// (with nothing changed) when there is no earlier conversation to compact.
 pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepseek_code_core::db::turn_repo::TurnTimer) -> Result<bool> {
     use deepseek_code_core::db::message_repo;
-    let rows = session.store.db.with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+    let rows = session.store.db.select_session(&session.id)?.messages()?;
     let start = rows.iter().rposition(|row| row.is_compact_boundary).unwrap_or(0);
     let Some(index) = rows.iter().rposition(|row| row.role == "user") else { return Ok(false) };
     if rows[index].content != prompt || index <= start + 1 {
@@ -915,9 +896,7 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Res
     if let Some(keep) =
         deepseek_code_core::services::compaction_requests::take(&session.store.db, &session.id)?
     {
-        let rows = session.store.db.with_conn(|conn| {
-            deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)
-        })??;
+        let rows = session.store.db.select_session(&session.id)?.messages()?;
         let start = rows
             .iter()
             .rposition(|row| row.is_compact_boundary)

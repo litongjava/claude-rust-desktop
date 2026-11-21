@@ -220,10 +220,7 @@ async fn real_child_runs_in_the_prepared_workspace_and_resumes_there() {
     );
     let stored = sessions
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &first.session_id)
-        })
-        .unwrap()
+        .conversation_metadata(&first.session_id)
         .unwrap()
         .unwrap();
     assert_eq!(

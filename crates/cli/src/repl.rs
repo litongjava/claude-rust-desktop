@@ -1,4 +1,5 @@
 //! Local REPL commands use the same stores as Desktop and never call a model.
+use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Result};
 use deepseek_code_core::{
@@ -90,9 +91,7 @@ pub fn save_completion(session: &Session) -> Result<()> {
     let Some(status) = status else {
         return Ok(());
     };
-    let messages = session.store.db.with_conn(|conn| {
-        deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)
-    })??;
+    let messages = session.store.db.select_session(&session.id)?.messages()?;
     if let Some(message) = messages.last().filter(|m| m.role == "assistant") {
         let directory = session.paths.data_dir.join("turn-completions");
         std::fs::create_dir_all(&directory)?;

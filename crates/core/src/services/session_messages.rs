@@ -610,7 +610,7 @@ impl Consumer {
         let context = context(root)?;
         let saved = context
             .db
-            .with_conn(|conn| conversation_repo::get_conversation(conn, session))??;
+            .conversation_metadata(session)?;
         let Some(saved) = saved else { return Ok(None) };
         // Desktop chat and internal unbound sessions are not message endpoints.
         if saved.workspace_mode != "code" || saved.project_id.is_none() {

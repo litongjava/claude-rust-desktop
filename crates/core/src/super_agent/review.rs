@@ -198,9 +198,7 @@ fn session_metadata(store: &TaskStore, task: &TaskRecord, session: &str) -> Resu
     authorize_session(store, task, session)?;
     let row = store
         .db()
-        .with_conn(|conn| -> Result<Option<conversation_repo::ConversationRow>> {
-            conversation_repo::get_conversation(conn, session)
-        })??
+        .conversation_metadata(session)?
         .with_context(|| format!("Session {session} not found"))?;
     let counts = store.db().with_conn(|conn| -> Result<(i64, i64)> {
         let messages = conn.query_row(

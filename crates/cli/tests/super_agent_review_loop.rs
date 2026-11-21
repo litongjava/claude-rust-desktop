@@ -2107,10 +2107,7 @@ async fn run_review_loop_with(
     assert_eq!(lines[2], second_commit, "Reviewer read a different commit");
     let reviewer_row = context
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &reviewer)
-        })
-        .unwrap()
+        .conversation_metadata(&reviewer)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -4108,10 +4105,7 @@ async fn run_review_loop_with(
     let conversation = |session: &str| -> Value {
         context
             .db
-            .with_conn(|conn| {
-                deepseek_code_core::db::conversation_repo::get_conversation(conn, session)
-            })
-            .unwrap()
+            .conversation_metadata(session)
             .unwrap()
             .map(|row| {
                 json!({

@@ -1,4 +1,5 @@
 //! Explicit, previewable code/conversation rewind without destroying the source transcript.
+use deepseek_code_core::db::session_store::SessionAccess as _;
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
@@ -106,7 +107,7 @@ async fn apply(action: &str, id: &str, paths: &RuntimePaths, session: &mut Sessi
         let messages = session
             .store
             .db
-            .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+            .select_session(&session.id)?.messages()?;
         let index = messages
             .iter()
             .position(|message| message.id == checkpoint.message_id)
@@ -114,9 +115,7 @@ async fn apply(action: &str, id: &str, paths: &RuntimePaths, session: &mut Sessi
         Some(if index == 0 {
             session.store.clear(&session.id)?
         } else {
-            session.store.db.with_conn(|conn| {
-                conversation_repo::branch_conversation(conn, &session.id, None, Some(index - 1))
-            })??
+            session.store.db.branch_conversation(&session.id, None, Some(index - 1))?
         })
     } else {
         None
@@ -148,7 +147,7 @@ async fn pick(paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
     let messages = session
         .store
         .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+        .select_session(&session.id)?.messages()?;
     let mut entries: Vec<Entry> = saved
         .iter()
         .map(|checkpoint| {

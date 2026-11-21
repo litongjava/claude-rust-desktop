@@ -346,9 +346,7 @@ pub(crate) async fn prepare_child_session(
                             id.to_owned()
                         }
                         Err(error) => {
-                            let existing = context.db.with_conn(|conn| {
-                                crate::db::conversation_repo::get_conversation(conn, id)
-                            })??;
+                            let existing = context.db.conversation_metadata(id)?;
                             let Some(row) = existing else {
                                 return Err(error);
                             };
@@ -859,7 +857,7 @@ fn require_session(
     ensure!(!session.trim().is_empty(), "{label} ID is required");
     let row = context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, session))??;
+        .conversation_metadata(session)?;
     row.with_context(|| format!("{label} not found"))
 }
 
@@ -1197,10 +1195,7 @@ mod tests {
         assert_eq!(handle.workspace, canonical);
         let row = context
             .db
-            .with_conn(|conn| {
-                crate::db::conversation_repo::get_conversation(conn, &handle.session_id)
-            })
-            .unwrap()
+            .conversation_metadata(&handle.session_id)
             .unwrap()
             .unwrap();
         assert_eq!(

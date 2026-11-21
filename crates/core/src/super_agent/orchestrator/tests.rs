@@ -216,8 +216,7 @@ async fn manual_plan_approval_launches_then_resumes_the_same_coder_once() {
     let conversation = fixture
         .context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &coder))
-        .unwrap()
+        .conversation_metadata(&coder)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -388,8 +387,7 @@ async fn the_reviewer_gets_a_pinned_checkout_separate_from_the_coder() {
     let conversation = fixture
         .context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &reviewer))
-        .unwrap()
+        .conversation_metadata(&reviewer)
         .unwrap()
         .unwrap();
     let review_workspace = PathBuf::from(conversation.workspace_path.unwrap());

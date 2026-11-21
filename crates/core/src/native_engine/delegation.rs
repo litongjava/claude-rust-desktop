@@ -1113,7 +1113,7 @@ impl ToolLoopExecutor {
             // Creating from actual cwd would incorrectly trust a worktree as a new project.
             let parent_row = context
                 .db
-                .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, parent))??
+                .conversation_metadata(parent)?
                 .context("Parent session not found")?;
             let workspaces_root = if parent_row.project_id.as_deref().is_none_or(str::is_empty) {
                 // The engine may use a private root outside data_dir/workspaces.
