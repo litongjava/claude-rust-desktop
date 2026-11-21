@@ -106,11 +106,18 @@ fn replacing_the_sealed_message_with_identical_text_clears_its_receipt() -> Resu
 }
 
 #[test]
-fn upgrade_binds_a_legacy_receipt_to_the_surviving_sealed_message() -> Result<()> {
-    for rewind in [false, true] {
+fn upgrade_discards_all_legacy_first_message_receipts() -> Result<()> {
+    for (rewind, reordered) in [(false, true), (true, false), (false, false)] {
         let root = tempfile::tempdir()?;
         let stores = Stores::open(root.path())?;
         recover_first(&stores)?;
+        if reordered {
+            let mut sealed = stores.sync_messages(RETRY)?.remove(0);
+            let mut other = sealed.clone();
+            other.id = uuid::Uuid::new_v4().to_string();
+            sealed.sort_order = 1;
+            stores.sync_conversation(RETRY, None, &[sealed, other])?;
+        }
         drop(stores);
         let shard = rusqlite::Connection::open(
             root.path().join("sessions").join(RETRY).join("session.db"),
@@ -127,8 +134,18 @@ fn upgrade_binds_a_legacy_receipt_to_the_surviving_sealed_message() -> Result<()
         }
         drop(shard);
         let stores = Stores::open(root.path())?;
-        assert_eq!(submit(&stores, "A")?, !rewind);
-        assert_eq!(texts(&stores)?, [json!("A")]);
+        if reordered {
+            stores.rewind_messages(
+                RETRY,
+                deepseek_code_core::db::session_store::Rewind::Tail(1),
+            )?;
+        }
+        let claimed = submit(&stores, "A")?;
+        assert_eq!(
+            texts(&stores)?,
+            vec![json!("A"); if rewind { 1 } else { 2 }]
+        );
+        assert!(!claimed);
     }
     Ok(())
 }

@@ -312,17 +312,12 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
             }
             if kind == SESSION && version < 12 {
                 tx.execute_batch(include_str!("session_v12.sql"))?;
-                // V11 saved only a digest. The seal records the original timestamp and
-                // order. A removed shard-issued message makes that identity ambiguous.
-                tx.execute_batch("INSERT INTO first_chat_receipts(message_id,digest)
-                    SELECT m.id,s.value FROM manifest f JOIN peripheral_settings s
-                      ON s.key='first-chat-receipt.' || f.incarnation
-                    JOIN messages m ON m.conversation_id=f.id AND m.created_at=f.created_at
-                      AND m.sort_order=0 AND m.role='user'
-                    WHERE NOT EXISTS(SELECT 1 FROM removed_message_owners)
-                    AND (SELECT count(*) FROM messages WHERE sort_order=0)=1;
-                    DELETE FROM peripheral_settings WHERE key=(
-                        SELECT 'first-chat-receipt.' || incarnation FROM manifest);")?;
+                // V11 sync could reorder equal prompts. Its digest identifies
+                // content only, so a retry must append after an upgrade.
+                tx.execute(
+                    "DELETE FROM peripheral_settings WHERE key GLOB 'first-chat-receipt.*'",
+                    [],
+                )?;
             }
             if kind == GLOBAL {
                 if version < 5 {
