@@ -2015,3 +2015,44 @@ fn a_rejected_transition_keeps_earlier_pending_events_unapplied() {
         .filter(|event| event.event_type != EventType::TaskCreated)
         .all(|event| !event.processed));
 }
+
+#[test]
+fn isolated_members_require_the_original_router_and_member_incarnations() -> anyhow::Result<()> {
+    use crate::db::session_store::{CreateOptions, ProjectSelection, Stores};
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let tasks = TaskStore::new(Arc::new(stores.clone()), root.path().to_owned());
+    let options = |project: &str| -> anyhow::Result<CreateOptions> {
+        let dir = root.path().join(project);
+        std::fs::create_dir_all(&dir)?;
+        Ok(CreateOptions {
+            project: Some(ProjectSelection::Workspace(dir)),
+            workspace_mode: Some("code".into()),
+            ..Default::default()
+        })
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let router = stores.create(&id, options("router")?)?;
+    let coder = stores.create(&uuid::Uuid::new_v4().to_string(), options("coder")?)?;
+    assert!(router.send_peer(&coder, "before", "unrelated").is_err());
+    let task = tasks.create_task(&id, spec("Route isolated work"), "create")?;
+    tasks.set_sessions(&task.task_id, Some(coder.id()), None)?;
+    let mailbox = crate::services::ServiceContext::from_stores(
+        crate::runtime::RuntimePaths::new(root.path().into())?,
+        Arc::new(crate::services::EnvironmentCredentials),
+    )?;
+    use crate::services::session_messages as mail;
+    let first = mail::send_once(&mailbox, "dispatch", &id, coder.id(), "implement")?;
+    assert_eq!(mail::send_once(&mailbox, "dispatch", &id, coder.id(), "implement")?.id, first.id);
+    assert_eq!(mail::pending_count(&mailbox, coder.id())?, 1);
+    let notices = mail::notices(&mailbox, coder.id())?;
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].ends_with("implement"));
+    assert!(mail::notices(&mailbox, coder.id())?.is_empty());
+    assert!(coder.delivery_owner()?.next_peer()?.unwrap().applied);
+    coder.send_peer(&router, "reply", "finished")?;
+    router.delete()?;
+    let replacement = stores.create(&id, options("router")?)?;
+    assert!(replacement.send_peer(&coder, "after", "reused").is_err());
+    Ok(())
+}

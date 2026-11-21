@@ -243,6 +243,15 @@ impl SessionDb {
             })
     }
     pub fn send_peer(&self, to: &SessionDb, operation: &str, text: &str) -> Result<String> {
+        Ok(self.send_peer_message(to, operation, text)?.id)
+    }
+
+    pub(crate) fn send_peer_message(
+        &self,
+        to: &SessionDb,
+        operation: &str,
+        text: &str,
+    ) -> Result<session_messages::Message> {
         ensure!(
             std::sync::Arc::ptr_eq(&self.stores.root, &to.stores.root) && self.id != to.id,
             "Invalid peer"
@@ -257,6 +266,10 @@ impl SessionDb {
         self.check_directory()?;
         to.check_directory()?;
         let hash = self.stores.put_payload(&Value::String(text.into()))?;
+        let message = |c: &Connection, id: &str| -> Result<session_messages::Message> {
+            Ok(c.query_row("SELECT id,sender,recipient,?2,created_at,state,read,blocked_reason FROM session_inbox WHERE id=?1",
+                [id,text], session_messages::row)?)
+        };
         self.stores
             .global()
             .write("send peer", &self.id, false, |c| {
@@ -275,9 +288,9 @@ impl SessionDb {
                         s == self.incarnation && r == to.id && h == hash,
                         "Peer operation conflict"
                     );
-                    return Ok(id);
+                    return message(c, &id);
                 }
-                let project = peer_project(c, &self.stores.root.path, &self.id, &to.id)?;
+                let (source, destination) = peer_projects(c, &self.stores.root.path, &self.id, &to.id)?;
                 let (count, bytes): (i64, i64) =
                     c.query_row("SELECT count(*),coalesce(sum(size),0) FROM session_inbox WHERE recipient=?1 AND state IN ('queued','claimed','blocked')", [&to.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 ensure!(
@@ -286,21 +299,78 @@ impl SessionDb {
                 );
                 let id = uuid::Uuid::new_v4().to_string();
                 c.execute(
-                    "INSERT INTO session_inbox(id,sender,recipient,project_source,payload,size,created_at,sender_incarnation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    "INSERT INTO session_inbox(id,sender,recipient,project_source,payload,size,created_at,sender_incarnation,recipient_source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![
                         id,
                         self.id,
                         to.id,
-                        project,
+                        source,
                         hash,
                         text.len(),
                         chrono::Utc::now().to_rfc3339(),
-                        self.incarnation
+                        self.incarnation,
+                        destination
                     ],
                 )?;
                 c.execute("INSERT INTO session_inbox_operations VALUES(?1,?2,?3)", params![self.id, operation, id])?;
-                Ok(id)
+                message(c, &id)
             })
+    }
+    pub(crate) fn pending_peer_count(&self) -> Result<i64> {
+        let _locks = self.stores.key_lock(&self.key, false, false)?;
+        self.check_directory()?;
+        self.stores.global().read(|c| Ok(c.query_row(
+            "SELECT count(*) FROM session_inbox WHERE recipient=?1 AND state IN ('queued','claimed')",
+            [&self.id], |r|r.get(0))?))
+    }
+
+    pub(crate) fn peer_notices(&self) -> Result<Vec<String>> {
+        let _locks = self.stores.key_lock(&self.key, false, false)?;
+        self.check_directory()?;
+        let pending: bool = self.stores.global().read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_inbox WHERE recipient=?1 AND notified=0)",
+                [&self.id],
+                |r| r.get(0),
+            )?)
+        })?;
+        if !pending {
+            return Ok(Vec::new());
+        }
+        let notices = self
+            .stores
+            .global()
+            .write("claim inbox notices", &self.id, false, |tx| {
+                let mut q = tx.prepare_cached(
+                    "SELECT i.id,c.title,i.payload,i.state FROM session_inbox i
+                LEFT JOIN conversations c ON c.id=i.sender AND c.incarnation=i.sender_incarnation
+                WHERE i.recipient=?1 AND i.notified=0 ORDER BY i.rowid LIMIT 16",
+                )?;
+                let rows = q
+                    .query_map([&self.id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for (id, ..) in &rows {
+                    tx.execute("UPDATE session_inbox SET notified=1 WHERE id=?1", [id])?;
+                }
+                Ok(rows)
+            })?;
+        notices
+            .into_iter()
+            .map(|(_, title, digest, state)| {
+                let content: String = serde_json::from_value(self.stores.payload(&digest)?)?;
+                let sender = title
+                    .filter(|v| !v.trim().is_empty() && !v.eq_ignore_ascii_case("CLI session"))
+                    .unwrap_or_else(|| "Agent".into());
+                Ok(format!("Agent message from {sender} · {state}\n{content}"))
+            })
+            .collect()
     }
     pub fn inbox(&self, unread_only: bool) -> Result<Vec<session_messages::Message>> {
         self.peer_view(true, unread_only)
@@ -367,10 +437,13 @@ impl SessionDb {
                 )?)
             })?;
         if interrupted {
-            while self.write_locked("settle interrupted execution", |tx| {
-                tx.2.set(true);
-                crate::db::turn_repo::settle_next(tx.0, tx.1)
-            })?.is_some() {}
+            while self
+                .write_locked("settle interrupted execution", |tx| {
+                    tx.2.set(true);
+                    crate::db::turn_repo::settle_next(tx.0, tx.1)
+                })?
+                .is_some()
+            {}
         }
         Ok(DeliveryOwner {
             session: self.clone(),
@@ -387,13 +460,22 @@ fn paused(c: &Connection, id: &str) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
-fn peer_project(c: &Connection, root: &Path, from: &str, to: &str) -> Result<String> {
-    let project = session_messages::project(c, root, from)?;
-    ensure!(
-        project == session_messages::project(c, root, to)?,
-        "Peer trust or project changed"
-    );
-    Ok(project)
+fn peer_projects(c: &Connection, root: &Path, from: &str, to: &str) -> Result<(String, String)> {
+    let source = session_messages::project(c, root, from)?;
+    let destination = session_messages::project(c, root, to)?;
+    if source != destination {
+        let paired: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sa_member_sessions a
+             JOIN sa_member_sessions b ON b.task_id=a.task_id
+             JOIN conversations ca ON (ca.id,ca.incarnation)=(a.session_id,a.incarnation)
+             JOIN conversations cb ON (cb.id,cb.incarnation)=(b.session_id,b.incarnation)
+             WHERE ca.id=?1 AND cb.id=?2)",
+            [from, to],
+            |r| r.get(0),
+        )?;
+        ensure!(paired, "Recipient belongs to another project");
+    }
+    Ok((source, destination))
 }
 pub struct DeliveryOwner {
     pub(super) session: SessionDb,
@@ -541,8 +623,8 @@ impl DeliveryOwner {
                     c.execute("UPDATE session_inbox SET state='undeliverable',blocked_reason='Sender retired before local delivery' WHERE id=?1", [&claim.id])?;
                     return Ok(None);
                 }
-                let expected: String = c.query_row("SELECT project_source FROM session_inbox WHERE id=?1", [&claim.id], |r| r.get(0))?;
-                let allowed = match peer_project(
+                let expected: (String,String) = c.query_row("SELECT project_source,coalesce(recipient_source,project_source) FROM session_inbox WHERE id=?1", [&claim.id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                let allowed = match peer_projects(
                     c,
                     &s.stores.root.path,
                     claim.sender.as_ref().unwrap(),
@@ -598,7 +680,11 @@ impl DeliveryOwner {
                 s.stores.global().read(|c| authorize_queue(c, &s.id))?;
             }
             let payload = s.stores.payload(&claim.hash)?;
-            let _parent=if claim.sender.is_some(){s.peer_parent_fence()?}else{None};
+            let _parent = if claim.sender.is_some() {
+                s.peer_parent_fence()?
+            } else {
+                None
+            };
             let delivered = s.write_locked("deliver input", |tx| {
                 ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {

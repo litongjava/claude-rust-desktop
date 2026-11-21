@@ -113,19 +113,19 @@ fn message_by_id(conn: &Connection, id: &str) -> Result<Message> {
 }
 
 pub fn send(
-    context: &ServiceContext,
+    context: &impl PeerMailbox,
     sender: &str,
     recipient: &str,
     content: &str,
 ) -> Result<Message> {
-    deliver(context, None, sender, recipient, content)
+    context.deliver(None, sender, recipient, content)
 }
 
 /// Delivers a message at most once for a durable operation ID. A retry after a
 /// crash between delivery and the caller's event append returns the original
 /// message instead of queueing a duplicate.
 pub fn send_once(
-    context: &ServiceContext,
+    context: &impl PeerMailbox,
     operation_id: &str,
     sender: &str,
     recipient: &str,
@@ -135,26 +135,93 @@ pub fn send_once(
         !operation_id.trim().is_empty(),
         "Message operation ID is required"
     );
-    deliver(context, Some(operation_id), sender, recipient, content)
+    context.deliver(Some(operation_id), sender, recipient, content)
 }
 
-fn deliver(
-    context: &ServiceContext,
-    operation_id: Option<&str>,
-    sender: &str,
+pub trait PeerMailbox {
+    fn deliver(
+        &self,
+        operation: Option<&str>,
+        sender: &str,
+        recipient: &str,
+        content: &str,
+    ) -> Result<Message>;
+    fn inbox(&self, recipient: &str, unread_only: bool) -> Result<Vec<Message>>;
+    fn pending_count(&self, recipient: &str) -> Result<i64>;
+    fn sent(&self, sender: &str) -> Result<Vec<Message>>;
+    fn mark_read(&self, recipient: &str, id: &str) -> Result<()>;
+    fn notices(&self, recipient: &str) -> Result<Vec<String>>;
+}
+pub fn inbox(
+    context: &impl PeerMailbox,
     recipient: &str,
-    content: &str,
-) -> Result<Message> {
-    ensure!(
-        !content.trim().is_empty() && content.len() <= 64 * 1024,
-        "Message must contain 1..65536 bytes of nonempty text"
-    );
-    ensure!(
-        sender != recipient,
-        "SendMessage requires a different recipient session"
-    );
-    let digest = content_digest(content);
-    context.db.with_conn(|conn|->Result<_>{
+    unread_only: bool,
+) -> Result<Vec<Message>> {
+    context.inbox(recipient, unread_only)
+}
+pub fn pending_count(context: &impl PeerMailbox, recipient: &str) -> Result<i64> {
+    context.pending_count(recipient)
+}
+pub fn sent(context: &impl PeerMailbox, sender: &str) -> Result<Vec<Message>> {
+    context.sent(sender)
+}
+pub fn mark_read(context: &impl PeerMailbox, recipient: &str, id: &str) -> Result<()> {
+    context.mark_read(recipient, id)
+}
+pub fn notices(context: &impl PeerMailbox, recipient: &str) -> Result<Vec<String>> {
+    context.notices(recipient)
+}
+impl PeerMailbox for ServiceContext<crate::db::session_store::Stores> {
+    fn deliver(
+        &self,
+        operation: Option<&str>,
+        sender: &str,
+        recipient: &str,
+        content: &str,
+    ) -> Result<Message> {
+        let operation = operation
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.db.open_session(sender)?.send_peer_message(
+            &self.db.open_session(recipient)?,
+            &operation,
+            content,
+        )
+    }
+    fn inbox(&self, recipient: &str, unread_only: bool) -> Result<Vec<Message>> {
+        self.db.open_session(recipient)?.inbox(unread_only)
+    }
+    fn pending_count(&self, recipient: &str) -> Result<i64> {
+        self.db.open_session(recipient)?.pending_peer_count()
+    }
+    fn sent(&self, sender: &str) -> Result<Vec<Message>> {
+        self.db.open_session(sender)?.sent()
+    }
+    fn mark_read(&self, recipient: &str, id: &str) -> Result<()> {
+        self.db.open_session(recipient)?.mark_peer_read(id)
+    }
+    fn notices(&self, recipient: &str) -> Result<Vec<String>> {
+        self.db.open_session(recipient)?.peer_notices()
+    }
+}
+impl PeerMailbox for ServiceContext {
+    fn deliver(
+        &self,
+        operation_id: Option<&str>,
+        sender: &str,
+        recipient: &str,
+        content: &str,
+    ) -> Result<Message> {
+        ensure!(
+            !content.trim().is_empty() && content.len() <= 64 * 1024,
+            "Message must contain 1..65536 bytes of nonempty text"
+        );
+        ensure!(
+            sender != recipient,
+            "SendMessage requires a different recipient session"
+        );
+        let digest = content_digest(content);
+        self.db.with_conn(|conn|->Result<_>{
         schema(conn)?;let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate)?;
         if let Some(operation_id) = operation_id {
             if let Some((message_id, stored_sender, stored_recipient, stored_digest)) = tx
@@ -176,8 +243,8 @@ fn deliver(
                 return Ok(message);
             }
         }
-        let source=project(&tx,&context.paths.data_dir,sender)?;
-        let recipient_source=project(&tx,&context.paths.data_dir,recipient)?;
+        let source=project(&tx,&self.paths.data_dir,sender)?;
+        let recipient_source=project(&tx,&self.paths.data_dir,recipient)?;
         // A Super Agent task deliberately pairs a Router with sessions in
         // isolated workspaces. The durable task record is the authorization for
         // exactly those pairs; arbitrary cross-project messages stay rejected.
@@ -194,10 +261,10 @@ fn deliver(
         }
         tx.commit()?;Ok(message)
     })?
-}
-pub fn inbox(context: &ServiceContext, recipient: &str, unread_only: bool) -> Result<Vec<Message>> {
-    valid_id(recipient)?;
-    context.db.with_conn(|conn| -> Result<_> {
+    }
+    fn inbox(&self, recipient: &str, unread_only: bool) -> Result<Vec<Message>> {
+        valid_id(recipient)?;
+        self.db.with_conn(|conn| -> Result<_> {
         schema(conn)?;
         ensure!(
             conversation_repo::get_conversation(conn, recipient)?.is_some(),
@@ -211,96 +278,100 @@ pub fn inbox(context: &ServiceContext, recipient: &str, unread_only: bool) -> Re
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(result)
     })?
-}
-pub fn pending_count(context: &ServiceContext, recipient: &str) -> Result<i64> {
-    valid_id(recipient)?;
-    context.db.with_conn(|conn| -> Result<_> {
-        schema(conn)?;
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM session_inbox WHERE recipient=?1 AND state='queued'",
-            [recipient],
-            |row| row.get(0),
-        )?)
-    })?
-}
-pub fn sent(context: &ServiceContext, sender: &str) -> Result<Vec<Message>> {
-    valid_id(sender)?;
-    context.db.with_conn(|conn| -> Result<_> {
-        schema(conn)?;
-        let mut query = conn.prepare(&format!(
-            "{SELECT} WHERE sender=?1 ORDER BY rowid DESC LIMIT 1000"
-        ))?;
-        let result = query
-            .query_map([sender], row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(result)
-    })?
-}
-pub fn mark_read(context: &ServiceContext, recipient: &str, id: &str) -> Result<()> {
-    valid_id(recipient)?;
-    valid_id(id)?;
-    context.db.with_conn(|conn| -> Result<_> {
-        schema(conn)?;
-        ensure!(
-            conn.execute(
-                "UPDATE session_inbox SET read=1 WHERE id=?1 AND recipient=?2",
-                params![id, recipient]
-            )? == 1,
-            "Message not found in recipient inbox"
-        );
-        Ok(())
-    })?
-}
-/// At-most-once UI notices; the durable inbox remains readable after a UI crash.
-pub fn notices(context: &ServiceContext, recipient: &str) -> Result<Vec<String>> {
-    valid_id(recipient)?;
-    context.db.with_conn(|conn| -> Result<_> {
-        schema(conn)?;
-        // Empty polls stay read-only and never compete for the writer lock.
-        let pending: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_inbox WHERE recipient=?1 AND notified=0)",
-            [recipient],
-            |row| row.get(0),
-        )?;
-        if !pending {
-            return Ok(Vec::new());
-        }
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let rows = {
-            let mut query = tx.prepare(&format!(
-                "{SELECT} WHERE recipient=?1 AND notified=0 ORDER BY rowid LIMIT 16"
+    }
+    fn pending_count(&self, recipient: &str) -> Result<i64> {
+        valid_id(recipient)?;
+        self.db.with_conn(|conn| -> Result<_> {
+            schema(conn)?;
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM session_inbox WHERE recipient=?1 AND state='queued'",
+                [recipient],
+                |row| row.get(0),
+            )?)
+        })?
+    }
+    fn sent(&self, sender: &str) -> Result<Vec<Message>> {
+        valid_id(sender)?;
+        self.db.with_conn(|conn| -> Result<_> {
+            schema(conn)?;
+            let mut query = conn.prepare(&format!(
+                "{SELECT} WHERE sender=?1 ORDER BY rowid DESC LIMIT 1000"
             ))?;
-            let rows = query
-                .query_map([recipient], row)?
+            let result = query
+                .query_map([sender], row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        let mut result = Vec::new();
-        for message in rows {
-            tx.execute(
-                "UPDATE session_inbox SET notified=1 WHERE id=?1",
-                [&message.id],
+            Ok(result)
+        })?
+    }
+    fn mark_read(&self, recipient: &str, id: &str) -> Result<()> {
+        valid_id(recipient)?;
+        valid_id(id)?;
+        self.db.with_conn(|conn| -> Result<_> {
+            schema(conn)?;
+            ensure!(
+                conn.execute(
+                    "UPDATE session_inbox SET read=1 WHERE id=?1 AND recipient=?2",
+                    params![id, recipient]
+                )? == 1,
+                "Message not found in recipient inbox"
+            );
+            Ok(())
+        })?
+    }
+    /// At-most-once UI notices; the durable inbox remains readable after a UI crash.
+    fn notices(&self, recipient: &str) -> Result<Vec<String>> {
+        valid_id(recipient)?;
+        self.db.with_conn(|conn| -> Result<_> {
+            schema(conn)?;
+            // Empty polls stay read-only and never compete for the writer lock.
+            let pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_inbox WHERE recipient=?1 AND notified=0)",
+                [recipient],
+                |row| row.get(0),
             )?;
-            let sender =
-                super::background_sessions::list(&context.paths.data_dir, Some(recipient))?
-                    .into_iter()
-                    .find(|job| job.session_id == message.sender)
-                    .map(|job| job.title)
-                    .or(conversation_repo::get_conversation(&tx, &message.sender)?
-                        .and_then(|row| row.title)
-                        .filter(|title| {
-                            !title.trim().is_empty() && !title.eq_ignore_ascii_case("CLI session")
-                        }))
-                    .unwrap_or_else(|| "Agent".into());
-            result.push(format!(
-                "Agent message from {sender} · {}\n{}",
-                message.state, message.content
-            ));
-        }
-        tx.commit()?;
-        Ok(result)
-    })?
+            if !pending {
+                return Ok(Vec::new());
+            }
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let rows = {
+                let mut query = tx.prepare(&format!(
+                    "{SELECT} WHERE recipient=?1 AND notified=0 ORDER BY rowid LIMIT 16"
+                ))?;
+                let rows = query
+                    .query_map([recipient], row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let mut result = Vec::new();
+            for message in rows {
+                tx.execute(
+                    "UPDATE session_inbox SET notified=1 WHERE id=?1",
+                    [&message.id],
+                )?;
+                let sender =
+                    super::background_sessions::list(&self.paths.data_dir, Some(recipient))?
+                        .into_iter()
+                        .find(|job| job.session_id == message.sender)
+                        .map(|job| job.title)
+                        .or(conversation_repo::get_conversation(&tx, &message.sender)?
+                            .and_then(|row| row.title)
+                            .filter(|title| {
+                                !title.trim().is_empty()
+                                    && !title.eq_ignore_ascii_case("CLI session")
+                            }))
+                        .unwrap_or_else(|| "Agent".into());
+                result.push(format!(
+                    "Agent message from {sender} · {}\n{}",
+                    message.state, message.content
+                ));
+            }
+            tx.commit()?;
+            Ok(result)
+        })?
+    }
 }
 fn lock_path(root: &Path, session: &str) -> Result<PathBuf> {
     valid_id(session)?;
@@ -477,12 +548,20 @@ pub struct ExecutionLease {
     owner: u32,
 }
 impl ExecutionLease {
-    pub(crate) fn acquire_inbox(root:&Path,incarnation:&str)->Result<Self>{
-        let path=lock_path(root,incarnation)?;
+    pub(crate) fn acquire_inbox(root: &Path, incarnation: &str) -> Result<Self> {
+        let path = lock_path(root, incarnation)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         crate::fs::try_lock_briefly(&file).context("Recipient already has a consumer")?;
-        Ok(Self{file,owner:std::process::id()})
+        Ok(Self {
+            file,
+            owner: std::process::id(),
+        })
     }
 
     /// Exclusive admission for one session. Every caller - a frontend turn, an
@@ -608,9 +687,7 @@ impl Consumer {
             return Ok(None);
         }
         let context = context(root)?;
-        let saved = context
-            .db
-            .conversation_metadata(session)?;
+        let saved = context.db.conversation_metadata(session)?;
         let Some(saved) = saved else { return Ok(None) };
         // Desktop chat and internal unbound sessions are not message endpoints.
         if saved.workspace_mode != "code" || saved.project_id.is_none() {
@@ -1179,10 +1256,11 @@ mod tests {
             Ok(_) => panic!("the injected trigger must fail the attach"),
             Err(error) => error,
         };
-        assert!(format!("{error:#}").contains("fixture failure"), "{error:#}");
-        let duplicate = receive
-            .try_recv()
-            .expect("the attach never took the lock");
+        assert!(
+            format!("{error:#}").contains("fixture failure"),
+            "{error:#}"
+        );
+        let duplicate = receive.try_recv().expect("the attach never took the lock");
         assert!(
             !receiver_active(&context.paths.data_dir, &recipient).unwrap(),
             "a failed attach left the lock held through a duplicated descriptor"
@@ -1220,9 +1298,7 @@ mod tests {
             send.send(file.try_clone().unwrap()).unwrap();
         }));
         assert!(!session_open(dir.path(), &id).unwrap());
-        let duplicate = receive
-            .try_recv()
-            .expect("the probe never took the lock");
+        let duplicate = receive.try_recv().expect("the probe never took the lock");
         assert!(
             !session_open(dir.path(), &id).unwrap(),
             "the probe's lock outlived it through a duplicated descriptor"
@@ -1246,9 +1322,7 @@ mod tests {
             send.send(file.try_clone().unwrap()).unwrap();
         }));
         assert!(!receiver_active(dir.path(), &id).unwrap());
-        let duplicate = receive
-            .try_recv()
-            .expect("the probe never took the lock");
+        let duplicate = receive.try_recv().expect("the probe never took the lock");
         assert!(
             !receiver_active(dir.path(), &id).unwrap(),
             "the probe's lock outlived it through a duplicated descriptor"
@@ -1461,16 +1535,19 @@ mod tests {
     #[test]
     fn operation_scoped_delivery_is_exactly_once() {
         let (_temp, context, _store, sender, recipient) = fixture();
-        let first = send_once(&context, "crp-send:tool-1", &sender, &recipient, "hello")
-            .unwrap();
-        let replay = send_once(&context, "crp-send:tool-1", &sender, &recipient, "hello")
-            .unwrap();
+        let first = send_once(&context, "crp-send:tool-1", &sender, &recipient, "hello").unwrap();
+        let replay = send_once(&context, "crp-send:tool-1", &sender, &recipient, "hello").unwrap();
         assert_eq!(first.id, replay.id);
         assert_eq!(inbox(&context, &recipient, false).unwrap().len(), 1);
-        assert!(send_once(&context, "crp-send:tool-1", &sender, &recipient, "different")
-            .is_err());
-        let other = send_once(&context, "crp-send:tool-2", &sender, &recipient, "hello")
-            .unwrap();
+        assert!(send_once(
+            &context,
+            "crp-send:tool-1",
+            &sender,
+            &recipient,
+            "different"
+        )
+        .is_err());
+        let other = send_once(&context, "crp-send:tool-2", &sender, &recipient, "hello").unwrap();
         assert_ne!(first.id, other.id);
         assert_eq!(inbox(&context, &recipient, false).unwrap().len(), 2);
     }

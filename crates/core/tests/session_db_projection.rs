@@ -403,6 +403,9 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
         let g = Connection::open(root.path().join("global.db"))?;
         g.execute_batch(
             "BEGIN IMMEDIATE; DROP TABLE global_settings;
+            DROP INDEX inbox_notices;
+            ALTER TABLE session_inbox DROP COLUMN notified;
+            ALTER TABLE session_inbox DROP COLUMN recipient_source;
             ALTER TABLE conversations DROP COLUMN request_count;
             ALTER TABLE conversations DROP COLUMN input_tokens;
             ALTER TABLE conversations DROP COLUMN output_tokens;
