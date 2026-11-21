@@ -40,6 +40,24 @@ impl ExecutorHistory {
         }
     }
 
+    /// Capture the history view that hooks can expose to a command. The snapshot
+    /// has the same lifetime and incarnation as the tool that triggered it.
+    pub(crate) fn write_hook_transcript(&self, out: &mut impl std::io::Write) -> Result<()> {
+        self.read(|c,id| {
+            let mut query = c.prepare_cached("SELECT role,id,created_at,content FROM messages WHERE conversation_id=?1 ORDER BY sort_order,rowid")?;
+            let mut rows = query.query([id])?;
+            while let Some(row) = rows.next()? {
+                let role: String = row.get(0)?;
+                serde_json::to_writer(&mut *out, &serde_json::json!({
+                    "type":role,"uuid":row.get::<_,String>(1)?,"sessionId":id,"timestamp":row.get::<_,String>(2)?,
+                    "message":{"role":role,"content":row.get::<_,String>(3)?}
+                }))?;
+                out.write_all(b"\n")?;
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn restore(&self, messages: &mut Vec<Value>) -> Result<()> {
         self.read(|c, id| mcp_output::restore_history(messages, c, id))
     }

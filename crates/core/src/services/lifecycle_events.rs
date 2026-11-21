@@ -6,40 +6,46 @@ use super::{
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
 };
 
 /// Resolve the advertised transcript location without accessing storage.
 pub(crate) fn transcript_path(root: &Path, session: &str) -> PathBuf {
-    let name = session
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    use sha2::{Digest,Sha256};
+    let name = if session.len() > 100 {
+        format!("hash-{:x}",Sha256::digest(session.as_bytes()))
+    } else {
+        session.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    };
     root.join("hook-transcripts").join(format!("{name}.jsonl"))
 }
 
 /// A real, readable JSONL snapshot of the durable conversation (no request headers).
 pub(crate) fn transcript(root: &Path, session: &str) -> Result<PathBuf> {
-    let path = transcript_path(root, session);
+    snapshot(root, session, None)
+}
+
+pub(crate) fn snapshot(root:&Path, session:&str, bound:Option<&crate::db::session_store::ExecutorHistory>) -> Result<PathBuf> {
+    use crate::db::session_store::{ExecutorHistory,Stores};
+    let selected;
+    let history = if let Some(bound) = bound {
+        anyhow::ensure!(bound.id()==session,"Hook session does not match its bound history");
+        Some(bound)
+    } else if root.join("global.db").try_exists()? {
+        let stores = Stores::open(root)?;
+        selected = stores.global().conversation(session)?
+            .map(|_|stores.executor_history(session)).transpose()?;
+        selected.as_ref()
+    } else { None };
+    let path = match history {
+        Some(ExecutorHistory::Session(s)) => root.join("hook-transcripts").join(format!("{}.jsonl",s.incarnation())),
+        _ => transcript_path(root,session),
+    };
     let directory = root.join("hook-transcripts");
     std::fs::create_dir_all(&directory)?;
     let mut snapshot = tempfile::NamedTempFile::new_in(&directory)?;
-    let database = root.join(crate::runtime::DATABASE_FILE);
-    if database.exists() {
-        let conn = rusqlite::Connection::open_with_flags(
-            database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        for row in crate::db::message_repo::get_messages_by_conversation(&conn, session)? {
-            writeln!(
-                snapshot,
-                "{}",
-                json!({"type":row.role,"uuid":row.id,"sessionId":session,"timestamp":row.created_at,"message":{"role":row.role,"content":row.content}})
-            )?;
-        }
+    if let Some(history) = history {
+        history.write_hook_transcript(&mut snapshot)?;
     }
     snapshot.persist(&path).map_err(|e| e.error)?;
     Ok(path)

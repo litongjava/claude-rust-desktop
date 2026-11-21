@@ -511,3 +511,30 @@ async fn completed_once_hook_does_not_regenerate_transcript() {
         1
     );
 }
+
+#[test]
+fn hook_transcript_uses_the_selected_incarnation_and_preserves_message_order() -> anyhow::Result<()> {
+    use crate::db::session_store::Stores;
+    use super::super::lifecycle_events::snapshot;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let first = stores.create("hook",Default::default())?;
+    first.write(|w| {
+        w.append("user","one")?;
+        w.append("assistant","two")?;
+        Ok(())
+    })?;
+    let history = stores.executor_history("hook")?;
+    let path = snapshot(root.path(),"hook",Some(&history))?;
+    let rows = std::fs::read_to_string(&path)?.lines().map(serde_json::from_str::<Value>).collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(rows.len(),2);
+    assert_eq!(rows[0]["message"],json!({"role":"user","content":"one"}));
+    assert_eq!(rows[1]["message"],json!({"role":"assistant","content":"two"}));
+    first.delete()?;
+    stores.create("hook",Default::default())?;
+    assert!(snapshot(root.path(),"hook",Some(&history)).is_err());
+    let replacement = snapshot(root.path(),"hook",None)?;
+    assert_ne!(replacement,path);
+    assert!(std::fs::read(replacement)?.is_empty());
+    Ok(())
+}

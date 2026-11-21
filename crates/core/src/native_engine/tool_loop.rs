@@ -1709,8 +1709,9 @@ impl ToolLoopExecutor {
         self
     }
 
-    pub fn with_hooks(mut self, hooks: crate::services::tool_hooks::HookRunner) -> Self {
+    pub fn with_hooks(mut self, mut hooks: crate::services::tool_hooks::HookRunner) -> Self {
         if hooks.has_hooks() {
+            hooks.transcript_history = self.executor_history.clone();
             self.hooks = Some(Arc::new(hooks));
         }
         self
@@ -3537,6 +3538,7 @@ impl ToolLoopExecutor {
     pub fn with_executor_history(mut self, history: ExecutorHistory) -> Result<Self> {
         anyhow::ensure!(self.conv_id.as_deref() == Some(history.id()), "Executor transcript belongs to another session");
         self.file_state.session=match &history {ExecutorHistory::Session(s)=>Some(s.clone()),ExecutorHistory::Shared(..)=>None};
+        if let Some(hooks) = self.hooks.as_mut() { Arc::make_mut(hooks).transcript_history = Some(history.clone()); }
         self.executor_history = Some(history);
         self.builtin_names.take();
         Ok(self)

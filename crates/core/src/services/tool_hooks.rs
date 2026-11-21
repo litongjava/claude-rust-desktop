@@ -263,6 +263,7 @@ fn default_timeout() -> u64 {
 
 #[derive(Default, Clone)]
 pub struct HookRunner {
+    pub(crate) transcript_history: Option<crate::db::session_store::ExecutorHistory>,
     recording_db: Option<std::sync::Arc<crate::db::DbManager>>,
     workspace: PathBuf,
     once_directory: PathBuf,
@@ -477,6 +478,7 @@ impl HookRunner {
             force_sync: false,
             callbacks: None,
             prompt_provider: None,
+            transcript_history: None,
             recording_db: None,
         })
     }
@@ -587,12 +589,17 @@ impl HookRunner {
     ) -> Value {
         let path = cache.get_or_init(|| {
             let root = self.once_directory.parent().unwrap_or(&self.workspace);
-            let path = super::lifecycle_events::transcript_path(root, session);
-            if let Err(error) = super::lifecycle_events::transcript(root, session) {
-                tracing::warn!(session_id = session, transcript_path = %path.display(),
-                    "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
+            let fallback = self.recording_db.as_ref().and_then(|db| db.executor_history(session).ok());
+            let history = self.transcript_history.as_ref().or(fallback.as_ref());
+            match super::lifecycle_events::snapshot(root,session,history) {
+                Ok(path) => path,
+                Err(error) => {
+                    let path = super::lifecycle_events::transcript_path(root,session);
+                    tracing::warn!(session_id = session, transcript_path = %path.display(),
+                        "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
+                    path
+                }
             }
-            path
         });
         input["transcript_path"] = json!(path);
         input
