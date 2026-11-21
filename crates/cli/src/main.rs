@@ -624,9 +624,15 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if let SessionCommands::Compact { id, instructions } = action {
                 return compaction::run(cli, &paths, id, instructions).await;
             }
+            if let SessionCommands::List = action {
+                let rows = paths.list_published_sessions()?;
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
             let db = paths.open_database()?;
             let value = match action {
-                SessionCommands::Live { .. }
+                SessionCommands::List
+                | SessionCommands::Live { .. }
                 | SessionCommands::ShutdownWorker { .. }
                 | SessionCommands::StopTask { .. } => unreachable!(),
                 SessionCommands::Trust { id, folders } => serde_json::to_value(
@@ -647,9 +653,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         *preview,
                     )?)?
                 }
-                SessionCommands::List => serde_json::to_value(
-                    db.conversations()?,
-                )?,
                 SessionCommands::Show { id } => {
                     let store = SessionStore::new(db);
                     serde_json::json!({"session":store.resume(id)?,"messages":store.history(id)?})

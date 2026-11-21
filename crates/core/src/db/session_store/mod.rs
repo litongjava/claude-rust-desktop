@@ -111,19 +111,36 @@ pub struct Stores {
     root: Arc<Root>,
     fault: Option<Arc<Fault>>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Host,
+    Directory,
+    Reconcile,
+}
+
 impl Stores {
     pub fn open(path: &Path) -> Result<Self> {
         layout::allow_entry()?;
         std::fs::create_dir_all(path)?;
-        Self::open_existing(path, false)
+        Self::open_existing(path, OpenMode::Host)
     }
 
     #[doc(hidden)]
     pub fn open_for_test(path: &Path) -> Result<Self> {
-        Self::open_existing(path, true)
+        Self::open_existing(path, OpenMode::Reconcile)
     }
 
-    fn open_existing(path: &Path, reconcile_existing: bool) -> Result<Self> {
+    /// Inspect the published directory from a short-lived listing process.
+    /// Session recovery and the projection worker start when a host opens the root.
+    pub(crate) fn list_published(
+        path: &Path,
+    ) -> Result<Vec<crate::db::conversation_repo::ConversationRow>> {
+        layout::allow_entry()?;
+        std::fs::create_dir_all(path)?;
+        Self::open_existing(path, OpenMode::Directory)?.conversations()
+    }
+
+    fn open_existing(path: &Path, mode: OpenMode) -> Result<Self> {
         layout::allow_entry()?;
         ensure!(
             path.is_dir(),
@@ -139,35 +156,40 @@ impl Stores {
         };
         // Opening or migrating one data root must never block another root.
         let mut cached = slot.lock().unwrap();
-        if let Some(root) = cached.upgrade() {
-            let stores = Self { root, fault: None };
-            drop(cached);
-            if reconcile_existing {
-                drop(stores.namespace()?);
-                stores.reconcile()?;
-            }
-            return Ok(stores);
-        }
-        let (uuid, upgraded_directory) = layout::open_root(&path)?;
-        let mut global = GlobalDb::new(&path, uuid)?;
-        let root = Arc::new_cyclic(|weak| {
-            global.root = weak.clone();
-            Root {
-                global,
-                host: Default::default(),
-                upgraded_directory,
-                repair: Default::default(),
-                repair_cursor: Default::default(),
-                recording: Default::default(),
-                migrating: Default::default(),
-                path,
-            }
-        });
+        let root = if let Some(existing) = cached.upgrade() {
+            existing
+        } else {
+            let (uuid, upgraded_directory) = layout::open_root(&path)?;
+            let mut global = GlobalDb::new(&path, uuid)?;
+            Arc::new_cyclic(|weak| {
+                global.root = weak.clone();
+                Root {
+                    global,
+                    host: Default::default(),
+                    upgraded_directory,
+                    repair: Default::default(),
+                    repair_cursor: Default::default(),
+                    recording: Default::default(),
+                    migrating: Default::default(),
+                    path,
+                }
+            })
+        };
         let stores = Self { root, fault: None };
-        drop(stores.namespace()?);
-        stores.reconcile()?;
-        stores.start_projection_repair();
+        let initialized = stores.root.repair.get().is_some();
+        if !initialized {
+            drop(stores.namespace()?);
+            if mode != OpenMode::Directory {
+                stores.reconcile()?;
+                stores.start_projection_repair();
+            }
+        }
         *cached = Arc::downgrade(&stores.root);
+        drop(cached);
+        if initialized && mode == OpenMode::Reconcile {
+            drop(stores.namespace()?);
+            stores.reconcile()?;
+        }
         Ok(stores)
     }
 

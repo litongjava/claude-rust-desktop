@@ -24,7 +24,6 @@ pub use user_content::{image_block_from_file, image_media_type, normalize_user_c
 
 /// Default data directory under the user's home.
 pub const DATA_DIR_NAME: &str = ".deepseek-code";
-/// SQLite database shared by the CLI and Desktop inside the data directory.
 /// Explicit data directory override.
 pub const DATA_DIR_ENV: &str = "DEEPSEEK_CODE_DATA_DIR";
 
@@ -58,6 +57,10 @@ impl RuntimePaths {
 
     pub fn open_stores(&self) -> Result<crate::db::session_store::Stores> {
         crate::db::session_store::Stores::open(&self.data_dir)
+    }
+
+    pub fn list_published_sessions(&self) -> Result<Vec<conversation_repo::ConversationRow>> {
+        crate::db::session_store::Stores::list_published(&self.data_dir)
     }
 
     pub fn open_database(&self) -> Result<Arc<crate::db::session_store::Stores>> {

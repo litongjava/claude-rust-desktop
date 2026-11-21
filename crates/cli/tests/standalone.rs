@@ -1278,3 +1278,68 @@ async fn redirected_output_config_confirmation_reports_enospc() {
         serde_json::from_slice(&std::fs::read(data.join("customization.json")).unwrap()).unwrap();
     assert_eq!(saved["tool_loading"]["Read"]["enabled"], true);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cold_sessions_list_reads_the_directory_without_opening_history() -> anyhow::Result<()> {
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.json");
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = "2026-11-20T00:00:00Z";
+    std::fs::write(
+        &source,
+        json!({
+            "id": id, "name": "Directory fixture", "created_at": at, "updated_at": at,
+            "messages": [{"role":"user", "content":"first question", "timestamp":at}]
+        })
+        .to_string(),
+    )?;
+    let mut import = command(&data, temp.path());
+    import
+        .current_dir(temp.path())
+        .args(["sessions", "import-legacy"])
+        .arg(source);
+    let result = execute(import).await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let shard = data.join("sessions").join(&id).join("session.db");
+    let path = CString::new(shard.as_os_str().as_bytes())?;
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    let mut watch = unsafe { std::fs::File::from_raw_fd(fd) };
+    anyhow::ensure!(
+        unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_OPEN) } >= 0,
+        std::io::Error::last_os_error()
+    );
+    let mut list = command(&data, temp.path());
+    list.args(["sessions", "list"]);
+    let result = execute(list).await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let rows: Vec<Value> = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+    assert_eq!(rows[0]["title"], "Directory fixture");
+    let mut buf = [0; 1024];
+    assert_eq!(
+        watch.read(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(std::fs::File::open(shard)?);
+    assert!(watch.read(&mut buf)? >= std::mem::size_of::<libc::inotify_event>());
+    Ok(())
+}
