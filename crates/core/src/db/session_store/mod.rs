@@ -1,5 +1,4 @@
-//! Session database layout. The sole constructor is an internal integration-test
-//! factory until all production hosts switch together.
+//! Process-local resolver for the global directory and incarnation-bound session shards.
 mod compaction;
 mod directory;
 pub use compaction::{CheckpointKey, CompactionClaim};
@@ -40,7 +39,8 @@ struct Root {
     upgraded_directory: bool,
     migrating: std::sync::atomic::AtomicBool,
 }
-static ROOTS: LazyLock<Mutex<HashMap<PathBuf, Weak<Root>>>> = LazyLock::new(Default::default);
+type RootSlot = Arc<Mutex<Weak<Root>>>;
+static ROOTS: LazyLock<Mutex<HashMap<PathBuf, RootSlot>>> = LazyLock::new(Default::default);
 
 #[derive(Clone)]
 pub struct Stores {
@@ -48,43 +48,65 @@ pub struct Stores {
     fault: Option<Arc<Fault>>,
 }
 impl Stores {
+    pub fn open(path: &Path) -> Result<Self> {
+        layout::allow_entry()?;
+        std::fs::create_dir_all(path)?;
+        Self::open_existing(path, false)
+    }
+
     #[doc(hidden)]
     pub fn open_for_test(path: &Path) -> Result<Self> {
+        Self::open_existing(path, true)
+    }
+
+    fn open_existing(path: &Path, reconcile_existing: bool) -> Result<Self> {
         layout::allow_entry()?;
-        // The caller owns the durability of this data root and its ancestry.
         ensure!(
             path.is_dir(),
             "Session store requires an existing data root"
         );
         let path = path.canonicalize()?;
-        let root = {
+        let slot = {
             let mut roots = ROOTS.lock().unwrap();
-            roots.retain(|_, root| root.strong_count() > 0);
-            if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
-                root
-            } else {
-                let (uuid, upgraded_directory) = layout::open_root(&path)?;
-                let mut global = GlobalDb::new(&path, uuid)?;
-                let root = Arc::new_cyclic(|weak| {
-                    global.root = weak.clone();
-                    Root {
-                        global,
-                        upgraded_directory,
-                        repair: Default::default(),
-                        repair_cursor: Default::default(),
-                        migrating: Default::default(),
-                        path: path.clone(),
-                    }
-                });
-                roots.insert(path, Arc::downgrade(&root));
-                root
-            }
+            roots.retain(|_, slot| {
+                Arc::strong_count(slot) > 1 || slot.lock().unwrap().strong_count() > 0
+            });
+            roots.entry(path.clone()).or_default().clone()
         };
+        // Opening or migrating one data root must never block another root.
+        let mut cached = slot.lock().unwrap();
+        if let Some(root) = cached.upgrade() {
+            let stores = Self { root, fault: None };
+            drop(cached);
+            if reconcile_existing {
+                drop(stores.namespace()?);
+                stores.reconcile()?;
+            }
+            return Ok(stores);
+        }
+        let (uuid, upgraded_directory) = layout::open_root(&path)?;
+        let mut global = GlobalDb::new(&path, uuid)?;
+        let root = Arc::new_cyclic(|weak| {
+            global.root = weak.clone();
+            Root {
+                global,
+                upgraded_directory,
+                repair: Default::default(),
+                repair_cursor: Default::default(),
+                migrating: Default::default(),
+                path,
+            }
+        });
         let stores = Self { root, fault: None };
         drop(stores.namespace()?);
         stores.reconcile()?;
         stores.start_projection_repair();
+        *cached = Arc::downgrade(&stores.root);
         Ok(stores)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.root.path
     }
     #[doc(hidden)]
     pub fn with_fault_hook(

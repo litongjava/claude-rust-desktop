@@ -223,41 +223,46 @@ pub(super) fn needs_upgrade(path: &Path, kind: i32) -> Result<bool> {
 
 // Caller owns the exclusive lifecycle lock and has checked the store identity.
 pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
-    let mut c = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        (1..schema_version(kind)).contains(&version),
-        "Unsupported upgrade"
-    );
-    verify_version(&tx, kind, version)?;
-    if version == 1 {
-        tx.execute_batch(additions(kind))?;
-    }
-    if kind == GLOBAL && version < 3 {
-        tx.execute_batch(include_str!("inbox_v3.sql"))?;
-    }
-    if (kind == GLOBAL && version < 4) || (kind == SESSION && version < 3) {
-        install_state(&tx, kind)?;
-    }
-    if kind == SESSION {
-        if version < 4 {
-            install_session_v4(&tx)?;
-            super::history::flush_summary(&tx)?;
-        }
-        let previous: i64 =
-            tx.query_row("SELECT transcript_bytes FROM projection_state", [], |r| {
-                r.get(0)
-            })?;
-        tx.execute_batch(include_str!("session_v5.sql"))?;
-        tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
-    }
-    if kind == GLOBAL {
-        install_global_v5(&tx)?;
-    }
-    tx.pragma_update(None, "user_version", schema_version(kind))?;
-    tx.commit()?;
-    Ok(())
+    let c = open(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    crate::db::write_tx(
+        &c,
+        "upgrade store format",
+        crate::db::STARTUP_WRITE_DEADLINE,
+        |tx| {
+            let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            ensure!(
+                (1..schema_version(kind)).contains(&version),
+                "Unsupported upgrade"
+            );
+            verify_version(&tx, kind, version)?;
+            if version == 1 {
+                tx.execute_batch(additions(kind))?;
+            }
+            if kind == GLOBAL && version < 3 {
+                tx.execute_batch(include_str!("inbox_v3.sql"))?;
+            }
+            if (kind == GLOBAL && version < 4) || (kind == SESSION && version < 3) {
+                install_state(&tx, kind)?;
+            }
+            if kind == SESSION {
+                if version < 4 {
+                    install_session_v4(&tx)?;
+                    super::history::flush_summary(&tx)?;
+                }
+                let previous: i64 =
+                    tx.query_row("SELECT transcript_bytes FROM projection_state", [], |r| {
+                        r.get(0)
+                    })?;
+                tx.execute_batch(include_str!("session_v5.sql"))?;
+                tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
+            }
+            if kind == GLOBAL {
+                install_global_v5(&tx)?;
+            }
+            tx.pragma_update(None, "user_version", schema_version(kind))?;
+            Ok(())
+        },
+    )
 }
 
 fn install_session_v4(c: &Connection) -> Result<()> {

@@ -57,6 +57,10 @@ impl RuntimePaths {
         resolve_default_data_dir()
     }
 
+    pub fn open_stores(&self) -> Result<crate::db::session_store::Stores> {
+        crate::db::session_store::Stores::open(&self.data_dir)
+    }
+
     pub fn open_database(&self) -> Result<Arc<DbManager>> {
         // Keep one initialized pool per data directory while any host owns it.
         // Status polling must not create pool threads or rerun migrations.
