@@ -6,7 +6,7 @@ use serde_json::Value as Json;
 #[derive(Clone, Copy, Debug)]
 pub enum Branch<'a> {
     Full,
-    Summary { message: &'a str, part: crate::services::compaction::Part, revision: i64, text: &'a str },
+    Summary { message: &'a str, part: crate::services::compaction::Part, fingerprint: &'a str, text: &'a str },
     AgentFork {
         title: &'a str,
         directive: &'a str,
@@ -135,7 +135,7 @@ impl SessionDb {
                 ensure!(!r.0.query_row("SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",[&row.id],|r|r.get::<_,bool>(0))?, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
                 transcript.push(serde_json::json!({"message":row,"tools":r.tools(&row.id)?}));
             }
-            Ok(PreparedPart {incarnation:self.incarnation().into(),revision:r.0.query_row("SELECT content_revision FROM manifest",[],|r|r.get(0))?,transcript:serde_json::to_string(&transcript)?,count:range.len()})
+            Ok(PreparedPart {incarnation:self.incarnation().into(),fingerprint:crate::services::compaction::fingerprint(r.0,self.id())?.0,transcript:serde_json::to_string(&transcript)?,count:range.len()})
         })
     }
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
@@ -538,7 +538,7 @@ impl Copier<'_> {
             }
             message_repo::save_request_trajectory(self.dst, &new, &requests)?;
         }
-        super::super::history::advance(self.dst)?;
+
         Ok(())
     }
 }
@@ -582,9 +582,9 @@ pub(super) fn copy_snapshot(
         )?;
     }
     let mut addition=None;
-    let boundary=if let Branch::Summary{message,part,revision,text}=boundary {
+    let boundary=if let Branch::Summary{message,part,fingerprint,text}=boundary {
         use crate::services::compaction::Part;
-        ensure!(tx.query_row("SELECT content_revision FROM manifest",[],|r|r.get::<_,i64>(0))?==revision,"Session changed during compaction");
+        ensure!(crate::services::compaction::fingerprint(&tx,source.id())?.0==fingerprint,"Session changed during compaction");
         let (index,order):(usize,i64)=tx.query_row("SELECT position,sort_order FROM (SELECT id,sort_order,row_number() OVER(ORDER BY sort_order,rowid)-1 AS position FROM messages) WHERE id=?1",[message],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let (copy,order,boundary)=match part {
             Part::UpTo => (Branch::Full,order,true),
@@ -609,7 +609,7 @@ pub(super) fn copy_snapshot(
         let heading=if boundary {"Conversation summary — earlier transcript retained in session history"}else{"Summary of the later conversation — full transcript retained in session history"};
         message_repo::insert_message(dst,&uuid::Uuid::new_v4().to_string(),id,"user",&format!("[{heading}]\n{text}"),None,&chrono::Utc::now().to_rfc3339(),boundary,order)?;
     }
-    Ok(())
+    super::super::history::advance(dst)
 }
 
 fn preference_snapshot(c: &Connection, source: &str, destination: &str) -> Result<Vec<(String,String)>> {
