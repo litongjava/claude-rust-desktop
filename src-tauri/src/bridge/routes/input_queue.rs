@@ -247,8 +247,14 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
 }
 pub(super) async fn stop(state: AppState, id: String) -> Response {
     let _gate = gate(&state, &id).await;
-    if let Err(e) = queue::set_paused(&state.db_manager, &id, true) {
-        return error(e);
+    match state.db_manager.global().conversation(&id) {
+        Ok(Some(_)) => {
+            if let Err(error_value) = queue::set_paused(&state.db_manager, &id, true) {
+                return error(error_value);
+            }
+        }
+        Ok(None) => {}
+        Err(error_value) => return error(error_value),
     }
     let outcome = state
         .generation_runs
