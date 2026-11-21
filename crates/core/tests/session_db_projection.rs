@@ -835,6 +835,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
             w.set_setting(EDITOR, &editor)?;
             w.set_setting(ROLE, &Role::Router)?;
             w.set_setting(AGENT_DESCRIPTION, &"worker".into())?;
+            w.set_setting(AGENT_FORK_PARENT, &"source".into())?;
             w.set_setting(
                 MICROCOMPACT,
                 &Microcompact {
@@ -880,6 +881,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
         assert_eq!(r.setting(DISPLAY)?, Some(display));
         assert_eq!(r.setting(EDITOR)?, Some(editor));
         assert_eq!(r.setting(AGENT_DESCRIPTION)?.as_deref(), Some("worker"));
+        assert_eq!(r.setting(AGENT_FORK_PARENT)?.as_deref(), Some("source"));
         assert_eq!(r.setting(ROLE)?, Some(Role::Router));
         assert_eq!(r.setting(MICROCOMPACT)?.unwrap().through, 11);
         assert_eq!(r.setting(CHILD_PROGRESS)?, Some(progress));

@@ -176,6 +176,8 @@ pub const SEEN_INSTRUCTIONS: Setting<Vec<(PathBuf, String)>> =
     Setting::new("lifecycle-instructions");
 pub const INSTRUCTIONS_BOUNDARY: Setting<String> = Setting::new("lifecycle-instructions.boundary");
 pub const ROLE: Setting<Role> = Setting::new("super-agent.role");
+/// Agent-tool fork provenance used by the engine's nested-fork check.
+pub const AGENT_FORK_PARENT: Setting<String> = Setting::new("fork-of");
 pub const AGENT_DESCRIPTION: Setting<String> = Setting::new("agent-description");
 pub const CHILD_PROGRESS: Setting<serde_json::Map<String, serde_json::Value>> =
     Setting::new("delegation.progress");
