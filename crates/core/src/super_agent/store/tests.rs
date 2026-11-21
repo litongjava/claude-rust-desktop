@@ -9,6 +9,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, TaskStore) {
     let data = temp.path().join("data");
     let paths = crate::runtime::RuntimePaths::new(data.clone()).unwrap();
     let store = TaskStore::new(paths.open_database().unwrap(), data.clone());
+    store.db.create("router", Default::default()).unwrap();
     (temp, data, store)
 }
 
@@ -1955,6 +1956,9 @@ fn ingested_events_stay_pending_until_processed_exactly_once() {
 #[test]
 fn a_pending_event_for_another_router_is_not_processed() {
     let (_temp, _data, store) = fixture();
+    for router in ["router-a", "router-b"] {
+        store.db.create(router, Default::default()).unwrap();
+    }
     let policy = StatePolicy::default();
     let task = store
         .create_task("router-a", spec("Scoped"), "create")

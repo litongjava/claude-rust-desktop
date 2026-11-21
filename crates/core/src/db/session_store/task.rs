@@ -7,6 +7,10 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 use std::collections::BTreeMap;
 
 impl TaskDatabase for Stores {
+    const ROUTED_TASKS: &'static str = "(SELECT t.* FROM sa_tasks t
+        JOIN sa_member_sessions m ON m.task_id=t.task_id AND m.role='router' AND m.session_id=t.router_session_id
+        JOIN conversations c ON c.id=m.session_id AND c.incarnation=m.incarnation)";
+
     fn task_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         self.global().read(f)
     }
@@ -31,9 +35,14 @@ impl TaskDatabase for Stores {
             Decision::Event(id)=>("task_id IN (SELECT task_id FROM sa_events WHERE event_id=?1 AND event_type='TASK_COMPLETED' AND processed=0)",id),
             Decision::Pending(router)=>("router_session_id=?1 AND task_id IN (SELECT task_id FROM sa_events WHERE event_type='TASK_COMPLETED' AND processed=0)",router),
         };
+        let table = if matches!(selection, Decision::Pending(_)) {
+            Self::ROUTED_TASKS
+        } else {
+            "sa_tasks"
+        };
         let members = self.global().read(|c| {
             let mut q = c.prepare(&format!(
-                "SELECT coder_session_id,reviewer_session_id FROM sa_tasks WHERE {predicate}"
+                "SELECT coder_session_id,reviewer_session_id FROM {table} WHERE {predicate}"
             ))?;
             let mut cursor = q.query([value])?;
             let mut members = BTreeMap::new();

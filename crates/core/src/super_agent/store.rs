@@ -112,6 +112,7 @@ pub(crate) struct EvidenceFence {
     pub members: std::collections::BTreeMap<String, MemberEvidence>,
 }
 pub(crate) trait TaskDatabase {
+    const ROUTED_TASKS: &'static str = "sa_tasks";
     fn task_read<T>(&self, f: impl FnOnce(&Connection) -> AnyResult<T>) -> AnyResult<T>;
     fn task_write<T>(
         &self,
@@ -136,27 +137,69 @@ impl TaskDatabase for DbManager {
     }
 }
 
+#[derive(Clone)]
+struct RouterScope {
+    session: String,
+    incarnation: String,
+    task: Option<String>,
+}
+
+impl RouterScope {
+    fn check(&self, conn: &Connection) -> AnyResult<()> {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.incarnation=?2 AND
+                (?3 IS NULL OR EXISTS(SELECT 1 FROM sa_member_sessions m WHERE m.task_id=?3
+                AND m.role='router' AND m.session_id=c.id AND m.incarnation=c.incarnation)))",
+            params![self.session, self.incarnation, self.task],
+            |r| r.get(0),
+        )?;
+        ensure!(valid, "Task belongs to another Router incarnation");
+        Ok(())
+    }
+}
+
 pub struct TaskStore<D = crate::db::session_store::Stores> {
     db: Arc<D>,
     data_dir: PathBuf,
+    router: Option<RouterScope>,
 }
 impl<D> Clone for TaskStore<D> {
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
+            router: self.router.clone(),
         }
     }
 }
 impl<D: TaskDatabase> TaskStore<D> {
     pub fn new(db: Arc<D>, data_dir: PathBuf) -> Self {
-        Self { db, data_dir }
+        Self {
+            db,
+            data_dir,
+            router: None,
+        }
     }
     pub fn from_context(context: &crate::services::ServiceContext<D>) -> Self {
         Self::new(context.db.clone(), context.paths.data_dir.clone())
     }
     pub fn db(&self) -> &Arc<D> {
         &self.db
+    }
+
+    pub(super) fn for_router(mut self, router: &crate::db::session_store::SessionDb) -> Self {
+        self.router = Some(RouterScope {
+            session: router.id().into(),
+            incarnation: router.incarnation().into(),
+            task: None,
+        });
+        self
+    }
+
+    pub(super) fn select_router_task(&mut self, task: &str) -> Result<(), StoreError> {
+        let scope = self.router.as_mut().context("Router scope required")?;
+        scope.task = Some(task.into());
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -169,7 +212,12 @@ impl<D: TaskDatabase> TaskStore<D> {
         mut operation: impl FnMut(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.db
-            .task_write(label, |tx| operation(tx).map_err(anyhow::Error::new))
+            .task_write(label, |tx| {
+                if let Some(scope) = &self.router {
+                    scope.check(tx)?;
+                }
+                operation(tx).map_err(anyhow::Error::new)
+            })
             .map_err(unpack)
     }
     fn run_read<T>(
@@ -177,7 +225,14 @@ impl<D: TaskDatabase> TaskStore<D> {
         read: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.db
-            .task_read(|c| read(c).map_err(anyhow::Error::new))
+            .task_read(|c| {
+                let Some(scope) = &self.router else {
+                    return read(c).map_err(anyhow::Error::new);
+                };
+                let tx = c.unchecked_transaction()?;
+                scope.check(&tx)?;
+                read(&tx).map_err(anyhow::Error::new)
+            })
             .map_err(unpack)
     }
 
@@ -196,6 +251,11 @@ impl<D: TaskDatabase> TaskStore<D> {
         self.run_tx("super-agent create task", |tx| {
             if let Some((kind, task_id, stored)) = operation_row(tx, operation_id)? {
                 if kind == "task.create" && stored == hash {
+                    if let Some(scope) = &self.router {
+                        let mut scope = scope.clone();
+                        scope.task = Some(task_id.clone());
+                        scope.check(tx)?;
+                    }
                     return load_record_conn(tx, &task_id)?
                         .ok_or_else(|| StoreError::TaskNotFound(task_id));
                 }
@@ -264,9 +324,10 @@ impl<D: TaskDatabase> TaskStore<D> {
         status: Option<Status>,
     ) -> Result<Vec<TaskRecord>, StoreError> {
         self.run_read(|tx| {
-            let mut statement = tx.prepare(
-                "SELECT task_id FROM sa_tasks WHERE router_session_id=?1 ORDER BY task_id",
-            )?;
+            let mut statement = tx.prepare(&format!(
+                "SELECT task_id FROM {} WHERE router_session_id=?1 ORDER BY task_id",
+                D::ROUTED_TASKS
+            ))?;
             let ids = statement
                 .query_map([router_session_id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -348,9 +409,9 @@ impl<D: TaskDatabase> TaskStore<D> {
     ) -> Result<Vec<TaskRecord>, StoreError> {
         let fence = self.db.fence_decision(Decision::Pending(router_session))?;
         self.run_tx("super-agent process pending", |tx| {
-            let mut statement = tx.prepare(
-                "SELECT e.event_id FROM sa_events e JOIN sa_tasks t ON t.task_id=e.task_id WHERE t.router_session_id=?1 AND e.processed=0 ORDER BY e.task_id, e.sequence",
-            )?;
+            let mut statement = tx.prepare(&format!(
+                "SELECT e.event_id FROM sa_events e JOIN {} t ON t.task_id=e.task_id WHERE t.router_session_id=?1 AND e.processed=0 ORDER BY e.task_id, e.sequence", D::ROUTED_TASKS
+            ))?;
             let ids = statement
                 .query_map([router_session], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
