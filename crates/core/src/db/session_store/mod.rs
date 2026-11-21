@@ -4,7 +4,7 @@ mod binding;
 mod compaction;
 mod directory;
 pub use compaction::{CheckpointKey, CompactionClaim};
-pub use directory::{DirectoryEntry, DirectoryFilter};
+pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod executor;
 pub use executor::ExecutorHistory;

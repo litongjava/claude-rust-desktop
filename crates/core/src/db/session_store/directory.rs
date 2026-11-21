@@ -117,3 +117,95 @@ impl Stores {
         Ok(s)
     }
 }
+
+pub struct ResumeEntry {
+    pub conversation: ConversationRow,
+    pub latest: Option<String>,
+    pub branch: Option<String>,
+    pub bytes: i64,
+}
+
+impl Stores {
+    pub fn resume_entries(
+        &self,
+        current: &str,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<Vec<ResumeEntry>> {
+        let workspace = workspace.map(std::fs::canonicalize).transpose()?;
+        let path = workspace.as_deref().map(|p| p.to_string_lossy());
+        let rows = self.global().list_sessions(DirectoryFilter {
+            archived: Some(false),
+            nonempty: true,
+            exclude: Some(current),
+            workspace: path.as_deref(),
+            ..Default::default()
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ResumeEntry {
+                conversation: row.conversation,
+                latest: row.latest_prompt,
+                branch: row.git_branch,
+                bytes: row.transcript_bytes,
+            })
+            .collect())
+    }
+
+    pub fn record_git_branch(&self, id: &str, branch: &str) -> Result<()> {
+        self.open_session(id)?
+            .write(|w| w.set_git_branch(Some(branch)))
+    }
+
+    pub fn rename_session(&self, id: &str, title: &str) -> Result<()> {
+        let key = super::layout::storage_key(id)?;
+        let _guards = self
+            .resolved_key(&key)?
+            .ok_or_else(|| anyhow::anyhow!("Session unavailable"))?;
+        self.global().write("rename session",id,false,|c| {
+            anyhow::ensure!(c.execute("UPDATE conversations SET title=?1, metadata_revision=metadata_revision+1,
+                updated_at=CASE WHEN julianday(updated_at)>=julianday(?2) THEN updated_at ELSE ?2 END WHERE id=?3",
+                rusqlite::params![title,chrono::Utc::now().to_rfc3339(),id])?==1,"Session unavailable");
+            Ok(())
+        })
+    }
+}
+
+impl crate::db::DbManager {
+    pub fn resume_entries(
+        &self,
+        current: &str,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<Vec<ResumeEntry>> {
+        let here = workspace.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_owned()));
+        self.with_conn(|c| {
+            let mut result=Vec::new();
+            for mut row in crate::db::conversation_repo::list_conversations(c)? {
+                if row.id==current || row.archived || row.message_count==0 {continue;}
+                if let Some(root)=&here {
+                    if row.workspace_path.as_deref().map(std::path::Path::new).map(|p|p.canonicalize().unwrap_or_else(|_|p.to_owned())).as_ref()!=Some(root) { continue; }
+                }
+                if row.title.as_deref().is_none_or(|t|t.trim().is_empty()||t=="CLI session") {
+                    let first:Option<String>=c.query_row("SELECT content FROM messages WHERE conversation_id=?1 AND role='user' AND instr(content,?2)<>1 ORDER BY sort_order,rowid LIMIT 1",
+                        [&row.id,crate::tools::background_shell::NOTIFICATION_START],|r|r.get(0)).optional()?;
+                    row.title=first.as_deref().and_then(crate::db::conversation_repo::prompt_title);
+                }
+                let latest=c.query_row("SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1",[&row.id],|r|r.get(0)).optional()?;
+                let branch=c.query_row("SELECT value FROM peripheral_settings WHERE key=?1",[format!("cli.git-branch.{}",row.id)],|r|r.get(0)).optional()?;
+                let bytes=c.query_row("SELECT (SELECT coalesce(sum(length(CAST(content AS BLOB))+coalesce(length(CAST(thinking AS BLOB)),0)),0) FROM messages WHERE conversation_id=?1)
+                     +(SELECT coalesce(sum(coalesce(length(CAST(t.input AS BLOB)),0)+coalesce(length(CAST(t.output AS BLOB)),0)),0) FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1)
+                     +(SELECT coalesce(sum(length(CAST(t.requests_json AS BLOB))),0) FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1)",[&row.id],|r|r.get(0))?;
+                result.push(ResumeEntry{conversation:row,latest,branch,bytes});
+            }
+            Ok(result)
+        })?
+    }
+
+    pub fn record_git_branch(&self, id: &str, branch: &str) -> Result<()> {
+        self.with_conn(|c| c.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![format!("cli.git-branch.{id}"),branch]))??;
+        Ok(())
+    }
+    pub fn rename_session(&self, id: &str, title: &str) -> Result<()> {
+        self.with_conn(|c| crate::db::conversation_repo::update_conversation_title(c, id, title))?
+    }
+}

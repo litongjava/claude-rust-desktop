@@ -1,7 +1,7 @@
 ﻿//! Local commands backed by the shared conversation store and OS clipboard.
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
-use deepseek_code_core::{db::conversation_repo, runtime::RuntimePaths};
+use deepseek_code_core::runtime::RuntimePaths;
 use serde_json::Value;
 use std::{
     fs::OpenOptions,
@@ -120,7 +120,7 @@ pub async fn handle(
                             selected = index;
                             if let Some(title) = crate::terminal::picker::text_input("Rename session:", &found[index].1.title)?.filter(|title| !title.is_empty()) {
                                 let title: String = title.chars().take(200).collect();
-                                session.store.db.with_conn(|conn| conversation_repo::update_conversation_title(conn, &found[index].0, &title))??;
+                                session.store.db.rename_session(&found[index].0, &title)?;
                             }
                         }
                         Picked::Key(..) => {}
@@ -709,12 +709,7 @@ pub(crate) fn record_branch(session: &Session) {
     let Some(branch) = git_branch(&session.workspace) else {
         return;
     };
-    let _ = session.store.db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("cli.git-branch.{}", session.id), branch],
-        )
-    });
+    let _ = session.store.db.record_git_branch(&session.id,&branch);
 }
 
 /// `168KB` or `167.2KB`, as the reference CLI shows a session's size.
@@ -744,51 +739,16 @@ fn resume_title(title: &str, latest: Option<&str>) -> String {
 }
 
 fn resumable(session: &Session, all: bool) -> Result<Vec<(String, Resumable)>> {
-    let here = session.workspace.canonicalize().unwrap_or_else(|_| session.workspace.clone());
-    session.store.db.with_conn(|conn| -> Result<Vec<(String, Resumable)>> {
-        let mut found = Vec::new();
-        for row in conversation_repo::list_conversations(conn)? {
-            let same = row.workspace_path.as_deref().map(|path| Path::new(path).canonicalize().unwrap_or_else(|_| Path::new(path).to_path_buf())) == Some(here.clone());
-            if row.id == session.id || row.archived || !(same || all) || row.message_count == 0 {
-                continue;
-            }
-            let named = row.title.clone().filter(|title| !title.trim().is_empty() && title != "CLI session");
-            let title = match named {
-                Some(title) => title,
-                None => deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &row.id)?
-                    .into_iter()
-                    .find(|message| message.role == "user" && !crate::background_commands::is_notification(&message.content))
-                    .map(|message| message.content.lines().next().unwrap_or_default().to_owned())
-                    .unwrap_or_else(|| "(no prompt)".into()),
-            };
-            let latest_prompt: Option<String> = conn.query_row(
-                "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1",
-                [&row.id], |r| r.get(0),
-            ).ok();
-            let title = resume_title(&title, latest_prompt.as_deref());
-            // No row: the session was never used in a git repository.
-            let branch: Option<String> = conn
-                .query_row("SELECT value FROM peripheral_settings WHERE key=?1", [format!("cli.git-branch.{}", row.id)], |r| r.get(0))
-                .ok();
-            let size: i64 = conn.query_row(
-                "SELECT (SELECT COALESCE(SUM(length(CAST(content AS BLOB)) + COALESCE(length(CAST(thinking AS BLOB)),0)),0) FROM messages WHERE conversation_id=?1)
-                      + (SELECT COALESCE(SUM(COALESCE(length(CAST(t.input AS BLOB)),0) + COALESCE(length(CAST(t.output AS BLOB)),0)),0) FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1)
-                      + (SELECT COALESCE(SUM(length(CAST(r.requests_json AS BLOB))),0) FROM message_trajectory r JOIN messages m ON r.message_id=m.id WHERE m.conversation_id=?1)",
-                [&row.id],
-                |r| r.get(0),
-            )?;
-            let mut detail = ago(&row.updated_at);
-            detail.push_str(&format!(" \u{b7} {}", branch.as_deref().unwrap_or("HEAD")));
-            detail.push_str(&format!(" \u{b7} {}", short_size(size)));
-            if all {
-                if let Some(path) = &row.workspace_path {
-                    detail.push_str(&format!(" \u{b7} {}", path));
-                }
-            }
-            found.push((row.id, Resumable { title, detail, branch }));
+    let entries = session.store.db.resume_entries(&session.id, (!all).then_some(&session.workspace))?;
+    Ok(entries.into_iter().map(|entry| {
+        let row = entry.conversation;
+        let title = resume_title(row.title.as_deref().filter(|s| !s.trim().is_empty() && *s!="CLI session").unwrap_or("(no prompt)"),entry.latest.as_deref());
+        let mut detail = format!("{} · {} · {}",ago(&row.updated_at),entry.branch.as_deref().unwrap_or("HEAD"),short_size(entry.bytes));
+        if let Some(path)=row.workspace_path.filter(|_| all) {
+            detail.push_str(&format!(" · {path}"));
         }
-        Ok(found)
-    })?
+        (row.id,Resumable {title,detail,branch:entry.branch})
+    }).collect())
 }
 
 #[cfg(test)]
