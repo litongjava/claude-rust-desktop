@@ -111,9 +111,7 @@ impl TurnRecord {
     /// cancellation always records `ended_at` and `elapsed_ms`, so a missing
     /// endpoint is the durable marker.
     pub fn interrupted(&self) -> bool {
-        self.status == TurnStatus::Cancelled
-            && self.ended_at.is_none()
-            && self.elapsed_ms.is_none()
+        self.status == TurnStatus::Cancelled && self.ended_at.is_none() && self.elapsed_ms.is_none()
     }
 }
 
@@ -171,8 +169,13 @@ pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Ve
     while running_turn(conn, conversation_id)?.is_some() {
         // Recheck the candidate after acquiring the writer. Commit each
         // settlement so a later damaged row cannot undo earlier progress.
-        let turn = super::write_tx(conn, "settle interrupted turn", super::STARTUP_WRITE_DEADLINE,
-            |tx| settle_next(tx, conversation_id)).context("Settling interrupted turn")?;
+        let turn = super::write_tx(
+            conn,
+            "settle interrupted turn",
+            super::STARTUP_WRITE_DEADLINE,
+            |tx| settle_next(tx, conversation_id),
+        )
+        .context("Settling interrupted turn")?;
         let Some(turn) = turn else { break };
         settled.push(turn);
     }
@@ -180,7 +183,9 @@ pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Ve
 }
 
 pub(crate) fn settle_next(conn: &Connection, conversation_id: &str) -> Result<Option<TurnRecord>> {
-    let Some(mut record) = running_turn(conn, conversation_id)? else { return Ok(None) };
+    let Some(mut record) = running_turn(conn, conversation_id)? else {
+        return Ok(None);
+    };
     conn.execute(
         "UPDATE execution_turns SET ended_at=NULL,elapsed_ms=NULL,status='cancelled' WHERE id=?1 AND status='running'",
         [&record.turn_id],
@@ -200,9 +205,13 @@ pub fn terminal_status(stop_reason: Option<&str>, failed: bool) -> TurnStatus {
     }
 }
 
+enum TurnStore {
+    Shared(Arc<DbManager>, String),
+    Session(super::session_store::SessionDb),
+}
+
 pub struct TurnTimer {
-    db: Arc<DbManager>,
-    conversation_id: String,
+    store: TurnStore,
     started: Instant,
     record: TurnRecord,
     message_id: Option<String>,
@@ -211,6 +220,14 @@ pub struct TurnTimer {
 
 impl TurnTimer {
     pub fn start(db: Arc<DbManager>, conversation_id: &str) -> Result<Self> {
+        Self::begin(TurnStore::Shared(db, conversation_id.into()))
+    }
+
+    pub fn in_session(session: super::session_store::SessionDb) -> Result<Self> {
+        Self::begin(TurnStore::Session(session))
+    }
+
+    fn begin(store: TurnStore) -> Result<Self> {
         let started = Instant::now();
         let record = TurnRecord {
             turn_id: uuid::Uuid::new_v4().to_string(),
@@ -219,13 +236,19 @@ impl TurnTimer {
             elapsed_ms: None,
             status: TurnStatus::Running,
         };
-        db.with_conn(|conn| conn.execute(
+        match &store {
+            TurnStore::Session(shard) => {
+                shard.write(|w| w.start_turn_at(&record.turn_id, &record.started_at))?
+            }
+            TurnStore::Shared(db, conversation_id) => {
+                db.with_conn(|conn| conn.execute(
             "INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')",
             params![record.turn_id, conversation_id, record.started_at],
         ))??;
+            }
+        }
         Ok(Self {
-            db,
-            conversation_id: conversation_id.into(),
+            store,
             started,
             record,
             message_id: None,
@@ -258,16 +281,22 @@ impl TurnTimer {
     }
 
     pub fn new_segment(&mut self) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.db.with_conn(|conn| -> Result<()> {
+        let id = match &self.store {
+            TurnStore::Session(shard) => shard.write(|w| w.segment(&self.record.turn_id))?,
+            TurnStore::Shared(db, conversation_id) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                db.with_conn(|conn| -> Result<()> {
             super::write_tx(conn, "start turn segment", Duration::from_secs(30), |tx| {
                 tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES(?1,?2,'assistant','',?3,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))",
-                    params![id,self.conversation_id,chrono::Utc::now().to_rfc3339()])?;
+                    params![id,conversation_id,chrono::Utc::now().to_rfc3339()])?;
                 link_message(tx, &self.record.turn_id, &id)?;
-                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1", [&self.conversation_id])?;
+                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1", [conversation_id])?;
                 Ok(())
             })
         })??;
+                id
+            }
+        };
         self.message_id = Some(id.clone());
         Ok(id)
     }
@@ -296,7 +325,11 @@ impl TurnTimer {
         self.ensure_segment()?;
         // Finalize in the database first; memory fields change only after the
         // write commits, so a retry never re-applies half of the state.
-        self.db.with_conn(|conn| {
+        match &self.store {
+            TurnStore::Session(shard) => shard
+                .write(|w| w.finish_turn_at(&self.record.turn_id, status, elapsed_ms, &ended_at))?,
+            TurnStore::Shared(db, conversation_id) => {
+                db.with_conn(|conn| {
             super::write_tx(conn, "finish turn", Duration::from_secs(30), |tx| {
                 let changed = tx.execute(
                     "UPDATE execution_turns SET ended_at=?2,elapsed_ms=?3,status=?4 WHERE id=?1 AND status='running'",
@@ -308,17 +341,30 @@ impl TurnTimer {
                         .map(|end| now.max(end.to_utc()))
                         .unwrap_or(now);
                     super::conversation_repo::update_conversation_timestamp(
-                        tx, &self.conversation_id, &latest.to_rfc3339(),
+                        tx, conversation_id, &latest.to_rfc3339(),
                     )?;
                 }
                 Ok(())
             })
         })??;
+            }
+        }
         self.record.ended_at = Some(ended_at);
         self.record.elapsed_ms = Some(elapsed_ms);
         self.record.status = status;
         self.finished = true;
         Ok(self.record.clone())
+    }
+}
+
+impl DbManager {
+    pub fn start_turn_timer(self: &Arc<Self>, id: &str) -> Result<TurnTimer> {
+        TurnTimer::start(self.clone(), id)
+    }
+}
+impl super::session_store::Stores {
+    pub fn start_turn_timer(&self, id: &str) -> Result<TurnTimer> {
+        TurnTimer::in_session(self.open_session(id)?)
     }
 }
 

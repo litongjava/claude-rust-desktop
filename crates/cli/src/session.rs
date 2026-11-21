@@ -1868,7 +1868,7 @@ impl Session {
             Err(error) => return Err(error).context("This session is already executing in another process; observe or stop that turn first"),
         };
         let mut turn =
-            deepseek_code_core::db::turn_repo::TurnTimer::start(self.store.db.clone(), &self.id)?;
+            self.store.db.start_turn_timer(&self.id)?;
         let mut recovery_requests = Vec::new();
         let mut result = async {
             let first = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, completion, turn_lease.clone()).await;

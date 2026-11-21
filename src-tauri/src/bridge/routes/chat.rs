@@ -156,7 +156,7 @@ pub(super) async fn start_chat(
     }
     tracing::info!(module = "Chat", "[2/7] SQLite save COMPLETED");
 
-    let mut turn = match deepseek_code_core::db::turn_repo::TurnTimer::start(state.db_manager.clone(), &conv_id) {
+    let mut turn = match state.db_manager.start_turn_timer(&conv_id) {
         Ok(turn) => turn,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not start turn timing: {error:#}")}))).into_response(),
     };

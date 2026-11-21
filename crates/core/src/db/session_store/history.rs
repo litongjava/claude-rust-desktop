@@ -328,12 +328,15 @@ impl SessionWrite<'_> {
         Ok(())
     }
     pub fn start_turn(&self) -> Result<String> {
-        ensure!(!self.3, "Provider switch pending; worker is retiring");
         let id = uuid::Uuid::new_v4().to_string();
-        self.0
-            .execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')", params![id, self.1, chrono::Utc::now().to_rfc3339()])?;
-        self.2.set(true);
+        self.start_turn_at(&id, &chrono::Utc::now().to_rfc3339())?;
         Ok(id)
+    }
+    pub(crate) fn start_turn_at(&self, id: &str, at: &str) -> Result<()> {
+        ensure!(!self.3, "Provider switch pending; worker is retiring");
+        self.0.execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')",params![id,self.1,at])?;
+        self.2.set(true);
+        Ok(())
     }
     pub fn segment(&self, turn: &str) -> Result<String> {
         let id = self.append("assistant", "")?;
@@ -346,6 +349,15 @@ impl SessionWrite<'_> {
         status: turn_repo::TurnStatus,
         elapsed_ms: u64,
     ) -> Result<()> {
+        self.finish_turn_at(turn, status, elapsed_ms, &chrono::Utc::now().to_rfc3339())
+    }
+    pub(crate) fn finish_turn_at(
+        &self,
+        turn: &str,
+        status: turn_repo::TurnStatus,
+        elapsed_ms: u64,
+        ended_at: &str,
+    ) -> Result<()> {
         ensure!(
             status != turn_repo::TurnStatus::Running,
             "Expected terminal status"
@@ -355,13 +367,14 @@ impl SessionWrite<'_> {
                 "UPDATE execution_turns SET status=?1,ended_at=?2,elapsed_ms=?3 WHERE id=?4 AND status='running'",
                 params![
                     turn_repo::status_name(status),
-                    chrono::Utc::now().to_rfc3339(),
+                    ended_at,
                     elapsed_ms,
                     turn
                 ]
             )? == 1,
             "Turn is no longer running"
         );
+        self.0.execute("UPDATE manifest SET updated_at=?1 WHERE singleton=1 AND julianday(updated_at)<julianday(?1)",[ended_at])?;
         self.2.set(true);
         Ok(())
     }
