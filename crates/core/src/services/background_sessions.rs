@@ -675,6 +675,34 @@ pub fn spawn_reserved(
     )
 }
 
+/// Keep the ancestry scan and worktree removal atomic with new job publication.
+pub(crate) struct PublicationFence(fs::File);
+
+impl Drop for PublicationFence {
+    fn drop(&mut self) {
+        let _ = crate::fs::unlock_file(&self.0);
+    }
+}
+
+pub(crate) fn job_publication_fence(root: &Path, cleanup: bool) -> Result<PublicationFence> {
+    fs::create_dir_all(root)?;
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("background-task-publication.lock"))?;
+    if cleanup {
+        crate::fs::try_lock_file(&file).context("Background job publication in progress")?;
+    } else {
+        #[cfg(target_os = "android")]
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)?;
+        #[cfg(not(target_os = "android"))]
+        file.lock_shared()?;
+    }
+    Ok(PublicationFence(file))
+}
+
 fn spawn_at(
     root: &Path,
     supervisor: &Path,
@@ -686,6 +714,7 @@ fn spawn_at(
     foreground: bool,
     reserved: Option<&str>,
 ) -> Result<Job> {
+    let _publication = job_publication_fence(root, false)?;
     let id = match reserved {
         Some(id) => {
             // Validates the reserved identity before touching the filesystem.

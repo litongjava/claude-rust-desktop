@@ -1064,3 +1064,88 @@ async fn cleanup_finishes_after_retirement_of_a_previous_coder() {
         .unwrap();
     assert_eq!(cleanup_events(&f), 1);
 }
+
+#[tokio::test]
+async fn cleanup_checks_grandchild_after_intermediate_retirement() {
+    use crate::db::session_store::WorkerDirectory;
+    let f = cleanup_fixture(1).await;
+    let coder = f.task().coder.session_id.unwrap();
+    let middle = uuid::Uuid::new_v4().to_string();
+    let leaf = uuid::Uuid::new_v4().to_string();
+    let middle_db = f.context.db.create(&middle, Default::default()).unwrap();
+    let leaf_db = f.context.db.create(&leaf, Default::default()).unwrap();
+    let coder_db = f.context.db.open_session(&coder).unwrap();
+    let mut leaf_job = None;
+    for (parent, child, terminal) in [(&coder_db, &middle_db, true), (&middle_db, &leaf_db, false)]
+    {
+        let job = uuid::Uuid::new_v4().to_string();
+        if !terminal {
+            leaf_job = Some(job.clone());
+        }
+        let status = if terminal { "completed" } else { "running" };
+        let owner = crate::native_engine::child_session::ChildOwnership {
+            parent_session_id: parent.id().into(),
+            agent_type: "general".into(),
+            description: "owned descendant".into(),
+            mode: "background".into(),
+            status: status.into(),
+            job_id: Some(job.clone()),
+            created_at: "fixture".into(),
+            updated_at: "fixture".into(),
+            last_error: None,
+        };
+        let pair = f.context.db.worker_pair(parent.id(), child.id()).unwrap();
+        f.context.db.save_child_owner(&pair, &owner).unwrap();
+        let path = f.data.join("background-tasks").join(&job);
+        std::fs::create_dir(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let state = json!({"id":job,"session_id":child.id(),"parent_session_id":parent.id(),
+            "title":"owned descendant","status":status,"started_ms":now,"heartbeat_ms":now,
+            "finished_ms":terminal.then_some(now),"exit_code":terminal.then_some(0)});
+        std::fs::write(path.join("state.json"), state.to_string()).unwrap();
+        std::fs::write(
+            path.join("session-owners.json"),
+            json!({"parent":parent.incarnation(),"execution":child.incarnation()}).to_string(),
+        )
+        .unwrap();
+    }
+    let lease = leaf_db.acquire_execution().unwrap();
+    let host = f.orchestrator();
+    let wt = f.task().repositories[0].worktree_path.clone();
+    let check = || {
+        crate::super_agent::cleanup::cleanup_completed(&host.launcher(), &f.task_id, &host.policy())
+    };
+    let control = check();
+    println!(
+        "Before intermediate retirement: {control:?}, worktree exists={}",
+        wt.is_dir()
+    );
+    assert!(control.is_err() && wt.is_dir());
+    middle_db.delete().unwrap();
+    let after = check();
+    println!(
+        "After intermediate retirement with same active grandchild: {after:?}, worktree exists={}",
+        wt.is_dir()
+    );
+    assert!(
+        after.is_err() && wt.is_dir(),
+        "Cleanup must wait for the active descendant"
+    );
+    let path = f
+        .data
+        .join("background-tasks")
+        .join(leaf_job.unwrap())
+        .join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["status"] = json!("completed");
+    state["finished_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    std::fs::write(path, state.to_string()).unwrap();
+    assert!(
+        check().is_err() && wt.is_dir(),
+        "The execution lease alone must retain the worktree"
+    );
+    drop(lease);
+    let report = cleanup_observation(&f).await;
+    assert!(!wt.exists(), "{report:?}");
+    assert_eq!(cleanup_events(&f), 1);
+}

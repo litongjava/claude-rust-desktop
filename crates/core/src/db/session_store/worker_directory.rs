@@ -319,21 +319,33 @@ impl DbManager {
     }
 }
 
-pub(crate) trait WorkspaceDirectory {
-    fn workspace_sessions(&self) -> Result<Vec<(String, String)>>;
-}
-impl<D: super::shared::DirectoryRepository> WorkspaceDirectory for D {
-    fn workspace_sessions(&self) -> Result<Vec<(String, String)>> {
-        self.directory_read(|c| {
-            let mut q = c.prepare(
-                "SELECT id,workspace_path FROM conversations WHERE workspace_path IS NOT NULL",
-            )?;
-            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+impl Stores {
+    pub(crate) fn workspace_sessions(&self) -> Result<Vec<(String, String, String)>> {
+        self.global().read(|c| {
+            let mut q = c.prepare("SELECT id, incarnation, workspace_path FROM conversations WHERE workspace_path IS NOT NULL")?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
-}
 
+    pub(crate) fn cleanup_members(
+        &self,
+        task: &crate::super_agent::model::TaskRecord,
+    ) -> Result<Vec<(String, String)>> {
+        self.global().read(|c| {
+            let mut q = c.prepare("SELECT incarnation FROM sa_member_sessions WHERE task_id=?1 AND role=?2 AND session_id=?3")?;
+            let mut members = Vec::new();
+            for (role, id) in [("coder", &task.coder.session_id), ("reviewer", &task.reviewer.session_id)] {
+                if let Some(id) = id {
+                    let incarnation = q.query_row([&task.task_id, role, id], |r| r.get(0))
+                        .with_context(|| format!("Missing recorded {role} incarnation for {id}"))?;
+                    members.push((id.clone(), incarnation));
+                }
+            }
+            Ok(members)
+        })
+    }
+}
 impl Stores {
     pub(crate) fn register_background_agent(
         &self,

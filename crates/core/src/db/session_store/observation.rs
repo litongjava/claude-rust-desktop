@@ -5,7 +5,7 @@ use crate::db::{
     turn_repo::{self, TurnRecord},
 };
 use crate::services::session_messages::{self, ExecutionLease};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
 impl SessionRepository<'_> {
@@ -111,19 +111,17 @@ impl super::Stores {
         })
     }
 
-    pub(crate) fn require_recorded_execution_stopped(
+    pub(crate) fn hold_stopped_execution(
         &self,
         id: &str,
         incarnation: &str,
-    ) -> Result<()> {
+    ) -> Result<session_messages::ExecutionLease> {
         // Verify a still-live shard. A replacement has no bearing on this lock.
         if self.published_incarnation_matches(id, incarnation)? {
             self.open_current_session(id, Some(incarnation))?;
         }
-        ensure!(
-            !session_messages::execution_active(self.data_dir(), incarnation)?,
-            "Session {id} still owns an active execution"
-        );
-        Ok(())
+        session_messages::ExecutionLease::acquire(self.data_dir(), incarnation)
+            .with_context(|| format!("Session {id} still owns an active execution"))?
+            .context("Invalid participant incarnation")
     }
 }

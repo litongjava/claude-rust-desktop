@@ -671,6 +671,7 @@ pub fn begin_job_with_target(
     prompt: &str,
     child: Option<&crate::db::session_store::SessionDb>,
 ) -> Result<Job> {
+    let _publication = jobs::job_publication_fence(&worker.root, false)?;
     let active = directory(worker).join("active.json");
     if active.exists() {
         // A finished job's marker is stale: its owner is only about to remove it.
@@ -736,10 +737,22 @@ pub fn record_job_child(
 }
 
 pub(crate) fn job_child(root: &Path, job: &Job) -> Result<Option<JobChild>> {
-    match fs::read(jobs::directory(root, &job.id)?.join("owned-child.json")) {
+    job_child_by_id(root, &job.id)
+}
+
+fn job_child_by_id(root: &Path, id: &str) -> Result<Option<JobChild>> {
+    match fs::read(jobs::directory(root, id)?.join("owned-child.json")) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn recorded_job_child(root: &Path, id: &str) -> Result<Option<(String, String)>> {
+    match job_child_by_id(root, id)? {
+        Some(JobChild::Bound { id, incarnation }) => Ok(Some((id, incarnation))),
+        Some(JobChild::Legacy(_)) => anyhow::bail!("Child lacks recorded incarnation for job {id}"),
+        None => Ok(None),
     }
 }
 
