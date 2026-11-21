@@ -52,6 +52,11 @@ fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
     })
 }
 
+pub(super) fn one(c: &rusqlite::Connection, id: &str) -> Result<Option<DirectoryEntry>> {
+    Ok(c.query_row(&format!("{FIELDS} WHERE id=?1"), [id], entry)
+        .optional()?)
+}
+
 impl GlobalDb {
     pub fn list_sessions(&self, filter: DirectoryFilter<'_>) -> Result<Vec<DirectoryEntry>> {
         let mut sql = String::from(FIELDS);
@@ -89,11 +94,7 @@ impl GlobalDb {
         })
     }
     pub fn conversation(&self, id: &str) -> Result<Option<ConversationRow>> {
-        self.read_directory_row(id, |c| {
-            Ok(c.query_row(&format!("{FIELDS} WHERE id=?1"), [id], entry)
-                .optional()?
-                .map(|r| r.conversation))
-        })
+        self.read_directory_row(id, |c| Ok(one(c, id)?.map(|r| r.conversation)))
     }
 }
 impl Stores {

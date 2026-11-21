@@ -10,6 +10,7 @@ mod global_format;
 mod history;
 mod im;
 mod repair;
+mod runtime;
 pub mod settings;
 mod state;
 mod usage;

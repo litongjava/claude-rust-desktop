@@ -41,7 +41,7 @@ fn private_owner(c: &Connection, id: &str) -> Result<(String, String)> {
     .context("Private workspace owner unavailable")
 }
 
-pub(super) fn workspace(c: &Connection, root: &Path, id: &str) -> Result<PathBuf> {
+pub(in crate::db::session_store) fn workspace(c: &Connection, root: &Path, id: &str) -> Result<PathBuf> {
     let row = crate::db::conversation_repo::conversation_metadata(c, id)?
         .context("Session unavailable")?;
     ensure!(!row.archived, "Session is archived");

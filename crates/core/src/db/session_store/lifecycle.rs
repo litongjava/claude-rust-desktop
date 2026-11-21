@@ -1,4 +1,5 @@
 mod copy;
+pub(super) use copy::workspace;
 mod import;
 use super::layout::{self, canonical_uuid, durable_move, storage_key, sync_dir, Permits, SESSION};
 use super::{verify_manifest, SessionDb, Stores};
