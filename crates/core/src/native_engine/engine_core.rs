@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use uuid::Uuid;
 
 #[path = "idle_children.rs"]
 mod idle_children;
@@ -745,51 +744,22 @@ impl QueryEngine {
         conv_id: &str,
     ) -> Result<Option<ConversationState>> {
         let db = self.db_manager.clone();
-        let conv_id_clone = conv_id.to_string();
-
-        let result =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConversationState>> {
-                db.with_conn(|conn| {
-                    let messages = crate::db::message_repo::get_messages_by_conversation(
-                        conn,
-                        &conv_id_clone,
-                    )?;
-                    let conv =
-                        crate::db::conversation_repo::get_conversation(conn, &conv_id_clone)?;
-
-                    if messages.is_empty() && conv.is_none() {
-                        return Ok(None);
-                    }
-
-                    let model = conv.as_ref().and_then(|c| c.model.as_deref()).unwrap_or("");
-
-                    let start = messages
-                        .iter()
-                        .rposition(|msg| msg.is_compact_boundary)
-                        .unwrap_or(0);
-                    let messages_json: Vec<Value> = messages
-                        .into_iter()
-                        .skip(start)
-                        .map(|msg| {
-                            serde_json::json!({
-                                "role": msg.role,
-                                "content": msg.content,
-                            })
-                        })
-                        .collect();
-
-                    Ok(Some(ConversationState {
-                        conversation_id: conv_id_clone,
-                        model: model.to_string(),
-                        messages: messages_json,
-                        system_prompt: None,
-                        last_activity: Utc::now().to_rfc3339(),
-                        turn_count: 0,
-                        status: ConversationStatus::Idle,
-                    }))
-                })?
-            })
-            .await??;
+        let id = conv_id.to_owned();
+        let saved = tokio::task::spawn_blocking(move || db.engine_history(&id)).await??;
+        let result = saved.map(|(model, messages)| {
+            let start = messages.iter().rposition(|msg| msg.is_compact_boundary).unwrap_or(0);
+            ConversationState {
+                conversation_id: conv_id.to_owned(),
+                model: model.unwrap_or_default(),
+                messages: messages.into_iter().skip(start).map(|msg| {
+                    serde_json::json!({"role": msg.role, "content": msg.content})
+                }).collect(),
+                system_prompt: None,
+                last_activity: Utc::now().to_rfc3339(),
+                turn_count: 0,
+                status: ConversationStatus::Idle,
+            }
+        });
 
         if let Some(state) = &result {
             self.update_conversation_state(conv_id, state.clone()).await;
@@ -799,58 +769,12 @@ impl QueryEngine {
     }
 
     pub async fn save_conversation_state(&self, conv_id: &str) -> Result<()> {
-        let states = self.conversation_states.lock().await;
-        if let Some(state) = states.get(conv_id) {
+        let state = self.conversation_states.lock().await.get(conv_id).cloned();
+        if let Some(state) = state {
             let db = self.db_manager.clone();
-            let state_clone = state.clone();
-
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let result = db.with_conn(|conn| {
-                    let tx = crate::db::write_transaction(&conn)?;
-
-                    let existing = crate::db::conversation_repo::get_conversation(
-                        &tx,
-                        &state_clone.conversation_id,
-                    )?;
-                    if existing.is_none() {
-                        crate::db::conversation_repo::insert_conversation(
-                            &tx,
-                            &state_clone.conversation_id,
-                            None,
-                            Some(&state_clone.model),
-                            None,
-                            None,
-                            None,
-                            false,
-                            false,
-                            false,
-                            &state_clone.last_activity,
-                            &state_clone.last_activity,
-                            state_clone.turn_count as i64,
-                        )?;
-                    } else {
-                        crate::db::conversation_repo::update_conversation(
-                            &tx,
-                            &state_clone.conversation_id,
-                            None,
-                            Some(&state_clone.model),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(&state_clone.last_activity),
-                            Some(state_clone.turn_count as i64),
-                        )?;
-                    }
-
-                    tx.commit()?;
-                    Ok(())
-                });
-                result?
-            })
-            .await??;
+            tokio::task::spawn_blocking(move || db.save_engine_state(
+                &state.conversation_id, &state.model, &state.last_activity, state.turn_count as i64,
+            )).await??;
         }
         Ok(())
     }
@@ -1026,19 +950,8 @@ impl QueryEngine {
         let workspaces_root = self.workspaces_dir.clone();
         let requested_workspace = request.workspace_path.clone();
         let (workspace, project, prompt_profile) = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let (workspace, project) = super::workspace::resolve_workspace(
-                    conn,
-                    &workspaces_root,
-                    &project_conv_id,
-                    requested_workspace.as_deref(),
-                )?;
-                let profile =
-                    super::workspace::conversation_prompt_profile(conn, &project_conv_id)?;
-                Ok::<_, anyhow::Error>((workspace, project, profile))
-            })
-        })
-        .await???;
+            db.engine_workspace(&workspaces_root, &project_conv_id, requested_workspace.as_deref())
+        }).await??;
         crate::services::lifecycle_events::check_configuration(
             &plugin_context,
             &workspace,
@@ -1626,6 +1539,7 @@ impl QueryEngine {
         } else {
             None
         };
+        let history = self.db_manager.executor_history(&conv_id)?;
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -1670,7 +1584,7 @@ impl QueryEngine {
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
-        .with_executor_history(self.db_manager.executor_history(&conv_id)?)?
+        .with_executor_history(history.clone())?
         .with_durable_super_agent(crate::super_agent::crp::ToolRuntime {
             db: self.db_manager.clone(),
             data_dir,
@@ -1725,9 +1639,9 @@ impl QueryEngine {
         let active_turns_clone = self.active_turns.clone();
         let conversation_states_clone = self.conversation_states.clone();
         let _tool_call_history_clone = self.tool_call_history.clone();
-        let db = self.db_manager.clone();
-        let provider_manager_title = self.provider_manager.clone();
+        let title_history = history.clone();
         let db_title = self.db_manager.clone();
+        let provider_manager_title = self.provider_manager.clone();
 
         tracing::info!(
             module = "EngineCore",
@@ -1828,7 +1742,6 @@ impl QueryEngine {
                         full_text.len()
                     );
                     if save_response && !full_text.is_empty() {
-                        let conv_id = conv_id_clone.clone();
                         // This blocking write cannot be aborted once started, so
                         // it keeps the attempt's ownership until it exits: the
                         // session stays admitted and completion stays pending
@@ -1850,31 +1763,7 @@ impl QueryEngine {
                                 // holding anything the async side needs.
                                 let _ = release.recv();
                             }
-                            db.with_conn(|conn| {
-                                let msg_id = Uuid::new_v4().to_string();
-                                let now = Utc::now().to_rfc3339();
-                                let sort_order =
-                                    crate::db::message_repo::get_messages_by_conversation(
-                                        conn, &conv_id,
-                                    )
-                                    .unwrap_or_default()
-                                    .len() as i64;
-                                crate::db::message_repo::insert_message(
-                                    conn,
-                                    &msg_id,
-                                    &conv_id,
-                                    "assistant",
-                                    &full_text,
-                                    None,
-                                    &now,
-                                    false,
-                                    sort_order,
-                                )?;
-                                crate::db::conversation_repo::increment_message_count(
-                                    conn, &conv_id,
-                                )?;
-                                Ok::<(), anyhow::Error>(())
-                            })
+                            history.finish_response(&full_text)
                         })
                         .await;
                     }
@@ -1923,146 +1812,111 @@ impl QueryEngine {
                     let title_conv_id = conv_id_clone.clone();
                     let title_model = state.model.clone();
                     let pm = provider_manager_title.clone();
-                    let db_t = db_title.clone();
                     let title_identity = super::request_identity::TurnIdentity::new(
                         Some(title_conv_id.clone()),
                         None,
                     );
                     tokio::spawn(title_identity.scope(async move {
                         tracing::info!(module = "EngineCore", "Auto-generating title for conv_id={}", title_conv_id);
-                        let title_conv_id_inner = title_conv_id.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            db_t.with_conn(|conn| {
-                                let conv = crate::db::conversation_repo::get_conversation(conn, &title_conv_id_inner)?;
-                                if conv.as_ref().and_then(|c| c.title.as_ref()).map_or(false, |t| !t.is_empty()) {
-                                    return Ok::<bool, anyhow::Error>(false);
-                                }
-                                let messages = crate::db::message_repo::get_messages_by_conversation(conn, &title_conv_id_inner)?;
-                                let _first_user_msg = messages.iter().find(|m| m.role == "user").map(|m| m.content.clone());
-                                let _first_assistant_msg = messages.iter().find(|m| m.role == "assistant").map(|m| m.content.clone());
-                                Ok::<bool, anyhow::Error>(true)
-                            })
-                        }).await;
+                        let source = title_history.clone();
+                        let seed = tokio::task::spawn_blocking(move || source.title_seed()).await;
 
-                        let should_generate = match result {
-                            Ok(Ok(Ok(true))) => true,
-                            _ => false,
-                        };
-
-                        if should_generate {
+                        if let Ok(Ok(Some((user_msg, assistant_msg)))) = seed {
                             let resolved = {
                                 let pm_guard = pm.lock().await;
                                 match pm_guard.binding.resolve(None) { Some(active) => Some(active), None => pm_guard.resolve_provider(&title_model).await }
                             };
 
                             if let Some(resolved) = resolved {
-                                let db_msgs = db_title.clone();
-                                let conv_id_for_msgs = title_conv_id.clone();
-                                let msgs_result = tokio::task::spawn_blocking(move || {
-                                    db_msgs.with_conn(|conn| {
-                                        let messages = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_for_msgs)?;
-                                        let first_user = messages.iter().find(|m| m.role == "user").map(|m| m.content.clone());
-                                        let first_assistant = messages.iter().find(|m| m.role == "assistant").map(|m| m.content.clone());
-                                        Ok::<_, anyhow::Error>((first_user, first_assistant))
-                                    })
-                                }).await;
+                                let assistant_text: String = assistant_msg.unwrap_or_default();
+                                let truncated_assistant = if assistant_text.chars().count() > 200 {
+                                    let mut end = 0;
+                                    for (i, _) in assistant_text.char_indices() {
+                                        if i >= 200 { break; }
+                                        end = i;
+                                    }
+                                    assistant_text[..end].to_string()
+                                } else {
+                                    assistant_text
+                                };
 
-                                if let Ok(Ok(Ok((Some(user_msg), assistant_msg)))) = msgs_result {
-                                    let assistant_text: String = assistant_msg.unwrap_or_default();
-                                    let truncated_assistant = if assistant_text.chars().count() > 200 {
-                                        let mut end = 0;
-                                        for (i, _) in assistant_text.char_indices() {
-                                            if i >= 200 { break; }
-                                            end = i;
-                                        }
-                                        assistant_text[..end].to_string()
-                                    } else {
-                                        assistant_text
-                                    };
+                                let prompt = format!(
+                                    "Based on the following conversation, generate a concise title (max 50 characters, in the same language as the user's message). Only output the title, nothing else.\n\nUser: {}\nAssistant: {}",
+                                    user_msg, truncated_assistant
+                                );
 
-                                    let prompt = format!(
-                                        "Based on the following conversation, generate a concise title (max 50 characters, in the same language as the user's message). Only output the title, nothing else.\n\nUser: {}\nAssistant: {}",
-                                        user_msg, truncated_assistant
-                                    );
+                                let user_msg_ref: &str = &user_msg;
+                                let fallback: String = if user_msg_ref.chars().count() > 30 {
+                                    let mut end = 0;
+                                    for (i, _) in user_msg_ref.char_indices() {
+                                        if i >= 30 { break; }
+                                        end = i;
+                                    }
+                                    user_msg_ref[..end].to_string()
+                                } else {
+                                    user_msg.clone()
+                                };
 
-                                    let user_msg_ref: &str = &user_msg;
-                                    let fallback: String = if user_msg_ref.chars().count() > 30 {
-                                        let mut end = 0;
-                                        for (i, _) in user_msg_ref.char_indices() {
-                                            if i >= 30 { break; }
-                                            end = i;
-                                        }
-                                        user_msg_ref[..end].to_string()
-                                    } else {
-                                        user_msg.clone()
-                                    };
-
-                                    let title_result: Result<String, anyhow::Error> = match resolved.provider.api_format {
-                                        crate::native_engine::provider_manager::ApiFormat::OpenAI => {
-                                            let client = crate::native_engine::openai_client::OpenAIClient::new()
-                                                .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
-                                            let msgs = vec![
-                                                crate::native_engine::openai_client::OpenAIMessage {
-                                                    role: "user".to_string(),
-                                                    content: crate::native_engine::openai_client::OpenAIContent::Text(prompt),
-                                                    tool_calls: None,
-                                                    tool_call_id: None,
-                                                    reasoning_content: None, provider_content: None,
-                                                }
-                                            ];
-                                            match client.send_message(&resolved, msgs, None, vec![], 100).await {
-                                                Ok(resp) => {
-                                                    let t = resp.choices.first()
-                                                        .map(|c| match &c.message.content {
-                                                            crate::native_engine::openai_client::OpenAIContent::Text(t) => t.trim().to_string(),
-                                                            crate::native_engine::openai_client::OpenAIContent::Multi(parts) => parts.iter()
-                                                                .filter_map(|p| if let crate::native_engine::openai_client::OpenAIContentPart::Text { text } = p { Some(text.as_str()) } else { None })
-                                                                .collect::<Vec<_>>()
-                                                                .join(""),
-                                                        })
-                                                        .unwrap_or_default();
-                                                    Ok(t)
-                                                }
-                                                Err(e) => Err(e),
+                                let title_result: Result<String, anyhow::Error> = match resolved.provider.api_format {
+                                    crate::native_engine::provider_manager::ApiFormat::OpenAI => {
+                                        let client = crate::native_engine::openai_client::OpenAIClient::new()
+                                            .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
+                                        let msgs = vec![
+                                            crate::native_engine::openai_client::OpenAIMessage {
+                                                role: "user".to_string(),
+                                                content: crate::native_engine::openai_client::OpenAIContent::Text(prompt),
+                                                tool_calls: None,
+                                                tool_call_id: None,
+                                                reasoning_content: None, provider_content: None,
                                             }
-                                        }
-                                        crate::native_engine::provider_manager::ApiFormat::Anthropic => {
-                                            let client = crate::native_engine::anthropic_client::AnthropicClient::new()
-                                                .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
-                                            let msgs = vec![
-                                                crate::native_engine::anthropic_client::AnthropicMessage {
-                                                    role: "user".to_string(),
-                                                    content: crate::native_engine::anthropic_client::AnthropicContent::Text(prompt),
-                                                }
-                                            ];
-                                            match client.send_message(&resolved, msgs, None, vec![], 100).await {
-                                                Ok(resp) => {
-                                                    let t = resp.content.iter()
-                                                        .filter_map(|block| if let crate::native_engine::anthropic_client::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None })
-                                                        .collect::<Vec<_>>()
-                                                        .join("")
-                                                        .trim()
-                                                        .to_string();
-                                                    Ok(t)
-                                                }
-                                                Err(e) => Err(e),
+                                        ];
+                                        match client.send_message(&resolved, msgs, None, vec![], 100).await {
+                                            Ok(resp) => {
+                                                let t = resp.choices.first()
+                                                    .map(|c| match &c.message.content {
+                                                        crate::native_engine::openai_client::OpenAIContent::Text(t) => t.trim().to_string(),
+                                                        crate::native_engine::openai_client::OpenAIContent::Multi(parts) => parts.iter()
+                                                            .filter_map(|p| if let crate::native_engine::openai_client::OpenAIContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+                                                            .collect::<Vec<_>>()
+                                                            .join(""),
+                                                    })
+                                                    .unwrap_or_default();
+                                                Ok(t)
                                             }
+                                            Err(e) => Err(e),
                                         }
-                                    };
+                                    }
+                                    crate::native_engine::provider_manager::ApiFormat::Anthropic => {
+                                        let client = crate::native_engine::anthropic_client::AnthropicClient::new()
+                                            .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
+                                        let msgs = vec![
+                                            crate::native_engine::anthropic_client::AnthropicMessage {
+                                                role: "user".to_string(),
+                                                content: crate::native_engine::anthropic_client::AnthropicContent::Text(prompt),
+                                            }
+                                        ];
+                                        match client.send_message(&resolved, msgs, None, vec![], 100).await {
+                                            Ok(resp) => {
+                                                let t = resp.content.iter()
+                                                    .filter_map(|block| if let crate::native_engine::anthropic_client::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None })
+                                                    .collect::<Vec<_>>()
+                                                    .join("")
+                                                    .trim()
+                                                    .to_string();
+                                                Ok(t)
+                                            }
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                };
 
-                                    let final_title = match title_result {
-                                        Ok(t) if !t.is_empty() => t,
-                                        _ => fallback,
-                                    };
+                                let final_title = match title_result {
+                                    Ok(t) if !t.is_empty() => t,
+                                    _ => fallback,
+                                };
 
-                                    let db_save = db_title.clone();
-                                    let conv_id_save = title_conv_id.clone();
-                                    let title_save = final_title.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        db_save.with_conn(|conn| {
-                                            crate::db::conversation_repo::update_title_if_empty(conn, &conv_id_save, &title_save)
-                                        })
-                                    }).await;
+                                let title_save = final_title.clone();
+                                if matches!(tokio::task::spawn_blocking(move || title_history.publish_title(&title_save)).await, Ok(Ok(true))) {
                                     tracing::info!(module = "EngineCore", "Title generated for {}: {}", title_conv_id, final_title);
                                 }
                             }

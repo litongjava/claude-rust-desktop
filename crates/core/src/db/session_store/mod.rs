@@ -13,6 +13,7 @@ pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod executor;
+mod engine;
 mod segment;
 mod owned;
 mod goal_state;
