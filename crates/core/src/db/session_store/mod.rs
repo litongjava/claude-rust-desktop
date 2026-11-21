@@ -55,6 +55,8 @@ mod state;
 mod usage;
 mod task;
 mod task_state;
+mod task_roles;
+pub use task_roles::TaskMembership;
 pub use task_state::TaskState;
 pub use delivery::*;
 pub use history::*;
