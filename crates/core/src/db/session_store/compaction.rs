@@ -34,6 +34,16 @@ pub struct CompactionClaim {
     pub transcript: String,
 }
 
+enum PendingClaim {
+    Empty,
+    Ready(CompactionClaim),
+    Obsolete {
+        id: String,
+        revision: i64,
+        reason: &'static str,
+    },
+}
+
 impl CompactionClaim {
     pub fn request_id(&self) -> &str {
         &self.id
@@ -121,33 +131,37 @@ impl DeliveryOwner {
         let candidate = s.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
             let request = tx
-                .query_row("SELECT id,keep,EXISTS(SELECT 1 FROM messages WHERE messages.id=target_message),content_revision
-                    FROM compaction_request JOIN manifest USING(singleton)", [], |r| {
+                .query_row("SELECT q.id,q.keep,EXISTS(SELECT 1 FROM messages WHERE id=q.target_message),m.content_revision
+                    FROM compaction_request q JOIN manifest m USING(singleton)", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?))
                 })
                 .optional()?;
             let Some((id, keep, has_target, revision)) = request else {
-                return Ok(None);
+                return Ok(PendingClaim::Empty);
             };
             if !has_target {
-                return Ok(Some(Err((id, revision, "missing compaction target"))));
+                return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
             let (fingerprint, transcript, count) = compaction::fingerprint(&tx, &s.id)?;
             if count < 2 {
-                return Ok(Some(Err((id, revision, "not enough messages to compact"))));
+                return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
-            Ok(Some(Ok(CompactionClaim {
+            Ok(PendingClaim::Ready(CompactionClaim {
                 id,
                 incarnation: s.incarnation.clone(),
                 fingerprint,
                 keep,
                 transcript,
-            })))
+            }))
         })?;
         match candidate {
-            None => Ok(None),
-            Some(Ok(claim)) => Ok(Some(claim)),
-            Some(Err((id, revision, reason))) => {
+            PendingClaim::Empty => Ok(None),
+            PendingClaim::Ready(claim) => Ok(Some(claim)),
+            PendingClaim::Obsolete {
+                id,
+                revision,
+                reason,
+            } => {
                 // The read snapshot has closed. Fence both a replacement request
                 // and history that became eligible before acquiring the writer.
                 s.write_locked("cancel obsolete compaction", |w| {
