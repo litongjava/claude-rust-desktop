@@ -168,10 +168,10 @@ pub async fn payload(session: &Session) -> Result<Value> {
     let usage = crate::display_commands::usage(session)?;
     let selected = session.selected_provider().await?;
     let title = session.store.resume(&session.id)?.title;
-    let (current, added, project_dir) = session.store.db.with_conn(|conn| -> Result<_> {
-        let current = setup::current_usage(conn, &session.id)?;
-        let project =
-            deepseek_code_core::native_engine::workspace::conversation_project(conn, &session.id)?;
+    use deepseek_code_core::db::session_store::SessionAccess;
+    let history = session.store.db.select_session(&session.id)?;
+    let current = history.current_usage()?;
+    let project = history.workspace_project()?;
         let project_dir = project
             .as_ref()
             .and_then(|p| p.workspace_path.clone())
@@ -186,8 +186,6 @@ pub async fn payload(session: &Session) -> Result<Value> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        Ok((current, added, project_dir))
-    })??;
     let context_size = selected.model.context_window;
     let used = current.as_ref().and_then(|v| {
         v["input_tokens"].as_u64().map(|input| {

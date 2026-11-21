@@ -1,6 +1,6 @@
 //! Terminal and SDK presentation of the latest suggestion for a session.
 use deepseek_code_core::{
-    db::DbManager,
+    db::session_store::SessionDb,
     native_engine::suggestion::SuggestionCapture,
     session_files::suggestion::{SavedSuggestion, SuggestionGuard},
 };
@@ -81,24 +81,22 @@ impl Pending {
 
 #[derive(Clone)]
 pub(crate) struct Ghost {
-    db: Arc<DbManager>,
-    session: String,
+    db: SessionDb,
     pub saved: SavedSuggestion,
 }
 
 impl Ghost {
     pub fn load(session: &crate::session::Session) -> Option<Self> {
-        let db = session.store.db.clone();
-        let saved = SavedSuggestion::load(&db, &session.id).ok()??;
+        let db = session.store.db.open_session(&session.id).ok()?;
+        let saved = SavedSuggestion::load_from(&db).ok()??;
         Some(Self {
             db,
-            session: session.id.clone(),
             saved,
         })
     }
 
     pub fn accept(&self) -> bool {
-        self.saved.accept(&self.db, &self.session).unwrap_or(false)
+        self.saved.accept_from(&self.db).unwrap_or(false)
     }
 }
 

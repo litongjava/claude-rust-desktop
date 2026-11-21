@@ -205,6 +205,50 @@ impl super::SessionRepository<'_> {
 }
 impl SessionDb {
     pub fn enqueue(&self, request: &str, content: &Value, mode: QueueMode) -> Result<Admission> {
+        if request.starts_with("internal-cli:") {return Err(QueueError::InvalidContent.into());}
+        self.enqueue_content(request,content,mode,false)
+    }
+
+    pub fn enqueue_cli_prompt(&self, text:&str) -> Result<()> {
+        let content = input_queue::content_with_images(self.stores.data_dir(), self.id(),text).map(Value::Array).unwrap_or_else(||Value::String(text.into()));
+        let request=format!("internal-cli:prompt:{}",uuid::Uuid::new_v4());
+        self.enqueue_content(&request,&content,QueueMode::Steer,false)?;
+        Ok(())
+    }
+
+    pub fn enqueue_cli_notification(&self, text:&str) -> Result<()> {
+        let request=format!("internal-cli:notice:{}",uuid::Uuid::new_v4());
+        self.enqueue_content(&request,&Value::String(text.into()),QueueMode::Steer,true)?;
+        Ok(())
+    }
+
+    pub fn recall_cli_prompts(&self) -> Result<Vec<String>> {
+        let _lock=self.stores.key_lock(&self.key,false,false)?;
+        self.check_directory()?;
+        let candidates=self.stores.global().read(|c| {
+            let mut query=c.prepare("SELECT id,revision,payload FROM session_input_queue WHERE session_id=?1 AND state='queued' AND request_id GLOB 'internal-cli:prompt:*' ORDER BY id")?;
+            let rows=query.query_map([self.id()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?;
+        let mut texts=Vec::new();
+        for (id,revision,hash) in candidates {
+            let content=self.stores.payload(&hash)?;
+            let (text,_)=crate::db::message_repo::prepare_user_message(&content)?;
+            texts.push((id,revision,text));
+        }
+        if texts.is_empty(){ return Ok(Vec::new()); }
+        self.stores.global().write("recall unsent prompts",self.id(),false,|c|{
+            let mut recalled=Vec::new();
+            for (id,revision,text) in &texts {
+                if c.execute("UPDATE session_input_queue SET state='cancelled',revision=revision+1 WHERE id=?1 AND revision=?2 AND state='queued'",params![id,revision])?==1 {
+                    recalled.push(text.clone());
+                }
+            }
+            Ok(recalled)
+        })
+    }
+
+    fn enqueue_content(&self,request:&str,content:&Value,mode:QueueMode,notification:bool)->Result<Admission>{
         if request.trim().is_empty() {
             return Err(QueueError::InvalidContent.into());
         }
@@ -247,7 +291,7 @@ impl SessionDb {
                     original,
                     hash,
                     mode,
-                    uuid::Uuid::new_v4().to_string()
+                    if notification { format!("notice-{}",uuid::Uuid::new_v4()) } else {uuid::Uuid::new_v4().to_string()}
                 ],
             )?;
             admission(c, c.last_insert_rowid(), &self.id)
@@ -896,7 +940,7 @@ impl DeliveryOwner {
                     Ok(Some(DeliveredInput {
                         text: row.content,
                         content,
-                        origin: handoff.id.clone(),
+                        origin: format!("queue-input-{}",handoff.id),
                     }))
                 },
             )?;
@@ -978,14 +1022,17 @@ impl DeliveryOwner {
                     inputs.push(DeliveredInput {
                         text: payload.as_str().map(str::to_owned).unwrap_or_else(|| payload.to_string()),
                         content: payload.clone(),
-                        origin: "user".into(),
+                        origin: if claim.id.starts_with("notice-") {"task_notification"}else{"user"}.into(),
                     });
                     input_queue::save_delivered(tx.0, tool, &inputs)?;
-                    crate::services::permission_authority::record_conn(
-                        tx.0, &s.id, crate::services::permission_authority::Source::User, &payload,
-                    )?;
+                    if !claim.id.starts_with("notice-") {
+                        crate::services::permission_authority::record_conn(tx.0,&s.id,crate::services::permission_authority::Source::User,&payload)?;
+                    }
                 } else {
-                    tx.append_user(&claim.id, &payload)?;
+                    if claim.id.starts_with("notice-") {
+                        crate::db::message_repo::save_user_message(tx.0,&claim.id,&s.id,&payload,&chrono::Utc::now().to_rfc3339(),tx.next_order()?)?;
+                        tx.2.set(true);
+                    } else { tx.append_user(&claim.id, &payload)?; }
                     // The running loop consumes in-turn steers directly.
                     tx.0.execute(
                         "INSERT INTO delivery_generations(delivery_id)

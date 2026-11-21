@@ -45,6 +45,7 @@ pub use mcp_control::McpControl;
 mod global_format;
 mod history;
 mod im;
+pub use im::FeishuChatMapping;
 mod im_catalog;
 mod learning;
 pub use learning::LearningRecords;
@@ -63,6 +64,7 @@ mod repair;
 mod runtime;
 pub mod settings;
 mod state;
+pub(crate) mod suggestions;
 mod usage;
 mod task;
 mod task_state;
@@ -94,6 +96,7 @@ type Fault = dyn Fn(Phase) -> Result<()> + Send + Sync;
 struct Root {
     path: PathBuf,
     global: GlobalDb,
+    host: Mutex<Weak<Stores>>,
     repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
     repair_cursor: Mutex<String>,
     recording: std::sync::RwLock<HashMap<String,crate::native_engine::request_recording::Policy>>,
@@ -151,6 +154,7 @@ impl Stores {
             global.root = weak.clone();
             Root {
                 global,
+                host: Default::default(),
                 upgraded_directory,
                 repair: Default::default(),
                 repair_cursor: Default::default(),
@@ -165,6 +169,15 @@ impl Stores {
         stores.start_projection_repair();
         *cached = Arc::downgrade(&stores.root);
         Ok(stores)
+    }
+
+    pub(crate) fn host_handle(self) -> Arc<Self> {
+        let root=self.root.clone();
+        let mut slot=root.host.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(host)=slot.upgrade() { return host; }
+        let host=Arc::new(self);
+        *slot=Arc::downgrade(&host);
+        host
     }
 
     pub fn data_dir(&self) -> &Path {

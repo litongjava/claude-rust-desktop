@@ -1,6 +1,5 @@
 pub mod cron;
 
-use crate::db::DbManager;
 use crate::native_engine::anthropic_client::AnthropicClient;
 use crate::native_engine::openai_client::OpenAIClient;
 use crate::native_engine::provider_manager::{ApiFormat, ProviderManager, ResolvedProvider};
@@ -40,7 +39,6 @@ pub struct TaskEvent {
 
 pub struct TaskExecutor {
     provider_manager: Arc<Mutex<ProviderManager>>,
-    db_manager: Arc<DbManager>,
     anthropic_client: AnthropicClient,
     openai_client: OpenAIClient,
     tasks: Arc<Mutex<HashMap<String, TaskState>>>,
@@ -67,11 +65,9 @@ pub enum TaskStatus {
 impl TaskExecutor {
     pub fn new_with_provider_manager(
         provider_manager: Arc<Mutex<ProviderManager>>,
-        db_manager: Arc<DbManager>,
     ) -> Self {
         Self {
             provider_manager,
-            db_manager,
             anthropic_client: AnthropicClient::new(),
             openai_client: OpenAIClient::new(),
             tasks: Arc::new(Mutex::new(HashMap::new())),

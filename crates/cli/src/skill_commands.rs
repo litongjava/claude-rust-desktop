@@ -340,18 +340,17 @@ pub async fn prepare_invocation(
 fn isolated_child(
     store: &deepseek_code_core::runtime::SessionStore,
     parent: &str,
-    context: &deepseek_code_core::services::ServiceContext,
+    _context: &deepseek_code_core::services::ServiceContext,
 ) -> anyhow::Result<String> {
-    let child = store.clear(parent)?;
-    deepseek_code_core::services::permission_authority::inherit(&store.db, parent, &child)?;
-    crate::session_commands::copy_settings(&store.db, parent, &child)?;
-    // A parent autonomous goal must not turn a bounded skill into unrelated work.
-    let setting = format!("cli.session.{child}");
-    if let Some(mut settings) = context.setting::<serde_json::Value>(&setting)? {
-        if let Some(object) = settings.as_object_mut() {
-            object.remove("goal");
-        }
-        context.save_setting(&setting, &settings)?;
+    use deepseek_code_core::db::session_store::{settings, SessionAccess};
+    let owner = store.db.open_session(parent)?;
+    let child = uuid::Uuid::new_v4().to_string();
+    let destination = owner.derive_owned_child(&child, &owner.workspace()?)?;
+    owner.copy_preferences_to(&destination)?;
+    let preferences = destination.select_session(&child)?;
+    if let Some(mut value) = preferences.preference(settings::PREFERENCES)? {
+        value.goal = None;
+        preferences.set_preference(settings::PREFERENCES, Some(&value))?;
     }
     Ok(child)
 }

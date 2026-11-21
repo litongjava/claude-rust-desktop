@@ -123,7 +123,8 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
         named.push(session.id.clone());
     }
     let engine = session.side_engine();
-    let db = session.store.db.clone();
+    let Ok(shard) = session.store.db.open_session(&session.id) else { return; };
+    let history = deepseek_code_core::db::session_store::ExecutorHistory::Session(shard);
     let (id, provider, model) = (
         session.id.clone(),
         session.binding_state().provider_id.clone(),
@@ -136,7 +137,7 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
             .await
             .map(|reply| tidy(&reply))
         {
-            let _ = db.with_conn(|conn| deepseek_code_core::db::conversation_repo::update_title_if_empty(conn, &id, &title));
+            if !matches!(history.publish_title(&title), Ok(true)) { return; }
             *TOPIC.lock().unwrap_or_else(|error| error.into_inner()) = Some((id, title));
         }
     });

@@ -61,36 +61,8 @@ impl RuntimePaths {
         crate::db::session_store::Stores::open(&self.data_dir)
     }
 
-    pub fn open_database(&self) -> Result<Arc<DbManager>> {
-        // Keep one initialized pool per data directory while any host owns it.
-        // Status polling must not create pool threads or rerun migrations.
-        static DATABASES: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<std::sync::Weak<DbManager>>>>>,
-        > = std::sync::OnceLock::new();
-        std::fs::create_dir_all(&self.data_dir)?;
-        let path = self.data_dir.canonicalize()?.join(DATABASE_FILE);
-        let slot = {
-            let mut databases = DATABASES
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Drop slots nobody else holds whose pool is gone. Checking the Arc count
-            // first means a slot being initialized by another thread is never locked here.
-            databases.retain(|_, slot| {
-                Arc::strong_count(slot) > 1
-                    || slot.lock().map(|db| db.strong_count() > 0).unwrap_or(true)
-            });
-            databases.entry(path.clone()).or_default().clone()
-        };
-        // Only callers of this same directory wait for its creation and migrations.
-        let mut cached = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(db) = cached.upgrade() {
-            return Ok(db);
-        }
-        let db = Arc::new(DbManager::new(path).context("Opening shared database pool")?);
-        db.init().context("Initializing shared database schema")?;
-        *cached = Arc::downgrade(&db);
-        Ok(db)
+    pub fn open_database(&self) -> Result<Arc<crate::db::session_store::Stores>> {
+        Ok(self.open_stores()?.host_handle())
     }
 
     /// Read without silently discarding malformed configuration or creating defaults.
@@ -163,7 +135,7 @@ pub fn provider_from_config(p: &ProviderConfig) -> Provider {
 
 pub fn create_engine(
     paths: &RuntimePaths,
-    db: Arc<DbManager>,
+    db: Arc<crate::db::session_store::Stores>,
     providers: Arc<Mutex<ProviderManager>>,
     permissions: Arc<PermissionManager>,
     cache: Arc<FileCache>,
@@ -200,7 +172,7 @@ pub fn default_permissions() -> Arc<PermissionManager> {
 const SESSION_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sessions use the same project trust, Code prompt and SQLite schema as Desktop.
-pub struct SessionStore<D = DbManager> {
+pub struct SessionStore<D = crate::db::session_store::Stores> {
     pub db: Arc<D>,
 }
 
@@ -646,8 +618,8 @@ mod database_cache_tests {
         let data_a = root.path().join("a");
         std::fs::create_dir_all(&data_a).unwrap();
         // Hold the write lock so opening directory A stays busy for a while.
-        let blocker = rusqlite::Connection::open(data_a.join(DATABASE_FILE)).unwrap();
-        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let blocker=std::fs::File::create(data_a.join(".session-bootstrap")).unwrap();
+        blocker.lock().unwrap();
         let began = Instant::now();
         let slow = {
             let data_a = data_a.clone();
@@ -663,7 +635,7 @@ mod database_cache_tests {
             "opening another directory took {elapsed:?} while A was initializing"
         );
         std::thread::sleep(Duration::from_secs(2).saturating_sub(began.elapsed()));
-        blocker.execute_batch("COMMIT").unwrap();
+        blocker.unlock().unwrap();
         assert!(slow.join().unwrap().is_ok());
     }
 

@@ -833,14 +833,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
     };
     if let Some(resumed) = &resumed {
         let db = paths.open_database()?;
-        let (workspace, _) = db.with_conn(|conn| {
-            deepseek_code_core::native_engine::workspace::resolve_workspace(
-                conn,
-                &paths.data_dir.join("workspaces"),
-                &resumed.id,
-                None,
-            )
-        })??;
+        let workspace = db.open_session(&resumed.id)?.workspace()?;
         if cli.path.is_some() {
             ensure!(
                 std::fs::canonicalize(&workspace)?
@@ -918,7 +911,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
     };
     // Observe the selector and its version together, before resolving any configuration.
     let observed = if let Some(saved) = resumed.as_ref() {
-        Some(binding_store::observe(&*paths.open_database()?, &saved.id)?)
+        Some(paths.open_database()?.observed_binding(&saved.id)?)
     } else {
         None
     };
@@ -1258,8 +1251,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                 },
                 _ = background_refresh.tick() => {
-                    let failure = session.store.db.with_conn(|c|
-                        binding_store::frontend_failure(c, &session.id, &session.binding_requester))??;
+                    let failure = session.store.db.binding_notice(&session.id,&session.binding_requester)?;
                     if let Some((generation, requested, restored, needs_ack)) = failure {
                         let seen = reported_binding_failures.entry(session.id.clone()).or_insert(0);
                         if generation > *seen {
@@ -1272,7 +1264,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                             *seen = generation;
                         }
                         if needs_ack {
-                            session.store.db.with_conn(|c| binding_store::acknowledge(c,&session.id,&session.binding_requester,generation))??;
+                            session.store.db.acknowledge_binding(&session.id,&session.binding_requester,generation)?;
                         }
                     }
                     if suggestions_enabled {
@@ -1333,7 +1325,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                                     }
                                     continue 'repl;
                                 }
-                                for prompt in due { deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &prompt)?; }
+                                for prompt in due { session.store.db.open_session(&session.id)?.enqueue_cli_notification(&prompt)?; }
                             }
                             Ok(_) => {}
                             Err(error) => command_eprintln!("Scheduled jobs: {error:#}"),
@@ -1370,7 +1362,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     // A finished background command starts a turn; its line is
                     // printed first, above that turn.
                     if !session.waiting_for_continue() && !composer.is_pending()
-                        && deepseek_code_core::services::input_queue::any(&session.store.db, &session.id, background_commands::is_notification).unwrap_or(false)
+                        && session.store.db.next_desktop_input(&session.id).ok().flatten().is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         for notice in notices { command_eprintln!("{notice}"); }
                         continue 'repl;

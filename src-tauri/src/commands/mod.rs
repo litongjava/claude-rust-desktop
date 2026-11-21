@@ -15,7 +15,7 @@ pub fn app_data_dir() -> Result<std::path::PathBuf, String> {
 use deepseek_code_core::db::session_store::{HostAccess,SessionAccess};
 use deepseek_code_core::db::session_store::Schedules;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::db::diff_repo::CodeDiffRow;
 use crate::db::h5_repo::H5TokenRow;
 use crate::db::permission_repo::{PermissionApprovalRow, AlwaysAllowRuleRow};
@@ -273,9 +273,9 @@ pub async fn native_engine_init(
         let provider_manager = Arc::new(Mutex::new(ProviderManager::new(
             data_dir.join("providers.json"),
         )));
-        let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+        let db_manager = match app_handle.try_state::<Arc<Stores>>() {
             Some(state) => state.inner().clone(),
-            None => return Err("DbManager not found".to_string()),
+            None => return Err("Stores not found".to_string()),
         };
         let permission_manager = app_handle
             .state::<Arc<Mutex<Option<Arc<crate::permissions::PermissionManager>>>>>()
@@ -690,9 +690,9 @@ pub async fn reject_diff(
     conversation_id: Option<String>,
     diff_id: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.reject_diff(conversation_id.as_deref(), &diff_id)
@@ -707,9 +707,9 @@ pub async fn get_code_diffs(
     app_handle: tauri::AppHandle,
     conversation_id: String,
 ) -> Result<Vec<CodeDiffRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.select_session(&conversation_id)?.diffs()
@@ -725,9 +725,9 @@ pub async fn generate_h5_token(
     conversation_id: String,
     expires_in_hours: Option<i64>,
 ) -> Result<String, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let token = format!("h5_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
@@ -752,9 +752,9 @@ pub async fn revoke_h5_token(
     app_handle: tauri::AppHandle,
     token_id: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.revoke_h5_token(&token_id)
@@ -769,9 +769,9 @@ pub async fn list_h5_tokens(
     app_handle: tauri::AppHandle,
     conversation_id: String,
 ) -> Result<Vec<H5TokenRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.list_h5_tokens_by_conversation(&conversation_id)
@@ -786,9 +786,9 @@ pub async fn validate_h5_token(
     app_handle: tauri::AppHandle,
     token: String,
 ) -> Result<Option<H5TokenRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.validate_h5_token(&token)
@@ -802,9 +802,9 @@ pub async fn validate_h5_token(
 pub async fn cleanup_expired_h5_tokens(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.cleanup_expired_tokens()
@@ -825,9 +825,9 @@ pub async fn create_scheduled_task(
     conversation_id: Option<String>,
     is_enabled: bool,
 ) -> Result<ScheduledTaskRow, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -877,9 +877,9 @@ pub async fn create_scheduled_task(
 pub async fn list_scheduled_tasks(
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<ScheduledTaskRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.list_scheduled_tasks()
@@ -901,9 +901,9 @@ pub async fn update_scheduled_task(
     conversation_id: Option<String>,
     is_enabled: Option<bool>,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let now = chrono::Utc::now().to_rfc3339();
     let next_run_opt = if let Some(ref cron) = cron_expression {
@@ -931,9 +931,9 @@ pub async fn delete_scheduled_task(
     app_handle: tauri::AppHandle,
     task_id: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.delete_scheduled_task(&task_id)
@@ -948,9 +948,9 @@ pub async fn execute_task_now(
     app_handle: tauri::AppHandle,
     task_id: String,
 ) -> Result<String, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let task = tokio::task::spawn_blocking({
         let db = db_manager.clone();
@@ -979,9 +979,9 @@ pub async fn get_task_runs(
     task_id: String,
     limit: Option<usize>,
 ) -> Result<Vec<TaskRunRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let limit = limit.unwrap_or(50);
     tokio::task::spawn_blocking(move || {
@@ -1001,9 +1001,9 @@ pub async fn request_permission_approval(
     action: String,
     risk_level: String,
 ) -> Result<String, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -1025,9 +1025,9 @@ pub async fn approve_permission(
     approval_id: String,
     conversation_id: Option<String>,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1046,9 +1046,9 @@ pub async fn reject_permission(
     conversation_id: Option<String>,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1065,9 +1065,9 @@ pub async fn get_pending_approvals(
     app_handle: tauri::AppHandle,
     conversation_id: String,
 ) -> Result<Vec<PermissionApprovalRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.select_session(&conversation_id)?.pending_approvals()
@@ -1083,9 +1083,9 @@ pub async fn always_allow_permission(
     tool_name: String,
     action: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -1340,9 +1340,9 @@ pub async fn add_always_allow_rule(
     rule_pattern: String,
     rule_type: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -1360,9 +1360,9 @@ pub async fn remove_always_allow_rule(
     app_handle: tauri::AppHandle,
     rule_id: String,
 ) -> Result<(), String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.delete_always_allow_rule(&rule_id)
@@ -1376,9 +1376,9 @@ pub async fn remove_always_allow_rule(
 pub async fn get_always_allow_rules(
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<AlwaysAllowRuleRow>, String> {
-    let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
+    let db_manager = match app_handle.try_state::<Arc<Stores>>() {
         Some(state) => state.inner().clone(),
-        None => return Err("DbManager not found".to_string()),
+        None => return Err("Stores not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
         db_manager.get_always_allow_rules()

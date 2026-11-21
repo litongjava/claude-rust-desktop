@@ -27,7 +27,7 @@ impl CheckpointKey {
 }
 
 pub struct CompactionClaim {
-    id: String,
+    pub(crate) id: String,
     incarnation: String,
     fingerprint: String,
     pub keep: String,
@@ -241,7 +241,11 @@ impl SessionRepository<'_> {
             }
             let (fingerprint, transcript, count) = compaction::fingerprint(c, id)?;
             ensure!(count >= 2, "Not enough messages to compact");
+            let pending_request = if incarnation.is_some() {
+                c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?
+            } else {None};
             Ok(compaction::PreparedCompaction {
+                pending_request,
                 incarnation,
                 conversation_id: id.into(),
                 fingerprint,
@@ -276,6 +280,9 @@ impl SessionRepository<'_> {
                         compaction::fingerprint(w.0, w.1)?.0 == prepared.fingerprint,
                         "Session changed during compaction; retry after the active turn finishes"
                     );
+                    if let Some(request)=&prepared.pending_request {
+                        ensure!(w.0.execute("DELETE FROM compaction_request WHERE id=?1",[request])?==1,"Compaction request changed");
+                    }
                     let message_id = w.commit_summary(generated)?;
                     if let Some(context) = context {
                         state::set_local(

@@ -187,14 +187,7 @@ pub async fn run(
         if let Some(id) = &resume_id {
             let db = paths.open_database()?;
             let resumed = deepseek_code_core::runtime::SessionStore::new(db.clone()).resume(id)?;
-            let (workspace, _) = db.with_conn(|c| {
-                deepseek_code_core::native_engine::workspace::resolve_workspace(
-                    c,
-                    &paths.data_dir.join("workspaces"),
-                    id,
-                    None,
-                )
-            })??;
+            let workspace = db.open_session(id)?.workspace()?;
             if cli.path.is_some() {
                 ensure!(
                     std::fs::canonicalize(&workspace)?

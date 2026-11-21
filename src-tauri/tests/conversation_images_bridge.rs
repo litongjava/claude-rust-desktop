@@ -89,7 +89,7 @@ async fn image_history_roundtrip() {
     let text_id = store
         .append(&conversation, "user", "ordinary text")
         .unwrap();
-    let mut timer = TurnTimer::start(db.clone(), &conversation).unwrap();
+    let mut timer = db.start_turn_timer(&conversation).unwrap();
     let assistant_id = timer.ensure_segment().unwrap();
     let turn = serde_json::to_value(timer.finish(TurnStatus::Completed).unwrap()).unwrap();
 
@@ -172,29 +172,11 @@ async fn image_history_roundtrip() {
         tail["messages"][2]["turn"], turn,
         "retained messages keep host-owned timing"
     );
-    db.with_conn(|conn| {
-        assert_eq!(
-            message_repo::get_message(conn, &cli_id)
-                .unwrap()
-                .unwrap()
-                .content,
-            "[Image #3] first\n[Image]\n[Image #8] second\n[Image]"
-        );
-    })
-    .unwrap();
-
-    // Read the same durable content through a separately reopened SQLite connection.
-    let reopened =
-        rusqlite::Connection::open(dir.path().join(deepseek_code_core::runtime::DATABASE_FILE))
-            .unwrap();
-    let row = message_repo::get_message(&reopened, &cli_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        message_repo::user_content_for_display(&reopened, &row).unwrap(),
-        normalized
-    );
-    drop(reopened);
+    let shard=db.open_session(&conversation).unwrap();
+    assert_eq!(shard.read(|r|r.messages()).unwrap().into_iter().find(|m|m.id==cli_id).unwrap().content,
+        "[Image #3] first\n[Image]\n[Image #8] second\n[Image]");
+    let reopened=paths.open_database().unwrap().open_session(&conversation).unwrap();
+    assert_eq!(reopened.read(|r|r.user_content(&cli_id)).unwrap(),normalized);
 
     // IDs cannot move content between conversations, and rejection rolls back earlier edits.
     let other = store
@@ -243,6 +225,7 @@ async fn image_history_roundtrip() {
     let locked_session = store
         .create(dir.path(), "fixture-model", "fixture")
         .unwrap();
+    let lease=db.open_session(&locked_session).unwrap().acquire_execution().unwrap();
     let lease = deepseek_code_core::services::session_messages::ExecutionLease::acquire(
         dir.path(),
         &locked_session,
@@ -368,14 +351,9 @@ async fn image_history_roundtrip() {
         "not-json",
         r#"[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]"#,
     ] {
-        db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE message_user_content SET content_json=?1 WHERE message_id=?2",
-                rusqlite::params![malformed, cli_id],
-            )
-        })
-        .unwrap()
-        .unwrap();
+        let damage=rusqlite::Connection::open(dir.path().join("sessions").join(&conversation).join("session.db")).unwrap();
+        damage.execute("UPDATE message_user_content SET content_json=?1 WHERE message_id=?2",rusqlite::params![malformed,cli_id]).unwrap();
+        drop(damage);
         for suffix in ["", "/messages"] {
             let body = get(suffix).await;
             assert_eq!(
@@ -438,17 +416,9 @@ async fn image_history_roundtrip() {
         .unwrap();
     assert_eq!(assistant["content"], "");
     assert_eq!(assistant["turn"], timing[1]["turn"]);
-    db.with_conn(|conn| {
-        let saved = deepseek_code_core::db::turn_repo::get_message_turn(
-            conn,
-            assistant["id"].as_str().unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(saved.status, TurnStatus::Failed);
-        assert!(saved.elapsed_ms.is_some());
-    })
-    .unwrap();
+    let saved=db.open_session(&failed_conversation).unwrap().read(|r|r.message_turn(assistant["id"].as_str().unwrap())).unwrap().unwrap();
+    assert_eq!(saved.status,TurnStatus::Failed);
+    assert!(saved.elapsed_ms.is_some());
 
     // Disconnect detaches observation; explicit stop finalizes before reload.
     for disconnect in [false, true] {
@@ -501,24 +471,12 @@ async fn image_history_roundtrip() {
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let finished = db
-                    .with_conn(|conn| {
-                        message_repo::get_messages_by_conversation(conn, &session)
-                            .unwrap()
-                            .iter()
-                            .filter_map(|message| {
-                                deepseek_code_core::db::turn_repo::get_message_turn(
-                                    conn,
-                                    &message.id,
-                                )
-                                .unwrap()
-                            })
-                            .any(|record| {
-                                record.status == TurnStatus::Cancelled
-                                    && record.elapsed_ms.is_some()
-                            })
-                    })
-                    .unwrap();
+                let finished=db.open_session(&session).unwrap().read(|r| {
+                    for message in r.messages()? {
+                        if r.message_turn(&message.id)?.is_some_and(|turn|turn.status==TurnStatus::Cancelled && turn.elapsed_ms.is_some()){return Ok(true);}
+                    }
+                    Ok(false)
+                }).unwrap();
                 if finished {
                     break;
                 }

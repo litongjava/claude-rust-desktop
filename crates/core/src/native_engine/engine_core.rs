@@ -1,7 +1,7 @@
 use crate::db::session_store::GlobalSetting;
 use crate::cache::FileCache;
 use crate::cost_tracker::{BudgetCheckResult, CostTracker};
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::mcp::McpToolRegistry;
 use crate::native_engine::provider_manager::ProviderManager;
 use crate::native_engine::tool_loop::{EngineEvent, ToolLoopExecutor};
@@ -318,7 +318,7 @@ pub struct QueryEngine {
     context_usage: std::sync::Mutex<Option<(u64, u64)>>,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
-    db_manager: Arc<DbManager>,
+    db_manager: Arc<Stores>,
     active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     /// Completion bookkeeping for the executor attempt that owns a session.
     /// Entries are created before the executor is spawned and removed by that
@@ -571,7 +571,7 @@ impl QueryEngine {
     }
     pub fn new(
         provider_manager: Arc<Mutex<ProviderManager>>,
-        db_manager: Arc<DbManager>,
+        db_manager: Arc<Stores>,
         workspaces_dir: PathBuf,
         permission_manager: Arc<PermissionManager>,
         file_cache: Arc<FileCache>,

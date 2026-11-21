@@ -163,8 +163,8 @@ fn conversation(
 ) -> Result<Vec<crate::terminal::change_view::Line>> {
     use crate::terminal::{change_view, tool_view};
     let width = crate::terminal::size().0.saturating_sub(1) as usize;
-    session.store.db.with_conn(|conn| {
-        let rows = deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, id)?;
+    session.store.db.open_session(id)?.read(|history| {
+        let rows = history.messages()?;
         let mut lines = Vec::new();
         let mut tool_number = 0;
         for message in &rows {
@@ -254,7 +254,7 @@ fn conversation(
                 record_lines(recorded, &lines[message_start..], width);
             }
             for tool in
-                deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &message.id)?
+                history.tools(&message.id)?
             {
                 tool_number += 1;
                 let number = Some(tool_number);
@@ -287,7 +287,7 @@ fn conversation(
                         (short, full)
                     } else {
                         let elapsed =
-                            deepseek_code_core::db::message_repo::tool_duration(conn, &tool.id)?
+                            history.tool_duration(&tool.id)?
                                 .map(std::time::Duration::from_millis);
                         (
                             tool_view::finished(
@@ -387,7 +387,7 @@ fn conversation(
             // Only the final legacy message has a fallback; intermediate tool
             // messages must not be presented as completed turns.
             if saved.is_file() || rows.last().is_some_and(|last| last.id == message.id) {
-                let turn = deepseek_code_core::db::turn_repo::get_message_turn(conn, &message.id)
+                let turn = history.message_turn(&message.id)
                     .ok()
                     .flatten();
                 if let Some(status) =
@@ -412,7 +412,7 @@ fn conversation(
             }
         }
         Ok(lines)
-    })?
+    })
 }
 
 #[cfg(test)]
@@ -614,7 +614,6 @@ pub async fn compact(
         // and stops the post-compaction hooks instead of waiting for them.
     };
     // A manual compaction supersedes any request the model queued.
-    deepseek_code_core::services::compaction_requests::clear(&session.store.db, &session.id)?;
     for warning in &compacted.report.warnings {
         command_eprintln!("Hook: {warning}");
     }
@@ -749,12 +748,7 @@ pub async fn handle(
         }
         "/context" => {
             ensure!(argument.trim().is_empty(), "Usage: /context");
-            let rows = session.store.db.with_conn(|conn| {
-                deepseek_code_core::db::message_repo::get_messages_by_conversation(
-                    conn,
-                    &session.id,
-                )
-            })??;
+            let rows = session.store.db.open_session(&session.id)?.read(|r| r.messages())?;
             let start = rows
                 .iter()
                 .rposition(|row| row.is_compact_boundary)
@@ -882,9 +876,7 @@ fn rename(store: &SessionStore, id: &str, title: &str) -> Result<()> {
         title.chars().count() <= 200,
         "Session titles must be at most 200 characters"
     );
-    store
-        .db
-        .with_conn(|conn| conversation_repo::update_conversation_title(conn, id, title))??;
+    store.db.rename_session(id, title)?;
     Ok(())
 }
 

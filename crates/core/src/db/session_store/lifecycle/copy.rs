@@ -6,6 +6,7 @@ use serde_json::Value as Json;
 #[derive(Clone, Copy, Debug)]
 pub enum Branch<'a> {
     Full,
+    Summary { message: &'a str, part: crate::services::compaction::Part, revision: i64, text: &'a str },
     AgentFork {
         title: &'a str,
         directive: &'a str,
@@ -100,6 +101,40 @@ impl SessionDb {
                 &self.stores.root.path.join("workspaces"),
                 &self.id,
             )
+        })
+    }
+    pub fn copy_preferences_to(&self, destination: &SessionDb) -> Result<()> {
+        ensure!(self.stores.data_dir() == destination.stores.data_dir() && self.key != destination.key,
+            "Preference copy requires distinct sessions in one store");
+        let _locks = self.stores.group_access(vec![(&self.key,false,false),(&destination.key,false,false)])?;
+        self.check_directory()?;
+        destination.check_directory()?;
+        let values = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |conn| {
+            let tx = conn.unchecked_transaction()?;
+            preference_snapshot(&tx, self.id(), destination.id())
+        })?;
+        destination.write_locked("copy session preferences", |w| {
+            for (key, value) in &values { super::super::state::set_local(w.0, key, value)?; }
+            Ok(())
+        })
+    }
+
+    pub fn prepare_summary_part(&self, message: &str, part: crate::services::compaction::Part) -> Result<crate::services::compaction::PreparedPart> {
+        use crate::services::compaction::{Part,PreparedPart};
+        self.read(|r| {
+            let rows=r.messages()?;
+            let index=rows.iter().position(|m|m.id==message).context("Message not found in this conversation")?;
+            let range=match part {
+                Part::UpTo=>rows[..index].iter().rposition(|m|m.is_compact_boundary).unwrap_or(0)..index,
+                Part::From=>index..rows.len(),
+            };
+            ensure!(!range.is_empty(),"Nothing to summarize there");
+            let mut transcript=Vec::new();
+            for row in &rows[range.clone()] {
+                ensure!(!r.0.query_row("SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",[&row.id],|r|r.get::<_,bool>(0))?, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
+                transcript.push(serde_json::json!({"message":row,"tools":r.tools(&row.id)?}));
+            }
+            Ok(PreparedPart {incarnation:self.incarnation().into(),revision:r.0.query_row("SELECT content_revision FROM manifest",[],|r|r.get(0))?,transcript:serde_json::to_string(&transcript)?,count:range.len()})
         })
     }
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
@@ -528,15 +563,8 @@ pub(super) fn copy_snapshot(
         &source.incarnation,
     )?;
     if copy_preferences {
-        for key in ["cli.session", "cli.permissions", "cli.display", "cli.ide"] {
-            if let Some(value) = super::super::state::local(&tx, key)? {
-                super::super::state::set_local(dst, key, &value)?;
-            }
-        }
-        for key in ["cli.permission-mode", "plan.return-bypass"] {
-            if let Some(value) = super::super::state::local(&tx, &format!("{key}.{}", source.id))? {
-                super::super::state::set_local(dst, &format!("{key}.{id}"), &value)?;
-            }
+        for (key, value) in preference_snapshot(&tx, source.id(), id)? {
+            super::super::state::set_local(dst, &key, &value)?;
         }
     }
     if let Branch::AgentFork { directive, .. } = boundary {
@@ -552,6 +580,19 @@ pub(super) fn copy_snapshot(
             &Json::String(directive.into()),
         )?;
     }
+    let mut addition=None;
+    let boundary=if let Branch::Summary{message,part,revision,text}=boundary {
+        use crate::services::compaction::Part;
+        ensure!(tx.query_row("SELECT content_revision FROM manifest",[],|r|r.get::<_,i64>(0))?==revision,"Session changed during compaction");
+        let (index,order):(usize,i64)=tx.query_row("SELECT position,sort_order FROM (SELECT id,sort_order,row_number() OVER(ORDER BY sort_order,rowid)-1 AS position FROM messages) WHERE id=?1",[message],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (copy,order,boundary)=match part {
+            Part::UpTo => (Branch::Full,order,true),
+            Part::From if index==0 => (Branch::Full,tx.query_row("SELECT max(sort_order)+1 FROM messages",[],|r| r.get(0))?,true),
+            Part::From => (Branch::Through{message:None,index:Some(index-1)},order,false),
+        };
+        addition=Some((part,order,boundary,text));
+        copy
+    } else { boundary };
     source.stores.step(Phase::ForkSnapshot)?;
     Copier {
         src: &tx,
@@ -559,5 +600,26 @@ pub(super) fn copy_snapshot(
         id,
         keep_unresolved_origins: matches!(boundary, Branch::Full | Branch::AgentFork { .. }),
     }
-    .run(boundary)
+    .run(boundary)?;
+    if let Some((part,order,boundary,text))=addition {
+        if part==crate::services::compaction::Part::UpTo {
+            dst.execute("UPDATE messages SET sort_order=sort_order+1 WHERE sort_order>=?1",[order])?;
+        }
+        let heading=if boundary {"Conversation summary — earlier transcript retained in session history"}else{"Summary of the later conversation — full transcript retained in session history"};
+        message_repo::insert_message(dst,&uuid::Uuid::new_v4().to_string(),id,"user",&format!("[{heading}]\n{text}"),None,&chrono::Utc::now().to_rfc3339(),boundary,order)?;
+    }
+    Ok(())
+}
+
+fn preference_snapshot(c: &Connection, source: &str, destination: &str) -> Result<Vec<(String,String)>> {
+    let mut values = Vec::new();
+    for key in ["cli.session","cli.permissions","cli.display","cli.ide"] {
+        if let Some(value) = super::super::state::local(c,key)? { values.push((key.into(),value)); }
+    }
+    for key in ["cli.permission-mode","plan.return-bypass"] {
+        if let Some(value)=super::super::state::local(c,&format!("{key}.{source}"))? {
+            values.push((format!("{key}.{destination}"),value));
+        }
+    }
+    Ok(values)
 }

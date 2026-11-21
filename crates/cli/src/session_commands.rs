@@ -1,8 +1,10 @@
 //! Interactive session settings persisted alongside the shared conversation.
-use deepseek_code_core::db::session_store::SessionAccess as _;
+use deepseek_code_core::db::session_store::{settings, SessionAccess, Stores};
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
-use deepseek_code_core::{db::DbManager, runtime::RuntimePaths};
+use deepseek_code_core::runtime::RuntimePaths;
+#[cfg(test)]
+use deepseek_code_core::db::DbManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -59,31 +61,14 @@ enum GoalStatus {
     Blocked,
 }
 
-fn load(db: &DbManager, id: &str) -> Result<Settings> {
-    db.with_conn(|conn| load_in(conn, id))?
+fn load(db: &impl SessionAccess, id: &str) -> Result<Settings> {
+    let value = db.select_session(id)?.preference(settings::PREFERENCES)?.unwrap_or_default();
+    Ok(serde_json::from_value(serde_json::to_value(value)?)?)
 }
 
-fn load_in(conn: &rusqlite::Connection, id: &str) -> Result<Settings> {
-    let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-    let mut rows = statement.query([format!("cli.session.{id}")])?;
-    Ok(match rows.next()? {
-        Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
-        None => Settings::default(),
-    })
-}
-
-fn save(db: &DbManager, id: &str, settings: &Settings) -> Result<()> {
-    db.with_conn(|conn| save_in(conn, id, settings))?
-}
-
-fn save_in(conn: &rusqlite::Connection, id: &str, settings: &Settings) -> Result<()> {
-    let key = format!("cli.session.{id}");
-    let value = serde_json::to_string(settings)?;
-    conn.execute(
-        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [&key, &value],
-    )?;
-    Ok(())
+fn save(db: &impl SessionAccess, id: &str, value: &Settings) -> Result<()> {
+    let settings = serde_json::from_value(serde_json::to_value(value)?)?;
+    db.select_session(id)?.set_preference(settings::PREFERENCES, Some(&settings))
 }
 
 pub fn effective_effort(session: &Session, fallback: Option<&str>) -> Result<Option<String>> {
@@ -110,46 +95,18 @@ pub async fn step_effort(session: &Session, up: bool) -> Result<String> {
 
 /// Share request accounting with a separate attached frontend during a turn.
 pub fn save_live_requests(session: &Session, snapshots: &[Value]) -> Result<()> {
-    let key = format!("cli.live-requests.{}", session.id);
-    // Store only accounting fields, never prompt bodies or credentials.
-    let values: Vec<Value> = snapshots.iter().map(|snapshot| {
-        let mut value = serde_json::Map::new();
-        for key in ["id", "source", "model", "providerId", "contextBoundary", "startedAt", "inputTokens", "outputTokens", "contextUsage"] {
-            if let Some(field) = snapshot.get(key) { value.insert(key.into(), field.clone()); }
-        }
-        Value::Object(value)
-    }).collect();
-    let value = serde_json::to_string(&values)?;
-    session.store.db.with_conn(|conn| conn.execute(
-        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [&key, &value],
-    ))??;
-    Ok(())
+    let requests = snapshots.iter().cloned().map(serde_json::from_value)
+        .collect::<serde_json::Result<Vec<settings::LiveRequest>>>()?;
+    session.store.db.select_session(&session.id)?.set_preference(settings::LIVE_REQUESTS, Some(&requests))
 }
 
 pub fn live_requests(session: &Session) -> Result<Vec<Value>> {
-    session.store.db.with_conn(|conn| -> Result<Vec<Value>> {
-        let mut statement = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = statement.query([format!("cli.live-requests.{}", session.id)])?;
-        let raw: Option<String> = rows.next()?.map(|row| row.get(0)).transpose()?;
-        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
-    })?
+    let requests = session.store.db.select_session(&session.id)?.preference(settings::LIVE_REQUESTS)?.unwrap_or_default();
+    Ok(requests.into_iter().map(serde_json::to_value).collect::<serde_json::Result<_>>()?)
 }
 
-/// Copy only behavioral settings, retaining independent state after branching.
-pub fn copy_settings(db: &DbManager, from: &str, to: &str) -> Result<()> {
-    db.with_conn(|conn| copy_settings_in(conn, from, to))?
-}
-
-pub(crate) fn copy_settings_in(conn: &rusqlite::Connection, from: &str, to: &str) -> Result<()> {
-    save_in(conn, to, &load_in(conn, from)?)?;
-    for prefix in ["cli.display", "cli.permissions", "cli.permission-mode", "cli.ide"] {
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("{prefix}.{to}"), format!("{prefix}.{from}")],
-        )?;
-    }
-    Ok(())
+pub fn copy_settings(db: &Stores, from: &str, to: &str) -> Result<()> {
+    db.open_session(from)?.copy_preferences_to(&db.open_session(to)?)
 }
 
 /// The levels /effort and the model picker offer, in order.
@@ -267,19 +224,9 @@ pub async fn handle(
                     .workspace(&session.id, &paths.data_dir.join("workspaces"))?;
                 command_eprintln!("Working directory: {}", workspace.display());
                 if command == "/add-dir" {
-                    session.store.db.with_conn(|conn| -> Result<()> {
-                        if let Some(project) =
-                            deepseek_code_core::native_engine::workspace::conversation_project(
-                                conn,
-                                &session.id,
-                            )?
-                        {
-                            for folder in project.folders {
-                                command_eprintln!("  {}", folder.path);
-                            }
-                        }
-                        Ok(())
-                    })??;
+                    if let Some(project) = session.store.db.select_session(&session.id)?.workspace_project()? {
+                        for folder in project.folders { command_eprintln!("  {}", folder.path); }
+                    }
                 }
             } else {
                 let old_cwd = session.workspace.clone();
@@ -411,9 +358,7 @@ pub fn is_goal_clear(argument: &str) -> bool {
 }
 
 fn ensure_goal_allowed(session: &Session) -> Result<()> {
-    session.store.db.with_conn(|conn| {
-        deepseek_code_core::native_engine::workspace::conversation_project(conn, &session.id)
-    })??;
+    session.store.db.select_session(&session.id)?.workspace_project()?;
     for path in [
         session.paths.data_dir.join("settings.json"),
         session.workspace.join(".claude/settings.json"),
@@ -874,29 +819,23 @@ pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepse
         return Ok(false);
     }
     crate::compaction::notice("Context limit reached; compacting the conversation and retrying…");
-    let failed_attempt = rows[index].sort_order;
-    session.store.db.with_conn(|conn| message_repo::delete_messages_from(conn, &session.id, failed_attempt))??;
+    session.store.db.open_session(&session.id)?.write(|w| w.rewind_from(&rows[index].id))?;
     turn.clear_segment();
-    compact_automatic(session, "").await?;
+    compact_automatic(session, "", None).await?;
     Ok(true)
 }
 
 /// Run before assembling the next request so the compact boundary is reflected
 /// in model_history. The original transcript remains available to Desktop.
-pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Result<()> {
+pub async fn prepare_turn(session: &Session, context_window: Option<u32>, lease: Option<std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>>) -> Result<()> {
     // A request the model queued is honored before this prompt even when the
     // history is below the automatic threshold. It is consumed exactly once.
-    if let Some(keep) =
-        deepseek_code_core::services::compaction_requests::take(&session.store.db, &session.id)?
-    {
-        let rows = session.store.db.select_session(&session.id)?.messages()?;
-        let start = rows
-            .iter()
-            .rposition(|row| row.is_compact_boundary)
-            .map_or(0, |index| index + 1);
-        if rows.len().saturating_sub(start) >= 2 {
+    let shard=session.store.db.open_session(&session.id)?;
+    if let Some(lease)=lease {
+        let claim=shard.delivery_under_lease(lease)?.claim_compaction()?;
+        if let Some(claim)=claim {
             crate::compaction::notice("Compacting the conversation as the model requested…");
-            compact_automatic(session, &keep).await?;
+            compact_automatic(session, &claim.keep, Some(&claim)).await?;
             return Ok(());
         }
     }
@@ -917,16 +856,15 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>) -> Res
     crate::compaction::notice(&format!(
         "Auto-compacting conversation (estimated {estimated} tokens, threshold {threshold})…"
     ));
-    compact_automatic(session, "").await?;
-    deepseek_code_core::services::compaction_requests::clear(&session.store.db, &session.id)?;
+    compact_automatic(session, "", None).await?;
     Ok(())
 }
 
 /// Both automatic entries retain the commit outcome across cancellation.
-async fn compact_automatic(session: &Session, instructions: &str) -> Result<()> {
+async fn compact_automatic(session: &Session, instructions: &str, claim: Option<&deepseek_code_core::db::session_store::CompactionClaim>) -> Result<()> {
     use deepseek_code_core::services::compaction::{compact_with_hooks_tracked, CompactionTracker};
     let context = crate::services::context(&session.paths)?;
-    let tracker = CompactionTracker::default();
+    let tracker = claim.map(CompactionTracker::for_claim).unwrap_or_default();
     let state = session.binding_state();
     // The SDK frame reader owns stdin; terminal progress must not inspect it.
     let result = {

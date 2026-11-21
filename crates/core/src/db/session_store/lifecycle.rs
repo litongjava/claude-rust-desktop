@@ -83,6 +83,8 @@ struct Metadata {
     #[serde(default)]
     sync: Option<sync::SyncPublication>,
     #[serde(default)]
+    feishu_chat: Option<String>,
+    #[serde(default)]
     prepared: Option<crate::worktree::session::PreparedWorkspace>,
 }
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -257,6 +259,7 @@ impl Intent {
 
 enum Seed<'a> {
     New,
+    Feishu(&'a str),
     Fork(&'a SessionDb, Branch<'a>),
     Import(&'a import::LegacySession),
     Project(&'a Project, &'a crate::worktree::session::PreparedWorkspace),
@@ -268,6 +271,18 @@ impl Stores {
         let key = storage_key(id)?;
         let _locks = self.group_access(vec![(&key, true, true)])?;
         self.create_locked(id, options, Seed::New, None)
+    }
+
+    pub fn feishu_conversation(&self,chat:&str,title:Option<String>)->Result<super::im::FeishuChatMapping> {
+        if let Some(row)=self.feishu_mapping(chat)? {return Ok(row);}
+        let id=uuid::Uuid::new_v4().to_string();
+        let key=storage_key(&id)?;
+        let _guard=self.group_access(vec![(&key,true,true)])?;
+        let options=CreateOptions {title:Some(title.unwrap_or_else(||format!("飞书-{}",chat.chars().take(8).collect::<String>()))),..Default::default()};
+        let result=self.create_locked(&id,options,Seed::Feishu(chat),None);
+        if let Some(row)=self.feishu_mapping(chat)? {return Ok(row);}
+        result?;
+        anyhow::bail!("Feishu mapping disappeared during creation")
     }
 
     pub fn create_project_chat(
@@ -351,8 +366,9 @@ impl Stores {
         } else {
             None
         };
-        let copied = !matches!(seed, Seed::New | Seed::Project(..));
+        let copied = !matches!(seed, Seed::New | Seed::Feishu(_) | Seed::Project(..));
         let meta = Metadata {
+            feishu_chat: if let Seed::Feishu(chat)=seed {Some(chat.to_string())} else {None},
             initial_shape: (!copied).then(|| {
                 (
                     options.first_message.is_some(),
@@ -466,7 +482,7 @@ impl Stores {
                     }
                 }
                 match seed {
-                    Seed::New | Seed::Project(..) => {}
+                    Seed::New | Seed::Feishu(_) | Seed::Project(..) => {}
                     Seed::Fork(source, boundary) => copy::copy_snapshot(
                         source,
                         tx,
@@ -791,6 +807,9 @@ impl Stores {
                 "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
                 params![prepared.path.to_string_lossy(), op.id],
             )?;
+        }
+        if let Some(chat) = &meta.feishu_chat {
+            tx.execute("INSERT INTO feishu_chat_mappings(chat_id,conversation_id,title,created_at,last_active_at) VALUES(?1,?2,?3,?4,?4)", params![chat,op.id,meta.title,meta.created])?;
         }
         if let Some(sync) = &meta.sync {
             let synced_workspace=sync::workspace(tx,&op.id,project.as_deref(),sync.workspace_path.as_deref())?;

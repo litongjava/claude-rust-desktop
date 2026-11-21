@@ -5,7 +5,7 @@ use deepseek_code_core::db::session_store::HostAccess;
 use crate::clipboard::ClipboardManager;
 use crate::config::{AppConfig, ConfigManager};
 use crate::cost_tracker::CostTracker;
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::engine::EnginePool;
 use crate::fs::FileOperations;
 use crate::git::GitIntegration;
@@ -164,7 +164,7 @@ pub type AppStateTuple = (
     Arc<Mutex<HashMap<String, bool>>>,
     Arc<Mutex<Option<ConfigManager>>>,
     Arc<Mutex<SkillsManager>>,
-    Arc<DbManager>,
+    Arc<Stores>,
     Arc<Mutex<Option<TaskExecutor>>>,
     Arc<Mutex<ProcessManager>>,
     Arc<Mutex<PtyManager>>,
@@ -193,7 +193,7 @@ pub struct BridgeServer {
     research_mode: Arc<Mutex<HashMap<String, bool>>>,
     config_manager: Arc<Mutex<Option<ConfigManager>>>,
     skill_manager: Arc<Mutex<SkillsManager>>,
-    db_manager: Arc<DbManager>,
+    db_manager: Arc<Stores>,
     task_executor: Arc<Mutex<Option<TaskExecutor>>>,
     process_manager: Arc<Mutex<ProcessManager>>,
     terminal_manager: Arc<Mutex<PtyManager>>,
@@ -214,7 +214,7 @@ pub struct BridgeServer {
 }
 
 impl BridgeServer {
-    pub fn new(data_dir: PathBuf, db_manager: Arc<DbManager>) -> Self {
+    pub fn new(data_dir: PathBuf, db_manager: Arc<Stores>) -> Self {
         let skills_dir = data_dir.join("skills");
         let log_dir = data_dir.join("logs");
         let analytics_dir = data_dir.join("analytics");
@@ -237,7 +237,6 @@ impl BridgeServer {
         )));
         let task_executor = TaskExecutor::new_with_provider_manager(
             provider_manager.clone(),
-            db_manager.clone(),
         );
 
         let audit_logger = Arc::new(AuditLogger::new(1000));

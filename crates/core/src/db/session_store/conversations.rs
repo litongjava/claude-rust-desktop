@@ -233,3 +233,69 @@ impl crate::db::DbManager {
         self.with_conn(|c| conversations::branch_conversation(c, id, message, index))?
     }
 }
+
+impl super::SessionDb {
+    /// Serialize a Desktop edit with retirement and provider publication.
+    pub fn edit_conversation(&self, body: &Value) -> Result<()> {
+        let _lock=self.stores.key_lock(&self.key,true,false)?;
+        self.check_directory()?;
+        let has_metadata=["workspace_mode","pinned","archived","project_id","title","model","workspace_path"].iter().any(|k|body.get(k).is_some());
+        if let Some(mode)=body.get("workspace_mode") {
+            serde_json::from_value::<conversations::WorkspaceMode>(mode.clone())?;
+        }
+        if let Some(project)=body.get("project_id").and_then(Value::as_str) {
+            self.stores.global().read(|c| crate::db::project_repo::require_trusted(c,project))?;
+        }
+        if let Some(messages)=body.get("messages").and_then(Value::as_array) {
+            self.write_locked("replace conversation history",|w|w.replace_messages(messages))?;
+        }
+        if !has_metadata {return Ok(());}
+        let id=self.id();
+        self.stores.global().write("edit conversation",id,false,|conn| {
+            let prior:String=conn.query_row("SELECT updated_at FROM conversations WHERE id=?1",[id],|r|r.get(0))?;
+            if let Some(mode) = body.get("workspace_mode") {
+                let mode: crate::db::conversation_repo::WorkspaceMode = serde_json::from_value(mode.clone())?;
+                crate::db::conversation_repo::set_workspace_mode(conn, id, mode.as_str())?;
+                crate::db::conversation_repo::update_conversation_timestamp(conn, id, &chrono::Utc::now().to_rfc3339())?;
+            }
+            if let Some(pinned) = body.get("pinned").and_then(|v| v.as_bool()) {
+                crate::db::conversation_repo::pin_conversation(conn, id, pinned)?;
+            }
+            if let Some(archived) = body.get("archived").and_then(|v| v.as_bool()) {
+                crate::db::conversation_repo::archive_conversation(conn, id, archived)?;
+            }
+            if let Some(project_id) = body.get("project_id") {
+                if let Some(project_id) = project_id.as_str() {
+                    let project = crate::db::project_repo::require_trusted(conn, project_id)?;
+                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1 AND project_id != ?2", rusqlite::params![id, project_id])?;
+                    conn.execute("UPDATE conversations SET project_id = ?1, workspace_path = COALESCE((SELECT path FROM conversation_worktrees WHERE conversation_id = ?4), ?2), updated_at = ?3 WHERE id = ?4",
+                        rusqlite::params![project_id, project.workspace_path, chrono::Utc::now().to_rfc3339(), id])?;
+                } else if project_id.is_null() {
+                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1", rusqlite::params![id])?;
+                    conn.execute("UPDATE conversations SET project_id = NULL, workspace_path = NULL WHERE id = ?1", rusqlite::params![id])?;
+                }
+            }
+            if let Some(title) = body.get("title").and_then(|v| v.as_str()) {
+                conn.execute(
+                    "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![title, chrono::Utc::now().to_rfc3339(), id],
+                )?;
+            }
+            if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+                conn.execute(
+                    "UPDATE conversations SET model = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![model, chrono::Utc::now().to_rfc3339(), id],
+                )?;
+            }
+            if let Some(workspace) = body.get("workspace_path").and_then(|v| v.as_str()) {
+                conn.execute(
+                    "UPDATE conversations SET workspace_path = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![workspace, chrono::Utc::now().to_rfc3339(), id],
+                )?;
+            }
+
+            conn.execute("UPDATE conversations SET metadata_revision=metadata_revision+1,updated_at=CASE WHEN julianday(updated_at)>=julianday(?2) THEN updated_at ELSE ?2 END WHERE id=?1",rusqlite::params![id,prior])?;
+            Ok(())
+        })
+    }
+}

@@ -32,7 +32,7 @@ fn context(app: &tauri::AppHandle) -> Result<ServiceContext> {
     Ok(ServiceContext {
         paths: RuntimePaths::new(super::app_data_dir().map_err(anyhow::Error::msg)?)?,
         db: app
-            .state::<Arc<deepseek_code_core::db::DbManager>>()
+            .state::<Arc<deepseek_code_core::db::session_store::Stores>>()
             .inner()
             .clone(),
         credentials: Arc::new(DesktopCredentials(app.clone())),
@@ -250,10 +250,9 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
                 let root = project.workspace_path.context("Project has no workspace")?;
                 let definition = deepseek_code_core::services::agents::resolve(&context,&agent_type)?;
                 Generator::saved(&context.paths,&provider,&model)?;
-                let store = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
-                let id = store.create(std::path::Path::new(&root),&model,&provider)?;
-                // Preserve the exact project selected by the user, even if roots overlap.
-                context.db.with_conn(|c|c.execute("UPDATE conversations SET project_id=?1,title=?2 WHERE id=?3",rusqlite::params![project_id,format!("{} agent",definition.id),id]))??;
+                use deepseek_code_core::db::session_store::{CreateOptions,ProjectSelection};
+                let id=uuid::Uuid::new_v4().to_string();
+                context.db.create(&id,CreateOptions {title:Some(format!("{} agent",definition.id)),model:Some(model),provider:Some(provider),workspace_mode:Some("code".into()),project:Some(ProjectSelection::Existing(project_id)),..Default::default()})?;
                 deepseek_code_core::services::agents::bind(&context.db,&id,&definition)?;
                 Ok(json!({"id":id,"agent":definition.id}))
             }

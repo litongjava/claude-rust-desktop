@@ -1,5 +1,5 @@
 //! CLI-only recovery guidance; shared Desktop errors remain unchanged.
-use deepseek_code_core::{db::DbManager, runtime::RuntimePaths};
+use deepseek_code_core::{db::session_store::SessionAccess, runtime::RuntimePaths};
 
 pub fn repair_error(paths: &RuntimePaths, id: &str, error: anyhow::Error) -> anyhow::Error {
     if !error.to_string().contains("Cannot repair trust while") {
@@ -126,7 +126,7 @@ pub async fn stop_task(paths: &RuntimePaths, id: &str, task_id: &str) -> anyhow:
 }
 
 pub fn diagnose(
-    db: &DbManager,
+    db: &impl SessionAccess,
     paths: &RuntimePaths,
     id: &str,
     error: anyhow::Error,

@@ -545,7 +545,6 @@ impl ToolLoopExecutor {
         entry.executor.answer_waiters = self.answer_waiters.clone();
         entry.executor.permission_mailbox = self.permission_mailbox.clone();
         entry.executor.permission_host_available = self.permission_host_available;
-        entry.executor.message_inbox = None;
         entry.executor.require_pending_peer_message = automatic;
         entry.executor.stop_hook_active = false;
         if let Some(manager) = &entry.executor.permission_manager {
@@ -1623,7 +1622,6 @@ impl ToolLoopExecutor {
                         child.auto_history.shrink_to_fit();
                         child.streaming_tool_args.clear();
                         child.streaming_tool_args.shrink_to_fit();
-                        child.message_inbox = None;
                         child.execution_lease = None;
                         child.context_manager = child
                             .memex_client

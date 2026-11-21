@@ -23,7 +23,7 @@ fn invalid(error: impl std::fmt::Display) -> ApiError {
 async fn database<T, F>(state: &AppState, operation: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: FnOnce(&crate::db::DbManager) -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce(&crate::db::session_store::Stores) -> anyhow::Result<T> + Send + 'static,
 {
     let db = state.db_manager.clone();
     tokio::task::spawn_blocking(move || operation(&db))

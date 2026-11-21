@@ -349,7 +349,7 @@ pub struct ToolLoopExecutor {
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
     stop_hook_blocks: u64,
-    goal_db: Option<Arc<crate::db::DbManager>>,
+    goal_db: Option<Arc<crate::db::session_store::Stores>>,
     skill_shell_active: bool,
     /// Deep-research children read pages as text: their quotes are checked
     /// against the fetched source, not against a model's answer about it.
@@ -358,7 +358,6 @@ pub struct ToolLoopExecutor {
     manual_skill_active: bool,
     durable_user_input: bool,
     turn_delivery: std::sync::Weak<std::sync::Mutex<crate::db::session_store::DeliveryOwner>>,
-    message_inbox: Option<crate::services::session_messages::Target>,
     require_pending_peer_message: bool,
     require_hook_wake: bool,
     /// Session ownership for this attempt. The executor retains the token for
@@ -1668,7 +1667,6 @@ impl ToolLoopExecutor {
             manual_skill_active: false,
             durable_user_input: false,
             turn_delivery: Default::default(),
-            message_inbox: None,
             require_pending_peer_message: false,
             require_hook_wake: false,
             execution_lease: None,
@@ -1720,7 +1718,7 @@ impl ToolLoopExecutor {
         self
     }
 
-    pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
+    pub fn with_goal_state(mut self, db: Arc<crate::db::session_store::Stores>) -> Self {
         self.goal_db = Some(db);
         // Session-backed tools enter the catalog once storage is bound.
         self.builtin_names.take();
@@ -3549,7 +3547,7 @@ impl ToolLoopExecutor {
     fn session_search_storage(&self) -> Option<ExecutorHistory> {
         self.executor_history.clone().or_else(|| {
             let db = self.goal_db.as_ref()?;
-            Some(ExecutorHistory::Shared(db.clone(), self.conv_id.clone()?))
+            db.executor_history(self.conv_id.as_deref()?).ok()
         })
     }
 
@@ -3709,83 +3707,7 @@ impl ToolLoopExecutor {
             for input in &inputs { let _ = self.event_tx.send(EngineEvent::QueuedInput(input.clone())).await; }
             return inputs;
         }
-        let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) else { return Vec::new(); };
-        let inputs = crate::services::input_queue::take(db, id).unwrap_or_else(|error| {
-            tracing::warn!("Queued input unavailable: {error:#}");
-            Vec::new()
-        });
-        let data_dir = self
-            .search_config_path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| crate::runtime::resolve_default_data_dir().ok());
-        let mut inputs: Vec<_> = inputs
-            .into_iter()
-            .map(|text| {
-                crate::services::input_queue::DeliveredInput::resolve(data_dir.as_deref(), id, text)
-            })
-            .collect();
-        // Next-turn input never crosses a running model's tool-result boundary.
-        use crate::services::input_queue::{self as queue, QueueMode, QueueState};
-        if !queue::is_paused(db, id).unwrap_or(true) {
-            let pending = queue::list(db, id).unwrap_or_default();
-            for item in pending.into_iter().filter(|item| {
-                item.mode == QueueMode::Steer
-                    && matches!(item.state, QueueState::Queued | QueueState::Claimed)
-            }) {
-                let result = (|| -> anyhow::Result<_> {
-                    let item = if item.state == QueueState::Queued {
-                        queue::claim(db, id, item.id, item.revision)?
-                    } else {
-                        item
-                    };
-                    queue::handoff(db, id, item.id, item.revision, |tx, item, message_id| {
-                        let paused: bool = tx.query_row("SELECT COALESCE((SELECT paused FROM session_input_queue_control WHERE session_id=?1),0)", [id], |row| row.get(0))?;
-                        anyhow::ensure!(!paused, queue::QueueError::Paused);
-                        let order: i64 = tx.query_row("SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1", [id], |row| row.get(0))?;
-                        crate::db::message_repo::save_user_message(
-                            tx,
-                            message_id,
-                            id,
-                            &item.content,
-                            &chrono::Utc::now().to_rfc3339(),
-                            order,
-                        )?;
-                        Ok(())
-                    })
-                })();
-                match result {
-                    Ok(item) => {
-                        let text = item.content.as_str().map(str::to_owned).unwrap_or_else(|| {
-                            item.content
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|block| block["text"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        });
-                        inputs.push(queue::DeliveredInput {
-                            text,
-                            content: item.content,
-                            origin: item.handoff_id.unwrap_or_default(),
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!("Steer handoff retained for recovery: {error:#}");
-                        break;
-                    }
-                }
-            }
-        }
-        for input in &inputs {
-            let _ = self
-                .event_tx
-                .send(EngineEvent::QueuedInput(input.clone()))
-                .await;
-        }
-        inputs
+        Vec::new()
     }
 
     fn drain_approval_notes(&self) -> Vec<String> {
@@ -3802,7 +3724,7 @@ impl ToolLoopExecutor {
         let messages = if let Some(owner) = self.turn_delivery.upgrade() {
             owner.lock().unwrap_or_else(|e| e.into_inner()).poll_turn(true, limit)?
                 .into_iter().map(|input| input.text).collect()
-        } else if let Some(inbox) = &self.message_inbox { inbox.drain(limit)? } else { Vec::new() };
+        } else { Vec::new() };
         self.message_deliveries += messages.len();
         Ok(messages)
     }
@@ -3849,18 +3771,14 @@ impl ToolLoopExecutor {
         // work. The field is intentionally never taken, so cancellation of
         // this future or the outer task still releases it by dropping the
         // executor.
+        if self.executor_history.is_none() {
+            if let (Some(db),Some(id))=(&self.goal_db,self.conv_id.as_deref()) {
+                self.executor_history=db.listed_history(id)?;
+            }
+        }
         if self.execution_lease.is_none() {
-            if let Some(history) = &self.executor_history {
-                self.execution_lease = history.execution_lease()?.map(std::sync::Arc::new);
-            } else if let (Some(root), Some(session)) = (
-                self.search_config_path
-                    .as_deref()
-                    .and_then(std::path::Path::parent),
-                self.conv_id.as_deref(),
-            ) {
-                self.execution_lease =
-                    crate::services::session_messages::ExecutionLease::acquire(root, session)?
-                        .map(std::sync::Arc::new);
+            if let Some(history)=&self.executor_history {
+                self.execution_lease=history.execution_lease()?.map(std::sync::Arc::new);
             }
         }
         let mut async_hook_guard = crate::services::async_hooks::TurnGuard(self.conv_id.clone());
@@ -3903,18 +3821,6 @@ impl ToolLoopExecutor {
             Some(std::sync::Arc::new(std::sync::Mutex::new(shard.delivery_under_lease(lease)?)))
         } else { None };
         self.turn_delivery = turn_delivery.as_ref().map(std::sync::Arc::downgrade).unwrap_or_default();
-        let inbox_owner = match (
-            self.search_config_path
-                .as_deref()
-                .and_then(std::path::Path::parent),
-            self.conv_id.as_deref(),
-        ) {
-            (Some(root), Some(session)) if turn_delivery.is_none() => {
-                crate::services::session_messages::Consumer::attach(root, session)?
-            }
-            _ => None,
-        };
-        self.message_inbox = inbox_owner.as_ref().map(|owner| owner.target.clone());
         self.message_deliveries = 0;
         self.child_resumes.store(0, Ordering::Relaxed);
         if self.require_pending_peer_message {

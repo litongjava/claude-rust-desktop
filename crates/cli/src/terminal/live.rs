@@ -4485,11 +4485,11 @@ impl TurnDisplay {
         })
     }
     pub fn restore_numbers(&mut self, session: &crate::session::Session) -> anyhow::Result<()> {
-        self.numbers = session.store.db.with_conn(|conn| -> anyhow::Result<_> {
+        self.numbers = session.store.db.open_session(&session.id)?.read(|history| {
             let mut numbers = std::collections::HashMap::new();
             let mut next = 0usize;
-            for message in deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)? {
-                for tool in deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &message.id)? {
+            for message in history.messages()? {
+                for tool in history.tools(&message.id)? {
                     // Count every saved row, not just distinct map keys: old
                     // records may repeat a raw provider id across messages, and
                     // a later live call must not reuse an already shown number.
@@ -4500,7 +4500,7 @@ impl TurnDisplay {
                 }
             }
             Ok(numbers)
-        })??;
+        })?;
         self.fallback.restore_numbers(self.numbers.clone());
         Ok(())
     }

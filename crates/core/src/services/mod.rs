@@ -82,7 +82,7 @@ impl Credentials for EnvironmentCredentials {
     }
 }
 
-pub struct ServiceContext<D = DbManager> {
+pub struct ServiceContext<D = crate::db::session_store::Stores> {
     pub paths: RuntimePaths,
     pub db: Arc<D>,
     pub credentials: Arc<dyn Credentials>,
@@ -101,6 +101,8 @@ impl ServiceContext {
             credentials,
         })
     }
+}
+impl ServiceContext<DbManager> {
     pub fn setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let value: Option<String> = self.db.with_conn(|c| {
             c.query_row(

@@ -74,48 +74,16 @@ async fn durable_queue_roundtrip() {
     .unwrap();
     let url = format!("{base}/api/conversations/{id}/queue");
     // Desktop Code submissions need a selected project before any side effects.
-    let original_project: String = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT project_id FROM conversations WHERE id=?1",
-                [&id],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE conversations SET project_id=NULL,workspace_mode='code' WHERE id=?1",
-            [&id],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    let original_project = db.conversation_metadata(&id).unwrap().unwrap().project_id.unwrap();
+    let shard=db.open_session(&id).unwrap();
+    shard.edit_conversation(&json!({"project_id":null,"workspace_mode":"code"})).unwrap();
     let rejected = client.post(format!("{base}/api/chat")).header("x-api-key", &key)
         .json(&json!({"conversation_id":id,"messages":[{"role":"user","content":"must not persist"}],"model":"fixture-model","provider_id":"fixture"})).send().await.unwrap();
     assert_eq!(rejected.status(), 400);
     assert!(rejected.text().await.unwrap().contains("Select a project"));
-    let count: i64 = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-                [&id],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(count, 0);
+    assert!(shard.read(|r|r.messages()).unwrap().is_empty());
     assert!(requests.try_recv().is_err());
-    db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE conversations SET project_id=?2 WHERE id=?1",
-            rusqlite::params![id, original_project],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    shard.edit_conversation(&json!({"project_id":original_project})).unwrap();
     queue::set_paused(&db, &id, true).unwrap();
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY9sAAAAASUVORK5CYII=";
     let content = json!([
@@ -255,28 +223,10 @@ async fn durable_queue_roundtrip() {
         queue::list(&db, &id).unwrap()[0].state,
         queue::QueueState::Handoff
     );
-    let count: i64 = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE id=?1",
-                [format!("queue-input-{}", first["id"])],
-                |r| r.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(count, 1);
-    let saved: String = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT content_json FROM message_user_content WHERE message_id=?1",
-                [format!("queue-input-{}", first["id"])],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), content);
+    let handoff=queue::list(&db,&id).unwrap()[0].handoff_id.clone().unwrap();
+    let messages=shard.read(|r|r.messages()).unwrap();
+    assert_eq!(messages.iter().filter(|m|m.id==handoff).count(),1);
+    assert_eq!(shard.read(|r|r.user_content(&handoff)).unwrap(),content);
     client
         .post(format!("{base}/api/conversations/{id}/stop-generation"))
         .header("x-api-key", &key)

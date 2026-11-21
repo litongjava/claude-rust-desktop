@@ -224,12 +224,12 @@ fn main() {
             {
                 use tokio::sync::mpsc;
                 use crate::im_integration::message_router::{UnifiedMessage, MessageType, ReplyPayload};
-                use crate::db::DbManager;
+                use crate::db::session_store::Stores;
                 use crate::native_engine::NativeEngine;
 
                 let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<UnifiedMessage>();
                 let im_manager_ref = app.state::<Arc<crate::im_integration::ImIntegrationManager>>().inner().clone();
-                let db_for_im = app.state::<Arc<DbManager>>().inner().clone();
+                let db_for_im = app.state::<Arc<Stores>>().inner().clone();
                 let native_engine_state = app.state::<Arc<Mutex<Option<NativeEngine>>>>().inner().clone();
                 let _ = db_for_im;
 

@@ -187,3 +187,33 @@ impl ThreadHistory for crate::db::DbManager {
         Ok(())
     }
 }
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct FeishuChatMapping {
+    pub chat_id: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub created_at: String,
+    pub last_active_at: String,
+    pub message_count: u64,
+}
+
+
+fn feishu_row(r:&rusqlite::Row<'_>)->rusqlite::Result<FeishuChatMapping>{
+    Ok(FeishuChatMapping{ chat_id:r.get(0)?,conversation_id:r.get(1)?,title:r.get(2)?,created_at:r.get(3)?,last_active_at:r.get(4)?,message_count:r.get(5)? })
+}
+impl Stores {
+    pub(super) fn feishu_mapping(&self,chat:&str)->Result<Option<FeishuChatMapping>> {
+        self.global().read(|c|Ok(c.query_row("SELECT chat_id,conversation_id,title,created_at,last_active_at,message_count FROM feishu_chat_mappings WHERE chat_id=?1",[chat],feishu_row).optional()?))
+    }
+    pub fn feishu_mappings(&self)->Result<Vec<FeishuChatMapping>> {
+        self.global().read(|c| {
+            let mut q=c.prepare("SELECT chat_id,conversation_id,title,created_at,last_active_at,message_count FROM feishu_chat_mappings ORDER BY last_active_at DESC")?;
+            let rows=q.query_map([],feishu_row)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+    pub fn delete_feishu_mapping(&self,chat:&str)->Result<()> {
+        self.global().write("forget Feishu routing",chat,false,|c| {c.execute("DELETE FROM feishu_chat_mappings WHERE chat_id=?1",[chat])?; Ok(())})
+    }
+}

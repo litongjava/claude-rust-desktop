@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use deepseek_code_core::{
-    db::DbManager,
+    db::session_store::Stores,
     native_engine::engine_core::ChatRequest,
     services::input_queue::{self as queue, QueueError, QueueMode},
 };
@@ -43,7 +43,7 @@ fn error(error: anyhow::Error) -> Response {
     };
     (status, Json(json!({"error":error.to_string()}))).into_response()
 }
-fn exists(db: &DbManager, id: &str) -> anyhow::Result<()> {
+fn exists(db: &Stores, id: &str) -> anyhow::Result<()> {
     if db
         .conversation_metadata(id)?
         .is_none()
@@ -52,13 +52,13 @@ fn exists(db: &DbManager, id: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
-fn snapshot(db: &DbManager, id: &str) -> anyhow::Result<Value> {
+fn snapshot(db: &Stores, id: &str) -> anyhow::Result<Value> {
     exists(db, id)?;
     Ok(json!({"items":queue::list(db,id)?,"paused":queue::is_paused(db,id)?}))
 }
 
 pub(super) fn execution_lease(
-    db: &DbManager,
+    db: &Stores,
     id: &str,
 ) -> anyhow::Result<deepseek_code_core::services::session_messages::ExecutionLease> {
     db.existing_chat_lease(id)
@@ -67,7 +67,7 @@ pub(super) fn execution_lease(
 /// The turn that queued this dispatch can still hold the execution lease for a
 /// moment (its engine tail drops the last clone). Wait, bounded, until it is free.
 pub(super) async fn wait_for_release(
-    db: &DbManager,
+    db: &Stores,
     id: &str,
     limit: std::time::Duration,
 ) -> bool {
@@ -271,14 +271,13 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepseek_code_core::services::session_messages::ExecutionLease;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn waits_for_the_finished_turn_to_drop_its_lease() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DbManager::new(dir.path().join("accept.db")).unwrap();
+        let db = Stores::open(dir.path()).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+        let lease = db.create(&id,Default::default()).unwrap().acquire_execution().unwrap();
         let released = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             drop(lease);
@@ -290,9 +289,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lease_that_stays_held_reports_no_release() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DbManager::new(dir.path().join("accept.db")).unwrap();
+        let db = Stores::open(dir.path()).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+        let lease = db.create(&id,Default::default()).unwrap().acquire_execution().unwrap();
         assert!(!wait_for_release(&db, &id, std::time::Duration::from_millis(300)).await);
         drop(lease);
     }

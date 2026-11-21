@@ -94,13 +94,7 @@ fn usage_rows(session: &Session, paths: &RuntimePaths) -> Result<Vec<String>> {
         let seconds = ms / 1000;
         if seconds < 60 { format!("{seconds}s") } else { format!("{}m {}s", seconds / 60, seconds % 60) }
     };
-    let (added, removed) = session.store.db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(SUM(json_extract(t.output,'$.file_change.added')),0), COALESCE(SUM(json_extract(t.output,'$.file_change.removed')),0) FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1 AND json_valid(t.output) AND t.is_error=0",
-            [&session.id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-    })??;
+    let (added, removed) = session.store.db.open_session(&session.id)?.read(|r| r.changed_lines())?;
     let wall = crate::terminal::STARTED.get().map_or(0, |started| started.elapsed().as_millis() as i64);
     let cost = match billing["total_usd"].as_f64() {
         Some(total) if billing["unpriced_requests"].as_i64().unwrap_or(0) == 0 => format!("${total:.4}"),

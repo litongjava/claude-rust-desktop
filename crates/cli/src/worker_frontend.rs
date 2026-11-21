@@ -552,9 +552,6 @@ async fn observe(
                     }
                 }
                 if drained && !matches!(job.status.as_str(), "starting"|"running") {
-                    if let Some(reader) = input.as_mut() {
-                        if let Err(error) = crate::session::requeue_unread(session, reader) { display.notice(&format!("Could not restore queued messages: {error:#}")); }
-                    }
                     if job.session_id == owner && matches!(job.status.as_str(),"completed"|"failed"|"cancelled") {jobs::acknowledge_foreground(root,id,owner)?;}
                     ensure!(job.status == "completed", "Worker {}: {}{}", id, job.status, job.error.map(|error|format!(" - {error}")).unwrap_or_default());
                     if side.is_none() && !has_proposal { return Ok(false); }
@@ -714,7 +711,7 @@ async fn observe(
                                     // As in the reference CLI the running turn reads it after its
                                     // next tool results; unread messages become the next prompt.
                                     crate::images::share(&session.id, &prompt);
-                                    deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &prompt)?;
+                                    session.store.db.open_session(&session.id)?.enqueue_cli_prompt(&prompt)?;
                                     queued_inputs.push(prompt);
                                     display.queued(queued_inputs.clone());
                                 } else {

@@ -4,7 +4,7 @@
 //! authorized from the durable records at execution time: a forged router tool
 //! name, a stale member session or a task owned by another Router is rejected
 //! even if it reaches the dispatcher.
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::services::{EnvironmentCredentials, ServiceContext};
 use crate::super_agent::role::{self, MemberRole, Role};
 use crate::super_agent::store::{EventAppend, StoreError, TaskStore};
@@ -34,7 +34,7 @@ pub const ROUTER_FORBIDDEN_EDIT_TOOLS: [&str; 5] =
 
 #[derive(Clone)]
 pub struct ToolRuntime {
-    pub db: Arc<DbManager>,
+    pub db: Arc<Stores>,
     pub data_dir: PathBuf,
     pub session_id: String,
 }

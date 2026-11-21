@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use deepseek_code_core::native_engine::provider_manager::ResolvedProvider;
 use deepseek_code_core::services::session_worker::{self, Request};
 use deepseek_code_core::{
-    db::DbManager, native_engine::session_binding::BindingSnapshot, runtime::RuntimePaths,
+    db::session_store::Stores, native_engine::session_binding::BindingSnapshot, runtime::RuntimePaths,
 };
 use std::{collections::BTreeMap, ffi::OsString, path::Path};
 pub const SNAPSHOT_ENV: &str = "DEEPSEEK_CODE_SESSION_BINDING";
@@ -145,11 +145,11 @@ pub fn snapshot(
 /// the terminal can still observe the session but cannot use another account.
 pub async fn observe(
     paths: &RuntimePaths,
-    db: &DbManager,
+    db: &Stores,
     id: &str,
     mut local: BindingSnapshot,
 ) -> Result<BindingSnapshot> {
-    let row = binding_store::observe(db, id)?;
+    let row = db.observed_binding(id)?;
     if row.pending.is_some() {
         eprintln!("Provider switch pending: the legacy worker continues its current job. Use /continue to observe.");
     }
@@ -167,12 +167,12 @@ pub async fn observe(
 /// predating binding revisions still take their transport from the job itself.
 pub(crate) async fn observe_worker(
     paths: &RuntimePaths,
-    db: &DbManager,
+    db: &Stores,
     id: &str,
     host: Option<&deepseek_code_core::native_engine::session_binding::SessionBinding>,
     local: impl FnOnce() -> Result<BindingSnapshot>,
 ) -> Result<BindingSnapshot> {
-    let row = binding_store::observe(db, id)?;
+    let row = db.observed_binding(id)?;
     ensure!(
         row.pending.is_none(),
         "Provider switch pending; use /continue to observe the legacy job"
@@ -272,7 +272,7 @@ fn matches_revision(row: &Observed, state: &BindingSnapshot) -> Result<bool> {
 /// socket. A stale frontend transfers only its identity and observed generation.
 pub async fn retain_for_transfer(session: &crate::session::Session) -> Result<()> {
     let state = session.binding_state();
-    let row = binding_store::observe(&session.store.db, &session.id)?;
+    let row = session.store.db.observed_binding(&session.id)?;
     if row.pending.is_some() || state.observation_only || !matches_revision(&row, &state)? {
         return Ok(());
     }
@@ -304,7 +304,7 @@ pub async fn retain_for_transfer(session: &crate::session::Session) -> Result<()
     )
     .await
     {
-        if binding_store::observe(&session.store.db, &session.id)?.generation == row.generation {
+        if session.store.db.observed_binding(&session.id)?.generation == row.generation {
             return Err(error.context("Cannot transfer the private session binding"));
         }
     }
@@ -314,13 +314,14 @@ pub async fn retain_for_transfer(session: &crate::session::Session) -> Result<()
 /// Commit the selector and its version together. A failed selector update rolls both back.
 pub async fn commit(
     root: &Path,
-    db: &std::sync::Arc<DbManager>,
+    db: &std::sync::Arc<Stores>,
     id: &str,
     expected: u64,
     state: &mut BindingSnapshot,
     requester: &str,
     picker_effort: Option<Option<&str>>,
 ) -> Result<bool> {
+    let shard=db.open_session(id)?;
     let worker = if uuid::Uuid::parse_str(id).is_ok() {
         session_worker::current(root, id)?
     } else {
@@ -342,9 +343,7 @@ pub async fn commit(
     };
     let pending = live.as_ref().filter(|_| legacy).map(|w| w.id.as_str());
     let reserved = pending.map(|id| (id, live.as_ref().and_then(|w| w.child_pid)));
-    let change = db.with_conn(|c| {
-        binding_store::publish_choice(c, id, expected, state, reserved, requester, picker_effort)
-    })??;
+    let change = shard.publish_provider(expected,state,reserved,requester,picker_effort)?;
     match change {
         Write::Published(generation) => state.generation = generation,
         Write::Unchanged => {
@@ -397,11 +396,11 @@ pub async fn commit(
 const RETIRE_ENV: &str = "DEEPSEEK_CODE_RETIRE_SESSION_WORKER";
 
 fn finish_retirement(
-    db: &DbManager,
+    db: &Stores,
     worker: &session_worker::Worker,
     generation: u64,
 ) -> Result<()> {
-    db.with_conn(|c| binding_store::activate(c, &worker.session_id, &worker.id, generation))?
+    db.open_session(&worker.session_id)?.activate_provider(&worker.id,generation)
 }
 
 fn start_retirement(worker: &session_worker::Worker, generation: u64) -> Result<()> {
@@ -451,14 +450,13 @@ pub async fn retire_from_env() -> Result<bool> {
 }
 
 async fn retire_worker(
-    db: &DbManager,
+    db: &Stores,
     worker: &session_worker::Worker,
     generation: u64,
 ) -> Result<()> {
     loop {
-        let reserved: bool = db.with_conn(|c| c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cli_binding_generations WHERE session_id=?1 AND pending=?2 AND generation=?3)",
-            (&worker.session_id,&worker.id,generation), |r|r.get(0)))??;
+        let state = db.observed_binding(&worker.session_id)?;
+        let reserved = state.generation == generation && state.pending.as_deref() == Some(worker.id.as_str());
         if !reserved {
             return Ok(());
         }
@@ -494,7 +492,7 @@ pub fn validate_worker_snapshot(
     );
     validate_environment(&state.environment, &names)?;
     let db = paths.open_database()?;
-    let observed = binding_store::observe(&db, session)?;
+    let observed = db.observed_binding(session)?;
     ensure!(observed.pending.is_none(), "Provider switch pending");
     ensure!(
         matches_revision(&observed, state)?,

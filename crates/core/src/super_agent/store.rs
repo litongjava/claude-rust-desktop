@@ -136,7 +136,7 @@ impl TaskDatabase for DbManager {
     }
 }
 
-pub struct TaskStore<D = DbManager> {
+pub struct TaskStore<D = crate::db::session_store::Stores> {
     db: Arc<D>,
     data_dir: PathBuf,
 }

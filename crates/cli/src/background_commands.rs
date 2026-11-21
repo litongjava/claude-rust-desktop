@@ -642,32 +642,13 @@ fn child_output_tokens(
     context: &deepseek_code_core::services::ServiceContext,
     session: &str,
 ) -> i64 {
-    let mut requests = std::collections::HashMap::<String, i64>::new();
-    let _ = context.db.with_conn(|conn| -> anyhow::Result<()> {
-        let mut statement = conn.prepare("SELECT id,output_tokens FROM model_requests WHERE conversation_id=?1 AND output_tokens IS NOT NULL")?;
-        for row in statement.query_map([session], |row| Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?)))? {
-            let (id, tokens) = row?;
-            requests.insert(id, tokens);
-        }
-        Ok(())
-    });
-    if let Ok(Some(values)) =
-        context.setting::<Vec<serde_json::Value>>(&format!("cli.live-requests.{session}"))
-    {
-        for value in values {
-            if let (Some(id), Some(tokens)) = (value["id"].as_str(), value["outputTokens"].as_i64())
-            {
-                requests.insert(id.to_owned(), tokens);
-            }
-        }
-    }
-    requests.values().copied().sum()
+    context.db.open_session(session).and_then(|s| s.read(|r| r.output_tokens())).unwrap_or_default()
 }
 
 /// This session's background agents that are still running.
 pub(crate) fn running_agents(
     paths: &RuntimePaths,
-    _db: &deepseek_code_core::db::DbManager,
+    _db: &impl deepseek_code_core::db::session_store::SessionAccess,
     session: &str,
 ) -> Vec<Agent> {
     let Ok(context) = crate::services::context(paths) else {
@@ -1164,7 +1145,7 @@ pub(crate) fn notification_text(text: &str) -> Option<String> {
 fn shell_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for task in deepseek_code_core::tools::background_shell::collect_finished(&session.paths.data_dir, &session.id)? {
-        deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &task.notification())?;
+        session.store.db.open_session(&session.id)?.enqueue_cli_notification(&task.notification())?;
         notices.push(format!("\u{25cf} {}", task.summary()));
     }
     Ok(notices)
@@ -1175,7 +1156,7 @@ fn shell_notifications(session: &Session) -> Result<Vec<String>> {
 fn monitor_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for event in deepseek_code_core::tools::monitor::collect_events(&session.paths.data_dir, &session.id)? {
-        deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &event.notification())?;
+        session.store.db.open_session(&session.id)?.enqueue_cli_notification(&event.notification())?;
         notices.push(format!("\u{25cf} {}", event.summary()));
     }
     Ok(notices)
@@ -1187,11 +1168,8 @@ pub(crate) async fn wake_for_notifications(cli: &crate::args::Cli, session: &mut
     if session.waiting_for_continue() {
         return Ok(false);
     }
-    let prompts = deepseek_code_core::services::input_queue::take_where(&session.store.db, &session.id, is_notification)?;
-    if prompts.is_empty() {
-        return Ok(false);
-    }
-    session.turn(cli, &prompts.join("\n\n"), input).await?;
+    let Some(item)=session.store.db.next_desktop_input(&session.id)? else { return Ok(false); };
+    session.dispatch_input(cli,item,input).await?;
     Ok(true)
 }
 
@@ -1223,9 +1201,7 @@ fn agent_notice(session: &Session, report: String) -> Result<String> {
             summary.push_str(&safe_output(reason).chars().take(400).collect::<String>());
         }
     }
-    deepseek_code_core::services::input_queue::push(
-        &session.store.db,
-        &session.id,
+    session.store.db.open_session(&session.id)?.enqueue_cli_notification(
         &format!("{}\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>{summary}</summary>\n<result>See the background task report for this task above.</result>\n</task-notification>", deepseek_code_core::tools::background_shell::NOTIFICATION_START),
     )?;
     Ok(format!("\u{25cf} {summary}"))
@@ -1704,25 +1680,17 @@ pub(crate) fn agent_transcript(
             value["status"].as_str().unwrap_or("unknown")
         ));
     }
-    let saved = context.db.with_conn(|conn| -> anyhow::Result<()> {
-        let mut statement = conn.prepare("SELECT id,role,substr(content,-65536) FROM (SELECT id,role,content,sort_order,rowid AS sequence FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC, rowid DESC LIMIT 20) ORDER BY sort_order,sequence")?;
-        let messages = statement.query_map([id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
-        for (message_id, role, content) in messages {
-            if role == "user" { transcript.user(&content); continue; }
-            if role != "assistant" { continue; }
-            let mut statement = conn.prepare("SELECT name,substr(input,1,8192),substr(output,-16384),is_error FROM (SELECT name,input,output,is_error,sort_order,rowid AS sequence FROM tool_calls WHERE message_id=?1 ORDER BY sort_order DESC, rowid DESC LIMIT 30) ORDER BY sort_order,sequence")?;
-            for row in statement.query_map([message_id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,Option<String>>(2)?, row.get::<_,bool>(3)?)))? {
-                let (name, input, output, failed) = row?;
-                let input = input.and_then(|input| serde_json::from_str(&input).ok()).unwrap_or_default();
-                transcript.tool(&name, &input, &output.unwrap_or_default(), failed);
+    match context.db.open_session(id).and_then(|s| s.read(|r| r.transcript_tail())) {
+        Ok(messages) => for message in messages {
+            if message.role == "user" { transcript.user(&message.text); }
+            if message.role == "assistant" {
+                for (name, input, output, failed) in message.tools {
+                    let input = input.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+                    transcript.tool(&name, &input, &output.unwrap_or_default(), failed);
+                }
+                transcript.assistant(&message.text);
             }
-            transcript.assistant(&content);
-        }
-        Ok(())
-    });
-    match saved {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => transcript.note(&format!("Execution history unavailable: {error}")),
+        },
         Err(error) => transcript.note(&format!("Execution history unavailable: {error}")),
     }
     // A detached worker commits its assistant row at turn completion. Its bounded

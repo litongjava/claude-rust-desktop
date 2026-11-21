@@ -25,7 +25,7 @@ struct ModeControl {
     job_id: String,
     session_id: String,
     manager: Arc<deepseek_code_core::permissions::PermissionManager>,
-    db: Arc<deepseek_code_core::db::DbManager>,
+    db: Arc<deepseek_code_core::db::session_store::Stores>,
     provider: deepseek_code_core::native_engine::provider_manager::ResolvedProvider,
     owner_manager: Option<Arc<deepseek_code_core::permissions::PermissionManager>>,
     /// The job's launch allows bypass, and Full Access when `full_access`.
@@ -442,7 +442,7 @@ async fn execute(
         if observed.generation != 0 {
             cli.discard_binding_options();
         }
-        binding.track(&db, &worker.session_id);
+        binding.track_session(db.open_session(&worker.session_id)?);
         binding.restore(observed)?;
     }
     let snapshot = binding.read().context("Missing worker binding")?;

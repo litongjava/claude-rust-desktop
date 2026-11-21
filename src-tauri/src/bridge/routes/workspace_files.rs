@@ -35,16 +35,7 @@ async fn handle(
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = cancel.0.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let roots = state.db_manager.with_conn(|conn| -> anyhow::Result<_> {
-            let database = conn
-                .path()
-                .ok_or_else(|| anyhow::anyhow!("Workspace database path is unavailable"))?;
-            let private_root = std::path::Path::new(database)
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Workspace database has no parent"))?
-                .join("workspaces");
-            files::roots(conn, &private_root, &request.scope)
-        })??;
+        let roots = state.db_manager.workspace_roots(&request.scope)?;
         if operation == "roots" {
             return Ok(json!({"roots": roots}));
         }

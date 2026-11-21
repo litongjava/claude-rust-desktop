@@ -134,77 +134,11 @@ async fn conversation_get(Path(id): Path<String>, Query(query): Query<Conversati
 
 async fn conversation_update(Path(id): Path<String>, State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let db = state.db_manager.clone();
-    let id_for_error = id.clone();
-    let id_clone = id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn: &rusqlite::Connection| {
-            let transaction = deepseek_code_core::db::write_transaction(&conn)?;
-            let conn = &transaction;
-            anyhow::ensure!(crate::db::conversation_repo::get_conversation(conn, &id_clone)?.is_some(), "Conversation not found");
-            if let Some(mode) = body.get("workspace_mode") {
-                let mode: crate::db::conversation_repo::WorkspaceMode = serde_json::from_value(mode.clone())?;
-                crate::db::conversation_repo::set_workspace_mode(conn, &id_clone, mode.as_str())?;
-                crate::db::conversation_repo::update_conversation_timestamp(conn, &id_clone, &chrono::Utc::now().to_rfc3339())?;
-            }
-            if let Some(pinned) = body.get("pinned").and_then(|v| v.as_bool()) {
-                crate::db::conversation_repo::pin_conversation(conn, &id_clone, pinned)?;
-            }
-            if let Some(archived) = body.get("archived").and_then(|v| v.as_bool()) {
-                crate::db::conversation_repo::archive_conversation(conn, &id_clone, archived)?;
-            }
-            if let Some(project_id) = body.get("project_id") {
-                if let Some(project_id) = project_id.as_str() {
-                    let project = crate::db::project_repo::require_trusted(conn, project_id)?;
-                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1 AND project_id != ?2", rusqlite::params![&id_clone, project_id])?;
-                    conn.execute("UPDATE conversations SET project_id = ?1, workspace_path = COALESCE((SELECT path FROM conversation_worktrees WHERE conversation_id = ?4), ?2), updated_at = ?3 WHERE id = ?4",
-                        rusqlite::params![project_id, project.workspace_path, chrono::Utc::now().to_rfc3339(), &id_clone])?;
-                } else if project_id.is_null() {
-                    conn.execute("DELETE FROM conversation_worktrees WHERE conversation_id = ?1", rusqlite::params![&id_clone])?;
-                    conn.execute("UPDATE conversations SET project_id = NULL, workspace_path = NULL WHERE id = ?1", rusqlite::params![&id_clone])?;
-                }
-            }
-            if let Some(title) = body.get("title").and_then(|v| v.as_str()) {
-                conn.execute(
-                    "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![title, chrono::Utc::now().to_rfc3339(), &id_clone],
-                )?;
-            }
-            if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-                conn.execute(
-                    "UPDATE conversations SET model = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![model, chrono::Utc::now().to_rfc3339(), &id_clone],
-                )?;
-            }
-            if let Some(workspace) = body.get("workspace_path").and_then(|v| v.as_str()) {
-                conn.execute(
-                    "UPDATE conversations SET workspace_path = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![workspace, chrono::Utc::now().to_rfc3339(), &id_clone],
-                )?;
-            }
-            if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-                let tx = conn;
-                deepseek_code_core::db::transcript::replace_messages(tx, &id_clone, messages)?;
-                tx.execute("UPDATE conversations SET message_count = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![messages.len() as i64, chrono::Utc::now().to_rfc3339(), id_clone])?;
-            }
-            transaction.commit()?;
-            Ok::<(), anyhow::Error>(())
-        })
-    }).await;
+    let result=tokio::task::spawn_blocking(move || db.open_session(&id)?.edit_conversation(&body)).await;
     match result {
-        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })),
-        Err(e) => {
-            tracing::error!(module = "Conversations", "Failed to update conversation {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
-        Ok(Ok(Err(e))) => {
-            tracing::error!(module = "Conversations", "Failed to update conversation {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
-        Ok(Err(e)) => {
-            tracing::error!(module = "Conversations", "DB error on update {}: {}", id_for_error, e);
-            Json(serde_json::json!({ "ok": false, "error": format!("{}", e) }))
-        }
+        Ok(Ok(())) => Json(serde_json::json!({"ok":true})),
+        Ok(Err(error)) => Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        Err(error) => Json(serde_json::json!({"ok":false,"error":error.to_string()})),
     }
 }
 

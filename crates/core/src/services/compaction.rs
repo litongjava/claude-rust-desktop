@@ -162,6 +162,7 @@ pub struct CommittedCompaction {
 /// Records a committed compaction before any post-compaction work. A
 /// cancelling caller reads the outcome instead of reporting an unsaved one.
 pub struct CompactionTracker {
+    expected_request: Option<String>,
     committed: std::sync::atomic::AtomicBool,
     outcome: std::sync::Mutex<Option<CommittedCompaction>>,
     /// The operation's monotonic start. Both the normal and the cancelled
@@ -173,6 +174,7 @@ pub struct CompactionTracker {
 impl Default for CompactionTracker {
     fn default() -> Self {
         Self {
+            expected_request: None,
             committed: std::sync::atomic::AtomicBool::new(false),
             outcome: std::sync::Mutex::new(None),
             started: std::time::Instant::now(),
@@ -181,6 +183,10 @@ impl Default for CompactionTracker {
 }
 
 impl CompactionTracker {
+    pub fn for_claim(claim: &crate::db::session_store::CompactionClaim) -> Self {
+        Self { expected_request: Some(claim.id.clone()), ..Self::default() }
+    }
+
     /// The committed result, if the boundary transaction has already run.
     pub fn outcome(&self) -> Option<CommittedCompaction> {
         self.outcome
@@ -217,6 +223,7 @@ impl CompactionTracker {
 }
 
 pub struct PreparedCompaction {
+    pub(crate) pending_request: Option<String>,
     pub(crate) incarnation: Option<String>,
     pub(crate) conversation_id: String,
     /// SHA-256 of the history at planning time; only equality matters.
@@ -465,7 +472,7 @@ fn export_summary(
 /// Dropping this future during generation cancels it without mutating the conversation.
 pub async fn compact(
     engine: &NativeEngine,
-    db: &DbManager,
+    db: &(impl crate::db::session_store::SessionAccess + crate::db::session_store::RecordingPolicies),
     id: &str,
     provider_id: &str,
     model: &str,
@@ -514,89 +521,30 @@ pub enum Part {
 }
 
 pub struct PreparedPart {
-    transcript: String,
-    count: usize,
+    pub(crate) incarnation: String,
+    pub(crate) revision: i64,
+    pub(crate) transcript: String,
+    pub(crate) count: usize,
 }
 
 /// The messages `part` summarizes, as the transcript the summary is made from.
-pub fn prepare_part(
-    db: &DbManager,
-    id: &str,
-    message_id: &str,
-    part: Part,
-) -> Result<PreparedPart> {
-    db.with_conn(|conn| {
-        let rows = message_repo::get_messages_by_conversation(conn, id)?;
-        let index = rows.iter().position(|m| m.id == message_id).context("Message not found in this conversation")?;
-        let range = match part {
-            Part::UpTo => rows[..index].iter().rposition(|m| m.is_compact_boundary).unwrap_or(0)..index,
-            Part::From => index..rows.len(),
-        };
-        ensure!(!range.is_empty(), "Nothing to summarize there");
-        let mut all = Vec::new();
-        for row in &rows[range.clone()] {
-            ensure!(native::load(conn, &row.id)?.is_none(), "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
-            let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
-            all.push(json!({"message": row, "tools": calls}));
-        }
-        Ok(PreparedPart { transcript: serde_json::to_string(&all)?, count: range.len() })
-    })?
+pub fn prepare_part(db: &crate::db::session_store::Stores, id: &str, message: &str, part: Part) -> Result<PreparedPart> {
+    db.open_session(id)?.prepare_summary_part(message,part)
 }
 
-/// Writes the summary into a new branch of the conversation and returns the
-/// branch's id and how many messages the summary replaced. The original
-/// conversation is left as it was.
-pub fn commit_part(
-    db: &DbManager,
-    id: &str,
-    message_id: &str,
-    part: Part,
-    prepared: PreparedPart,
-    summary: &str,
-) -> Result<(String, usize)> {
-    ensure!(
-        !summary.trim().is_empty() && summary.chars().count() <= 32_000,
-        "Empty or oversized summary"
-    );
-    let branch = db.with_conn(|conn| -> Result<String> {
-        let rows = message_repo::get_messages_by_conversation(conn, id)?;
-        let index = rows.iter().position(|m| m.id == message_id).context("Message not found in this conversation")?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let summary_id = uuid::Uuid::new_v4().to_string();
-        match part {
-            Part::UpTo => {
-                // The summary becomes a boundary right before the message.
-                let branch = conversation_repo::branch_conversation(conn, id, None, None)?;
-                let order = rows[index].sort_order;
-                conn.execute("UPDATE messages SET sort_order = sort_order + 1 WHERE conversation_id = ?1 AND sort_order >= ?2", rusqlite::params![branch, order])?;
-                let content = format!("[Conversation summary — earlier transcript retained in session history]\n{}", summary.trim());
-                message_repo::insert_message(conn, &summary_id, &branch, "user", &content, None, &now, true, order)?;
-                Ok(branch)
-            }
-            Part::From if index == 0 => {
-                // Nothing comes before: the whole conversation is summarized.
-                let branch = conversation_repo::branch_conversation(conn, id, None, None)?;
-                let order = rows.last().map_or(0, |m| m.sort_order + 1);
-                let content = format!("[Conversation summary — earlier transcript retained in session history]\n{}", summary.trim());
-                message_repo::insert_message(conn, &summary_id, &branch, "user", &content, None, &now, true, order)?;
-                Ok(branch)
-            }
-            Part::From => {
-                // Earlier messages stay; the rest becomes one summary message.
-                let branch = conversation_repo::branch_conversation(conn, id, None, Some(index - 1))?;
-                let content = format!("[Summary of the later conversation — full transcript retained in session history]\n{}", summary.trim());
-                message_repo::insert_message(conn, &summary_id, &branch, "user", &content, None, &now, false, rows[index].sort_order)?;
-                Ok(branch)
-            }
-        }
-    })??;
-    Ok((branch, prepared.count))
+pub fn commit_part(db: &crate::db::session_store::Stores, id: &str, message: &str, part: Part, prepared: PreparedPart, summary: &str) -> Result<(String,usize)> {
+    ensure!(!summary.trim().is_empty() && summary.chars().count() <= 32_000, "Empty or oversized summary");
+    let source=db.open_session(id)?;
+    ensure!(source.incarnation()==prepared.incarnation, "Summary source was replaced");
+    let branch=uuid::Uuid::new_v4().to_string();
+    source.branch(&branch,crate::db::session_store::Branch::Summary { message, part, revision:prepared.revision, text:summary.trim() })?;
+    Ok((branch,prepared.count))
 }
 
 /// Summarizes part of a conversation into a new branch; see [`Part`].
 pub async fn summarize_part(
     engine: &NativeEngine,
-    db: &DbManager,
+    db: &crate::db::session_store::Stores,
     id: &str,
     message_id: &str,
     part: Part,
@@ -722,6 +670,10 @@ where
         "Invalid compaction trigger"
     );
     let prepared = prepare(&context.db, id)?;
+    if let Some(expected) = tracker.and_then(|t|t.expected_request.as_ref()) {
+        ensure!(prepared.pending_request.as_ref()==Some(expected), "Compaction request changed");
+    }
+
     let mut warnings = Vec::new();
     let runner = match HookRunner::load_with_plugins(context, workspace) {
         Ok(runner) => Some(runner),

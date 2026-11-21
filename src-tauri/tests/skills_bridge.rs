@@ -186,14 +186,7 @@ async fn skills_bridge_streams_with_permissions_rejects_disabled_and_supports_ex
         !dir.path().join("late.txt").exists(),
         "Explicit Stop left the child process running"
     );
-    let rows = db
-        .with_conn(|conn| {
-            deepseek_desktop_tauri_lib::db::message_repo::get_messages_by_conversation(
-                conn, &cancel_id,
-            )
-        })
-        .unwrap()
-        .unwrap();
+    let rows = db.open_session(&cancel_id).unwrap().read(|r|r.messages()).unwrap();
     assert!(
         rows.iter()
             .any(|row| row.role == "assistant" && row.content.contains("partial skill evidence")),

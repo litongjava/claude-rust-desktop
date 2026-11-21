@@ -256,15 +256,7 @@ async fn conversation_status_context_size_and_stop_generation_routes() {
         !dir.path().join("late.txt").exists(),
         "stop-generation left the tool running"
     );
-    let rows = db
-        .with_conn(|conn| {
-            deepseek_desktop_tauri_lib::db::message_repo::get_messages_by_conversation(
-                conn,
-                &conversation,
-            )
-        })
-        .unwrap()
-        .unwrap();
+    let rows = db.open_session(&conversation).unwrap().read(|r|r.messages()).unwrap();
     assert!(
         rows.iter()
             .any(|row| row.role == "assistant"
