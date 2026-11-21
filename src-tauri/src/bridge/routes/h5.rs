@@ -1,89 +1,41 @@
+use super::super::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use axum::response::IntoResponse;
+use deepseek_code_core::db::session_store::H5Session;
 use serde::Deserialize;
-use serde_json;
-use std::convert::Infallible;
-use std::sync::Arc;
-use tokio::time::Duration;
+use serde_json::{json, Value};
 
-use super::super::AppState;
-use crate::db::DbManager;
-
-async fn validate_h5_token_from_db(
-    db_manager: &Arc<DbManager>,
-    token: &str,
-) -> Result<crate::db::h5_repo::H5TokenRow, StatusCode> {
-    let token_str = token.to_string();
-    let db = db_manager.clone();
-    let inner_result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::db::h5_repo::validate_h5_token(conn, &token_str)
-                .map_err(|e| {
-                    tracing::error!(module = "H5_API", "DB error: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })
-        })
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!(module = "H5_API", "spawn_blocking error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let inner_result = inner_result.map_err(|e| {
-        tracing::error!(module = "H5_API", "with_conn error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })??;
-
-    inner_result.ok_or(StatusCode::UNAUTHORIZED)
+async fn authorize(state: &AppState, token: String) -> Result<H5Session, StatusCode> {
+    let db = state.db_manager.clone();
+    tokio::task::spawn_blocking(move || db.authorize_h5(&token))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!("H5 authorization failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
-
 async fn h5_access_handler(
     Path(token): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let db_manager = state.db_manager.clone();
-
-    let token_row = match validate_h5_token_from_db(&db_manager, &token).await {
-        Ok(row) => row,
-        Err(status) => {
-            return (status, Json(serde_json::json!({
-                "error": "Invalid or expired token"
-            }))).into_response();
+    let grant = match authorize(&state, token).await {
+        Ok(g) => g,
+        Err(code) => {
+            return (code, Json(json!({"error":"Invalid or expired token"}))).into_response()
         }
     };
-
-    let conv_id = token_row.conversation_id.clone();
-    let db = db_manager.clone();
-    let cid = conv_id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| -> anyhow::Result<serde_json::Value> {
-            let conv = crate::db::conversation_repo::get_conversation(conn, &cid)?;
-            let msgs = crate::db::message_repo::get_messages_by_conversation(conn, &cid)?;
-            Ok(serde_json::json!({
-                "success": true,
-                "conversation": conv,
-                "messages": msgs,
-            }))
-        })
-    })
-    .await;
-
-    match result {
-        Ok(Ok(Ok(json))) => (StatusCode::OK, Json(json)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to fetch conversation"
-        }))).into_response(),
+    match tokio::task::spawn_blocking(move||grant.messages().map(|messages|json!({"success":true,"conversation":grant.conversation,"messages":messages}))).await {
+        Ok(Ok(value))=>Json(value).into_response(),
+        _=>(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"Failed to fetch conversation"}))).into_response(),
     }
 }
-
 #[derive(Deserialize)]
 struct H5ChatRequest {
     message: String,
@@ -95,254 +47,78 @@ async fn h5_chat_handler(
     State(state): State<AppState>,
     Json(req): Json<H5ChatRequest>,
 ) -> impl IntoResponse {
-    let db_manager = state.db_manager.clone();
-
-    let token_row = match validate_h5_token_from_db(&db_manager, &token).await {
-        Ok(row) => row,
-        Err(status) => {
-            return (status, Json(serde_json::json!({
-                "error": "Invalid or expired token"
-            }))).into_response();
+    let grant = match authorize(&state, token).await {
+        Ok(g) => g,
+        Err(code) => {
+            return (code, Json(json!({"error":"Invalid or expired token"}))).into_response()
         }
     };
-
-    let conv_id = token_row.conversation_id.clone();
-    let message = req.message.clone();
-    let model = req.model.clone().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-
-    tracing::info!(module = "H5_Chat", "token={}, conv_id={}, model={}", token, conv_id, model);
-
-    let native_engine = state.native_engine.clone();
-    let rx_opt = {
-        let mut engine_guard = native_engine.lock().await;
-        if let Some(engine) = engine_guard.as_mut() {
-            let chat_req = crate::native_engine::engine_core::ChatRequest {
-                max_turns: None,
-                response_schema: None,
-                provider_id: None, effort: None,
-                conversation_id: conv_id.clone(),
-                context_boundary: None,
-                assistant_message_id: None,
-                messages: vec![serde_json::json!({
-                    "role": "user",
-                    "content": message
-                })],
-                model: model.clone(),
-                system_prompt: None,
-                standalone_frontend: false,
-                max_tokens: None,
-                workspace_path: None,
-                temperature: None,
-                top_p: None,
-                reasoning_mode: None,
-            };
-            match engine.send_message(chat_req).await {
-                Ok(rx) => Some(rx),
-                Err(e) => {
-                    tracing::error!(module = "H5_Chat", "Engine error: {}", e);
-                    None
-                }
-            }
-        } else {
-            tracing::error!(module = "H5_Chat", "Engine not initialized");
-            None
-        }
-    };
-
-    let db_for_stream = state.db_manager.clone();
-    let stream = async_stream::stream! {
-        let mut rx = match rx_opt {
-            Some(rx) => rx,
-            None => {
-                yield Ok::<Event, Infallible>(Event::default().data(
-                    serde_json::json!({"type": "error", "error": "Engine not available"}).to_string()
-                ));
-                return;
-            }
-        };
-
-        let mut full_text = String::new();
-        let mut permission_watches = super::permission_watch::PermissionWatches::default();
-        loop {
-            let event = tokio::select! {
-                biased;
-                resolved = permission_watches.next(&conv_id), if !permission_watches.is_empty() => {
-                    yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
-                    continue;
-                }
-                event = rx.recv() => match event { Some(event) => event, None => break },
-            };
-            let event_data = match event {
-                crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(_) => None,
-                crate::native_engine::tool_loop::EngineEvent::ContextReset { .. } => { full_text.clear(); None },
-                crate::native_engine::tool_loop::EngineEvent::MessageStart { model } => {
-                    Some(serde_json::json!({
-                        "type": "message_start",
-                        "model": model,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::QueuedInput(text) => {
-                    Some(serde_json::json!({"type": "queued_input", "text": text}))
-                }
-                crate::native_engine::tool_loop::EngineEvent::Text(text) => {
-                    full_text.push_str(&text);
-                    Some(serde_json::json!({
-                        "type": "content_block_delta",
-                        "delta": {"type": "text_delta", "text": text},
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::Thinking(thinking) => {
-                    Some(serde_json::json!({
-                        "type": "thinking",
-                        "thinking": thinking,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::NestedToolCall { tool_use_id, parent_tool_use_id, sequence } => {
-                    Some(serde_json::json!({
-                        "type": "nested_tool_call",
-                        "tool_use_id": tool_use_id,
-                        "parent_tool_use_id": parent_tool_use_id,
-                        "sequence": sequence,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::ToolUseStart { tool_use_id, tool_name, tool_input, .. } => {
-                    Some(serde_json::json!({
-                        "type": "tool_use_start",
-                        "tool_use_id": tool_use_id,
-                        "tool_name": tool_name,
-                        "tool_input": tool_input,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error } => {
-                    Some(serde_json::json!({
-                        "type": "tool_use_done",
-                        "tool_use_id": tool_use_id,
-                        "tool_name": tool_name,
-                        "tool_input": tool_input,
-                        "output": output,
-                        "is_error": is_error,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::MessageStop { full_text: _ft, stop_reason } => {
-                    for resolved in permission_watches.finish(&conv_id) {
-                        yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
-                    }
-                    Some(serde_json::json!({
-                        "type": "message_stop",
-                        "stop_reason": stop_reason,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::Error(error) => {
-                    for resolved in permission_watches.finish(&conv_id) {
-                        yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
-                    }
-                    tracing::error!(module = "H5_Chat", "Engine error event: {}", error);
-                    Some(serde_json::json!({
-                        "type": "error",
-                        "error": error,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::Usage(usage) => {
-                    Some(serde_json::json!({
-                        "type": "usage",
-                        "usage": usage,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::ToolPermission { request_id, tool_use_id, tool_name, input } => {
-                    let closed = match native_engine.lock().await.as_ref() {
-                        Some(engine) => engine.permission_completion(&request_id).await,
-                        None => tokio::sync::watch::channel(true).1,
-                    };
-                    if !permission_watches.register(&request_id, &tool_use_id, closed) {
-                        yield Ok::<Event, Infallible>(Event::default().data(super::permission_watch::resolved(&conv_id, &request_id, &tool_use_id).to_string()));
-                        continue;
-                    }
-                    Some(serde_json::json!({
-                        "type": "tool_permission",
-                        "toolscript": deepseek_code_core::native_engine::permission_response::toolscript_origin(&request_id),
-                        "request_id": request_id,
-                        "tool_use_id": tool_use_id,
-                        "tool_name": tool_name,
-                        "input": input,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::AskUser { .. } |
-                crate::native_engine::tool_loop::EngineEvent::MessageDelta { .. } |
-                crate::native_engine::tool_loop::EngineEvent::ToolArgDelta { .. } |
-                crate::native_engine::tool_loop::EngineEvent::PipelineToolResult { .. } => None,
-                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
-                    Some(serde_json::json!({
-                        "type": "agent_progress",
-                        "session_id": session_id,
-                        "agent_type": agent_type,
-                        "status": status,
-                        "tool_name": tool_name,
-                    }))
-                }
-                crate::native_engine::tool_loop::EngineEvent::RequestAttempt(event) => Some(event),
-                crate::native_engine::tool_loop::EngineEvent::BudgetWarning { message, usage, limit } => {
-                    Some(serde_json::json!({
-                        "type": "budget_warning",
-                        "message": message,
-                        "usage": usage,
-                        "limit": limit,
-                    }))
-                }
-            };
-
-            if let Some(data) = event_data {
-                yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
-            }
-        }
-
-        for resolved in permission_watches.finish(&conv_id) {
-            yield Ok::<Event, Infallible>(Event::default().data(resolved.to_string()));
-        }
-        let db = db_for_stream.clone();
-        let conv_id_save = conv_id.clone();
-        let full_text_save = full_text.clone();
-        let model_save = model.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let now = chrono::Utc::now().to_rfc3339();
-                let sort_order = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
-                    .unwrap_or_default()
-                    .len() as i64;
-                let _ = crate::db::message_repo::insert_message(
-                    conn,
-                    &uuid::Uuid::new_v4().to_string(),
-                    &conv_id_save,
-                    "assistant",
-                    &full_text_save,
-                    None,
-                    &now,
-                    false,
-                    sort_order,
-                );
-                let count = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
-                    .unwrap_or_default()
-                    .len() as i64;
-                let _ = conn.execute(
-                    "UPDATE conversations SET message_count = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![count, &now, &conv_id_save],
-                );
-                let _ = conn.execute(
-                    "UPDATE conversations SET model = ?1 WHERE id = ?2 AND model IS NULL",
-                    rusqlite::params![model_save, conv_id_save],
-                );
-                tracing::error!(module = "H5_Chat", "Assistant message saved: conv={}, len={}", conv_id_save, full_text_save.len());
-                Ok::<(), anyhow::Error>(())
-            })
-        }).await;
-    };
-
-    Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive-text"),
+    let id = grant.conversation.id.clone();
+    let _gate = super::input_queue::gate(&state, &id).await;
+    if state.generation_runs.is_active(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"Conversation is running"})),
         )
-        .into_response()
+            .into_response();
+    }
+    let request = crate::native_engine::engine_core::ChatRequest {
+        conversation_id: id,
+        messages: vec![json!({"role":"user","content":req.message})],
+        model: req.model.unwrap_or_else(|| "claude-sonnet-4-6".into()),
+        context_boundary: None,
+        provider_id: None,
+        assistant_message_id: None,
+        effort: None,
+        system_prompt: None,
+        standalone_frontend: false,
+        max_tokens: None,
+        max_turns: None,
+        response_schema: None,
+        workspace_path: None,
+        temperature: None,
+        top_p: None,
+        reasoning_mode: None,
+    };
+    super::chat::start_authorized_chat(state, request, None, Some(grant)).await
+}
+
+pub(super) fn client_event(value: Value) -> Option<Value> {
+    let fields: &[&str] = match value["type"].as_str()? {
+        "request_snapshot"
+        | "ask_user"
+        | "tool_arg_delta"
+        | "message_delta"
+        | "pipeline_tool_result"
+        | "context_reset" => return None,
+        "message_start" => &["model"],
+        "tool_use_start" => &["tool_use_id", "tool_name", "tool_input"],
+        "tool_use_done" => &[
+            "tool_use_id",
+            "tool_name",
+            "tool_input",
+            "output",
+            "is_error",
+        ],
+        "tool_permission" => &[
+            "toolscript",
+            "request_id",
+            "tool_use_id",
+            "tool_name",
+            "input",
+        ],
+        "queued_input" => {
+            return Some(
+                json!({"type":"queued_input","text":{"text":value["text"],"content":value["content"],"origin":value["origin"]}}),
+            )
+        }
+        _ => return Some(value),
+    };
+    let mut event = json!({"type":value["type"]});
+    for &field in fields {
+        event[field] = value[field].clone();
+    }
+    Some(event)
 }
 
 pub fn routes() -> Router<AppState> {

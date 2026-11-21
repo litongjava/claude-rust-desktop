@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::Projects;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
     runtime::RuntimePaths,
@@ -172,13 +173,13 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
         match request {
             Request::SkillImportLegacy {source,preview} => Ok(json!(deepseek_code_core::skills::import::import_legacy(&source,&context.paths.data_dir.join("skills"),preview)?)),
             Request::Cron {project_id,operation} => {
-                let project=context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project=context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");
                 let root=project.workspace_path.context("Project has no workspace")?;
                 deepseek_code_core::tools::scheduled::execute(operation,&root)
             }
             Request::CronStart {project_id,provider,model} => {
-                let project=context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project=context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");
                 let root=project.workspace_path.context("Project has no workspace")?;
                 Generator::saved(&context.paths,&provider,&model)?;
@@ -217,7 +218,7 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
                 run_network(&host,id,async {Ok(json!(deepseek_code_core::services::remote_access::ssh(&config,operation).await?))}).await
             }
             Request::SessionImport {source,project_id,preview} => {
-                let project=context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project=context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");let root=project.workspace_path.context("Project has no workspace")?;
                 Ok(json!(deepseek_code_core::services::session_import::import_into_project(&context,&source,std::path::Path::new(&root),preview,Some(&project_id))?))
             }
@@ -232,7 +233,7 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
             Request::PluginRemove {id} => {deepseek_code_core::services::plugins::remove(&context,&id)?;Ok(json!({"removed":id}))},
             Request::PluginRun {id,command,input,project_id,confirmed} => {
                 ensure!(confirmed,"Confirm plugin execution first");
-                let project=context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project=context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");
                 let root=project.workspace_path.context("Project has no workspace")?;
                 deepseek_code_core::services::plugins::run(&context,&id,&command,input,std::path::Path::new(&root)).await
@@ -243,7 +244,7 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
             Request::Agents => Ok(json!(deepseek_code_core::services::agents::list(&context)?)),
             Request::AgentImport { definition } => {deepseek_code_core::services::agents::install(&context,definition)?;Ok(json!({"imported":true}))}
             Request::AgentCreate { project_id,agent_type,provider,model } => {
-                let project = context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project = context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");
                 let root = project.workspace_path.context("Project has no workspace")?;
                 let definition = deepseek_code_core::services::agents::resolve(&context,&agent_type)?;
@@ -257,7 +258,7 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
             }
             Request::Magic { project_id, operation } => {
                 use deepseek_code_core::services::magic_docs as docs;
-                let project = context.db.with_conn(|c| deepseek_code_core::db::project_repo::require_trusted(c, &project_id))??;
+                let project = context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived, "Select an active project");
                 let root = std::path::PathBuf::from(project.workspace_path.context("Project has no workspace")?);
                 match operation {
@@ -333,7 +334,7 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
             Request::VoiceConfig {config}=> {config.validate()?;context.save_setting("voice",&config)?;Ok(json!(config))}
             Request::TeamAuth {config}=> {team::auth(&context,config).await?;Ok(json!({"authenticated":true}))}
             Request::TeamContext {project_id,enabled} => {
-                let project=context.db.with_conn(|c|deepseek_code_core::db::project_repo::require_trusted(c,&project_id))??;
+                let project=context.db.trusted_project(&project_id)?;
                 ensure!(!project.is_archived,"Select an active project");
                 let root=project.workspace_path.context("Project has no workspace")?;
                 if let Some(enabled)=enabled {Ok(json!(team::configure_model_context(&context,std::path::Path::new(&root),enabled)?))}

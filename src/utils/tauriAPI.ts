@@ -259,8 +259,8 @@ export const diffAPI = {
     return invoke('apply_diff', { diffId });
   },
 
-  async rejectDiff(diffId: string): Promise<void> {
-    return invoke('reject_diff', { diffId });
+  async rejectDiff(diffId: string, conversationId?: string): Promise<void> {
+    return invoke('reject_diff', { diffId, conversationId });
   },
 
   async getCodeDiffs(conversationId: string, messageId?: string): Promise<CodeDiffInfo[]> {

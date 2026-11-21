@@ -34,6 +34,16 @@ pub(super) async fn start_chat(
     req: ChatRequest,
     queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
 ) -> axum::response::Response {
+    start_authorized_chat(state,req,queued,None).await
+}
+
+pub(super) async fn start_authorized_chat(
+    state: AppState,
+    req: ChatRequest,
+    queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
+    grant: Option<deepseek_code_core::db::session_store::H5Session>,
+) -> axum::response::Response {
+    let h5 = grant.is_some();
     crate::metrics::HTTP_REQUESTS_TOTAL.inc();
     let _request_timer = crate::metrics::HTTP_REQUEST_DURATION.start_timer();
 
@@ -73,7 +83,7 @@ pub(super) async fn start_chat(
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
     let model = req.model.clone();
-    if let Err(error) = super::input_queue::remember(&state, &req) {
+    if let Err(error) = if h5 { Ok(()) } else { super::input_queue::remember(&state, &req) } {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response();
     }
     let lifecycle_state = state.clone();
@@ -204,6 +214,7 @@ pub(super) async fn start_chat(
     crate::metrics::ACTIVE_SSE_CONNECTIONS.inc();
     let stream = async_stream::stream! {
         // Keep the session owned until this stream has persisted the turn.
+        let _h5_grant = grant;
         let _turn_lease = execution_lease;
         let db_clone = db_for_stream;
         yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"turn_timing","turn":turn.record(),"assistant_id":first_assistant_id}).to_string()));
@@ -512,6 +523,10 @@ pub(super) async fn start_chat(
                     || data.get("type").and_then(|t| t.as_str()) == Some("error");
                 if is_stop { terminal_event = Some(data); break; }
                 run.record_event();
+                let data = if h5 {
+                    let Some(event) = super::h5::client_event(data) else {continue};
+                    event
+                } else {data};
                 yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
             }
         }
@@ -561,11 +576,11 @@ pub(super) async fn start_chat(
                 tracing::error!("Could not persist final assistant trajectory: {:?}", saved);
                 let _ = deepseek_code_core::services::input_queue::set_paused(&lifecycle_state.db_manager, &lifecycle_id, true);
             }
-            for snapshot in pending_snapshot_updates {
+            for snapshot in pending_snapshot_updates.into_iter().filter(|_|!h5) {
                 yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"request_snapshot", "snapshot":snapshot, "persisted":persisted}).to_string()));
             }
         }
-        if let Some(record) = final_turn {
+        if let Some(record) = final_turn.filter(|_|!h5) {
             yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"turn_timing","turn":record,"assistant_id":final_assistant_id}).to_string()));
         }
         if terminal_event.as_ref().is_none_or(|event| event["type"] == "error" || event["stop_reason"] == "cancelled" || event["stop_reason"] == "error" || event["stop_reason"] == "channel_closed") {
@@ -576,6 +591,7 @@ pub(super) async fn start_chat(
         drop(_turn_lease);
         super::input_queue::kick(lifecycle_state, lifecycle_id);
         if let Some(event) = terminal_event {
+            let event = if h5 && event["type"]=="message_stop" {serde_json::json!({"type":"message_stop","stop_reason":event["stop_reason"]})}else{event};
             yield Ok::<Event, Infallible>(Event::default().data(event.to_string()));
         }
     };
@@ -586,7 +602,7 @@ pub(super) async fn start_chat(
         use futures::StreamExt;
         futures::pin_mut!(stream);
         while let Some(event) = stream.next().await {
-            let _ = sse_tx.send(event).await;
+            if sse_tx.send(event).await.is_err() && h5 { break; }
         }
     });
     let mut response = Sse::new(tokio_stream::wrappers::ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()).into_response();

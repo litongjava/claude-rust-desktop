@@ -1,5 +1,7 @@
 //! Process-local resolver for the global directory and incarnation-bound session shards.
 mod approvals;
+mod access;
+pub use access::{H5Session,HostAccess};
 mod agents;
 pub use agents::AgentCatalog;
 mod admission;

@@ -355,7 +355,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
             }}
             onReject={async () => {
               try {
-                await invoke('reject_diff', { diffId: diff.id });
+                await invoke('reject_diff', { diffId: diff.id, conversationId: diff.conversation_id ?? msg.conversation_id });
                 const updated = msg.codeDiffs.map((d: any) =>
                   d.id === diff.id ? { ...d, status: 'rejected' } : d
                 );

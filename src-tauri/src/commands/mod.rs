@@ -12,6 +12,7 @@ pub fn app_data_dir() -> Result<std::path::PathBuf, String> {
     .clone()
 }
 
+use deepseek_code_core::db::session_store::{HostAccess,SessionAccess};
 use deepseek_code_core::db::session_store::Schedules;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
 use crate::db::DbManager;
@@ -686,6 +687,7 @@ pub fn apply_diff(content: String, diff_text: String) -> Result<String, String> 
 #[tauri::command]
 pub async fn reject_diff(
     app_handle: tauri::AppHandle,
+    conversation_id: Option<String>,
     diff_id: String,
 ) -> Result<(), String> {
     let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
@@ -693,9 +695,7 @@ pub async fn reject_diff(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::diff_repo::update_diff_status(conn, &diff_id, "rejected", None)
-        })?
+        db_manager.reject_diff(conversation_id.as_deref(), &diff_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -712,9 +712,7 @@ pub async fn get_code_diffs(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::diff_repo::get_diffs_by_conversation(conn, &conversation_id)
-        })?
+        db_manager.select_session(&conversation_id)?.diffs()
     })
     .await
     .map_err(|e| e.to_string())?
@@ -740,9 +738,7 @@ pub async fn generate_h5_token(
     let token_clone = token.clone();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::h5_repo::insert_h5_token(conn, &id, &token_clone, &conversation_id, &expires_str, &now)
-        })?
+        db_manager.insert_h5_token(&id, &token_clone, &conversation_id, &expires_str, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -761,9 +757,7 @@ pub async fn revoke_h5_token(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::h5_repo::revoke_h5_token(conn, &token_id)
-        })?
+        db_manager.revoke_h5_token(&token_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -780,9 +774,7 @@ pub async fn list_h5_tokens(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::h5_repo::list_h5_tokens_by_conversation(conn, &conversation_id)
-        })?
+        db_manager.list_h5_tokens_by_conversation(&conversation_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -799,9 +791,7 @@ pub async fn validate_h5_token(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::h5_repo::validate_h5_token(conn, &token)
-        })?
+        db_manager.validate_h5_token(&token)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -817,9 +807,7 @@ pub async fn cleanup_expired_h5_tokens(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::h5_repo::cleanup_expired_tokens(conn)
-        })?
+        db_manager.cleanup_expired_tokens()
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1022,12 +1010,7 @@ pub async fn request_permission_approval(
     let id_clone = id.clone();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::insert_permission_approval(
-                conn, &id_clone, &conversation_id, &message_id,
-                &tool_name, &action, &risk_level, "pending", &now,
-            )
-        })?
+        db_manager.select_session(&conversation_id)?.request_approval(&id_clone, &message_id, &tool_name, &action, &risk_level, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1049,11 +1032,7 @@ pub async fn approve_permission(
     let now = chrono::Utc::now().to_rfc3339();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::decide_for_session(
-                conn, conversation_id.as_deref(), &approval_id, "approved", None, &now,
-            )
-        })?
+        db_manager.decide_approval(conversation_id.as_deref(), &approval_id, "approved", None, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1074,11 +1053,7 @@ pub async fn reject_permission(
     let now = chrono::Utc::now().to_rfc3339();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::decide_for_session(
-                conn, conversation_id.as_deref(), &approval_id, "rejected", reason.as_deref(), &now,
-            )
-        })?
+        db_manager.decide_approval(conversation_id.as_deref(), &approval_id, "rejected", reason.as_deref(), &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1095,9 +1070,7 @@ pub async fn get_pending_approvals(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::get_pending_approvals(conn, &conversation_id)
-        })?
+        db_manager.select_session(&conversation_id)?.pending_approvals()
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1119,11 +1092,7 @@ pub async fn always_allow_permission(
     let rule_pattern = format!("{}:{}", tool_name, action);
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::insert_always_allow_rule(
-                conn, &id, &rule_pattern, "combined", &now, &now,
-            )
-        })?
+        db_manager.insert_always_allow_rule(&id, &rule_pattern, "combined", &now, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1379,11 +1348,7 @@ pub async fn add_always_allow_rule(
     let now = chrono::Utc::now().to_rfc3339();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::insert_always_allow_rule(
-                conn, &id, &rule_pattern, &rule_type, &now, &now,
-            )
-        })?
+        db_manager.insert_always_allow_rule(&id, &rule_pattern, &rule_type, &now, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1400,9 +1365,7 @@ pub async fn remove_always_allow_rule(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::delete_always_allow_rule(conn, &rule_id)
-        })?
+        db_manager.delete_always_allow_rule(&rule_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1418,9 +1381,7 @@ pub async fn get_always_allow_rules(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::permission_repo::get_always_allow_rules(conn)
-        })?
+        db_manager.get_always_allow_rules()
     })
     .await
     .map_err(|e| e.to_string())?

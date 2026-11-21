@@ -772,3 +772,24 @@ fn synced_project_chat_uses_the_locally_trusted_workspace() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn h5_tokens_resolve_only_the_issuing_incarnation_and_expire_with_it() -> Result<()> {
+    use deepseek_code_core::db::session_store::HostAccess;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let shard=stores.create("phone",Default::default())?;
+    let other=stores.create("other",Default::default())?;
+    shard.write(|w|w.append("user","phone question").map(drop))?;
+    other.write(|w|w.append("user","unrelated").map(drop))?;
+    let expiry = (chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339();
+    stores.insert_h5_token("grant","token","phone",&expiry,&chrono::Utc::now().to_rfc3339())?;
+    let grant=stores.authorize_h5("token")?.unwrap();
+    assert_eq!(grant.conversation.id,"phone");
+    assert_eq!(grant.messages()?.iter().map(|m|m.content.as_str()).collect::<Vec<_>>(),["phone question"]);
+    drop(grant);
+    shard.delete()?;
+    stores.create("phone",Default::default())?;
+    assert!(stores.authorize_h5("token")?.is_none());
+    Ok(())
+}

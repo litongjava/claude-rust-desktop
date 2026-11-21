@@ -1,6 +1,7 @@
 pub mod routes;
 pub mod server_mode;
 
+use deepseek_code_core::db::session_store::HostAccess;
 use crate::clipboard::ClipboardManager;
 use crate::config::{AppConfig, ConfigManager};
 use crate::cost_tracker::CostTracker;
@@ -223,17 +224,6 @@ impl BridgeServer {
             tracing::error!(module = "Bridge", error = %e);
         }
 
-        tracing::info!(module = "Bridge", "Database initialized at {:?}", data_dir.join(deepseek_code_core::runtime::DATABASE_FILE));
-        tracing::info!(module = "Bridge", "Running migration check...");
-        {
-            let data_dir_ref = &data_dir;
-            db_manager.with_conn(|conn| {
-                if let Err(e) = crate::db::migration::check_and_migrate(data_dir_ref, conn) {
-                    tracing::warn!(module = "Bridge", error = %e);
-                }
-            }).ok();
-        }
-        tracing::info!(module = "Bridge", "Migration check completed");
         let logger = Logger::new(log_dir);
         let file_watcher = FileWatcher::new();
 
@@ -257,11 +247,7 @@ impl BridgeServer {
         // 注册 always_allow 检查器，使 PermissionManager 能够通过数据库检查始终允许规则
         let db_for_checker = db_manager.clone();
         permission_manager.set_always_allow_checker(Box::new(move |tool_name: &str, action: &str| -> bool {
-            let tool = tool_name.to_string();
-            let act = action.to_string();
-            db_for_checker.with_conn(|conn| {
-                crate::db::permission_repo::check_always_allowed(conn, &tool, &act)
-            }).unwrap_or(false)
+            db_for_checker.always_allowed(tool_name, action)
         }));
 
         let file_cache = Arc::new(FileCache::new());
@@ -579,9 +565,7 @@ async fn system_status() -> Json<SystemStatus> {
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let db_healthy = {
         let db = &state.db_manager;
-        db.with_conn(|conn| {
-            conn.execute_batch("SELECT 1")
-        }).is_ok()
+        db.directory_healthy()
     };
 
     let active_sse = crate::metrics::ACTIVE_SSE_CONNECTIONS.get();

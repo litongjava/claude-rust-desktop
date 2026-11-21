@@ -308,7 +308,7 @@ const MessageList = React.memo<MessageListProps>(({
                       }}
                       onReject={readOnly ? undefined : async () => {
                         try {
-                          await invoke('reject_diff', { diffId: diff.id });
+                          await invoke('reject_diff', { diffId: diff.id, conversationId: conversationId });
                           if ((msg as any).codeDiffs) {
                             const updated = (msg as any).codeDiffs.map((d: any) =>
                               d.id === diff.id ? { ...d, status: 'rejected' } : d
