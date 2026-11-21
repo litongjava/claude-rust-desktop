@@ -57,11 +57,21 @@ const RECORDS: &[(&str, &str, &str, &str)] = &[
 
 impl Stores {
     pub fn export_session(path: &Path, id: &str, output: impl Write) -> Result<()> {
+        Self::export_session_interruptible(path, id, output, &|| Ok(()))
+    }
+
+    pub fn export_session_interruptible(
+        path: &Path,
+        id: &str,
+        output: impl Write,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
         layout::allow_entry()?;
+        check()?;
         let key = layout::storage_key(id)?;
         let locks = path.join("session-locks");
-        let _namespace = shared_lock(&locks.join(".directory"))?;
-        let _key = shared_lock(&locks.join(&key))?;
+        let _namespace = shared_lock(&locks.join(".directory"), check)?;
+        let _key = shared_lock(&locks.join(&key), check)?;
         let shard = path.join("sessions").join(&key);
         ensure!(
             shard.join("session.db").is_file()
@@ -73,16 +83,17 @@ impl Stores {
         let _permit = layout::Permits::take(1);
         let mut stream = Stream {
             output,
+            check,
             counts: BTreeMap::new(),
             digest: Sha256::new(),
         };
         const ATTEMPTS: usize = 8;
         for _ in 0..ATTEMPTS {
-            let mut directory = source::Source::open(&global)?;
+            let mut directory = source::Source::open(&global, check)?;
             // Pin the directory row before acquiring the shard snapshot. Large header
             // fields can then stream from that same row after the revision fence.
             let header = directory.db.transaction()?;
-            layout::verify(&header, layout::GLOBAL)?;
+            layout::verify_export(&header, layout::GLOBAL)?;
             let store: String = header.query_row(
                 "SELECT store_uuid FROM store_identity WHERE singleton=1",
                 [],
@@ -97,10 +108,10 @@ impl Stores {
                      WHERE id=?1 AND storage_key=?2 AND NOT EXISTS
                      (SELECT 1 FROM lifecycle WHERE storage_key=?2 AND quarantine_reason IS NULL)",
                     [id, &key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.context("Session unavailable")?;
-            let mut source = source::Source::open(&shard.join("session.db"))?;
+            let mut source = source::Source::open(&shard.join("session.db"), check)?;
             let tx = source.db.transaction()?;
             super::verify_manifest(&tx, &store, id, &incarnation)?;
-            layout::verify(&tx, layout::SESSION)?;
+            layout::verify_export(&tx, layout::SESSION)?;
             layout::integrity(&tx)?;
             let (content, count, activity, status): (i64, i64, String, Option<String>) = tx
                 .query_row(
@@ -108,7 +119,7 @@ impl Stores {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
-            let current: i64 = source::Source::open(&global)?.db.query_row(
+            let current: i64 = source::Source::open(&global, check)?.db.query_row(
                 "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
                 [id, &incarnation],
                 |r| r.get(0),
@@ -145,20 +156,30 @@ impl Stores {
     }
 }
 
-fn shared_lock(path: &Path) -> Result<std::fs::File> {
+fn shared_lock(path: &Path, check: &dyn Fn() -> Result<()>) -> Result<std::fs::File> {
     let file = std::fs::File::open(path).context("Session unavailable")?;
-    file.lock_shared()?;
-    Ok(file)
+    loop {
+        check()?;
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+        }
+    }
 }
 
-struct Stream<W> {
+struct Stream<'a, W> {
+    check: &'a dyn Fn() -> Result<()>,
     output: W,
     counts: BTreeMap<&'static str, u64>,
     digest: Sha256,
 }
 
-impl<W: Write> Stream<W> {
+impl<W: Write> Stream<'_, W> {
     fn line(&mut self, kind: &'static str, record: &mut Value) -> Result<()> {
+        (self.check)()?;
         record["type"] = json!(kind);
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
@@ -169,6 +190,7 @@ impl<W: Write> Stream<W> {
     }
 
     fn finish(&mut self) -> Result<()> {
+        (self.check)()?;
         let hash = format!("{:x}", std::mem::take(&mut self.digest).finalize());
         serde_json::to_writer(
             &mut self.output,
@@ -189,7 +211,7 @@ impl<W: Write> Stream<W> {
     ) -> Result<()> {
         // Rewind can leave unreferenced deduplicated headers behind.
         let filter = if kind == "request_blob" {
-            references::index(db)?;
+            references::index(db, self.check)?;
             "WHERE hash IN (SELECT hash FROM temp.export_refs)"
         } else {
             ""
@@ -217,7 +239,17 @@ impl<W: Write> Stream<W> {
         let owner = format!("{kind}/{rowid}");
         let mut pending = Vec::new();
         for field in columns.split_whitespace() {
-            read_field(db, table, rowid, field, field, &owner, record, &mut pending)?;
+            read_field(
+                db,
+                table,
+                rowid,
+                field,
+                field,
+                &owner,
+                record,
+                &mut pending,
+                self.check,
+            )?;
         }
         if kind == "message" {
             let (turn,typed): (Option<i64>,Option<i64>) = db.query_row(
@@ -235,7 +267,17 @@ impl<W: Write> Stream<W> {
             ] {
                 record[field] = Value::Null;
                 if let Some(row) = row {
-                    read_field(db, source, row, column, field, &owner, record, &mut pending)?;
+                    read_field(
+                        db,
+                        source,
+                        row,
+                        column,
+                        field,
+                        &owner,
+                        record,
+                        &mut pending,
+                        self.check,
+                    )?;
                 }
             }
         }
@@ -293,6 +335,7 @@ fn read_field<'a>(
     owner: &str,
     record: &mut Value,
     pending: &mut Vec<(String, String, Blob<'a>)>,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     // Read the storage class first. SQLite can answer typeof from the record header.
     let sql = format!("SELECT typeof({column}),CASE WHEN typeof({column}) NOT IN ('text','blob') THEN {column} END FROM {table} WHERE rowid=?1");
@@ -331,6 +374,7 @@ fn read_field<'a>(
                 }
                 let mut hash = Sha256::new();
                 visit_chunks(&blob, |_, bytes| {
+                    check()?;
                     hash.update(bytes);
                     Ok(())
                 })?;

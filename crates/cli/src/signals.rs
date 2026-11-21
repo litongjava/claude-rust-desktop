@@ -331,6 +331,12 @@ pub async fn interrupted() {
     }
 }
 
+/// A one-shot command has no earlier turn whose interrupt can be ignored.
+pub(crate) fn received_signal() -> bool {
+    LISTENER.get().and_then(|listener| listener.as_ref().ok())
+        .is_some_and(|state| state.is_terminating() || *state.sender.borrow() != 0)
+}
+
 /// True once termination is requested. Safe to check from a terminal reader
 /// thread, which must never install the async listener itself.
 pub fn terminating() -> bool {

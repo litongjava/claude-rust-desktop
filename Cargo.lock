@@ -1670,6 +1670,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "tokio",
  "tracing",

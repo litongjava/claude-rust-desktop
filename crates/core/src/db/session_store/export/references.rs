@@ -4,26 +4,34 @@
 use anyhow::Result;
 use rusqlite::{Connection, DatabaseName, OptionalExtension};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use std::{fmt, io::BufReader};
+use std::{
+    fmt,
+    io::{self, BufReader, Read},
+};
 
-pub(super) fn index(db: &Connection) -> Result<()> {
+pub(super) fn index(db: &Connection, check: &dyn Fn() -> Result<()>) -> Result<()> {
     db.execute_batch("CREATE TEMP TABLE export_refs(hash TEXT PRIMARY KEY) WITHOUT ROWID")?;
     let mut rows = db.prepare("SELECT rowid FROM message_trajectory")?;
     for id in rows.query_map([], |r| r.get(0))? {
-        let blob = db.blob_open(
+        check()?;
+        let mut blob = db.blob_open(
             DatabaseName::Main,
             "message_trajectory",
             "requests_json",
             id?,
             true,
         )?;
-        let mut json = serde_json::Deserializer::from_reader(BufReader::new(blob));
+        let reader = CheckedRead {
+            inner: &mut blob,
+            check,
+        };
+        let mut json = serde_json::Deserializer::from_reader(BufReader::new(reader));
         Scan::Array(db).deserialize(&mut json)?;
         json.end()?;
     }
     let missing: Option<String> = db
         .query_row(
-            "SELECT hash FROM temp.export_refs EXCEPT SELECT hash FROM request_blobs LIMIT 1",
+            "SELECT hash FROM temp.export_refs r WHERE NOT EXISTS (SELECT 1 FROM request_blobs b WHERE b.hash=r.hash) LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -32,6 +40,19 @@ pub(super) fn index(db: &Connection) -> Result<()> {
         anyhow::bail!("Missing request blob {hash}");
     }
     Ok(())
+}
+
+// Check once per buffered refill, including within a single large snapshot.
+struct CheckedRead<'a, R> {
+    inner: &'a mut R,
+    check: &'a dyn Fn() -> Result<()>,
+}
+
+impl<R: Read> Read for CheckedRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (self.check)().map_err(io::Error::other)?;
+        self.inner.read(buf)
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -851,3 +851,90 @@ fn export_closed_databases_without_creating_sqlite_sidecars() -> Result<()> {
     assert_eq!(before, names()?);
     Ok(())
 }
+#[cfg(unix)]
+#[test]
+fn killed_cold_reader_leaves_no_private_snapshot_files() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let scratch = tempfile::tempdir()?;
+    let id = "6217631e-49bd-41f9-b922-dbb42d16c3d1";
+    let store = Stores::open(root.path())?;
+    store
+        .create(id, Default::default())?
+        .write(|w| w.append("assistant", &"x".repeat(1_000_000)))?;
+    drop(store);
+    let shard = root.path().join("sessions").join(id).join("session.db");
+    rusqlite::Connection::open(&shard)?.execute_batch("BEGIN IMMEDIATE; COMMIT")?;
+    assert!(!shard.with_extension("db-wal").exists());
+    let mut child = export(root.path(), id)
+        .env("TMPDIR", scratch.path())
+        .env("SQLITE_TMPDIR", scratch.path())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut header = Vec::new();
+    let mut pipe = BufReader::new(child.stdout.take().unwrap());
+    let received = pipe.read_until(b'\n', &mut header);
+    let killed = child.kill();
+    let status = child.wait()?;
+    killed?;
+    assert!(received? > 0 && !status.success());
+    assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupt_named_export_and_reclaim_abandoned_staging() -> Result<()> {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir()?;
+    let store = Stores::open(root.path())?;
+    let id = "6217631e-49bd-41f9-b922-dbb42d16c3d1";
+    store.create(id, Default::default())?;
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGKILL] {
+        let out = tempfile::tempdir()?;
+        let path = out.path().join("backup.jsonl");
+        let guard = fs::File::open(root.path().join("session-locks").join(id))?;
+        guard.lock()?;
+        let mut child = export(root.path(), id).arg("--output").arg(&path).spawn()?;
+        let stage = out
+            .path()
+            .join(format!(".backup.jsonl.export-{}.tmp", child.id()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_dir(out.path())?.count() == 0
+            && Instant::now() < deadline
+            && child.try_wait()?.is_none()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let signalled = unsafe { libc::kill(child.id() as i32, signal) } == 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait()?.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited = child.try_wait()?.is_some();
+        drop(guard);
+        let status = child.wait()?;
+        assert!(
+            signalled && exited && !status.success() && !path.exists(),
+            "signal {signal}: {status}"
+        );
+        if signal == libc::SIGKILL {
+            assert!(stage.is_file());
+            let live = out
+                .path()
+                .join(format!(".backup.jsonl.export-{}.tmp", std::process::id()));
+            fs::write(&live, b"live")?;
+            let other = out.path().join(".other.export-10000000.tmp");
+            fs::write(&other, b"other")?;
+            assert!(export(root.path(), id)
+                .arg("--output")
+                .arg(&path)
+                .status()?
+                .success());
+            decode(&fs::read(&path)?)?;
+            assert!(!stage.exists() && live.exists() && other.exists());
+        } else {
+            assert_eq!(fs::read_dir(out.path())?.count(), 0);
+        }
+    }
+    Ok(())
+}

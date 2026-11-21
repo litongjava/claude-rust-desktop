@@ -37,6 +37,7 @@ vte = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
+signal-hook = "0.3"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # The workflow script engine; the crate ships no Android bindings.

@@ -380,6 +380,23 @@ fn verify_version(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
 }
 
 pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> Result<()> {
+    verify_tables(conn, kind, expected, "wal")
+}
+
+// The exporter's source reader has checked the WAL header before making an
+// anonymous cold snapshot. SQLite uses a rollback journal for that private DB.
+pub(super) fn verify_export(conn: &Connection, kind: i32) -> Result<()> {
+    if conn.path() != Some("") {
+        return verify(conn, kind);
+    }
+    verify_tables(conn, kind, schema_version(kind), "delete")?;
+    if kind == SESSION {
+        verify_history(conn)?;
+    }
+    Ok(())
+}
+
+fn verify_tables(conn: &Connection, kind: i32, expected: i32, journal_mode: &str) -> Result<()> {
     let (app, version, journal): (i32, i32, String) = conn.query_row(
         "SELECT application_id,user_version,journal_mode FROM pragma_application_id,pragma_user_version,pragma_journal_mode",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -389,8 +406,8 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     if version != expected {
         return Err(InvalidFormat(format!("Unsupported schema version {version}")).into());
     }
-    if journal != "wal" {
-        return Err(InvalidFormat("Expected WAL journal mode".into()).into());
+    if journal != journal_mode {
+        return Err(InvalidFormat(format!("Expected {journal_mode} journal mode")).into());
     }
     let tables: &[(&str, &str)] = if kind == GLOBAL {
         &[

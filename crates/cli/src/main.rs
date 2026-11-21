@@ -5,6 +5,7 @@ mod fixture_sql;
 mod terminal_output;
 mod request_attempts;
 mod signals;
+mod session_export;
 // Local command output shares the terminal's display-only history.
 macro_rules! command_eprintln {
     ($($arg:tt)*) => {{
@@ -340,16 +341,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(Commands::Sessions {
         action: SessionCommands::Export { id, output },
     }) = &cli.command {
-        use deepseek_code_core::db::session_store::Stores;
-        if let Some(path) = output {
-            let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-            let mut file = tempfile::NamedTempFile::new_in(dir)?;
-            Stores::export_session(&paths.data_dir, id, io::BufWriter::new(file.as_file_mut()))?;
-            file.as_file().sync_all()?;
-            file.persist_noclobber(path).with_context(|| format!("Cannot publish {}", path.display()))?;
-            return Ok(());
-        }
-        return Stores::export_session(&paths.data_dir, id, io::BufWriter::new(io::stdout().lock()));
+        return session_export::run(&paths.data_dir, id, output.as_deref());
     }
     // The coordination root resolves against the launch directory, before `-C`,
     // and the same absolute root is exported for every host child later.
