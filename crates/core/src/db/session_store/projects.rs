@@ -60,6 +60,11 @@ fn save(c: &Connection, id: &str, edit: &ProjectEdit, create: bool) -> Result<Pr
             edit.archived,
         )?;
         if let Some(folders) = &edit.folders {
+            c.execute(
+                "UPDATE conversations SET metadata_revision=metadata_revision+1 WHERE project_id=?1
+                 AND id NOT IN (SELECT conversation_id FROM conversation_worktrees)",
+                [id],
+            )?;
             project::set_folders(c, id, folders)?;
         }
     }
@@ -112,6 +117,10 @@ impl Projects for Stores {
     }
     fn delete_project(&self, id: &str) -> Result<()> {
         self.global().write("delete project", id, false, |c| {
+            c.execute(
+                "UPDATE conversations SET metadata_revision=metadata_revision+1 WHERE project_id=?1",
+                [id],
+            )?;
             project::delete_project(c, id)
         })
     }

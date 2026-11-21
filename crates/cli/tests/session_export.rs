@@ -685,3 +685,6 @@ fn fresh_install_creates_only_directory_shard_and_lifecycle_files() -> Result<()
     )?;
     Ok(())
 }
+
+#[path = "session_export/race.rs"]
+mod race;

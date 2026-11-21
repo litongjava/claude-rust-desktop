@@ -70,36 +70,39 @@ impl Stores {
             digest: Sha256::new(),
         };
         shard.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |conn| {
-            loop {
-                let revision: i64 = stores.global().read(|g| Ok(g.query_row(
-                    "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
-                    [id, shard.incarnation()], |r| r.get(0))?))?;
+            let mut directory = layout::open(&path.join("global.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            const ATTEMPTS: usize = 8;
+            for _ in 0..ATTEMPTS {
+                // Pin the directory row before acquiring the shard snapshot. Large header
+                // fields can then stream from that same row after the revision fence.
+                let header = directory.transaction()?;
+                let (rowid, revision, projected, updated): (i64,i64,i64,String) = header.query_row(
+                    "SELECT rowid,metadata_revision,content_revision,updated_at FROM conversations WHERE id=?1 AND incarnation=?2",
+                    [id, shard.incarnation()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
                 let tx = conn.transaction()?;
                 let (content, count, activity, status): (i64,i64,String,Option<String>) = tx.query_row(
                     "SELECT content_revision,message_count,updated_at,last_turn_status FROM manifest",
                     [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-                let valid = stores.global().read(|g| {
-                    let header = g.unchecked_transaction()?;
-                    let (rowid, current, projected, updated): (i64,i64,i64,String) = header.query_row(
-                        "SELECT rowid,metadata_revision,content_revision,updated_at FROM conversations WHERE id=?1 AND incarnation=?2",
-                        [id, shard.incarnation()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-                    if current != revision || projected > content { return Ok(false); }
+                let current: i64 = stores.global().read(|g| Ok(g.query_row(
+                    "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
+                    [id, shard.incarnation()], |r| r.get(0))?))?;
+                if current != revision || projected > content {
+                    continue;
+                }
+                return layout::callback(|| {
                     let mut record = json!({"format":"deepseek-code.session","version":1,"session_id":id,
                         "content_revision":content,"metadata_revision":revision,"message_count":count,
                         "updated_at":super::history::latest_activity(&updated,&activity),"status":status});
                     let columns = "incarnation title project_id workspace_path workspace_mode provider model archived pinned research_mode created_at";
                     stream.record(&header, "header", "conversations", columns, rowid, &mut record)?;
-                    Ok(true)
-                })?;
-                if valid {
-                    return layout::callback(|| {
-                        for &(kind, table, order, columns) in RECORDS {
-                            stream.table(&tx, kind, table, order, columns)?;
-                        }
-                        stream.finish()
-                    });
-                }
+                    drop(header);
+                    for &(kind, table, order, columns) in RECORDS {
+                        stream.table(&tx, kind, table, order, columns)?;
+                    }
+                    stream.finish()
+                });
             }
+            anyhow::bail!("Could not acquire a consistent session export snapshot after {ATTEMPTS} attempts")
         })
     }
 }
