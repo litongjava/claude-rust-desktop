@@ -577,7 +577,7 @@ async fn watch_member(
         Ok(claim) => claim,
         Err(_) => return Ok(()),
     };
-    let lease = session_messages::ExecutionLease::acquire(&host.context.paths.data_dir, session)?;
+    let lease = host.context.db.open_session(session)?.acquire_execution()?;
     if recovery.prompt.is_none() {
         let observation = reconcile_git(task, &pending)?;
         let checkpoints =

@@ -852,21 +852,7 @@ impl QueryEngine {
         // independent caller is refused here, before any turn work.
         let execution_lease = match execution_lease {
             Some(lease) => Some(lease),
-            None => {
-                let root = self
-                    .provider_manager
-                    .lock()
-                    .await
-                    .config_path()
-                    .parent()
-                    .context("Missing runtime directory")?
-                    .to_path_buf();
-                crate::services::session_messages::ExecutionLease::acquire(
-                    &root,
-                    &request.conversation_id,
-                )?
-                .map(std::sync::Arc::new)
-            }
+            None => Some(Arc::new(self.db_manager.open_session(&request.conversation_id)?.acquire_execution()?)),
         };
         let applied_compaction = crate::services::compaction::apply_persisted_boundary(
             &self.db_manager,
