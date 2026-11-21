@@ -139,8 +139,7 @@ fn fill_default_model(input: &mut Value, data_dir: &std::path::Path) -> Option<S
 }
 
 struct ChildState {
-    context: ServiceContext,
-    key: String,
+    history: crate::db::session_store::ExecutorHistory,
     value: Value,
     event_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     request_id: String,
@@ -169,14 +168,7 @@ impl Drop for TeamTaskGuard {
 }
 impl ChildState {
     fn snapshot(&mut self, snapshot: &Value, assistant: &str) -> Result<()> {
-        let session = self.value["session_id"]
-            .as_str()
-            .context("Child session missing")?;
-        let total = self.context.db.with_conn(|conn| -> Result<u64> {
-            conn.execute("INSERT OR IGNORE INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES(?1,?2,'assistant','',?3,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))", rusqlite::params![assistant,session,chrono::Utc::now().to_rfc3339()])?;
-            crate::db::request_repo::save_request(conn, assistant, snapshot)?;
-            Ok(conn.query_row("SELECT COALESCE(SUM(output_tokens),0) FROM model_requests WHERE conversation_id=?1", [session], |row| row.get(0))?)
-        })??;
+        let total=self.history.child_request(assistant,snapshot)?;
         let id = snapshot["id"].as_str().unwrap_or_default();
         if self.request_id != id {
             self.request_id = id.to_owned();
@@ -187,7 +179,7 @@ impl ChildState {
             self.value["output_tokens"] = json!(total);
             self.value["output_tokens_estimated"] = json!(false);
         }
-        self.context.save_setting(&self.key, &self.value)
+        self.history.save_child_state(&self.value)
     }
 
     fn usage(&mut self, usage: &Value) {
@@ -227,7 +219,7 @@ impl Drop for ChildState {
             let _ = self.event_tx.try_send(self.progress("cancelled", None));
         }
         self.value["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
-        if self.context.save_setting(&self.key, &self.value).is_err() {
+        if self.history.save_child_state(&self.value).is_err() {
             tracing::warn!("Could not persist child task state");
         }
     }
@@ -1514,19 +1506,19 @@ impl ToolLoopExecutor {
                 .map(std::sync::Arc::new);
             }
             let state = ChildState {
-                context: context.clone(),
-                key: format!("delegation.{id}"),
+                history: context.db.executor_history(&id)?,
                 event_tx: self.event_tx.clone(),
                 value: json!({"session_id":id,"parent_session_id":self.conv_id,"agent_type":agent_type,"status":"running","started_at":chrono::Utc::now().to_rfc3339()}),
                 request_id: String::new(),
                 request_base: 0,
                 streamed_bytes: 0,
             };
-            context.save_setting(&state.key, &state.value)?;
+            state.history.save_child_state(&state.value)?;
             let _ = self.event_tx.send(state.progress("started", None)).await;
             let collect_web_evidence = child.response_schema.is_some();
             let mut transcript =
                 child_transcript::ChildTranscript::new(state, receiver, collect_web_evidence)?;
+            child.parent_message_id=Some(transcript.assistant_id.clone());
             // The tool loop scopes the child's shells and monitors to the
             // data root, the parent directory of the search config path.
             let cleanup_root = self
@@ -1900,8 +1892,7 @@ fn child_usage_accumulates_requests_without_counting_repeated_snapshots_or_paren
     let id = sessions.create(temp.path(), "fixture", "fixture").unwrap();
     let (event_tx, _) = tokio::sync::mpsc::channel(32);
     let mut state = ChildState {
-        context: context.clone(),
-        key: format!("delegation.{id}"),
+        history: context.db.executor_history(&id).unwrap(),
         value: json!({"session_id":id,"status":"completed"}),
         event_tx,
         request_id: String::new(),

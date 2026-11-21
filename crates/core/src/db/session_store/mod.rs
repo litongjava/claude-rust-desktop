@@ -19,6 +19,7 @@ mod delivery;
 mod desktop_queue;
 mod executor;
 mod engine;
+mod children;
 mod recording;
 pub use recording::RecordingPolicies;
 mod segment;
