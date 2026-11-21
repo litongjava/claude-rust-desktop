@@ -19,6 +19,7 @@ pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod desktop_queue;
 mod executor;
+mod export;
 mod engine;
 mod children;
 mod child_reader;

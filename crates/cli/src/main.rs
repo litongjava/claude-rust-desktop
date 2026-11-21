@@ -629,9 +629,22 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
                 return Ok(());
             }
+            if let SessionCommands::Export { id, output } = action {
+                use deepseek_code_core::db::session_store::Stores;
+                if let Some(path) = output {
+                    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+                    Stores::export_session(&paths.data_dir, id, io::BufWriter::new(file.as_file_mut()))?;
+                    file.as_file().sync_all()?;
+                    file.persist_noclobber(path).with_context(|| format!("Cannot publish {}", path.display()))?;
+                    return Ok(());
+                }
+                return Stores::export_session(&paths.data_dir, id, io::BufWriter::new(io::stdout().lock()));
+            }
             let db = paths.open_database()?;
             let value = match action {
                 SessionCommands::List
+                | SessionCommands::Export { .. }
                 | SessionCommands::Live { .. }
                 | SessionCommands::ShutdownWorker { .. }
                 | SessionCommands::StopTask { .. } => unreachable!(),

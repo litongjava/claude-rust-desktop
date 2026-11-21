@@ -940,6 +940,12 @@ pub enum SessionCommands {
     Show {
         id: String,
     },
+    /// Export a consistent JSONL backup of a saved session.
+    Export {
+        id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Summarize a saved conversation while preserving its original transcript.
     Compact {
         id: String,
