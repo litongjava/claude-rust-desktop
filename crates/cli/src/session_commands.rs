@@ -837,15 +837,15 @@ pub fn microcompact(session: &Session, history: &mut [Value], window: Option<u32
     let rows = session.store.db.select_session(&session.id)?.messages()?;
     let boundary = rows.iter().rev().find(|row| row.is_compact_boundary).map(|row| row.id.clone()).unwrap_or_default();
     use deepseek_code_core::db::session_store::settings::{Microcompact, MICROCOMPACT};
-    let history=session.store.db.select_session(&session.id)?;
-    let mut state = history.preference(MICROCOMPACT)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
+    let repository = session.store.db.select_session(&session.id)?;
+    let mut state = repository.preference(MICROCOMPACT)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
     let len = history.len();
     clear_tool_results(&mut history[..state.through.min(len)]);
     let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
     let through = microcompact_through(state.through, len, estimated, window);
     if through != state.through {
         state.through = through;
-        history.set_preference(MICROCOMPACT, Some(&state))?;
+        repository.set_preference(MICROCOMPACT, Some(&state))?;
         clear_tool_results(&mut history[..through.min(len)]);
         crate::compaction::notice("Cleared older tool results to save context.");
     }
