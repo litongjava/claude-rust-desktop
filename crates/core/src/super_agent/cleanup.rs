@@ -569,7 +569,7 @@ fn validate_worktree(repo: &RepoTarget) -> Result<()> {
 }
 
 fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
-    use crate::native_engine::child_session::{ChildOwnership, OWNER_KEY_PREFIX};
+    use crate::db::session_store::{SessionAccess,WorkspaceDirectory};
     let context = &launcher.context;
     let mut sessions = BTreeSet::new();
     sessions.extend(task.coder.session_id.clone());
@@ -631,64 +631,20 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
             break;
         }
     }
-    let owners = context
-        .db
-        .with_conn(|conn| -> Result<Vec<(String, ChildOwnership)>> {
-            let mut statement = conn.prepare(
-                "SELECT key,value FROM peripheral_settings WHERE key LIKE 'child-owner.%'",
-            )?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter()
-                .map(|(key, value)| {
-                    Ok((
-                        key.strip_prefix(OWNER_KEY_PREFIX)
-                            .context("Invalid child owner key")?
-                            .into(),
-                        serde_json::from_str(&value)?,
-                    ))
-                })
-                .collect()
-        })??;
-    loop {
-        let mut changed = false;
-        for (session, owner) in &owners {
-            if sessions.contains(&owner.parent_session_id) && !sessions.contains(session) {
-                let id = owner
-                    .job_id
-                    .as_deref()
-                    .context("Descendant has no proven job identity")?;
-                require_stopped(
-                    &context.paths.data_dir,
-                    id,
-                    session,
-                    Some(&owner.parent_session_id),
-                )?;
-                sessions.insert(session.clone());
-                changed = true;
+    let mut parents=sessions.iter().cloned().collect::<Vec<_>>();
+    while let Some(parent)=parents.pop(){
+        for (session,owner) in context.db.child_jobs(&parent)? {
+            if sessions.insert(session.clone()) {
+                let id=owner.job_id.as_deref().context("Descendant has no proven job identity")?;
+                require_stopped(&context.paths.data_dir,id,&session,Some(&parent))?;
+                parents.push(session);
             }
-        }
-        if !changed {
-            break;
         }
     }
     // Also cover unrelated sessions explicitly using this worktree and jobs
     // absent from a launch receipt. Discovery must never silently skip damage.
     let worktree = &task.repositories[0].worktree_path;
-    let workspaces = context
-        .db
-        .with_conn(|conn| -> Result<Vec<(String, String)>> {
-            let mut statement = conn.prepare(
-                "SELECT id,workspace_path FROM conversations WHERE workspace_path IS NOT NULL",
-            )?;
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })??;
+    let workspaces=context.db.workspace_sessions()?;
     for (session, workspace) in workspaces {
         if Path::new(&workspace).starts_with(worktree) {
             sessions.insert(session);
@@ -696,7 +652,7 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
     }
     for session in &sessions {
         ensure!(
-            !crate::services::session_messages::execution_active(&context.paths.data_dir, session)?,
+            !context.db.select_session(session)?.execution_active(&context.paths.data_dir)?,
             "Session {session} still owns an active execution"
         );
     }

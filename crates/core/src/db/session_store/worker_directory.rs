@@ -206,3 +206,72 @@ impl WorkerDirectory for DbManager {
         store.workspace(child, root)
     }
 }
+
+impl Stores {
+    pub(crate) fn child_jobs(&self, parent: &str) -> Result<Vec<(String, ChildOwnership)>> {
+        let rows = self.global().read(|c| {
+            let mut q = c.prepare(
+                "SELECT child.id,owner.record,p.id FROM child_owners owner
+                JOIN conversations child ON child.incarnation=owner.child_incarnation
+                LEFT JOIN conversations p ON p.incarnation=owner.parent_incarnation
+                WHERE json_extract(owner.record,'$.parent_session_id')=?1",
+            )?;
+            let rows = q.query_map([parent], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?;
+        rows.into_iter()
+            .map(|(id, raw, p)| {
+                ensure!(
+                    p.as_deref() == Some(parent),
+                    "Descendant's recorded owner was retired"
+                );
+                Ok((id, serde_json::from_str(&raw)?))
+            })
+            .collect()
+    }
+}
+impl DbManager {
+    pub(crate) fn child_jobs(&self, parent: &str) -> Result<Vec<(String, ChildOwnership)>> {
+        let rows = self.with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut q = c.prepare(
+                "SELECT key,value FROM peripheral_settings WHERE key LIKE 'child-owner.%'",
+            )?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })??;
+        let mut found = Vec::new();
+        for (key, raw) in rows {
+            let owner: ChildOwnership = serde_json::from_str(&raw)?;
+            if owner.parent_session_id == parent {
+                found.push((
+                    key.strip_prefix(OWNER_KEY_PREFIX)
+                        .context("Invalid child owner key")?
+                        .into(),
+                    owner,
+                ));
+            }
+        }
+        Ok(found)
+    }
+}
+
+pub(crate) trait WorkspaceDirectory {
+    fn workspace_sessions(&self) -> Result<Vec<(String, String)>>;
+}
+impl<D: super::shared::DirectoryRepository> WorkspaceDirectory for D {
+    fn workspace_sessions(&self) -> Result<Vec<(String, String)>> {
+        self.directory_read(|c| {
+            let mut q = c.prepare(
+                "SELECT id,workspace_path FROM conversations WHERE workspace_path IS NOT NULL",
+            )?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+}

@@ -5,6 +5,7 @@
 //! terminal may resume the same session; it must show that progress without
 //! taking the lease, submitting input, running tools, or cancelling the owner.
 use crate::session::Session;
+use deepseek_code_core::db::session_store::{SessionAccess,SessionRepository};
 use anyhow::Result;
 use deepseek_code_core::{
     db::{message_repo, turn_repo, DbManager},
@@ -56,24 +57,18 @@ pub struct Observer {
 /// Whether some process holds execution ownership, whether a managed worker or
 /// a direct print/json run. This only probes the lease; it never acquires it.
 pub fn execution_lease_active(session: &Session) -> Result<bool> {
-    session_messages::execution_active(&session.paths.data_dir, &session.id)
+    session.store.db.select_session(&session.id)?.execution_active(&session.paths.data_dir)
 }
 
 /// The truthful resume notice for a turn owned elsewhere.
 pub fn running_notice(session: &Session) -> Result<String> {
-    let turn = session
-        .store
-        .db
-        .with_conn(|conn| turn_repo::running_turn(conn, &session.id))??;
+    let turn = session.store.db.select_session(&session.id)?.running_turn()?;
     Ok(running_notice_for(turn.as_ref()))
 }
 
 /// Whether the last turn ended because its owner disappeared.
 pub fn latest_interrupted(session: &Session) -> Result<bool> {
-    let latest = session
-        .store
-        .db
-        .with_conn(|conn| turn_repo::latest_turn(conn, &session.id))??;
+    let latest = session.store.db.select_session(&session.id)?.latest_turn()?;
     Ok(latest.is_some_and(|turn| turn.interrupted()))
 }
 
@@ -105,16 +100,17 @@ impl Observer {
     pub(crate) fn poll_at(
         &mut self,
         root: &Path,
-        db: &Arc<DbManager>,
+        db: &impl SessionAccess,
         session_id: &str,
     ) -> Result<(State, Vec<String>)> {
         let mut lines = Vec::new();
         // A resumed different session starts from a clean view.
-        if self.session.as_deref() != Some(session_id) {
-            self.reset(Some(session_id.to_owned()));
+        let selected=db.select_session(session_id)?;
+        if self.session.as_deref() != Some(selected.observation_identity()) {
+            self.reset(Some(selected.observation_identity().into()));
         }
-        if session_messages::execution_active(root, session_id)? {
-            let turn = db.with_conn(|conn| turn_repo::running_turn(conn, session_id))??;
+        if selected.execution_active(root)? {
+            let turn = selected.running_turn()?;
             self.idle_since = None;
             if !self.announced {
                 self.announced = true;
@@ -128,7 +124,7 @@ impl Observer {
                     self.turn = Some(turn.turn_id.clone());
                     self.segments.clear();
                 }
-                self.render(db, &turn.turn_id, &mut lines)?;
+                self.render(&selected, &turn.turn_id, &mut lines)?;
             }
             return Ok((State::Running, lines));
         }
@@ -138,18 +134,10 @@ impl Observer {
         // Drain whatever the owner published between the last active poll and
         // its lease disappearing; those final lines are otherwise lost.
         if let Some(turn) = self.turn.clone() {
-            self.render(db, &turn, &mut lines)?;
+            self.render(&selected, &turn, &mut lines)?;
             self.flush_all(&mut lines);
         }
-        let turn = self
-            .turn
-            .as_deref()
-            .and_then(|id| {
-                db.with_conn(|conn| turn_repo::get_turn(conn, id))
-                    .ok()?
-                    .ok()
-            })
-            .flatten();
+        let turn=self.turn.as_deref().map(|id|selected.observed_turn(id)).transpose()?.flatten();
         let running = turn
             .as_ref()
             .is_some_and(|record| record.status == turn_repo::TurnStatus::Running);
@@ -161,7 +149,7 @@ impl Observer {
             if since.elapsed() < SETTLE_GRACE {
                 return Ok((State::Running, lines));
             }
-            match settle_if_abandoned(root, db, session_id) {
+            match selected.settle_observed_turn(root).ok().flatten() {
                 Some(settled) => finished_notice(Some(&settled)),
                 None => return Ok((State::Running, lines)),
             }
@@ -186,22 +174,11 @@ impl Observer {
 
     fn render(
         &mut self,
-        db: &Arc<DbManager>,
+        selected: &SessionRepository<'_>,
         turn_id: &str,
         lines: &mut Vec<String>,
     ) -> Result<()> {
-        let segments = db.with_conn(
-            |conn| -> Result<Vec<(message_repo::MessageRow, Vec<message_repo::ToolCallRow>)>> {
-                let mut segments = Vec::new();
-                for id in turn_repo::turn_messages(conn, turn_id)? {
-                    if let Some(row) = message_repo::get_message(conn, &id)? {
-                        let tools = message_repo::get_tool_calls_for_message(conn, &id)?;
-                        segments.push((row, tools));
-                    }
-                }
-                Ok(segments)
-            },
-        )??;
+        let segments = selected.observed_segments(turn_id)?;
         let mut present = BTreeSet::new();
         for (row, tools) in segments {
             present.insert(row.id.clone());
@@ -301,23 +278,6 @@ impl Cursor {
 
 /// Settles a turn whose owner vanished. The lease is acquired first, so a live
 /// owner is never marked interrupted, and released immediately after.
-fn settle_if_abandoned(
-    root: &Path,
-    db: &Arc<DbManager>,
-    session_id: &str,
-) -> Option<turn_repo::TurnRecord> {
-    let lease = session_messages::ExecutionLease::acquire(root, session_id).ok()??;
-    let settled = db
-        .with_conn(|conn| -> Result<Option<turn_repo::TurnRecord>> {
-            turn_repo::settle_interrupted(conn, session_id)?;
-            Ok(turn_repo::latest_turn(conn, session_id)?)
-        })
-        .ok()?
-        .ok()?;
-    drop(lease);
-    settled
-}
-
 /// A one-line hint from the public tool input; never the whole payload.
 fn tool_hint(input: Option<&str>) -> String {
     let Some(input) = input else {

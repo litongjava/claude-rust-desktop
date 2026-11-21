@@ -6,7 +6,7 @@
 //! from the delegation behavior. Callers remain responsible for their own
 //! entry-point limits, such as the delegation depth check.
 use crate::native_engine::provider_manager::ResolvedProvider;
-use crate::db::session_store::{WorkerDirectory, WorkerPair};
+use crate::db::session_store::{SessionAccess, WorkerDirectory, WorkerPair};
 use crate::runtime::{RuntimePaths, SessionStore};
 use crate::services::{
     agents, background_sessions, subagents, EnvironmentCredentials, ServiceContext,
@@ -250,10 +250,7 @@ pub(crate) async fn prepare_child_session(
             );
             // Never start a second process for a session that is still executing.
             ensure!(
-                !crate::services::session_messages::execution_active(
-                    &context.paths.data_dir,
-                    session
-                )?,
+                !context.db.select_session(session)?.execution_active(&context.paths.data_dir)?,
                 "Child session still has an active execution; stop it before resuming"
             );
             let stored = child

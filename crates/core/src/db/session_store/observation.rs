@@ -1,0 +1,91 @@
+//! Observer cursors and liveness probes follow the incarnation of the selected turn.
+use super::{owned::Backend, SessionRepository};
+use crate::db::{
+    message_repo::{self, MessageRow, ToolCallRow},
+    turn_repo::{self, TurnRecord},
+};
+use crate::services::session_messages::{self, ExecutionLease};
+use anyhow::{ensure, Result};
+use std::path::Path;
+
+impl SessionRepository<'_> {
+    pub fn observation_identity(&self) -> &str {
+        match &self.0 {
+            Backend::Admitted(s) => s.incarnation(),
+            Backend::Shared(_, id) => id,
+        }
+    }
+    pub fn execution_active(&self, root: &Path) -> Result<bool> {
+        match &self.0 {
+            Backend::Shared(_, id) => session_messages::execution_active(root, id),
+            Backend::Admitted(s) => {
+                ensure!(
+                    root.canonicalize()? == s.stores.data_dir(),
+                    "Observer data root changed"
+                );
+                let _lock = s.stores.key_lock(&s.key, false, false)?;
+                s.check_directory()?;
+                session_messages::execution_active(root, s.incarnation())
+            }
+        }
+    }
+    pub fn running_turn(&self) -> Result<Option<TurnRecord>> {
+        self.read(|c, id| Ok(turn_repo::running_turn(c, id)?))
+    }
+    pub fn latest_turn(&self) -> Result<Option<TurnRecord>> {
+        self.read(|c, id| Ok(turn_repo::latest_turn(c, id)?))
+    }
+    pub fn observed_turn(&self, turn: &str) -> Result<Option<TurnRecord>> {
+        self.read(|c, id| {
+            if !c
+                .prepare_cached("SELECT 1 FROM execution_turns WHERE conversation_id=?1 AND id=?2")?
+                .exists([id, turn])?
+            {
+                return Ok(None);
+            }
+            Ok(turn_repo::get_turn(c, turn)?)
+        })
+    }
+    pub fn observed_segments(&self, turn: &str) -> Result<Vec<(MessageRow, Vec<ToolCallRow>)>> {
+        self.read(|c, id| {
+            // Session reads already own a pinned snapshot.
+            let snapshot = if c.is_autocommit() {
+                Some(c.unchecked_transaction()?)
+            } else {
+                None
+            };
+            let c = snapshot.as_deref().unwrap_or(c);
+            let mut result = Vec::new();
+            for message in turn_repo::turn_messages(c, turn)? {
+                if let Some(row) =
+                    message_repo::get_message(c, &message)?.filter(|m| m.conversation_id == id)
+                {
+                    result.push((row, message_repo::get_tool_calls_for_message(c, &message)?));
+                }
+            }
+            Ok(result)
+        })
+    }
+    pub fn settle_observed_turn(&self, root: &Path) -> Result<Option<TurnRecord>> {
+        match &self.0 {
+            Backend::Admitted(s) => {
+                ensure!(
+                    root.canonicalize()? == s.stores.data_dir(),
+                    "Observer data root changed"
+                );
+                let lease = s.acquire_execution()?;
+                s.settle_abandoned(&lease)?;
+                self.latest_turn()
+            }
+            Backend::Shared(db, id) => {
+                let Some(_lease) = ExecutionLease::acquire(root, id)? else {
+                    return Ok(None);
+                };
+                db.with_conn(|c| {
+                    turn_repo::settle_interrupted(c, id)?;
+                    Ok(turn_repo::latest_turn(c, id)?)
+                })?
+            }
+        }
+    }
+}
