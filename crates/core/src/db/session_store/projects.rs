@@ -84,15 +84,24 @@ impl Projects for Stores {
         self.global()
             .write("update project", id, false, |c| {
                 let project = save(c, id, edit, false)?;
-                let admission = if edit.folders.is_some() {
-                    project
-                        .workspace_path
-                        .as_deref()
-                        .map(|p| self.admit_workspace_path(std::path::Path::new(p)))
-                        .transpose()?
-                } else {
-                    None
-                };
+                let mut admission = Default::default();
+                if edit.folders.is_some() {
+                    for folder in &project.folders {
+                        self.include_workspace_path(
+                            std::path::Path::new(&folder.path),
+                            &mut admission,
+                            |_| Ok(()),
+                        )?;
+                    }
+                    let mut q =
+                        c.prepare("SELECT id,incarnation FROM conversations WHERE project_id=?1")?;
+                    for row in q.query_map([id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })? {
+                        let (session, incarnation) = row?;
+                        self.admit_workspace_change(c, &session, &incarnation, &mut admission)?;
+                    }
+                }
                 Ok((project, admission))
             })
             .map(|(project, _admission)| project)

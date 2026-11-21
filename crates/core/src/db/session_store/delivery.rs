@@ -570,11 +570,7 @@ impl SessionDb {
         self.check_directory()?;
         let mut lease = ExecutionLease::acquire(self.stores.data_dir(), &self.incarnation)?
             .context("Invalid execution incarnation")?;
-        locks.extend(
-            self.stores
-                .global()
-                .read(|c| self.stores.admit_session_workspace(c, self.id()))?,
-        );
+        locks.extend(self.execution_workspace_locks()?);
         lease.address = Some(self.address());
         lease.lifecycle = locks;
         Ok(lease)

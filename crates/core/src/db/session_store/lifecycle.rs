@@ -325,6 +325,7 @@ impl Stores {
         drop(locks);
         lease.lifecycle = self.key_lock(&key, false, false)?;
         shard.check_directory()?;
+        lease.lifecycle.extend(shard.execution_workspace_locks()?);
         let sealed = shard.consume_sealed_first(first.as_ref())?;
         Ok((lease, sealed))
     }

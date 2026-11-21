@@ -1286,3 +1286,94 @@ async fn cleanup_releases_fences_when_participant_is_busy() -> anyhow::Result<()
     assert!(!wt.exists());
     Ok(())
 }
+#[tokio::test]
+async fn cleanup_preserves_all_engine_paths_until_lease_ends() -> anyhow::Result<()> {
+    use crate::services::session_workspace::change;
+    for (secondary, before) in [(false, false), (true, true), (true, false)] {
+        let f = cleanup_fixture(1).await;
+        let wt = f.task().repositories[0].worktree_path.clone();
+        let a = f.checkout_target(0);
+        let db = &f.context.db;
+        let s =
+            db.create_code_session(&a, "model", "provider", &uuid::Uuid::new_v4().to_string())?;
+        if before {
+            change(db.as_ref(), s.id(), &a, wt.to_str().unwrap(), true)?;
+        }
+        let lease = s.acquire_execution()?;
+        if !before {
+            change(db.as_ref(), s.id(), &a, wt.to_str().unwrap(), secondary)?;
+        }
+        let (cwd, project, _) = db.engine_workspace(&f.data.join("workspaces"), s.id(), None)?;
+        let project = project.unwrap();
+        assert!(if secondary {
+            project
+                .folders
+                .iter()
+                .skip(1)
+                .any(|f| std::path::Path::new(&f.path) == wt)
+        } else {
+            cwd == wt
+        });
+        let path = wt.join("base.txt");
+        let file = std::fs::File::open(&path)?;
+        change(db.as_ref(), s.id(), &wt, a.to_str().unwrap(), false)?;
+        let host = f.orchestrator();
+        let outcome = crate::super_agent::cleanup::run(
+            &host.launcher(),
+            &f.task_id,
+            &host.policy(),
+            &mut |_| Ok(()),
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Worktree has active workspace users"),
+            "{error:#}"
+        );
+        assert!(path.exists() && file.metadata()?.len() > 0);
+        drop((file, lease));
+        crate::super_agent::cleanup::run(
+            &host.launcher(),
+            &f.task_id,
+            &host.policy(),
+            &mut |_| Ok(()),
+        )?;
+        assert!(!path.exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_excludes_import_publication() -> anyhow::Result<()> {
+    let f = cleanup_fixture(1).await;
+    let wt = f.task().repositories[0].worktree_path.clone();
+    let host = f.orchestrator();
+    let archive = f.data.join("import.json");
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        &archive,
+        serde_json::to_vec(
+            &serde_json::json!({"id":id,"name":"Imported","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","messages":[]}),
+        )?,
+    )?;
+    let mut attempted = false;
+    crate::super_agent::cleanup::run(&host.launcher(), &f.task_id, &host.policy(), &mut |stage| {
+        if stage == "before-worktree-remove" {
+            let err = f.context.db.import_json(&archive, &wt, false).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("Worktree removal in progress"),
+                "{err:#}"
+            );
+            assert!(!f
+                .context
+                .db
+                .global()
+                .list_sessions(Default::default())?
+                .iter()
+                .any(|row| row.conversation.id == id));
+            attempted = true;
+        }
+        Ok(())
+    })?;
+    assert!(attempted && !wt.exists());
+    Ok(())
+}

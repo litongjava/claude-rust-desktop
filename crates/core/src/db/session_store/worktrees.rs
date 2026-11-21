@@ -43,7 +43,9 @@ impl SessionRepository<'_> {
                 s.stores.global().write_with_deadline(label,s.id(),false,deadline,|tx| {
                     ensure!(tx.execute("UPDATE conversations SET metadata_revision=metadata_revision+1 WHERE id=?1 AND incarnation=?2",[s.id(),s.incarnation()])?==1,"Session was replaced");
                     let value = body(tx, s.id())?;
-                    Ok((value, s.stores.admit_session_workspace(tx, s.id())?))
+                    let mut guards = Default::default();
+                    s.stores.admit_workspace_change(tx, s.id(), s.incarnation(), &mut guards)?;
+                    Ok((value, guards))
                 }).map(|(value, _admission)| value)
             }
         }

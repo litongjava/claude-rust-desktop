@@ -280,14 +280,17 @@ impl Stores {
                         bail!("Import project selection changed before publication");
                     }
                 }
+                let mut admission = Default::default();
                 for ((op, digest, _), (meta, p)) in members.iter().zip(&ready) {
                     self.publish_row(tx, op, meta, p).inspect_err(|e| {
                         rejected = e.downcast_ref::<rusqlite::Error>().is_none()
                     })?;
+                    self.include_session_workspace(tx, &op.id, &mut admission, None)?;
                     tx.execute("INSERT INTO legacy_session_imports SELECT id,?2,project_id,incarnation FROM conversations WHERE id=?1", [&op.id, digest])?;
                 }
                 tx.execute("DELETE FROM import_members WHERE batch=?1", [batch])?;
-                self.step(Phase::BeforePublishCommit)
+                self.step(Phase::BeforePublishCommit)?;
+                Ok(admission)
             })
             .or_else(|e| {
                 if rejected {
