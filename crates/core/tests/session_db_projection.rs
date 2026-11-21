@@ -363,7 +363,7 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
                 c.execute_batch(&format!("DROP TRIGGER context_search_{owner}_{operation}"))?;
             }
         }
-        c.execute_batch("DROP INDEX projection_prompt_order")?;
+        c.execute_batch("DROP TRIGGER cancel_rewound_compaction; DROP TABLE compaction_cancellations; DROP INDEX projection_prompt_order")?;
         for name in ["message", "typed", "request"] {
             for action in ["insert", "update", "delete"] {
                 c.execute_batch(&format!("DROP TRIGGER projection_{name}_{action}"))?;
@@ -676,13 +676,24 @@ fn fix_rewound_compaction_target_stays_cancelled() -> Result<()> {
         .finish_compaction(&stale, &"stale summary".into())
         .is_err());
     drop(owner);
+    assert_eq!(
+        a.read(|r| r.compaction_cancellation(stale.request_id()))?
+            .as_deref(),
+        Some("target removed by rewind")
+    );
     assert!(s
         .open_session(A)?
         .delivery_owner()?
         .claim_compaction()?
         .is_none());
+    a.write(|w| w.request_compaction("ineligible", 50, 100))?;
+    assert!(a.delivery_owner()?.claim_compaction()?.is_none());
     a.write(|w| w.append("assistant", "unrelated"))?;
     assert!(a.delivery_owner()?.claim_compaction()?.is_none());
+    a.write(|w| w.request_compaction("replacement", 50, 100))?;
+    let owner = a.delivery_owner()?;
+    assert!(owner.finish_compaction(&stale, &"old".into()).is_err());
+    assert_eq!(owner.claim_compaction()?.unwrap().keep, "replacement");
     Ok(())
 }
 

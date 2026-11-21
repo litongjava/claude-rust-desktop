@@ -34,12 +34,18 @@ pub struct CompactionClaim {
     pub transcript: String,
 }
 
+impl CompactionClaim {
+    pub fn request_id(&self) -> &str {
+        &self.id
+    }
+}
+
 impl SessionWrite<'_> {
     pub fn request_compaction(&self, keep: &str, used_tokens: u64, window: u64) -> Result<()> {
         compaction_requests::validate(self.0, self.1, keep, used_tokens, window)?;
         self.0.execute(
-            "INSERT INTO compaction_request VALUES(1,?1,?2)
-            ON CONFLICT(singleton) DO UPDATE SET id=excluded.id,keep=excluded.keep",
+            "INSERT INTO compaction_request(singleton,id,keep,target_message) VALUES(1,?1,?2,(SELECT id FROM messages ORDER BY sort_order DESC,rowid DESC LIMIT 1))
+            ON CONFLICT(singleton) DO UPDATE SET id=excluded.id,keep=excluded.keep,target_message=excluded.target_message",
             params![uuid::Uuid::new_v4().to_string(), keep],
         )?;
         Ok(())
@@ -58,6 +64,17 @@ impl SessionWrite<'_> {
 }
 
 impl SessionRead<'_> {
+    pub fn compaction_cancellation(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT reason FROM compaction_cancellations WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn compaction_checkpoint(&self, key: &CheckpointKey) -> Result<Option<String>> {
         Ok(self
             .0
@@ -101,26 +118,47 @@ impl DeliveryOwner {
         layout::allow_entry()?;
         let s = &self.session;
         self.check_compaction_session()?;
-        s.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+        let candidate = s.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
             let request = tx
-                .query_row("SELECT id,keep FROM compaction_request", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+                .query_row("SELECT id,keep,EXISTS(SELECT 1 FROM messages WHERE messages.id=target_message),content_revision
+                    FROM compaction_request JOIN manifest USING(singleton)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?))
                 })
                 .optional()?;
-            let Some((id, keep)) = request else {
+            let Some((id, keep, has_target, revision)) = request else {
                 return Ok(None);
             };
+            if !has_target {
+                return Ok(Some(Err((id, revision, "missing compaction target"))));
+            }
             let (fingerprint, transcript, count) = compaction::fingerprint(&tx, &s.id)?;
-            ensure!(count >= 2, "Not enough messages to compact");
-            Ok(Some(CompactionClaim {
+            if count < 2 {
+                return Ok(Some(Err((id, revision, "not enough messages to compact"))));
+            }
+            Ok(Some(Ok(CompactionClaim {
                 id,
                 incarnation: s.incarnation.clone(),
                 fingerprint,
                 keep,
                 transcript,
-            }))
-        })
+            })))
+        })?;
+        match candidate {
+            None => Ok(None),
+            Some(Ok(claim)) => Ok(Some(claim)),
+            Some(Err((id, revision, reason))) => {
+                // The read snapshot has closed. Fence both a replacement request
+                // and history that became eligible before acquiring the writer.
+                s.write_locked("cancel obsolete compaction", |w| {
+                    if w.0.execute("DELETE FROM compaction_request WHERE id=?1 AND (SELECT content_revision FROM manifest)=?2", params![id,revision])? == 1 {
+                        w.0.execute("INSERT INTO compaction_cancellations(id,reason) VALUES(?1,?2)",[id.as_str(), reason])?;
+                    }
+                    Ok(())
+                })?;
+                Ok(None)
+            }
+        }
     }
 
     pub fn finish_compaction(

@@ -250,6 +250,7 @@ fn install_session_v4(c: &Connection) -> Result<()> {
     c.execute_batch(include_str!("projection.sql"))?;
     // A legacy timestamp cannot attest to bytes read before the upgrade.
     c.execute_batch("ALTER TABLE file_read_stamps ADD COLUMN digest BLOB")?;
+    c.execute_batch(include_str!("compaction_target.sql"))?;
     Ok(())
 }
 
@@ -395,8 +396,9 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
             objects == 10,
             "Missing required session summary index or trigger"
         );
+        ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name='messages' AND name='cancel_rewound_compaction')", [], |r|r.get::<_,bool>(0))?, "Missing compaction rewind trigger");
         &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_dirty request_count input_tokens output_tokens total_tokens"),
-          ("file_read_stamps","digest"), ("request_metric_deltas","direction input output total")]
+          ("compaction_request","target_message"), ("compaction_cancellations","id reason"), ("file_read_stamps","digest"), ("request_metric_deltas","direction input output total")]
     } else {
         &[]
     };
