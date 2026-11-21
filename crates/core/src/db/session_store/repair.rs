@@ -206,8 +206,8 @@ impl SessionDb {
         if (1..layout::SESSION_VERSION).contains(&version) {
             return Ok(SummaryCheck::Upgrade);
         }
-        let (_, dirty) = layout::session_header(&tx)?;
-        ensure!(!dirty, "Unvalidated external history edit");
+        let (_, external_edit) = layout::session_header(&tx)?;
+        ensure!(external_edit.is_none(), "Unvalidated external history edit");
         let revision: i64 = tx.query_row(
             "SELECT content_revision FROM manifest WHERE singleton=1",
             [],

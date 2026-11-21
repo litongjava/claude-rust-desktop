@@ -640,6 +640,11 @@ impl Stores {
             let identity = super::VerifiedShard {
                 file: layout::file_identity(&db)?,
                 schema: c.pragma_query_value(None, "schema_version", |r| r.get(0))?,
+                external_edit: c.query_row(
+                    "SELECT history_edit FROM projection_state WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )?,
                 incarnation: op.incarnation.clone(),
             };
             // A failure to read the secondary summary leaves the sealed intent retryable.

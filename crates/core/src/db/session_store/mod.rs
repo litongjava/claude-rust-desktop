@@ -218,6 +218,7 @@ struct VerifiedShard {
     file: (u64, u64),
     schema: i64,
     incarnation: String,
+    external_edit: Option<[u8; 16]>,
 }
 // Verification outlives the last resolver handle, without retaining a root,
 // pool or open file. Roots with different stores never share verification.
@@ -278,7 +279,7 @@ impl SessionDb {
         let file = layout::file_identity(&path)?;
         let mut conn = layout::open(&path, mode)?;
         let snap = conn.transaction()?;
-        let (schema, dirty) = layout::session_header(&snap)?;
+        let (schema, external_edit) = layout::session_header(&snap)?;
         verify_manifest(
             &snap,
             self.stores.global().store_uuid(),
@@ -293,11 +294,12 @@ impl SessionDb {
             file,
             schema,
             incarnation: self.incarnation.clone(),
+            external_edit,
         };
         let slot = self.stores.verification_slot(&self.key);
         {
             let mut verified = slot.lock().unwrap();
-            if dirty || verified.as_ref() != Some(&identity) {
+            if verified.as_ref() != Some(&identity) {
                 *verified = None;
                 layout::verify(&snap, SESSION)?;
                 layout::integrity(&snap)?;

@@ -568,6 +568,22 @@ fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
         bytes < 4 << 20,
         "reopening the resolver rescanned {bytes} bytes"
     );
+    // A valid external repair invalidates admission once. Further checkouts of
+    // that same edited file must still obey the query budget.
+    let db = Connection::open(root.path().join("sessions").join(A).join("session.db"))?;
+    db.execute(
+        "UPDATE message_user_content SET content_json=content_json",
+        [],
+    )?;
+    let verified = reopened.open_session(A)?;
+    let start = syscall_read_bytes("/proc/thread-self/io")?;
+    verified.read(|_| Ok(()))?;
+    assert!(syscall_read_bytes("/proc/thread-self/io")? - start < 4 << 20);
+    db.execute(
+        "UPDATE message_user_content SET content_json=cast(content_json AS BLOB)",
+        [],
+    )?;
+    assert!(verified.read(|_| Ok(())).is_err());
     Ok(())
 }
 
@@ -929,7 +945,7 @@ fn shard_replacement_with_the_same_incarnation_requires_verification() -> Result
         copy.execute_batch(
             "PRAGMA journal_mode=WAL;
             UPDATE message_user_content SET content_json=cast(content_json AS BLOB);
-            UPDATE projection_state SET history_dirty=0",
+            UPDATE projection_state SET history_edit=NULL",
         )?;
         copy.pragma_update(None, "schema_version", cookie)?;
     }

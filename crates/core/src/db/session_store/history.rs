@@ -35,7 +35,7 @@ pub(super) fn projection(c: &Connection) -> Result<Projection> {
 // Keep the exact totals locally so deleting a large request can undo a clamp.
 pub(super) fn flush_summary(c: &Connection) -> Result<()> {
     let (dirty, history_dirty): (bool, bool) = c.query_row(
-        "SELECT prompts_dirty,history_dirty FROM projection_state WHERE singleton=1",
+        "SELECT prompts_dirty,history_edit IS NOT NULL FROM projection_state WHERE singleton=1",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -43,10 +43,10 @@ pub(super) fn flush_summary(c: &Connection) -> Result<()> {
         let first: Option<String> = c.query_row("SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order,rowid LIMIT 1", [], |r|r.get(0)).optional()?;
         c.execute("UPDATE projection_state SET first_prompt=?1,
             latest_prompt=(SELECT substr(content,1,80) FROM messages WHERE role='user' AND content<>'' ORDER BY sort_order DESC,rowid DESC LIMIT 1),
-            prompts_dirty=0,history_dirty=0 WHERE singleton=1", [first.as_deref().and_then(crate::db::conversation_repo::prompt_title)])?;
+            prompts_dirty=0,history_edit=NULL WHERE singleton=1", [first.as_deref().and_then(crate::db::conversation_repo::prompt_title)])?;
     } else if history_dirty {
         c.execute(
-            "UPDATE projection_state SET history_dirty=0 WHERE singleton=1",
+            "UPDATE projection_state SET history_edit=NULL WHERE singleton=1",
             [],
         )?;
     }

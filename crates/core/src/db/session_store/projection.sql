@@ -3,28 +3,28 @@
 CREATE TABLE projection_state(
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), transcript_bytes INTEGER NOT NULL,
     first_prompt TEXT, latest_prompt TEXT, prompts_dirty INTEGER NOT NULL,
-    history_dirty INTEGER NOT NULL, request_count INTEGER NOT NULL,
+    history_edit BLOB, request_count INTEGER NOT NULL,
     input_tokens TEXT NOT NULL, output_tokens TEXT NOT NULL, total_tokens TEXT NOT NULL
 );
 INSERT INTO projection_state VALUES(1,
     (SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM messages),
-    NULL,NULL,1,0,0,'0','0','0');
+    NULL,NULL,1,NULL,0,'0','0','0');
 CREATE INDEX projection_prompt_order ON messages(sort_order) WHERE role='user' AND content<>'';
 CREATE TRIGGER projection_message_insert AFTER INSERT ON messages BEGIN
     UPDATE projection_state SET transcript_bytes=transcript_bytes+length(CAST(NEW.content AS BLOB)),
-        prompts_dirty=max(prompts_dirty,NEW.role='user'), history_dirty=1;
+        prompts_dirty=max(prompts_dirty,NEW.role='user'), history_edit=randomblob(16);
 END;
 CREATE TRIGGER projection_message_delete AFTER DELETE ON messages BEGIN
     UPDATE projection_state SET transcript_bytes=transcript_bytes-length(CAST(OLD.content AS BLOB)),
-        prompts_dirty=max(prompts_dirty,OLD.role='user'), history_dirty=1;
+        prompts_dirty=max(prompts_dirty,OLD.role='user'), history_edit=randomblob(16);
 END;
 CREATE TRIGGER projection_message_update AFTER UPDATE ON messages BEGIN
     UPDATE projection_state SET transcript_bytes=transcript_bytes-length(CAST(OLD.content AS BLOB))+length(CAST(NEW.content AS BLOB)),
-        prompts_dirty=max(prompts_dirty,OLD.role='user',NEW.role='user'), history_dirty=1;
+        prompts_dirty=max(prompts_dirty,OLD.role='user',NEW.role='user'), history_edit=randomblob(16);
 END;
-CREATE TRIGGER projection_typed_insert AFTER INSERT ON message_user_content BEGIN UPDATE projection_state SET history_dirty=1; END;
-CREATE TRIGGER projection_typed_update AFTER UPDATE ON message_user_content BEGIN UPDATE projection_state SET history_dirty=1; END;
-CREATE TRIGGER projection_typed_delete AFTER DELETE ON message_user_content BEGIN UPDATE projection_state SET history_dirty=1; END;
+CREATE TRIGGER projection_typed_insert AFTER INSERT ON message_user_content BEGIN UPDATE projection_state SET history_edit=randomblob(16); END;
+CREATE TRIGGER projection_typed_update AFTER UPDATE ON message_user_content BEGIN UPDATE projection_state SET history_edit=randomblob(16); END;
+CREATE TRIGGER projection_typed_delete AFTER DELETE ON message_user_content BEGIN UPDATE projection_state SET history_edit=randomblob(16); END;
 
 -- Fold the transaction's deltas with wide arithmetic before commit. Keep the
 -- sign separate so even the minimum signed SQLite integer can be subtracted.

@@ -178,7 +178,7 @@ pub(super) fn file_identity(path: &Path) -> Result<(u64, u64)> {
 
 /// Bounded checks for an admitted incarnation. Schema edits invalidate the
 /// cached format check. Unsealed external history edits require revalidation.
-pub(super) fn session_header(c: &Connection) -> Result<(i64, bool)> {
+pub(super) fn session_header(c: &Connection) -> Result<(i64, Option<[u8; 16]>)> {
     let (app,version,mode,schema):(i32,i32,String,i64)=c.query_row(
         "SELECT application_id,user_version,journal_mode,schema_version FROM pragma_application_id,pragma_user_version,pragma_journal_mode,pragma_schema_version", [],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
@@ -186,13 +186,13 @@ pub(super) fn session_header(c: &Connection) -> Result<(i64, bool)> {
         app == SESSION && version == SESSION_VERSION && mode == "wal",
         "Unsupported session header"
     );
-    let (seal,dirty):(String,bool)=c.query_row("SELECT sealed_operation,history_dirty,updated_at,created_at,message_count,content_revision,last_turn_status
+    let (seal,edit):(String,Option<[u8;16]>)=c.query_row("SELECT sealed_operation,history_edit,updated_at,created_at,message_count,content_revision,last_turn_status
         FROM manifest JOIN projection_state USING(singleton) WHERE singleton=1", [], |r|{
         r.get::<_,String>(2)?; r.get::<_,String>(3)?; r.get::<_,i64>(4)?; r.get::<_,i64>(5)?; r.get::<_,Option<String>>(6)?;
         Ok((r.get(0)?,r.get(1)?))
     })?;
     ensure!(canonical_uuid(&seal), "Invalid session seal");
-    Ok((schema, dirty))
+    Ok((schema, edit))
 }
 
 pub(super) fn verify(conn: &Connection, kind: i32) -> Result<()> {
@@ -399,7 +399,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
             objects == 11,
             "Missing required session summary index or trigger"
         );
-        &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_dirty request_count input_tokens output_tokens total_tokens"),
+        &[("projection_state","singleton transcript_bytes first_prompt latest_prompt prompts_dirty history_edit request_count input_tokens output_tokens total_tokens"),
           ("compaction_request","target_message"), ("compaction_cancellations","id reason"), ("file_read_stamps","digest"), ("request_metric_deltas","direction input output total")]
     } else {
         &[]
