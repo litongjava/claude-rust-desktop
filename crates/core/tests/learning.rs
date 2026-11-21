@@ -9,7 +9,7 @@ use std::sync::Arc;
 async fn learning_persists_deduplicates_and_feedback_changes_ranking() {
     let dir = tempfile::tempdir().unwrap();
     let open = || {
-        ServiceContext::open(
+        ServiceContext::from_stores(
             RuntimePaths::new(dir.path().into()).unwrap(),
             Arc::new(EnvironmentCredentials),
         )
@@ -74,7 +74,7 @@ async fn learning_persists_deduplicates_and_feedback_changes_ranking() {
 #[tokio::test]
 async fn cancelled_turn_is_recorded_without_prompt_or_tool_content() {
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ServiceContext::open(
+    let ctx = ServiceContext::from_stores(
         RuntimePaths::new(dir.path().into()).unwrap(),
         Arc::new(EnvironmentCredentials),
     )

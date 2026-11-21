@@ -40,6 +40,8 @@ mod global_format;
 mod history;
 mod im;
 mod im_catalog;
+mod learning;
+pub use learning::LearningRecords;
 pub use im_catalog::ImCatalog;
 mod im_permissions;
 pub use im_permissions::{ImPermissionChange, ImPermissions};
