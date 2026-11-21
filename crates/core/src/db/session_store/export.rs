@@ -3,11 +3,14 @@
 //! Such an mcp_output retains its scoped tool_use_id and carries occurrence_pending=true.
 //! Once its tool_call is present in the snapshot the marker is omitted.
 mod references;
+mod source;
 
-use super::{layout, OpenMode, SessionDb, Stores};
+use super::{layout, Stores};
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rusqlite::{blob::Blob, types::ValueRef, Connection, DatabaseName, OpenFlags};
+use rusqlite::{
+    blob::Blob, types::ValueRef, Connection, DatabaseName, OpenFlags, OptionalExtension,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Write, path::Path};
@@ -54,60 +57,98 @@ const RECORDS: &[(&str, &str, &str, &str)] = &[
 
 impl Stores {
     pub fn export_session(path: &Path, id: &str, output: impl Write) -> Result<()> {
-        let stores = Self::open_existing(path, OpenMode::Directory)?;
+        layout::allow_entry()?;
         let key = layout::storage_key(id)?;
-        let _guard = stores.resolved_key(&key)?.context("Session unavailable")?;
-        let incarnation = stores
-            .global()
-            .incarnation(id, &key)?
-            .context("Session unavailable")?;
-        let shard = SessionDb {
-            stores: stores.clone(),
-            id: id.into(),
-            key,
-            incarnation,
-        };
+        let locks = path.join("session-locks");
+        let _namespace = shared_lock(&locks.join(".directory"))?;
+        let _key = shared_lock(&locks.join(&key))?;
+        let shard = path.join("sessions").join(&key);
+        ensure!(
+            shard.join("session.db").is_file()
+                && !shard.join(super::conversation_edit::PENDING).try_exists()?,
+            "Session unavailable"
+        );
+        let uuid = std::fs::read_to_string(locks.join(".initialized"))?;
+        let global = path.join("global.db");
+        let _permit = layout::Permits::take(1);
         let mut stream = Stream {
             output,
             counts: BTreeMap::new(),
             digest: Sha256::new(),
         };
-        shard.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |conn| {
-            let mut directory = layout::open(&path.join("global.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            const ATTEMPTS: usize = 8;
-            for _ in 0..ATTEMPTS {
-                // Pin the directory row before acquiring the shard snapshot. Large header
-                // fields can then stream from that same row after the revision fence.
-                let header = directory.transaction()?;
-                let (rowid, revision, projected, updated): (i64,i64,i64,String) = header.query_row(
-                    "SELECT rowid,metadata_revision,content_revision,updated_at FROM conversations WHERE id=?1 AND incarnation=?2",
-                    [id, shard.incarnation()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-                let tx = conn.transaction()?;
-                let (content, count, activity, status): (i64,i64,String,Option<String>) = tx.query_row(
-                    "SELECT content_revision,message_count,updated_at,last_turn_status FROM manifest",
-                    [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-                let current: i64 = stores.global().read(|g| Ok(g.query_row(
-                    "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
-                    [id, shard.incarnation()], |r| r.get(0))?))?;
-                if current != revision || projected > content {
-                    continue;
-                }
-                return layout::callback(|| {
-                    let mut record = json!({"format":"deepseek-code.session","version":1,"session_id":id,
+        const ATTEMPTS: usize = 8;
+        for _ in 0..ATTEMPTS {
+            let mut directory = source::Source::open(&global)?;
+            // Pin the directory row before acquiring the shard snapshot. Large header
+            // fields can then stream from that same row after the revision fence.
+            let header = directory.db.transaction()?;
+            layout::verify(&header, layout::GLOBAL)?;
+            let store: String = header.query_row(
+                "SELECT store_uuid FROM store_identity WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                store == uuid && layout::canonical_uuid(&store),
+                "Lifecycle namespace identity changed"
+            );
+            let (rowid, revision, projected, updated, incarnation): (i64,i64,i64,String,String) = header.query_row(
+                    "SELECT rowid,metadata_revision,content_revision,updated_at,incarnation FROM conversations
+                     WHERE id=?1 AND storage_key=?2 AND NOT EXISTS
+                     (SELECT 1 FROM lifecycle WHERE storage_key=?2 AND quarantine_reason IS NULL)",
+                    [id, &key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.context("Session unavailable")?;
+            let mut source = source::Source::open(&shard.join("session.db"))?;
+            let tx = source.db.transaction()?;
+            super::verify_manifest(&tx, &store, id, &incarnation)?;
+            layout::verify(&tx, layout::SESSION)?;
+            layout::integrity(&tx)?;
+            let (content, count, activity, status): (i64, i64, String, Option<String>) = tx
+                .query_row(
+                "SELECT content_revision,message_count,updated_at,last_turn_status FROM manifest",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let current: i64 = source::Source::open(&global)?.db.query_row(
+                "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
+                [id, &incarnation],
+                |r| r.get(0),
+            )?;
+            if current != revision || projected > content {
+                continue;
+            }
+            layout::callback(|| {
+                let mut record = json!({"format":"deepseek-code.session","version":1,"session_id":id,
                         "content_revision":content,"metadata_revision":revision,"message_count":count,
                         "updated_at":super::history::latest_activity(&updated,&activity),"status":status});
-                    let columns = "incarnation title project_id workspace_path workspace_mode provider model archived pinned research_mode created_at";
-                    stream.record(&header, "header", "conversations", columns, rowid, &mut record)?;
-                    drop(header);
-                    for &(kind, table, order, columns) in RECORDS {
-                        stream.table(&tx, kind, table, order, columns)?;
-                    }
-                    stream.finish()
-                });
-            }
-            anyhow::bail!("Could not acquire a consistent session export snapshot after {ATTEMPTS} attempts")
-        })
+                let columns = "incarnation title project_id workspace_path workspace_mode provider model archived pinned research_mode created_at";
+                stream.record(
+                    &header,
+                    "header",
+                    "conversations",
+                    columns,
+                    rowid,
+                    &mut record,
+                )
+            })?;
+            drop(header);
+            drop(directory);
+            return layout::callback(|| {
+                for &(kind, table, order, columns) in RECORDS {
+                    stream.table(&tx, kind, table, order, columns)?;
+                }
+                stream.finish()
+            });
+        }
+        anyhow::bail!(
+            "Could not acquire a consistent session export snapshot after {ATTEMPTS} attempts"
+        )
     }
+}
+
+fn shared_lock(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::File::open(path).context("Session unavailable")?;
+    file.lock_shared()?;
+    Ok(file)
 }
 
 struct Stream<W> {

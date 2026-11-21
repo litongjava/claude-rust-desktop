@@ -780,3 +780,74 @@ fn mark_transport_result_waiting_for_occurrence() -> Result<()> {
         .is_none());
     Ok(())
 }
+#[test]
+fn export_leaves_unknown_roots_and_sessions_untouched() -> Result<()> {
+    let empty = tempfile::tempdir()?;
+    for root in [empty.path().join("absent"), empty.path().to_owned()] {
+        assert!(!export(&root, "absent").output()?.status.success());
+        assert_eq!(fs::read_dir(empty.path())?.count(), 0);
+    }
+    let store = Stores::open(empty.path())?;
+    store.create("known", Default::default())?;
+    let locks = empty.path().join("session-locks");
+    let sessions = empty.path().join("sessions");
+    let before = (directory_names(&locks)?, directory_names(&sessions)?);
+    assert!(!export(empty.path(), "unknown").output()?.status.success());
+    assert_eq!(
+        before,
+        (directory_names(&locks)?, directory_names(&sessions)?)
+    );
+    Ok(())
+}
+#[test]
+fn leave_pending_delete_for_host_recovery() -> Result<()> {
+    use deepseek_code_core::db::session_store::Phase;
+    let root = tempfile::tempdir()?;
+    let store = Stores::open(root.path())?;
+    let id = "6217631e-49bd-41f9-b922-dbb42d16c3d1";
+    store.create(id, Default::default())?;
+    let fault = store.with_fault_hook(|phase| {
+        if phase == Phase::DeleteIntent {
+            anyhow::bail!("stop after intent");
+        }
+        Ok(())
+    });
+    assert!(fault.open_session(id)?.delete().is_err());
+    let db = rusqlite::Connection::open(root.path().join("global.db"))?;
+    let intent = || {
+        db.query_row("SELECT operation FROM lifecycle WHERE id=?1", [id], |r| {
+            r.get::<_, String>(0)
+        })
+    };
+    let pending = intent()?;
+    let shard = root.path().join("sessions").join(id).join("session.db");
+    assert!(shard.is_file());
+    let out = export(root.path(), id).output()?;
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("Session unavailable")
+    );
+    assert!(shard.is_file());
+    assert_eq!(intent()?, pending);
+    Ok(())
+}
+
+#[test]
+fn export_closed_databases_without_creating_sqlite_sidecars() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let id = "6217631e-49bd-41f9-b922-dbb42d16c3d1";
+    let store = Stores::open(root.path())?;
+    store.create(id, Default::default())?;
+    drop(store);
+    let shard = root.path().join("sessions").join(id);
+    for path in [root.path().join("global.db"), shard.join("session.db")] {
+        // Close the last writer to checkpoint the fixture and remove its WAL.
+        rusqlite::Connection::open(&path)?.execute_batch("BEGIN IMMEDIATE; COMMIT")?;
+        assert!(!path.with_extension("db-wal").exists());
+    }
+    let names = || -> Result<_> { Ok((directory_names(root.path())?, directory_names(&shard)?)) };
+    let before = names()?;
+    assert_eq!(decode(&stdout(root.path(), id)?)?[0]["session_id"], id);
+    assert_eq!(before, names()?);
+    Ok(())
+}
