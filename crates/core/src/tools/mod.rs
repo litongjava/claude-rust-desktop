@@ -14,7 +14,7 @@ mod base64_collapse;
 mod lsp;
 mod notebook;
 pub mod plan_import;
-mod read;
+pub(crate) mod read;
 mod search;
 pub mod tasks;
 pub mod toolscript;

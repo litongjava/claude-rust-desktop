@@ -226,6 +226,13 @@ fn stamp(metadata: std::fs::Metadata) -> Result<(String, String)> {
 impl SessionDb {
     /// Capture evidence for exactly the bytes returned to the caller.
     pub fn read_tracked_file(&self, path: &Path) -> Result<Vec<u8>> {
+        self.render_tracked_file(path, Ok)
+    }
+    pub(crate) fn render_tracked_file<T>(
+        &self,
+        path: &Path,
+        render: impl FnOnce(Vec<u8>) -> Result<T>,
+    ) -> Result<T> {
         use std::io::Read;
         layout::allow_entry()?;
         let path = path.canonicalize()?;
@@ -238,12 +245,13 @@ impl SessionDb {
             "File changed during read"
         );
         let digest = Sha256::digest(&bytes);
+        let result = render(bytes)?;
         self.write_named("record file read",|w|{
             w.0.execute("INSERT INTO file_read_stamps(path,modified_ns,size,digest) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET modified_ns=excluded.modified_ns,size=excluded.size,digest=excluded.digest WHERE modified_ns<>excluded.modified_ns OR size<>excluded.size OR digest IS NOT excluded.digest",
                 params![path.as_os_str().as_encoded_bytes(),before.0,before.1,&digest[..]])?;
             Ok(())
         })?;
-        Ok(bytes)
+        Ok(result)
     }
     pub fn check_file_write(&self, path: &Path) -> Result<()> {
         layout::allow_entry()?;

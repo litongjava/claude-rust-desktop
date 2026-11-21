@@ -31,6 +31,13 @@ pub fn definition() -> super::ToolDefinition {
 }
 
 pub fn execute(input: Value, cwd: &str) -> Result<Value> {
+    execute_bound(input, cwd, None)
+}
+pub(crate) fn execute_bound(
+    input: Value,
+    cwd: &str,
+    session: Option<&crate::db::session_store::SessionDb>,
+) -> Result<Value> {
     let file_path = input["file_path"]
         .as_str()
         .ok_or_else(|| anyhow!("file_path required"))?;
@@ -61,24 +68,30 @@ pub fn execute(input: Value, cwd: &str) -> Result<Value> {
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if let Some(media_type) = image_media_type(&extension) {
-        return image(path, media_type);
-    }
-    let pages = optional_pages(&input)?;
-    if extension == "pdf" {
-        return pdf(path, pages);
-    }
-    anyhow::ensure!(pages.is_none(), "pages applies only to PDF files; omit pages for text files and use offset/limit for line ranges");
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| anyhow!("Cannot read {} as UTF-8 text: {error}", path.display()))?;
-    if extension == "ipynb" {
-        if let Ok(notebook) = serde_json::from_str::<Value>(&content) {
-            return Ok(
-                json!({"content": notebook_cells(&notebook), "cells": notebook["cells"].as_array().map_or(0, Vec::len)}),
-            );
+    let render = |bytes: Vec<u8>| {
+        if let Some(media_type) = image_media_type(&extension) {
+            return image(path, media_type, &bytes);
         }
+        let pages = optional_pages(&input)?;
+        if extension == "pdf" {
+            return pdf(path, pages, &bytes);
+        }
+        anyhow::ensure!(pages.is_none(),"pages applies only to PDF files; omit pages for text files and use offset/limit for line ranges");
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|error| anyhow!("Cannot read {} as UTF-8 text: {error}", path.display()))?;
+        if extension == "ipynb" {
+            if let Ok(notebook) = serde_json::from_str::<Value>(content) {
+                return Ok(
+                    json!({"content":notebook_cells(&notebook),"cells":notebook["cells"].as_array().map_or(0,Vec::len)}),
+                );
+            }
+        }
+        text(content, &input)
+    };
+    match session {
+        Some(session) => session.render_tracked_file(path, render),
+        None => render(std::fs::read(path)?),
     }
-    text(&content, &input)
 }
 
 // Empty optional strings from model adapters are placeholders, not page ranges.
@@ -153,8 +166,7 @@ fn image_media_type(extension: &str) -> Option<&'static str> {
 }
 
 /// The tool loop turns `image` into model image content when the model accepts it.
-fn image(path: &Path, media_type: &str) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
+fn image(path: &Path, media_type: &str, bytes: &[u8]) -> Result<Value> {
     anyhow::ensure!(
         bytes.len() <= MAX_IMAGE_BYTES,
         "Image is {} MB; the limit is {} MB",
@@ -168,8 +180,7 @@ fn image(path: &Path, media_type: &str) -> Result<Value> {
     }))
 }
 
-fn pdf(path: &Path, pages: Option<&str>) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
+fn pdf(path: &Path, pages: Option<&str>, bytes: &[u8]) -> Result<Value> {
     let texts = pdf_extract::extract_text_from_mem_by_pages(&bytes)
         .map_err(|error| anyhow!("Cannot extract PDF text from {}: {error}", path.display()))?;
     let total = texts.len();

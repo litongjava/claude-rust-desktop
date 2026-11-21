@@ -1393,6 +1393,7 @@ async fn execute_builtin_tool(
     search_config_path: Option<&std::path::Path>,
     skill_shell_active: bool,
     options: super::request_options::RequestOptions,
+    session:Option<crate::db::session_store::SessionDb>,
 ) -> Result<Value> {
     let provider = &provider.current()?;
     if name == "DeepSeekCode" {
@@ -1460,6 +1461,9 @@ async fn execute_builtin_tool(
         let mut result = if matches!(name, "Read" | "Glob" | "Grep" | "ListDir") {
             let (name, cwd) = (name.to_owned(), cwd.to_owned());
             tokio::task::spawn_blocking(crate::tools::path_scope::carry(move || {
+                if name=="Read" {
+                    return crate::tools::read::execute_bound(input,&cwd,session.as_ref());
+                }
                 crate::tools::execute_tool(&name, input, &cwd)
             }))
             .await??
@@ -2856,6 +2860,7 @@ impl ToolLoopExecutor {
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
         if self.executor_history.as_ref().is_some_and(|h| h.id() != conv_id) {
             self.executor_history = None;
+            self.file_state=Default::default();
         }
         self.conv_id = Some(conv_id);
         self.builtin_names.take();
@@ -3047,6 +3052,7 @@ impl ToolLoopExecutor {
                         self.search_config_path.as_deref(),
                         self.skill_shell_active,
                         self.openai_client.request_options.clone(),
+                        self.file_state.session.clone(),
                     ),
                 ),
             ),
@@ -3530,6 +3536,7 @@ impl ToolLoopExecutor {
 
     pub fn with_executor_history(mut self, history: ExecutorHistory) -> Result<Self> {
         anyhow::ensure!(self.conv_id.as_deref() == Some(history.id()), "Executor transcript belongs to another session");
+        self.file_state.session=match &history {ExecutorHistory::Session(s)=>Some(s.clone()),ExecutorHistory::Shared(..)=>None};
         self.executor_history = Some(history);
         self.builtin_names.take();
         Ok(self)
@@ -5152,7 +5159,9 @@ impl ToolLoopExecutor {
                 .as_str()
                 .or_else(|| tool_input["notebook_path"].as_str())
             {
-                self.record_seen_file(file_path);
+                if tool_name!="Read" || self.file_state.session.is_none() {
+                    self.record_seen_file(file_path);
+                }
             }
         }
         match take_read_image(tool_name, &mut value) {

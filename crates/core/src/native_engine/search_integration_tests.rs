@@ -47,6 +47,7 @@ async fn parallel_searches_keep_provider_credentials_and_usage_separate() {
         None,
         false,
         Default::default(),
+        None,
     );
     let b = execute_builtin_tool(
         "WebSearch",
@@ -57,6 +58,7 @@ async fn parallel_searches_keep_provider_credentials_and_usage_separate() {
         None,
         false,
         Default::default(),
+        None,
     );
     let (a, b) = tokio::join!(a, b);
     let (a, b) = (a.unwrap().to_string(), b.unwrap().to_string());
@@ -107,6 +109,7 @@ async fn search_failure_still_records_provider_usage() {
         None,
         false,
         Default::default(),
+        None,
     )
     .await
     .is_err());
@@ -149,6 +152,7 @@ async fn deepseek_search_falls_back_to_chat_when_unconfigured() {
         None,
         false,
         Default::default(),
+        None,
     )
     .await
     .unwrap();
@@ -167,6 +171,7 @@ async fn deepseek_search_falls_back_to_chat_when_unconfigured() {
         Some(&path),
         false,
         Default::default(),
+        None,
     )
     .await
     .unwrap_err()
@@ -215,6 +220,7 @@ async fn deepseek_search_reads_independent_endpoint_model_and_new_key_on_each_ca
             Some(&config_path),
             false,
             Default::default(),
+            None,
         )
         .await
         .unwrap();
@@ -271,7 +277,12 @@ async fn web_search_recording_matches_wire_and_existing_trace_id() {
         &tx,
         None,
         false,
-        crate::native_engine::request_options::RequestOptions::from_root(root.path(), Some("search-session"), "main"),
+        crate::native_engine::request_options::RequestOptions::from_root(
+            root.path(),
+            Some("search-session"),
+            "main",
+        ),
+        None,
     )
     .await
     .unwrap();

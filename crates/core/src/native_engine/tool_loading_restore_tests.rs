@@ -239,3 +239,43 @@ fn executor_saves_hook_adjusted_mcp_to_its_admitted_occurrence() -> Result<()> {
         .is_none());
     Ok(())
 }
+
+#[test]
+fn failed_read_cannot_authorize_an_edit_and_the_successful_read_survives_resume() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(temp.path().join("data"))?;
+    let stores = paths.open_stores()?;
+    let s = stores.create("file-owner", Default::default())?;
+    let file = temp.path().join("file.txt");
+    std::fs::write(&file, "original")?;
+    let read = json!({"file_path":file});
+    assert!(crate::tools::read::execute_bound(
+        json!({"file_path":file,"pages":"1"}),
+        temp.path().to_str().unwrap(),
+        Some(&s)
+    )
+    .is_err());
+    let mut executor = restore_executor(&paths, vec![])
+        .with_conv_id(s.id().into())
+        .with_executor_history(stores.executor_history(s.id())?)?;
+    assert!(executor.unread_file_error("Edit", &read).is_some());
+    let response =
+        crate::tools::read::execute_bound(read.clone(), temp.path().to_str().unwrap(), Some(&s))?;
+    assert!(response["content"].as_str().unwrap().contains("original"));
+    let mut resumed = restore_executor(&paths, vec![])
+        .with_conv_id(s.id().into())
+        .with_executor_history(stores.executor_history(s.id())?)?;
+    assert!(resumed.unread_file_error("Edit", &read).is_none());
+    let time = std::fs::metadata(&file)?.modified()?;
+    std::fs::write(&file, "modified")?;
+    std::fs::File::options()
+        .write(true)
+        .open(&file)?
+        .set_modified(time)?;
+    assert!(resumed
+        .unread_file_error("Edit", &read)
+        .unwrap()
+        .contains("modified"));
+    assert!(!paths.data_dir.join("file-state").exists());
+    Ok(())
+}
