@@ -238,9 +238,13 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
 #[tokio::test]
 async fn model_invokes_image_tool_and_receives_persisted_actual_image() {
     let Fixture { dir, store, id, engine, seen, server, .. } = fixture(4).await;
-    let assistant_id = uuid::Uuid::new_v4().to_string();
-    let request: ChatRequest = serde_json::from_value(json!({"conversation_id":id,"messages":store.model_history(&id,&ApiFormat::OpenAI).unwrap(),"model":"gpt-6-astra","provider_id":"gateway","workspace_path":dir.path()})).unwrap();
-    let mut events = engine.send_message(request).await.unwrap();
+    let messages = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+    let assistant_id = store.append(&id, "assistant", "").unwrap();
+    let request: ChatRequest = serde_json::from_value(json!({
+        "conversation_id":id, "messages":messages, "assistant_message_id":assistant_id,
+        "model":"gpt-6-astra", "provider_id":"gateway", "workspace_path":dir.path()
+    })).unwrap();
+    let mut events = engine.send_message_with_history(request, false).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(event) = events.recv().await {
             assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");

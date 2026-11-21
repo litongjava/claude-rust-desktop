@@ -1729,6 +1729,7 @@ impl QueryEngine {
                         full_text.len()
                     );
                     if save_response && !full_text.is_empty() {
+                        let assistant = executor.assistant_message_id().map(str::to_owned);
                         // This blocking write cannot be aborted once started, so
                         // it keeps the attempt's ownership until it exits: the
                         // session stays admitted and completion stays pending
@@ -1750,7 +1751,14 @@ impl QueryEngine {
                                 // holding anything the async side needs.
                                 let _ = release.recv();
                             }
-                            history.finish_response(&full_text)
+                            if let Some(message) = assistant {
+                                history.save_segment(&message, crate::db::session_store::SegmentUpdate {
+                                    text: Some(&full_text),
+                                    ..Default::default()
+                                })
+                            } else {
+                                history.finish_response(&full_text)
+                            }
                         })
                         .await;
                     }

@@ -215,7 +215,7 @@ fn executor_saves_hook_adjusted_mcp_to_its_admitted_occurrence() -> Result<()> {
     let stores = paths.open_stores()?;
     let session = stores.create("owner", Default::default())?;
     let assistant = session.write(|w| w.append("assistant", ""))?;
-    let executor = restore_executor(&paths, vec![])
+    let mut executor = restore_executor(&paths, vec![])
         .with_conv_id("owner".into())
         .with_executor_history(stores.executor_history("owner")?)?
         .with_parent_message_id(assistant.clone());

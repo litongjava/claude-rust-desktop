@@ -2821,7 +2821,7 @@ impl ToolLoopExecutor {
     }
 
     fn finish_mcp_output(
-        &self,
+        &mut self,
         id: &str,
         name: &str,
         display: &str,
@@ -2833,6 +2833,11 @@ impl ToolLoopExecutor {
         };
         if let Some(history) = self.session_search_storage() {
             let started = std::time::Instant::now();
+            if self.parent_message_id.is_none() {
+                if let ExecutorHistory::Session(session) = &history {
+                    self.parent_message_id = Some(session.write(|w| w.append("assistant", ""))?);
+                }
+            }
             history.save_mcp(self.parent_message_id.as_deref(), id, &content, display, failed)
                 .map_err(|error| crate::db::write_boundary_context(
                     "save MCP tool output", history.id(), started, error,
@@ -2895,6 +2900,10 @@ impl ToolLoopExecutor {
         let member = crate::super_agent::role::membership(&runtime.db, &runtime.session_id)?
             .map(|(_, role)| role);
         Ok(self.with_super_agent(role, member, runtime))
+    }
+
+    pub(super) fn assistant_message_id(&self) -> Option<&str> {
+        self.parent_message_id.as_deref()
     }
 
     pub fn with_parent_message_id(mut self, message_id: String) -> Self {
