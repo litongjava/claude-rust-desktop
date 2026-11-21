@@ -793,8 +793,9 @@ impl Stores {
             )?;
         }
         if let Some(sync) = &meta.sync {
+            let synced_workspace=sync::workspace(tx,&op.id,project.as_deref(),sync.workspace_path.as_deref())?;
             tx.execute("UPDATE conversations SET pinned=?1,archived=?2,workspace_path=coalesce(?3,workspace_path) WHERE id=?4",
-                params![sync.pinned,sync.archived,sync.workspace_path,op.id])?;
+                params![sync.pinned,sync.archived,synced_workspace,op.id])?;
             tx.execute(
                 "INSERT INTO sync_publications VALUES(?1,?2,?3)",
                 [&op.id, &sync.digest, &op.incarnation],

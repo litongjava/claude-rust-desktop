@@ -219,17 +219,7 @@ async fn sync_pull(
 
     let db = state.db_manager.clone();
     let (conversations, messages_per_conversation) =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let conversations = db.conversations()?;
-            let mut messages = HashMap::new();
-            for conversation in &conversations {
-                let rows = db.sync_messages(&conversation.id)?;
-                if !rows.is_empty() {
-                    messages.insert(conversation.id.clone(), rows);
-                }
-            }
-            Ok((conversations, messages))
-        })
+        tokio::task::spawn_blocking(move ||db.sync_contents())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|error| {

@@ -82,6 +82,27 @@ pub(super) struct SyncPublication {
     pub archived: bool,
 }
 
+/// Sync headers describe paths on the sending machine. Resolve project authority locally.
+pub(super) fn workspace(
+    c: &Connection,
+    id: &str,
+    project: Option<&str>,
+    remote: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(project) = project else {
+        return Ok(remote.map(str::to_owned));
+    };
+    let local = project_repo::require_trusted(c, project)?;
+    ensure!(!local.is_archived, "Project is archived");
+    let bound: Option<String> = c
+        .query_row(
+            "SELECT path FROM conversation_worktrees WHERE conversation_id=?1 AND project_id=?2",
+            [id, project],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(bound.or(local.workspace_path))
+}
 impl Stores {
     pub fn sync_conversation(
         &self,
@@ -166,11 +187,13 @@ impl Stores {
         self.global().write("acknowledge session sync",id,false,|c| {
             if let (Some(h),Some(expected))=(header,expected) {
                 if let Some(project)=&h.project_id { Project::select(c,&ProjectSelection::Existing(project.clone()))?; }
+                let workspace=workspace(c,id,h.project_id.as_deref(),h.workspace_path.as_deref())?;
+                c.execute("DELETE FROM conversation_worktrees WHERE conversation_id=?1 AND project_id IS NOT ?2",params![id,h.project_id])?;
                 c.execute("UPDATE conversations SET title=?1,model=?2,provider=?3,workspace_mode=coalesce(?4,workspace_mode),research_mode=?5,
                     pinned=?6,archived=?7,project_id=?8,workspace_path=?9,created_at=?10,
                     updated_at=CASE WHEN julianday(updated_at)>julianday(?11) THEN updated_at ELSE ?11 END, metadata_revision=metadata_revision+1
                     WHERE id=?12 AND incarnation=?13 AND metadata_revision=?14",
-                    params![h.title,h.model,h.provider,h.workspace_mode.map(|m|m.as_str()),h.research_mode,h.pinned,h.archived,h.project_id,h.workspace_path,h.created_at,h.updated_at,id,shard.incarnation,expected])?;
+                    params![h.title,h.model,h.provider,h.workspace_mode.map(|m|m.as_str()),h.research_mode,h.pinned,h.archived,h.project_id,workspace,h.created_at,h.updated_at,id,shard.incarnation,expected])?;
             }
             c.execute("INSERT INTO sync_publications VALUES(?1,?2,?3)",[id,&digest,&shard.incarnation])?;
             Ok(())
@@ -212,9 +235,47 @@ impl Stores {
         self.open_session(id)?.read(|r| r.messages())
     }
     pub fn sync_delete(&self, id: &str) -> Result<()> {
-        if self.global().conversation(id)?.is_some() {
-            self.open_session(id)?.delete()?;
+        if let Some(row) = self
+            .global()
+            .read_directory_row(id, |c| super::super::directory::one(c, id))?
+        {
+            self.open_listed(&row)?.delete()?;
         }
         Ok(())
+    }
+}
+
+pub type SyncContents = (
+    Vec<crate::db::conversation_repo::ConversationRow>,
+    std::collections::HashMap<String, Vec<MessageRow>>,
+);
+impl Stores {
+    pub fn sync_contents(&self) -> Result<SyncContents> {
+        let mut conversations = Vec::new();
+        let mut messages = std::collections::HashMap::new();
+        for entry in self.global().list_sessions(Default::default())? {
+            let rows = self.open_listed(&entry)?.read(|r| r.messages())?;
+            if !rows.is_empty() {
+                messages.insert(entry.conversation.id.clone(), rows);
+            }
+            conversations.push(entry.conversation);
+        }
+        Ok((conversations, messages))
+    }
+}
+impl crate::db::DbManager {
+    pub fn sync_contents(&self) -> Result<SyncContents> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let conversations = crate::db::conversation_repo::list_conversations(&tx)?;
+            let mut messages = std::collections::HashMap::new();
+            for entry in &conversations {
+                let rows = crate::db::message_repo::get_messages_by_conversation(&tx, &entry.id)?;
+                if !rows.is_empty() {
+                    messages.insert(entry.id.clone(), rows);
+                }
+            }
+            Ok((conversations, messages))
+        })?
     }
 }

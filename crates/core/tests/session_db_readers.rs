@@ -744,3 +744,31 @@ fn first_bridge_message_is_published_with_typed_history_and_chat_authority() -> 
     assert!(stores.global().conversation("invalid")?.is_none());
     Ok(())
 }
+
+#[test]
+fn synced_project_chat_uses_the_locally_trusted_workspace() -> Result<()> {
+    use deepseek_code_core::db::session_store::SyncHeader;
+    let root = tempfile::tempdir()?;
+    let project = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let existing =
+        stores.create_code_session(project.path(), "m", "p", &uuid::Uuid::new_v4().to_string())?;
+    let project_id = stores
+        .global()
+        .conversation(existing.id())?
+        .unwrap()
+        .project_id
+        .unwrap();
+    let header: SyncHeader = serde_json::from_value(serde_json::json!({
+        "id":"synced","title":"Remote project","projectId":project_id,"workspacePath":"/another/device/path",
+        "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z"
+    }))?;
+    stores.sync_conversation(&header.id, Some(&header), &[])?;
+    let (catalog, _) = stores.sync_contents()?;
+    let selected = catalog.iter().find(|row| row.id == header.id).unwrap();
+    assert_eq!(
+        selected.workspace_path.as_deref(),
+        project.path().canonicalize()?.to_str()
+    );
+    Ok(())
+}
