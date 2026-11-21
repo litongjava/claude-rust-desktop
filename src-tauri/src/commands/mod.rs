@@ -12,6 +12,7 @@ pub fn app_data_dir() -> Result<std::path::PathBuf, String> {
     .clone()
 }
 
+use deepseek_code_core::db::session_store::Schedules;
 use crate::computer_use::{ComputerUseManager, ComputerAction, MouseButton};
 use crate::db::DbManager;
 use crate::db::diff_repo::CodeDiffRow;
@@ -857,13 +858,10 @@ pub async fn create_scheduled_task(
     let now_clone = now.clone();
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::task_repo::insert_scheduled_task(
-                conn, &id_clone, &name_clone, description_clone.as_deref(), &cron_clone,
+        db_manager.insert_scheduled_task(&id_clone, &name_clone, description_clone.as_deref(), &cron_clone,
                 &task_type_clone, &task_config_clone, conversation_id_clone.as_deref(),
                 is_enabled, next_run_opt_clone.as_deref(), &now_clone, &now_clone,
             )
-        })?
     })
     .await
     .map_err(|e| e.to_string())?
@@ -896,9 +894,7 @@ pub async fn list_scheduled_tasks(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::task_repo::list_scheduled_tasks(conn)
-        })?
+        db_manager.list_scheduled_tasks()
     })
     .await
     .map_err(|e| e.to_string())?
@@ -930,15 +926,12 @@ pub async fn update_scheduled_task(
     };
 
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::task_repo::update_scheduled_task(
-                conn, &task_id,
+        db_manager.update_scheduled_task(&task_id,
                 name.as_deref(), description.as_deref(),
                 cron_expression.as_deref(), task_type.as_deref(),
                 task_config.as_deref(), conversation_id.as_deref(),
                 is_enabled, next_run_opt.as_deref(), &now,
             )
-        })?
     })
     .await
     .map_err(|e| e.to_string())?
@@ -955,9 +948,7 @@ pub async fn delete_scheduled_task(
         None => return Err("DbManager not found".to_string()),
     };
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::task_repo::delete_scheduled_task(conn, &task_id)
-        })?
+        db_manager.delete_scheduled_task(&task_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -976,9 +967,7 @@ pub async fn execute_task_now(
     let task = tokio::task::spawn_blocking({
         let db = db_manager.clone();
         move || {
-            db.with_conn(|conn| {
-                crate::db::task_repo::get_scheduled_task(conn, &task_id)
-            })?
+            db.get_scheduled_task(&task_id)
         }
     })
     .await
@@ -1008,9 +997,7 @@ pub async fn get_task_runs(
     };
     let limit = limit.unwrap_or(50);
     tokio::task::spawn_blocking(move || {
-        db_manager.with_conn(|conn| {
-            crate::db::task_repo::get_task_runs(conn, &task_id, limit)
-        })?
+        db_manager.get_task_runs(&task_id, limit)
     })
     .await
     .map_err(|e| e.to_string())?
