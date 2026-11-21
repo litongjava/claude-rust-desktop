@@ -156,7 +156,12 @@ impl SessionWrite<'_> {
         self.2.set(true);
         Ok(())
     }
-    pub fn approve_plan(&self, content: &str) -> Result<String> {
+    pub fn approve_plan(&self, content:&str) -> Result<String> {
+        let message=self.plan_marker(content)?;
+        permission_authority::record_conn(self.0,self.1,permission_authority::Source::ApprovedPlan,&Value::String(content.into()))?;
+        Ok(message)
+    }
+    pub(super) fn plan_marker(&self, content: &str) -> Result<String> {
         // The legacy plan setting refers to the latest approval only. A rewind
         // removing that marker must never reactivate an older approval.
         self.0.execute("DELETE FROM approved_plan_boundaries", [])?;
@@ -168,12 +173,6 @@ impl SessionWrite<'_> {
         self.0.execute(
             "INSERT INTO approved_plan_boundaries VALUES(?1)",
             [&message],
-        )?;
-        permission_authority::record_conn(
-            self.0,
-            self.1,
-            permission_authority::Source::ApprovedPlan,
-            &Value::String(content.into()),
         )?;
         Ok(message)
     }

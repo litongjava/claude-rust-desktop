@@ -182,3 +182,75 @@ impl SessionRepository<'_> {
         })
     }
 }
+
+impl SessionRepository<'_> {
+    pub(crate) fn plan_boundary(&self) -> Result<Option<String>> {
+        match &self.0 {
+            Backend::Admitted(s) => s.read(|r| r.approved_plan_boundary()),
+            Backend::Shared(_, _) => {
+                self.read(crate::services::plan_approval::latest_boundary_conn)
+            }
+        }
+    }
+
+    pub(crate) fn accept_plan(
+        &self,
+        text: &str,
+        reset: bool,
+        transition: Option<(
+            &crate::permissions::PermissionManager,
+            crate::permissions::manager::ModeSnapshot,
+            crate::permissions::PermissionMode,
+        )>,
+    ) -> Result<Option<String>> {
+        use crate::services::{permission_authority, session_permission_mode};
+        let label = "commit plan decision";
+        let commit = |tx: rusqlite::Transaction<'_>| {
+            if let Some((manager, expected, mode)) = transition {
+                manager.commit_mode_transition(expected, mode, || Ok(tx.commit()?))
+            } else {
+                Ok(tx.commit()?)
+            }
+        };
+        let policy = |c: &Connection, id: &str| -> Result<()> {
+            if let Some((_, _, mode)) = transition {
+                super::state::set_local(
+                    c,
+                    &format!("cli.permission-mode.{id}"),
+                    session_permission_mode::name(mode),
+                )?;
+                permission_authority::record_conn(
+                    c,
+                    id,
+                    permission_authority::Source::ApprovedPlan,
+                    &serde_json::json!(text),
+                )?;
+            }
+            Ok(())
+        };
+        match &self.0 {
+            Backend::Admitted(s) => {
+                let _locks=s.stores.key_lock(&s.key,false,false)?;
+                s.write_locked_with_commit(label,super::WRITE_DEADLINE,|w|{
+                    let message=reset.then(||w.plan_marker(text)).transpose()?;
+                    policy(w.0,w.1)?;
+                    Ok(message)
+                },commit)
+            }
+            Backend::Shared(db,id) => db.with_conn(|c|crate::db::write_tx_with_commit(c,label,super::WRITE_DEADLINE,|tx|{
+                let message=if reset {
+                    anyhow::ensure!(crate::db::conversation_repo::conversation_metadata(&tx,id)?.is_some(),"Plan session not found");
+                    let order=tx.query_row("SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",[id],|r|r.get(0))?;
+                    let message=uuid::Uuid::new_v4().to_string();
+                    crate::db::message_repo::insert_message(&tx,&message,id,"user",text,None,&chrono::Utc::now().to_rfc3339(),true,order)?;
+                    crate::db::conversation_repo::increment_message_count(&tx,id)?;
+                    super::state::set_local(&tx,&format!("plan.context_boundary.{id}"),&serde_json::json!({"boundary_id":message}).to_string())?;
+                    Some(message)
+                }else{None};
+                policy(&tx,id)?;
+                commit(tx)?;
+                Ok(message)
+            }))?,
+        }
+    }
+}
