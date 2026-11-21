@@ -174,7 +174,7 @@ pub async fn execute_for_session_async(
                 let deadline = started + timeout;
                 // A poll may read an immediately available snapshot. All reads,
                 // including authorization, share the same bounded allowance.
-                let read_deadline = if timeout.is_zero() {
+                let read_deadline = if !block || timeout.is_zero() {
                     started + std::time::Duration::from_millis(100)
                 } else {
                     deadline
@@ -186,13 +186,13 @@ pub async fn execute_for_session_async(
                     background_sessions::authorize_job(&read_root, &job, &read_owner)?;
                     Ok::<_, anyhow::Error>(job)
                 });
-                let mut job = if block {
+                let mut job = if name == "TaskStop" {
+                    admission.await??
+                } else {
                     match tokio::time::timeout_at(read_deadline, admission).await {
                         Ok(result) => result??,
                         Err(_) => return Ok(json!({"task_id":id,"retrieval_status":"timeout"})),
                     }
-                } else {
-                    admission.await??
                 };
                 if name == "TaskStop" {
                     let (root, id) = (root.to_owned(), id.to_owned());
@@ -243,16 +243,12 @@ pub async fn execute_for_session_async(
                         page => job_page(&root, &id, &page),
                     })
                 });
-                let snapshot = if block {
-                    match tokio::time::timeout_at(read_deadline, snapshot).await {
-                        Ok(result) => Some(result?),
-                        Err(_) => {
-                            timed_out = true;
-                            None
-                        }
+                let snapshot = match tokio::time::timeout_at(read_deadline, snapshot).await {
+                    Ok(result) => Some(result?),
+                    Err(_) => {
+                        timed_out = true;
+                        None
                     }
-                } else {
-                    Some(snapshot.await?)
                 };
                 let (status, mut value) = match snapshot {
                     Some((result, metadata)) => {
