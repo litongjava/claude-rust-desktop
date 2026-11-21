@@ -89,3 +89,20 @@ fn synced_message_ids_can_be_restored_only_in_the_receiving_shard() -> Result<()
     assert!(other.edit_conversation(&unqualified).is_err());
     Ok(())
 }
+
+#[test]
+fn pin_completes_while_execution_is_held() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let shard = stores.create("running", Default::default())?;
+    let lease = shard.acquire_execution()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer =
+        std::thread::spawn(move || tx.send(shard.edit_conversation(&json!({"pinned":true}))));
+    let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(lease);
+    writer.join().unwrap().ok();
+    result??;
+    assert!(stores.conversation_metadata("running")?.unwrap().pinned);
+    Ok(())
+}

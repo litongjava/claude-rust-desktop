@@ -237,7 +237,18 @@ impl crate::db::DbManager {
 impl super::SessionDb {
     /// Serialize a Desktop edit with retirement and provider publication.
     pub fn edit_conversation(&self, body: &Value) -> Result<()> {
-        let _lock=self.stores.key_lock(&self.key,true,false)?;
+        // Pin, archive and title edits only serialize on the G writer. Keep
+        // the incarnation stable alongside a running execution's shared lock.
+        let exclusive = [
+            "messages",
+            "workspace_mode",
+            "project_id",
+            "model",
+            "workspace_path",
+        ]
+        .iter()
+        .any(|key| body.get(key).is_some());
+        let _lock = self.stores.key_lock(&self.key, exclusive, false)?;
         self.check_directory()?;
         let has_metadata=["workspace_mode","pinned","archived","project_id","title","model","workspace_path"].iter().any(|k|body.get(k).is_some());
         if let Some(mode)=body.get("workspace_mode") {
