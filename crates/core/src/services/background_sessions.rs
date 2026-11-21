@@ -96,6 +96,77 @@ pub struct Job {
     pub launched: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct JobOwners {
+    pub(crate) parent: String,
+    execution: String,
+}
+
+impl JobOwners {
+    fn path(root: &Path, job: &Job) -> Result<PathBuf> {
+        Ok(directory(root, &job.id)?.join("session-owners.json"))
+    }
+
+    pub(crate) fn load(root: &Path, job: &Job) -> Result<Option<Self>> {
+        match fs::read(Self::path(root, job)?) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) fn publish(root: &Path, job: &Job) -> Result<()> {
+        if !root.join("global.db").try_exists()? {
+            return Ok(());
+        }
+        let stores = crate::db::session_store::Stores::open(root)?;
+        let owner = stores.open_session(&job.parent_session_id)?;
+        let target = if job.session_id == job.parent_session_id {
+            owner.clone()
+        } else {
+            stores.open_session(&job.session_id)?
+        };
+        save(
+            &Self::path(root, job)?,
+            &Self {
+                parent: owner.incarnation().into(),
+                execution: target.incarnation().into(),
+            },
+        )
+    }
+
+    pub(crate) fn target(
+        &self,
+        root: &Path,
+        job: &Job,
+        stores: &crate::db::session_store::Stores,
+    ) -> Result<Option<crate::db::session_store::SessionDb>> {
+        use super::session_worker::{job_child, JobChild};
+        match job_child(root, job)? {
+            Some(JobChild::Bound { id, incarnation }) => stores.selected_child(&id, &incarnation),
+            Some(JobChild::Legacy(_)) => Ok(None),
+            None => stores.selected_child(&job.session_id, &self.execution),
+        }
+    }
+}
+
+pub(crate) fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()> {
+    ensure!(
+        job.parent_session_id == session,
+        "Task belongs to another session"
+    );
+    let owners = JobOwners::load(root, job)?;
+    if owners.is_some() || root.join("global.db").try_exists()? {
+        let owners = owners.context("Task has no recorded parent incarnation")?;
+        let stores = crate::db::session_store::Stores::open(root)?;
+        ensure!(
+            stores.open_session(session)?.incarnation() == owners.parent,
+            "Task belongs to another session incarnation"
+        );
+    }
+    Ok(())
+}
+
 /// Durable view of a reserved job, used by hosts that reconcile after a crash.
 #[derive(Debug, Clone)]
 pub enum JobSnapshot {
@@ -610,6 +681,7 @@ fn spawn_at(
             job.session_id == session,
             "Reserved background task {id} belongs to another child session"
         );
+        authorize_job(root, &job, parent)?;
         let stored = launch_of(root, &id)?
             .with_context(|| format!("Reserved background task {id} has no launch record"))?;
         ensure!(
@@ -672,6 +744,7 @@ fn spawn_at(
             error: None,
             launched: false,
         };
+        JobOwners::publish(root, &job)?;
         save(&dir.join("launch.json"), &launch)?;
         save(&dir.join("state.json"), &job)?;
         job
@@ -1460,7 +1533,8 @@ pub fn collect_completed(
     root: &Path,
     parent: &str,
 ) -> Result<Vec<String>> {
-    let owner=store.db.select_session(parent)?;
+    let shard = store.db.open_session(parent)?;
+    let owner = shard.select_session(parent)?;
     let mut notices = Vec::new();
     for job in list(root, Some(parent))? {
         if job.session_id == parent
@@ -1472,6 +1546,12 @@ pub fn collect_completed(
             continue;
         }
         if !matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
+            continue;
+        }
+        let Some(owners) = JobOwners::load(root, &job)? else {
+            continue;
+        };
+        if owners.parent != shard.incarnation() {
             continue;
         }
         let message_id = format!("background-report:{}:{}", parent, job.id);
@@ -1487,13 +1567,11 @@ pub fn collect_completed(
             .find(|event| event["type"] == "result")
             .and_then(|event| event["result"].as_str().map(str::to_owned));
         let result = if execution_session != job.session_id {
-            store
-                .db
-                .select_session(&execution_session)?.messages()?
-                .into_iter()
-                .rev()
-                .find(|message| message.role == "assistant" && !message.content.trim().is_empty())
-                .map(|message| message.content)
+            owners
+                .target(root, &job, &store.db)?
+                .map(|s| s.read(|r| r.last_assistant_report()))
+                .transpose()?
+                .flatten()
                 .or(result)
         } else if job.session_id == parent {
             Some(if job.status == "completed" {
@@ -2199,6 +2277,11 @@ mod tests {
             b"{\"type\":\"result\",\"result\":\"child answer\"}\n",
         )
         .unwrap();
+        store
+            .db
+            .create(&job.session_id, Default::default())
+            .unwrap();
+        JobOwners::publish(root.path(), &job).unwrap();
         let notices = collect_completed(&store, root.path(), &parent).unwrap();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("child answer"));
@@ -2237,6 +2320,7 @@ mod tests {
             b"{\"type\":\"error\",\"error\":\"original full diagnostic\"}\n",
         )
         .unwrap();
+        JobOwners::publish(root.path(), &job).unwrap();
         acknowledge_foreground(root.path(), &id, &parent).unwrap();
         detach(root.path(), &id, &parent).unwrap();
         assert!(collect_completed(&store, root.path(), &parent)

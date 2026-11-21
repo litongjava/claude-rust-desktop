@@ -107,7 +107,7 @@ impl SessionDb {
 }
 
 impl Stores {
-    fn selected_child(&self, id: &str, inc: &str) -> Result<Option<SessionDb>> {
+    pub(crate) fn selected_child(&self, id: &str, inc: &str) -> Result<Option<SessionDb>> {
         self.global()
             .read_directory_row(id, |c| super::directory::one(c, id))?
             .filter(|entry| entry.incarnation == inc)

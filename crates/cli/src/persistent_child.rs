@@ -68,14 +68,8 @@ pub(super) async fn start_pending(
     // Automatic work is visible under /tasks and never seizes the input prompt.
     let publish = (|| -> Result<()> {
         if !child.is_empty() {
-            std::fs::write(
-                worker
-                    .root
-                    .join("background-tasks")
-                    .join(&id)
-                    .join("owned-child.json"),
-                serde_json::to_vec(&child)?,
-            )?;
+            let target = session.store.db.open_session(&child)?;
+            service::record_job_child(&worker.root, &id, &target)?;
         }
         jobs::detach(&worker.root, &id, &worker.session_id)
     })();

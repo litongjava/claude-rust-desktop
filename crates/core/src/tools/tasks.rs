@@ -168,14 +168,13 @@ pub async fn execute_for_session_async(
             {
                 use crate::services::background_sessions;
                 let (read_root, read_id) = (root.to_owned(), id.to_owned());
+                let read_owner = session.to_owned();
                 let mut job = tokio::task::spawn_blocking(move || {
-                    background_sessions::get(&read_root, &read_id)
+                    let job = background_sessions::get(&read_root, &read_id)?;
+                    background_sessions::authorize_job(&read_root, &job, &read_owner)?;
+                    Ok::<_, anyhow::Error>(job)
                 })
                 .await??;
-                ensure!(
-                    job.parent_session_id == session,
-                    "Task belongs to another session"
-                );
                 if name == "TaskStop" {
                     let (root, id) = (root.to_owned(), id.to_owned());
                     let mut value = tokio::task::spawn_blocking(move || {
@@ -327,10 +326,14 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     if !terminal_status(&job.status) {
         return None;
     }
-    let execution = crate::services::session_worker::job_execution_session(root, job).ok()?;
-    if !root.join("global.db").is_file() { return None; }
+    let owners = crate::services::background_sessions::JobOwners::load(root, job).ok()??;
     let stores = crate::db::session_store::Stores::open(root).ok()?;
-    stores.open_session(&execution).ok()?.read(|r| r.last_assistant_report()).ok().flatten()
+    owners
+        .target(root, job, &stores)
+        .ok()??
+        .read(|r| r.last_assistant_report())
+        .ok()
+        .flatten()
 }
 
 /// Head of a string on a UTF-8 character boundary.
@@ -1674,6 +1677,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_job_reads_require_recorded_incarnations() -> Result<()> {
+        use crate::db::session_store::Stores;
+        let root = tempfile::tempdir()?;
+        let stores = Stores::open(root.path())?;
+        let parent = uuid::Uuid::new_v4().to_string();
+        let child = uuid::Uuid::new_v4().to_string();
+        let owner = stores.create(&parent, Default::default())?;
+        let target = stores.create(&child, Default::default())?;
+        target.write(|w| w.append("assistant", "recorded history"))?;
+        let job = uuid::Uuid::new_v4().to_string();
+        let dir = crate::services::background_sessions::directory(root.path(), &job)?;
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("state.json"),
+            json!({
+                "id":job,"parent_session_id":parent,"session_id":child,"title":"fixture",
+                "status":"completed","started_ms":1,"heartbeat_ms":1
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            dir.join("session-owners.json"),
+            json!({
+                "parent":owner.incarnation(),"execution":target.incarnation()
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            dir.join("output.jsonl"),
+            "{\"type\":\"result\",\"result\":\"saved output\"}\n",
+        )?;
+        let get = |input| execute_for_session_async("TaskGet", input, root.path(), &parent);
+        assert_eq!(
+            get(json!({"task_id":job})).await?["stdout"],
+            "recorded history"
+        );
+        target.delete()?;
+        stores
+            .create(&child, Default::default())?
+            .write(|w| w.append("assistant", "new history"))?;
+        for input in [
+            json!({"task_id":job}),
+            json!({"task_id":job,"max_output_bytes":80}),
+        ] {
+            assert_eq!(get(input).await?["stdout"], "saved output");
+        }
+        owner.delete()?;
+        stores.create(&parent, Default::default())?;
+        assert!(get(json!({"task_id":job})).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn background_job_task_get_deadline_bounds_a_locked_report_database() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let root = tempfile::tempdir().unwrap();
@@ -1699,7 +1755,17 @@ mod tests {
         let child=job["session_id"].as_str().unwrap();
         let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
         stores.create(child,Default::default()).unwrap();
-        let lock=rusqlite::Connection::open_with_flags(root.path().join("sessions").join(child).join("session.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        stores.create(&session, Default::default()).unwrap();
+        crate::services::background_sessions::JobOwners::publish(
+            root.path(),
+            &serde_json::from_value(job.clone()).unwrap(),
+        )
+        .unwrap();
+        let lock = rusqlite::Connection::open_with_flags(
+            root.path().join("sessions").join(child).join("session.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
         lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let started = tokio::time::Instant::now();
         let value = execute_for_session_async(
@@ -1735,7 +1801,17 @@ mod tests {
         let child=job["session_id"].as_str().unwrap();
         let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
         stores.create(child,Default::default()).unwrap();
-        let lock=rusqlite::Connection::open_with_flags(root.path().join("sessions").join(child).join("session.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        stores.create(&session, Default::default()).unwrap();
+        crate::services::background_sessions::JobOwners::publish(
+            root.path(),
+            &serde_json::from_value(job.clone()).unwrap(),
+        )
+        .unwrap();
+        let lock = rusqlite::Connection::open_with_flags(
+            root.path().join("sessions").join(child).join("session.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
         lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
         // timeout:0 still reads the snapshot, bounded by a short read deadline.
         let started = tokio::time::Instant::now();
@@ -2031,6 +2107,11 @@ mod tests {
         if let Some(stderr) = stderr {
             std::fs::write(directory.join("stderr.log"), stderr).unwrap();
         }
+        let stores = crate::db::session_store::Stores::open(root).unwrap();
+        if stores.global().conversation(session).unwrap().is_none() {
+            stores.create(session, Default::default()).unwrap();
+        }
+        crate::services::background_sessions::JobOwners::publish(root, &job).unwrap();
         if let Some(report) = report {
             insert_assistant(root, session, "report-1", report, 1);
         }

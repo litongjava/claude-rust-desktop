@@ -669,23 +669,50 @@ pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
         error: None,
         launched: true,
     };
+    jobs::JobOwners::publish(&worker.root, &job)?;
     jobs::save(&dir.join("state.json"), &job)?;
     fs::File::create(dir.join("output.jsonl"))?;
     jobs::save(&active, &id)?;
     Ok(job)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum JobChild {
+    Bound { id: String, incarnation: String },
+    Legacy(String),
+}
+
+pub fn record_job_child(
+    root: &Path,
+    job: &str,
+    child: &crate::db::session_store::SessionDb,
+) -> Result<()> {
+    jobs::save(
+        &jobs::directory(root, job)?.join("owned-child.json"),
+        &JobChild::Bound {
+            id: child.id().to_owned(),
+            incarnation: child.incarnation().to_owned(),
+        },
+    )
+}
+
+pub(crate) fn job_child(root: &Path, job: &Job) -> Result<Option<JobChild>> {
+    match fs::read(jobs::directory(root, &job.id)?.join("owned-child.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The durable target lets historical task attachments avoid changing the owner UI state.
 pub fn job_execution_session(root: &Path, job: &Job) -> Result<String> {
-    let path = jobs::directory(root, &job.id)?.join("owned-child.json");
-    match fs::read(path) {
-        Ok(bytes) => {
-            let id: String = serde_json::from_slice(&bytes)?;
+    match job_child(root, job)? {
+        Some(JobChild::Bound { id, .. } | JobChild::Legacy(id)) => {
             ensure!(uuid::Uuid::parse_str(&id).is_ok(), "Invalid owned child job target");
             Ok(id)
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(job.session_id.clone()),
-        Err(error) => Err(error.into()),
+        }
+        None => Ok(job.session_id.clone()),
     }
 }
 /// Remove the active marker only while it still belongs to `id`, so an old
