@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::db::DbManager;
 use crate::db::im_permission_repo;
+use crate::db::session_store::{ImPermissionChange, ImPermissions};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,12 +64,12 @@ impl From<im_permission_repo::ImUserPermissionRow> for UserPermission {
 }
 
 pub struct PermissionManager {
-    db: Arc<DbManager>,
+    db: Arc<dyn ImPermissions>,
     platform_modes: Mutex<HashMap<String, PermissionMode>>,
 }
 
 impl PermissionManager {
-    pub fn new(db: Arc<DbManager>) -> Self {
+    pub fn new(db: Arc<dyn ImPermissions>) -> Self {
         Self {
             db,
             platform_modes: Mutex::new(HashMap::new()),
@@ -84,291 +84,117 @@ impl PermissionManager {
 
     pub async fn get_permission_mode(&self, platform: &str) -> PermissionMode {
         let modes = self.platform_modes.lock().await;
-        modes
-            .get(platform)
-            .cloned()
-            .unwrap_or(PermissionMode::Open)
+        modes.get(platform).cloned().unwrap_or(PermissionMode::Open)
     }
 
-    pub async fn generate_pairing_code(
+    async fn for_user<T: Send + 'static>(
         &self,
         platform: &str,
-        user_id: &str,
-    ) -> Result<String> {
-        let code = format!("{:06}", uuid::Uuid::new_v4().as_u128() % 1_000_000u128);
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-
+        user: &str,
+        operation: impl FnOnce(&dyn ImPermissions, &str, &str) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-        let code_clone = code.clone();
-        let now_str_clone = now_str.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let existing = db.with_conn(|conn| {
-                im_permission_repo::get_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-
-            match existing {
-                Some(row) => {
-                    db.with_conn(|conn| {
-                        im_permission_repo::update_im_user_permission(
-                            conn,
-                            &row.id,
-                            PermissionMode::PairingCode.as_str(),
-                            false,
-                            Some(&code_clone),
-                            &now_str_clone,
-                        )
-                    })??;
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    db.with_conn(|conn| {
-                        im_permission_repo::insert_im_user_permission(
-                            conn,
-                            &id,
-                            &platform_clone,
-                            &user_id_clone,
-                            PermissionMode::PairingCode.as_str(),
-                            false,
-                            Some(&code_clone),
-                            &now_str_clone,
-                            &now_str_clone,
-                        )
-                    })??;
-                }
-            }
-            Ok(())
-        })
-        .await??;
-
-        Ok(code)
+        let platform = platform.to_owned();
+        let user = user.to_owned();
+        tokio::task::spawn_blocking(move || operation(db.as_ref(), &platform, &user)).await?
     }
 
+    pub async fn generate_pairing_code(&self, platform: &str, user: &str) -> Result<String> {
+        self.for_user(platform, user, |db, platform, user| {
+            let code = format!("{:06}", uuid::Uuid::new_v4().as_u128() % 1_000_000);
+            db.change_im_permission(platform, user, ImPermissionChange::Pair(&code))?;
+            Ok(code)
+        })
+        .await
+    }
     pub async fn verify_pairing_code(
         &self,
         platform: &str,
-        user_id: &str,
+        user: &str,
         code: &str,
     ) -> Result<bool> {
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-        let code_clone = code.to_string();
-
-        let valid = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let existing = db.with_conn(|conn| {
-                im_permission_repo::get_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-
-            match existing {
-                Some(row) => Ok(row.paired_code.as_deref() == Some(&code_clone)),
-                None => Ok(false),
-            }
+        let code = code.to_owned();
+        self.for_user(platform, user, move |db, p, u| {
+            Ok(db
+                .im_user(p, u)?
+                .is_some_and(|row| row.paired_code.as_deref() == Some(&code)))
         })
-        .await??;
-
-        Ok(valid)
+        .await
     }
-
-    pub async fn add_to_whitelist(&self, platform: &str, user_id: &str) -> Result<()> {
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-        let now_str_clone = now_str.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let existing = db.with_conn(|conn| {
-                im_permission_repo::get_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-
-            match existing {
-                Some(row) => {
-                    db.with_conn(|conn| {
-                        im_permission_repo::update_im_user_permission(
-                            conn,
-                            &row.id,
-                            PermissionMode::Whitelist.as_str(),
-                            true,
-                            None,
-                            &now_str_clone,
-                        )
-                    })??;
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    db.with_conn(|conn| {
-                        im_permission_repo::insert_im_user_permission(
-                            conn,
-                            &id,
-                            &platform_clone,
-                            &user_id_clone,
-                            PermissionMode::Whitelist.as_str(),
-                            true,
-                            None,
-                            &now_str_clone,
-                            &now_str_clone,
-                        )
-                    })??;
-                }
-            }
-            Ok(())
+    pub async fn add_to_whitelist(&self, platform: &str, user: &str) -> Result<()> {
+        self.for_user(platform, user, |db, p, u| {
+            db.change_im_permission(p, u, ImPermissionChange::Allow)
         })
-        .await??;
-
-        Ok(())
+        .await
     }
-
-    pub async fn remove_from_whitelist(&self, platform: &str, user_id: &str) -> Result<()> {
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            db.with_conn(|conn| {
-                im_permission_repo::delete_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-            Ok(())
+    pub async fn remove_from_whitelist(&self, platform: &str, user: &str) -> Result<()> {
+        self.for_user(platform, user, |db, p, u| {
+            db.change_im_permission(p, u, ImPermissionChange::Remove)
         })
-        .await??;
-
-        Ok(())
+        .await
     }
-
-    pub async fn check_permission(&self, platform: &str, user_id: &str) -> Result<bool> {
-        let mode = self.get_permission_mode(platform).await;
-
-        match mode {
-            PermissionMode::Open => Ok(true),
-            PermissionMode::Whitelist | PermissionMode::PairingCode => {
-                let db = self.db.clone();
-                let platform_clone = platform.to_string();
-                let user_id_clone = user_id.to_string();
-
-                let allowed = tokio::task::spawn_blocking(move || -> Result<bool> {
-                    let existing = db.with_conn(|conn| {
-                        im_permission_repo::get_im_user_permission_by_platform_user(
-                            conn,
-                            &platform_clone,
-                            &user_id_clone,
-                        )
-                    })??;
-
-                    match existing {
-                        Some(row) => Ok(row.is_allowed),
-                        None => Ok(false),
-                    }
-                })
-                .await??;
-
-                Ok(allowed)
-            }
+    pub async fn check_permission(&self, platform: &str, user: &str) -> Result<bool> {
+        if self.get_permission_mode(platform).await == PermissionMode::Open {
+            return Ok(true);
         }
+        self.for_user(platform, user, |db, p, u| {
+            Ok(db.im_user(p, u)?.is_some_and(|row| row.is_allowed))
+        })
+        .await
     }
-
+    async fn list(&self, platform: &str, pending: bool) -> Result<Vec<UserPermission>> {
+        let db = self.db.clone();
+        let platform = platform.to_owned();
+        let rows =
+            tokio::task::spawn_blocking(move || db.list_im_users(&platform, pending)).await??;
+        Ok(rows.into_iter().map(UserPermission::from).collect())
+    }
     pub async fn list_permissions(&self, platform: &str) -> Result<Vec<UserPermission>> {
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-
-        let rows: Vec<im_permission_repo::ImUserPermissionRow> = tokio::task::spawn_blocking(move || -> Result<Vec<im_permission_repo::ImUserPermissionRow>> {
-            db.with_conn(|conn| {
-                im_permission_repo::list_im_user_permissions_by_platform(conn, &platform_clone)
-            })?
-        })
-        .await??;
-
-        Ok(rows.into_iter().map(UserPermission::from).collect())
+        self.list(platform, false).await
     }
-
-    pub async fn get_pending_pairing_requests(&self, platform: &str) -> Result<Vec<UserPermission>> {
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-
-        let rows: Vec<im_permission_repo::ImUserPermissionRow> = tokio::task::spawn_blocking(move || -> Result<Vec<im_permission_repo::ImUserPermissionRow>> {
-            db.with_conn(|conn| {
-                im_permission_repo::list_pending_im_user_permissions(conn, &platform_clone)
-            })?
-        })
-        .await??;
-
-        Ok(rows.into_iter().map(UserPermission::from).collect())
+    pub async fn get_pending_pairing_requests(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<UserPermission>> {
+        self.list(platform, true).await
     }
-
-    pub async fn approve_pairing_request(&self, platform: &str, user_id: &str) -> Result<()> {
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-        let now_str_clone = now_str;
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let existing = db.with_conn(|conn| {
-                im_permission_repo::get_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-
-            if let Some(row) = existing {
-                db.with_conn(|conn| {
-                    im_permission_repo::update_im_user_permission(
-                        conn,
-                        &row.id,
-                        PermissionMode::PairingCode.as_str(),
-                        true,
-                        row.paired_code.as_deref(),
-                        &now_str_clone,
-                    )
-                })??;
-            }
-            Ok(())
+    pub async fn approve_pairing_request(&self, platform: &str, user: &str) -> Result<()> {
+        self.for_user(platform, user, |db, p, u| {
+            db.change_im_permission(p, u, ImPermissionChange::Approve)
         })
-        .await??;
-
-        Ok(())
+        .await
     }
+    pub async fn reject_pairing_request(&self, platform: &str, user: &str) -> Result<()> {
+        self.remove_from_whitelist(platform, user).await
+    }
+}
 
-    pub async fn reject_pairing_request(&self, platform: &str, user_id: &str) -> Result<()> {
-        let db = self.db.clone();
-        let platform_clone = platform.to_string();
-        let user_id_clone = user_id.to_string();
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            db.with_conn(|conn| {
-                im_permission_repo::delete_im_user_permission_by_platform_user(
-                    conn,
-                    &platform_clone,
-                    &user_id_clone,
-                )
-            })??;
-            Ok(())
-        })
-        .await??;
-
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn pairing_decisions_survive_restart_and_are_scoped_to_the_platform() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let stores = crate::db::session_store::Stores::open(root.path())?;
+        let manager = PermissionManager::new(Arc::new(stores));
+        manager
+            .set_permission_mode("alpha", PermissionMode::PairingCode)
+            .await?;
+        let code = manager.generate_pairing_code("alpha", "user").await?;
+        assert!(manager.verify_pairing_code("alpha", "user", &code).await?);
+        assert!(!manager.verify_pairing_code("beta", "user", &code).await?);
+        assert!(!manager.check_permission("alpha", "user").await?);
+        manager.approve_pairing_request("alpha", "user").await?;
+        drop(manager);
+        let manager = PermissionManager::new(Arc::new(crate::db::session_store::Stores::open(
+            root.path(),
+        )?));
+        manager
+            .set_permission_mode("alpha", PermissionMode::PairingCode)
+            .await?;
+        assert!(manager.check_permission("alpha", "user").await?);
+        manager.reject_pairing_request("alpha", "user").await?;
+        assert!(!manager.check_permission("alpha", "user").await?);
         Ok(())
     }
 }
