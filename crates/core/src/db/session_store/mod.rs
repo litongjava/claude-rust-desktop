@@ -14,6 +14,8 @@ pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
 mod delivery;
 mod executor;
 mod engine;
+mod recording;
+pub use recording::RecordingPolicies;
 mod segment;
 mod owned;
 mod goal_state;
@@ -67,6 +69,7 @@ struct Root {
     global: GlobalDb,
     repair: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
     repair_cursor: Mutex<String>,
+    recording: std::sync::RwLock<HashMap<String,crate::native_engine::request_recording::Policy>>,
     upgraded_directory: bool,
     migrating: std::sync::atomic::AtomicBool,
 }
@@ -124,6 +127,7 @@ impl Stores {
                 upgraded_directory,
                 repair: Default::default(),
                 repair_cursor: Default::default(),
+                recording: Default::default(),
                 migrating: Default::default(),
                 path,
             }

@@ -3,7 +3,7 @@ use super::{CreateOptions, ExecutorHistory, Stores, WRITE_DEADLINE};
 use crate::db::{conversation_repo as catalog, message_repo as history, project_repo, DbManager};
 use crate::native_engine::workspace;
 use anyhow::{ensure, Result};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
 type SavedHistory = (Option<String>, Vec<history::MessageRow>);
@@ -32,10 +32,19 @@ impl Stores {
     ) -> Result<Workspace> {
         let key = super::layout::storage_key(id)?;
         let _guard = self.resolved_key(&key)?;
-        self.global()
-            .connection(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-                workspace_at(c, root, id, requested)
-            })
+        self.global().read(|c| {
+            let tx = c.unchecked_transaction()?;
+            if let Some(row) = catalog::conversation_metadata(&tx, id)? {
+                ensure!(!row.archived, "Session is archived");
+                if row.project_id.is_none() {
+                    let path = super::lifecycle::workspace(&tx, root, id)?;
+                    let profile =
+                        crate::prompt::PromptProfile::from_workspace_mode(&row.workspace_mode);
+                    return Ok((path, None, profile));
+                }
+            }
+            workspace_at(&tx, root, id, requested)
+        })
     }
 
     pub(crate) fn engine_history(&self, id: &str) -> Result<Option<SavedHistory>> {
@@ -216,6 +225,12 @@ mod tests {
         stores.save_engine_state("chat", "model", "2026-10-01T00:00:00Z", 99)?;
         let shard = stores.open_session("chat")?;
         let history = stores.executor_history("chat")?;
+        assert_eq!(
+            stores
+                .engine_workspace(&root.path().join("workspaces"), "chat", None)?
+                .0,
+            shard.workspace()?
+        );
         shard.write(|w| w.append("user", "question").map(drop))?;
         history.finish_response("response")?;
         assert_eq!(

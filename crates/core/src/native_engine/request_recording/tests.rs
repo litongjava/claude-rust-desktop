@@ -467,41 +467,29 @@ async fn nonstream_response_is_unformatted_bytes() {
 fn launch_policy_is_session_scoped_and_inherited_by_explicit_parent() {
     let temp = tempfile::tempdir().unwrap();
     let paths = crate::runtime::RuntimePaths::new(temp.path().into()).unwrap();
-    let db = paths.open_database().unwrap();
-    db.set_request_recording_policy("parent-test", true, false);
-    assert!(RequestOptions::from_db(&db, Some("parent-test"), "main")
-        .recording
-        .is_some());
-    assert!(RequestOptions::from_db(&db, Some("unrelated"), "main")
-        .recording
-        .is_none());
-    db.with_conn(|c| {
-        c.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-            rusqlite::params!["delegation.child", r#"{"parent_session_id":"parent-test"}"#],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    let db = paths.open_stores().unwrap();
+    let parent = db.create("parent-test",Default::default()).unwrap();
+    let workspace = parent.workspace().unwrap();
+    let owned = parent.derive_owned_child("child",&workspace).unwrap();
+    owned.derive_owned_child("grandchild",&workspace).unwrap();
+    db.set_request_recording_policy("parent-test", true, false).unwrap();
+    assert!(RequestOptions::from_db(&db, Some("parent-test"), "main").recording.is_some());
+    assert!(RequestOptions::from_db(&db, Some("unrelated"), "main").recording.is_none());
     let child = RequestOptions::from_db(&db, Some("child"), "main");
     assert_eq!(child.purpose, "subagent");
     assert_eq!(
         child.recording.unwrap().parent_session_id.as_deref(),
         Some("parent-test")
     );
-    db.with_conn(|c| {
-        c.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-            rusqlite::params!["delegation.grandchild", r#"{"parent_session_id":"child"}"#],
-        )
-    })
-    .unwrap()
-    .unwrap();
     let grandchild = RequestOptions::from_db(&db, Some("grandchild"), "main");
     assert_eq!(
         grandchild.recording.unwrap().parent_session_id.as_deref(),
         Some("child")
     );
+    parent.delete().unwrap();
+    db.create("parent-test",Default::default()).unwrap();
+    db.set_request_recording_policy("parent-test",true,false).unwrap();
+    assert!(RequestOptions::from_db(&db, Some("child"),"main").recording.is_none());
     assert!(!temp.path().join("request-records").exists());
 }
 
