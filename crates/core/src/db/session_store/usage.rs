@@ -106,3 +106,59 @@ impl crate::db::DbManager {
         })
     }
 }
+
+impl Stores {
+    pub fn skill_usage(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<BTreeMap<String, crate::services::skill_usage::Usage>> {
+        let mut totals = BTreeMap::<String, crate::services::skill_usage::Usage>::new();
+        for row in self.global().list_sessions(Default::default())? {
+            ensure!(!cancelled(), "Usage scan cancelled");
+            let session = self.open_listed(&row)?;
+            for (name, current) in session
+                .read(|r| crate::services::skill_usage::skill_snapshot(r.0, now, &cancelled))?
+            {
+                let total = totals.entry(name).or_default();
+                total.uses = total.uses.saturating_add(current.uses);
+                total.tokens_7d = total.tokens_7d.saturating_add(current.tokens_7d);
+                total.last_used = total.last_used.max(current.last_used);
+            }
+        }
+        Ok(totals)
+    }
+
+    pub fn mcp_last_used(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<BTreeMap<String, chrono::DateTime<chrono::Utc>>> {
+        let mut latest = BTreeMap::new();
+        for row in self.global().list_sessions(Default::default())? {
+            ensure!(!cancelled(), "Usage scan cancelled");
+            let session = self.open_listed(&row)?;
+            for (name, at) in
+                session.read(|r| crate::services::skill_usage::mcp_snapshot(r.0, &cancelled))?
+            {
+                let last = latest.entry(name).or_insert(at);
+                *last = (*last).max(at);
+            }
+        }
+        Ok(latest)
+    }
+}
+impl crate::db::DbManager {
+    pub fn skill_usage(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<BTreeMap<String, crate::services::skill_usage::Usage>> {
+        self.with_conn(|c| crate::services::skill_usage::skill_snapshot(c, now, &cancelled))?
+    }
+    pub fn mcp_last_used(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<BTreeMap<String, chrono::DateTime<chrono::Utc>>> {
+        self.with_conn(|c| crate::services::skill_usage::mcp_snapshot(c, &cancelled))?
+    }
+}

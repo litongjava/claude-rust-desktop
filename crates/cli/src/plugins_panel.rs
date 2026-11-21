@@ -146,7 +146,7 @@ pub(crate) async fn load(paths: &RuntimePaths, session: &Session) -> Result<Mode
     let bundled = deepseek_code_core::skills::discovery::bundled_dir(&paths.data_dir);
     let installed =
         deepseek_code_core::skills::discovery::installed_bundled_skills(&paths.data_dir);
-    let usages = skill_usage::skill_usage(&session.store.db, Utc::now())?;
+    let usages = session.store.db.skill_usage(Utc::now(), || false)?;
     let mut names: BTreeSet<String> = commands.keys().cloned().collect();
     names.extend(installed.keys().cloned());
     names.extend(states.keys().cloned());
@@ -202,7 +202,7 @@ pub(crate) async fn load(paths: &RuntimePaths, session: &Session) -> Result<Mode
     // token estimate below sees their tools and opening the panel does not
     // disconnect servers that are already running.
     session.ensure_mcp().await?;
-    let last_used = skill_usage::mcp_last_used(&session.store.db)?;
+    let last_used = session.store.db.mcp_last_used(|| false)?;
     let stored_mcp = mcp_states::load(&paths.data_dir);
     let live_tools = session.mcp.get_all_tools().await;
     let mut mcp: Vec<McpRow> = session
