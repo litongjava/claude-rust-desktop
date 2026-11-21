@@ -8,8 +8,10 @@ use std::sync::Arc;
 fn fixture() -> serde_json::Value {
     json!({"agent_type":"Custom","name":"Old Reader","description":"Read code","when_to_use":"Code review","tools":["file_read","search","list_files"],"model":"sonnet","system_prompt":"Inspect carefully.","source":"user","base_dir":"old/project"})
 }
-fn context(path: &std::path::Path) -> ServiceContext {
-    ServiceContext::open(
+fn context(
+    path: &std::path::Path,
+) -> ServiceContext<deepseek_code_core::db::session_store::Stores> {
+    ServiceContext::from_stores(
         RuntimePaths::new(path.to_path_buf()).unwrap(),
         Arc::new(EnvironmentCredentials),
     )
@@ -32,11 +34,19 @@ fn legacy_mapping_preview_backup_idempotence_conflicts_and_reopen() {
     assert!(!dir.path().join("backups").exists());
     let report = agent_import::import(&ctx, &source, "OldReader", false).unwrap();
     assert!(report.imported && !report.skipped);
-    let backup = rusqlite::Connection::open(report.backup.unwrap()).unwrap();
+    let manifest = std::path::PathBuf::from(report.backup.unwrap());
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(inventory["session_shards"], json!([]));
+    let backup = rusqlite::Connection::open_with_flags(
+        manifest.with_file_name(inventory["database"].as_str().unwrap()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
     assert_eq!(
         backup
             .query_row(
-                "SELECT COUNT(*) FROM peripheral_settings WHERE key='agent-definitions'",
+                "SELECT COUNT(*) FROM global_settings WHERE domain='agent' AND name='agent-definitions'",
                 [],
                 |r| r.get::<_, i64>(0)
             )

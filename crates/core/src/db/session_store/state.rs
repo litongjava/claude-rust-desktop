@@ -18,7 +18,7 @@ pub enum GlobalSetting<'a> {
     TeamConfiguration(&'a str),
 }
 impl<'a> GlobalSetting<'a> {
-    fn parts(self) -> [&'a str; 2] {
+    pub(super) fn parts(self) -> [&'a str; 2] {
         match self {
             Self::MachinePreference(k) => ["machine", k],
             Self::AgentDefinition(k) => ["agent", k],

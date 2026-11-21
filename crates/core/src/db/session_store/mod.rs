@@ -1,5 +1,7 @@
 //! Process-local resolver for the global directory and incarnation-bound session shards.
 mod approvals;
+mod agents;
+pub use agents::AgentCatalog;
 mod admission;
 mod binding;
 mod compaction;
