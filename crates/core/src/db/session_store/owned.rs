@@ -100,6 +100,7 @@ impl SessionRepository<'_> {
                 s.write_locked_with_commit(
                     label,
                     deadline,
+                    false,
                     |w| w.set_agent_mode_from(mode, manager.get_mode(), manager.bypass_available()),
                     commit,
                 )
@@ -249,7 +250,7 @@ impl SessionRepository<'_> {
         match &self.0 {
             Backend::Admitted(s) => {
                 let _locks=s.stores.key_lock(&s.key,false,false)?;
-                s.write_locked_with_commit(label,super::WRITE_DEADLINE,|w|{
+                s.write_locked_with_commit(label,super::WRITE_DEADLINE,false,|w|{
                     let message=reset.then(||w.plan_marker(text)).transpose()?;
                     policy(w.0,w.1)?;
                     Ok(message)

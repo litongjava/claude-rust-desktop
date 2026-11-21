@@ -92,6 +92,7 @@ crates/core/tests/agent_import.rs	Connection::open	1	8ec869ecc1192224c2e178deb28
 crates/core/tests/context_compression_utf8.rs	Connection::open	1	09573b6b113b5a27c6f0551091463558d33394fc78dc4ce203f48844a890689b	context_compression_utf8 integration or repository fixture
 crates/core/tests/scheduled_prompts.rs	Connection::open	1	924c148587f1992956162241fa3906edd5f2e07266c8f50b8073c0fb1d696195	scheduled_prompts integration or repository fixture
 crates/core/tests/session_concurrency.rs	Connection::open	1	e373254f1d65ebceb8806e6523743eb6e0a975dcc1b05ed9198a90fce348d9fa	session_concurrency integration or repository fixture
+crates/core/tests/session_db_conversation_edits.rs	Connection::open	1	6e79af0040f8c677f7fec9322ca5fd3fd14d6f5da0d4e6b69e69cb4056ed748d	Temporary global trigger for combined-edit failure injection
 crates/core/tests/session_db_delivery.rs	Connection::open	7	708c8684ed875c888d87e70ff46810ef154bf13280d6944c1553a089a31a5638	Independent SQLite writer, occurrence corruption and schema fixtures
 crates/core/tests/session_db_lifecycle.rs	Connection::open	11	a0a6f79b821af4000b39aeee62a6402d2d5d1bd4ecec3510f4c1b4c079518faa	Lifecycle damage, interruption, durability and legacy sentinel fixtures
 crates/core/tests/session_db_lifecycle.rs	deepseek_code.db	3	7f59df4961b74e4bcad013a60411bb5ef978b0ca1b214366837977ed47c10d94	Untouched legacy-file sentinel assertion

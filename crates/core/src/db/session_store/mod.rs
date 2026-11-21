@@ -12,6 +12,7 @@ mod compaction;
 mod directory;
 pub mod diagnostics;
 mod conversations;
+mod conversation_edit;
 pub use conversations::Rewind;
 pub use compaction::{CheckpointKey, CompactionClaim};
 pub use directory::{DirectoryEntry, DirectoryFilter, ResumeEntry};
@@ -304,7 +305,20 @@ impl Stores {
         if allocate {
             layout::sync_dir(&dir)?;
         }
-        let mut guards = lock_keys(&dir, vec![key], exclusive)?;
+        let pending = self.sessions().join(key).join(conversation_edit::PENDING);
+        let mut guards = loop {
+            let locks = lock_keys(&dir, vec![key], exclusive)?;
+            if !pending.try_exists()? {
+                break locks;
+            }
+            if exclusive {
+                self.recover_conversation_edit(key, &pending)?;
+                break locks;
+            }
+            drop(locks);
+            let _writer = lock_keys(&dir, vec![key], true)?;
+            self.recover_conversation_edit(key, &pending)?;
+        };
         guards.push(namespace);
         Ok(Some(guards))
     }
@@ -513,13 +527,14 @@ impl SessionDb {
         deadline: Duration,
         body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.write_locked_with_commit(label,deadline,body,|tx|Ok(tx.commit()?))
+        self.write_locked_with_commit(label, deadline, false, body, |tx| Ok(tx.commit()?))
     }
 
     fn write_locked_with_commit<T>(
         &self,
         label: &str,
         deadline: Duration,
+        durable: bool,
         mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
         mut commit:impl FnMut(rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<T> {
@@ -527,6 +542,7 @@ impl SessionDb {
         let _admission=self.provider_fence(false,deadline)?;
         let binding = self.binding_control()?;
         let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            if durable { c.pragma_update(None, "synchronous", "FULL")?; }
             crate::db::write_tx_with_commit(c, label, deadline.saturating_sub(start.elapsed()), |tx| {
                 let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
                 let writer=SessionWrite(&tx,&self.id,false.into(),&binding);

@@ -38,6 +38,7 @@ pub enum Phase {
     Retired,
     ForkSnapshot,
     SyncContent,
+    EditMetadata,
     DeliveryClaimed,
     DeliveryCommitted,
     DeliveryAcknowledged,
