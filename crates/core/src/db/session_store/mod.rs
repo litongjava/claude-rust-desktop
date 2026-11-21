@@ -15,6 +15,7 @@ mod global;
 mod global_format;
 mod history;
 mod im;
+pub mod magic;
 mod projects;
 pub use projects::{ProjectEdit,Projects};
 mod repair;

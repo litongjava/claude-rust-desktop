@@ -1,56 +1,45 @@
 //! Explicit project consent for feeding recent conversation text into Magic Docs.
 use super::ServiceContext;
-use anyhow::{ensure, Result};
-use serde::Serialize;
+use crate::db::session_store::magic::MagicHistory;
+use anyhow::Result;
 use std::path::Path;
 
-pub fn enabled(context: &ServiceContext, project_id: &str) -> Result<bool> {
-    Ok(context
-        .setting::<bool>(&format!("magic-docs-conversations:{project_id}"))?
-        .unwrap_or(false))
+pub fn enabled(context: &ServiceContext<impl MagicHistory>, project_id: &str) -> Result<bool> {
+    context.db.conversation_consent(project_id)
 }
 pub fn configure(
-    context: &ServiceContext,
+    context: &ServiceContext<impl MagicHistory>,
     root: &Path,
     project_id: &str,
     value: bool,
 ) -> Result<()> {
-    let project = context
+    context
         .db
-        .with_conn(|c| crate::db::project_repo::require_trusted(c, project_id))??;
-    ensure!(
-        !project.is_archived
-            && project
-                .workspace_path
-                .as_deref()
-                .and_then(|p| std::fs::canonicalize(p).ok())
-                .as_deref()
-                == Some(std::fs::canonicalize(root)?.as_path()),
-        "Project does not match this workspace"
-    );
-    context.save_setting(&format!("magic-docs-conversations:{project_id}"), &value)
-}
-
-#[derive(Serialize)]
-struct Message {
-    session: String,
-    role: String,
-    content: String,
+        .configure_conversations(project_id, &std::fs::canonicalize(root)?, value)
 }
 
 pub fn collect(
-    context: &ServiceContext,
+    context: &ServiceContext<impl MagicHistory>,
     root: &Path,
     project_id: Option<&str>,
     memories: Vec<String>,
 ) -> Result<Option<String>> {
+    collect_cancellable(context, root, project_id, memories, &|| false)
+}
+
+pub fn collect_cancellable(
+    context: &ServiceContext<impl MagicHistory>,
+    root: &Path,
+    project_id: Option<&str>,
+    memories: Vec<String>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<String>> {
     let root = std::fs::canonicalize(root)?;
-    let projects = context
-        .db
-        .with_conn(crate::db::project_repo::list_projects)??;
+    let projects = context.db.projects()?;
     let mut messages = Vec::new();
     let mut remaining = 12000usize;
     for project in projects {
+        anyhow::ensure!(!cancelled(), "Conversation search cancelled");
         if project_id.is_some_and(|id| id != project.id)
             || project.is_archived
             || project.folders.is_empty()
@@ -65,11 +54,9 @@ pub fn collect(
         {
             continue;
         }
-        let rows = context.db.with_conn(|c| -> rusqlite::Result<Vec<Message>> {
-            let mut stmt = c.prepare("SELECT m.conversation_id,m.role,substr(m.content,1,2000) FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.project_id=?1 AND c.archived=0 AND m.role IN ('user','assistant') ORDER BY m.created_at DESC,m.id DESC LIMIT 12")?;
-            let values = stmt.query_map([&project.id], |r| Ok(Message { session:r.get(0)?, role:r.get(1)?, content:r.get(2)? }))?.collect();
-            values
-        })??;
+        let rows = context
+            .db
+            .conversation_excerpts(&project.id, &root, cancelled)?;
         for mut message in rows {
             let mut end = message.content.len().min(remaining);
             while !message.content.is_char_boundary(end) {
