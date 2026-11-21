@@ -801,7 +801,7 @@ async fn idle_child_budget_is_shared_with_owner_turn_continuations() {
 #[tokio::test]
 async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
     for case in [
-        "policy", "sender", "restart", "failure", "lease", "binding", "foreign",
+        "policy", "sender", "restart", "failure", "lease", "binding", "foreign", "directory_owner",
     ] {
         let mut fixture = Fixture::start("bypass", false).await;
         let lease = if case == "lease" {
@@ -823,7 +823,22 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
                 .unwrap();
         }
         if case == "foreign" {
-            fixture.context.db.directory_sql(|c| c.execute("UPDATE child_owners SET parent_incarnation=(SELECT incarnation FROM conversations WHERE id=?1), record=json_set(record,'$.parent_session_id',?1) WHERE child_incarnation=(SELECT incarnation FROM conversations WHERE id=?2)", (&fixture.peer,&fixture.child))).unwrap().unwrap();
+            let child = fixture.context.db.open_session(&fixture.child).unwrap();
+            child.write(|w| {
+                use deepseek_code_core::db::session_store::settings::CHILD_PROGRESS;
+                let mut progress = w.setting(CHILD_PROGRESS)?.unwrap();
+                progress.insert("parent_session_id".into(), json!(fixture.peer));
+                w.set_setting(CHILD_PROGRESS, &progress)
+            }).unwrap();
+        }
+        if case == "directory_owner" {
+            let changed = fixture.context.db.directory_sql(|c| c.execute(
+                "UPDATE session_execution_parents SET parent_id=?1,
+                    parent_incarnation=(SELECT incarnation FROM conversations WHERE id=?1)
+                 WHERE child_id=?2",
+                (&fixture.peer, &fixture.child),
+            )).unwrap().unwrap();
+            assert_eq!(changed, 1);
         }
         if case == "policy" {
             fixture
@@ -883,7 +898,12 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
             "{case}"
         );
         assert!(!fixture.workspace.join("idle.txt").exists());
-        if case != "failure" {
+        if case == "sender" {
+            let inbox = session_messages::inbox(&fixture.context, &fixture.child, false).unwrap();
+            let message = inbox.iter().find(|message| message.content == "IDLE_WRITE").unwrap();
+            assert_eq!(message.state, "blocked");
+            assert!(message.blocked_reason.is_some());
+        } else if case != "failure" {
             assert_eq!(
                 session_messages::pending_count(&fixture.context, &fixture.child).unwrap(),
                 1, "{case}"

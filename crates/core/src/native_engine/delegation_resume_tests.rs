@@ -152,11 +152,7 @@ async fn foreground_agent_executes_from_parent_on_default_worker_stack() {
                 .unwrap_or_default()
                 .contains("CHILD_IMPLEMENTED")
     }));
-    assert!(
-        mail::ExecutionLease::acquire(&context.paths.data_dir, child)
-            .unwrap()
-            .is_some()
-    );
+    drop(context.db.open_session(child).unwrap().acquire_execution().unwrap());
     drop(retained);
     server.abort();
     events.abort();
@@ -412,7 +408,7 @@ async fn resume_cancellation_releases_ownership_and_never_automatically_restarts
         .unwrap();
     assert_eq!(saved["status"], "cancelled");
     assert!(!mail::receiver_active(&context.paths.data_dir, &child).unwrap());
-    drop(mail::ExecutionLease::acquire(&context.paths.data_dir, &child).unwrap());
+    drop(context.db.open_session(&child).unwrap().acquire_execution().unwrap());
     mail::send(&context, &parent, &child, "must remain queued").unwrap();
     other.resume_pending_owned_children().await;
     assert!(other
@@ -617,16 +613,11 @@ fn private_session_execution_lease_rejects_other_engine_until_drop() {
         })
         .unwrap()
         .unwrap();
-    let lease = mail::ExecutionLease::acquire(&context.paths.data_dir, &parent)
-        .unwrap()
-        .unwrap();
-    assert!(mail::ExecutionLease::acquire(&context.paths.data_dir, &parent).is_err());
+    let session = context.db.open_session(&parent).unwrap();
+    let lease = session.acquire_execution().unwrap();
+    assert!(session.acquire_execution().is_err());
     drop(lease);
-    assert!(
-        mail::ExecutionLease::acquire(&context.paths.data_dir, &parent)
-            .unwrap()
-            .is_some()
-    );
+    drop(session.acquire_execution().unwrap());
 }
 
 fn plan_child_stream(format: &str, call: Option<(&str, &str, Value)>) -> String {
