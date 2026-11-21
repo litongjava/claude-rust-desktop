@@ -4,6 +4,7 @@ mod compaction;
 pub use compaction::{CheckpointKey, CompactionClaim};
 mod delivery;
 mod global;
+mod global_format;
 mod history;
 mod repair;
 pub mod settings;

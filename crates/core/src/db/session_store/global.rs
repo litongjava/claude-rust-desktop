@@ -31,6 +31,7 @@ pub struct GlobalDb {
     path: PathBuf,
     pub(super) uuid: String,
     pool: Pool<Slots>,
+    verified_schema: std::sync::Mutex<Option<i64>>,
 }
 
 impl GlobalDb {
@@ -41,6 +42,7 @@ impl GlobalDb {
             identity: file_identity(&root.join("global.db"))?,
             path: root.join("global.db"),
             uuid,
+            verified_schema: Default::default(),
             pool: Pool::builder().max_size(4).min_idle(Some(0)).build(Slots)?,
         })
     }
@@ -99,7 +101,22 @@ impl GlobalDb {
         } else {
             5000
         }))?;
-        layout::verify(conn, GLOBAL)?;
+        let (kind, version, schema, journal): (i32, i32, i64, String) = conn.query_row(
+            "SELECT application_id,user_version,schema_version,journal_mode FROM pragma_application_id,
+             pragma_user_version,pragma_schema_version,pragma_journal_mode", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        )?;
+        ensure!(
+            kind == GLOBAL && version == layout::GLOBAL_VERSION && journal == "wal",
+            "Unsupported global database format"
+        );
+        {
+            let mut verified = self.verified_schema.lock().unwrap();
+            if *verified != Some(schema) {
+                layout::verify(conn, GLOBAL)?;
+                *verified = Some(schema);
+            }
+        }
         let store: String = conn.query_row(
             "SELECT store_uuid FROM store_identity WHERE singleton=1",
             [],

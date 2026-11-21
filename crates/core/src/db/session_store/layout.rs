@@ -12,7 +12,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-const GLOBAL_VERSION: i32 = 4;
+pub(super) const GLOBAL_VERSION: i32 = 5;
 pub(super) const SESSION_VERSION: i32 = 4;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
@@ -237,12 +237,15 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
     if kind == GLOBAL && version < 3 {
         tx.execute_batch(include_str!("inbox_v3.sql"))?;
     }
-    if kind == GLOBAL || version < 3 {
+    if (kind == GLOBAL && version < 4) || (kind == SESSION && version < 3) {
         install_state(&tx, kind)?;
     }
     if kind == SESSION {
         install_session_v4(&tx)?;
         super::history::flush_summary(&tx)?;
+    }
+    if kind == GLOBAL {
+        install_global_v5(&tx)?;
     }
     tx.pragma_update(None, "user_version", schema_version(kind))?;
     tx.commit()?;
@@ -254,6 +257,12 @@ fn install_session_v4(c: &Connection) -> Result<()> {
     // A legacy timestamp cannot attest to bytes read before the upgrade.
     c.execute_batch("ALTER TABLE file_read_stamps ADD COLUMN digest BLOB")?;
     c.execute_batch(include_str!("compaction_target.sql"))?;
+    Ok(())
+}
+
+fn install_global_v5(c: &Connection) -> Result<()> {
+    c.execute_batch(include_str!("shared_domains.sql"))?;
+    c.execute_batch(include_str!("global_v5.sql"))?;
     Ok(())
 }
 
@@ -408,7 +417,25 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         "SELECT p.name FROM main.sqlite_schema AS t, pragma_table_info(t.name,'main') AS p
          WHERE t.type='table' AND t.name=?1",
     )?;
-    for &(table, required) in tables.iter().chain(added).chain(state).chain(v4) {
+    let shared = if kind == GLOBAL && expected >= 5 {
+        let indexes: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE tbl_name='conversations' AND
+            ((type='index' AND name IN ('directory_order','directory_project_order','directory_activity')) OR
+            (type='trigger' AND name='conversation_binding_changed'))", [], |r|r.get(0))?;
+        ensure!(
+            indexes == 4,
+            "Missing global directory index or binding trigger"
+        );
+        super::global_format::TABLES
+    } else {
+        &[]
+    };
+    for &(table, required) in tables
+        .iter()
+        .chain(added)
+        .chain(state)
+        .chain(v4)
+        .chain(shared)
+    {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -492,6 +519,9 @@ pub(super) fn initialize(
     install_state(&tx, kind)?;
     if kind == SESSION {
         install_session_v4(&tx)?;
+    }
+    if kind == GLOBAL {
+        install_global_v5(&tx)?;
     }
     populate(&tx)?;
     if kind == SESSION {
