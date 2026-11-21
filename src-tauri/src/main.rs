@@ -181,21 +181,10 @@ fn main() {
             if let Err(e) = crate::config::OrchestrationConfig::init_global() {
                 tracing::warn!("Failed to load orchestration.toml, using defaults: {}", e);
             }
-            // Initialize SQLite database with persistent storage
-            let db_path = data_dir.join(deepseek_code_core::runtime::DATABASE_FILE);
-            let db_manager = match crate::db::DbManager::new(db_path.clone()) {
-                Ok(db) => Arc::new(db),
-                Err(e) => {
-                    tracing::error!(module = "FATAL", error = %e);
-                    std::process::exit(1);
-                }
-            };
-            if let Err(e) = db_manager.init() {
-                tracing::error!(module = "FATAL", error = %e);
-                std::process::exit(1);
-            }
+            let paths = deepseek_code_core::runtime::RuntimePaths::new(std::path::absolute(&data_dir)?)?;
+            let db_manager = paths.open_database()?;
             app.manage(db_manager.clone());
-            tracing::info!(module = "SQLite", "Database initialized at {:?}", db_path);
+            tracing::info!(module = "SQLite", "Database initialized in {:?}", data_dir);
 
             let im_manager = Arc::new(
                 crate::im_integration::ImIntegrationManager::new(db_manager.clone())
@@ -476,29 +465,10 @@ fn main() {
             }
 
             let api_key_store = app.state::<Arc<std::sync::Mutex<Option<String>>>>().inner().clone();
-            let db_manager_for_bridge = match app.try_state::<Arc<crate::db::DbManager>>() {
-                Some(state) => state.inner().clone(),
-                None => {
-                    tracing::error!(module = "Main", "DbManager not found in state, creating new one for Bridge");
-                    let new_db = match crate::db::DbManager::new(db_path.clone()) {
-                        Ok(db) => Arc::new(db),
-                        Err(e) => {
-                            tracing::error!(module = "FATAL", error = %e);
-                            std::process::exit(1);
-                        }
-                    };
-                    if let Err(e) = new_db.init() {
-                        tracing::error!(module = "FATAL", error = %e);
-                        std::process::exit(1);
-                    }
-                    new_db
-                }
-            };
-
             let bridge_ready = Arc::new(tokio::sync::Notify::new());
             let bridge_ready_for_bridge = bridge_ready.clone();
 
-            let bridge = BridgeServer::new(data_dir, db_manager_for_bridge)
+            let bridge = BridgeServer::new(data_dir, db_manager.clone())
                 .with_launch_permissions(launch_permissions);
             // Native mode controls and Bridge execution must use the same authority.
             tauri::async_runtime::block_on(async {
@@ -523,18 +493,10 @@ fn main() {
                 }
             });
 
-            let db_manager_for_scheduler = match app.try_state::<Arc<crate::db::DbManager>>() {
-                Some(state) => state.inner().clone(),
-                None => {
-                    tracing::error!(module = "Scheduler", "DbManager not found, scheduler disabled");
-                    return Ok(());
-                }
-            };
-
             match crate::commands::app_data_dir() {
                 Ok(data_dir) => {
                     tauri::async_runtime::spawn(async move {
-                        crate::scheduler::ScheduledTaskScheduler::new(db_manager_for_scheduler)
+                        crate::scheduler::ScheduledTaskScheduler::new(db_manager)
                             .with_data_dir(data_dir)
                             .start()
                             .await;

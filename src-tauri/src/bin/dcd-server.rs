@@ -9,7 +9,6 @@ use deepseek_desktop_tauri_lib::bridge::server_mode::{self, ServeOptions, TlsFil
 use deepseek_desktop_tauri_lib::bridge::BridgeServer;
 use deepseek_desktop_tauri_lib::launch_permissions::LaunchPermissions;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 const USAGE: &str = "Usage: dcd-server [options]
 
@@ -138,9 +137,8 @@ fn run(mut args: Args) -> anyhow::Result<()> {
         )
         .init();
 
-    let db_path = data_dir.join(deepseek_code_core::runtime::DATABASE_FILE);
-    let db = Arc::new(deepseek_desktop_tauri_lib::db::DbManager::new(db_path)?);
-    db.init()?;
+    let db = deepseek_code_core::runtime::RuntimePaths::new(std::path::absolute(&data_dir)?)?
+        .open_database()?;
 
     let runtime = deepseek_desktop_tauri_lib::build_runtime()?;
     runtime.block_on(async move {
