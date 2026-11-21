@@ -126,6 +126,25 @@ impl RecordingPolicies for DbManager {
         (policy, first)
     }
 }
+impl RecordingPolicies for super::ExecutorHistory {
+    fn recording_root(&self) -> &Path {
+        match self {
+            Self::Session(s) => s.stores.data_dir(),
+            Self::Shared(db, _) => db.data_dir(),
+        }
+    }
+    fn recording_policy_and_parent(&self, id: &str) -> (Option<Policy>, Option<String>) {
+        if self.id()!=id { return (None,None); }
+        match self {
+            Self::Session(s) => {
+                let Ok(_locks)=s.stores.key_lock(&s.key,false,false) else {return (None,None)};
+                if s.check_directory().is_err() {return (None,None)}
+                s.stores.recording_policy_and_parent(id)
+            }
+            Self::Shared(db, _) => db.recording_policy_and_parent(id),
+        }
+    }
+}
 impl<D: RecordingPolicies> RecordingPolicies for Arc<D> {
     fn recording_root(&self) -> &Path {
         self.as_ref().recording_root()

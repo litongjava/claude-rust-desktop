@@ -42,21 +42,21 @@ impl RequestOptions {
     }
 
     pub fn from_db(db: &(impl crate::db::session_store::RecordingPolicies + ?Sized), session: Option<&str>, purpose: &str) -> Self {
+        Self::with_recording_parent(db, session, purpose).0
+    }
+
+    pub(super) fn with_recording_parent(db: &(impl crate::db::session_store::RecordingPolicies + ?Sized), session: Option<&str>, purpose: &str) -> (Self, Option<String>) {
         let mut options = Self::for_session(session).with_purpose(purpose);
-        if let Some(session) = session {
-            let (policy, parent) = db.recording_policy_and_parent(session);
-            let policy = policy.unwrap_or_default();
-            if policy.enabled_at(db.recording_root()) {
-                if purpose == "main" && parent.is_some() {
-                    options.purpose = "subagent".into();
-                }
-                options.recording = Some(super::request_recording::RecordingContext {
-                    root: db.recording_root().into(),
-                    parent_session_id: parent,
-                });
-            }
+        let Some(session) = session else { return (options,None) };
+        let (policy, parent) = db.recording_policy_and_parent(session);
+        if policy.unwrap_or_default().enabled_at(db.recording_root()) {
+            if purpose=="main" && parent.is_some() {options.purpose="subagent".into();}
+            options.recording = Some(super::request_recording::RecordingContext {
+                root:db.recording_root().into(),
+                parent_session_id:parent.clone(),
+            });
         }
-        options
+        (options,parent)
     }
 
     pub fn with_purpose(mut self, purpose: &str) -> Self {

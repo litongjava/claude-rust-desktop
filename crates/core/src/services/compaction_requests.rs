@@ -32,7 +32,7 @@ fn read(conn: &Connection, session: &str) -> Result<Option<Request>> {
         .transpose()
 }
 
-fn save(conn: &Connection, session: &str, keep: &str) -> Result<()> {
+pub(crate) fn save(conn: &Connection, session: &str, keep: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [key(session), serde_json::to_string(&Request { keep: keep.into() })?],
@@ -52,16 +52,13 @@ pub fn definition() -> ToolDefinition {
 /// is under 30% of the window or directly after a compaction, so a model cannot
 /// repeatedly summarize a conversation that has nothing to drop.
 pub fn request(
-    db: &DbManager,
+    db: &impl crate::db::session_store::SessionAccess,
     session: &str,
     keep: &str,
     used_tokens: u64,
     window: u64,
 ) -> Result<String> {
-    db.with_conn(|conn| -> Result<()> {
-        validate(conn, session, keep, used_tokens, window)?;
-        save(conn, session, keep)
-    })??;
+    db.select_session(session)?.request_compaction(keep,used_tokens,window)?;
     Ok("Compaction queued. It runs before the next user message, using your `keep` text as the summary instructions. Continue or finish the current turn normally.".into())
 }
 

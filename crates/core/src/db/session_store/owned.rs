@@ -27,6 +27,15 @@ impl SessionAccess for SessionDb {
         Ok(SessionRepository(Backend::Admitted(self.clone())))
     }
 }
+impl SessionAccess for super::ExecutorHistory {
+    fn select_session<'a>(&'a self, id:&'a str) -> Result<SessionRepository<'a>> {
+        ensure!(id==self.id(), "Executor history belongs to another session");
+        match self {
+            Self::Session(shard) => shard.select_session(id),
+            Self::Shared(db, _) => db.select_session(id),
+        }
+    }
+}
 impl SessionAccess for DbManager {
     fn select_session<'a>(&'a self, id: &'a str) -> Result<SessionRepository<'a>> {
         Ok(SessionRepository(Backend::Shared(self, id)))

@@ -204,6 +204,16 @@ impl DeliveryOwner {
 }
 
 impl SessionRepository<'_> {
+    pub(crate) fn request_compaction(&self, keep:&str, used:u64, window:u64) -> Result<()> {
+        match &self.0 {
+            owned::Backend::Admitted(s) => s.write_named("queue compaction", |w| w.request_compaction(keep, used, window)),
+            owned::Backend::Shared(_,_) => self.write("queue compaction",|c,id|{
+                compaction_requests::validate(c,id,keep,used,window)?;
+                compaction_requests::save(c,id,keep)
+            }),
+        }
+    }
+
     pub(crate) fn compaction_total(&self) -> Result<compaction::CompactionCount> {
         match &self.0 {
             owned::Backend::Admitted(shard) => shard.read(|r| {

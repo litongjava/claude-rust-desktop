@@ -801,13 +801,6 @@ const MICROCOMPACT_KEEP_RECENT: usize = 10;
 const MICROCOMPACT_MIN_CHARS: usize = 1000;
 const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared to save context]";
 
-/// Where microcompact's clearing stops, and the compaction it applies to.
-#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
-struct Microcompact {
-    through: usize,
-    boundary: String,
-}
-
 /// Microcompact moves its line forward only once the request passes half the
 /// window, so between moves every request shares the same prefix and cache.
 fn microcompact_through(current: usize, len: usize, estimated_tokens: usize, window: Option<u32>) -> usize {
@@ -843,16 +836,16 @@ fn clear_tool_results(messages: &mut [Value]) {
 pub fn microcompact(session: &Session, history: &mut [Value], window: Option<u32>) -> Result<()> {
     let rows = session.store.db.select_session(&session.id)?.messages()?;
     let boundary = rows.iter().rev().find(|row| row.is_compact_boundary).map(|row| row.id.clone()).unwrap_or_default();
-    let context = crate::services::context(&session.paths)?;
-    let key = format!("microcompact.{}", session.id);
-    let mut state = context.setting::<Microcompact>(&key)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
+    use deepseek_code_core::db::session_store::settings::{Microcompact, MICROCOMPACT};
+    let history=session.store.db.select_session(&session.id)?;
+    let mut state = history.preference(MICROCOMPACT)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
     let len = history.len();
     clear_tool_results(&mut history[..state.through.min(len)]);
     let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
     let through = microcompact_through(state.through, len, estimated, window);
     if through != state.through {
         state.through = through;
-        context.save_setting(&key, &state)?;
+        history.set_preference(MICROCOMPACT, Some(&state))?;
         clear_tool_results(&mut history[..through.min(len)]);
         crate::compaction::notice("Cleared older tool results to save context.");
     }

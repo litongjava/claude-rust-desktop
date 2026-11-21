@@ -3527,7 +3527,7 @@ impl ToolLoopExecutor {
         self.context_usage.is_some()
             && self.delegation_depth == 0
             && self.subagent_hook_context.is_none()
-            && self.goal_db.is_some()
+            && self.session_search_storage().is_some()
             && self.conv_id.is_some()
     }
 
@@ -3988,29 +3988,22 @@ impl ToolLoopExecutor {
             .as_deref()
             .and_then(|p| p.parent())
             .map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
-        let mut options = self
-            .goal_db
-            .as_ref()
-            .map(|db| {
-                super::request_options::RequestOptions::from_db(
-                    db,
-                    self.conv_id.as_deref(),
-                    if self.delegation_depth > 0 {
-                        "subagent"
-                    } else {
-                        "main"
-                    },
-                )
-            })
-            .unwrap_or_else(|| {
-                super::request_options::RequestOptions::for_session(self.conv_id.as_deref())
-            });
-        if let Some(recording) = &mut options.recording {
-            recording.parent_session_id = self.request_parent_session();
-        }
+        let history = self.session_search_storage();
+        let (options, recorded_parent) = match &history {
+            Some(storage) => super::request_options::RequestOptions::with_recording_parent(
+                storage, self.conv_id.as_deref(), if self.delegation_depth>0 { "subagent" } else { "main" }),
+            None => (super::request_options::RequestOptions::for_session(self.conv_id.as_deref()),None)
+        };
+        let parent_session = recorded_parent.or_else(|| {
+            if matches!(history, Some(ExecutorHistory::Session(_))) {return None;}
+            let session=self.conv_id.as_deref()?;
+            let root=self.search_config_path.as_deref()?.parent()?;
+            let dir=crate::services::background_sessions::worker_directory(root,session).ok()??;
+            let job=crate::services::background_sessions::read_job(&dir).ok()?;
+            (job.parent_session_id != session).then_some(job.parent_session_id)
+        });
         self.openai_client.request_options = options.clone();
         self.anthropic_client.request_options = options;
-        let parent_session = self.request_parent_session();
         let identity =
             super::request_identity::TurnIdentity::new(self.conv_id.clone(), parent_session);
         let result = identity
@@ -4029,35 +4022,6 @@ impl ToolLoopExecutor {
             async_hook_guard.0 = None;
         }
         result
-    }
-
-    fn request_parent_session(&self) -> Option<String> {
-        let session = self.conv_id.as_deref()?;
-        if let Some(parent) = self
-            .goal_db
-            .as_ref()
-            .and_then(|db| {
-                db.with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("delegation.{session}")],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .ok()
-                })
-                .ok()
-                .flatten()
-            })
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|value| value["parent_session_id"].as_str().map(str::to_owned))
-        {
-            return Some(parent);
-        }
-        let root = self.search_config_path.as_deref()?.parent()?;
-        let directory =
-            crate::services::background_sessions::worker_directory(root, session).ok()??;
-        let job = crate::services::background_sessions::read_job(&directory).ok()?;
-        (job.parent_session_id != session).then_some(job.parent_session_id)
     }
 
     fn drain_async_hook_messages(&self) -> Vec<String> {
@@ -4716,7 +4680,7 @@ impl ToolLoopExecutor {
                 anyhow::ensure!(self.compaction_requests_available(), "CompactContext is only available in an interactive terminal session");
                 let keep = tool_input["keep"].as_str().context("CompactContext requires keep")?;
                 let (used, window) = self.context_usage.context("CompactContext is only available in an interactive terminal session")?;
-                crate::services::compaction_requests::request(self.goal_db.as_ref().unwrap(), self.conv_id.as_deref().unwrap(), keep, used, window)
+                crate::services::compaction_requests::request(&self.session_search_storage().context("Compaction history unavailable")?, self.conv_id.as_deref().unwrap(), keep, used, window)
             })();
             let failed = result.is_err();
             return CallStep::Finished((tool_input.clone(), result.unwrap_or_else(|error| error.to_string()), failed));
