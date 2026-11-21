@@ -165,14 +165,35 @@ pub async fn execute_for_session_async(
                     .exists()
             {
                 use crate::services::background_sessions;
+                let (block, timeout) = if name == "TaskStop" {
+                    (false, std::time::Duration::ZERO)
+                } else {
+                    super::background_shell::wait_policy(&input)?
+                };
+                let started = tokio::time::Instant::now();
+                let deadline = started + timeout;
+                // A poll may read an immediately available snapshot. All reads,
+                // including authorization, share the same bounded allowance.
+                let read_deadline = if timeout.is_zero() {
+                    started + std::time::Duration::from_millis(100)
+                } else {
+                    deadline
+                };
                 let (read_root, read_id) = (root.to_owned(), id.to_owned());
                 let read_owner = session.to_owned();
-                let mut job = tokio::task::spawn_blocking(move || {
+                let admission = tokio::task::spawn_blocking(move || {
                     let job = background_sessions::get(&read_root, &read_id)?;
                     background_sessions::authorize_job(&read_root, &job, &read_owner)?;
                     Ok::<_, anyhow::Error>(job)
-                })
-                .await??;
+                });
+                let mut job = if block {
+                    match tokio::time::timeout_at(read_deadline, admission).await {
+                        Ok(result) => result??,
+                        Err(_) => return Ok(json!({"task_id":id,"retrieval_status":"timeout"})),
+                    }
+                } else {
+                    admission.await??
+                };
                 if name == "TaskStop" {
                     let (root, id) = (root.to_owned(), id.to_owned());
                     let mut value = tokio::task::spawn_blocking(move || {
@@ -188,8 +209,6 @@ pub async fn execute_for_session_async(
                     });
                     return Ok(value);
                 }
-                let (block, timeout) = super::background_shell::wait_policy(&input)?;
-                let deadline = tokio::time::Instant::now() + timeout;
                 let mut timed_out = false;
                 if block {
                     loop {
@@ -206,19 +225,16 @@ pub async fn execute_for_session_async(
                         )
                         .await;
                         let (root, id) = (root.to_owned(), id.to_owned());
-                        job = tokio::task::spawn_blocking(move || {
-                            background_sessions::get(&root, &id)
-                        })
-                        .await??;
+                        let refresh = tokio::task::spawn_blocking(move || background_sessions::get(&root, &id));
+                        match tokio::time::timeout_at(read_deadline, refresh).await {
+                            Ok(result) => job = result??,
+                            Err(_) => { timed_out = true; break; }
+                        }
                     }
                 }
                 // The output files and the optional SQLite report are read on
                 // the blocking pool. An explicit wait deadline bounds the whole
                 // retrieval, so a slow disk or busy database cannot outlive it.
-                // A wait that used its whole deadline still gets a short bounded
-                // read, so the caller sees output already written; a busy disk or
-                // database still cannot hold the call open for long. timeout:0
-                // likewise reads the current snapshot without waiting.
                 let page = super::output_page::PageRequest::parse(&input)?;
                 let (root, id) = (root.to_owned(), id.to_owned());
                 let snapshot = tokio::task::spawn_blocking(move || {
@@ -228,8 +244,6 @@ pub async fn execute_for_session_async(
                     })
                 });
                 let snapshot = if block {
-                    let read_deadline = deadline
-                        .max(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
                     match tokio::time::timeout_at(read_deadline, snapshot).await {
                         Ok(result) => Some(result?),
                         Err(_) => {

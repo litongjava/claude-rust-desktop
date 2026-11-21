@@ -162,7 +162,7 @@ pub fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()> {
         let owners = owners.context("Task has no recorded parent incarnation")?;
         let stores = crate::db::session_store::Stores::open(root)?;
         ensure!(
-            stores.open_session(session)?.incarnation() == owners.parent,
+            stores.published_incarnation_matches(session, &owners.parent)?,
             "Task belongs to another session incarnation"
         );
     }

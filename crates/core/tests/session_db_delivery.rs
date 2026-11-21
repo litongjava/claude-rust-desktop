@@ -1350,3 +1350,45 @@ fn host_execution_lease_is_shared_for_handoff_and_fenced_to_the_shard() -> Resul
     assert_eq!(source.settle_abandoned(&source.acquire_execution()?)?.len(),1);
     Ok(())
 }
+
+#[tokio::test]
+async fn task_get_parent_admission_uses_the_wait_budget() -> Result<()> {
+    use std::time::{Duration, Instant};
+    use deepseek_code_core::tools::tasks;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let parent_id = uuid::Uuid::new_v4().to_string();
+    let child_id = uuid::Uuid::new_v4().to_string();
+    let parent = stores.create(&parent_id, Default::default())?;
+    let child = stores.create(&child_id, Default::default())?;
+    child.write(|w| w.append("assistant", "committed report"))?;
+    let job = uuid::Uuid::new_v4().to_string();
+    let directory = root.path().join("background-tasks").join(&job);
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(directory.join("state.json"), json!({
+        "id":job,"parent_session_id":parent_id,"session_id":child_id,
+        "status":"completed","title":"fixture","started_ms":1,"heartbeat_ms":1
+    }).to_string())?;
+    std::fs::write(directory.join("session-owners.json"), json!({
+        "parent":parent.incarnation(),"execution":child.incarnation()
+    }).to_string())?;
+    let key = std::fs::File::open(root.path().join("session-locks").join(&parent_id))?;
+    key.lock()?;
+    let (release, rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _ = rx.recv_timeout(Duration::from_secs(3));
+        drop(key);
+    });
+    let start = Instant::now();
+    let response = tasks::execute_for_session_async("TaskGet",
+        json!({"task_id":job,"block":true,"timeout":0}), root.path(), &parent_id).await;
+    let elapsed = start.elapsed();
+    drop(release);
+    holder.join().unwrap();
+    assert!(elapsed < Duration::from_millis(750), "{elapsed:?}");
+    let response = response?;
+    if response["retrieval_status"] != "timeout" {
+        assert_eq!(response["stdout"], "committed report");
+    }
+    Ok(())
+}

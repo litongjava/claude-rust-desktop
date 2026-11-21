@@ -337,6 +337,12 @@ impl Stores {
         Ok(Some(exclusive))
     }
 
+    /// Background job ownership is published in G. Checking that identity needs
+    /// neither transcript access nor the session lifecycle lock.
+    pub(crate) fn published_incarnation_matches(&self, id: &str, incarnation: &str) -> Result<bool> {
+        Ok(self.global().incarnation(id, &storage_key(id)?)?.as_deref() == Some(incarnation))
+    }
+
     pub fn open_session(&self, id: &str) -> Result<SessionDb> {
         let key = storage_key(id)?;
         let mut locks = self.resolved_key(&key)?.context("Session unavailable")?;
