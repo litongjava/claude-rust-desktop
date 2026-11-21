@@ -874,7 +874,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/{command_output_summary,bash_test_summary,model_tool_output}.rs`、`tools/{bash_process,background_shell}.rs` 的捕获与分页、`config/command_output.rs` 和 CLI 的摘要设置：执行下面“长命令输出摘要”的模型请求、设置和捕获回归。
 - `runtime.rs`、`db/message_repo.rs`（发给模型的历史）：D2、E5，以及 SDK 测试
 - `db/mod.rs`（`write_tx`）：`cargo test --locked -p deepseek-code-core --lib db::write_tx`（重试、非争用不重试、超时报 label、失败不留半行）与 `cargo test --locked -p deepseek-code-core --test session_concurrency`。真实争用复验：用 `VACUUM INTO` 复制数据库，`DEEPSEEK_CODE_DATA_DIR` 指向副本，另一个进程 `BEGIN IMMEDIATE` 占锁 8 秒，期间跑一轮带工具调用的请求，确认回合完成、日志有重试告警、工具行与快照完整；再占锁 40 秒，确认回合以带 label 的错误结束（不是裸 `database is locked`），且没有半成品工具行。
-- 共享数据库启动争用：在默认 DELETE 日志模式的空库上持有 `BEGIN IMMEDIATE` 8 秒，启动 `dcl sessions list`，释放后应成功并迁移至 WAL。在已初始化的库上重复测试，同时启动 8 个客户端，全部应成功。将持锁时间延长至 61 秒，客户端应在约 60 秒以带 SQLite 原因的锁超时退出。另在初始化之后持锁，覆盖无项目 Code 会话的目录回写、模型和提供商、标题、Git 工作树绑定，以及没有运行中回合时的执行租约探测。对应测试见 `startup_contention_tests`、`git_worktree_binding_waits_for_writer_after_init`、`projectless_code_resume_waits_for_another_writer` 和 `db::write_tx_tests`。共享权限管理器的双写入顺序由 `session_permission_mode` 测试验证。
+- 启动争用：在已初始化的 `global.db` 上持有写锁，覆盖模型与提供商切换、标题、项目目录回写、Git 工作树绑定和空闲执行租约。运行 `startup_contention_tests`、`git_worktree_binding_waits_for_writer_after_init`、`projectless_code_resume_waits_for_another_writer`。会话创建和单会话写锁竞争见 `session_concurrency`，多进程首次启动见 `session_db_lifecycle`。
 - `db/message_repo.rs` 的请求快照去重（`request_blobs` / `*Ref`）：`cargo test --locked -p deepseek-code-core --lib db::message_repo`（同头只存一份、往返字段一致、旧内联行可读、缺 blob 不伪造、不修改调用方数据）、`cargo test --locked -p deepseek-code-core --test compaction_status_regressions` 与 `cargo test --locked -p deepseek-code-cli --bin dcl status_commands_tests`。历史数据不会自动回填：要缩小现有库需另跑一次性回填脚本并 `VACUUM`，验证方法是回填前后比较 `requests_json` 总字节、`request_blobs` 行数，并抽 3 条消息确认 `get_request_snapshots` 往返一致。
 - `services/input_queue.rs`：B、E4，以及“第十一轮：SDK 回合内引导”的全部自动用例
 - `sdk.rs`（SDK stream-json 输入与回合控制）：E6、SDK 全套，以及“第十一轮：SDK 回合内引导”
@@ -993,6 +993,13 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 - SDK 全套覆盖审批、Hook、MCP 等待取消及迟到回复；同时保留 `usage_accounting`、`recovery_result_contract`、`request_usage_tests`、ContextReset、初始 Hook/hook wake 回归。
 - 第十轮的独立复现与需求证据已在 2026-11-10 的开发支持目录清理中删除。未执行平台或旧验收组合继续标记未验证。
 
+### 会话分库与 JSONL 导出
+
+1. 运行 `cargo test --locked -p deepseek-code-cli --test session_export`。空数据目录首次启动应创建 `global.db`、`session-locks/` 和 `sessions/`。已发布会话的历史位于 `sessions/<storage_key>/session.db`。核对生命周期目录、准入锁以及 SQLite 的 WAL/SHM 文件。另在启动前放入内容各异的 `deepseek_code.db`、`deepseek_code.db-wal`、`deepseek_code.db-shm`，启动并导出后逐一核对字节与修改时间。Linux 文件事件监视应记录零次打开、改名或删除。
+2. 用本地 OpenAI、Anthropic 服务分别生成会话，运行 `dcl sessions export <id>`。标准输出逐行解析 UTF-8 JSON，首行为 `deepseek-code.session` 的版本 1 头。核对归档标志、两种修订号、多模态内容、父子调用 ID、请求及按摘要去重的请求体。分支导出保留来源回合 ID，回退后只含保留下来的历史。
+3. 保持回合运行，通过管道读到导出头后追加消息。该次导出只含快照内已提交的内容，运行中回合的状态为 `running`。按 owner、字段和索引连接大字段的 Base64 字节，核对长度和 SHA-256 后再解码文本。逐类统计末行之前的记录，并对其原始字节（含每行 LF）计算 SHA-256，与 `end` 核对。截断或校验失败的文件应判作不完整。
+4. 运行 `dcl sessions export <id> --output <file>`，核对成功后目标可读、标准输出为空。已有目标时应失败，错误写入标准错误，原文件保持原样。外部附件保留路径引用，导出内容包含原始用户输入与工具结果。
+
 ### 会话创建与消息追加的 SQLite 写者竞争
 
 - `cargo test --locked -p deepseek-code-core --test session_concurrency`：`SessionStore::create`/`append` 在第二个连接持有写锁且超过一次 `busy_timeout` 时，应重试整笔事务而不是直接失败；持锁超过 30 秒预算时返回带静态操作名（`session create`／`session append`）的类型化竞争错误，不得留下部分会话、项目、文件夹、消息、结构化内容或来源行，释放写者后同一连接池仍可正常写入。
@@ -1009,7 +1016,7 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 
 ### 会话消息收件箱的 SQLite 竞争与有界轮询
 
-会话消息（`SendMessage`/`session_messages`）的引擎侧轮询发生在每个模型/工具边界。宿主同时会把完整对话写回同一个数据库，因此轮询不能因为一次写者竞争而结束整个回合。
+会话消息（`SendMessage`/`session_messages`）的引擎侧轮询发生在每个模型/工具边界。收件箱和队列位于 `global.db`，已投递的消息和工具输入写入接收会话的 `session.db`。分别持有目录和会话的写锁，验证轮询能在竞争结束后继续当前回合。
 
 ```bash
 env -u DEEPSEEK_CODE_BACKGROUND_CONTROL -u DEEPSEEK_CODE_BACKGROUND_JOB \

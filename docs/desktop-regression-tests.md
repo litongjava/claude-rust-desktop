@@ -122,6 +122,12 @@ Desktop 的模型技能列表和 `Skill` 工具与 CLI 共用 `crates/core` 的�
 4. `enabled: false` 与 `disable-model-invocation` 的显示和调用行为与 CLI 一致。
 5. `<数据目录>/skills/bundled`、`mcp` 中的同名副本不覆盖内置工作流。
 
+### D5. 会话分库与 CLI 导出
+
+1. 用独立数据目录启动 Desktop，创建两个会话，各发送不同的消息。核对侧边栏标题、项目和归档状态与 `global.db` 的已发布目录一致，分别打开会话时，历史来自对应的 `sessions/<storage_key>/session.db`。
+2. 对同一数据目录运行 `dcl --data-dir <目录> sessions export <id> --output <file>`。逐行解析 JSONL，核对头部会话 ID、incarnation、消息顺序、审批、附件路径和轨迹中的请求。归档后重复导出。流式回答期间导出时，核对已提交片段和运行状态；随后收到的片段应出现在下一次导出。
+3. 运行 `cargo test --locked -p deepseek-code-desktop --test conversation_generation_bridge --test input_queue_bridge --test trajectory_persistence` 覆盖 Bridge 的生成、排队和轨迹。运行 `cargo test --locked -p deepseek-code-cli --test session_export` 校验导出末行计数、SHA-256、文件名冲突和旧库三个文件的哨兵。
+
 ### E. 浏览器和手机（dcd-server）
 
 用独立数据目录启动：`DEEPSEEK_CODE_DATA_DIR=<测试目录>/data target/debug/dcd-server --port 30185 --web-dir dist`（先 `npm run build`）。
