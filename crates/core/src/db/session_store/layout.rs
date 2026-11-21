@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 pub(super) const GLOBAL_VERSION: i32 = 5;
-pub(super) const SESSION_VERSION: i32 = 5;
+pub(super) const SESSION_VERSION: i32 = 6;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -253,7 +253,10 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                     tx.query_row("SELECT transcript_bytes FROM projection_state", [], |r| {
                         r.get(0)
                     })?;
-                tx.execute_batch(include_str!("session_v5.sql"))?;
+                if version < 5 {
+                    tx.execute_batch(include_str!("session_v5.sql"))?;
+                }
+                tx.execute_batch(include_str!("session_v6.sql"))?;
                 tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
             }
             if kind == GLOBAL {
@@ -441,6 +444,11 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
             "Missing session turn index or transcript size trigger"
         );
     }
+    if kind == SESSION && expected >= 6 {
+        let triggers: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger'
+            AND tbl_name='message_trajectory' AND name IN ('transcript_trajectory_insert','transcript_trajectory_delete','transcript_trajectory_update')", [], |r|r.get(0))?;
+        ensure!(triggers == 3, "Missing trajectory size trigger");
+    }
     let shared = if kind == GLOBAL && expected >= 5 {
         let indexes: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE tbl_name='conversations' AND
             ((type='index' AND name IN ('directory_order','directory_project_order','directory_activity')) OR
@@ -544,6 +552,7 @@ pub(super) fn initialize(
     if kind == SESSION {
         install_session_v4(&tx)?;
         tx.execute_batch(include_str!("session_v5.sql"))?;
+        tx.execute_batch(include_str!("session_v6.sql"))?;
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;

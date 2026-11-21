@@ -20,6 +20,7 @@ fn directory_filters_titles_and_sizes_follow_the_selected_incarnation() -> Resul
     a.write(|w| {
         w.append("user", "\n  first\nsecond")?;
         let m = w.append("assistant", "π")?;
+        w.snapshots(&m, &serde_json::json!({"id":"r"}))?;
         w.tool(
             &ToolCallRow {
                 id: "tool".into(),
@@ -57,7 +58,11 @@ fn directory_filters_titles_and_sizes_follow_the_selected_incarnation() -> Resul
     assert_eq!(item.git_branch.as_deref(), Some("branch"));
     assert_eq!(
         item.transcript_bytes,
-        ("\n  first\nsecond".len() + "π".len() + "[]".len() + "résumé".len()) as i64
+        ("\n  first\nsecond".len()
+            + "π".len()
+            + "[]".len()
+            + "résumé".len()
+            + r#"{"id":"r"}"#.len()) as i64
     );
     assert_eq!(
         stores.global().list_sessions(DirectoryFilter {
