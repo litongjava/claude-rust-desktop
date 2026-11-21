@@ -101,3 +101,53 @@ impl SessionDb {
         Ok(control)
     }
 }
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(super) struct ClearBinding {
+    generation: u64,
+    provider: String,
+    model: String,
+    digest: String,
+    options: String,
+}
+impl ClearBinding {
+    pub(super) fn from_snapshot(snapshot: &BindingSnapshot) -> Result<Self> {
+        anyhow::ensure!(
+            !snapshot.observation_only,
+            "Cannot clear with unavailable session credentials"
+        );
+        let active = snapshot.active()?;
+        let model = active
+            .provider
+            .models
+            .iter()
+            .find(|m| m.id == active.model.id)
+            .context("Selected model unavailable")?;
+        Ok(Self {
+            generation: snapshot.generation,
+            provider: snapshot.provider_id.clone(),
+            model: snapshot.model.clone(),
+            options: serde_json::to_string(&(model, &model.effort))?,
+            digest: store::fingerprint(snapshot)?,
+        })
+    }
+    pub(super) fn publish(
+        &self,
+        tx: &rusqlite::Connection,
+        parent: &str,
+        child: &str,
+    ) -> Result<()> {
+        let current = store::read(tx, parent)?;
+        anyhow::ensure!(
+            current.generation == self.generation && current.pending.is_none(),
+            "Clear did not apply: the source binding changed or is pending"
+        );
+        tx.execute(
+            "UPDATE conversations SET provider=?1,model=?2 WHERE id=?3",
+            [&self.provider, &self.model, child],
+        )?;
+        tx.execute("INSERT INTO cli_binding_generations(session_id,generation,target_provider,target_model) VALUES(?1,1,?2,?3)",[child,&self.provider,&self.model])?;
+        tx.execute("INSERT INTO cli_binding_revisions(session_id,generation,previous,digest,options) VALUES(?1,1,0,?2,?3)",[child,&self.digest,&self.options])?;
+        Ok(())
+    }
+}

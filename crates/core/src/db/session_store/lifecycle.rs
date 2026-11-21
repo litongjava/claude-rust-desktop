@@ -390,9 +390,15 @@ impl Stores {
                 }
                 match seed {
                     Seed::New => {}
-                    Seed::Fork(source, boundary) => {
-                        copy::copy_snapshot(source, tx, &op.id, boundary)?
-                    }
+                    Seed::Fork(source, boundary) => copy::copy_snapshot(
+                        source,
+                        tx,
+                        &op.id,
+                        boundary,
+                        meta.source
+                            .as_ref()
+                            .is_some_and(|s| s.provider_selection.is_some()),
+                    )?,
                     Seed::Import(session) => session.populate(tx)?,
                 }
                 self.step(Phase::BeforeSeal)
@@ -703,6 +709,9 @@ impl Stores {
                 valid && copy::binding(tx, source)? == saved.binding,
                 "Source binding changed"
             );
+            if let Some(binding) = &saved.provider_selection {
+                binding.publish(tx, source, &op.id)?;
+            }
             for (table, cols) in [
                 (
                     "conversation_worktrees",

@@ -22,6 +22,8 @@ pub(super) struct Source {
     pub child: bool,
     pub expected_cwd: Option<PathBuf>,
     pub binding: String,
+    #[serde(default)]
+    pub provider_selection: Option<super::super::binding::ClearBinding>,
 }
 
 fn private_owner(c: &Connection, id: &str) -> Result<(String, String)> {
@@ -41,7 +43,11 @@ fn private_owner(c: &Connection, id: &str) -> Result<(String, String)> {
     .context("Private workspace owner unavailable")
 }
 
-pub(in crate::db::session_store) fn workspace(c: &Connection, root: &Path, id: &str) -> Result<PathBuf> {
+pub(in crate::db::session_store) fn workspace(
+    c: &Connection,
+    root: &Path,
+    id: &str,
+) -> Result<PathBuf> {
     let row = crate::db::conversation_repo::conversation_metadata(c, id)?
         .context("Session unavailable")?;
     ensure!(!row.archived, "Session is archived");
@@ -93,13 +99,28 @@ impl SessionDb {
         })
     }
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
-        self.branch_at(destination, boundary, None)
+        self.branch_at(destination, boundary, None, None)
     }
     pub fn derive_owned_child(&self, destination: &str, expected_cwd: &Path) -> Result<SessionDb> {
         self.branch_at(
             destination,
             Branch::Child,
             Some(expected_cwd.canonicalize()?),
+            None,
+        )
+    }
+    pub fn clear_with_provider(
+        &self,
+        destination: &str,
+        snapshot: &crate::native_engine::session_binding::BindingSnapshot,
+    ) -> Result<SessionDb> {
+        self.branch_at(
+            destination,
+            Branch::Clear,
+            None,
+            Some(super::super::binding::ClearBinding::from_snapshot(
+                snapshot,
+            )?),
         )
     }
     fn branch_at(
@@ -107,6 +128,7 @@ impl SessionDb {
         destination: &str,
         boundary: Branch<'_>,
         expected_cwd: Option<PathBuf>,
+        provider_selection: Option<super::super::binding::ClearBinding>,
     ) -> Result<SessionDb> {
         let dest = storage_key(destination)?;
         ensure!(dest != self.key, "Source and destination must differ");
@@ -165,6 +187,7 @@ impl SessionDb {
                 child: matches!(boundary, Branch::Child),
                 expected_cwd,
                 binding,
+                provider_selection,
             }),
         )
     }
@@ -476,6 +499,7 @@ pub(super) fn copy_snapshot(
     dst: &Connection,
     id: &str,
     boundary: Branch<'_>,
+    copy_preferences: bool,
 ) -> Result<()> {
     let path = source
         .stores
@@ -491,6 +515,18 @@ pub(super) fn copy_snapshot(
         &source.id,
         &source.incarnation,
     )?;
+    if copy_preferences {
+        for key in ["cli.session", "cli.permissions", "cli.display", "cli.ide"] {
+            if let Some(value) = super::super::state::local(&tx, key)? {
+                super::super::state::set_local(dst, key, &value)?;
+            }
+        }
+        for key in ["cli.permission-mode", "plan.return-bypass"] {
+            if let Some(value) = super::super::state::local(&tx, &format!("{key}.{}", source.id))? {
+                super::super::state::set_local(dst, &format!("{key}.{id}"), &value)?;
+            }
+        }
+    }
     source.stores.step(Phase::ForkSnapshot)?;
     Copier {
         src: &tx,
