@@ -3,6 +3,7 @@ mod approvals;
 mod binding;
 mod compaction;
 mod directory;
+pub mod diagnostics;
 mod conversations;
 pub use conversations::Rewind;
 pub use compaction::{CheckpointKey, CompactionClaim};

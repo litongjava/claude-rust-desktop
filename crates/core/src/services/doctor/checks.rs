@@ -1,6 +1,5 @@
 use super::DoctorReport;
 use crate::skills::discovery;
-use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -92,7 +91,6 @@ pub fn inspect(
     if let Some(data) = data {
         settings(report, &data.join("settings.json"));
         keybindings(report, &data.join("keybindings.json"));
-        persisted_agents(report, &data.join(crate::runtime::DATABASE_FILE));
         report.json("application MCP", &data.join("mcp-servers.json"));
     }
     installation(report, env);
@@ -244,25 +242,10 @@ fn markdown_agents(report: &mut DoctorReport, root: &Path, names: &mut HashMap<S
     }
 }
 
-fn persisted_agents(report: &mut DoctorReport, db: &Path) {
-    if !db.is_file() {
-        return;
-    }
-    let result = (|| -> anyhow::Result<Option<String>> {
-        let connection =
-            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(std::time::Duration::from_millis(250))?;
-        Ok(connection
-            .query_row(
-                "SELECT value FROM peripheral_settings WHERE key='agent-definitions'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?)
-    })();
-    match result {
-        Ok(None) => report.add("stored agents", "absent", "No custom definitions stored"),
-        Ok(Some(raw)) => {
+pub(super) fn persisted_agents(report: &mut DoctorReport, raw: Option<String>) {
+    match raw {
+        None => report.add("stored agents", "absent", "No custom definitions stored"),
+        Some(raw) => {
             let definitions = (raw.len() <= 1024 * 1024)
                 .then(|| serde_json::from_str::<Vec<super::super::agents::Definition>>(&raw).ok())
                 .flatten();
@@ -290,11 +273,6 @@ fn persisted_agents(report: &mut DoctorReport, db: &Path) {
                 }
             }
         }
-        Err(_) => report.add(
-            "stored agents",
-            "not checked",
-            "Read-only definition query failed or database busy",
-        ),
     }
 }
 

@@ -119,37 +119,13 @@ pub fn inspect_with_environment(
             "application settings",
             &paths.data_dir.join("settings.json"),
         );
-        let db = paths.data_dir.join(crate::runtime::DATABASE_FILE);
-        if !db.exists() {
-            report.add(
-                "database",
-                "absent",
-                "No shared database found; no file was created",
-            );
-        } else {
-            let check = rusqlite::Connection::open_with_flags(
-                &db,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .and_then(|connection| {
-                connection.busy_timeout(std::time::Duration::from_millis(250))?;
-                connection.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-            });
-            match check {
-                Ok(result) if result == "ok" => {
-                    report.add("database", "ok", "SQLite read-only quick_check passed")
-                }
-                Ok(_) => report.add(
-                    "database",
-                    "error",
-                    "SQLite integrity check reported a problem",
-                ),
-                Err(_) => report.add(
-                    "database",
-                    "error",
-                    "SQLite read-only check failed or database is busy",
-                ),
+        match crate::db::session_store::diagnostics::inspect_directory(&paths.data_dir) {
+            Ok(None) => report.add("database", "absent", "No session directory database found"),
+            Ok(Some(health)) => {
+                report.add("database", "ok", "Session directory format and read-only quick_check passed");
+                checks::persisted_agents(&mut report, health.stored_agents);
             }
+            Err(_) => report.add("database", "error", "Session directory format or read-only integrity check failed, or the database is busy"),
         }
         report.add(
             "OAuth credential file",
@@ -202,7 +178,7 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains("application config: error"));
         assert!(!rendered.contains("DO_NOT_ECHO_THIS_SECRET"));
-        assert!(!paths.data_dir.join(crate::runtime::DATABASE_FILE).exists());
+        assert!(!paths.data_dir.join("global.db").exists());
         assert_eq!(std::fs::read_to_string(config).unwrap(), secret);
     }
     #[test]
@@ -248,11 +224,7 @@ mod tests {
         let second = temp.path().join("second-bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&second).unwrap();
-        let name = if cfg!(windows) {
-            "dcl.exe"
-        } else {
-            "dcl"
-        };
+        let name = if cfg!(windows) { "dcl.exe" } else { "dcl" };
         std::fs::write(bin.join(name), b"Not an executable; must never be launched").unwrap();
         std::fs::write(second.join(name), b"Not an executable either").unwrap();
         fn contents(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -287,30 +259,24 @@ mod tests {
         assert!(!report.contains("DO_NOT_ECHO_SECRET"));
         assert!(report.contains("Invalid YAML frontmatter at line"));
         assert_eq!(contents(temp.path()), before);
-        assert!(!paths.data_dir.join(crate::runtime::DATABASE_FILE).exists());
+        assert!(!paths.data_dir.join("global.db").exists());
     }
 
     #[test]
     fn stored_agent_collisions_are_reported_without_definition_contents() {
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().to_owned()).unwrap();
-        let database = temp.path().join(crate::runtime::DATABASE_FILE);
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        connection
-            .execute(
-                "CREATE TABLE peripheral_settings (key TEXT PRIMARY KEY, value TEXT)",
-                [],
-            )
-            .unwrap();
+        let database = temp.path().join("global.db");
+        let stores = paths.open_stores().unwrap();
         let definition = serde_json::json!({"id":"fixture","description":"DO_NOT_ECHO_SECRET","system_prompt":"DO_NOT_ECHO_SECRET","tools":null});
-        let definitions = serde_json::json!([definition.clone(), definition]);
-        connection
-            .execute(
-                "INSERT INTO peripheral_settings VALUES ('agent-definitions', ?1)",
-                [definitions.to_string()],
+        stores
+            .global()
+            .set_setting(
+                crate::db::session_store::GlobalSetting::AgentDefinition("agent-definitions"),
+                &serde_json::json!([definition.clone(), definition]),
             )
             .unwrap();
-        drop(connection);
+        drop(stores);
         let before = std::fs::read(&database).unwrap();
         let report = isolated(temp.path(), &paths).render();
         assert!(report.contains("stored agent definition: error"));
@@ -323,13 +289,27 @@ mod tests {
     fn actual_database_integrity_is_checked() {
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().to_owned()).unwrap();
-        let connection = rusqlite::Connection::open(temp.path().join(crate::runtime::DATABASE_FILE)).unwrap();
-        connection
-            .execute("CREATE TABLE fixture (id INTEGER)", [])
-            .unwrap();
-        drop(connection);
+        drop(paths.open_stores().unwrap());
         assert!(isolated(temp.path(), &paths)
             .render()
             .contains("database: ok"));
+    }
+    #[test]
+    fn wrong_format_fails_and_a_legacy_only_root_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().to_owned()).unwrap();
+        let legacy = temp.path().join("deepseek_code.db");
+        std::fs::write(&legacy, b"legacy sentinel").unwrap();
+        assert!(isolated(temp.path(), &paths)
+            .render()
+            .contains("database: absent"));
+        let directory = temp.path().join("global.db");
+        assert!(!directory.exists());
+        std::fs::write(&directory, b"corrupt").unwrap();
+        assert!(isolated(temp.path(), &paths)
+            .render()
+            .contains("database: error"));
+        assert_eq!(std::fs::read(directory).unwrap(), b"corrupt");
+        assert_eq!(std::fs::read(legacy).unwrap(), b"legacy sentinel");
     }
 }
