@@ -431,7 +431,7 @@ async fn piped_input_stream_json_and_legacy_import_are_scriptable() {
         .unwrap();
     assert!(first_user.ends_with("piped 中文"));
     assert!(first_user.contains(
-        "<system-reminder>\nThe user is working in the standalone DeepSeek Code terminal frontend."
+        "<system-reminder>\nStandalone DeepSeek Code terminal: no Desktop window or Bridge server"
     ));
     task.abort();
     let old = temp.path().join("settings.json");
@@ -1254,7 +1254,7 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
     assert_eq!(wire[0].0, &json!("user"));
     let first = wire[0].1.as_str().unwrap();
     assert!(first.ends_with("Stored summary"), "{first}");
-    assert!(first.contains("<system-reminder>\n# Environment\n"), "{first}");
+    assert!(first.contains("<system-reminder>\n# Working environment\n"), "{first}");
     assert!(first.contains("<system-reminder>\nToday's date is "), "{first}");
     assert_eq!(
         wire[1],

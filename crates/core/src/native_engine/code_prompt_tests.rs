@@ -398,7 +398,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
     let body = capture_instruction_request("responses", reminders).await;
     assert!(body["instructions"]
         .as_str()
-        .is_none_or(|system| !system.contains("# Environment")));
+        .is_none_or(|system| !system.contains("# Working environment")));
     let first = body["input"]
         .as_array()
         .unwrap()
@@ -411,7 +411,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
     let text = |index: usize| parts[index]["text"].as_str().unwrap();
     assert!(text(0).starts_with("<system-reminder>\n") && text(0).contains("user marker"));
     assert!(!text(0).contains("project marker"));
-    assert!(text(1).starts_with("<system-reminder>\n# Environment\n"));
+    assert!(text(1).starts_with("<system-reminder>\n# Working environment\n"));
     assert!(text(1).contains(" - Project: Demo\n - Primary working directory: "));
     assert!(text(1).contains(" - Platform: "));
     assert!(text(2).starts_with("<system-reminder>\n") && text(2).contains("project marker"));

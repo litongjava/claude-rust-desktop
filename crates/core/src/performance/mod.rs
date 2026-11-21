@@ -1021,7 +1021,7 @@ mod tests {
         // The per-session tail moves after the first user message where accepted.
         let composed = crate::prompt::compose_system_prompt_in(Some("custom rule"), crate::prompt::PromptProfile::Code);
         let (fixed, tail) = crate::prompt::split_tail(&composed).unwrap();
-        assert!(tail.starts_with("<additional_instructions>") && tail.contains("custom rule") && !tail.contains("# Environment"));
+        assert!(tail.starts_with("<additional_instructions>") && tail.contains("custom rule") && !tail.contains("# Working environment"));
         assert!(!fixed.contains("custom rule"));
         let mut moved = serde_json::json!({"system":composed,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
         move_system_tail(&mut moved);
@@ -1031,7 +1031,7 @@ mod tests {
         assert!(moved["system"].as_array().unwrap().iter().all(|block| block["cache_control"]["type"] == "ephemeral"));
         // A system prompt with no per-request tail is left where it is.
         let plain = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code);
-        assert!(crate::prompt::split_tail(&plain).is_none() && !plain.contains("# Environment"));
+        assert!(crate::prompt::split_tail(&plain).is_none() && !plain.contains("# Working environment"));
         let mut untouched = serde_json::json!({"system":plain,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
         move_system_tail(&mut untouched);
         assert_eq!(untouched["system"], plain);
