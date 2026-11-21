@@ -39,6 +39,11 @@ fn rows(conn: &Connection, id: &str, messages: &[MessageRow]) -> Result<()> {
             m.conversation_id == id,
             "Message belongs to another sync bucket"
         );
+        // The typed payload is a rendering of the old user text. A replay or
+        // a timestamp/order change preserves it and the other subordinate rows.
+        conn.execute("DELETE FROM message_user_content WHERE message_id=?1 AND EXISTS(
+            SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND role='user' AND content<>?3)",
+            params![m.id, id, m.content])?;
         ensure!(
             upsert.execute(params![
                 m.id,

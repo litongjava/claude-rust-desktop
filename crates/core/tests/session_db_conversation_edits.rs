@@ -48,3 +48,23 @@ fn combined_edit_preserves_history_on_failure_and_recovers_after_decision() -> R
     assert!(history.is_empty());
     Ok(())
 }
+
+#[test]
+fn sync_reconciles_changed_user_display_and_preserves_unchanged_parts() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let shard = stores.create("typed", Default::default())?;
+    let typed = json!([{"type":"text","text":"before"}]);
+    shard.write(|w| w.append_user("typed-user", &typed))?;
+    let mut rows = stores.sync_messages("typed")?;
+    stores.sync_conversation("typed", None, &rows)?;
+    assert_eq!(stores.conversation_detail("typed")?.1[0]["content"], typed);
+    rows[0].content = "after".into();
+    stores.sync_conversation("typed", None, &rows)?;
+    stores.sync_conversation("typed", None, &rows)?;
+    assert_eq!(
+        stores.conversation_detail("typed")?.1[0]["content"],
+        "after"
+    );
+    Ok(())
+}
