@@ -66,6 +66,9 @@ pub struct Worker {
 pub enum Request {
     Ping,
     RuntimeStatus,
+    Bind { identity: String },
+    GetBinding { generation: u64 },
+    SetBinding { binding: crate::native_engine::session_binding::BindingSnapshot },
     SetPermissionMode {
         job_id: String,
         mode: String,
@@ -90,6 +93,13 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Reply {
     pub ok: bool,
+    /// Present on Ping replies from hosts that implement Bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::native_engine::session_binding::BindingSnapshot>,
     pub job_id: Option<String>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +119,9 @@ impl Reply {
     pub fn ok(id: Option<String>) -> Self {
         Self {
             ok: true,
+            binding_supported: None,
+            generation_supported: None,
+            snapshot: None,
             job_id: id,
             error: None,
             permission_mode: None,
@@ -122,6 +135,9 @@ impl Reply {
     pub fn error(error: impl ToString) -> Self {
         Self {
             ok: false,
+            binding_supported: None,
+            generation_supported: None,
+            snapshot: None,
             job_id: None,
             error: Some(error.to_string()),
             permission_mode: None,
@@ -701,22 +717,29 @@ pub async fn finish_job(worker: &Worker, id: &str, error: Option<String>) -> Res
 pub async fn shutdown(root: &Path, session: &str) -> Result<()> {
     recover_session(root, session)?;
     if let Some(worker) = current(root, session)? {
-        if worker.status != "stopped" {
-            call(&worker, &Request::Shutdown).await?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if read_worker(&directory(&worker))?.status == "stopped"
-                        && worker.supervisor_pid.is_none_or(recovery::exited)
-                        && worker.child_pid.is_none_or(recovery::exited)
-                    {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_worker(&worker).await?;
+    }
+    Ok(())
+}
+
+/// Retire the observed incarnation. A concurrently created successor owns a
+/// different endpoint and directory.
+pub async fn shutdown_worker(worker: &Worker) -> Result<()> {
+    if worker.status != "stopped" {
+        call(worker, &Request::Shutdown).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if read_worker(&directory(worker))?.status == "stopped"
+                    && worker.supervisor_pid.is_none_or(recovery::exited)
+                    && worker.child_pid.is_none_or(recovery::exited)
+                {
+                    return Ok::<_, anyhow::Error>(());
                 }
-            })
-            .await
-            .context("Session worker shutdown timed out")??;
-        }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Session worker shutdown timed out")??;
     }
     Ok(())
 }

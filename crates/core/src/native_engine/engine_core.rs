@@ -719,6 +719,7 @@ impl QueryEngine {
         let mut pm = self.provider_manager.lock().await;
         let config_path = pm.config_path().clone();
         *pm = ProviderManager::from_providers(providers, config_path);
+        self.invalidate_child_bindings(&pm, None);
     }
 
     pub async fn resolve_provider(
@@ -1305,7 +1306,7 @@ impl QueryEngine {
         )?;
         let hook_provider = {
             let pm = self.provider_manager.lock().await;
-            if let Some(id) = request.provider_id.as_deref() {
+            if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &request.model)
             } else {
                 pm.resolve_provider(&request.model).await
@@ -1527,7 +1528,7 @@ impl QueryEngine {
 
         let mut provider = {
             let pm = self.provider_manager.lock().await;
-            let resolved = if let Some(id) = request.provider_id.as_deref() {
+            let resolved = if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &model)
             } else {
                 pm.resolve_provider(&model).await
@@ -1635,6 +1636,7 @@ impl QueryEngine {
             reasoning_mode.clone(),
         )
         .with_owned_children(self.owned_children.clone())
+        .with_provider_manager(Some(self.provider_manager.clone()))
         .with_runtime_agents(
             self.runtime_agents
                 .read()
@@ -1699,6 +1701,13 @@ impl QueryEngine {
             self.file_cache.clone(),
             workspace_path.clone(),
         )));
+
+        let selector = model.split_once("::").map_or(model.as_str(), |(_, id)| id);
+        if super::provider_manager::one_million_context_base(selector)
+            == Some(executor.model_selector.as_str())
+        {
+            executor.model_selector.push_str("[1m]");
+        }
 
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
@@ -1942,7 +1951,7 @@ impl QueryEngine {
                         if should_generate {
                             let resolved = {
                                 let pm_guard = pm.lock().await;
-                                pm_guard.resolve_provider(&title_model).await
+                                match pm_guard.binding.resolve(None) { Some(active) => Some(active), None => pm_guard.resolve_provider(&title_model).await }
                             };
 
                             if let Some(resolved) = resolved {
@@ -2166,6 +2175,18 @@ impl QueryEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session.to_owned(), agents);
+    }
+
+    /// Only a change to the shared catalog can revoke an independently retained child.
+    pub fn invalidate_child_bindings(
+        &self,
+        manager: &ProviderManager,
+        _owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
+    ) {
+        self.owned_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, child| child.binding_is_current(manager));
     }
 
     pub fn clear_runtime_agents(&self, session: &str) {

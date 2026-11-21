@@ -60,6 +60,10 @@ impl QueryEngine {
         if self.active_turns.lock().await.contains_key(owner) {
             return Ok(None);
         }
+        {
+            let manager = self.provider_manager.lock().await;
+            self.invalidate_child_bindings(&manager, None);
+        }
         let ids = self
             .owned_children
             .lock()
@@ -107,6 +111,10 @@ impl QueryEngine {
         child: &str,
         events: tokio::sync::mpsc::Sender<EngineEvent>,
     ) -> Result<Value> {
+        {
+            let manager = self.provider_manager.lock().await;
+            self.invalidate_child_bindings(&manager, None);
+        }
         ensure!(
             self.owned_children
                 .lock()

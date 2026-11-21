@@ -128,13 +128,13 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         &session.store.db,
         &session.id,
         boundary_id,
-        &session.model,
-        Some(&session.provider_id),
+        &session.binding_state().model,
+        Some(&session.binding_state().provider_id),
     )?;
     let same_context = |snapshot: &serde_json::Value| {
         (snapshot["source"] == "native_engine" || snapshot.get("source").is_none())
-            && snapshot["model"] == session.model
-            && snapshot["providerId"] == session.provider_id
+            && snapshot["model"] == session.binding_state().model
+            && snapshot["providerId"] == session.binding_state().provider_id
             && match boundary_id {
                 Some(id) => snapshot["contextBoundary"].as_str() == Some(id),
                 None => snapshot
@@ -175,8 +175,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         deepseek_code_core::services::context_usage::estimated_after_compaction(
             &session.store,
             &session.id,
-            &session.model,
-            Some(&session.provider_id),
+            &session.binding_state().model,
+            Some(&session.binding_state().provider_id),
         )?
     } else {
         None
@@ -185,11 +185,11 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         let saved = deepseek_code_core::services::context_usage::last_reported_request(
             &session.store.db,
             &session.id,
-            &session.model,
+            &session.binding_state().model,
         )?;
         let reported = live.iter().rev().find(|snapshot| {
             (snapshot["source"] == "native_engine" || snapshot.get("source").is_none())
-                && snapshot["model"] == session.model
+                && snapshot["model"] == session.binding_state().model
                 && snapshot["inputTokens"].is_u64()
                 && snapshot["startedAt"].as_i64().unwrap_or(0)
                     >= saved.as_ref().and_then(|r| r.started_at_ms).unwrap_or(0)
@@ -274,12 +274,12 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
                 format!(
                     "{} ({})",
                     runtime_status::label(&provider.provider.name),
-                    runtime_status::label(&session.provider_id)
+                    runtime_status::label(&session.binding_state().provider_id)
                 ),
             ),
             (
                 "Model",
-                format!("{} \u{b7} /model", runtime_status::label(&session.model)),
+                format!("{} \u{b7} /model", runtime_status::label(&session.binding_state().model)),
             ),
             (
                 "API endpoint",

@@ -206,6 +206,12 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
                 "SKILL_FIXTURE_KEY",
                 "--model",
                 "fixture",
+                "--max-tokens",
+                "211",
+                "--system-prompt",
+                "I4_BASE_SKILL_PROMPT",
+                "--append-system-prompt",
+                "I4_APPEND_SKILL_PROMPT",
                 "--permission-mode",
                 permission,
                 "--print",
@@ -254,6 +260,7 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
     assert_eq!(store.history(&parent).unwrap().len(), 3);
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request["max_tokens"] == 211));
     assert!(requests[1]
         .to_string()
         .contains("PARENT_HISTORY_MUST_STAY_PRIVATE"));
@@ -262,6 +269,13 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
     assert!(body.contains("收集结果😀"));
     assert!(body.contains("external data"));
     assert!(body.contains("target-file"));
+    for marker in [
+        "I4_BASE_SKILL_PROMPT",
+        "I4_APPEND_SKILL_PROMPT",
+        "收集结果😀",
+    ] {
+        assert_eq!(body.matches(marker).count(), 1, "{marker}");
+    }
     let child_tools = requests[0]["tools"].as_array().unwrap();
     assert!(child_tools.iter().all(|tool| ![
         "Write",

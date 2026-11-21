@@ -50,6 +50,7 @@ fn mime(bytes: &[u8]) -> Result<&'static str> {
 }
 
 pub async fn generate(input: Value, cwd: &str, provider: &ResolvedProvider) -> Result<Value> {
+    let provider = &provider.current()?;
     let input: Input = serde_json::from_value(input).context("Invalid ImageGenerate arguments")?;
     ensure!(
         !input.prompt.trim().is_empty() && input.prompt.len() <= 32_000,
@@ -132,6 +133,7 @@ pub async fn generate(input: Value, cwd: &str, provider: &ResolvedProvider) -> R
         request = request.bearer_auth(&provider.provider.api_key);
     }
     // Do not retry paid generation automatically or follow redirects with credentials/images.
+    provider.ensure_current()?;
     let mut response = request
         .send()
         .await

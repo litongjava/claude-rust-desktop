@@ -154,3 +154,65 @@ async fn runtime_agent_fields_reach_the_child_request() {
     drop(bodies);
     server.abort();
 }
+
+#[tokio::test]
+async fn sdk_agent_invocation_rebinds_and_its_retained_executor_rejects_rotation() {
+    use crate::native_engine::{provider_manager::ProviderManager, runtime_agents::AgentModel};
+    async fn mock() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let captured = keys.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |headers: axum::http::HeaderMap| {
+            captured.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
+            async { ([("content-type", "text/event-stream")],
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n") }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            keys,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+    let (old, first_requests, first_server) = mock().await;
+    let (new, next_requests, next_server) = mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = uuid::Uuid::new_v4().to_string();
+    let (mut host, _) = executor(dir.path(), &parent, old.clone(), Default::default()).await;
+    let mut owner = host.provider.provider.clone();
+    owner.models.push(host.provider.model.clone());
+    let mut child = owner.clone();
+    child.id = "explicit-child".into();
+    child.api_key = "old-dummy".into();
+    let manager = Arc::new(tokio::sync::Mutex::new(ProviderManager::in_memory(
+        vec![owner, child.clone()],
+        dir.path().join("providers.json"),
+    )));
+    host.provider_manager = Some(manager.clone());
+    Arc::make_mut(&mut host.runtime_agents)[0].provider = Some(AgentModel {
+        provider_id: child.id.clone(),
+        model: "fixture".into(),
+    });
+    let invoke = json!({"prompt":"inspect","agent_type":"analyst"});
+    let first = host.execute_delegated(&invoke).await.unwrap();
+    child.base_url = new;
+    child.api_key = "new-dummy".into();
+    manager
+        .lock()
+        .await
+        .update_provider("explicit-child", child);
+    let err = host
+        .resume_owned_child(
+            first["session_id"].as_str().unwrap(),
+            Some("continue"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("needs_resume"));
+    host.execute_delegated(&invoke).await.unwrap();
+    assert_eq!(*first_requests.lock().unwrap(), ["Bearer old-dummy"]);
+    assert_eq!(*next_requests.lock().unwrap(), ["Bearer new-dummy"]);
+    first_server.abort();
+    next_server.abort();
+}

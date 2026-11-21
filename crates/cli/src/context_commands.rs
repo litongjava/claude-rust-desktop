@@ -154,8 +154,8 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
         }
     }
     Ok(deepseek_code_core::services::context_usage::LastRequest {
-        model: session.model.clone(),
-        provider: Some(session.provider_id.clone()),
+        model: session.binding_state().model.clone(),
+        provider: Some(session.binding_state().provider_id.clone()),
         started_at_ms: None,
         status: "estimate".into(),
         usage: Some(usage),

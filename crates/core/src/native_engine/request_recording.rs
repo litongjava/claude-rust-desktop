@@ -518,6 +518,7 @@ pub async fn send(
     api: &str,
     streaming: bool,
 ) -> Result<reqwest::Response> {
+    provider.ensure_current()?;
     let (client, request) = request.build_split();
     let mut request = request?;
     if options.recording.is_some() {

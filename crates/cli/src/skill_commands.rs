@@ -183,7 +183,7 @@ pub async fn prepare_invocation(
         .permissions
         .set_session_rules(&session.id, crate::permission_commands::load(session)?);
     let hooks = HookRunner::load_with_plugins(&context, &session.workspace)?
-        .with_prompt_provider(session.sdk_resolve_model(&session.model).await?)?;
+        .with_prompt_provider(session.sdk_resolve_model(&session.binding_state().model).await?)?;
     let mut expanded = String::new();
     for segment in segments {
         match segment {
@@ -305,7 +305,7 @@ pub async fn prepare_invocation(
     std::io::Write::write_all(&mut file, expanded.as_bytes())?;
     let instructions = directory.join(format!("{child_id}.md"));
     file.persist(&instructions)?;
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let mut arguments = crate::background_commands::arguments(cli, &session.paths, session, &child_id, "Execute the selected skill in the appended instructions. Report the result concisely. Shell context was already expanded; do not rerun it.", &provider)?;
     let position = arguments
         .iter()

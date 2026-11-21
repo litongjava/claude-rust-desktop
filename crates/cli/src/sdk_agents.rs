@@ -182,7 +182,7 @@ pub async fn prepare(session: &Session, value: Option<&Value>) -> Result<Catalog
         agents::validate_custom(&definition)?;
         let provider = match agent.model.as_deref() {
             None | Some("inherit") => None,
-            Some(model) => Some(session.sdk_resolve_model(model).await?),
+            Some(model) => Some(session.sdk_agent_model(model).await?),
         };
         catalog.push(RuntimeAgent {
             definition,

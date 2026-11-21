@@ -80,6 +80,7 @@ impl DeepSeekSearchConfig {
         };
         Ok(ResolvedProvider {
             provider: Provider {
+                lease: None,
                 id: "deepseek-search".into(),
                 name: "DeepSeek Search".into(),
                 base_url: self.base_url.trim().trim_end_matches('/').into(),

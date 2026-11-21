@@ -10,6 +10,7 @@ use std::sync::{
 
 pub(super) async fn start_pending(
     worker: &Worker,
+    expected_binding: Option<&str>,
     sessions: &Arc<tokio::sync::Mutex<Option<Session>>>,
     active: &Arc<AtomicBool>,
     admission_released: &Arc<tokio::sync::Notify>,
@@ -24,6 +25,10 @@ pub(super) async fn start_pending(
     let Some(session) = current.as_ref() else {
         return Ok(());
     };
+    let Some((installed, _)) = &session.idle_launch else { return Ok(()); };
+    if expected_binding.is_some_and(|expected| installed != expected) {
+        return Ok(());
+    }
     let child =
         if deepseek_code_core::services::async_hooks::has_pending_wake(&worker.root, &worker.session_id) {
             String::new()
@@ -160,12 +165,7 @@ async fn execute(
         }
     }
     if child.is_empty() {
-        let cli = session
-            .hook_wake_cli
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .context("Hook wake requires live worker options")?;
+        let (_, cli) = session.idle_launch.as_ref().context("Hook wake requires live worker options")?;
         *mode_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModeControl {
             job_id: id.into(),
             session_id: session.id.clone(),
@@ -176,7 +176,7 @@ async fn execute(
             bypass_available: session.bypass_available,
             full_access: session.full_access,
         });
-        return session.wake_hooks(&cli, &mut None).await;
+        return session.wake_hooks(cli, &mut None).await;
     }
     let (manager, provider) = session
         .engine

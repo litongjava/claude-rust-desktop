@@ -92,7 +92,7 @@ pub async fn handle(
         "/logout" => {
             ensure!(argument.trim().is_empty(), "Usage: /logout");
             remove_account(paths).await?;
-            if session.provider_id == PROVIDER_ID {
+            if session.binding_state().provider_id == PROVIDER_ID {
                 session.set_fast(false).await?;
                 let providers = paths.providers()?;
                 let fallback = providers
@@ -120,6 +120,7 @@ pub async fn handle(
             command_eprintln!("Signed out of this application's Anthropic account. Official CLI credentials were not changed. Browser/server-side sessions are not revoked.");
         }
         "/fast" => {
+            session.refresh_binding().await?;
             let argument = argument.trim();
             ensure!(
                 ["", "status", "on", "off"].contains(&argument),
@@ -127,6 +128,7 @@ pub async fn handle(
             );
             let selected = session.selected_provider().await?;
             if argument == "on" {
+                selected.ensure_current()?;
                 ensure!(
                     matches!(
                         selected.provider.api_format,

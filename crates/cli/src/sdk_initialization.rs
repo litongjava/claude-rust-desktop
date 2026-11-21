@@ -53,6 +53,7 @@ impl State {
             .transpose()?
             .unwrap_or_default();
         let catalog = agents::prepare(session, request.get("agents")).await?;
+        let mut response = metadata(session).await?;
         if let Some(name) = request.get("agent").and_then(Value::as_str) {
             let agent = catalog
                 .iter()
@@ -72,8 +73,7 @@ impl State {
             overrides.system_prompt = Some(prompt);
             overrides.initial_prompt = agent.initial_prompt.clone();
             if let Some(provider) = &agent.provider {
-                session.model = provider.model.id.clone();
-                session.provider_id = provider.provider.id.clone();
+                session.sdk_set_model(&format!("{}::{}", provider.provider_id, provider.model)).await?;
             }
             if let Some(mode) = &agent.permission_mode {
                 session
@@ -81,7 +81,6 @@ impl State {
                     .set_mode(deepseek_code_core::permissions::PermissionMode::parse(mode)?);
             }
         }
-        let mut response = metadata(session).await?;
         let entries = response["agents"]
             .as_array_mut()
             .expect("metadata agents array");
@@ -90,11 +89,10 @@ impl State {
             let mut entry =
                 json!({"name":agent.definition.id,"description":agent.definition.description});
             if let Some(provider) = &agent.provider {
-                entry["model"] = json!(provider.model.id);
+                entry["model"] = json!(provider.model);
             }
             entries.push(entry);
         }
-        // Nothing above mutates the running session, including a failed metadata read.
         session.sdk_mcp.install(servers, mcp_host)?;
         session
             .sdk_hooks

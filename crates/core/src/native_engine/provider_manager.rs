@@ -31,6 +31,8 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
+    #[serde(skip)]
+    pub lease: Option<super::session_binding::ProviderLease>,
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -43,7 +45,7 @@ pub struct Provider {
     pub web_search_strategy: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiFormat {
     #[serde(rename = "anthropic")]
     Anthropic,
@@ -87,6 +89,46 @@ pub struct ResolvedProvider {
     pub model: ModelConfig,
 }
 
+impl ResolvedProvider {
+    /// A native adapter can choose the endpoint, protocol or signing region
+    /// from the model (including Bedrock ARNs). Keep that selector with the
+    /// transport when deciding whether an earlier runtime can keep sending.
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        self.provider.same_transport(&other.provider)
+            && (self.provider.builtin_id.is_none()
+                || (self.model.id == other.model.id && self.model.api == other.model.api))
+    }
+}
+
+impl Provider {
+    /// The child must use the selected transport even when its process was
+    /// started with a different endpoint in the environment.
+    pub fn child_transport_arguments(&self) -> Vec<String> {
+        let mut args = vec![
+            "--base-url".into(),
+            self.base_url.clone(),
+            "--api-format".into(),
+            match self.api_format {
+                ApiFormat::Anthropic => "anthropic",
+                ApiFormat::OpenAI => "openai",
+            }
+            .into(),
+        ];
+        if let Some(builtin) = &self.builtin_id {
+            args.extend(["--bound-builtin".into(), builtin.clone()]);
+        }
+        args
+    }
+
+    pub fn same_transport(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.base_url == other.base_url
+            && self.api_key == other.api_key
+            && self.api_format == other.api_format
+            && self.builtin_id == other.builtin_id
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProviderCacheEntry {
     pub provider: Provider,
@@ -96,6 +138,7 @@ struct ProviderCacheEntry {
 
 #[derive(Debug)]
 pub struct ProviderManager {
+    pub binding: super::session_binding::SessionBinding,
     providers: Vec<Provider>,
     config_path: PathBuf,
     resolve_cache: Mutex<HashMap<String, ProviderCacheEntry>>,
@@ -107,6 +150,7 @@ pub struct ProviderManager {
 impl ProviderManager {
     pub fn new(config_path: PathBuf) -> Self {
         let mut manager = Self {
+            binding: Default::default(),
             providers: Vec::new(),
             config_path,
             resolve_cache: Mutex::new(HashMap::new()),
@@ -129,6 +173,7 @@ impl ProviderManager {
     /// Runtime credentials and CLI overrides must never be written to disk.
     pub fn in_memory(providers: Vec<Provider>, config_path: PathBuf) -> Self {
         Self {
+            binding: Default::default(),
             providers,
             config_path,
             resolve_cache: Mutex::new(HashMap::new()),
@@ -182,7 +227,8 @@ impl ProviderManager {
         Ok(())
     }
 
-    fn invalidate_cache(&self) {
+    fn invalidate_cache(&mut self) {
+        self.resolve_cache.get_mut().clear();
         tracing::info!(module = "ProviderManager", "Resolve cache invalidated (sync)");
     }
 
@@ -193,6 +239,21 @@ impl ProviderManager {
     }
 
     pub async fn resolve_provider(&self, model_id: &str) -> Option<ResolvedProvider> {
+        if let Some(state) = self.binding.read() {
+            if model_id == state.model {
+                return self.binding.resolve_in(&state, None);
+            }
+            if let Some(selector) = model_id.split_once("::") {
+                return self.binding.resolve_in(&state, Some(selector));
+            }
+            let resolved = Self::resolve_bare(&state.providers, model_id)?;
+            // Bind aliases to the resolved model and keep a virtual context override.
+            let mut selector = resolved.model.id.clone();
+            if one_million_context_base(model_id).is_some() && one_million_context_base(&selector).is_none() {
+                selector.push_str("[1m]");
+            }
+            return self.binding.resolve_in(&state, Some((&resolved.provider.id, &selector)));
+        }
         let now = Instant::now();
 
         {
@@ -232,6 +293,11 @@ impl ProviderManager {
     }
 
     pub fn resolve_selected(&self, provider_id: &str, model_id: &str) -> Option<ResolvedProvider> {
+        if let Some(state) = self.binding.read() {
+            let selector = (provider_id, model_id);
+            let pinned = (selector != (state.provider_id.as_str(), state.model.as_str())).then_some(selector);
+            return self.binding.resolve_in(&state, pinned);
+        }
         let provider = self.providers.iter().find(|p| p.id == provider_id && p.enabled)?;
         let model = resolve_model_selection(&provider.models,model_id)?;
         Some(ResolvedProvider { provider: provider.clone(), model })
@@ -239,6 +305,10 @@ impl ProviderManager {
 
     fn resolve_provider_internal(&self, model_id: &str) -> Option<ResolvedProvider> {
         if let Some((provider, model)) = model_id.split_once("::") { return self.resolve_selected(provider, model); }
+        Self::resolve_bare(&self.list_providers(), model_id)
+    }
+
+    fn resolve_bare(providers: &[Provider], model_id: &str) -> Option<ResolvedProvider> {
         let mut first_match: Option<ResolvedProvider> = None;
         
         let aliases: std::collections::HashMap<&str, Vec<&str>> = [
@@ -257,7 +327,7 @@ impl ProviderManager {
         }
         
         for try_id in &ids_to_try {
-            for provider in &self.providers {
+            for provider in providers {
                 if !provider.enabled {
                     continue;
                 }
@@ -294,7 +364,7 @@ impl ProviderManager {
 
         if first_match.is_none() {
             if let Some(base)=one_million_context_base(model_id) {
-                return self.resolve_provider_internal(base).map(|mut resolved|{resolved.model.context_window=Some(1_000_000);resolved});
+                return Self::resolve_bare(providers, base).map(|mut resolved|{resolved.model.context_window=Some(1_000_000);resolved});
             }
         }
         first_match
@@ -359,17 +429,23 @@ impl ProviderManager {
         clean.trim_end_matches('/').strip_suffix("/v1").unwrap_or(clean.trim_end_matches('/')).to_string()
     }
 
-    pub fn list_providers(&self) -> &[Provider] {
-        &self.providers
+    pub fn list_providers(&self) -> std::borrow::Cow<'_, [Provider]> {
+        match self.binding.read() {
+            Some(binding) => std::borrow::Cow::Owned(binding.providers.clone()),
+            None => std::borrow::Cow::Borrowed(&self.providers),
+        }
     }
 
     pub fn set_model_fast(&mut self, provider_id: &str, model_id: &str, enabled: bool) -> Result<()> {
-        let provider = self.providers.iter_mut().find(|p| p.id == provider_id).ok_or_else(|| anyhow!("Provider not found"))?;
+        let mut snapshot = self.binding.read().map(|s| (*s).clone());
+        let catalog = snapshot.as_mut().map(|s| &mut s.providers).unwrap_or(&mut self.providers);
+        let provider = catalog.iter_mut().find(|p| p.id == provider_id).ok_or_else(|| anyhow!("Provider not found"))?;
         let selected=resolve_model_selection(&provider.models,model_id).ok_or_else(||anyhow!("Model not found"))?;
         let model = provider.models.iter_mut().find(|m| m.id == selected.id).ok_or_else(|| anyhow!("Model not found"))?;
         model.fast = enabled;
+        if let Some(snapshot) = snapshot { self.binding.install(snapshot)?; }
         // resolve_selected reads the live provider list; discard other cached resolutions.
-        if let Ok(mut cache) = self.resolve_cache.try_lock() { cache.clear(); }
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -415,6 +491,45 @@ impl ProviderManager {
 #[cfg(test)]
 mod provider_selection_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_cache_rebinds_bare_and_qualified_models_on_update_reload_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let mut provider: Provider = serde_json::from_value(serde_json::json!({
+            "id":"p","name":"test","enabled":true,"api_format":"openai",
+            "base_url":"http://127.0.0.1:1","api_key":"first",
+            "models":[{"id":"m","name":"m","enabled":true,"supports_web_search":false}]
+        }))
+        .unwrap();
+        let mut manager = ProviderManager::in_memory(vec![provider.clone()], path.clone());
+        for change in ["initial", "endpoint", "key", "reload"] {
+            match change {
+                "endpoint" => {
+                    provider.base_url = "http://127.0.0.1:2".into();
+                    manager.update_provider("p", provider.clone());
+                }
+                "key" => {
+                    provider.api_key = "second".into();
+                    manager.update_provider("p", provider.clone());
+                }
+                "reload" => {
+                    provider.api_key = "third".into();
+                    std::fs::write(&path, serde_json::to_vec(&[&provider]).unwrap()).unwrap();
+                    manager.load();
+                }
+                _ => {}
+            }
+            for selector in ["m", "p::m"] {
+                let resolved = manager.resolve_provider(selector).await.unwrap();
+                assert_eq!(resolved.provider.base_url, provider.base_url, "{change}");
+                assert_eq!(resolved.provider.api_key, provider.api_key, "{change}");
+            }
+        }
+        manager.delete_provider("p");
+        assert!(manager.resolve_provider("m").await.is_none());
+        assert!(manager.resolve_provider("p::m").await.is_none());
+    }
 
     #[test]
     fn astra_context_defaults_apply_to_saved_models_and_preserve_overrides() {

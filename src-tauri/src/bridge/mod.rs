@@ -2218,6 +2218,7 @@ async fn workflow_execute(
     };
 
     let provider = crate::native_engine::provider_manager::Provider {
+        lease: None,
         id: provider_config.id.clone(),
         builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),
@@ -2306,6 +2307,7 @@ async fn workflow_execute_stream(
     };
 
     let provider = crate::native_engine::provider_manager::Provider {
+        lease: None,
         id: provider_config.id.clone(),
         builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),

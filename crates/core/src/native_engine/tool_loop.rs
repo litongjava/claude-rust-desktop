@@ -121,6 +121,8 @@ mod tool_loading_restore_tests;
 
 #[path = "multimodal.rs"]
 mod multimodal;
+#[path = "provider_transcript.rs"]
+mod provider_transcript;
 #[cfg(test)]
 #[path = "multimodal_tests.rs"]
 mod multimodal_tests;
@@ -267,6 +269,8 @@ impl std::ops::Deref for LoadedTools {
 }
 
 pub struct ToolLoopExecutor {
+    /// Selected model including a virtual context suffix omitted from the wire ID.
+    pub(super) model_selector: String,
     pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
@@ -315,6 +319,7 @@ pub struct ToolLoopExecutor {
     approval_notes: Arc<std::sync::Mutex<Vec<String>>>,
     approved_call: Option<tool_approval::ExactApproval>,
     runtime_agents: super::runtime_agents::Catalog,
+    provider_manager: Option<Arc<tokio::sync::Mutex<super::provider_manager::ProviderManager>>>,
     permission_manager: Option<Arc<PermissionManager>>,
     memex_client: Option<MemExClient>,
     context_manager: Option<ContextManager>,
@@ -401,8 +406,14 @@ struct PendingToolCall {
     concurrent: bool,
 }
 
-/// Everything one request sends: the tool definitions and the system prompt,
-/// both built from the same settings and catalog snapshot.
+struct Continuation<M> {
+    messages: Vec<M>,
+    iteration: usize,
+    text: String,
+    after_tools: bool,
+}
+
+/// Tools and system prompt for a single provider request.
 struct PreparedRequest {
     tools: Vec<crate::tools::ToolDefinition>,
     system_prompt: Option<String>,
@@ -1382,6 +1393,10 @@ async fn execute_builtin_tool(
     skill_shell_active: bool,
     options: super::request_options::RequestOptions,
 ) -> Result<Value> {
+    let provider = &provider.current()?;
+    if name == "DeepSeekCode" {
+        return crate::tools::external_agents::execute_bound(name, input, cwd, provider.binding_snapshot().as_deref()).await;
+    }
     if name == "Bash" && skill_shell_active {
         let input = crate::skills::invocation::shell_input(
             input["command"]
@@ -1587,6 +1602,7 @@ impl ToolLoopExecutor {
             context_usage: None,
             suggestion: None,
             auto_history: messages.clone(),
+            model_selector: provider.model.id.clone(),
             provider,
             messages,
             context_boundary_id: None,
@@ -1614,6 +1630,7 @@ impl ToolLoopExecutor {
             approval_notes: Arc::new(std::sync::Mutex::new(Vec::new())),
             approved_call: None,
             runtime_agents: Default::default(),
+            provider_manager: None,
             permission_manager: None,
             memex_client: None,
             context_manager: None,
@@ -1980,7 +1997,7 @@ impl ToolLoopExecutor {
             // Foreground and background jobs share this owning frontend.
             interactive: self.permission_host_available,
         };
-        let mut start = match crate::native_engine::toolscript_job::start_job(&root, spec).await {
+        let mut start = match crate::native_engine::toolscript_job::start_bound_job(&root, spec, Some(&self.provider)).await {
             Ok(start) => start,
             Err(error) => return failed(format!("ToolScript could not start: {error:#}")),
         };
@@ -3210,6 +3227,14 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub(crate) fn with_provider_manager(
+        mut self,
+        manager: Option<Arc<tokio::sync::Mutex<super::provider_manager::ProviderManager>>>,
+    ) -> Self {
+        self.provider_manager = manager;
+        self
+    }
+
     pub(crate) fn with_runtime_agents(mut self, agents: super::runtime_agents::Catalog) -> Self {
         self.runtime_agents = agents;
         self
@@ -4086,6 +4111,13 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
+    fn refresh_provider(&mut self) -> Result<()> {
+        let (provider, selector) = self.provider.current_selection()?;
+        self.provider = provider;
+        if let Some(selector) = selector { self.model_selector = selector; }
+        Ok(())
+    }
+
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
         let conv_id = self.conv_id.clone().unwrap_or_default();
         tracing::info!(
@@ -4319,6 +4351,7 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
         provider_id: &str,
     ) -> CallStep {
+        if let Err(error) = self.refresh_provider() { return CallStep::Finished((tool_input.clone(), error.to_string(), true)); }
         // Hard denials are enforced before any permission prompt. A pending
         // Super Agent plan approval, a Router edit, or an agent tool allowlist
         // must not become a user-confirmable prompt that could authorize it.
@@ -5363,19 +5396,13 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_anthropic_loop(&mut self) -> Result<(String, Option<String>)> {
-        tracing::info!(
-            module = "AnthropicLoop",
-            "ENTRY: building messages, msg_count={}",
-            self.messages.len()
-        );
-        let mut conversation_messages: Vec<AnthropicMessage> = self.build_anthropic_messages()?;
-        tracing::info!(
-            module = "AnthropicLoop",
-            "Messages built, count={}",
-            conversation_messages.len()
-        );
+        let messages = self.build_anthropic_messages()?;
+        self.continue_anthropic(Continuation { messages, iteration: 0, text: String::new(), after_tools: false }).await
+    }
 
-        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+    async fn continue_anthropic(&mut self, cursor: Continuation<AnthropicMessage>) -> Result<(String, Option<String>)> {
+        let mut conversation_messages = cursor.messages;
+        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
             if let Some(ref sp) = self.system_prompt {
                 self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
             } else {
@@ -5383,17 +5410,23 @@ impl ToolLoopExecutor {
             }
         }
 
-        let mut full_text = String::new();
+        let mut full_text = cursor.text;
         let mut stop_reason = None;
-        let base_url = self.provider.provider.base_url.clone();
-        let model_id = self.provider.model.id.clone();
-        let api_key_len = self.provider.provider.api_key.len();
+
 
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
         let mut output_recoveries = 0;
 
-        let mut after_tool_results = false;
-        for iteration in 0usize.. {
+        let mut after_tool_results = cursor.after_tools;
+        for iteration in cursor.iteration.. {
+            self.refresh_provider()?;
+            if self.provider.provider.api_format != ApiFormat::Anthropic {
+                let messages = provider_transcript::openai(conversation_messages)?;
+                return Box::pin(self.continue_openai(Continuation { messages, iteration, text: full_text, after_tools: after_tool_results })).await;
+            }
+            let base_url = self.provider.provider.base_url.clone();
+            let model_id = self.provider.model.id.clone();
+            let api_key_len = self.provider.provider.api_key.len();
             for context in self.drain_async_hook_messages() {
                 conversation_messages.push(AnthropicMessage {
                     role: "user".into(),
@@ -6116,19 +6149,13 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_openai_loop(&mut self) -> Result<(String, Option<String>)> {
-        tracing::info!(
-            module = "OpenAILoop",
-            "ENTRY: building messages, msg_count={}",
-            self.messages.len()
-        );
-        let mut conversation_messages: Vec<OpenAIMessage> = self.build_openai_messages()?;
-        tracing::info!(
-            module = "OpenAILoop",
-            "Messages built, count={}",
-            conversation_messages.len()
-        );
+        let messages = self.build_openai_messages()?;
+        self.continue_openai(Continuation { messages, iteration: 0, text: String::new(), after_tools: false }).await
+    }
 
-        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+    async fn continue_openai(&mut self, cursor: Continuation<OpenAIMessage>) -> Result<(String, Option<String>)> {
+        let mut conversation_messages = cursor.messages;
+        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
             if let Some(ref sp) = self.system_prompt {
                 self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
             } else {
@@ -6136,11 +6163,9 @@ impl ToolLoopExecutor {
             }
         }
 
-        let mut full_text = String::new();
+        let mut full_text = cursor.text;
         let mut stop_reason = None;
-        let base_url = self.provider.provider.base_url.clone();
-        let model_id = self.provider.model.id.clone();
-        let api_key_len = self.provider.provider.api_key.len();
+
         let mut output_recoveries = 0;
 
         // Read once per turn. The opt-in replay covers the Chat Completions
@@ -6159,8 +6184,16 @@ impl ToolLoopExecutor {
         };
         let mut recovery_used = false;
 
-        let mut after_tool_results = false;
-        for iteration in 0usize.. {
+        let mut after_tool_results = cursor.after_tools;
+        for iteration in cursor.iteration.. {
+            self.refresh_provider()?;
+            if self.provider.provider.api_format != ApiFormat::OpenAI {
+                let messages = provider_transcript::anthropic(conversation_messages)?;
+                return Box::pin(self.continue_anthropic(Continuation { messages, iteration, text: full_text, after_tools: after_tool_results })).await;
+            }
+            let base_url = self.provider.provider.base_url.clone();
+            let model_id = self.provider.model.id.clone();
+            let api_key_len = self.provider.provider.api_key.len();
             for context in self.drain_async_hook_messages() {
                 conversation_messages.push(OpenAIMessage {
                     role: "user".into(),

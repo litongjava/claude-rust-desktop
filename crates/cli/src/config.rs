@@ -11,10 +11,84 @@ use deepseek_code_core::{
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::Path};
 
+/// User-supplied overrides belong to one selection. Keep the key's source
+/// name so a later saved-session transition resolves its current value.
+#[derive(Clone)]
+pub(crate) struct StartupProvider {
+    pub id: String,
+    base_url: bool,
+    api_key_env: Option<String>,
+    api_format: bool,
+    bound_builtin: bool,
+    max_tokens: Option<u32>,
+}
+
+impl StartupProvider {
+    pub fn new(id: &str, cli: &Cli) -> Self {
+        Self {
+            id: id.into(),
+            base_url: cli.base_url.is_some(),
+            api_key_env: cli.api_key_env.clone(),
+            api_format: cli.api_format.is_some(),
+            bound_builtin: cli.bound_builtin.is_some(),
+            max_tokens: cli.max_tokens,
+        }
+    }
+
+    // Provenance and the key source name are retained; transport values come
+    // from the session binding, including on a later process transfer.
+    pub fn apply(&self, cli: &mut Cli, provider: &Provider) {
+        cli.base_url = self.base_url.then(|| provider.base_url.clone());
+        cli.api_key_env.clone_from(&self.api_key_env);
+        cli.api_format = self.api_format.then_some(match provider.api_format { ApiFormat::OpenAI => ApiFormatArg::Openai, ApiFormat::Anthropic => ApiFormatArg::Anthropic });
+        cli.bound_builtin = provider.builtin_id.clone().filter(|_| self.bound_builtin);
+        cli.max_tokens = self.max_tokens;
+    }
+
+
+}
+
 pub struct Selection {
     pub providers: Vec<Provider>,
     pub model: String,
     pub provider_id: String,
+}
+
+impl Selection {
+    /// Replace the selected model's configuration with the launcher's snapshot.
+    /// The receiver must first establish that this launch owns the snapshot.
+    pub fn apply_worker_model_snapshot(&mut self, required: bool) -> Result<()> {
+        use deepseek_code_core::{
+            native_engine::provider_manager::{resolve_model_selection, ModelConfig},
+            services::background_sessions::WORKER_MODEL_ENV,
+        };
+
+        let value = match std::env::var(WORKER_MODEL_ENV) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) if !required => return Ok(()),
+            Err(error) => return Err(error).context("Reading worker model snapshot"),
+        };
+        let mut snapshot: ModelConfig = serde_json::from_str(&value)?;
+        let provider = self
+            .providers
+            .iter_mut()
+            .find(|p| p.id == self.provider_id)
+            .context("Worker provider unavailable")?;
+        let expected = resolve_model_selection(&provider.models, &self.model)
+            .context("Worker model unavailable")?;
+        ensure!(
+            snapshot.id == expected.id,
+            "Worker model snapshot does not match the selected model"
+        );
+        let model = provider
+            .models
+            .iter_mut()
+            .find(|m| m.id == expected.id)
+            .context("Worker model unavailable")?;
+        snapshot.effort.clone_from(&model.effort);
+        *model = snapshot;
+        Ok(())
+    }
 }
 
 fn preferences(paths: &RuntimePaths) -> Result<Value> {
@@ -180,6 +254,20 @@ pub fn select(
     let prefs = preferences(paths)?;
     let config = paths.read_config()?;
     let mut providers = paths.providers()?;
+    // An explicitly pinned SDK agent can invoke any enabled catalog entry.
+    // Apply each provider's configured key source before selecting the parent.
+    for entry in &mut providers {
+        if let Some(key_env) = config.providers.iter().find(|p| p.id == entry.id)
+            .and_then(|p| p.settings.get("apiKeyEnv")).and_then(Value::as_str)
+        {
+            entry.api_key = std::env::var(key_env).unwrap_or_default();
+        } else if let Some(builtin) = &entry.builtin_id {
+            let name = deepseek_code_core::native_engine::provider_runtime::credential_env(builtin);
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() { entry.api_key = value; }
+            }
+        }
+    }
     let default_provider = config.default_provider_id.as_deref().or_else(|| {
         config
             .providers
@@ -278,7 +366,8 @@ pub fn select(
             }
         });
     let key = std::env::var(key_env).ok().filter(|s| !s.is_empty());
-    if cli.api_key_env.is_some() || configured_key_env.is_some() {
+    let bound_without_key = cli.bound_builtin.is_some() && cli.api_key_env.is_none();
+    if cli.api_key_env.is_some() || (configured_key_env.is_some() && !bound_without_key) {
         ensure!(
             key.is_some(),
             "API key environment variable {key_env} is empty or unset"
@@ -318,12 +407,19 @@ pub fn select(
         };
         p.builtin_id = None;
     }
+    if let Some(builtin) = &cli.bound_builtin {
+        p.builtin_id = Some(builtin.clone());
+        if bound_without_key {
+            p.api_key.clear();
+        }
+    }
     ensure!(!p.api_key.trim().is_empty() || matches!(p.builtin_id.as_deref(),Some("amazon-bedrock"|"google-vertex")), "No API key configured; set {key_env}, use --api-key-env, or configure a provider in Desktop");
-    if let Some(limit) = cli.max_tokens {
+    if cli.max_tokens.is_some() || cli.effort.is_some() {
         p.models
             .iter_mut()
             .filter(|m| m.id == model || (!exact && Some(m.id.as_str())==deepseek_code_core::native_engine::provider_manager::one_million_context_base(&model)))
-            .for_each(|m| m.max_tokens = Some(limit));
+            .for_each(|m| { if let Some(limit) = cli.max_tokens { m.max_tokens = Some(limit); }
+                if let Some(effort) = &cli.effort { m.effort = Some(effort.clone()); } });
     }
     let provider_id = p.id.clone();
     Ok(Selection {

@@ -17,7 +17,10 @@ pub const CONTROL_ENV: &str = "DEEPSEEK_CODE_BACKGROUND_CONTROL";
 /// arguments, and a deliberately forwarded snapshot arrives through the
 /// explicit `environment` after inherited values have been stripped.
 pub const WORKER_MODEL_ENV: &str = "DEEPSEEK_CODE_WORKER_MODEL";
+pub const WORKER_GENERATION_ENV: &str = "DEEPSEEK_CODE_WORKER_GENERATION";
 pub const WORKER_AUTO_ROUTE_ENV: &str = "DEEPSEEK_CODE_WORKER_AUTO_ROUTE";
+/// A credential staged for one explicit child launch.
+pub const CHILD_API_KEY_ENV: &str = "DEEPSEEK_CODE_CHILD_API_KEY";
 /// The exclusive-execution token of a reserved job. The host publishes it in
 /// the worker claim before spawning and passes it to that supervisor only, so
 /// a duplicate supervisor cannot execute the same job.
@@ -29,10 +32,11 @@ pub const WORKER_TOKEN_ENV: &str = "DEEPSEEK_CODE_BACKGROUND_TOKEN";
 /// rejected by its own ownership check, or silently join the parent's job. A
 /// managed worker additionally inherits the parent's model snapshot, which its
 /// own launch then rejects as a mismatch.
-pub const INTERNAL_ENV: [&str; 5] = [
+pub const INTERNAL_ENV: [&str; 6] = [
     WORKER_ENV,
     CONTROL_ENV,
     WORKER_MODEL_ENV,
+    WORKER_GENERATION_ENV,
     WORKER_AUTO_ROUTE_ENV,
     WORKER_TOKEN_ENV,
 ];

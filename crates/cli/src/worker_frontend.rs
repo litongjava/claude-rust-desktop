@@ -8,6 +8,7 @@ use crate::{
         live::{Action, TurnDisplay},
     },
 };
+use anyhow::Context;
 use anyhow::{ensure, Result};
 use deepseek_code_core::services::background_sessions::{self as jobs, Launch};
 use serde_json::Value;
@@ -132,18 +133,8 @@ async fn single_turn(
     if let Some(job) = settle_session(session)? {
         anyhow::bail!("{} The current prompt was not submitted.", active_worker_message(&job));
     }
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let executable = std::env::current_exe()?;
-    let arguments = crate::background_commands::arguments(
-        cli,
-        &session.paths,
-        session,
-        &session.id,
-        prompt,
-        &provider,
-    )?;
-    let environment =
-        crate::background_commands::worker_environment(session.auto_route, &provider)?;
     // Validate interactive configuration before launching a request that must survive us.
     let history = session
         .store
@@ -172,6 +163,9 @@ async fn single_turn(
         Some(acquire_proposal_frontend(session).await?)
     } else { None };
     let job = if std::env::var("DEEPSEEK_CODE_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
+        let arguments = crate::background_commands::arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
+        let mut environment = crate::background_commands::worker_environment(session.auto_route, &provider)?;
+        environment.push((jobs::WORKER_GENERATION_ENV.into(), format!("{}:{}", session.id, session.binding_state().generation)));
         jobs::spawn_foreground(
             root,
             &executable,
@@ -186,9 +180,17 @@ async fn single_turn(
         )?
     } else {
         use deepseek_code_core::services::session_worker::{self, Request};
-        let worker =
+        let mut worker =
             session_worker::ensure_worker(root, &executable, &session.id, &session.workspace)
                 .await?;
+        let arguments = crate::background_commands::turn_arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
+        let mut environment = vec![("DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),session.auto_route.to_string())];
+        if session_worker::call(&worker, &Request::Ping).await?.generation_supported != Some(true) {
+            session_worker::shutdown_worker(&worker).await.context("Provider switch pending; observe the legacy job with /continue")?;
+            worker = session_worker::ensure_worker(root, &executable, &session.id, &session.workspace).await?;
+        }
+        let state = session.binding.read().context("Missing session binding")?;
+        environment.push((crate::worker_binding::SNAPSHOT_ENV.into(), serde_json::to_string(state.as_ref())?));
         let id = uuid::Uuid::new_v4().to_string();
         let response = session_worker::call(
             &worker,

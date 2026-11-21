@@ -35,7 +35,7 @@ pub fn show_resumed(session: &Session, clear: bool) -> Result<()> {
     let mut out = String::new();
     if clear {
         out.push_str("\x1b[2J\x1b[H");
-        out.push_str(&crate::terminal::banner(&session.model, &session.workspace));
+        out.push_str(&crate::terminal::banner(&session.binding_state().model, &session.workspace));
         out.push('\n');
     }
     let mut recorded = crate::terminal::scrollback::Scrollback::default();
@@ -216,7 +216,7 @@ fn conversation(
                             .to_string()
                     })
                     .unwrap_or_default();
-                let header = format!("{time} {}", session.model);
+                let header = format!("{time} {}", session.binding_state().model);
                 lines.push(change_view::muted(&format!("{header:>width$}")));
             }
             if let (Some(recorded), Some(thinking)) = (
@@ -580,6 +580,7 @@ pub async fn compact(
     use deepseek_code_core::services::compaction::CompactionTracker;
     let context = crate::services::context(paths)?;
     let tracker = CompactionTracker::default();
+    let state = session.binding_state();
     let compacted = {
         let future = crate::hook_progress::during(
             &session.id,
@@ -589,8 +590,8 @@ pub async fn compact(
                 &context,
                 &session.workspace,
                 &session.id,
-                &session.provider_id,
-                &session.model,
+                &state.provider_id,
+                &state.model,
                 instructions.trim(),
                 "manual",
                 Some(&tracker),

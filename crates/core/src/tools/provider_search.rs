@@ -380,6 +380,7 @@ pub(crate) async fn search_with_options(
     if query.chars().count() > 2000 {
         bail!("WebSearch query must be at most 2000 characters.");
     }
+    let provider = &provider.current()?;
     let (selected, url) = endpoint(provider)?;
     let (api_key, bearer_only) = credentials(provider)?;
     let client = reqwest::Client::builder()
@@ -451,6 +452,7 @@ mod tests {
     fn provider(base: &str, strategy: Option<&str>) -> ResolvedProvider {
         ResolvedProvider {
             provider: Provider {
+                lease: None,
                 id: "p".into(),
                 name: "Test provider".into(),
                 base_url: base.into(),

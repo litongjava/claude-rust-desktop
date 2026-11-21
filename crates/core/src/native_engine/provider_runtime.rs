@@ -317,6 +317,7 @@ async fn stream_with_options_client_budget(
     client: reqwest::Client,
     budget: crate::performance::AttemptBudget,
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let provider = &provider.current()?;
     let (entry, model) = metadata(provider)?;
     let (protocol, api) = resolved_transport(provider)?;
     let initiator = if messages.last().is_some_and(|m| m.role != "user") {
@@ -450,6 +451,8 @@ pub(super) async fn stream_body(
     client: reqwest::Client,
     budget: crate::performance::AttemptBudget,
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let account_state = provider.binding_snapshot();
+    let env = |name: &str| super::session_binding::account_var(account_state.as_deref(), name);
     let (entry, model) = metadata(provider)?;
     let (protocol, api) = resolved_transport(provider)?;
     let key = credential(provider, entry["id"].as_str().unwrap_or_default());
@@ -461,8 +464,8 @@ pub(super) async fn stream_body(
             .strip_prefix("arn:aws:bedrock:")
             .and_then(|s| s.split(':').next())
             .map(str::to_string)
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            .or_else(|| env("AWS_REGION").ok())
+            .or_else(|| env("AWS_DEFAULT_REGION").ok())
             .or_else(|| {
                 reqwest::Url::parse(if configured.is_empty() {
                     model["baseUrl"].as_str().unwrap_or_default()
@@ -493,10 +496,10 @@ pub(super) async fn stream_body(
         if !key.is_empty() && key != "gcp-vertex-credentials" {
             "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
         } else {
-            let project = std::env::var("GOOGLE_CLOUD_PROJECT")
-                .or_else(|_| std::env::var("GCLOUD_PROJECT"))
+            let project = env("GOOGLE_CLOUD_PROJECT")
+                .or_else(|_| env("GCLOUD_PROJECT"))
                 .context("Vertex ADC requires GOOGLE_CLOUD_PROJECT")?;
-            let location = std::env::var("GOOGLE_CLOUD_LOCATION")
+            let location = env("GOOGLE_CLOUD_LOCATION")
                 .context("Vertex ADC requires GOOGLE_CLOUD_LOCATION")?;
             let host = if location == "global" {
                 "aiplatform.googleapis.com".to_string()
@@ -510,9 +513,9 @@ pub(super) async fn stream_body(
             )
         }
     } else if protocol == "azure-openai-responses" && base.is_empty() {
-        std::env::var("AZURE_OPENAI_BASE_URL")
+        env("AZURE_OPENAI_BASE_URL")
             .or_else(|_| {
-                std::env::var("AZURE_OPENAI_RESOURCE_NAME")
+                env("AZURE_OPENAI_RESOURCE_NAME")
                     .map(|r| format!("https://{r}.openai.azure.com/openai/v1"))
             })
             .unwrap_or_default()
@@ -529,7 +532,7 @@ pub(super) async fn stream_body(
             base = base.replace(
                 &placeholder,
                 &urlencoding::encode(
-                    &std::env::var(name)
+                    &env(name)
                         .with_context(|| format!("Provider endpoint requires {name}"))?,
                 ),
             );
@@ -573,7 +576,7 @@ pub(super) async fn stream_body(
                 "{}?api-version={}",
                 endpoint(&base, "/responses"),
                 urlencoding::encode(
-                    &std::env::var("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".into())
+                    &env("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".into())
                 )
             )
         }
@@ -605,7 +608,7 @@ pub(super) async fn stream_body(
                 .timeout(std::time::Duration::from_secs(300))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?;
-            Some(cloud_auth::google_token(&buffered).await?)
+            Some(cloud_auth::google_token(&buffered, provider).await?)
         } else {
             None
         };
@@ -635,6 +638,7 @@ pub(super) async fn stream_body(
         let options = options.clone();
         let capture = context_capture.cloned();
         let google_token = google_token.clone();
+        let account_state = account_state.clone();
         let api_owned = api.clone();
         move |identity: &super::request_identity::RequestIdentity| -> super::stream_retry::OpenFuture {
             let client = client.clone();
@@ -649,6 +653,7 @@ pub(super) async fn stream_body(
             let options = options.clone();
             let capture = capture.clone();
             let google_token = google_token.clone();
+        let account_state = account_state.clone();
             let api = api_owned.clone();
             let protocol = protocol.clone();
             let region = region.clone();
@@ -696,7 +701,7 @@ pub(super) async fn stream_body(
                     "bedrock-converse-stream" => {
                         if key.is_empty() {
                             request =
-                                request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body)?);
+                                request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body, account_state.as_deref())?);
                         } else {
                             request = request.bearer_auth(&key);
                         }
@@ -898,7 +903,7 @@ fn credential(provider: &ResolvedProvider, id: &str) -> String {
     if !provider.provider.api_key.is_empty() {
         return provider.provider.api_key.clone();
     }
-    std::env::var(credential_env(id)).unwrap_or_default()
+    super::session_binding::account_var(provider.binding_snapshot().as_deref(), &credential_env(id)).unwrap_or_default()
 }
 
 pub fn credential_env(id: &str) -> String {

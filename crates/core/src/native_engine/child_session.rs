@@ -5,7 +5,7 @@
 //! This module owns that launch path so a later feature cannot silently drift
 //! from the delegation behavior. Callers remain responsible for their own
 //! entry-point limits, such as the delegation depth check.
-use crate::native_engine::provider_manager::{ApiFormat, ResolvedProvider};
+use crate::native_engine::provider_manager::ResolvedProvider;
 use crate::runtime::{RuntimePaths, SessionStore};
 use crate::services::{
     agents, background_sessions, subagents, EnvironmentCredentials, ServiceContext,
@@ -158,9 +158,11 @@ pub(crate) struct PreparedChildLaunch {
 /// launch. This function performs no external process side effect, so a host
 /// may stop after it and recover against the durable session identity.
 pub(crate) async fn prepare_child_session(
-    config: ChildLaunchConfig,
+    mut config: ChildLaunchConfig,
     spawn: ChildSpawn,
 ) -> Result<PreparedChildLaunch> {
+    // Freeze the version at preparation; the independent job owns that selection.
+    config.provider = config.provider.current()?;
     ensure!(
         !config.provider.provider.id.trim().is_empty(),
         "Child provider is required"
@@ -417,8 +419,12 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
-    let (mut arguments, mut environment) =
-        child_cli_arguments(&config.provider, &config.permission_mode, &spawn.data_dir);
+    let (mut arguments, mut environment) = child_cli_arguments(
+        &config.provider,
+        &config.provider.model.id,
+        &config.permission_mode,
+        &spawn.data_dir,
+    );
     if let Some(model) = spawn.model.as_deref() {
         let at = arguments
             .iter()
@@ -679,6 +685,7 @@ pub(crate) fn record_adopted_ownership(
 /// the parent worker's auto-route decision.
 pub(crate) fn child_cli_arguments(
     provider: &ResolvedProvider,
+    model_selector: &str,
     permission_mode: &str,
     data_dir: &Path,
 ) -> (Vec<String>, Vec<(String, String)>) {
@@ -688,21 +695,11 @@ pub(crate) fn child_cli_arguments(
         "--provider".into(),
         provider.provider.id.clone(),
         "--model".into(),
-        provider.model.id.clone(),
+        model_selector.to_owned(),
         "--permission-mode".into(),
         permission_mode.to_owned(),
     ];
-    if provider.provider.builtin_id.is_none() {
-        arguments.extend(["--base-url".into(), provider.provider.base_url.clone()]);
-        arguments.extend([
-            "--api-format".into(),
-            match provider.provider.api_format {
-                ApiFormat::Anthropic => "anthropic",
-                ApiFormat::OpenAI => "openai",
-            }
-            .into(),
-        ]);
-    }
+    arguments.extend(provider.provider.child_transport_arguments());
     let mut environment = vec![(
         background_sessions::WORKER_MODEL_ENV.to_owned(),
         serde_json::to_string(&provider.model).unwrap_or_default(),
@@ -1161,7 +1158,7 @@ mod tests {
     #[test]
     fn child_arguments_keep_the_explicit_snapshot_and_credential_without_auto_route() {
         let (arguments, environment) =
-            child_cli_arguments(&provider(), "ask", Path::new("/tmp/data"));
+            child_cli_arguments(&provider(), "fixture", "ask", Path::new("/tmp/data"));
         assert!(pair(&arguments, "--provider", "fixture"));
         assert!(pair(&arguments, "--model", "fixture"));
         let names: Vec<&str> = environment.iter().map(|(key, _)| key.as_str()).collect();

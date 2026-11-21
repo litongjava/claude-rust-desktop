@@ -130,7 +130,7 @@ pub async fn handle(argument: &str, session: &Session, input: &mut TerminalInput
         let payload = payload(session).await?;
         command_eprintln!(
             "Statusline setup: generating a proposal with {} (no shell or file-write tools).",
-            session.model
+            session.binding_state().model
         );
         let current_command = crate::display_commands::load(session)?.statusline;
         let request = json!({"request":if request.is_empty() {"Import my shell prompt without its trailing prompt marker"} else {request}, "shell":if cfg!(windows) {"Windows PowerShell"} else {"POSIX sh"}, "profiles":profiles, "current_command_untrusted_reference":current_command, "status_json_example":payload});
@@ -200,7 +200,7 @@ pub async fn payload(session: &Session) -> Result<Value> {
         .zip(context_size.filter(|size| *size > 0))
         .map(|(used, size)| (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0));
     Ok(
-        json!({"session_id":session.id,"session_name":title,"cwd":session.workspace,"model":{"id":session.model,"display_name":selected.model.name},"workspace":{"current_dir":session.workspace,"project_dir":project_dir,"added_dirs":added},"version":env!("CARGO_PKG_VERSION"),"output_style":{"name":crate::display_commands::load(session)?.output_style},"context_window":{"total_input_tokens":usage["input_tokens"].as_i64().unwrap_or(0),"total_output_tokens":usage["output_tokens"].as_i64().unwrap_or(0),"context_window_size":context_size,"current_usage":current,"used_percentage":percentage,"remaining_percentage":percentage.map(|v|100.0-v)},"usage":usage}),
+        json!({"session_id":session.id,"session_name":title,"cwd":session.workspace,"model":{"id":session.binding_state().model,"display_name":selected.model.name},"workspace":{"current_dir":session.workspace,"project_dir":project_dir,"added_dirs":added},"version":env!("CARGO_PKG_VERSION"),"output_style":{"name":crate::display_commands::load(session)?.output_style},"context_window":{"total_input_tokens":usage["input_tokens"].as_i64().unwrap_or(0),"total_output_tokens":usage["output_tokens"].as_i64().unwrap_or(0),"context_window_size":context_size,"current_usage":current,"used_percentage":percentage,"remaining_percentage":percentage.map(|v|100.0-v)},"usage":usage}),
     )
 }
 

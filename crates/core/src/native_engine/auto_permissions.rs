@@ -146,7 +146,14 @@ pub fn configured(
     current: &ResolvedProvider,
 ) -> anyhow::Result<(AutoConfig, ResolvedProvider)> {
     let config = crate::permissions::auto_config::load(context)?;
-    let selected = config.resolve(&context.paths.providers()?, current)?;
+    let current = current.current()?;
+    let mut selected = match current.binding_snapshot() {
+        Some(state) => config.resolve(&state.providers, &current)?,
+        None => config.resolve(&context.paths.providers()?, &current)?,
+    };
+    if selected.provider.lease.is_none() {
+        if let Some(pinned) = current.pinned(&selected.provider.id, &selected.model.id) { selected = pinned; }
+    }
     Ok((config, selected))
 }
 
@@ -441,14 +448,15 @@ impl AutoClassifier {
         &self,
         payload: String,
     ) -> anyhow::Result<(Result<Verdict, Failure>, Option<ClassifierUsage>)> {
-        match self.provider.provider.api_format {
+        let provider = self.provider.current()?;
+        match provider.provider.api_format {
             ApiFormat::OpenAI => {
                 let response = OpenAIClient::new()
                     .with_request_options(self.request_options.clone())
                     .without_retries()
                     .with_response_schema(Some(schema()))
                     .send_message(
-                        &self.provider,
+                        &provider,
                         vec![OpenAIMessage {
                             role: "user".into(),
                             content: OpenAIContent::Text(payload),
@@ -492,7 +500,7 @@ impl AutoClassifier {
                     .without_retries()
                     .with_response_schema(Some(schema()))
                     .send_message(
-                        &self.provider,
+                        &provider,
                         vec![AnthropicMessage {
                             role: "user".into(),
                             content: AnthropicContent::Text(payload),

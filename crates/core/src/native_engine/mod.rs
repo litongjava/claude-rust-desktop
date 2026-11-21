@@ -4,6 +4,7 @@ pub mod anthropic_client;
 pub mod openai_client;
 pub mod engine_core;
 pub mod provider_manager;
+pub mod session_binding;
 pub mod session_manager;
 pub mod tool_loop;
 // The durable owner path depends on the embedded QuickJS bridge.

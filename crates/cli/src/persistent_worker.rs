@@ -168,6 +168,8 @@ pub async fn run_from_env() -> Result<bool> {
     let mut idle = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut owner_pid = supervisor_pid.or(worker.supervisor_pid);
+    let binding = deepseek_code_core::native_engine::session_binding::SessionBinding::default();
+    let mut expected_binding = None;
     let mut orphaned_since = None::<Instant>;
     let serve_result: Result<()> = async {
         loop {
@@ -206,7 +208,7 @@ pub async fn run_from_env() -> Result<bool> {
                     if should_expire(turn_active, shell_active, fatal.load(Ordering::Acquire), idle.elapsed()) {break;}
                     if (turn_active && !idle_child_active.load(Ordering::Acquire)) || shell_active {idle=Instant::now();}
                     if !turn_active && !fatal.load(Ordering::Acquire) {
-                        if let Err(error) = child::start_pending(&worker, &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
+                        if let Err(error) = child::start_pending(&worker, expected_binding.as_deref(), &session, &active, &admission_released, &current_turn, &idle_child_active, &fatal, &mode_target).await {
                             eprintln!("Owned child wake unavailable: {error:#}");
                         }
                     }
@@ -258,7 +260,33 @@ pub async fn run_from_env() -> Result<bool> {
                             };
                             let _ = service::reply(stream, &response).await;
                         },
-                        Request::Ping=>{let _=service::reply(stream,&Reply::ok(None)).await;},
+                        Request::GetBinding { generation } => {
+                            let mut response=Reply::ok(None);
+                            response.snapshot=binding.read().filter(|s|s.generation==generation).map(|s|(*s).clone());
+                            let _=service::reply(stream,&response).await;
+                        },
+                        Request::SetBinding { binding: state } => {
+                            let changed = binding.read().is_none_or(|current| current.generation != state.generation);
+                            let result = RuntimePaths::new(worker.root.clone()).and_then(|paths| crate::worker_binding::validate_worker_snapshot(&paths, &worker.session_id, &state)).and_then(|()| binding.install(state));
+                            if let Some(state) = binding.read().filter(|_| changed && result.is_ok()) {
+                                crate::worker_binding::install_public(&state);
+                                // Pending autonomous work requires an explicit admission
+                                // with the new turn options.
+                                expected_binding = Some(format!("generation:{}", state.generation));
+                            }
+                            let reply = match result { Ok(()) => Reply::ok(None), Err(e) => Reply::error(e) };
+                            let _ = service::reply(stream, &reply).await;
+                        }
+                        Request::Bind { identity } => {
+                            expected_binding = Some(identity);
+                            let _ = service::reply(stream, &Reply::ok(None)).await;
+                        },
+                        Request::Ping => {
+                            let mut response = Reply::ok(None);
+                            response.binding_supported = Some(true);
+                            response.generation_supported = Some(true);
+                            let _ = service::reply(stream, &response).await;
+                        },
                         Request::SetPermissionMode { job_id, mode } => {
                             let result = update_live_mode(&worker, &mode_target, &job_id, &mode);
                             let reply = match result { Ok(session_id) => { let mut reply=Reply::ok(Some(job_id)); reply.permission_session_id=Some(session_id); reply }, Err(error) => Reply::error(error) };
@@ -279,11 +307,24 @@ pub async fn run_from_env() -> Result<bool> {
                             if active.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
                                 let _=service::reply(stream,&Reply::error("Session worker is busy; prompt was not submitted")).await;continue;
                             }
+                            let incoming = environment.iter().find(|(k,_)| k == crate::worker_binding::SNAPSHOT_ENV);
+                            let accepted = match incoming {
+                                Some((_,data)) => serde_json::from_str(data).map_err(anyhow::Error::from).and_then(|state| { let paths = RuntimePaths::new(worker.root.clone())?; crate::worker_binding::validate_worker_snapshot(&paths, &worker.session_id, &state)?; binding.install(state) }),
+                                None => Ok(()),
+                            };
+                            if let Err(error) = accepted {
+                                active.store(false,Ordering::Release);
+                                let _=service::reply(stream,&Reply::error(error)).await;
+                                continue;
+                            }
                             *current_turn.lock().unwrap_or_else(|e|e.into_inner())=Some(id.clone());
                             if let Err(error)=service::begin_job(&worker,&id,&prompt) {
                                 *current_turn.lock().unwrap_or_else(|e|e.into_inner())=None;
                                 active.store(false,Ordering::Release);let _=service::reply(stream,&Reply::error(error)).await;continue;
                             }
+                            // The new job installs its own authoritative binding. A frontend
+                            // Bind arriving while it runs can fence future idle work again.
+                            expected_binding = None;
                             // Admission succeeded: the same workspace path may now be on
                             // another branch, so the host asks its registry worker to
                             // re-observe before the turn runs. No second row is created.
@@ -292,10 +333,10 @@ pub async fn run_from_env() -> Result<bool> {
                                 guard.set_activity(deepseek_code_core::services::local_coordination::Activity::Active);
                             }
                             coordination_active = true;
-                            let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();let status_target=status_target.clone();let bash_target=bash_target.clone();let current_turn=current_turn.clone();let admission_released=admission_released.clone();
+                            let binding=binding.clone();let worker=worker.clone();let sessions=session.clone();let active=active.clone();let fatal=fatal.clone();let turn_id=id.clone();let mode_target=mode_target.clone();let status_target=status_target.clone();let bash_target=bash_target.clone();let current_turn=current_turn.clone();let admission_released=admission_released.clone();
                             tokio::spawn(async move {
                                 let task_worker=worker.clone();let task_id=turn_id.clone();let task_mode_target=mode_target.clone();
-                                let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,sessions,task_mode_target,status_target,bash_target).await}).await;
+                                let result=tokio::spawn(async move {execute(&task_worker,&task_id,arguments,environment,binding,sessions,task_mode_target,status_target,bash_target).await}).await;
                                 let error=match result {Ok(result)=>result.err().map(|error|format!("{error:#}")),Err(error)=>{fatal.store(true,Ordering::Release);Some(format!("Session turn panicked: {error}"))}};
                                 if let Some(error)=&error {let _=service::emit_event(&serde_json::json!({"type":"error","error":error}));}
                                 if service::finish_job(&worker,&turn_id,error).await.is_err() {fatal.store(true,Ordering::Release);}
@@ -346,6 +387,7 @@ async fn execute(
     id: &str,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
+    binding: deepseek_code_core::native_engine::session_binding::SessionBinding,
     sessions: Arc<tokio::sync::Mutex<Option<Session>>>,
     mode_target: ModeTarget,
     status_target: StatusTarget,
@@ -354,6 +396,10 @@ async fn execute(
     let dir = worker.root.join("background-tasks").join(id);
     service::set_event_sink(Some(dir.join("output.jsonl")));
     std::env::set_var(jobs::CONTROL_ENV, &dir);
+    let mut current = sessions.lock().await;
+    if let Some(session) = current.as_mut() {
+        session.idle_launch = None;
+    }
     // These are the only settings accepted from the same-user IPC frontend.
     for name in [
         "DEEPSEEK_CODE_CHILD_API_KEY",
@@ -362,7 +408,11 @@ async fn execute(
     ] {
         std::env::remove_var(name);
     }
+    let stamped = environment.iter().any(|(name, _)| name == crate::worker_binding::SNAPSHOT_ENV);
     for (name, value) in environment {
+        if name == crate::worker_binding::SNAPSHOT_ENV {
+            continue;
+        }
         ensure!(
             [
                 "DEEPSEEK_CODE_CHILD_API_KEY",
@@ -382,33 +432,23 @@ async fn execute(
         "Worker request must resume its own session without a subcommand"
     );
     let paths = RuntimePaths::new(worker.root.clone())?;
-    let mut selection =
-        crate::config::select(&cli, &paths, cli.model.as_deref(), cli.provider.as_deref())?;
-    if let Ok(value) = std::env::var("DEEPSEEK_CODE_WORKER_MODEL") {
-        let model: deepseek_code_core::native_engine::provider_manager::ModelConfig =
-            serde_json::from_str(&value)?;
-        let provider = selection
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == selection.provider_id)
-            .context("Worker provider missing")?;
-        let expected =
-            deepseek_code_core::native_engine::provider_manager::resolve_model_selection(
-                &provider.models,
-                &selection.model,
-            )
-            .context("Worker selected model missing")?;
-        ensure!(model.id == expected.id, "Worker model snapshot mismatch");
-        let target = provider
-            .models
-            .iter_mut()
-            .find(|item| item.id == model.id)
-            .context("Worker model missing")?;
-        *target = model;
+    if !stamped {
+        let db = paths.open_database()?;
+        let observed = crate::worker_binding::observe_worker(&paths, &db, &worker.session_id, Some(&binding), || {
+            let mut selection = crate::config::select(&cli, &paths, cli.model.as_deref(), cli.provider.as_deref())?;
+            selection.apply_worker_model_snapshot(false)?;
+            crate::worker_binding::snapshot(&paths, selection, true)
+        }).await?;
+        if observed.generation != 0 {
+            cli.discard_binding_options();
+        }
+        binding.track(&db, &worker.session_id);
+        binding.restore(observed)?;
     }
-    let mut current = sessions.lock().await;
+    let snapshot = binding.read().context("Missing worker binding")?;
+    crate::worker_binding::install_public(&snapshot);
     if let Some(session) = current.as_mut() {
-        session.switch(&paths, selection).await?;
+        session.use_worker_binding(&binding).await?;
         // Each job carries its own launch permissions.
         session.bypass_available = cli.allow_dangerously_skip_permissions;
         session.full_access = cli.full_access;
@@ -437,15 +477,20 @@ async fn execute(
             Session::open_with_registration(
                 &cli,
                 &paths,
-                selection,
+                crate::config::Selection {
+                    providers: snapshot.providers.clone(),
+                    model: snapshot.model.clone(),
+                    provider_id: snapshot.provider_id.clone(),
+                },
                 Some(&worker.session_id),
                 crate::local_coordination::RegistrationMode::HostOwned,
+                Some(&binding),
             )
             .await?,
         );
     }
     let prompt = cli.prompt.as_deref().context("Worker prompt missing")?;
-    let session = current.as_ref().unwrap();
+    let session = current.as_mut().unwrap();
     *bash_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.permissions.clone());
     session
         .engine
@@ -454,6 +499,11 @@ async fn execute(
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(session.runtime_status_source());
     let current_provider = session.selected_provider().await?;
+    let identity = if stamped || snapshot.generation != 0 {
+        format!("generation:{}", snapshot.generation)
+    } else {
+        crate::worker_binding::identity(&current_provider)
+    };
     *mode_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModeControl {
         job_id: id.into(),
         session_id: session.id.clone(),
@@ -469,15 +519,8 @@ async fn execute(
             && session.permissions.get_mode()
                 == deepseek_code_core::permissions::PermissionMode::BypassPermissions,
     );
-    let result = current
-        .as_ref()
-        .unwrap()
-        .turn(&cli, &prompt, &mut None)
-        .await;
-    *session
-        .hook_wake_cli
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(cli));
+    let result = session.turn(&cli, &prompt, &mut None).await;
+    session.idle_launch = Some((identity, Arc::new(cli)));
     session
         .engine
         .set_owned_child_idle_ready(&session.id, result.is_ok());

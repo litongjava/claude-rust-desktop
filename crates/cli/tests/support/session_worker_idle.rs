@@ -519,6 +519,16 @@ async fn owned_child_wakes_without_parent_turn_and_preserves_its_original_runtim
     assert!(notices[0].contains(&format!("Source session: {}", fixture.child)));
     assert!(!notices[0].contains("stored its answer directly in this session"));
     assert_no_secret(&fixture.context.paths.data_dir);
+    worker::call(
+        &fixture.host,
+        &worker::Request::Bind { identity: "changed-frontend-transport".into() },
+    )
+    .await
+    .unwrap();
+    fixture.send("Follow-up after provider rotation");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(fixture.model.requests.lock().unwrap().len(), 5);
+    assert_eq!(session_messages::pending_count(&fixture.context, &fixture.child).unwrap(), 1);
     fixture.stop().await;
 }
 
