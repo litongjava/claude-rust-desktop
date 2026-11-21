@@ -14,21 +14,20 @@ impl ExecutorHistory {
     }
     pub(crate) fn invocation_message(&self, requested: Option<&str>) -> Result<String> {
         use rusqlite::OptionalExtension;
-        self.read(|c, id| {
-            let selected = c
-                .query_row(
-                    "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant'
-                AND (?2 IS NULL OR id=?2) ORDER BY sort_order DESC,rowid DESC LIMIT 1",
-                    params![id, requested],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?;
-            // Shared-store clients historically allowed an association before the first segment.
-            if selected.is_none() && requested.is_none() && matches!(self, Self::Shared(..)) {
-                return Ok(String::new());
-            }
-            selected.context("Invocation parent assistant segment is missing")
-        })
+        if let Some(id) = requested {
+            return self.read(|c, session| {
+                c.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND id=?2 AND role='assistant'",
+                    [session,id], |r| r.get(0)).optional()?.context("Invocation parent assistant segment is missing")
+            });
+        }
+        match self {
+            // Standalone executors can invoke a child before their host has allocated
+            // a response segment. Give that invocation a durable owner in parent S.
+            Self::Session(parent) => parent.write(|w| w.append("assistant","")),
+            Self::Shared(..) => self.read(|c, session| Ok(c.query_row(
+                "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+                [session],|r|r.get(0)).optional()?.unwrap_or_default())),
+        }
     }
 
     pub(crate) fn save_invocation(

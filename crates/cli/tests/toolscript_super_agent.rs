@@ -72,7 +72,7 @@ impl Fixture {
         std::fs::write(
             job.join("spec.json"),
             json!({
-                "id":id,"session":r.session_id,"workspace":self.workspace,
+                "id":id,"session":r.session_id,"history":r.db.open_session(&r.session_id).unwrap().address(),"workspace":self.workspace,
                 "assistant_id":null,"parent_tool_use_id":format!("inv-{phase}"),
                 "provider_id":"fixture","model":"fixture","source":source,"args":null,
                 "data_dir":r.data_dir,"settings_path":r.data_dir.join("config.json"),

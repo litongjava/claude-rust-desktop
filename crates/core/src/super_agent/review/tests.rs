@@ -137,11 +137,13 @@ fn review_request_binds_current_versions_sessions_events_and_repo_commits() {
         )
         .unwrap();
     let child = uuid::Uuid::new_v4().to_string();
+    fixture.context.db.create(&child,Default::default()).unwrap();
+    let message=fixture.context.db.open_session(&fixture.coder).unwrap().write(|w|w.append("assistant","Child invocation")).unwrap();
     crate::services::subagents::save_invocation(
         &fixture.context,
         &crate::services::subagents::Invocation {
             parent_session_id: fixture.coder.clone(),
-            parent_message_id: "message".into(),
+            parent_message_id: message,
             tool_use_id: "tool".into(),
             child_session_id: child.clone(),
             attempt_id: "attempt".into(),
@@ -338,11 +340,13 @@ fn artifacts_are_reports_or_regular_task_files_only() {
 fn session_children_and_events_are_scoped() {
     let fixture = Fixture::new();
     let child = uuid::Uuid::new_v4().to_string();
+    fixture.context.db.create(&child,Default::default()).unwrap();
+    let message=fixture.context.db.open_session(&fixture.coder).unwrap().write(|w|w.append("assistant","Child invocation")).unwrap();
     crate::services::subagents::save_invocation(
         &fixture.context,
         &crate::services::subagents::Invocation {
             parent_session_id: fixture.coder.clone(),
-            parent_message_id: "message".into(),
+            parent_message_id: message,
             tool_use_id: "tool".into(),
             child_session_id: child.clone(),
             attempt_id: "attempt".into(),

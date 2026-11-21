@@ -674,7 +674,7 @@ async fn watcher_recovery_limit_blocks_and_notifies_router_once() {
     watch_once(&f.reopened(), &f.router).await.unwrap();
     assert_eq!(f.count(EventType::TaskBlocked), 1);
     assert_eq!(f.count(EventType::SessionResumed), 1);
-    let notices:i64=f.host.context.db.directory_sql(|c|c.query_row("SELECT count(*) FROM session_inbox WHERE recipient=?1 AND content LIKE 'Super Agent Watcher blocked task%'",[&f.router],|r|r.get(0))).unwrap().unwrap();
+    let notices=f.host.context.db.open_session(&f.router).unwrap().inbox(false).unwrap().into_iter().filter(|msg|msg.content.starts_with("Super Agent Watcher blocked task")).count();
     assert_eq!(notices, 1);
 }
 
