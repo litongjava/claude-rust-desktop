@@ -112,7 +112,7 @@ impl SessionDb {
         ensure!(dest != self.key, "Source and destination must differ");
         let s = &self.stores;
         let _locks = s.group_access(vec![(&self.key, false, false), (&dest, true, true)])?;
-        self.check_directory()?;
+        self.binding_control()?;
         let (row, revision, binding) = s.global().read(|conn| {
             let snapshot = conn.unchecked_transaction()?;
             let c = &snapshot;

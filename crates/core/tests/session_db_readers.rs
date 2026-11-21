@@ -390,3 +390,70 @@ fn runtime_resolves_new_resume_clear_and_child_under_one_root() -> Result<()> {
     assert_eq!(std::fs::read(&sentinel)?, b"existing user history");
     Ok(())
 }
+
+#[test]
+fn provider_reservation_rejects_stale_turns_and_applies_picker_once_on_resume() -> Result<()> {
+    use deepseek_code_core::{
+        db::session_store::settings::{Effort, PREFERENCES},
+        native_engine::session_binding::{store::Write, BindingSnapshot, SessionBinding},
+    };
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let session = stores.create("bound", Default::default())?;
+    let choice = |id: &str| {
+        BindingSnapshot {
+        provider_id:id.into(),model:"m".into(),generation:0,observation_only:false,environment:Default::default(),
+        providers:vec![serde_json::from_value(json!({"id":id,"name":id,"enabled":true,"api_format":"openai","api_key":"fixture","base_url":"http://localhost","models":[{"id":"m","name":"model","enabled":true}]})).unwrap()],
+    }
+    };
+    let mut original = choice("a");
+    assert_eq!(
+        session.publish_provider(0, &original, None, "", None)?,
+        Write::Published(1)
+    );
+    original.generation = 1;
+    let binding = SessionBinding::default();
+    binding.track_session(session.clone());
+    binding.install(original.clone())?;
+    let active = binding.resolve(None).unwrap();
+    active.ensure_current()?;
+    let next = choice("b");
+    assert_eq!(
+        session.publish_provider(0, &next, None, "", None)?,
+        Write::Conflict
+    );
+    assert_eq!(
+        session.publish_provider(
+            1,
+            &next,
+            Some(("worker", None)),
+            "picker",
+            Some(Some("high"))
+        )?,
+        Write::Published(2)
+    );
+    assert!(active.ensure_current().is_err());
+    assert!(session.write(|w| w.start_turn()).is_err());
+    let row = stores.global().conversation(session.id())?.unwrap();
+    assert_eq!(row.provider.as_deref(), Some("a"));
+    assert!(session.read(|r| r.setting(PREFERENCES))?.is_none());
+    session.activate_provider("wrong", 2)?;
+    assert!(session.observe_provider()?.pending.is_some());
+    session.activate_provider("worker", 2)?;
+    let reopened = Stores::open_for_test(root.path())?.open_session(session.id())?;
+    let mut prefs = reopened.read(|r| r.setting(PREFERENCES))?.unwrap();
+    assert_eq!(prefs.effort, Some(Effort::High));
+    prefs.effort = Some(Effort::Low);
+    reopened.write(|w| w.set_setting(PREFERENCES, &prefs))?;
+    assert_eq!(
+        session.read(|r| r.setting(PREFERENCES))?.unwrap().effort,
+        Some(Effort::Low)
+    );
+    assert!(session.write(|w| w.start_turn()).is_ok());
+    session.delete()?;
+    let fresh = stores.create("bound", Default::default())?;
+    assert_eq!(fresh.observe_provider()?.generation, 0);
+    assert!(active.ensure_current().is_err());
+    Ok(())
+}

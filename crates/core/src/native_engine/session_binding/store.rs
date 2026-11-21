@@ -31,7 +31,7 @@ pub fn schema(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn read(c: &Connection, id: &str) -> Result<Observed> {
+pub(crate) fn read(c: &Connection, id: &str) -> Result<Observed> {
     Ok(c.query_row(
         "SELECT COALESCE(g.generation,0),
         COALESCE(CASE WHEN g.pending IS NOT NULL THEN g.target_provider END,c.provider,''),
@@ -209,6 +209,12 @@ pub const PUBLISH_LABEL: &str = "session binding update";
 /// A resume can carry an explicit `--model`/`--provider`, so this startup write
 /// shares [`crate::db::STARTUP_WRITE_DEADLINE`] and waits for another host's
 /// writer instead of failing at the pooled connection's 5 s busy_timeout.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum BindingStore {
+    Monolithic,
+    Directory,
+}
+
 pub fn publish_choice(
     c: &Connection,
     id: &str,
@@ -241,30 +247,57 @@ fn publish_choice_with_deadline(
     deadline: std::time::Duration,
 ) -> Result<Write> {
     crate::db::write_tx(c, PUBLISH_LABEL, deadline, |tx| {
-        // Every retried attempt re-reads the generation inside its own
-        // transaction, so the compare-and-set cannot publish over a newer writer.
-        let mut result = publish_in(tx, id, expected, state, legacy)?;
-        match result {
-            Write::Published(generation) if legacy.is_some() => {
-                tx.execute("INSERT INTO cli_binding_reservations(session_id,generation,requester,effort,requested)
-                    VALUES(?1,?2,?3,?4,?5)", (id,generation,requester,picker_effort.map(|e| e.unwrap_or("default")),
-                    format!("{}::{}",state.provider_id,state.model)))?;
-            }
-            Write::Unchanged if picker_effort.is_some() && read(tx, id)?.pending.is_some() => {
-                result = Write::Conflict;
-            }
-            Write::Unchanged | Write::Published(_) => {
-                if let Some(effort) = picker_effort {
-                    apply_effort(tx, id, effort)?;
-                }
-            }
-            Write::Conflict => {}
-        }
-        Ok(result)
+        publish_choice_in(
+            tx,
+            id,
+            expected,
+            state,
+            legacy,
+            requester,
+            picker_effort,
+            BindingStore::Monolithic,
+        )
     })
 }
 
-fn apply_effort(c: &Connection, id: &str, effort: Option<&str>) -> Result<()> {
+pub(crate) fn publish_choice_in(
+    tx: &Connection,
+    id: &str,
+    expected: u64,
+    state: &BindingSnapshot,
+    legacy: Option<(&str, Option<u32>)>,
+    requester: &str,
+    picker_effort: Option<Option<&str>>,
+    store: BindingStore,
+) -> Result<Write> {
+    // Every retried attempt re-reads the generation inside its own
+    // transaction, so the compare-and-set cannot publish over a newer writer.
+    let mut result = publish_in(tx, id, expected, state, legacy, store)?;
+    match result {
+        Write::Published(generation) if legacy.is_some() => {
+            tx.execute("INSERT INTO cli_binding_reservations(session_id,generation,requester,effort,requested)
+                    VALUES(?1,?2,?3,?4,?5)", (id,generation,requester,picker_effort.map(|e| e.unwrap_or("default")),
+                    format!("{}::{}",state.provider_id,state.model)))?;
+        }
+        Write::Unchanged if picker_effort.is_some() && read(tx, id)?.pending.is_some() => {
+            result = Write::Conflict;
+        }
+        Write::Unchanged | Write::Published(_) => {
+            if let Some(effort) = picker_effort {
+                apply_effort(tx, id, effort, store)?;
+            }
+        }
+        Write::Conflict => {}
+    }
+    Ok(result)
+}
+
+fn apply_effort(c: &Connection, id: &str, effort: Option<&str>, store: BindingStore) -> Result<()> {
+    if store == BindingStore::Directory {
+        c.execute("INSERT INTO cli_binding_efforts(session_id,revision,effort) VALUES(?1,1,?2)
+                   ON CONFLICT(session_id) DO UPDATE SET revision=revision+1,effort=excluded.effort", (id,effort))?;
+        return Ok(());
+    }
     let changed = c.execute(
         "INSERT INTO peripheral_settings(key,value) VALUES(?1,json_object('effort',?2))
         ON CONFLICT(key) DO UPDATE SET value=json_set(peripheral_settings.value,'$.effort',?2)",
@@ -280,8 +313,11 @@ fn publish_in(
     expected: u64,
     state: &BindingSnapshot,
     legacy: Option<(&str, Option<u32>)>,
+    store: BindingStore,
 ) -> Result<Write> {
-    schema(tx)?;
+    if store == BindingStore::Monolithic {
+        schema(tx)?;
+    }
     let current = read(tx, id)?;
     if current.generation != expected {
         return Ok(Write::Conflict);
@@ -302,7 +338,9 @@ fn publish_in(
         return Ok(Write::Conflict);
     }
     if legacy.is_some() {
-        crate::native_engine::session_binding::fence_legacy_admissions(&tx)?;
+        if store == BindingStore::Monolithic {
+            crate::native_engine::session_binding::fence_legacy_admissions(tx)?;
+        }
         tx.execute_batch("SAVEPOINT validate_pending_provider")?;
     }
     let changed = tx.execute(
@@ -358,7 +396,7 @@ pub fn publish_clear(
         parent.generation == state.generation && parent.pending.is_none(),
         "Clear did not apply: the source binding changed or is pending. Retry the command."
     );
-    match publish_in(tx, child, 0, state, None)? {
+    match publish_in(tx, child, 0, state, None, BindingStore::Monolithic)? {
         Write::Published(generation) => Ok(generation),
         _ => anyhow::bail!("Clear did not apply: the new session binding changed"),
     }
@@ -368,7 +406,19 @@ pub fn publish_clear(
 /// On activation failure undo its selector write and restore the previous generation
 /// with a conditional compensating transaction before returning the original error.
 pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result<()> {
-    schema(c)?;
+    activate_on(c, id, worker, expected, BindingStore::Monolithic)
+}
+
+pub(crate) fn activate_on(
+    c: &Connection,
+    id: &str,
+    worker: &str,
+    expected: u64,
+    store: BindingStore,
+) -> Result<()> {
+    if store == BindingStore::Monolithic {
+        schema(c)?;
+    }
     let attempt = (|| -> Result<()> {
         let tx = crate::db::write_transaction(c)?;
         let owns: bool = tx.query_row(
@@ -405,7 +455,12 @@ pub fn activate(c: &Connection, id: &str, worker: &str, expected: u64) -> Result
             )
             .optional()?;
         if let Some(effort) = effort {
-            apply_effort(&tx, id, (effort != "default").then_some(effort.as_str()))?;
+            apply_effort(
+                &tx,
+                id,
+                (effort != "default").then_some(effort.as_str()),
+                store,
+            )?;
         }
         tx.execute(
             "DELETE FROM cli_binding_reservations WHERE session_id=?1 AND generation=?2",

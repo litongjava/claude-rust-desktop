@@ -1,5 +1,6 @@
 //! Process-local resolver for the global directory and incarnation-bound session shards.
 mod approvals;
+mod binding;
 mod compaction;
 mod directory;
 pub use compaction::{CheckpointKey, CompactionClaim};
@@ -343,7 +344,7 @@ impl SessionDb {
     /// store calls that need lifecycle access return an error on this thread.
     pub fn read<T>(&self, body: impl FnOnce(&SessionRead<'_>) -> Result<T>) -> Result<T> {
         let _locks = self.stores.key_lock(&self.key, false, false)?;
-        self.check_directory()?;
+        self.binding_control()?;
         self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
             layout::callback(|| body(&SessionRead(&tx)))
@@ -360,7 +361,6 @@ impl SessionDb {
         body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
     ) -> Result<T> {
         let _locks = self.stores.key_lock(&self.key, false, false)?;
-        self.check_directory()?;
         self.write_locked(label, body)
     }
     fn write_locked<T>(
@@ -368,11 +368,12 @@ impl SessionDb {
         label: &str,
         mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
     ) -> Result<T> {
+        let binding = self.binding_control()?;
         let start = Instant::now();
         let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
             crate::db::write_tx(c, label, WRITE_DEADLINE, |tx| {
                 let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
-                let writer=SessionWrite(tx,&self.id,false.into());
+                let writer=SessionWrite(tx,&self.id,false.into(),binding.pending);
                 let result=layout::callback(|| body(&writer))?;
                 let changed:bool=tx.query_row("SELECT total_changes()>?1",[before],|r|r.get(0))?;
                 let mut summary=None;
@@ -458,7 +459,7 @@ impl SessionRead<'_> {
         .transpose()
     }
 }
-pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>);
+pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>, bool);
 impl SessionWrite<'_> {
     #[doc(hidden)]
     pub fn synchronous_for_test(&self) -> Result<i32> {

@@ -328,6 +328,7 @@ impl SessionWrite<'_> {
         Ok(())
     }
     pub fn start_turn(&self) -> Result<String> {
+        ensure!(!self.3, "Provider switch pending; worker is retiring");
         let id = uuid::Uuid::new_v4().to_string();
         self.0
             .execute("INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')", params![id, self.1, chrono::Utc::now().to_rfc3339()])?;

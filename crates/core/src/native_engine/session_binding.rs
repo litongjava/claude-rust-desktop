@@ -127,7 +127,32 @@ impl BindingSnapshot {
 #[derive(Clone, Default)]
 pub struct SessionBinding {
     state: Arc<std::sync::OnceLock<Arc<RwLock<Arc<BindingSnapshot>>>>>,
-    authority: Arc<RwLock<Option<(std::sync::Weak<crate::db::DbManager>, String)>>>,
+    authority: Arc<RwLock<Option<BindingAuthority>>>,
+}
+
+#[derive(Clone)]
+enum BindingAuthority {
+    Session(crate::db::session_store::SessionDb),
+    Shared(std::sync::Weak<crate::db::DbManager>, String),
+}
+
+impl BindingAuthority {
+    fn version(&self) -> Result<(u64, bool)> {
+        match self {
+            Self::Session(shard) => {
+                let observed = shard.observe_provider()?;
+                Ok((observed.generation, observed.pending.is_some()))
+            }
+            Self::Shared(db, id) => {
+                let db = db.upgrade().context("Session binding closed")?;
+                Ok(db.with_conn(|c| c.query_row(
+                    "SELECT COALESCE((SELECT generation FROM cli_binding_generations WHERE session_id=?1),0),
+                     EXISTS(SELECT 1 FROM cli_binding_generations WHERE session_id=?1 AND pending IS NOT NULL)",
+                    [id], |r| Ok((r.get(0)?,r.get(1)?))
+                ))??)
+            }
+        }
+    }
 }
 
 /// An open CLI session can only own an initialized handle. Both views share
@@ -162,7 +187,11 @@ impl std::fmt::Debug for SessionBinding {
 impl SessionBinding {
     pub fn track(&self, db: &Arc<crate::db::DbManager>, session: &str) {
         *self.authority.write().unwrap_or_else(|e| e.into_inner()) =
-            Some((Arc::downgrade(db), session.into()));
+            Some(BindingAuthority::Shared(Arc::downgrade(db), session.into()));
+    }
+
+    pub fn track_session(&self, session: crate::db::session_store::SessionDb) {
+        *self.authority.write().unwrap_or_else(|e| e.into_inner()) = Some(BindingAuthority::Session(session));
     }
 
     fn check_generation(&self, expected: u64) -> Result<()> {
@@ -175,13 +204,8 @@ impl SessionBinding {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some((db, session)) = authority {
-            let db = db.upgrade().context("Session binding closed")?;
-            let (generation, pending): (u64, bool) = db.with_conn(|c| c.query_row(
-                "SELECT COALESCE((SELECT generation FROM cli_binding_generations WHERE session_id=?1),0),
-                 EXISTS(SELECT 1 FROM cli_binding_generations WHERE session_id=?1 AND pending IS NOT NULL)",
-                [session], |r| Ok((r.get(0)?, r.get(1)?))
-            ))??;
+        if let Some(authority) = authority {
+            let (generation,pending) = authority.version()?;
             ensure!(
                 generation == expected,
                 "Provider binding changed; resume the current session before submitting"
@@ -218,15 +242,9 @@ impl SessionBinding {
     /// Only a frontend restoring a freshly read durable revision can move back
     /// to the active generation after an aborted legacy retirement.
     pub fn restore(&self, next: BindingSnapshot) -> Result<()> {
-        let (db, id) = self
-            .authority
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let authority = self.authority.read().unwrap_or_else(|e|e.into_inner()).clone()
             .context("Missing binding authority")?;
-        let actual: u64 = db.upgrade().context("Session binding closed")?.with_conn(|c| c.query_row(
-            "SELECT COALESCE((SELECT generation FROM cli_binding_generations WHERE session_id=?1),0)",
-            [id], |r|r.get(0)))??;
+        let (actual,_) = authority.version()?;
         ensure!(
             actual == next.generation,
             "Session binding changed during refresh"

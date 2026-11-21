@@ -12,7 +12,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-pub(super) const GLOBAL_VERSION: i32 = 5;
+pub(super) const GLOBAL_VERSION: i32 = 6;
 pub(super) const SESSION_VERSION: i32 = 6;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
@@ -260,7 +260,10 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                 tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
             }
             if kind == GLOBAL {
-                install_global_v5(&tx)?;
+                if version < 5 {
+                    install_global_v5(tx)?;
+                }
+                tx.execute_batch(include_str!("global_v6.sql"))?;
             }
             tx.pragma_update(None, "user_version", schema_version(kind))?;
             Ok(())
@@ -461,12 +464,36 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     } else {
         &[]
     };
+    let bindings: &[(&str, &str)] = if kind == GLOBAL && expected >= 6 {
+        &[
+            (
+                "cli_binding_generations",
+                "session_id generation pending legacy_pid target_provider target_model",
+            ),
+            (
+                "cli_binding_failures",
+                "session_id generation requested restored",
+            ),
+            (
+                "cli_binding_reservations",
+                "session_id generation requester effort requested restored",
+            ),
+            (
+                "cli_binding_revisions",
+                "session_id generation previous digest options",
+            ),
+            ("cli_binding_efforts", "session_id revision effort"),
+        ]
+    } else {
+        &[]
+    };
     for &(table, required) in tables
         .iter()
         .chain(added)
         .chain(state)
         .chain(v4)
         .chain(shared)
+        .chain(bindings)
     {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
@@ -556,6 +583,7 @@ pub(super) fn initialize(
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;
+        tx.execute_batch(include_str!("global_v6.sql"))?;
     }
     populate(&tx)?;
     if kind == SESSION {
