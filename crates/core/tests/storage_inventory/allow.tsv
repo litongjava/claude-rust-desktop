@@ -8,6 +8,7 @@ crates/cli/tests/apply_patch_tool.rs	peripheral_settings	1	bdf67221e833a7fa95ed5
 crates/cli/tests/batch.rs	peripheral_settings	2	18e92e8978de18be85f3660b2cca0bd522dba2165720550b8dedf18d696b6e90	batch integration or repository fixture
 crates/cli/tests/local_coordination_registry.rs	Connection::open	1	f2a9358e7f288b4ae460ba95ad8a0e928221e8594a44cb0c15d8fb7335ebcd15	local_coordination_registry integration or repository fixture
 crates/cli/tests/sdk/apply_patch_permissions.rs	peripheral_settings	2	665b4ff00df9b40408c41aad2bd5a817f1c79c74991879bac94c1c85c04cc813	apply_patch_permissions integration or repository fixture
+crates/cli/tests/session_export.rs	Connection::open	1	585aa275b5164e1ee1eae12d760d25d4e8c598c64c1a7d50456fa55bda03d9ac	Request body corruption and lifecycle state in disposable export fixtures
 crates/cli/tests/session_export.rs	deepseek_code.db	3	7f59df4961b74e4bcad013a60411bb5ef978b0ca1b214366837977ed47c10d94	CLI startup and export sentinel files
 crates/cli/tests/session_export/race.rs	Connection::open	2	6fae9c960b78062c65f9df380983d8ead52049ec532b7afec550a222e0f920a1	Directory metadata and projection fixtures for export snapshot fences
 crates/cli/tests/session_trust.rs	with_conn	1	9949d5a7ae8a5785b8f319bbd0cd57ec496bfb21a0eae53edeeeea929b6c9a54	Standalone task database fixture

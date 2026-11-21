@@ -688,3 +688,51 @@ fn fresh_install_creates_only_directory_shard_and_lifecycle_files() -> Result<()
 
 #[path = "session_export/race.rs"]
 mod race;
+fn check_bad_blob(missing: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let dest = tempfile::tempdir()?;
+    let store = Stores::open(root.path())?;
+    let id = "6217631e-49bd-41f9-b922-dbb42d16c3d1";
+    let s = store.create(id, Default::default())?;
+    s.write(|w| {
+        let msg = w.append("assistant", "response")?;
+        let request = if missing {
+            json!({"toolsRef":"a".repeat(64)})
+        } else {
+            json!({"systemPrompt":"original"})
+        };
+        w.snapshots(&msg, &json!([request]))
+    })?;
+    if !missing {
+        let db =
+            rusqlite::Connection::open(root.path().join("sessions").join(id).join("session.db"))?;
+        assert_eq!(
+            db.execute("UPDATE request_blobs SET body=?1", ["wrong body"])?,
+            1
+        );
+    }
+    let out = export(root.path(), id)
+        .arg("--output")
+        .arg(dest.path().join("backup"))
+        .output()?;
+    assert!(!out.status.success());
+    let reason = if missing {
+        "Missing request blob"
+    } else {
+        "Request blob digest mismatch"
+    };
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(reason),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_dir(dest.path())?.count(), 0);
+    Ok(())
+}
+#[test]
+fn reject_missing_request_blob() -> Result<()> {
+    check_bad_blob(true)
+}
+#[test]
+fn reject_mismatched_request_blob() -> Result<()> {
+    check_bad_blob(false)
+}

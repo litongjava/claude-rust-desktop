@@ -2,7 +2,7 @@
 //! top-level header references in snapshot arrays, using a connection-local temp
 //! table so neither the transcript nor the set of distinct hashes lives in RAM.
 use anyhow::Result;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::{Connection, DatabaseName, OptionalExtension};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::{fmt, io::BufReader};
 
@@ -20,6 +20,16 @@ pub(super) fn index(db: &Connection) -> Result<()> {
         let mut json = serde_json::Deserializer::from_reader(BufReader::new(blob));
         Scan::Array(db).deserialize(&mut json)?;
         json.end()?;
+    }
+    let missing: Option<String> = db
+        .query_row(
+            "SELECT hash FROM temp.export_refs EXCEPT SELECT hash FROM request_blobs LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(hash) = missing {
+        anyhow::bail!("Missing request blob {hash}");
     }
     Ok(())
 }
@@ -70,11 +80,12 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
     fn visit_str<E: de::Error>(self, value: &str) -> Result<(), E> {
         if let Scan::Hash(db) = self {
-            if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-                db.prepare_cached("INSERT OR IGNORE INTO export_refs VALUES(?1)")
-                    .and_then(|mut insert| insert.execute([value]))
-                    .map_err(E::custom)?;
+            if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(E::custom("Invalid request blob digest"));
             }
+            db.prepare_cached("INSERT OR IGNORE INTO export_refs VALUES(?1)")
+                .and_then(|mut insert| insert.execute([value]))
+                .map_err(E::custom)?;
         }
         Ok(())
     }

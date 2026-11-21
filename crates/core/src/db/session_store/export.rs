@@ -195,6 +195,21 @@ impl<W: Write> Stream<W> {
                 }
             }
         }
+        if kind == "request_blob" {
+            let body = &record["body"];
+            let digest = match body.as_str() {
+                Some(text) => format!("{:x}", Sha256::digest(text.as_bytes())),
+                None => body["sha256"]
+                    .as_str()
+                    .context("Invalid request blob body")?
+                    .to_owned(),
+            };
+            ensure!(
+                record["hash"] == digest,
+                "Request blob digest mismatch for {}",
+                record["hash"]
+            );
+        }
         self.line(kind, record)?;
         for (field, digest, blob) in pending {
             visit_chunks(&blob, |index, bytes| {
