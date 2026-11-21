@@ -1,4 +1,5 @@
 //! Terminal adapters for persistent feature lessons.
+use deepseek_code_core::db::session_store::GlobalSetting;
 use anyhow::{Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
 use std::collections::BTreeSet;
@@ -22,7 +23,7 @@ pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Resu
         "/powerup" => {
             let context = crate::services::context(paths)?;
             let mut completed = context
-                .setting::<BTreeSet<String>>("cli.powerup.completed")?
+                .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
                 .unwrap_or_default();
             let words = argument.split_whitespace().collect::<Vec<_>>();
             match words.as_slice() {
@@ -46,7 +47,7 @@ pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Resu
                 }
                 ["reset"] => {
                     completed.clear();
-                    context.save_setting("cli.powerup.completed", &completed)?;
+                    context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                     command_eprintln!("Lesson progress reset.");
                 }
                 [id] | ["read", id] | ["done", id] => {
@@ -56,7 +57,7 @@ pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Resu
                         .context("Unknown lesson; use /powerup to list topics")?;
                     if words.first() == Some(&"done") {
                         completed.insert((*id).into());
-                        context.save_setting("cli.powerup.completed", &completed)?;
+                        context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                         command_eprintln!("Completed: {title}");
                     } else {
                         command_eprintln!("{title}\n\n{text}\n\nWhen finished: /powerup done {id}");

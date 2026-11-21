@@ -104,6 +104,7 @@ mod tool_settings;
 mod tools_menu;
 mod voice;
 mod worker_binding;
+use deepseek_code_core::db::session_store::GlobalSetting;
 use deepseek_code_core::native_engine::session_binding::store as binding_store;
 mod worker_frontend;
 mod workflow_commands;
@@ -571,7 +572,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 language: language.clone(),
             };
             config.validate()?;
-            context.save_setting("voice", &config)?;
+            context.save_global_setting(GlobalSetting::MachinePreference("voice"), &config)?;
             return services::print(&config);
         }
         Some(Commands::Voice {

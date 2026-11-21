@@ -1,6 +1,7 @@
 //! Shared transport policy. Retries end before a response stream is exposed.
 mod request_failure;
 
+use crate::db::session_store::GlobalSetting;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -908,7 +909,7 @@ pub fn configure_router(
     config: &RouterConfig,
 ) -> Result<()> {
     validate_router(ctx, config)?;
-    ctx.save_setting("performance.router", config)
+    ctx.save_global_setting(GlobalSetting::MachinePreference("performance.router"), config)
 }
 pub fn simple_turn(text: &str) -> bool {
     let text = text.trim();

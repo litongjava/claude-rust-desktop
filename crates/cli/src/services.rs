@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use crate::args::{ServiceCommands, TeamCommands};
 use anyhow::Result;
 use deepseek_code_core::services::{lifecycle, team, team_server::TeamServer, ServiceContext};
@@ -15,7 +16,7 @@ pub fn print(value: &impl Serialize) -> Result<()> {
 pub async fn team(context: &ServiceContext, action: &TeamCommands) -> Result<()> {
     match action {
         TeamCommands::Context {enabled}=>print(&team::configure_model_context(context,&std::env::current_dir()?,*enabled)?),
-        TeamCommands::Status => print(&context.setting::<team::TeamConfig>("team-sync")?),
+        TeamCommands::Status => print(&context.global_setting::<team::TeamConfig>(GlobalSetting::TeamConfiguration("team-sync"))?),
         TeamCommands::Auth {
             team_id,
             endpoint,
@@ -103,7 +104,7 @@ pub async fn services(context: &ServiceContext, action: &ServiceCommands) -> Res
         ServiceCommands::Start { name, interval } => {
             eprintln!("Hosting {name}; Ctrl+C or services stop {name} stops this instance.");
             if name == "auto-dream" {
-                let config: deepseek_code_core::services::dream::DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+                let config: deepseek_code_core::services::dream::DreamConfig = context.global_setting(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default();
                 config.validate()?;
                 anyhow::ensure!(config.enabled, "Enable AutoDream with memory dream-config first");
                 deepseek_code_core::services::generation::Generator::saved(&context.paths, &config.provider, &config.model)?;
@@ -117,9 +118,9 @@ pub async fn services(context: &ServiceContext, action: &ServiceCommands) -> Res
             lifecycle::wait_stopped(context, name).await?;
             print(&serde_json::json!({"stopped":name}))
         }
-        ServiceCommands::TeamSync => print(&context.setting::<team::TeamConfig>("team-sync")?),
+        ServiceCommands::TeamSync => print(&context.global_setting::<team::TeamConfig>(GlobalSetting::TeamConfiguration("team-sync"))?),
         ServiceCommands::Voice => {
-            print(&context.setting::<deepseek_code_core::services::voice::VoiceConfig>("voice")?)
+            print(&context.global_setting::<deepseek_code_core::services::voice::VoiceConfig>(GlobalSetting::MachinePreference("voice"))?)
         }
     }
 }

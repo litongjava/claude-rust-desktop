@@ -51,7 +51,7 @@ mod usage;
 mod task;
 pub use delivery::*;
 pub use history::*;
-pub use state::GlobalSetting;
+pub use state::{GlobalPreferences, GlobalSetting};
 pub use usage::{CorpusUsage, DailyUsage};
 mod layout;
 mod lifecycle;

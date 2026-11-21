@@ -1,3 +1,4 @@
+use crate::db::session_store::{GlobalSetting, GlobalPreferences, ServiceLeases};
 use super::{generation::Generator, lifecycle::Lease, ServiceContext};
 use crate::memory::MemExClient;
 use anyhow::{ensure, Result};
@@ -44,12 +45,12 @@ pub struct DreamReport {
     pub skipped: Option<String>,
 }
 
-pub fn client(context: &ServiceContext) -> MemExClient {
+pub fn client<D>(context: &ServiceContext<D>) -> MemExClient {
     MemExClient::with_path(context.paths.data_dir.join("memory.sqlite3"), None)
 }
 
 pub async fn run(
-    context: &ServiceContext,
+    context: &ServiceContext<impl GlobalPreferences + ServiceLeases + 'static>,
     generator: &Generator,
     automatic: bool,
 ) -> Result<DreamReport> {
@@ -57,7 +58,7 @@ pub async fn run(
     run_with_lease(context, generator, automatic, lease).await
 }
 pub async fn run_with_lease(
-    context: &ServiceContext,
+    context: &ServiceContext<impl GlobalPreferences + ServiceLeases + 'static>,
     generator: &Generator,
     automatic: bool,
     lease: Lease,
@@ -69,7 +70,7 @@ pub async fn run_with_lease(
     Ok(result?)
 }
 async fn run_inner(
-    context: &ServiceContext,
+    context: &ServiceContext<impl GlobalPreferences + ServiceLeases + 'static>,
     generator: &Generator,
     automatic: bool,
     lease: &Lease,
@@ -83,7 +84,7 @@ async fn run_inner(
         })
     };
     if automatic {
-        let config: DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+        let config: DreamConfig = context.global_setting(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default();
         config.validate()?;
         if !config.enabled {
             return skip("disabled");
@@ -143,7 +144,7 @@ async fn run_inner(
     })
 }
 
-pub async fn host(context: ServiceContext, interval: u64, lease: Lease) -> Result<()> {
+pub async fn host(context: ServiceContext<impl GlobalPreferences + ServiceLeases + 'static>, interval: u64, lease: Lease) -> Result<()> {
     ensure!(
         (1..=86400).contains(&interval),
         "Interval must be 1..86400 seconds"
@@ -151,7 +152,7 @@ pub async fn host(context: ServiceContext, interval: u64, lease: Lease) -> Resul
     let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
     loop {
         let operation = async {
-            let config: DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+            let config: DreamConfig = context.global_setting(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default();
             if !config.enabled {
                 return Ok(None);
             }

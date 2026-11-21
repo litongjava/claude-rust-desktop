@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use anyhow::{ensure, Context, Result};
 use clap::{Args, Subcommand};
 use deepseek_code_core::{
@@ -126,11 +127,11 @@ pub async fn learning(paths: &RuntimePaths, action: &LearningCommands) -> Result
         LearningCommands::Status => {
             let mut value = serde_json::to_value(deepseek_code_core::learning::status(&ctx)?)?;
             value["enabled"] =
-                serde_json::json!(ctx.setting::<bool>("learning.enabled")?.unwrap_or(false));
+                serde_json::json!(ctx.global_setting::<bool>(GlobalSetting::LearningRecord("learning.enabled"))?.unwrap_or(false));
             crate::services::print(&value)
         }
         LearningCommands::Configure { enabled } => {
-            ctx.save_setting("learning.enabled", enabled)?;
+            ctx.save_global_setting(GlobalSetting::LearningRecord("learning.enabled"), enabled)?;
             crate::services::print(&serde_json::json!({"enabled":enabled}))
         }
         LearningCommands::Feedback { id, rating } => {
@@ -146,7 +147,7 @@ pub async fn performance(paths: &RuntimePaths, action: &PerformanceCommands) -> 
     let ctx = crate::services::context(paths)?;
     match action {
         PerformanceCommands::Status => crate::services::print(
-            &ctx.setting::<deepseek_code_core::performance::RouterConfig>("performance.router")?
+            &ctx.global_setting::<deepseek_code_core::performance::RouterConfig>(GlobalSetting::MachinePreference("performance.router"))?
                 .unwrap_or_default(),
         ),
         PerformanceCommands::Configure {

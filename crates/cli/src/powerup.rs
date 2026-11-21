@@ -1,4 +1,5 @@
 //! Interactive lessons use the prompt's input owner and incremental inline renderer.
+use deepseek_code_core::db::session_store::GlobalSetting;
 use crate::{
     resource_commands::LESSONS,
     terminal::input::editor::{clipped, DisplayLine, Screen, TextStyle},
@@ -215,7 +216,7 @@ impl Drop for Modal {
 pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
     let context = crate::services::context(paths)?;
     let completed = context
-        .setting::<BTreeSet<String>>("cli.powerup.completed")?
+        .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
         .unwrap_or_default()
         .into_iter()
         .filter(|id| LESSONS.iter().any(|lesson| lesson.0 == id))
@@ -262,10 +263,10 @@ pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
                         if let Some(id) = tour.enter() {
                             // Publish progress only after saving succeeds.
                             let mut completed = context
-                                .setting::<BTreeSet<String>>("cli.powerup.completed")?
+                                .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
                                 .unwrap_or_default();
                             completed.insert(id.into());
-                            context.save_setting("cli.powerup.completed", &completed)?;
+                            context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                             tour.completed.insert(id.into());
                         }
                     }

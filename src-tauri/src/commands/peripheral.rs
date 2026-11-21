@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use deepseek_code_core::db::session_store::Projects;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
@@ -195,11 +196,11 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
                 if let Some(task)=task {let _=task.await;}
                 Ok(json!({"stopped":true}))
             }
-            Request::LearningStatus => {let mut value=json!(deepseek_code_core::learning::status(&context)?);value["enabled"]=json!(context.setting::<bool>("learning.enabled")?.unwrap_or(false));Ok(value)},
-            Request::LearningConfigure { enabled } => {context.save_setting("learning.enabled",&enabled)?;Ok(json!({"enabled":enabled}))},
+            Request::LearningStatus => {let mut value=json!(deepseek_code_core::learning::status(&context)?);value["enabled"]=json!(context.global_setting::<bool>(GlobalSetting::LearningRecord("learning.enabled"))?.unwrap_or(false));Ok(value)},
+            Request::LearningConfigure { enabled } => {context.save_global_setting(GlobalSetting::LearningRecord("learning.enabled"),&enabled)?;Ok(json!({"enabled":enabled}))},
             Request::LearningFeedback { id, rating } => {deepseek_code_core::learning::feedback(&context,&id,rating)?;Ok(json!({"updated":id}))},
             Request::LearningAccept { id } => Ok(json!(deepseek_code_core::learning::accept(&context,&id)?)),
-            Request::PerformanceStatus => Ok(json!(context.setting::<deepseek_code_core::performance::RouterConfig>("performance.router")?.unwrap_or_default())),
+            Request::PerformanceStatus => Ok(json!(context.global_setting::<deepseek_code_core::performance::RouterConfig>(GlobalSetting::MachinePreference("performance.router"))?.unwrap_or_default())),
             Request::PerformanceConfigure { config } => {deepseek_code_core::performance::configure_router(&context,&config)?;Ok(json!(config))},
             Request::ProjectTemplates => Ok(json!(deepseek_code_core::services::project_templates::builtin_templates())),
             Request::ProjectScaffold { parent,name,template,template_file,variables,git,vscode,preview,allow_commands } => {
@@ -295,15 +296,15 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
                     }
                 }
             }
-            Request::DreamStatus => Ok(json!({"config":context.setting::<dream::DreamConfig>("auto-dream")?.unwrap_or_default(), "memory":dream::client(&context).dream_status().await?, "services":lifecycle::status(&context)?})),
+            Request::DreamStatus => Ok(json!({"config":context.global_setting::<dream::DreamConfig>(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default(), "memory":dream::client(&context).dream_status().await?, "services":lifecycle::status(&context)?})),
             Request::DreamConfig { config } => {
                 config.validate()?;
                 Generator::saved(&context.paths, &config.provider, &config.model)?;
-                context.save_setting("auto-dream", &config)?;
+                context.save_global_setting(GlobalSetting::MachinePreference("auto-dream"), &config)?;
                 Ok(json!(config))
             }
             Request::DreamStart { automatic } => {
-                let config: dream::DreamConfig = context.setting("auto-dream")?.unwrap_or_default();
+                let config: dream::DreamConfig = context.global_setting(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default();
                 config.validate()?;
                 ensure!(!automatic || config.enabled, "Enable AutoDream first");
                 let generator = Generator::saved(&context.paths, &config.provider, &config.model)?;
@@ -327,11 +328,11 @@ pub async fn run(context: ServiceContext, host: &PeripheralHost, request: Reques
                 if let Some(task) = task { let _ = task.await; }
                 Ok(json!({"stopped":name}))
             }
-            Request::Status=>Ok(json!({"voice":context.setting::<voice::VoiceConfig>("voice")?,
-                "team":context.setting::<team::TeamConfig>("team-sync")?,"services":lifecycle::status(&context)?,
-                "memories":if context.setting::<team::TeamConfig>("team-sync")?.is_some(){team::list(&context,false)?}else{vec![]},
-                "conflicts":if context.setting::<team::TeamConfig>("team-sync")?.is_some(){team::conflicts(&context)?}else{vec![]}})),
-            Request::VoiceConfig {config}=> {config.validate()?;context.save_setting("voice",&config)?;Ok(json!(config))}
+            Request::Status=>Ok(json!({"voice":context.global_setting::<voice::VoiceConfig>(GlobalSetting::MachinePreference("voice"))?,
+                "team":context.global_setting::<team::TeamConfig>(GlobalSetting::TeamConfiguration("team-sync"))?,"services":lifecycle::status(&context)?,
+                "memories":if context.global_setting::<team::TeamConfig>(GlobalSetting::TeamConfiguration("team-sync"))?.is_some(){team::list(&context,false)?}else{vec![]},
+                "conflicts":if context.global_setting::<team::TeamConfig>(GlobalSetting::TeamConfiguration("team-sync"))?.is_some(){team::conflicts(&context)?}else{vec![]}})),
+            Request::VoiceConfig {config}=> {config.validate()?;context.save_global_setting(GlobalSetting::MachinePreference("voice"),&config)?;Ok(json!(config))}
             Request::TeamAuth {config}=> {team::auth(&context,config).await?;Ok(json!({"authenticated":true}))}
             Request::TeamContext {project_id,enabled} => {
                 let project=context.db.trusted_project(&project_id)?;
@@ -392,7 +393,7 @@ pub fn voice_begin(
     let prepare = || -> Result<_> {
         let context = context(&app)?;
         let config: voice::VoiceConfig = context
-            .setting("voice")?
+            .global_setting(GlobalSetting::MachinePreference("voice"))?
             .context("请先在设置 → 服务与团队中配置音频转写后端")?;
         config.validate()?;
         context.credentials.get(&config.credential)?;

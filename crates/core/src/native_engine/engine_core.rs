@@ -1,3 +1,4 @@
+use crate::db::session_store::GlobalSetting;
 use crate::cache::FileCache;
 use crate::cost_tracker::{BudgetCheckResult, CostTracker};
 use crate::db::DbManager;
@@ -901,7 +902,7 @@ impl QueryEngine {
             credentials: Arc::new(crate::services::EnvironmentCredentials),
         };
         if let Some(router) =
-            plugin_context.setting::<crate::performance::RouterConfig>("performance.router")?
+            plugin_context.global_setting::<crate::performance::RouterConfig>(GlobalSetting::MachinePreference("performance.router"))?
         {
             // Route only a fresh plain-text turn; never switch models mid tool conversation.
             if router.enabled
@@ -1529,7 +1530,7 @@ impl QueryEngine {
             request.system_prompt.clone()
         };
         let learning = if plugin_context
-            .setting::<bool>("learning.enabled")?
+            .global_setting::<bool>(GlobalSetting::LearningRecord("learning.enabled"))?
             .unwrap_or(false)
         {
             Some(crate::learning::TurnObservation::new(

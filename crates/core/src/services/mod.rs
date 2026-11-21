@@ -136,6 +136,15 @@ impl ServiceContext {
     }
 }
 
+impl<D: crate::db::session_store::GlobalPreferences> ServiceContext<D> {
+    pub fn global_setting<T: DeserializeOwned>(&self, key: crate::db::session_store::GlobalSetting<'_>) -> Result<Option<T>> {
+        self.db.global_preference(key)
+    }
+    pub fn save_global_setting<T: Serialize>(&self, key: crate::db::session_store::GlobalSetting<'_>, value: &T) -> Result<()> {
+        self.db.save_global_preference(key, value)
+    }
+}
+
 impl ServiceContext<crate::db::session_store::Stores> {
     pub fn from_stores(paths:RuntimePaths, credentials:Arc<dyn Credentials>) -> Result<Self> {
         let db=Arc::new(paths.open_stores()?);

@@ -1,3 +1,4 @@
+use crate::db::session_store::GlobalSetting;
 use super::{validate_endpoint, ServiceContext};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ impl VoiceConfig {
     }
 }
 
-pub async fn transcribe(context: &ServiceContext, bytes: Vec<u8>, mime: &str) -> Result<String> {
+pub async fn transcribe(context: &ServiceContext<impl crate::db::session_store::GlobalPreferences>, bytes: Vec<u8>, mime: &str) -> Result<String> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_AUDIO_BYTES,
         "Audio must contain 1..25 MiB"
@@ -37,7 +38,7 @@ pub async fn transcribe(context: &ServiceContext, bytes: Vec<u8>, mime: &str) ->
         _ => anyhow::bail!("Unsupported audio format: {mime}"),
     };
     let config: VoiceConfig = context
-        .setting("voice")?
+        .global_setting(GlobalSetting::MachinePreference("voice"))?
         .context("Voice backend is not configured; configure an audio transcription endpoint")?;
     config.validate()?;
     let token = context.credentials.get(&config.credential)?;

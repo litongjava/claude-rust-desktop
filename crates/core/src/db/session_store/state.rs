@@ -290,3 +290,27 @@ pub(super) fn save_agent_mode(c:&Connection,session:&str,mode:PermissionMode,eff
         }
         set_local(c, &key, session_permission_mode::name(mode))
 }
+
+pub trait GlobalPreferences {
+    fn global_preference<T: DeserializeOwned>(&self, key: GlobalSetting<'_>) -> Result<Option<T>>;
+    fn save_global_preference<T: Serialize>(&self, key: GlobalSetting<'_>, value:&T) -> Result<()>;
+}
+impl GlobalPreferences for Stores {
+    fn global_preference<T: DeserializeOwned>(&self,key: GlobalSetting<'_>)->Result<Option<T>> {
+        self.global().setting(key)
+    }
+    fn save_global_preference<T: Serialize>(&self,key: GlobalSetting<'_>,value:&T)->Result<()> {
+        self.global().set_setting(key,value)
+    }
+}
+impl GlobalPreferences for crate::db::DbManager {
+    fn global_preference<T: DeserializeOwned>(&self,key: GlobalSetting<'_>)->Result<Option<T>> {
+        let raw=self.with_conn(|c|local(c,key.parts()[1]))??;
+        raw.map(|raw|Ok(serde_json::from_str(&raw)?)).transpose()
+    }
+    fn save_global_preference<T: Serialize>(&self,key: GlobalSetting<'_>,value:&T)->Result<()> {
+        let raw=serde_json::to_string(value)?;
+        self.with_conn(|c| crate::db::write_tx(c,"save global setting",crate::db::STARTUP_WRITE_DEADLINE,
+            |tx|set_local(tx,key.parts()[1],&raw)))?
+    }
+}

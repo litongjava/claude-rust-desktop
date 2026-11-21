@@ -1,4 +1,5 @@
 //! Explicitly shared memories only. Provider configuration is never part of this protocol.
+use crate::db::session_store::GlobalSetting;
 use super::{lifecycle::Lease, validate_endpoint, ServiceContext};
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, OptionalExtension};
@@ -45,7 +46,7 @@ pub struct Conflict {
 
 pub fn configured(context: &ServiceContext) -> Result<TeamConfig> {
     let config: TeamConfig = context
-        .setting("team-sync")?
+        .global_setting(GlobalSetting::TeamConfiguration("team-sync"))?
         .context("Team sync is not configured; authenticate against a team server first")?;
     validate_endpoint(&config.endpoint)?;
     ensure!(
