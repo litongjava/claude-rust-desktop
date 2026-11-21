@@ -1,4 +1,4 @@
-use deepseek_code_core::services::{input_queue as queue, session_messages::ExecutionLease};
+use deepseek_code_core::services::input_queue as queue;
 use deepseek_desktop_tauri_lib::{
     bridge::BridgeServer,
     runtime::{RuntimePaths, SessionStore},
@@ -165,7 +165,7 @@ async fn durable_queue_roundtrip() {
         queue::QueueState::Queued
     );
     // Contending process ownership cannot consume the admitted row.
-    let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+    let lease = shard.acquire_execution().unwrap();
     client
         .post(format!("{url}/resume"))
         .header("x-api-key", &key)

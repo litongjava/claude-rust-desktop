@@ -226,12 +226,6 @@ async fn image_history_roundtrip() {
         .create(dir.path(), "fixture-model", "fixture")
         .unwrap();
     let lease=db.open_session(&locked_session).unwrap().acquire_execution().unwrap();
-    let lease = deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-        dir.path(),
-        &locked_session,
-    )
-    .unwrap()
-    .unwrap();
     let response = client
         .post(format!("{base}/api/chat"))
         .header("x-api-key", &key)
