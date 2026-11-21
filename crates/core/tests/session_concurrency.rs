@@ -1,5 +1,9 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
+use deepseek_code_core::db::session_store::Stores;
 use deepseek_code_core::db::{message_repo, write_tx};
-use deepseek_code_core::runtime::{RuntimePaths, SessionStore, DATABASE_FILE};
+use deepseek_code_core::runtime::{RuntimePaths, SessionStore};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -60,7 +64,8 @@ fn separate_hosts_can_open_and_initialize_the_same_database() {
 
 fn turn_fixture() -> (
     tempfile::TempDir,
-    Arc<deepseek_code_core::db::DbManager>,
+    Arc<Stores>,
+    String,
     String,
     std::path::PathBuf,
 ) {
@@ -70,8 +75,8 @@ fn turn_fixture() -> (
     let store = SessionStore::new(db.clone());
     let session = store.create(temp.path(), "fixture", "fixture").unwrap();
     let message = store.append(&session, "assistant", "").unwrap();
-    let path = temp.path().join("data").join(DATABASE_FILE);
-    (temp, db, message, path)
+    let path = db.shard_path(&session).unwrap();
+    (temp, db, session, message, path)
 }
 
 /// Hold the write lock until the returned sender fires, so the test controls
@@ -155,7 +160,7 @@ const DEADLINE_FIXTURE_GUARD: Duration = Duration::from_secs(45);
 
 fn session_fixture() -> (
     tempfile::TempDir,
-    Arc<deepseek_code_core::db::DbManager>,
+    Arc<Stores>,
     SessionStore,
     std::path::PathBuf,
 ) {
@@ -163,20 +168,24 @@ fn session_fixture() -> (
     let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
     let db = paths.open_database().unwrap();
     let store = SessionStore::new(db.clone());
-    let path = temp.path().join("data").join(DATABASE_FILE);
+    let path = temp.path().join("data").join("global.db");
     (temp, db, store, path)
 }
 
-fn count(db: &deepseek_code_core::db::DbManager, sql: &str, id: &str) -> i64 {
-    db.with_conn(|conn| conn.query_row(sql, [id], |row| row.get(0)))
+fn count(db: &Stores, sql: &str, id: &str) -> i64 {
+    db.directory_sql(|conn| conn.query_row(sql, [id], |row| row.get(0)))
         .unwrap()
         .unwrap()
 }
 
-fn scalar(db: &deepseek_code_core::db::DbManager, sql: &str) -> i64 {
-    db.with_conn(|conn| conn.query_row(sql, [], |row| row.get(0)))
+fn scalar(db: &Stores, sql: &str) -> i64 {
+    db.directory_sql(|conn| conn.query_row(sql, [], |row| row.get(0)))
         .unwrap()
         .unwrap()
+}
+
+fn shard_count(db: &Stores, session: &str, sql: &str, params: &[&str]) -> i64 {
+    db.shard_sql(session, |conn| conn.query_row(sql, rusqlite::params_from_iter(params), |r|r.get(0))).unwrap().unwrap()
 }
 
 /// A session create that meets a writer held past one busy timeout must not end
@@ -231,8 +240,9 @@ fn session_create_survives_a_writer_held_past_one_busy_timeout() {
 /// message exists exactly once, with the first sort order and a count of one.
 #[test]
 fn session_append_survives_a_writer_held_past_one_busy_timeout() {
-    let (temp, db, store, path) = session_fixture();
+    let (temp, db, store, _) = session_fixture();
     let id = store.create(temp.path(), "fixture", "fixture").unwrap();
+    let path = db.shard_path(&id).unwrap();
     let writer = hold_write_lock_guarded(path, Duration::from_secs(30));
     let release = writer.release.clone();
     let releaser = std::thread::spawn(move || {
@@ -251,7 +261,7 @@ fn session_append_survives_a_writer_held_past_one_busy_timeout() {
         "the fixture writer never recorded its release"
     );
     assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM messages WHERE id=?1", &message),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE id=?1", &[&message]),
         1,
         "a retried append must not duplicate the message"
     );
@@ -264,11 +274,7 @@ fn session_append_survives_a_writer_held_past_one_busy_timeout() {
         1
     );
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         1
     );
 }
@@ -285,7 +291,7 @@ fn session_create_gives_up_at_the_deadline_and_the_pool_stays_usable() {
     let elapsed = started.elapsed();
     assert!(deepseek_code_core::db::is_contention(&error), "{error:#}");
     let text = format!("{error:#}");
-    assert!(text.contains("session create"), "{text}");
+    assert!(text.contains("create intent"), "{text}");
     assert!(
         elapsed >= SESSION_WRITE_DEADLINE,
         "the create gave up before its retry budget: {elapsed:?}"
@@ -309,26 +315,23 @@ fn session_create_gives_up_at_the_deadline_and_the_pool_stays_usable() {
 /// counter left behind, and a usable pool once the writer is released.
 #[test]
 fn session_append_gives_up_at_the_deadline_and_the_pool_stays_usable() {
-    let (temp, db, store, path) = session_fixture();
+    let (temp, db, store, _) = session_fixture();
     let id = store.create(temp.path(), "fixture", "fixture").unwrap();
+    let path = db.shard_path(&id).unwrap();
     let writer = hold_write_lock_guarded(path, DEADLINE_FIXTURE_GUARD);
     let started = std::time::Instant::now();
     let error = store.append(&id, "user", "must not persist").unwrap_err();
     let elapsed = started.elapsed();
     assert!(deepseek_code_core::db::is_contention(&error), "{error:#}");
     let text = format!("{error:#}");
-    assert!(text.contains("session append"), "{text}");
+    assert!(text.contains("session write"), "{text}");
     assert!(
         elapsed >= SESSION_WRITE_DEADLINE,
         "the append gave up before its retry budget: {elapsed:?}"
     );
     assert!(!writer.released.load(Ordering::SeqCst));
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         0
     );
     assert_eq!(
@@ -343,11 +346,7 @@ fn session_append_gives_up_at_the_deadline_and_the_pool_stays_usable() {
     writer.holder.join().unwrap();
     store.append(&id, "user", "persisted once").unwrap();
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         1
     );
     assert_eq!(
@@ -365,7 +364,7 @@ fn session_append_gives_up_at_the_deadline_and_the_pool_stays_usable() {
 #[test]
 fn a_failed_create_leaves_no_partial_project_or_session() {
     let (temp, db, store, _path) = session_fixture();
-    db.with_conn(|conn| {
+    db.directory_sql(|conn| {
         conn.execute_batch(
             "CREATE TRIGGER reject_conversation BEFORE INSERT ON conversations \
              BEGIN SELECT RAISE(ABORT,'fixture create failure'); END;",
@@ -397,12 +396,12 @@ fn a_failed_create_leaves_no_partial_project_or_session() {
         ),
     ] {
         let remaining: i64 = db
-            .with_conn(|conn| conn.query_row(sql, [], |row| row.get(0)))
+            .directory_sql(|conn| conn.query_row(sql, [], |row| row.get(0)))
             .unwrap()
             .unwrap();
         assert_eq!(remaining, 0, "a failed create left a {table} row");
     }
-    db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_conversation"))
+    db.directory_sql(|conn| conn.execute_batch("DROP TRIGGER reject_conversation"))
         .unwrap()
         .unwrap();
     let id = store.create(temp.path(), "fixture", "fixture").unwrap();
@@ -418,7 +417,7 @@ fn a_failed_create_leaves_no_partial_project_or_session() {
 fn a_failed_append_leaves_the_transcript_unchanged() {
     let (temp, db, store, _path) = session_fixture();
     let id = store.create(temp.path(), "fixture", "fixture").unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(&id, |conn| {
         conn.execute_batch(
             "CREATE TRIGGER reject_message BEFORE INSERT ON messages \
              BEGIN SELECT RAISE(ABORT,'fixture append failure'); END;",
@@ -433,11 +432,7 @@ fn a_failed_append_leaves_the_transcript_unchanged() {
         "{error:#}"
     );
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         0
     );
     assert_eq!(
@@ -448,16 +443,12 @@ fn a_failed_append_leaves_the_transcript_unchanged() {
         ),
         0
     );
-    db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_message"))
+    db.shard_sql(&id, |conn| conn.execute_batch("DROP TRIGGER reject_message"))
         .unwrap()
         .unwrap();
     store.append(&id, "user", "persisted once").unwrap();
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         1
     );
 }
@@ -470,22 +461,14 @@ fn a_failed_append_leaves_the_transcript_unchanged() {
 fn a_failed_append_rolls_back_after_message_and_counter_writes() {
     let (temp, db, store, _path) = session_fixture();
     let id = store.create(temp.path(), "fixture", "fixture").unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(&id, |conn| {
         conn.execute_batch(
-            // The structured row is written after the counter. For hooks the
-            // order is message, origin, counter. Conditions prove each fault
-            // fires only after all of that append's rows have been written;
-            // activity timestamp triggers cannot cause an earlier failure.
-            "CREATE TRIGGER reject_structured_append \
-             AFTER INSERT ON message_user_content \
-             WHEN EXISTS (SELECT 1 FROM messages m JOIN conversations c \
-               ON c.id=m.conversation_id WHERE m.id=NEW.message_id AND c.message_count=1) \
-             BEGIN SELECT RAISE(ABORT,'fixture late append failure'); END; \
-             CREATE TRIGGER reject_hook_append \
-             AFTER UPDATE OF message_count ON conversations \
-             WHEN NEW.message_count > OLD.message_count AND EXISTS \
-               (SELECT 1 FROM messages m JOIN peripheral_settings p \
-                ON p.key='message-origin:' || m.id WHERE m.conversation_id=NEW.id) \
+            // Both sidecars are inserted after their owning message in the S transaction.
+            "CREATE TRIGGER reject_structured_append AFTER INSERT ON message_user_content
+             WHEN EXISTS(SELECT 1 FROM messages WHERE id=NEW.message_id)
+             BEGIN SELECT RAISE(ABORT,'fixture late append failure'); END;
+             CREATE TRIGGER reject_hook_append AFTER INSERT ON message_metadata
+             WHEN EXISTS(SELECT 1 FROM messages WHERE id=NEW.message_id)
              BEGIN SELECT RAISE(ABORT,'fixture late append failure'); END;",
         )
     })
@@ -501,11 +484,7 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
         "{error:#}"
     );
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         0,
         "the message row must not survive the rolled-back unit"
     );
@@ -519,7 +498,7 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
         "the counter update must not survive the rolled-back unit"
     );
     assert_eq!(
-        scalar(&db, "SELECT COUNT(*) FROM message_user_content"),
+        shard_count(&db,&id,"SELECT COUNT(*) FROM message_user_content", &[]),
         0,
         "the structured content row must not survive the rolled-back unit"
     );
@@ -534,19 +513,12 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
         "{error:#}"
     );
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         0,
         "the hook message row must not survive the rolled-back unit"
     );
     assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'message-origin:%'"
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM message_metadata",&[]),
         0,
         "the hook origin row must not survive the rolled-back unit"
     );
@@ -558,7 +530,7 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
         ),
         0
     );
-    db.with_conn(|conn| {
+    db.shard_sql(&id, |conn| {
         conn.execute_batch(
             "DROP TRIGGER reject_structured_append; DROP TRIGGER reject_hook_append;",
         )
@@ -569,18 +541,11 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
     // committed append.
     store.append_hook_user(&id, "hook body").unwrap();
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            &id
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM messages WHERE conversation_id=?1", &[&id]),
         1
     );
     assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'message-origin:%'"
-        ),
+        shard_count(&db, &id, "SELECT COUNT(*) FROM message_metadata",&[]),
         1,
         "a committed hook append records exactly one origin row"
     );
@@ -596,7 +561,7 @@ fn a_failed_append_rolls_back_after_message_and_counter_writes() {
 
 #[test]
 fn turn_write_survives_a_competing_writer_that_releases_within_the_deadline() {
-    let (_temp, db, message, path) = turn_fixture();
+    let (_temp, db, session, message, path) = turn_fixture();
     let (holder, release) = hold_write_lock(path);
     // Release the lock from another thread as the retry loop is waiting, so the
     // write can only succeed by retrying after contention.
@@ -607,7 +572,7 @@ fn turn_write_survives_a_competing_writer_that_releases_within_the_deadline() {
     // busy_timeout is lowered so the retry loop, not one long wait, absorbs the
     // contention; the default 5s would hide whether write_tx retries at all.
     let result = db
-        .with_conn(|conn| -> anyhow::Result<()> {
+        .shard_sql(&session, |conn| -> anyhow::Result<()> {
             conn.busy_timeout(Duration::from_millis(50)).unwrap();
             write_tx(conn, "turn results", Duration::from_secs(30), |tx| {
                 insert_tool_rows(tx, &message, 200)
@@ -618,7 +583,7 @@ fn turn_write_survives_a_competing_writer_that_releases_within_the_deadline() {
     releaser.join().unwrap();
     holder.join().unwrap();
     let count: i64 = db
-        .with_conn(|conn| {
+        .shard_sql(&session, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM tool_calls WHERE message_id=?1",
                 [&message],
@@ -632,10 +597,10 @@ fn turn_write_survives_a_competing_writer_that_releases_within_the_deadline() {
 
 #[test]
 fn turn_write_is_all_or_nothing_when_the_deadline_expires() {
-    let (_temp, db, message, path) = turn_fixture();
+    let (_temp, db, session, message, path) = turn_fixture();
     let (holder, release) = hold_write_lock(path);
     let error = db
-        .with_conn(|conn| -> anyhow::Result<()> {
+        .shard_sql(&session, |conn| -> anyhow::Result<()> {
             conn.busy_timeout(Duration::from_millis(50)).unwrap();
             write_tx(conn, "turn results", Duration::from_millis(200), |tx| {
                 insert_tool_rows(tx, &message, 200)
@@ -648,7 +613,7 @@ fn turn_write_is_all_or_nothing_when_the_deadline_expires() {
     release.send(()).unwrap();
     holder.join().unwrap();
     let count: i64 = db
-        .with_conn(|conn| {
+        .shard_sql(&session, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM tool_calls WHERE message_id=?1",
                 [&message],

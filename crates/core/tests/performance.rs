@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use deepseek_code_core::performance;
 
 #[test]
@@ -193,7 +194,7 @@ async fn shared_engine_routes_opt_in_and_preserves_explicit_provider() {
         },
     )
     .unwrap();
-    ctx.save_setting("learning.enabled", &true).unwrap();
+    ctx.save_global_setting(GlobalSetting::MachinePreference("learning.enabled"), &true).unwrap();
     let manager = Arc::new(tokio::sync::Mutex::new(ProviderManager::in_memory(
         vec![provider],
         dir.path().join("providers.json"),

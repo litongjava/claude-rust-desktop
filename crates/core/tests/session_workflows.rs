@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use deepseek_code_core::{
     db::{conversation_repo, message_repo},
     native_engine::provider_manager::ApiFormat,
@@ -26,7 +29,7 @@ fn continue_is_scoped_to_directory_and_skips_unavailable_sessions() {
     let empty = store.create(&a, "model", "provider").unwrap();
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conversation_repo::update_conversation_timestamp(conn, &empty, "2999-01-01T00:00:00Z")
                 .unwrap();
             // Seed historical ordering directly: activity updates are monotonic.
@@ -45,7 +48,7 @@ fn continue_is_scoped_to_directory_and_skips_unavailable_sessions() {
         std::fs::canonicalize(store.workspace(&first, &paths.data_dir).unwrap()).unwrap(),
         std::fs::canonicalize(&a).unwrap()
     );
-    store.db.with_conn(|conn| {
+    store.db.directory_sql(|conn| {
         conn.execute("UPDATE project_folders SET trusted = 0 WHERE project_id = (SELECT project_id FROM conversations WHERE id = ?1)", [&first]).unwrap();
     }).unwrap();
     assert!(store.latest(&a).unwrap().is_none());
@@ -74,7 +77,7 @@ fn fork_preserves_tool_history_and_leaves_source_unchanged_after_reopen() {
         let answer = store.append(&source, "assistant", "File contents").unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&source, |conn| {
                 message_repo::insert_tool_call(
                     conn,
                     "tool",

@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 // Context-status regressions: a request proves which context it used by the
 // boundary it recorded, overhead must be fully measurable, and a legacy branch
 // never claims its ancestor's compactions.
@@ -32,7 +35,7 @@ fn unknown_prompt_overhead_must_not_be_reported_as_complete() {
         "configured_context_window":128000,"requested_output_budget":1000,"sent_output_reserve":1000,"estimated_input_tokens":null});
     store
         .db
-        .with_conn(|c| {
+        .shard_sql(&id, |c| {
             message_repo::save_request_snapshots(
                 c,
                 &message,
@@ -73,7 +76,7 @@ fn pre_boundary_request_in_same_millisecond_must_not_be_current() {
     // the same millisecond, and without the boundary it never used.
     store
         .db
-        .with_conn(|c| {
+        .shard_sql(&id, |c| {
             message_repo::save_request_snapshots(
                 c,
                 &message,
@@ -90,7 +93,7 @@ fn pre_boundary_request_in_same_millisecond_must_not_be_current() {
 }
 
 #[test]
-fn legacy_branch_must_not_inherit_parent_compaction_count() {
+fn branch_must_not_inherit_parent_compaction_count() {
     let (_temp, store, id, _message) = fixture();
     compaction::commit(
         &store.db,
@@ -99,26 +102,12 @@ fn legacy_branch_must_not_inherit_parent_compaction_count() {
     )
     .unwrap();
     let fork = store.fork(&id).unwrap();
-    // Simulate a branch created before the count key was introduced.
-    store
-        .db
-        .with_conn(|c| {
-            c.execute(
-                "DELETE FROM peripheral_settings WHERE key=?1",
-                [format!("compaction.count.{fork}")],
-            )
-        })
-        .unwrap()
-        .unwrap();
     let count = compaction::count(&store.db, &fork).unwrap();
     assert_eq!(
         count,
-        compaction::CompactionCount::LegacyAfterUpgrade(0),
+        compaction::CompactionCount::Exact(0),
         "Copied ancestor boundaries are not branch executions"
     );
     assert_eq!(count.proven(), 0);
-    assert!(
-        count.to_string().contains("legacy history"),
-        "an unprovable total must be labelled: {count}"
-    );
+
 }

@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use axum::{extract::State, routing::post, Json, Router};
 use deepseek_code_core::{
     native_engine::provider_manager::Provider,
@@ -91,7 +92,7 @@ async fn consolidation_is_durable_recalled_once_and_respects_gates() {
         min_hours: 24,
         min_memories: 2,
     };
-    context.save_setting("auto-dream", &config).unwrap();
+    context.save_global_setting(GlobalSetting::MachinePreference("auto-dream"), &config).unwrap();
     assert_eq!(
         dream::run(&context, &generator, true)
             .await
@@ -126,8 +127,7 @@ async fn consolidation_is_durable_recalled_once_and_respects_gates() {
         .await
         .unwrap();
     context
-        .save_setting(
-            "auto-dream",
+        .save_global_setting(GlobalSetting::MachinePreference("auto-dream"),
             &DreamConfig {
                 min_memories: 1,
                 ..config

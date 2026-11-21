@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use deepseek_code_core::{
     db::message_repo,
     native_engine::provider_manager::ApiFormat,
@@ -15,7 +18,7 @@ fn approval_notes_follow_their_result_as_user_text_after_reopen_and_fork() {
     let call = format!("{message}:call-1");
     store
         .db
-        .with_conn(|conn| -> anyhow::Result<()> {
+        .shard_sql(&id, |conn| -> anyhow::Result<()> {
             message_repo::insert_tool_call(conn, &call, &message, "Bash", Some(r#"{"command":"git log -3"}"#), Some("abc init"), false, 0)?;
             message_repo::set_tool_call_note(conn, &call, "use -5 instead")?;
             Ok(())

@@ -54,20 +54,9 @@ fn clear_rejects_missing_and_archived_sessions_without_creating_rows() {
     let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
     let store = SessionStore::new(paths.open_database().unwrap());
     let source = store.create(temp.path(), "model", "provider").unwrap();
-    store
-        .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::archive_conversation(conn, &source, true).unwrap();
-        })
-        .unwrap();
+    store.db.open_session(&source).unwrap().set_archived(true).unwrap();
     assert!(store.clear("missing").is_err());
     assert!(store.clear(&source).is_err());
-    let count: i64 = store
-        .db
-        .with_conn(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
-        })
-        .unwrap()
-        .unwrap();
+    let count: i64 = store.db.conversations().unwrap().len() as i64;
     assert_eq!(count, 1);
 }

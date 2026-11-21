@@ -1,3 +1,7 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
+use deepseek_code_core::db::session_store::GlobalSetting;
 use deepseek_code_core::db::session_store::{ProjectEdit, Projects};
 use deepseek_code_core::{
     runtime::RuntimePaths,
@@ -69,8 +73,8 @@ fn team_model_context_is_project_and_team_scoped() {
         endpoint: "http://127.0.0.1:1234".into(),
         credential: "SECRET_ENV_NAME".into(),
     };
-    context.save_setting("team-sync", &config).unwrap();
-    context.db.with_conn(|c|c.execute("INSERT INTO team_memories(team,id,title,content,tags,deleted,revision,dirty,mutation) VALUES('team-a','m','Shared','Team fact','[]',0,1,0,'x')",[])).unwrap().unwrap();
+    context.save_global_setting(GlobalSetting::TeamConfiguration("team-sync"), &config).unwrap();
+    context.db.directory_sql(|c|c.execute("INSERT INTO team_memories(team,id,title,content,tags,deleted,revision,dirty,mutation) VALUES('team-a','m','Shared','Team fact','[]',0,1,0,'x')",[])).unwrap().unwrap();
     assert!(team::model_context(&context, &a).unwrap().is_empty());
     team::configure_model_context(&context, &a, true).unwrap();
     let result = team::model_context(&context, &a).unwrap();
@@ -78,10 +82,10 @@ fn team_model_context_is_project_and_team_scoped() {
     assert!(!result.contains("SECRET_ENV_NAME"));
     assert!(team::model_context(&context, &b).unwrap().is_empty());
     config.team = "team-b".into();
-    context.save_setting("team-sync", &config).unwrap();
+    context.save_global_setting(GlobalSetting::TeamConfiguration("team-sync"), &config).unwrap();
     assert!(team::model_context(&context, &a).unwrap().is_empty());
     config.team = "team-a".into();
-    context.save_setting("team-sync", &config).unwrap();
+    context.save_global_setting(GlobalSetting::TeamConfiguration("team-sync"), &config).unwrap();
     team::configure_model_context(&context, &a, false).unwrap();
     assert!(team::model_context(&context, &a).unwrap().is_empty());
 }
@@ -99,7 +103,7 @@ fn concurrent_hosts_initialize_and_write_shared_schema() {
                 barrier.wait();
                 let context =
                     ServiceContext::open(paths, Arc::new(EnvironmentCredentials)).unwrap();
-                context.save_setting(&format!("host-{i}"), &i).unwrap();
+                context.save_global_setting(GlobalSetting::MachinePreference(&format!("host-{i}")), &i).unwrap();
             })
         })
         .collect();
@@ -109,7 +113,7 @@ fn concurrent_hosts_initialize_and_write_shared_schema() {
     let context = ServiceContext::open(paths, Arc::new(EnvironmentCredentials)).unwrap();
     for i in 0..6 {
         assert_eq!(
-            context.setting::<i32>(&format!("host-{i}")).unwrap(),
+            context.global_setting::<i32>(GlobalSetting::MachinePreference(&format!("host-{i}"))).unwrap(),
             Some(i)
         );
     }
