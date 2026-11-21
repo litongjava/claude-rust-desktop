@@ -456,7 +456,7 @@ async fn execute(
             &session.id,
             cli.record_requests,
             cli.full_access,
-        );
+        )?;
         session
             .permissions
             .set_plan_launch_permissions(cli.allow_dangerously_skip_permissions, cli.full_access);

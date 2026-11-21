@@ -156,7 +156,7 @@ pub fn execute_live(
                 let to = target.as_str();
                 let message = live::send(context, session, to, &content)?;
                 let active = live::receiver_active(root, to)?;
-                let open = live::session_open(root, to)?;
+                let open = context.db.session_present(to)?;
                 let mut result = json!({"message":message,"state":"queued","processed":false,
                     "to":to,"delivered":[delivered(None,to)]});
                 let name = crate::services::background_sessions::list(root, Some(session))?
@@ -214,7 +214,7 @@ pub fn execute_live(
             };
             let message = live::send(context, session, &recipient, &content)?;
             let active = live::receiver_active(root, &recipient)?;
-            let open = live::session_open(root, &recipient)?;
+            let open = context.db.session_present(&recipient)?;
             let mut result = json!({"message":message,"state":"queued","processed":false,
                 "to":recipient,"delivered":[delivered(Some(to),&recipient)]});
             delivery(&mut result, active, open);

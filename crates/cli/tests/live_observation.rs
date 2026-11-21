@@ -601,7 +601,7 @@ async fn ownership_survives_a_delayed_post_compact_hook() {
     // could settle it as interrupted while it is alive.
     for _ in 0..8 {
         assert!(
-            deepseek_code_core::services::session_messages::execution_active(&data, &id).unwrap(),
+            deepseek_code_core::db::session_store::SessionAccess::select_session(&store_db(&data),&id).unwrap().execution_active(&data).unwrap(),
             "the turn lost execution ownership during the compaction hook"
         );
         let record = store_db(&data)

@@ -10,6 +10,12 @@ pub trait RecordingPolicies {
     fn recording_policy_and_parent(&self, session: &str) -> (Option<Policy>, Option<String>);
 }
 
+impl super::SessionDb {
+    pub fn set_recording_policy(&self,policy:Policy) {
+        self.stores.root.recording.write().unwrap_or_else(|e|e.into_inner()).insert(self.incarnation().to_owned(),policy);
+    }
+}
+
 impl Stores {
     pub fn set_request_recording_policy(
         &self,

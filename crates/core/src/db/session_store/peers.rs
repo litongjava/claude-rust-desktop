@@ -43,6 +43,17 @@ impl Stores {
         }
         Ok(values)
     }
+    pub fn acquire_presence(&self,id:&str)->Result<session_messages::PresenceLease> {
+        let session=self.open_session(id)?;
+        session_messages::PresenceLease::acquire(self.data_dir(),session.incarnation())
+    }
+    pub fn session_present(&self,id:&str)->Result<bool>{
+        let entry=self.global().read_directory_row(id,|c|directory::one(c,id))?;
+        match entry {
+            Some(entry)=>session_messages::session_open(self.data_dir(),&entry.incarnation),
+            None=>Ok(false),
+        }
+    }
     pub(crate) fn message_receiver_active(&self, session: &str) -> Result<bool> {
         let row = self
             .global()

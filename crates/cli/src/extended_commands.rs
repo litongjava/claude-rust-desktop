@@ -572,18 +572,19 @@ mod tests {
 
     #[test]
     fn active_agents_require_live_execution_and_exclude_unrelated_sessions() {
-        use deepseek_code_core::services::session_messages::{Consumer, PresenceLease};
+        use deepseek_code_core::services::session_messages::Consumer;
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let parent = store.create(dir.path(), "test", "cli-runtime").unwrap();
         let child = store.create(dir.path(), "test", "cli-runtime").unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.create(dir.path(), "test", "cli-runtime").unwrap();
         crate::services::context(&paths).unwrap().db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
             &json!({"session_id":child,"parent_session_id":parent,"description":"Inspect resume","current_tool":"Read","status":"running"}),
         ).unwrap();
         // Persisted running metadata and an open terminal are not active execution.
-        let _presence = PresenceLease::acquire(&paths.data_dir, &child).unwrap();
+        let _presence = store.db.acquire_presence(&child).unwrap();
         let _unrelated = Consumer::attach(&paths.data_dir, &unrelated)
             .unwrap()
             .unwrap();
@@ -615,6 +616,7 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         let parent = store.create(&project, "test", "cli-runtime").unwrap();
         let child = store.create(&project, "test", "cli-runtime").unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.create(&project, "test", "cli-runtime").unwrap();
         crate::services::context(&paths)
             .unwrap()

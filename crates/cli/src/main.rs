@@ -1155,7 +1155,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             if let Err(error) = remote.sync(&session) { command_eprintln!("Remote Control: {error:#}"); }
             if presence.as_ref().is_none_or(|(id, _)| *id != session.id) {
                 drop(presence.take());
-                presence = deepseek_code_core::services::session_messages::PresenceLease::acquire(&paths.data_dir, &session.id)
+                presence = session.store.db.acquire_presence(&session.id)
                     .ok()
                     .map(|lease| (session.id.clone(), lease));
             }

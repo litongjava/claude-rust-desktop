@@ -694,7 +694,7 @@ impl Session {
         };
         store
             .db
-            .set_request_recording_policy(&id, cli.record_requests, cli.full_access);
+            .set_request_recording_policy(&id, cli.record_requests, cli.full_access)?;
         let internal_worker = deepseek_code_core::services::background_sessions::worker_directory(
             &paths.data_dir,
             &id,
@@ -1095,16 +1095,11 @@ impl Session {
         let next=self.store.db.open_session(&self.id)?.clear_with_provider(&id,&state).context("Clear did not apply")?;
         state.generation=1;
         let target=deepseek_code_core::native_engine::session_binding::SessionBinding::default();
+        let policy=self.store.db.request_recording_policy(&self.id);
+        if let Some(policy)=policy { next.set_recording_policy(policy); }
         target.track_session(next);
         target.install(state)?;
-        let policy = self.store.db.request_recording_policy(&self.id);
         self.end_hooks("clear").await;
-        // Commit: no fallible step between these assignments.
-        if let Some(policy) = policy {
-            self.store
-                .db
-                .set_request_recording_policy(&id, policy.cli, policy.full_access);
-        }
         self.binding = target.initialized()?;
         self.providers.lock().await.binding = target;
         self.id = id.clone();
@@ -1164,6 +1159,7 @@ impl Session {
             None
         };
         let policy = self.store.db.request_recording_policy(&self.id);
+        let recording_target=self.store.db.open_session(id)?;
         // SessionEnd can wait on a hook while another frontend changes the target.
         // Validate a separate populated handle before changing any live reference.
         self.end_hooks("other").await;
@@ -1191,11 +1187,7 @@ impl Session {
         }
         self.workspace = workspace;
         self.auto_route = false;
-        if let Some(policy) = policy {
-            self.store
-                .db
-                .set_request_recording_policy(id, policy.cli, policy.full_access);
-        }
+        if let Some(policy)=policy { recording_target.set_recording_policy(policy); }
         self.id = id.to_owned();
         self.waiting_for_continue
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1798,10 +1790,9 @@ impl Session {
 
     pub(crate) async fn dispatch_input(&self,cli:&Cli,item:deepseek_code_core::services::input_queue::QueueItem,input:&mut Option<TerminalInput>)->Result<()> {
         self.apply_settings_permissions(cli)?;
-        let notice=item.request_id.starts_with("internal-cli:notice:");
         let prompt=item.content.as_str().or_else(||item.content.pointer("/0/text").and_then(Value::as_str)).unwrap_or_default().to_owned();
         let mut completion=TurnCompletion{queued:Some(item),..Default::default()};
-        let result=self.run_and_finalize_turn(cli,&prompt,input,notice,false,true,&mut completion).await;
+        let result=self.run_and_finalize_turn(cli,&prompt,input,false,false,true,&mut completion).await;
         match completion.stdout_failure { Some(failure)=>Err(failure.into()),None=>result }
     }
 
@@ -4306,12 +4297,7 @@ mod event_tests {
         turn.await.unwrap().unwrap();
         // The rejected turn never owned the session; the admitted one released
         // it when it returned.
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-            &paths.data_dir,
-            &id,
-        )
-        .expect("the session is free after the admitted turn")
-        .expect("a real session id");
+        second.store.db.open_session(&id).unwrap().acquire_execution().expect("the session is free after the admitted turn");
         second.close().await.unwrap();
         server.abort();
     }
@@ -4363,10 +4349,7 @@ mod event_tests {
             // The lease is released by the completed turn itself, so the next
             // turn is admitted immediately without waiting or retrying.
             assert!(
-                !deepseek_code_core::services::session_messages::execution_active(
-                    &paths.data_dir,
-                    &id
-                )
+                !deepseek_code_core::db::session_store::SessionAccess::select_session(&session.store.db,&id).unwrap().execution_active(&paths.data_dir)
                 .unwrap(),
                 "turn {index} returned while the session was still owned"
             );

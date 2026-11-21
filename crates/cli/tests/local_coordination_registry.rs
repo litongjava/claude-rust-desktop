@@ -1539,7 +1539,7 @@ async fn registry_failure_does_not_break_session() {
     .unwrap()
     .expect("the turn created a session");
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(&data, &session.id)
+        deepseek_code_core::db::session_store::Stores::open(&data).unwrap().open_session(&session.id).unwrap().acquire_execution()
             .is_err(),
         "the failed registration must not bypass the execution lease"
     );
@@ -1743,10 +1743,7 @@ async fn registry_worker_survives_frontend_exit() {
 
     // The running turn still owns the execution lease; no one bypassed it.
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-            &fixture.join("data"),
-            &session
-        )
+        deepseek_code_core::db::session_store::Stores::open(&fixture.join("data")).unwrap().open_session(&session).unwrap().acquire_execution()
         .is_err(),
         "the executor's execution lease stays active"
     );
@@ -2500,10 +2497,7 @@ async fn registry_host_owned_turn_refreshes_branch_without_duplicate_row() {
         "the workspace bytes are unchanged"
     );
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-            &fixture.join("data"),
-            &session
-        )
+        deepseek_code_core::db::session_store::Stores::open(&fixture.join("data")).unwrap().open_session(&session).unwrap().acquire_execution()
         .is_err(),
         "the running turn still holds its execution lease"
     );
@@ -3020,7 +3014,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     writer.flush().unwrap();
     let hook_deadline = Instant::now() + Duration::from_secs(120);
     while !entered.exists() {
-        assert!(Instant::now() < hook_deadline, "the clear hook never ran");
+        assert!(Instant::now() < hook_deadline, "the clear hook never ran: {}",std::fs::read_to_string(&log_path).unwrap_or_default());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The switch is already committed while its hook is still held.

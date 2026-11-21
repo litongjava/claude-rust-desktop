@@ -220,7 +220,6 @@ async fn title_waits_for_writer_after_init() {
 
 #[test]
 fn idle_resume_releases_execution_lease_while_writer_is_held() {
-    use deepseek_code_core::services::session_messages::ExecutionLease;
     let fixture = Fixture::new();
     let holder = fixture.lock_writer();
     let (done, finished) = std::sync::mpsc::channel();
@@ -231,11 +230,11 @@ fn idle_resume_releases_execution_lease_while_writer_is_held() {
             done.send(settled).unwrap();
         });
         let result = finished.recv_timeout(Duration::from_secs(2));
-        let probe = ExecutionLease::acquire(&fixture.paths.data_dir, &fixture.id);
+        let probe = fixture.store.db.open_session(&fixture.id).and_then(|s|s.acquire_execution());
         holder.execute_batch("ROLLBACK").unwrap();
         assert!(result
             .expect("idle resume waited for the unrelated writer")
             .is_empty());
-        assert!(probe.unwrap().is_some());
+        assert!(probe.is_ok());
     });
 }
