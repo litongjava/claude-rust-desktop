@@ -1,6 +1,8 @@
 //! Durable discovery for idle local sessions. Parking never submits a model turn.
 use super::{background_sessions as jobs, session_permission_mode, session_worker, ServiceContext};
-use crate::{permissions::PermissionMode, runtime::SessionStore};
+#[cfg(test)]
+use crate::runtime::SessionStore;
+use crate::{db::session_store::WorkerDirectory, permissions::PermissionMode};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -39,7 +41,7 @@ fn key(parent: &str, session: &str) -> Result<String> {
     );
     Ok(format!("{}{session}", prefix(parent)?))
 }
-fn active(context: &ServiceContext, session: &str) -> Result<Option<jobs::Job>> {
+fn active<D>(context: &ServiceContext<D>, session: &str) -> Result<Option<jobs::Job>> {
     Ok(jobs::list(&context.paths.data_dir, None)?
         .into_iter()
         .find(|job| {
@@ -49,23 +51,30 @@ fn active(context: &ServiceContext, session: &str) -> Result<Option<jobs::Job>> 
 }
 
 /// Validate the same project trust/worktree binding used by normal resume.
-pub fn validate_idle(context: &ServiceContext, parent: &str, session: &str) -> Result<PathBuf> {
+pub fn validate_idle<D: WorkerDirectory>(
+    context: &ServiceContext<D>,
+    parent: &str,
+    session: &str,
+) -> Result<PathBuf> {
     key(parent, session)?;
-    let store = SessionStore::new(context.db.clone());
-    store.resume(parent)?;
-    store.resume(session)?;
+    let workspace = context.db.parking_workspace(
+        parent,
+        session,
+        &context.paths.data_dir.join("workspaces"),
+    )?;
     if let Some(job) = active(context, session)? {
         anyhow::bail!("Session has active task {}; use /tasks attach {} or cancel it before parking an idle session", job.id, job.id);
     }
-    store.workspace(session, &context.paths.data_dir.join("workspaces"))
+    Ok(workspace)
 }
 
-pub async fn park(
-    context: &ServiceContext,
+pub async fn park<D: WorkerDirectory>(
+    context: &ServiceContext<D>,
     parent: &str,
     session: &str,
     executable: &Path,
 ) -> Result<ParkedSession> {
+    let pair = context.db.worker_pair(parent, session)?;
     let workspace = validate_idle(context, parent, session)?;
     let worker =
         session_worker::ensure_worker(&context.paths.data_dir, executable, session, &workspace)
@@ -78,38 +87,37 @@ pub async fn park(
         initial_worker_id: worker.id,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    context.save_setting(&key(parent, session)?, &record)
+    context.db.park_worker(&pair, &record)
         .with_context(||format!("Idle worker started for session {session}, but discovery registration failed; resume that session directly"))?;
     Ok(record)
 }
 
-pub fn registered(context: &ServiceContext, parent: &str) -> Result<Vec<ParkedSession>> {
-    let prefix = prefix(parent)?;
-    context.db.with_conn(|conn| -> Result<_> {
-        let mut query =
-            conn.prepare("SELECT value FROM peripheral_settings WHERE key LIKE ?1 ORDER BY key")?;
-        let rows = query.query_map([format!("{prefix}%")], |row| row.get::<_, String>(0))?;
-        let mut records = Vec::new();
-        for row in rows {
-            let record: ParkedSession = serde_json::from_str(&row?)?;
-            ensure!(
-                record.parent_session_id == parent,
-                "Parked session ownership mismatch"
-            );
-            key(parent, &record.session_id)?;
-            records.push(record);
-        }
-        Ok(records)
-    })?
+pub fn registered<D: WorkerDirectory>(
+    context: &ServiceContext<D>,
+    parent: &str,
+) -> Result<Vec<ParkedSession>> {
+    prefix(parent)?;
+    let records = context.db.parked_workers(parent)?;
+    for record in &records {
+        ensure!(
+            record.parent_session_id == parent,
+            "Parked session ownership mismatch"
+        );
+        key(parent, &record.session_id)?;
+    }
+    Ok(records)
 }
 
-pub async fn list(context: &ServiceContext, parent: &str) -> Result<Vec<ParkedStatus>> {
+pub async fn list<D: WorkerDirectory>(
+    context: &ServiceContext<D>,
+    parent: &str,
+) -> Result<Vec<ParkedStatus>> {
     let records = registered(context, parent)?;
     futures::future::try_join_all(records.into_iter().map(|record| async move {
         let worker =
             session_worker::runtime_status(&context.paths.data_dir, &record.session_id).await;
         let job = active(context, &record.session_id)?;
-        let saved = context.db.conversation_metadata(&record.session_id)?;
+        let saved = context.db.parked_metadata(&record.session_id)?;
         let mode = session_permission_mode::load(&context.db, &record.session_id)?;
         let mode = match mode {
             Some(PermissionMode::BypassPermissions) | None => PermissionMode::AskPermissions,
@@ -138,7 +146,11 @@ pub async fn list(context: &ServiceContext, parent: &str) -> Result<Vec<ParkedSt
     .await
 }
 
-pub async fn stop(context: &ServiceContext, parent: &str, session: &str) -> Result<()> {
+pub async fn stop<D: WorkerDirectory>(
+    context: &ServiceContext<D>,
+    parent: &str,
+    session: &str,
+) -> Result<()> {
     ensure!(
         parent == session
             || registered(context, parent)?

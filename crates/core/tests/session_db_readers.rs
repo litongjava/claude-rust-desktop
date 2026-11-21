@@ -847,3 +847,45 @@ fn manual_compaction_binds_the_prepared_transcript_to_its_incarnation() -> Resul
     assert!(replacement.read(|r| r.messages())?.is_empty());
     Ok(())
 }
+
+#[test]
+fn worker_registration_fences_both_sides_of_an_ipc_wait() -> Result<()> {
+    use deepseek_code_core::{
+        db::session_store::WorkerDirectory,
+        native_engine::child_session::ChildOwnership,
+        services::session_parking::ParkedSession,
+    };
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let parent = stores.create("parent", Default::default())?;
+    let child = stores.create("child", Default::default())?;
+    let pair = stores.worker_pair(parent.id(), child.id())?;
+    let parked = ParkedSession {
+        parent_session_id: parent.id().into(), session_id: child.id().into(),
+        initial_worker_id: "worker-1".into(), created_at:"now".into(),
+    };
+    let owner = ChildOwnership {
+        parent_session_id: parent.id().into(), agent_type:"general".into(), description:"task".into(),
+        mode:"background".into(), status:"running".into(), job_id:None,
+        created_at:"now".into(), updated_at:"now".into(), last_error:None,
+    };
+    stores.park_worker(&pair, &parked)?;
+    stores.save_child_owner(&pair, &owner)?;
+    assert_eq!(stores.child_owner(child.id())?,Some(owner.clone()));
+    assert_eq!(stores.parked_workers(parent.id())?[0].initial_worker_id,"worker-1");
+
+    parent.delete()?;
+    stores.create("parent", Default::default())?;
+    assert!(stores.parked_workers("parent")?.is_empty());
+    assert!(stores.park_worker(&pair, &parked).is_err());
+    assert!(stores.child_owner(child.id()).is_err());
+    assert!(stores.save_child_owner(&stores.worker_pair("parent","child")?, &owner).is_err());
+
+    let delayed = stores.worker_pair("parent","child")?;
+    child.delete()?;
+    stores.create("child", Default::default())?;
+    assert!(stores.park_worker(&delayed, &parked).is_err());
+    assert!(stores.save_child_owner(&delayed, &owner).is_err());
+    assert!(stores.child_owner("child")?.is_none());
+    Ok(())
+}

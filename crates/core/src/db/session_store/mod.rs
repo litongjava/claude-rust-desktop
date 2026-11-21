@@ -21,6 +21,8 @@ mod executor;
 mod engine;
 mod children;
 mod child_reader;
+mod worker_directory;
+pub use worker_directory::{WorkerDirectory, WorkerPair};
 mod recording;
 pub use recording::RecordingPolicies;
 mod segment;

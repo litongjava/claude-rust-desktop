@@ -6,6 +6,7 @@
 //! from the delegation behavior. Callers remain responsible for their own
 //! entry-point limits, such as the delegation depth check.
 use crate::native_engine::provider_manager::ResolvedProvider;
+use crate::db::session_store::{WorkerDirectory, WorkerPair};
 use crate::runtime::{RuntimePaths, SessionStore};
 use crate::services::{
     agents, background_sessions, subagents, EnvironmentCredentials, ServiceContext,
@@ -153,6 +154,7 @@ pub(crate) struct PreparedChildLaunch {
     invocation: Option<ChildInvocation>,
     reserved_job_id: Option<String>,
     ownership: ChildOwnership,
+    owners: WorkerPair,
 }
 
 /// Validates the parent, allocates or adopts the child session, and builds the
@@ -395,6 +397,7 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
+    let owners = context.db.worker_pair(&spawn.parent_session_id,&session_id)?;
     let workspace = match &spawn.workspace {
         ChildWorkspace::Directory(_) => requested_workspace
             .clone()
@@ -526,6 +529,7 @@ pub(crate) async fn prepare_child_session(
         invocation: spawn.invocation,
         reserved_job_id: spawn.reserved_job_id,
         ownership,
+        owners,
     })
 }
 
@@ -549,11 +553,12 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
         invocation,
         reserved_job_id,
         mut ownership,
+        owners,
     } = prepared;
     ownership.status = "starting".into();
     ownership.updated_at = chrono::Utc::now().to_rfc3339();
     ownership.last_error = None;
-    save_owner(&context, &session_id, &ownership)?;
+    context.db.save_child_owner(&owners, &ownership)?;
 
     if let Some((task_id, member)) = &member_binding {
         let store =
@@ -619,7 +624,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
             ownership.status = "failed".into();
             ownership.updated_at = chrono::Utc::now().to_rfc3339();
             ownership.last_error = Some(format!("{error:#}"));
-            let _ = save_owner(&context, &session_id, &ownership);
+            let _ = context.db.save_child_owner(&owners, &ownership);
             if let Some(invocation) = invocation.as_mut() {
                 let _ = invocation.finish(&Err(anyhow::anyhow!(error.to_string())));
             }
@@ -629,7 +634,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
     ownership.status = job.status.clone();
     ownership.job_id = Some(job.id.clone());
     ownership.updated_at = chrono::Utc::now().to_rfc3339();
-    save_owner(&context, &session_id, &ownership)?;
+    context.db.save_child_owner(&owners, &ownership)?;
     if let Some(invocation) = invocation.as_mut() {
         invocation.finish(&Ok(json!({"backgrounded":true})))?;
     }
@@ -837,16 +842,13 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn owner_key(session: &str) -> String {
-    format!("{OWNER_KEY_PREFIX}{session}")
+pub fn owner_record<D: WorkerDirectory>(context: &ServiceContext<D>, session: &str) -> Result<Option<ChildOwnership>> {
+    context.db.child_owner(session)
 }
 
-pub fn owner_record(context: &ServiceContext, session: &str) -> Result<Option<ChildOwnership>> {
-    context.setting(&owner_key(session))
-}
-
-fn save_owner(context: &ServiceContext, session: &str, owner: &ChildOwnership) -> Result<()> {
-    context.save_setting(&owner_key(session), owner)
+fn save_owner<D: WorkerDirectory>(context: &ServiceContext<D>, session: &str, owner: &ChildOwnership) -> Result<()> {
+    let owners = context.db.worker_pair(&owner.parent_session_id,session)?;
+    context.db.save_child_owner(&owners,owner)
 }
 
 fn require_session(
