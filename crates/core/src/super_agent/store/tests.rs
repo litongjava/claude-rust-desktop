@@ -63,11 +63,6 @@ fn repo(task_id: &str) -> RepoTarget {
 }
 
 fn finalizing(store: &TaskStore) -> TaskRecord {
-    let policy = StatePolicy::default();
-    let task = store
-        .create_task("router", spec("Fix login"), "create")
-        .unwrap();
-    store.save_repo(&repo(&task.task_id)).unwrap();
     // Sessions must exist in the durable store; a nonempty string is not proof.
     let sessions = crate::runtime::SessionStore::new(store.db().clone());
     let coder = sessions
@@ -83,8 +78,20 @@ fn finalizing(store: &TaskStore) -> TaskRecord {
     sessions
         .append(&reviewer, "user", "review the task")
         .unwrap();
+    finalizing_with_members(store, &coder, &reviewer)
+}
+fn finalizing_with_members<D: TaskDatabase>(
+    store: &TaskStore<D>,
+    coder: &str,
+    reviewer: &str,
+) -> TaskRecord {
+    let policy = StatePolicy::default();
+    let task = store
+        .create_task("router", spec("Fix login"), "create")
+        .unwrap();
+    store.save_repo(&repo(&task.task_id)).unwrap();
     store
-        .set_sessions(&task.task_id, Some(&coder), Some(&reviewer))
+        .set_sessions(&task.task_id, Some(coder), Some(reviewer))
         .unwrap();
     for (event_type, operation, payload) in [
         (EventType::DiscoveryCompleted, "discovery", json!({})),
@@ -324,9 +331,24 @@ fn spec_updates_invalidate_old_reports_and_expire_old_approvals() {
 
 #[test]
 fn completion_requires_the_gate_and_records_the_event() {
-    let (_temp, data, store) = fixture();
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let paths = crate::runtime::RuntimePaths::new(data.clone()).unwrap();
+    let roots = Arc::new(paths.open_stores().unwrap());
+    let store = TaskStore::new(roots.clone(), data.clone());
+    let sessions = crate::runtime::SessionStore::new(roots.clone());
+    let coder = sessions.create(temp.path(), "m", "p").unwrap();
+    let reviewer = sessions.create(temp.path(), "m", "p").unwrap();
+    sessions.append(&coder, "user", "implementation").unwrap();
+    sessions.append(&reviewer, "user", "review").unwrap();
     let policy = StatePolicy::default();
-    let record = finalizing(&store);
+    let record = finalizing_with_members(&store, &coder, &reviewer);
+    let member = roots.open_session(&coder).unwrap();
+    member.set_archived(true).unwrap();
+    assert!(store
+        .complete_task(&record.task_id, "complete", &policy)
+        .is_err());
+    member.set_archived(false).unwrap();
     let completed = store
         .complete_task(&record.task_id, "complete", &policy)
         .unwrap();
@@ -334,9 +356,12 @@ fn completion_requires_the_gate_and_records_the_event() {
     assert_eq!(completed.phase, Phase::Finalizing);
     let events = store.events(&record.task_id).unwrap();
     assert_eq!(events.last().unwrap().event_type, EventType::TaskCompleted);
-    let reopened = crate::db::DbManager::new(data.join("deepseek_code.db")).unwrap();
-    reopened.init().unwrap();
-    let reopened = TaskStore::new(Arc::new(reopened), data.clone());
+    let captured=store.run_read(|c| Ok(c.query_row(
+        "SELECT content_revision FROM sa_completion_evidence WHERE session_id=?1 AND incarnation=?2",
+        [&coder,member.incarnation()],|r|r.get::<_,i64>(0))?)).unwrap();
+    assert_eq!(captured, member.read(|r| r.projection()).unwrap().revision);
+    drop(store);
+    let reopened = TaskStore::new(Arc::new(paths.open_stores().unwrap()), data.clone());
     assert_eq!(
         reopened.get_task(&record.task_id).unwrap().unwrap().status,
         Status::Completed

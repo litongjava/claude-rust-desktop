@@ -21,6 +21,7 @@ mod runtime;
 pub mod settings;
 mod state;
 mod usage;
+mod task;
 pub use delivery::*;
 pub use history::*;
 pub use state::GlobalSetting;

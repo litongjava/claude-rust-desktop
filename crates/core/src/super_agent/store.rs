@@ -30,7 +30,7 @@ use thiserror::Error;
 
 const MAX_REPORT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -96,22 +96,66 @@ pub struct ApprovalDraft {
     pub permission_policy_version: u32,
 }
 
-#[derive(Clone)]
-pub struct TaskStore {
-    db: Arc<DbManager>,
-    data_dir: PathBuf,
+pub(crate) enum Decision<'a> {
+    Task(&'a str),
+    Event(&'a str),
+    Pending(&'a str),
+}
+pub(crate) struct MemberEvidence {
+    pub incarnation: String,
+    pub revision: i64,
+    pub nonempty: bool,
+}
+#[derive(Default)]
+pub(crate) struct EvidenceFence {
+    pub locks: Vec<std::fs::File>,
+    pub members: std::collections::BTreeMap<String, MemberEvidence>,
+}
+pub(crate) trait TaskDatabase {
+    fn task_read<T>(&self, f: impl FnOnce(&Connection) -> AnyResult<T>) -> AnyResult<T>;
+    fn task_write<T>(
+        &self,
+        label: &str,
+        f: impl FnMut(&Transaction<'_>) -> AnyResult<T>,
+    ) -> AnyResult<T>;
+    fn fence_decision(&self, selection: Decision<'_>) -> AnyResult<Option<EvidenceFence>>;
+}
+impl TaskDatabase for DbManager {
+    fn task_read<T>(&self, f: impl FnOnce(&Connection) -> AnyResult<T>) -> AnyResult<T> {
+        self.with_conn(f)?
+    }
+    fn task_write<T>(
+        &self,
+        label: &str,
+        f: impl FnMut(&Transaction<'_>) -> AnyResult<T>,
+    ) -> AnyResult<T> {
+        self.with_conn(|c| crate::db::write_tx(c, label, WRITE_DEADLINE, f))?
+    }
+    fn fence_decision(&self, _: Decision<'_>) -> AnyResult<Option<EvidenceFence>> {
+        Ok(None)
+    }
 }
 
-impl TaskStore {
-    pub fn new(db: Arc<DbManager>, data_dir: PathBuf) -> Self {
+pub struct TaskStore<D = DbManager> {
+    db: Arc<D>,
+    data_dir: PathBuf,
+}
+impl<D> Clone for TaskStore<D> {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            data_dir: self.data_dir.clone(),
+        }
+    }
+}
+impl<D: TaskDatabase> TaskStore<D> {
+    pub fn new(db: Arc<D>, data_dir: PathBuf) -> Self {
         Self { db, data_dir }
     }
-
-    pub fn from_context(context: &crate::services::ServiceContext) -> Self {
+    pub fn from_context(context: &crate::services::ServiceContext<D>) -> Self {
         Self::new(context.db.clone(), context.paths.data_dir.clone())
     }
-
-    pub fn db(&self) -> &Arc<DbManager> {
+    pub fn db(&self) -> &Arc<D> {
         &self.db
     }
 
@@ -124,30 +168,17 @@ impl TaskStore {
         label: &str,
         mut operation: impl FnMut(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let inner = self
-            .db
-            .with_conn(|connection| {
-                crate::db::write_tx(connection, label, WRITE_DEADLINE, |tx| {
-                    operation(tx).map_err(anyhow::Error::new)
-                })
-            })
-            .map_err(StoreError::Internal)?
-            .map_err(|error| match error.downcast::<StoreError>() {
-                Ok(error) => error,
-                Err(error) => StoreError::Internal(error),
-            })?;
-        Ok(inner)
+        self.db
+            .task_write(label, |tx| operation(tx).map_err(anyhow::Error::new))
+            .map_err(unpack)
     }
-
     fn run_read<T>(
         &self,
         read: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        match self.db.with_conn(read) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(StoreError::Internal(error)),
-        }
+        self.db
+            .task_read(|c| read(c).map_err(anyhow::Error::new))
+            .map_err(unpack)
     }
 
     pub fn create_task(
@@ -258,10 +289,15 @@ impl TaskStore {
         policy: &StatePolicy,
     ) -> Result<EventAppend, StoreError> {
         validate_operation_id(&event.operation_id)?;
+        let fence = if event.event_type == EventType::TaskCompleted {
+            self.db.fence_decision(Decision::Task(task_id))?
+        } else {
+            None
+        };
         self.run_tx("super-agent apply event", |tx| {
             let (stored, inserted) = append_event_conn(tx, task_id, &event)?;
             if inserted {
-                apply_transition_conn(tx, &self.data_dir, &stored, policy)?;
+                apply_transition_conn(tx, &self.data_dir, &stored, policy, fence.as_ref())?;
             }
             Ok(EventAppend {
                 event: stored,
@@ -290,13 +326,14 @@ impl TaskStore {
         event_id: &str,
         policy: &StatePolicy,
     ) -> Result<Option<TaskRecord>, StoreError> {
+        let fence = self.db.fence_decision(Decision::Event(event_id))?;
         self.run_tx("super-agent process event", |tx| {
             let event = event_by_id(tx, event_id)?
                 .ok_or_else(|| StoreError::Invalid(format!("event {event_id} not found")))?;
             if event.processed {
                 return Ok(None);
             }
-            let record = apply_transition_conn(tx, &self.data_dir, &event, policy)?;
+            let record = apply_transition_conn(tx, &self.data_dir, &event, policy, fence.as_ref())?;
             Ok(Some(record))
         })
     }
@@ -309,6 +346,7 @@ impl TaskStore {
         router_session: &str,
         policy: &StatePolicy,
     ) -> Result<Vec<TaskRecord>, StoreError> {
+        let fence = self.db.fence_decision(Decision::Pending(router_session))?;
         self.run_tx("super-agent process pending", |tx| {
             let mut statement = tx.prepare(
                 "SELECT e.event_id FROM sa_events e JOIN sa_tasks t ON t.task_id=e.task_id WHERE t.router_session_id=?1 AND e.processed=0 ORDER BY e.task_id, e.sequence",
@@ -323,7 +361,7 @@ impl TaskStore {
                 if event.processed {
                     continue;
                 }
-                records.push(apply_transition_conn(tx, &self.data_dir, &event, policy)?);
+                records.push(apply_transition_conn(tx, &self.data_dir, &event, policy,fence.as_ref())?);
             }
             Ok(records)
         })
@@ -390,13 +428,14 @@ impl TaskStore {
     /// Recheck the same durable completion gate before archiving/removing assets.
     /// Git and process liveness are checked by the cleanup executor separately.
     pub(crate) fn validate_cleanup_evidence(&self, task_id: &str) -> Result<(), StoreError> {
+        let fence = self.db.fence_decision(Decision::Task(task_id))?;
         self.run_read(|conn| {
             let record = load_record_conn(conn, task_id)?
                 .ok_or_else(|| StoreError::TaskNotFound(task_id.into()))?;
             if record.status != Status::Completed {
                 return Err(StoreError::Invalid("Cleanup requires COMPLETED".into()));
             }
-            let evidence = gate_evidence_conn(conn, &self.data_dir, &record)?;
+            let evidence = gate_evidence_conn(conn, &self.data_dir, &record, fence.as_ref())?;
             state::completion_gate(
                 &record,
                 &record.repositories,
@@ -1136,10 +1175,7 @@ impl TaskStore {
     /// order. Both the typed repository-scoped table and the legacy
     /// single-repository table are returned; callers reconcile each row against
     /// its persisted plan instead of guessing which schema produced it.
-    pub fn delivery_dispatches(
-        &self,
-        task_id: &str,
-    ) -> Result<Vec<DeliveryDispatch>, StoreError> {
+    pub fn delivery_dispatches(&self, task_id: &str) -> Result<Vec<DeliveryDispatch>, StoreError> {
         self.run_read(|tx| {
             let mut dispatches = Vec::new();
             {
@@ -1644,12 +1680,19 @@ fn validate_report_body(
     Ok(())
 }
 
+fn unpack(error: anyhow::Error) -> StoreError {
+    error
+        .downcast::<StoreError>()
+        .unwrap_or_else(StoreError::Internal)
+}
+
 /// Collects the durable facts the pure gate cannot read, inside the same
 /// transaction that will commit the completion.
 fn gate_evidence_conn(
     conn: &Connection,
     data_dir: &Path,
     record: &TaskRecord,
+    fence: Option<&EvidenceFence>,
 ) -> Result<GateEvidence, StoreError> {
     let mut evidence = GateEvidence::default();
     for session in [
@@ -1665,6 +1708,17 @@ fn gate_evidence_conn(
         }
         // A durable member is an existing, unarchived Code session with a
         // real transcript. An empty conversation row is not execution proof.
+        if let Some(fence) = fence {
+            if let Some(member) = fence.members.get(id) {
+                let visible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM conversations c JOIN sa_member_sessions b ON b.session_id=c.id AND b.incarnation=c.incarnation
+                    WHERE c.id=?1 AND c.incarnation=?2 AND c.archived=0 AND c.workspace_mode='code' AND b.task_id=?3)",
+                    [id,&member.incarnation,&record.task_id],|r|r.get(0))?;
+                if member.nonempty && visible {
+                    evidence.verified_sessions.insert(id.into());
+                }
+            }
+            continue;
+        }
         let row: Option<(i64, i64, String)> = conn
             .query_row(
                 "SELECT archived, (SELECT COUNT(*) FROM messages WHERE conversation_id=conversations.id), workspace_mode FROM conversations WHERE id=?1",
@@ -2066,6 +2120,7 @@ fn apply_transition_conn(
     data_dir: &Path,
     event: &Event,
     policy: &StatePolicy,
+    fence: Option<&EvidenceFence>,
 ) -> Result<TaskRecord, StoreError> {
     let record = load_record_conn(tx, &event.task_id)?
         .ok_or_else(|| StoreError::TaskNotFound(event.task_id.clone()))?;
@@ -2073,10 +2128,17 @@ fn apply_transition_conn(
         let repos = load_repos_conn(tx, &event.task_id)?;
         let reports = load_reports_conn(tx, &event.task_id)?;
         let approvals = load_approvals_conn(tx, &event.task_id)?;
-        let evidence = gate_evidence_conn(tx, data_dir, &record)?;
+        let evidence = gate_evidence_conn(tx, data_dir, &record, fence)?;
         if let Err(unmet) = state::completion_gate(&record, &repos, &reports, &approvals, &evidence)
         {
             return Err(StoreError::Gate(unmet));
+        }
+        if let Some(fence) = fence {
+            for id in &evidence.verified_sessions {
+                let member = &fence.members[id];
+                tx.execute("INSERT INTO sa_completion_evidence(event_id,session_id,incarnation,content_revision) VALUES(?1,?2,?3,?4)",
+                    params![event.event_id,id,member.incarnation,member.revision])?;
+            }
         }
     }
     let draft = NewEvent {

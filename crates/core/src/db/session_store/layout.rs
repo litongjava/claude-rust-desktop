@@ -12,7 +12,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
-pub(super) const GLOBAL_VERSION: i32 = 7;
+pub(super) const GLOBAL_VERSION: i32 = 8;
 pub(super) const SESSION_VERSION: i32 = 7;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
@@ -268,6 +268,7 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                 }
                 tx.execute_batch(include_str!("global_v6.sql"))?;
                 tx.execute_batch(include_str!("global_v7.sql"))?;
+                tx.execute_batch(include_str!("global_v8.sql"))?;
             }
             tx.pragma_update(None, "user_version", schema_version(kind))?;
             Ok(())
@@ -498,6 +499,17 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     } else {
         &[("sync_receipts", "digest content_revision metadata_revision")]
     };
+    let evidence: &[(&str, &str)] = if kind == GLOBAL && expected >= 8 {
+        &[
+            (
+                "sa_completion_evidence",
+                "event_id session_id incarnation content_revision",
+            ),
+            ("sa_member_sessions", "task_id role session_id incarnation"),
+        ]
+    } else {
+        &[]
+    };
     for &(table, required) in tables
         .iter()
         .chain(added)
@@ -506,6 +518,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         .chain(shared)
         .chain(bindings)
         .chain(sync)
+        .chain(evidence)
     {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
@@ -598,6 +611,7 @@ pub(super) fn initialize(
         install_global_v5(&tx)?;
         tx.execute_batch(include_str!("global_v6.sql"))?;
         tx.execute_batch(include_str!("global_v7.sql"))?;
+        tx.execute_batch(include_str!("global_v8.sql"))?;
     }
     populate(&tx)?;
     if kind == SESSION {
