@@ -357,6 +357,7 @@ pub struct ToolLoopExecutor {
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
     durable_user_input: bool,
+    turn_delivery: std::sync::Weak<std::sync::Mutex<crate::db::session_store::DeliveryOwner>>,
     message_inbox: Option<crate::services::session_messages::Target>,
     require_pending_peer_message: bool,
     require_hook_wake: bool,
@@ -1666,6 +1667,7 @@ impl ToolLoopExecutor {
             pending_user_skill: None,
             manual_skill_active: false,
             durable_user_input: false,
+            turn_delivery: Default::default(),
             message_inbox: None,
             require_pending_peer_message: false,
             require_hook_wake: false,
@@ -3697,12 +3699,16 @@ impl ToolLoopExecutor {
         &self,
         after_tool_results: bool,
     ) -> Vec<crate::services::input_queue::DeliveredInput> {
-        let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) else {
-            return Vec::new();
-        };
-        if !after_tool_results {
-            return Vec::new();
+        if !after_tool_results { return Vec::new(); }
+        if let Some(owner) = self.turn_delivery.upgrade() {
+            let inputs = owner.lock().unwrap_or_else(|e|e.into_inner()).poll_turn(false, 8).unwrap_or_else(|error| {
+                tracing::warn!("Steer handoff retained for recovery: {error:#}");
+                Vec::new()
+            });
+            for input in &inputs { let _ = self.event_tx.send(EngineEvent::QueuedInput(input.clone())).await; }
+            return inputs;
         }
+        let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) else { return Vec::new(); };
         let inputs = crate::services::input_queue::take(db, id).unwrap_or_else(|error| {
             tracing::warn!("Queued input unavailable: {error:#}");
             Vec::new()
@@ -3791,10 +3797,11 @@ impl ToolLoopExecutor {
     }
 
     fn drain_peer_messages(&mut self) -> Result<Vec<String>> {
-        let messages = match self.message_inbox.as_ref() {
-            Some(inbox) => inbox.drain(32usize.saturating_sub(self.message_deliveries))?,
-            None => Vec::new(),
-        };
+        let limit = 32usize.saturating_sub(self.message_deliveries);
+        let messages = if let Some(owner) = self.turn_delivery.upgrade() {
+            owner.lock().unwrap_or_else(|e| e.into_inner()).poll_turn(true, limit)?
+                .into_iter().map(|input| input.text).collect()
+        } else if let Some(inbox) = &self.message_inbox { inbox.drain(limit)? } else { Vec::new() };
         self.message_deliveries += messages.len();
         Ok(messages)
     }
@@ -3890,13 +3897,18 @@ impl ToolLoopExecutor {
             self.publish_context_reset(boundary_id).await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
+        let turn_delivery = if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
+            let lease = self.execution_lease.clone().context("Turn delivery requires execution ownership")?;
+            Some(std::sync::Arc::new(std::sync::Mutex::new(shard.delivery_under_lease(lease)?)))
+        } else { None };
+        self.turn_delivery = turn_delivery.as_ref().map(std::sync::Arc::downgrade).unwrap_or_default();
         let inbox_owner = match (
             self.search_config_path
                 .as_deref()
                 .and_then(std::path::Path::parent),
             self.conv_id.as_deref(),
         ) {
-            (Some(root), Some(session)) => {
+            (Some(root), Some(session)) if turn_delivery.is_none() => {
                 crate::services::session_messages::Consumer::attach(root, session)?
             }
             _ => None,

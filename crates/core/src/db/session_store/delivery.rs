@@ -449,6 +449,7 @@ impl SessionDb {
             session: self.clone(),
             _lease: lease,
             _consumer: consumer,
+            live_handoffs: Default::default(),
         })
     }
 
@@ -510,6 +511,7 @@ pub struct DeliveryOwner {
     pub(super) session: SessionDb,
     _lease: std::sync::Arc<ExecutionLease>,
     _consumer: ExecutionLease,
+    live_handoffs: std::collections::HashSet<String>,
 }
 #[derive(Debug, PartialEq)]
 pub struct Handoff {
@@ -557,6 +559,21 @@ impl DeliveryOwner {
         Ok(None)
     }
     pub fn next_queue(&mut self, mode: QueueMode, tool: Option<&str>) -> Result<Option<Handoff>> {
+        self.queue_before(
+            mode,
+            tool,
+            std::time::Instant::now() + super::WRITE_DEADLINE,
+            false,
+        )
+    }
+
+    fn queue_before(
+        &mut self,
+        mode: QueueMode,
+        tool: Option<&str>,
+        until: std::time::Instant,
+        live: bool,
+    ) -> Result<Option<Handoff>> {
         layout::allow_entry()?;
         let s = &self.session;
         let mode = mode_name(mode);
@@ -592,7 +609,7 @@ impl DeliveryOwner {
                 })?;
             }
         }
-        let claim = s.stores.global().write("claim queue", &s.id, true, |c| {
+        let claim = s.stores.global().write_with_deadline("claim queue", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
             let Some((id, state)) = pending(c)? else {
                 return Ok(None);
             };
@@ -614,38 +631,57 @@ impl DeliveryOwner {
                 })
             })?))
         })?;
-        claim.map(|c| self.complete(c)).transpose()
+        claim.map(|c| self.complete(c, until, live)).transpose()
     }
     pub fn next_peer(&mut self) -> Result<Option<Handoff>> {
+        self.peer_before(
+            usize::MAX,
+            std::time::Instant::now() + super::WRITE_DEADLINE,
+            false,
+        )
+    }
+
+    fn peer_before(
+        &mut self,
+        max_bytes: usize,
+        until: std::time::Instant,
+        live: bool,
+    ) -> Result<Option<Handoff>> {
         layout::allow_entry()?;
         let s = &self.session;
         let claims = s.stores.global().read(|c| {
             let mut q = c.prepare(
-                "SELECT id,payload,sender,coalesce(generation,0) FROM session_inbox
+                "SELECT id,payload,sender,coalesce(generation,0),size FROM session_inbox
                 WHERE recipient=?1 AND state IN ('claimed','queued','blocked')
                 ORDER BY CASE state WHEN 'claimed' THEN 0 ELSE 1 END,rowid",
             )?;
             let result = q
                 .query_map([&s.id], |r| {
-                    Ok(Claim {
-                        id: r.get(0)?,
-                        hash: r.get(1)?,
-                        target: None,
-                        sender: Some(r.get(2)?),
-                        steer: false,
-                        revision: r.get(3)?,
-                    })
+                    Ok((
+                        Claim {
+                            id: r.get(0)?,
+                            hash: r.get(1)?,
+                            target: None,
+                            sender: Some(r.get(2)?),
+                            steer: false,
+                            revision: r.get(3)?,
+                        },
+                        r.get::<_, usize>(4)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(result)
         })?;
-        for mut claim in claims {
+        for (mut claim, size) in claims {
+            if size > max_bytes {
+                return Ok(None);
+            }
             if self.has_receipt(&claim)? {
                 // The authorized generation already committed its local effect.
                 // Its frozen claim is sufficient for the acknowledgement CAS.
-                return self.complete(claim).map(Some);
+                return self.complete(claim, until, live).map(Some);
             }
-            let authorized = s.stores.global().write("claim inbox", &s.id, true, |c| {
+            let authorized = s.stores.global().write_with_deadline("claim inbox", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
                 let sender_live: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM session_inbox i JOIN conversations c ON c.id=i.sender AND c.incarnation=i.sender_incarnation WHERE i.id=?1)", [&claim.id], |r| r.get(0))?;
                 if !sender_live {
                     c.execute("UPDATE session_inbox SET state='undeliverable',blocked_reason='Sender retired before local delivery' WHERE id=?1", [&claim.id])?;
@@ -677,10 +713,63 @@ impl DeliveryOwner {
                 continue;
             };
             claim.revision = generation;
-            return self.complete(claim).map(Some);
+            return self.complete(claim, until, live).map(Some);
         }
         Ok(None)
     }
+    /// Model-boundary polling shares a single contention budget across the batch.
+    /// An ack-only retry injects content only if this same live owner committed it.
+    pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
+        use crate::db::message_repo;
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let mut remaining = 128 * 1024;
+        let mut inputs = Vec::new();
+        for _ in 0..limit.min(8) {
+            if std::time::Instant::now() >= until {
+                break;
+            }
+            let next = if peers {
+                self.peer_before(remaining, until, true)
+            } else {
+                self.queue_before(QueueMode::Steer, None, until, true)
+            };
+            let handoff = match next {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(error) if crate::db::is_contention(&error) => break,
+                Err(error) => return Err(error),
+            };
+            if !self.live_handoffs.remove(&handoff.id) {
+                continue;
+            }
+            let input = self.session.connection_under_lock(
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                |c| {
+                    // A previously claimed steer can be addressed to a particular tool.
+                    // Its tool sidecar already contains it and must not gain a second message.
+                    let Some(row) = message_repo::get_message(c, &handoff.id)? else {
+                        return Ok(None);
+                    };
+                    ensure!(
+                        row.conversation_id == self.session.id && row.role == "user",
+                        "Invalid delivered context"
+                    );
+                    let content = message_repo::user_content_for_display(c, &row)?;
+                    Ok(Some(DeliveredInput {
+                        text: row.content,
+                        content,
+                        origin: handoff.id.clone(),
+                    }))
+                },
+            )?;
+            if let Some(input) = input {
+                remaining = remaining.saturating_sub(input.text.len());
+                inputs.push(input);
+            }
+        }
+        Ok(inputs)
+    }
+
     fn has_receipt(&self, claim: &Claim) -> Result<bool> {
         self.session
             .connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
@@ -698,7 +787,7 @@ impl DeliveryOwner {
                 Ok(existing.is_some())
             })
     }
-    fn complete(&self, claim: Claim) -> Result<Handoff> {
+    fn complete(&mut self, claim: Claim, until: std::time::Instant, live: bool) -> Result<Handoff> {
         let s = &self.session;
         s.stores.step(Phase::DeliveryClaimed)?;
         let fresh = if self.has_receipt(&claim)? {
@@ -713,7 +802,7 @@ impl DeliveryOwner {
             } else {
                 None
             };
-            let delivered = s.write_locked("deliver input", |tx| {
+            let delivered = s.write_locked_with_deadline("deliver input", until.saturating_duration_since(std::time::Instant::now()), |tx| {
                 ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {
                     let exists: bool = tx.0.query_row(
@@ -771,7 +860,7 @@ impl DeliveryOwner {
             if !delivered {
                 s.stores
                     .global()
-                    .write("cancel rewound tool delivery", &s.id, true, |c| {
+                    .write_with_deadline("cancel rewound tool delivery", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
                         ensure!(
                             c.execute("UPDATE session_input_queue SET state='cancelled', revision=revision+1 WHERE session_id=?1 AND delivery_id=?2 AND revision=?3 AND state='claimed'", params![s.id, claim.id, claim.revision])? == 1,
                             "Stale tool claim"
@@ -783,20 +872,33 @@ impl DeliveryOwner {
                     applied: false,
                 });
             }
+            if live {
+                self.live_handoffs.insert(claim.id.clone());
+            }
             true
         };
         // Routine writes use NORMAL. Before making the cross-file handoff
         // durable in G, flush the committed receipt (also on ack-only replay).
         // A pinned reader can postpone the checkpoint; the G claim stays live.
         s.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
+            let _wait = crate::db::BusyTimeoutGuard::within(
+                c,
+                until.saturating_duration_since(std::time::Instant::now()),
+            )?;
             let busy: i64 = c.query_row("PRAGMA wal_checkpoint(FULL)", [], |r| r.get(0))?;
-            ensure!(busy == 0, "Receipt checkpoint busy for session {}", s.id);
+            if busy != 0 {
+                return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ))
+                .context(format!("Receipt checkpoint busy for session {}", s.id)));
+            }
             Ok(())
         })?;
         s.stores.step(Phase::DeliveryCommitted)?;
         s.stores
             .global()
-            .write("acknowledge delivery", &s.id, true, |c| {
+            .write_with_deadline("acknowledge delivery", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
                 let changed = if claim.sender.is_some() {
                     c.execute("UPDATE session_inbox SET state='context_committed',blocked_reason=NULL,committed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1 AND recipient=?2 AND state='claimed' AND generation=?3", params![claim.id, s.id, claim.revision])?
                 } else {
@@ -810,5 +912,40 @@ impl DeliveryOwner {
             id: claim.id,
             applied: fresh,
         })
+    }
+}
+
+#[cfg(test)]
+mod turn_delivery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn busy_ack_defers_a_live_steer_without_losing_or_repeating_its_content() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let stores = Stores::open(root.path())?;
+        let hold = AtomicBool::new(true);
+        let stores = stores.with_fault_hook(move |phase| {
+            if phase == Phase::DeliveryCommitted && hold.swap(false, Ordering::SeqCst) {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )
+                .into());
+            }
+            Ok(())
+        });
+        let session = stores.create("live-consumer", Default::default())?;
+        let mut owner = session.delivery_owner()?;
+        session.write(|w| w.start_turn())?;
+        session.enqueue("req", &serde_json::json!("update"), QueueMode::Steer)?;
+        assert!(owner.poll_turn(false, 8)?.is_empty());
+        let inputs = owner.poll_turn(false, 8)?;
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].content, "update");
+        assert!(owner.poll_turn(false, 8)?.is_empty());
+        assert_eq!(session.read(|r| r.messages())?.len(), 1);
+        assert!(owner.begin_generation()?.is_none());
+        Ok(())
     }
 }

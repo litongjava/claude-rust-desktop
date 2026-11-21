@@ -135,6 +135,17 @@ impl GlobalDb {
         label: &str,
         id: &str,
         publication: bool,
+        body: impl FnMut(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.write_with_deadline(label, id, publication, super::WRITE_DEADLINE, body)
+    }
+
+    pub(super) fn write_with_deadline<T>(
+        &self,
+        label: &str,
+        id: &str,
+        publication: bool,
+        deadline: std::time::Duration,
         mut body: impl FnMut(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         let start = Instant::now();
@@ -144,7 +155,12 @@ impl GlobalDb {
                 "synchronous",
                 if publication { "FULL" } else { "NORMAL" },
             )?;
-            crate::db::write_tx(conn, label, super::WRITE_DEADLINE, |tx| body(tx))
+            crate::db::write_tx(
+                conn,
+                label,
+                deadline.saturating_sub(start.elapsed()),
+                |tx| body(tx),
+            )
         })
         .map_err(|e| crate::db::write_boundary_context(label, id, start, e))
     }
