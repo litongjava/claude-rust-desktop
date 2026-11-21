@@ -25,7 +25,6 @@ pub use user_content::{image_block_from_file, image_media_type, normalize_user_c
 /// Default data directory under the user's home.
 pub const DATA_DIR_NAME: &str = ".deepseek-code";
 /// SQLite database shared by the CLI and Desktop inside the data directory.
-pub const DATABASE_FILE: &str = "deepseek_code.db";
 /// Explicit data directory override.
 pub const DATA_DIR_ENV: &str = "DEEPSEEK_CODE_DATA_DIR";
 

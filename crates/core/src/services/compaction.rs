@@ -1336,7 +1336,7 @@ mod count_tests {
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
-    use crate::runtime::{RuntimePaths, SessionStore, DATABASE_FILE};
+    use crate::runtime::{RuntimePaths, SessionStore};
 
     fn fixture() -> (
         tempfile::TempDir,

@@ -271,7 +271,7 @@ pub mod file_changed;
 mod tests {
     use super::*;
     use crate::db::test_support;
-    use crate::runtime::{RuntimePaths, DATABASE_FILE};
+    use crate::runtime::RuntimePaths;
     use std::time::{Duration, Instant};
 
     #[test]

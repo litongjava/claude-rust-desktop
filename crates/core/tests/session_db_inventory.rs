@@ -1,4 +1,5 @@
 //! Guard for SQLite access in tracked host, engine, service, and fixture source.
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path, process::Command};
 
 const TERMS: [&str; 5] = [
@@ -13,9 +14,8 @@ const SOURCE: [&str; 21] = [
     "*.kt", "*.kts", "*.swift", "*.java", "*.c", "*.h", "*.cpp", "*.cs", "*.go", "*.vue",
 ];
 const ALLOW: &str = include_str!("storage_inventory/allow.tsv");
-const REMAINING: &str = include_str!("storage_inventory/pending.tsv");
 
-fn inventory(root: &Path) -> BTreeMap<(String, String), usize> {
+fn inventory(root: &Path) -> BTreeMap<(String, String), (usize, String)> {
     // Use the index to select files, and the working tree for their current contents.
     let tracked = Command::new("git")
         .current_dir(root)
@@ -38,18 +38,28 @@ fn inventory(root: &Path) -> BTreeMap<(String, String), usize> {
             Err(e) => panic!("{path}: {e}"),
         };
         for term in TERMS {
-            let lines = source
+            let mut matching = source
                 .split(|b| *b == b'\n')
                 .filter(|line| line.windows(term.len()).any(|s| s == term.as_bytes()))
-                .count();
-            if lines != 0 {
-                result.insert((path.to_owned(), term.to_owned()), lines);
+                .map(|line| std::str::from_utf8(line).unwrap().trim())
+                .collect::<Vec<_>>();
+            if !matching.is_empty() {
+                matching.sort_unstable();
+                let mut digest = Sha256::new();
+                for line in &matching {
+                    digest.update(line.as_bytes());
+                    digest.update(b"\n");
+                }
+                result.insert(
+                    (path.into(), term.into()),
+                    (matching.len(), format!("{:x}", digest.finalize())),
+                );
             }
         }
     }
     result
 }
-fn limits(text: &str) -> BTreeMap<(String, String), usize> {
+fn limits(text: &str) -> BTreeMap<(String, String), (usize, String)> {
     text.lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|row| {
@@ -57,7 +67,17 @@ fn limits(text: &str) -> BTreeMap<(String, String), usize> {
             let path = fields.next().unwrap().to_owned();
             let term = fields.next().unwrap().to_owned();
             let count = fields.next().unwrap().parse().unwrap();
-            ((path, term), count)
+            let digest = fields
+                .next()
+                .expect("Missing reviewed SQL fingerprint")
+                .to_owned();
+            assert!(
+                fields
+                    .next()
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "Inventory entry lacks a reason"
+            );
+            ((path, term), (count, digest))
         })
         .collect()
 }
@@ -70,22 +90,20 @@ fn raw_store_access_is_accounted_for_in_tracked_source() {
         .unwrap();
     let actual = inventory(root);
     let allowed = limits(ALLOW);
-    let pending = limits(REMAINING);
-    let runtime = std::fs::read_to_string(root.join("crates/core/src/runtime.rs")).unwrap();
-    let legacy_opener = runtime.contains(".canonicalize()?.join(DATABASE_FILE)");
     let mut violations = Vec::new();
-    for (key, count) in actual {
-        let max = allowed
-            .get(&key)
-            .or_else(|| legacy_opener.then(|| pending.get(&key)).flatten())
-            .copied()
-            .unwrap_or_default();
-        if count > max {
+    for (key, fingerprint) in &actual {
+        if allowed.get(key) != Some(fingerprint) {
             violations.push(format!(
-                "{}: {} ({} lines, limit {})",
-                key.0, key.1, count, max
+                "{}: {} ({} matching lines)",
+                key.0, key.1, fingerprint.0
             ));
         }
+    }
+    for key in allowed.keys().filter(|key| !actual.contains_key(*key)) {
+        violations.push(format!(
+            "Remove obsolete allowance for {}: {}",
+            key.0, key.1
+        ));
     }
     assert!(
         violations.is_empty(),
