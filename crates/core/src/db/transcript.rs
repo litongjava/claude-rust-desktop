@@ -118,7 +118,9 @@ pub fn replace_messages(
             ["conversation_id", "conversationId"].into_iter().all(|key| {
                 msg.get(key).and_then(|v| v.as_str()).is_none_or(|source| source == id)
             })
-                && (previous.is_some() || owner.accepts(&msg_id)),
+                && (previous.is_some() || owner.accepts(&msg_id) || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM removed_message_owners WHERE id=?1 AND role=?2)",
+                    rusqlite::params![msg_id,role], |r|r.get::<_,bool>(0))?),
             "Message ID belongs to a different conversation"
         );
         if let Some(previous) = &previous {

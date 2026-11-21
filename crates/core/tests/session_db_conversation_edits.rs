@@ -68,3 +68,24 @@ fn sync_reconciles_changed_user_display_and_preserves_unchanged_parts() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn synced_message_ids_can_be_restored_only_in_the_receiving_shard() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let a = Stores::open(source.path())?;
+    a.create("shared", Default::default())?
+        .write(|w| w.append("user", "from another device"))?;
+    let b = Stores::open(destination.path())?;
+    let target = b.create("shared", Default::default())?;
+    let rows = a.sync_messages("shared")?;
+    b.sync_conversation("shared", None, &rows)?;
+    let snapshot = b.conversation_detail("shared")?.1;
+    target.edit_conversation(&json!({"messages":[]}))?;
+    target.edit_conversation(&json!({"messages":snapshot}))?;
+    assert_eq!(b.sync_messages("shared")?[0].id, rows[0].id);
+    let other = b.create("different", Default::default())?;
+    let unqualified = json!({"messages":[{"id":rows[0].id,"role":"user","content":"foreign"}]});
+    assert!(other.edit_conversation(&unqualified).is_err());
+    Ok(())
+}

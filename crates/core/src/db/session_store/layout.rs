@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 pub(super) const GLOBAL_VERSION: i32 = 14;
-pub(super) const SESSION_VERSION: i32 = 8;
+pub(super) const SESSION_VERSION: i32 = 9;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -260,6 +260,7 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                     tx.execute_batch(include_str!("session_v6.sql"))?;
                 }
                 tx.execute_batch(include_str!("session_v7.sql"))?;
+                tx.execute_batch(include_str!("session_v9.sql"))?;
                 super::admission::install(path)?;
                 tx.execute("UPDATE manifest SET content_revision=content_revision+1 WHERE (SELECT transcript_bytes FROM projection_state)<>?1",[previous])?;
             }
@@ -549,6 +550,11 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
     } else {
         &[]
     };
+    let removed: &[(&str, &str)] = if kind == SESSION && expected >= 9 {
+        &[("removed_message_owners", "id role")]
+    } else {
+        &[]
+    };
     for &(table, required) in tables
         .iter()
         .chain(added)
@@ -563,6 +569,7 @@ pub(super) fn verify_structure(conn: &Connection, kind: i32, expected: i32) -> R
         .chain(worker_records)
         .chain(registrations)
         .chain(edits)
+        .chain(removed)
     {
         let actual = columns
             .query_map([table], |r| r.get::<_, String>(0))?
@@ -650,6 +657,7 @@ pub(super) fn initialize(
         tx.execute_batch(include_str!("session_v5.sql"))?;
         tx.execute_batch(include_str!("session_v6.sql"))?;
         tx.execute_batch(include_str!("session_v7.sql"))?;
+        tx.execute_batch(include_str!("session_v9.sql"))?;
     }
     if kind == GLOBAL {
         install_global_v5(&tx)?;
