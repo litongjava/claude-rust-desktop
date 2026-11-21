@@ -174,34 +174,6 @@ impl GlobalDb {
         };
         self.read(read)
     }
-    pub fn conversation(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::db::conversation_repo::ConversationRow>> {
-        self.read_directory_row(id, |conn| {
-            let snapshot = conn.unchecked_transaction()?;
-            let mut row = crate::db::conversation_repo::conversation_metadata(&snapshot, id)?;
-            if let Some(conversation) = row.as_mut().filter(|r| {
-                r.title
-                    .as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("CLI session"))
-            }) {
-                let prompt: Option<String> = snapshot.query_row(
-                    "SELECT first_prompt FROM conversations WHERE id=?1",
-                    [id],
-                    |r| r.get(0),
-                )?;
-                if let Some(title) = prompt
-                    .as_deref()
-                    .and_then(crate::db::conversation_repo::prompt_title)
-                {
-                    conversation.title = Some(title);
-                }
-            }
-            Ok(row)
-        })
-    }
-
     #[doc(hidden)]
     pub fn with_read_for_test<T>(&self, body: impl FnOnce() -> T) -> Result<T> {
         self.read(|_| Ok(body()))

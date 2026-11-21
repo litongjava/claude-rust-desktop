@@ -285,7 +285,7 @@ pub struct ConversationRow {
     pub message_count: i64,
 }
 
-fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRow> {
+pub(crate) fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRow> {
     Ok(ConversationRow {
         id: row.get(0)?,
         title: row.get(1)?,
