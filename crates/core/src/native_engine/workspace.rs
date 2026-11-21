@@ -18,14 +18,14 @@ use crate::db::{conversation_repo, project_repo};
 /// child-resume path refuses a workspace change unless the launcher set
 /// `allow_workspace_move`.
 pub fn rebind_conversation_workspace(conn: &Connection, id: &str, workspace: &Path) -> Result<()> {
-    let workspace = workspace
-        .canonicalize()
-        .context("Workspace is unavailable")?;
-    ensure!(workspace.is_dir(), "Workspace must be a directory");
-    let path = workspace.to_string_lossy().into_owned();
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let conversation =
-        conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
+    crate::db::write_tx(conn,"rebind session workspace",crate::db::STARTUP_WRITE_DEADLINE,|tx|rebind_in(tx,id,workspace))
+}
+
+pub(crate) fn rebind_in(tx:&Connection,id:&str,workspace:&Path)->Result<()> {
+    let workspace=workspace.canonicalize().context("Workspace is unavailable")?;
+    ensure!(workspace.is_dir(),"Workspace must be a directory");
+    let path=workspace.to_string_lossy().into_owned();
+    let conversation=conversation_repo::conversation_metadata(tx,id)?.context("Session not found")?;
     // A managed worktree owns its own resolution path; rebinding the project
     // underneath it would make the binding inconsistent.
     let managed: bool = tx.query_row(
@@ -82,7 +82,6 @@ pub fn rebind_conversation_workspace(conn: &Connection, id: &str, workspace: &Pa
         )? == 1,
         "Session not found"
     );
-    tx.commit()?;
     Ok(())
 }
 

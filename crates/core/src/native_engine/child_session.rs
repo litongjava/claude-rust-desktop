@@ -274,14 +274,7 @@ pub(crate) async fn prepare_child_session(
                     // checkout and takes precedence over the new workspace, so
                     // it is staged with the move: restored if the database
                     // rebind fails, dropped when it commits.
-                    context.db.with_conn(|conn| -> Result<()> {
-                        super::workspace::move_conversation_workspace(
-                            conn,
-                            &context.paths.data_dir,
-                            session,
-                            requested,
-                        )
-                    })??;
+                    context.db.select_session(session)?.move_child_workspace(&context.paths.data_dir,session,requested)?;
                 }
             }
             (session.to_owned(), true)
@@ -851,26 +844,7 @@ fn child_belongs_to_parent(
     if let Some(owner) = owner {
         return Ok(owner.parent_session_id == parent);
     }
-    let invoked = context
-        .db
-        .with_conn(|conn| subagents::list_invocations(conn, parent, None))??
-        .into_iter()
-        .any(|invocation| invocation.child_session_id == child);
-    if invoked {
-        return Ok(true);
-    }
-    let bound = context.db.with_conn(|conn| -> Result<bool> {
-        use rusqlite::OptionalExtension;
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM conversation_private_workspace_bindings WHERE child_id=?1 AND parent_id=?2",
-                rusqlite::params![child, parent],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    })??;
-    Ok(bound)
+    context.db.child_of(parent,child)
 }
 
 #[cfg(test)]

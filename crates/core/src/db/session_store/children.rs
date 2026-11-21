@@ -65,8 +65,11 @@ impl ExecutorHistory {
         self.child_repo()
             .set_preference(super::settings::CHILD_PROGRESS, Some(progress))
     }
-    pub(crate) fn require_child_resume(&self,owner:&str,error:&str)->Result<()> {
-        let key=match self {Self::Session(_)=>"delegation.progress".into(),Self::Shared(_,id)=>format!("delegation.{id}")};
+    pub(crate) fn require_child_resume(&self, owner: &str, error: &str) -> Result<()> {
+        let key = match self {
+            Self::Session(_) => "delegation.progress".into(),
+            Self::Shared(_, id) => format!("delegation.{id}"),
+        };
         self.child_repo().write("mark child for resume",|c,_|{
             c.execute("UPDATE peripheral_settings SET value=json_set(value,'$.status','needs_resume','$.error',?3)
                 WHERE key=?1 AND json_extract(value,'$.parent_session_id')=?2 AND json_extract(value,'$.status')='completed'",
@@ -180,5 +183,100 @@ impl crate::db::DbManager {
     }
     pub(crate) fn is_agent_fork(&self, session: &str) -> Result<bool> {
         self.with_conn(|c| Ok(super::state::local(c, &format!("fork-of.{session}"))?.is_some()))?
+    }
+}
+
+fn owner_binding(
+    c: &rusqlite::Connection,
+    root: &std::path::Path,
+    parent: &str,
+    child: &str,
+    expected: &std::path::Path,
+    split: bool,
+) -> Result<Value> {
+    use crate::db::conversation_repo::conversation_metadata;
+    use rusqlite::OptionalExtension;
+    use serde_json::json;
+    let p = conversation_metadata(c, parent)?.context("Owner missing")?;
+    let child_row = conversation_metadata(c, child)?.context("Child missing")?;
+    ensure!(
+        !p.archived && !child_row.archived,
+        "Owner or child archived"
+    );
+    let workspaces = if !split && child_row.project_id.as_deref().is_none_or(str::is_empty) {
+        expected
+            .parent()
+            .context("Private root missing")?
+            .to_owned()
+    } else {
+        root.join("workspaces")
+    };
+    let resolve = |id: &str| -> Result<std::path::PathBuf> {
+        if split {
+            super::lifecycle::workspace(c, &workspaces, id)
+        } else {
+            Ok(crate::native_engine::workspace::resolve_workspace(c, &workspaces, id, None)?.0)
+        }
+    };
+    let actual = resolve(child)?.canonicalize()?;
+    let owner = resolve(parent)?.canonicalize()?;
+    let isolated = if actual != owner && p.project_id == child_row.project_id {
+        let saved: Option<(String, String)> = c
+            .query_row(
+                "SELECT source_path,path FROM conversation_worktrees WHERE conversation_id=?1",
+                [child],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        saved.is_some_and(|(source, path)| {
+            std::path::Path::new(&source).canonicalize().ok().as_ref() == Some(&owner)
+                && std::path::Path::new(&path).canonicalize().ok().as_ref() == Some(&actual)
+        })
+    } else {
+        false
+    };
+    ensure!(
+        (actual == owner || isolated) && actual == expected.canonicalize()?,
+        "Owner/child workspace no longer matches"
+    );
+    let mut binding = json!({"runtime":root.canonicalize()?,"parent_project":p.project_id,"parent_mode":p.workspace_mode,"child_project":child_row.project_id,"child_mode":child_row.workspace_mode,"owner_cwd":owner,"cwd":actual,"provider":child_row.provider,"model":child_row.model});
+    if split {
+        let (p,k):(String,String)=c.query_row("SELECT p.incarnation,c.incarnation FROM session_execution_parents e JOIN conversations p ON (p.id,p.incarnation)=(e.parent_id,e.parent_incarnation) JOIN conversations c ON c.id=e.child_id WHERE p.id=?1 AND c.id=?2",[parent,child],|r|Ok((r.get(0)?,r.get(1)?))).context("Child execution parent changed")?;
+        binding["parent_incarnation"] = p.into();
+        binding["child_incarnation"] = k.into();
+    }
+    Ok(binding)
+}
+
+impl super::Stores {
+    pub(crate) fn owned_workspace_binding(
+        &self,
+        parent: &str,
+        child: &str,
+        expected: &std::path::Path,
+    ) -> Result<Value> {
+        self.global().read(|c| {
+            let tx = c.unchecked_transaction()?;
+            owner_binding(&tx, self.data_dir(), parent, child, expected, true)
+        })
+    }
+    pub(crate) fn child_of(&self, parent: &str, child: &str) -> Result<bool> {
+        self.global().read(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM session_execution_parents e JOIN conversations p ON (p.id,p.incarnation)=(e.parent_id,e.parent_incarnation) WHERE e.child_id=?1 AND p.id=?2)",[child,parent],|r|r.get(0))?))
+    }
+}
+impl crate::db::DbManager {
+    pub(crate) fn owned_workspace_binding(
+        &self,
+        parent: &str,
+        child: &str,
+        expected: &std::path::Path,
+    ) -> Result<Value> {
+        self.with_conn(|c| owner_binding(c, self.data_dir(), parent, child, expected, false))?
+    }
+    pub(crate) fn child_of(&self, parent: &str, child: &str) -> Result<bool> {
+        self.with_conn(|c|{
+            if crate::services::subagents::list_invocations(c,parent,None)?.iter().any(|row|row.child_session_id==child){return Ok(true);}
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM conversation_private_workspace_bindings WHERE child_id=?1 AND parent_id=?2)",[child,parent],|r|r.get(0))?)
+        })?
     }
 }

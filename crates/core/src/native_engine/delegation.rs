@@ -231,27 +231,7 @@ fn owned_binding(
     child: &str,
     expected: &str,
 ) -> Result<Value> {
-    context.db.with_conn(|conn| -> Result<Value> {
-        let parent_row=crate::db::conversation_repo::get_conversation(conn,parent)?.context("Owner missing")?;
-        let child_row=crate::db::conversation_repo::get_conversation(conn,child)?.context("Child missing")?;
-        ensure!(!parent_row.archived && !child_row.archived,"Owner or child archived");
-        let root=if child_row.project_id.as_deref().is_none_or(str::is_empty) {std::path::Path::new(expected).parent().context("Private root missing")?.to_path_buf()} else {context.paths.data_dir.join("workspaces")};
-        let actual=crate::native_engine::workspace::resolve_workspace(conn,&root,child,None)?.0.canonicalize()?;
-        let owner=crate::native_engine::workspace::resolve_workspace(conn,&root,parent,None)?.0.canonicalize()?;
-        let isolated = if actual != owner && parent_row.project_id == child_row.project_id {
-            use rusqlite::OptionalExtension;
-            let saved: Option<(String, String)> = conn.query_row(
-                "SELECT source_path,path FROM conversation_worktrees WHERE conversation_id=?1",
-                [child], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            saved.is_some_and(|(source, path)| {
-                std::path::Path::new(&source).canonicalize().ok().as_ref() == Some(&owner)
-                    && std::path::Path::new(&path).canonicalize().ok().as_ref() == Some(&actual)
-            })
-        } else { false };
-        ensure!((actual==owner || isolated) && actual==std::path::Path::new(expected).canonicalize()?,"Owner/child workspace no longer matches");
-        Ok(json!({"runtime":context.paths.data_dir.canonicalize()?,"parent_project":parent_row.project_id,"parent_mode":parent_row.workspace_mode,"child_project":child_row.project_id,"child_mode":child_row.workspace_mode,"owner_cwd":owner,"cwd":actual,"provider":child_row.provider,"model":child_row.model}))
-    })?
+    context.db.owned_workspace_binding(parent,child,std::path::Path::new(expected))
 }
 
 /// Loads agent memory Markdown from the upstream scope directories.
@@ -1118,12 +1098,8 @@ impl ToolLoopExecutor {
                 &workspaces_root,
                 std::path::Path::new(&self.workspace_cwd),
             )?;
-            context.db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
-                    rusqlite::params![child, provider.model.id, provider.provider.id],
-                )
-            })??;
+            use crate::db::session_store::SessionAccess;
+            context.db.select_session(&child)?.initialize_child_model(&provider.model.id,&provider.provider.id)?;
             child
         } else {
             sessions.create(

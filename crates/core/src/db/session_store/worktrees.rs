@@ -158,6 +158,42 @@ impl SessionRepository<'_> {
     }
 }
 
+impl SessionRepository<'_> {
+    pub(crate) fn move_child_workspace(
+        &self,
+        root: &Path,
+        id: &str,
+        workspace: &Path,
+    ) -> Result<()> {
+        use crate::native_engine::tool_loop::{RealShellCwdFs, ShellCwdReset};
+        let reset = ShellCwdReset::prepare_with(&RealShellCwdFs, root, id)?;
+        match self.update_workspace("rebind session workspace", |tx, owner| {
+            ensure!(owner == id, "Session identity changed");
+            crate::native_engine::workspace::rebind_in(tx, owner, workspace)
+        }) {
+            Ok(()) => reset.commit_with(&RealShellCwdFs),
+            Err(error) => match reset.restore_with(&RealShellCwdFs) {
+                Ok(()) => Err(error),
+                Err(restore) => Err(error.context(format!(
+                    "the shell state could not be restored either: {restore:#}"
+                ))),
+            },
+        }
+    }
+    pub(crate) fn initialize_child_model(&self, model: &str, provider: &str) -> Result<()> {
+        self.update_workspace("initialize child model", |tx, id| {
+            ensure!(
+                tx.execute(
+                    "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
+                    params![id, model, provider]
+                )? == 1,
+                "Child session disappeared"
+            );
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
