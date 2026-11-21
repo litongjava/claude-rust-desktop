@@ -236,6 +236,41 @@ fn conversation_snapshot_preserves_typed_content_and_turns_and_rolls_back_bad_id
 }
 
 #[test]
+fn snapshot_message_references_follow_the_issuing_incarnation() -> Result<()> {
+    use serde_json::json;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let first = stores.create("first", Default::default())?;
+    let second = stores.create("second", Default::default())?;
+    let original = first.write(|w| w.append("user", "source"))?;
+    let row = json!({"id":original, "role":"user", "content":"restored"});
+    first.write(|w| w.replace_messages(&[]))?;
+    first.write(|w| w.replace_messages(std::slice::from_ref(&row)))?;
+    assert_eq!(first.read(|r| r.messages())?[0].id, original);
+    let local = json!({"id":"client-id", "role":"user", "content":"retained"});
+    second.write(|w| w.replace_messages(std::slice::from_ref(&local)))?;
+    assert!(second
+        .write(|w| w.replace_messages(&[
+            json!({"id":"client-id", "content":"roll back"}),
+            row.clone()
+        ]))
+        .is_err());
+    assert!(
+        second
+            .write(|w| w
+                .replace_messages(&[json!({"id":"other-client-id", "conversation_id":"first"})]))
+            .is_err()
+    );
+    assert_eq!(second.read(|r| r.messages())?[0].content, "retained");
+    first.delete()?;
+    let replacement = stores.create("first", Default::default())?;
+    assert!(replacement
+        .write(|w| w.replace_messages(std::slice::from_ref(&row)))
+        .is_err());
+    Ok(())
+}
+
+#[test]
 fn im_threads_share_the_directory_without_owning_a_code_transcript() -> Result<()> {
     use deepseek_code_core::im_integration::session_manager::{SessionContext, SessionMessage};
     use serde_json::json;

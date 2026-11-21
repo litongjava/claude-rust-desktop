@@ -17,10 +17,11 @@ struct LegacyMessage {
 }
 impl LegacySession {
     pub(super) fn populate(&self, c: &Connection) -> Result<()> {
+        let ids = crate::db::transcript::MessageIds::for_shard(c)?;
         for (i, m) in self.messages.iter().enumerate() {
             crate::db::message_repo::insert_message(
                 c,
-                &Uuid::new_v4().to_string(),
+                &ids.issue(),
                 &self.id,
                 &m.role,
                 &m.content,

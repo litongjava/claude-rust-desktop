@@ -471,7 +471,7 @@ impl Stores {
                         crate::services::permission_authority::Source::User,
                         &content,
                     )?;
-                    let message = Uuid::new_v4().to_string();
+                    let message = crate::db::transcript::MessageIds::new(&op.incarnation).issue();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
                     if let Some(typed) = &first.typed {

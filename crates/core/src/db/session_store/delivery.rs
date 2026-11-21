@@ -291,7 +291,7 @@ impl SessionDb {
                     original,
                     hash,
                     mode,
-                    if notification { format!("notice-{}",uuid::Uuid::new_v4()) } else {uuid::Uuid::new_v4().to_string()}
+                    if notification { format!("notice-{}", self.new_message_id()) } else { self.new_message_id() }
                 ],
             )?;
             admission(c, c.last_insert_rowid(), &self.id)
@@ -442,7 +442,7 @@ impl SessionDb {
                     count < 256 && bytes + text.len() as i64 <= 1024 * 1024,
                     "Recipient inbox is full"
                 );
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = to.new_message_id();
                 c.execute(
                     "INSERT INTO session_inbox(id,sender,recipient,project_source,payload,size,created_at,sender_incarnation,recipient_source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![

@@ -27,12 +27,13 @@ impl ChildTranscript {
         receiver: tokio::sync::mpsc::Receiver<EngineEvent>,
         collect_web_evidence: bool,
     ) -> Result<Self> {
+        let assistant_id = state.history.new_message_id();
         let transcript = Self {
             state,
             receiver,
             collect_web_evidence,
             web_evidence: Vec::new(),
-            assistant_id: uuid::Uuid::new_v4().to_string(),
+            assistant_id,
             text: String::new(),
             thinking: String::new(),
             saw_text: false,
@@ -97,7 +98,7 @@ impl ChildTranscript {
         let mut progress = None;
         match event {
             EngineEvent::ContextReset { assistant_id, .. } => {
-                self.assistant_id = assistant_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.assistant_id = assistant_id.unwrap_or_else(|| self.state.history.new_message_id());
                 self.text.clear();
                 self.thinking.clear();
                 self.tools.clear();

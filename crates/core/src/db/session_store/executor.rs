@@ -45,6 +45,13 @@ impl ExecutorHistory {
     pub(crate) fn address(&self)->Option<super::HistoryAddress>{
         match self {Self::Session(s)=>Some(s.address()), Self::Shared(..)=>None}
     }
+    pub(crate) fn new_message_id(&self) -> String {
+        match self {
+            Self::Session(s) => s.new_message_id(),
+            Self::Shared(..) => uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
     pub fn id(&self) -> &str {
         match self {
             Self::Session(session) => session.id(),

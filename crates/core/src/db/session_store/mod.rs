@@ -391,6 +391,10 @@ pub struct SessionDb {
 }
 
 impl SessionDb {
+    pub(crate) fn new_message_id(&self) -> String {
+        crate::db::transcript::MessageIds::new(self.incarnation()).issue()
+    }
+
     pub fn incarnation(&self) -> &str {
         &self.incarnation
     }

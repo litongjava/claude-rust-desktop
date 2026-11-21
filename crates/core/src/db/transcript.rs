@@ -1,4 +1,54 @@
 //! The conversation detail and snapshot replacement contracts shared by hosts.
+
+/// UUIDv8 message references carry a shard-specific check on their random nonce.
+/// Snapshot writers can reject a reference from another shard without consulting it.
+pub(crate) struct MessageIds(String);
+
+impl MessageIds {
+    pub(crate) fn for_shard(c: &rusqlite::Connection) -> anyhow::Result<Self> {
+        Ok(Self(c.query_row(
+            "SELECT incarnation FROM manifest WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?))
+    }
+
+    pub(crate) fn new(incarnation: &str) -> Self {
+        Self(incarnation.to_owned())
+    }
+
+    fn check_bytes(&self, nonce: &[u8]) -> [u8; 6] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(self.0.as_bytes());
+        hash.update(nonce);
+        hash.finalize()[..6]
+            .try_into()
+            .expect("six-byte message check")
+    }
+
+    pub(crate) fn issue(&self) -> String {
+        let mut bytes = *uuid::Uuid::new_v4().as_bytes();
+        bytes[0] = 0xdc;
+        let mut bytes = uuid::Builder::from_custom_bytes(bytes)
+            .into_uuid()
+            .into_bytes();
+        let check = self.check_bytes(&bytes[..10]);
+        bytes[10..].copy_from_slice(&check);
+        uuid::Uuid::from_bytes(bytes).to_string()
+    }
+
+    fn accepts(&self, id: &str) -> bool {
+        let Ok(uuid) = uuid::Uuid::parse_str(id.strip_prefix("notice-").unwrap_or(id)) else {
+            return true;
+        };
+        let bytes = uuid.as_bytes();
+        uuid.get_version_num() != 8
+            || bytes[0] != 0xdc
+            || bytes[10..] == self.check_bytes(&bytes[..10])
+    }
+}
+
 pub fn enriched_messages(
     conn: &rusqlite::Connection,
     id: &str,
@@ -52,6 +102,7 @@ pub fn replace_messages(
     id: &str,
     messages: &[serde_json::Value],
 ) -> anyhow::Result<()> {
+    let owner = MessageIds::for_shard(tx)?;
     let existing = super::message_repo::get_messages_by_conversation(tx, id)?;
     let mut retained = std::collections::HashSet::new();
     for (idx, msg) in messages.iter().enumerate() {
@@ -59,10 +110,17 @@ pub fn replace_messages(
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(|| owner.issue());
         anyhow::ensure!(retained.insert(msg_id.clone()), "Duplicate message ID");
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let previous = super::message_repo::get_message(tx, &msg_id)?;
+        anyhow::ensure!(
+            ["conversation_id", "conversationId"].into_iter().all(|key| {
+                msg.get(key).and_then(|v| v.as_str()).is_none_or(|source| source == id)
+            })
+                && (previous.is_some() || owner.accepts(&msg_id)),
+            "Message ID belongs to a different conversation"
+        );
         if let Some(previous) = &previous {
             anyhow::ensure!(
                 previous.conversation_id == id && previous.role == role,

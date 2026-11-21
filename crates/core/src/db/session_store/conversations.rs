@@ -39,7 +39,7 @@ impl Stores {
             Some(entry) => {
                 let shard = self.open_listed(&entry)?;
                 if let Some(content) = content {
-                    let message = uuid::Uuid::new_v4().to_string();
+                    let message = shard.new_message_id();
                     shard.write(|w| w.append_user(&message, content))?;
                 }
             }

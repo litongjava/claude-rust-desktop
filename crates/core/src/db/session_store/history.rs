@@ -316,7 +316,7 @@ impl SessionWrite<'_> {
         Ok(())
     }
     pub fn append(&self, role: &str, content: &str) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::db::transcript::MessageIds::for_shard(self.0)?.issue();
         messages::insert_message(
             self.0,
             &id,

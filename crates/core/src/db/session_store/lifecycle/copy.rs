@@ -244,6 +244,7 @@ impl SessionDb {
 }
 
 struct Copier<'a> {
+    messages: crate::db::transcript::MessageIds,
     src: &'a Connection,
     dst: &'a Connection,
     id: &'a str,
@@ -264,7 +265,11 @@ impl Copier<'_> {
         if let Some(id) = self.mapped(kind, old)? {
             return Ok(id);
         }
-        let id = Uuid::new_v4().to_string();
+        let id = if kind == "message" {
+            self.messages.issue()
+        } else {
+            Uuid::new_v4().to_string()
+        };
         self.dst
             .execute("INSERT INTO copied_ids VALUES(?1,?2,?3)", [kind, old, &id])?;
         Ok(id)
@@ -606,6 +611,7 @@ pub(super) fn copy_snapshot(
     } else { boundary };
     source.stores.step(Phase::ForkSnapshot)?;
     Copier {
+        messages: crate::db::transcript::MessageIds::for_shard(dst)?,
         src: &tx,
         dst,
         id,
@@ -617,7 +623,7 @@ pub(super) fn copy_snapshot(
             dst.execute("UPDATE messages SET sort_order=sort_order+1 WHERE sort_order>=?1",[order])?;
         }
         let heading=if boundary {"Conversation summary — earlier transcript retained in session history"}else{"Summary of the later conversation — full transcript retained in session history"};
-        message_repo::insert_message(dst,&uuid::Uuid::new_v4().to_string(),id,"user",&format!("[{heading}]\n{text}"),None,&chrono::Utc::now().to_rfc3339(),boundary,order)?;
+        message_repo::insert_message(dst,&crate::db::transcript::MessageIds::for_shard(dst)?.issue(),id,"user",&format!("[{heading}]\n{text}"),None,&chrono::Utc::now().to_rfc3339(),boundary,order)?;
     }
     super::super::history::advance(dst)
 }

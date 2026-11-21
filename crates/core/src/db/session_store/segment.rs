@@ -118,7 +118,7 @@ impl ExecutorHistory {
     /// Reserve the next assistant before the model can persist an MCP result for it.
     pub(crate) fn rollover_segment(&self, previous: &str, boundary: &str) -> Result<String> {
         use crate::db::turn_repo;
-        let next = uuid::Uuid::new_v4().to_string();
+        let next = self.new_message_id();
         let insert = |c: &Connection, id: &str| -> Result<()> {
             ensure!(c.prepare_cached("SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND role='assistant'")?
                 .exists([previous, id])?, "Previous assistant segment is missing");
