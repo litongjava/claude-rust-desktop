@@ -611,21 +611,8 @@ fn job_phase(
     {
         return Ok(Some(r.phase));
     }
-    let operations = host.context.db.with_conn(|conn| -> Result<Vec<String>> {
-        let mut stmt = conn.prepare("SELECT value FROM peripheral_settings WHERE key LIKE ?1")?;
-        let rows = stmt
-            .query_map(
-                [format!(
-                    "super-agent.launch-op.{}.{}.%",
-                    task.task_id,
-                    role.as_str()
-                )],
-                |r| r.get(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })??;
-    for raw in operations {
+    let prefix=format!("super-agent.launch-op.{}.{}.",task.task_id,role.as_str());
+    for (_,raw) in host.context.db.task_state_rows(&prefix)? {
         let op: super::launcher::LaunchOperation = serde_json::from_str(&raw)?;
         if op.job_id != job.id {
             continue;

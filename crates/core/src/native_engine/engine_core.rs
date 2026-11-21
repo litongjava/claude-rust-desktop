@@ -550,7 +550,7 @@ impl QueryEngine {
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
             return crate::services::compaction::native::generate(
-                &self.db_manager,
+                history,
                 session,
                 &provider,
                 instructions,

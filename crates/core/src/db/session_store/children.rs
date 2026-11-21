@@ -65,6 +65,15 @@ impl ExecutorHistory {
         self.child_repo()
             .set_preference(super::settings::CHILD_PROGRESS, Some(progress))
     }
+    pub(crate) fn require_child_resume(&self,owner:&str,error:&str)->Result<()> {
+        let key=match self {Self::Session(_)=>"delegation.progress".into(),Self::Shared(_,id)=>format!("delegation.{id}")};
+        self.child_repo().write("mark child for resume",|c,_|{
+            c.execute("UPDATE peripheral_settings SET value=json_set(value,'$.status','needs_resume','$.error',?3)
+                WHERE key=?1 AND json_extract(value,'$.parent_session_id')=?2 AND json_extract(value,'$.status')='completed'",
+                params![key,owner,error])?;
+            Ok(())
+        })
+    }
     pub(crate) fn child_segment(&self, message: &str, text: &str, thinking: &str) -> Result<()> {
         self.child_repo().write("save child segment",|c,id|{
             let changed=c.execute("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,sort_order)

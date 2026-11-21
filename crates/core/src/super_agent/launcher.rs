@@ -884,20 +884,13 @@ impl Launcher {
         kind: LaunchKind,
     ) -> Result<Option<LaunchOperation>> {
         let prefix = format!(
-            "super-agent.launch-op.{task_id}.{}.{}.%",
+            "super-agent.launch-op.{task_id}.{}.{}.",
             member.as_str(),
             kind.as_str()
         );
-        let rows: Vec<String> = self.context.db.with_conn(|conn| -> Result<Vec<String>> {
-            let mut statement = conn.prepare(
-                "SELECT value FROM peripheral_settings WHERE key LIKE ?1 ORDER BY key DESC",
-            )?;
-            let rows = statement.query_map([prefix], |row| row.get::<_, String>(0))?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })??;
-        let mut operations = rows
-            .into_iter()
-            .filter_map(|value| serde_json::from_str::<LaunchOperation>(&value).ok())
+        let mut operations = self.context.db.task_state_rows(&prefix)?
+            .into_iter().rev()
+            .filter_map(|(_,value)| serde_json::from_str::<LaunchOperation>(&value).ok())
             .collect::<Vec<_>>();
         operations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         if let Some(incomplete) = operations

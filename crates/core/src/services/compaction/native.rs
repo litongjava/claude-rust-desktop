@@ -47,15 +47,12 @@ pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) 
 }
 
 pub(crate) async fn generate(
-    db: &std::sync::Arc<DbManager>,
+    history: Vec<Value>,
     id: &str,
     provider: &ResolvedProvider,
     instructions: &str,
     options: crate::native_engine::request_options::RequestOptions,
 ) -> Result<GeneratedSummary> {
-    let history =
-        crate::runtime::SessionStore::new(db.clone()).model_history(id, &ApiFormat::OpenAI)?;
-    validate_history(&history, provider)?;
     let messages = history
         .into_iter()
         .map(serde_json::from_value::<OpenAIMessage>)

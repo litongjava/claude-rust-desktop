@@ -113,15 +113,7 @@ impl Orchestrator {
     /// granted through the supported settings path. A task specification can
     /// only narrow this scope, never widen it.
     fn authorized_roots(&self, router_session: &str) -> Result<Vec<PathBuf>> {
-        let workspace: Option<String> =
-            self.context
-                .db
-                .with_conn(|conn| -> Result<Option<String>> {
-                    Ok(
-                        crate::db::conversation_repo::get_conversation(conn, router_session)?
-                            .and_then(|row| row.workspace_path),
-                    )
-                })??;
+        let workspace=self.context.db.conversation_metadata(router_session)?.and_then(|row|row.workspace_path);
         let workspace = PathBuf::from(
             workspace.context("Router session has no persisted workspace to authorize")?,
         );

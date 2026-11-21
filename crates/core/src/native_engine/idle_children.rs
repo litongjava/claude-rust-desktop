@@ -140,20 +140,14 @@ impl QueryEngine {
             db: self.db_manager.clone(),
             credentials: std::sync::Arc::new(EnvironmentCredentials),
         };
-        let _owner_lease = session_messages::ExecutionLease::acquire(&root, owner)?;
+        let _owner_lease = self.db_manager.executor_history(owner)?.execution_lease()?;
+        let child_history = self.db_manager.executor_history(child)?;
         let outcome: Result<Value> = async {
             ensure!(
                 session_messages::pending_count(&context, child)? > 0,
                 "Child inbox is empty"
             );
-            let (_, project) = self.db_manager.with_conn(|conn| {
-                crate::native_engine::workspace::resolve_workspace(
-                    conn,
-                    &self.workspaces_dir,
-                    owner,
-                    None,
-                )
-            })??;
+            let (_, project, _) = self.db_manager.engine_workspace(&self.workspaces_dir,owner,None)?;
             let agent = agents::for_session(&self.db_manager, owner)?;
             let tools = agent.as_ref().and_then(|agent| agent.tools.clone());
             let read_only_shell = agent.as_ref().is_some_and(|agent| agent.read_only_shell);
@@ -214,14 +208,7 @@ impl QueryEngine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(child);
-            let key = format!("delegation.{child}");
-            if let Some(mut saved) = context.setting::<Value>(&key)? {
-                if saved["parent_session_id"] == owner && saved["status"] == "completed" {
-                    saved["status"] = json!("needs_resume");
-                    saved["error"] = json!(error.to_string());
-                    context.save_setting(&key, &saved)?;
-                }
-            }
+            child_history.require_child_resume(owner,&error.to_string())?;
         }
         outcome
     }
