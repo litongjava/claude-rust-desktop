@@ -479,10 +479,12 @@ export const permissionApprovalAPI = {
   async approvePermission(
     approvalId: string,
     userDecision: string,
-    decisionReason?: string
+    decisionReason?: string,
+    conversationId?: string
   ): Promise<void> {
     return invoke('approve_permission', {
       approvalId,
+      conversationId,
       userDecision,
       decisionReason,
     });
@@ -490,11 +492,13 @@ export const permissionApprovalAPI = {
 
   async rejectPermission(
     approvalId: string,
-    decisionReason?: string
+    decisionReason?: string,
+    conversationId?: string
   ): Promise<void> {
     return invoke('reject_permission', {
       approvalId,
-      decisionReason,
+      conversationId,
+      reason: decisionReason,
     });
   },
 

@@ -1,4 +1,5 @@
 //! Process-local resolver for the global directory and incarnation-bound session shards.
+mod approvals;
 mod compaction;
 mod directory;
 pub use compaction::{CheckpointKey, CompactionClaim};

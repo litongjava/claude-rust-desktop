@@ -2465,7 +2465,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             const approval = permissionApproval;
             setPermissionApproval(null);
             if (hasNativeDesktop()) {
-              await permissionApprovalAPI.approvePermission(approval.id, decision, reason || undefined)
+              await permissionApprovalAPI.approvePermission(approval.id, decision, reason || undefined, approval.conversation_id ?? activeId ?? undefined)
                 .catch(err => console.error('Failed to record approval:', err));
             }
             await answerToolPermission('allow');
@@ -2475,7 +2475,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             const approval = permissionApproval;
             setPermissionApproval(null);
             if (hasNativeDesktop()) {
-              await permissionApprovalAPI.rejectPermission(approval.id, reason || undefined)
+              await permissionApprovalAPI.rejectPermission(approval.id, reason || undefined, approval.conversation_id ?? activeId ?? undefined)
                 .catch(err => console.error('Failed to record rejection:', err));
             }
             await answerToolPermission('deny');

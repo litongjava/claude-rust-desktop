@@ -1053,6 +1053,7 @@ pub async fn request_permission_approval(
 pub async fn approve_permission(
     app_handle: tauri::AppHandle,
     approval_id: String,
+    conversation_id: Option<String>,
 ) -> Result<(), String> {
     let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
         Some(state) => state.inner().clone(),
@@ -1062,8 +1063,8 @@ pub async fn approve_permission(
 
     tokio::task::spawn_blocking(move || {
         db_manager.with_conn(|conn| {
-            crate::db::permission_repo::update_approval_status(
-                conn, &approval_id, "approved", Some("approved"), None, &now,
+            crate::db::permission_repo::decide_for_session(
+                conn, conversation_id.as_deref(), &approval_id, "approved", None, &now,
             )
         })?
     })
@@ -1076,6 +1077,7 @@ pub async fn approve_permission(
 pub async fn reject_permission(
     app_handle: tauri::AppHandle,
     approval_id: String,
+    conversation_id: Option<String>,
     reason: Option<String>,
 ) -> Result<(), String> {
     let db_manager = match app_handle.try_state::<Arc<DbManager>>() {
@@ -1086,8 +1088,8 @@ pub async fn reject_permission(
 
     tokio::task::spawn_blocking(move || {
         db_manager.with_conn(|conn| {
-            crate::db::permission_repo::update_approval_status(
-                conn, &approval_id, "rejected", Some("rejected"), reason.as_deref(), &now,
+            crate::db::permission_repo::decide_for_session(
+                conn, conversation_id.as_deref(), &approval_id, "rejected", reason.as_deref(), &now,
             )
         })?
     })
