@@ -24,12 +24,13 @@ pub struct DirectoryEntry {
     pub transcript_bytes: i64,
     pub last_turn_status: Option<String>,
     pub content_revision: i64,
+    pub(super) metadata_revision: i64,
 }
 const FIELDS: &str = "SELECT id, title, model, provider, workspace_path, project_id,
     research_mode, pinned, archived, created_at, updated_at, message_count, workspace_mode,
     incarnation, first_prompt, latest_prompt, git_branch, transcript_bytes, last_turn_status,
     content_revision, coalesce((SELECT b.parent_incarnation FROM conversation_private_workspace_bindings b
-        WHERE b.child_id=conversations.id AND conversations.project_id IS NULL),incarnation)
+        WHERE b.child_id=conversations.id AND conversations.project_id IS NULL),incarnation),metadata_revision
     FROM conversations";
 fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
     let mut conversation = row_to_conversation(row)?;
@@ -53,6 +54,7 @@ fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
         last_turn_status: row.get(18)?,
         content_revision: row.get(19)?,
         workspace_incarnation: row.get(20)?,
+        metadata_revision: row.get(21)?,
     })
 }
 

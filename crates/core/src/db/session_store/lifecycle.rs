@@ -260,6 +260,7 @@ impl Intent {
 
 enum Seed<'a> {
     New,
+    Chat(&'a str),
     Feishu(&'a str),
     Fork(&'a SessionDb, Branch<'a>, Option<&'a crate::services::lifecycle_events::NewSessionConfiguration>),
     Import(&'a import::LegacySession),
@@ -282,10 +283,10 @@ impl Stores {
         use crate::services::session_messages::ExecutionLease;
         let key = storage_key(id)?;
         let locks = self.group_access(vec![(&key, true, true)])?;
-        let shard = self.create_locked(id, options, Seed::New, None)?;
-        // Reserve execution before releasing publication's exclusive lock.
-        let mut lease = ExecutionLease::acquire(self.data_dir(), shard.incarnation())?
+        let incarnation = Uuid::new_v4().to_string();
+        let mut lease = ExecutionLease::acquire(self.data_dir(), &incarnation)?
             .context("Invalid execution incarnation")?;
+        let shard = self.create_locked(id, options, Seed::Chat(&incarnation), None)?;
         lease.address = Some(shard.address());
         drop(locks);
         lease.lifecycle = self.key_lock(&key, false, false)?;
@@ -363,7 +364,11 @@ impl Stores {
         let key = storage_key(id)?;
         let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 OR storage_key=?2 UNION ALL SELECT 1 FROM lifecycle WHERE storage_key=?2 AND (quarantine_reason IS NULL OR kind='delete'))",[id,&key],|r|r.get(0))?;
         ensure!(!exists, "Session already exists or is fenced");
-        let op = Intent::new(self, id, &key, Uuid::new_v4().to_string(), "create");
+        let incarnation = match seed {
+            Seed::Chat(reserved) => (*reserved).to_owned(),
+            _ => Uuid::new_v4().to_string(),
+        };
+        let op = Intent::new(self, id, &key, incarnation, "create");
         let mode = options
             .workspace_mode
             .clone()
@@ -386,7 +391,7 @@ impl Stores {
         } else {
             None
         };
-        let copied = !matches!(seed, Seed::New | Seed::Feishu(_) | Seed::Project(..));
+        let copied = !matches!(seed, Seed::New | Seed::Chat(_) | Seed::Feishu(_) | Seed::Project(..));
         let meta = Metadata {
             feishu_chat: if let Seed::Feishu(chat)=seed {Some(chat.to_string())} else {None},
             initial_shape: (!copied).then(|| {
@@ -502,7 +507,7 @@ impl Stores {
                     }
                 }
                 match seed {
-                    Seed::New | Seed::Feishu(_) | Seed::Project(..) => {}
+                    Seed::New | Seed::Chat(_) | Seed::Feishu(_) | Seed::Project(..) => {}
                     Seed::Fork(source, boundary, configuration) => copy::copy_snapshot(
                         source,
                         tx,

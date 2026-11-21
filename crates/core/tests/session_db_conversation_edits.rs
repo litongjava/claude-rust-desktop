@@ -106,3 +106,50 @@ fn pin_completes_while_execution_is_held() -> Result<()> {
     assert!(stores.conversation_metadata("running")?.unwrap().pinned);
     Ok(())
 }
+
+#[test]
+fn first_chat_retries_once_after_execution_lease_failure() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let directory = root.path().join("session-execution-locks");
+    if directory.is_dir() { std::fs::remove_dir(&directory)?; }
+    std::fs::write(&directory, "unavailable")?;
+    let content = json!("first turn");
+    assert!(stores.admit_chat_execution(&id, "m", Some(&content)).is_err());
+    let (row, messages) = stores.conversation_detail(&id)?;
+    assert!(row.is_none() && messages.is_empty());
+    std::fs::remove_file(directory)?;
+    let (lease, sealed) = stores.admit_chat_execution(&id, "m", Some(&content))?;
+    if !sealed { stores.admit_chat_message(&id, "m", Some(&content))?; }
+    drop(lease);
+    assert_eq!(stores.conversation_detail(&id)?.1.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn combined_detail_matches_the_committed_edit() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    let root = tempfile::tempdir()?;
+    let db = Stores::open(root.path())?;
+    let shard = db.create("combined", Default::default())?;
+    let body = |n| json!({"title":format!("version {n}"),
+        "messages":[{"id":"message","role":"assistant","content":format!("version {n}")}]});
+    shard.edit_conversation(&body(0))?;
+    let barrier = Arc::new(Barrier::new(2));
+    std::thread::scope(|scope| -> Result<()> {
+        let start = barrier.clone();
+        let writer = scope.spawn(move || -> Result<()> {
+            start.wait();
+            for n in 1..=60 { shard.edit_conversation(&body(n))?; }
+            Ok(())
+        });
+        barrier.wait();
+        loop {
+            let (row, messages) = db.conversation_detail("combined")?;
+            assert_eq!(row.unwrap().title.as_deref(), messages[0]["content"].as_str());
+            if writer.is_finished() { break; }
+        }
+        writer.join().unwrap()
+    })
+}

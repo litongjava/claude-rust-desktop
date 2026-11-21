@@ -1,6 +1,6 @@
 use super::{Branch, CreateOptions, Stores};
 use crate::db::{conversation_repo as conversations, message_repo as messages, transcript};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
@@ -93,14 +93,23 @@ impl Stores {
         &self,
         id: &str,
     ) -> Result<(Option<conversations::ConversationRow>, Vec<Value>)> {
-        let Some(row) = self
-            .global()
-            .read_directory_row(id, |c| super::directory::one(c, id))?
-        else {
+        let Some(selected) = self.global().read_directory_row(id, |c| super::directory::one(c, id))? else {
             return Ok((None, Vec::new()));
         };
-        let messages = self.open_listed(&row)?.read(|r| r.enriched_messages())?;
-        Ok((Some(row.conversation), messages))
+        let shard = self.open_listed(&selected)?;
+        let _guard = shard.hold_incarnation()?;
+        loop {
+            // Combined edits take the exclusive lifecycle lock. Metadata-only
+            // edits and projection updates can still run alongside this reader.
+            let row = self.global().read(|c| super::directory::one(c, id))?
+                .context("Conversation retired")?;
+            let messages = shard.read(|r| r.enriched_messages())?;
+            let unchanged = self.global().read(|c| Ok(c.query_row(
+                "SELECT metadata_revision=?2 AND content_revision=?3 FROM conversations WHERE id=?1",
+                rusqlite::params![id, row.metadata_revision, row.content_revision], |r| r.get::<_, bool>(0)
+            )?))?;
+            if unchanged { return Ok((Some(row.conversation), messages)); }
+        }
     }
 
     pub fn conversation_metadata(

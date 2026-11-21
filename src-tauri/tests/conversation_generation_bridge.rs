@@ -180,11 +180,25 @@ async fn conversation_status_context_size_and_stop_generation_routes() {
     .await
     .unwrap();
 
-    let running: Value = get(format!("{conversation}/generation-status"))
-        .await
-        .json()
-        .await
-        .unwrap();
+    // The tool process and the Bridge event collector advance independently.
+    // Observe the collector's partial answer before stopping the still-running tool.
+    let running = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: Value = get(format!("{conversation}/generation-status"))
+                .await
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["text"].as_str().is_some_and(|s| !s.is_empty()) || status["active"] != true {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bridge must publish partial text while the tool is running");
     assert_eq!(
         (running["active"].clone(), running["status"].clone()),
         (json!(true), json!("generating")),
