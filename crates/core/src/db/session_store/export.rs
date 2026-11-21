@@ -5,7 +5,7 @@
 mod references;
 mod source;
 
-use super::{layout, Stores};
+use super::{history::activity_time, layout, Stores};
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rusqlite::{
@@ -103,21 +103,28 @@ impl Stores {
                 store == uuid && layout::canonical_uuid(&store),
                 "Lifecycle namespace identity changed"
             );
-            let (rowid, revision, projected, updated, incarnation): (i64,i64,i64,String,String) = header.query_row(
-                    "SELECT rowid,metadata_revision,content_revision,updated_at,incarnation FROM conversations
-                     WHERE id=?1 AND storage_key=?2 AND NOT EXISTS
-                     (SELECT 1 FROM lifecycle WHERE storage_key=?2 AND quarantine_reason IS NULL)",
-                    [id, &key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.context("Session unavailable")?;
+            let (rowid, revision, projected, updated, incarnation) = header.query_row(
+                "SELECT rowid,metadata_revision,content_revision,updated_at,incarnation FROM conversations
+                 WHERE id=?1 AND storage_key=?2 AND NOT EXISTS
+                 (SELECT 1 FROM lifecycle WHERE storage_key=?2 AND quarantine_reason IS NULL)",
+                [id, &key], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?,
+                    activity_time(r.get_ref(3)?.as_str()?), r.get::<_,String>(4)?)))
+                .optional()?.context("Session unavailable")?;
             let mut source = source::Source::open(&shard.join("session.db"), check)?;
             let tx = source.db.transaction()?;
             super::verify_manifest(&tx, &store, id, &incarnation)?;
             layout::verify_export(&tx, layout::SESSION)?;
             layout::integrity(&tx)?;
-            let (content, count, activity, status): (i64, i64, String, Option<String>) = tx
-                .query_row(
+            let (content, count, activity) = tx.query_row(
                 "SELECT content_revision,message_count,updated_at,last_turn_status FROM manifest",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        activity_time(r.get_ref(2)?.as_str()?),
+                    ))
+                },
             )?;
             let current: i64 = source::Source::open(&global, check)?.db.query_row(
                 "SELECT metadata_revision FROM conversations WHERE id=?1 AND incarnation=?2",
@@ -129,9 +136,13 @@ impl Stores {
             }
             layout::callback(|| {
                 let mut record = json!({"format":"deepseek-code.session","version":1,"session_id":id,
-                        "content_revision":content,"metadata_revision":revision,"message_count":count,
-                        "updated_at":super::history::latest_activity(&updated,&activity),"status":status});
+                        "content_revision":content,"metadata_revision":revision,"message_count":count});
                 let columns = "incarnation title project_id workspace_path workspace_mode provider model archived pinned research_mode created_at";
+                let (time_db, time_table, time_row) = if updated >= activity {
+                    (&*header, "conversations", rowid)
+                } else {
+                    (&*tx, "manifest", 1)
+                };
                 stream.record(
                     &header,
                     "header",
@@ -139,6 +150,10 @@ impl Stores {
                     columns,
                     rowid,
                     &mut record,
+                    &[
+                        (time_db, time_table, time_row, "updated_at", "updated_at"),
+                        (&*tx, "manifest", 1, "last_turn_status", "status"),
+                    ],
                 )
             })?;
             drop(header);
@@ -222,7 +237,7 @@ impl<W: Write> Stream<'_, W> {
         for row in ids.query_map([], |r| r.get(0))? {
             let rowid = row?;
             let mut record = json!({});
-            self.record(db, kind, table, columns, rowid, &mut record)?;
+            self.record(db, kind, table, columns, rowid, &mut record, &[])?;
         }
         Ok(())
     }
@@ -235,15 +250,19 @@ impl<W: Write> Stream<'_, W> {
         columns: &str,
         rowid: i64,
         record: &mut Value,
+        extra: &[(&Connection, &str, i64, &str, &str)],
     ) -> Result<()> {
         let owner = format!("{kind}/{rowid}");
         let mut pending = Vec::new();
-        for field in columns.split_whitespace() {
+        let fields = columns
+            .split_whitespace()
+            .map(|field| (db, table, rowid, field, field));
+        for (db, table, rowid, column, field) in fields.chain(extra.iter().copied()) {
             read_field(
                 db,
                 table,
                 rowid,
-                field,
+                column,
                 field,
                 &owner,
                 record,

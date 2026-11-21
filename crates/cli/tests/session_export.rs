@@ -938,3 +938,26 @@ fn interrupt_named_export_and_reclaim_abandoned_staging() -> Result<()> {
     }
     Ok(())
 }
+#[test]
+fn oversized_timestamp_in_header() -> Result<()> {
+    let id = "header";
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root");
+    let store = Stores::open(&root)?;
+    let timestamp = format!("2099-01-01T00:00:01.{}Z", "0".repeat(70000));
+    let source = dir.path().join("import.json");
+    fs::write(
+        &source,
+        serde_json::to_vec(
+            &json!({"id":id,"name":"import","created_at":"2025-01-01T00:00:01Z","updated_at":timestamp,"messages":[]}),
+        )?,
+    )?;
+    store.import_json(&source, dir.path(), false)?;
+    let bytes = stdout(&root, id)?;
+    let first = bytes.split(|b| *b == b'\n').next().unwrap();
+    let header: Value = serde_json::from_slice(first)?;
+    assert_eq!(decode(&bytes)?[0]["updated_at"], timestamp);
+    assert!(first.len() < 32 * 1024);
+    assert_eq!(header["updated_at"]["chunks"], 3);
+    Ok(())
+}
