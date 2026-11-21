@@ -540,3 +540,148 @@ async fn export_sessions_generated_by_both_streaming_protocols() -> Result<()> {
     }
     Ok(())
 }
+
+fn directory_names(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    fs::read_dir(dir)?
+        .map(|entry| Ok(entry?.file_name().into_string().unwrap()))
+        .collect()
+}
+
+fn assert_layout(dir: &Path, required: &[&str], optional: &[&str]) -> Result<()> {
+    let names = directory_names(dir)?;
+    for name in required {
+        ensure!(
+            names.contains(*name),
+            "missing {name} in {dir:?}: {names:?}"
+        );
+    }
+    for name in names {
+        ensure!(
+            required.contains(&name.as_str()) || optional.contains(&name.as_str()),
+            "unexpected {name} in {dir:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn watch_legacy_files(paths: &[std::path::PathBuf]) -> Result<fs::File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    ensure!(fd >= 0, std::io::Error::last_os_error());
+    let events = unsafe { fs::File::from_raw_fd(fd) };
+    for path in paths {
+        let name = CString::new(path.as_os_str().as_bytes())?;
+        let watch = unsafe {
+            libc::inotify_add_watch(events.as_raw_fd(), name.as_ptr(), libc::IN_ALL_EVENTS)
+        };
+        ensure!(watch >= 0, std::io::Error::last_os_error());
+    }
+    Ok(events)
+}
+
+#[test]
+fn fresh_start_and_export_leave_all_three_legacy_files_untouched() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let names = [
+        "deepseek_code.db",
+        "deepseek_code.db-wal",
+        "deepseek_code.db-shm",
+    ];
+    let paths = names.map(|s| root.path().join(s));
+    let mut mtimes = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        fs::write(path, [0xff, i as u8, 0, 0x80])?;
+        mtimes.push(fs::metadata(path)?.modified()?);
+    }
+    #[cfg(target_os = "linux")]
+    let mut events = watch_legacy_files(&paths)?;
+    let started = Command::new(env!("CARGO_BIN_EXE_dcl"))
+        .arg("--data-dir")
+        .arg(root.path())
+        .args(["sessions", "list"])
+        .output()?;
+    ensure!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&started.stdout)?, json!([]));
+    let id = uuid::Uuid::new_v4().to_string();
+    let db = Stores::open(root.path())?;
+    let s = db.create(&id, Default::default())?;
+    s.write(|w| w.append("user", "new-layout history"))?;
+    drop((s, db));
+    let bytes = stdout(root.path(), &id)?;
+    assert_eq!(
+        of(&decode(&bytes)?, "message")[0]["content"],
+        "new-layout history"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = [0; 4096];
+        assert_eq!(
+            events.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // Confirm the same watcher detects an actual open before checking bytes.
+        drop(fs::File::open(&paths[0])?);
+        assert!(events.read(&mut buf)? >= std::mem::size_of::<libc::inotify_event>());
+    }
+    for (i, path) in paths.iter().enumerate() {
+        assert_eq!(fs::metadata(path)?.modified()?, mtimes[i]);
+        assert_eq!(fs::read(path)?, [0xff, i as u8, 0, 0x80]);
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_install_creates_only_directory_shard_and_lifecycle_files() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let data = root.path().join("new");
+    let db = Stores::open(&data)?;
+    db.create(&id, Default::default())?;
+    drop(db);
+    let result = export(&data, &id)
+        .env("DCL_RESOURCE_SAMPLING", "0")
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(decode(&result.stdout)?[0]["session_id"], id);
+    assert_layout(
+        &data,
+        &[
+            ".session-bootstrap",
+            "global.db",
+            "session-locks",
+            "sessions",
+        ],
+        &["global.db-shm", "global.db-wal"],
+    )?;
+    assert_layout(
+        &data.join("session-locks"),
+        &[".directory", ".initialized", ".orphan-sweep", &id],
+        &[],
+    )?;
+    let sessions = data.join("sessions");
+    assert_layout(&sessions, &[".staging", ".trash", ".quarantine", &id], &[])?;
+    for dir in [".staging", ".trash", ".quarantine"] {
+        assert_layout(&sessions.join(dir), &[], &[])?;
+    }
+    assert_layout(
+        &sessions.join(id),
+        &["session.db", "session.db.admission"],
+        &["session.db-wal", "session.db-shm"],
+    )?;
+    Ok(())
+}
