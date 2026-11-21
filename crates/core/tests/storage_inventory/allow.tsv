@@ -1,0 +1,7 @@
+# Permanent exceptions: path, token, maximum matching lines, reason
+crates/cli/tests/local_coordination_registry.rs	Connection::open	1	Coordination registry fault fixture
+crates/core/src/memory/local.rs	Connection::open	1	Independent local memory store
+crates/core/src/services/doctor.rs	deepseek_code.db	1	Untouched legacy-only sentinel in doctor test
+crates/core/src/services/local_coordination/store.rs	Connection::open	5	Independent coordination registry and its fixtures
+crates/core/src/tools/coordination.rs	Connection::open	1	Coordination registry test
+crates/core/tests/session_db_lifecycle.rs	deepseek_code.db	3	Legacy-file sentinel assertions
