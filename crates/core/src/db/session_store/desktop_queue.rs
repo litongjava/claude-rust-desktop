@@ -69,3 +69,101 @@ impl DbManager {
         Ok(serde_json::from_str(&raw)?)
     }
 }
+
+use crate::db::turn_repo::{self, TurnRecord, TurnStatus, TurnTimer};
+use crate::services::{
+    input_queue::{self as queue, QueueItem, QueueState},
+    session_messages::ExecutionLease,
+};
+use std::sync::Arc;
+
+impl super::SessionRead<'_> {
+    pub(crate) fn dispatched_turn(&self, id: &str) -> Result<TurnRecord> {
+        let record = turn_repo::get_turn(self.0, id)?.context("Queued turn missing")?;
+        ensure!(
+            record.status == TurnStatus::Running,
+            "Queued turn is already terminal"
+        );
+        Ok(record)
+    }
+}
+
+impl Stores {
+    pub fn chat_execution_lease(&self, id: &str, model: &str) -> Result<ExecutionLease> {
+        if self.conversation_metadata(id)?.is_none() {
+            self.admit_chat_message(id, model, None)?;
+        }
+        let session = self.open_session(id)?;
+        let lease = session.acquire_execution()?;
+        session.settle_abandoned(&lease)?;
+        Ok(lease)
+    }
+    pub fn existing_chat_lease(&self, id: &str) -> Result<ExecutionLease> {
+        self.open_session(id)?.acquire_execution()
+    }
+    pub fn next_desktop_input(&self, id: &str) -> Result<Option<QueueItem>> {
+        self.open_session(id)?.desktop_dispatch_candidate()
+    }
+    pub fn start_desktop_input(
+        &self,
+        id: &str,
+        lease: Arc<ExecutionLease>,
+        item: &QueueItem,
+    ) -> Result<TurnTimer> {
+        let session = self.open_session(id)?;
+        session.delivery_under_lease(lease)?.start_queued_turn(item)
+    }
+}
+
+impl DbManager {
+    pub fn chat_execution_lease(&self, id: &str, _model: &str) -> Result<ExecutionLease> {
+        self.existing_chat_lease(id)
+    }
+    pub fn existing_chat_lease(&self, id: &str) -> Result<ExecutionLease> {
+        ExecutionLease::acquire(self.data_dir(), id)?
+            .context("Session is executing in another process")
+    }
+    pub fn next_desktop_input(&self, id: &str) -> Result<Option<QueueItem>> {
+        Ok(queue::list(self, id)?
+            .into_iter()
+            .find(|item| matches!(item.state, QueueState::Queued | QueueState::Claimed)))
+    }
+    pub fn start_desktop_input(
+        self: &Arc<Self>,
+        id: &str,
+        _lease: Arc<ExecutionLease>,
+        item: &QueueItem,
+    ) -> Result<TurnTimer> {
+        let claimed = if item.state == QueueState::Queued {
+            queue::claim(self, id, item.id, item.revision)?
+        } else {
+            item.clone()
+        };
+        queue::handoff(
+            self,
+            id,
+            claimed.id,
+            claimed.revision,
+            |tx, item, message| {
+                let paused:bool=tx.query_row("SELECT coalesce((SELECT paused FROM session_input_queue_control WHERE session_id=?1),0)",[id],|r|r.get(0))?;
+                ensure!(!paused, queue::QueueError::Paused);
+                let order = tx.query_row(
+                    "SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                crate::db::message_repo::save_user_message(
+                    tx,
+                    message,
+                    id,
+                    &item.content,
+                    &chrono::Utc::now().to_rfc3339(),
+                    order,
+                )?;
+                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1",[id])?;
+                Ok(())
+            },
+        )?;
+        self.start_turn_timer(id)
+    }
+}

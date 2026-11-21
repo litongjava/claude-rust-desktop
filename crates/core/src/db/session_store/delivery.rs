@@ -253,6 +253,23 @@ impl SessionDb {
             admission(c, c.last_insert_rowid(), &self.id)
         })
     }
+    pub(super) fn desktop_dispatch_candidate(&self) -> Result<Option<input_queue::QueueItem>> {
+        let _guard = self.stores.key_lock(&self.key, false, false)?;
+        self.check_directory()?;
+        let ready:Option<String>=self.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,|c|Ok(c.query_row(
+            "SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL ORDER BY rowid LIMIT 1",[],|r|r.get(0)).optional()?))?;
+        let item=self.stores.global().read(|c|{
+            let query=if ready.is_some(){
+                format!("SELECT {QUEUE_COLUMNS} FROM session_input_queue WHERE session_id=?1 AND delivery_id=?2 AND state IN ('claimed','handoff')")
+            } else {
+                format!("SELECT {QUEUE_COLUMNS} FROM session_input_queue WHERE session_id=?1 AND state IN ('claimed','queued') ORDER BY id LIMIT 1")
+            };
+            let mut q=c.prepare_cached(&query)?;
+            Ok(if let Some(delivery)=ready.as_deref(){q.query_row([self.id(),delivery],Admission::read).optional()?}
+                else{q.query_row([self.id()],Admission::read).optional()?})
+        })?;
+        item.map(|item| item.resolve(self)).transpose()
+    }
     pub fn queue_items(&self) -> Result<Vec<input_queue::QueueItem>> {
         let _guards = self.stores.key_lock(&self.key, false, false)?;
         self.check_directory()?;
@@ -615,12 +632,18 @@ impl DeliveryOwner {
     /// Recovery calls this after polling, including when the previous owner
     /// died after G ack but before notifying the engine.
     pub fn begin_generation(&mut self) -> Result<Option<(String, String)>> {
+        self.begin_selected_generation(None)
+    }
+    fn begin_selected_generation(
+        &mut self,
+        expected: Option<&str>,
+    ) -> Result<Option<(String, String)>> {
         layout::allow_entry()?;
         let s = &self.session;
         let ids = s.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
-            let mut q = c.prepare("SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL AND NOT EXISTS(SELECT 1 FROM execution_turns WHERE status='running') ORDER BY rowid")?;
+            let mut q = c.prepare("SELECT delivery_id FROM delivery_generations WHERE turn_id IS NULL AND (?1 IS NULL OR delivery_id=?1) AND NOT EXISTS(SELECT 1 FROM execution_turns WHERE status='running') ORDER BY rowid")?;
             let rows = q
-                .query_map([], |r| r.get::<_, String>(0))?
+                .query_map([expected], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
@@ -648,6 +671,7 @@ impl DeliveryOwner {
             tool,
             std::time::Instant::now() + super::WRITE_DEADLINE,
             false,
+            None,
         )
     }
 
@@ -657,6 +681,7 @@ impl DeliveryOwner {
         tool: Option<&str>,
         until: std::time::Instant,
         live: bool,
+        expected: Option<&input_queue::QueueItem>,
     ) -> Result<Option<Handoff>> {
         layout::allow_entry()?;
         let s = &self.session;
@@ -697,6 +722,10 @@ impl DeliveryOwner {
             let Some((id, state)) = pending(c)? else {
                 return Ok(None);
             };
+            if let Some(expected) = expected {
+                let row=admission(c,id,&s.id)?;
+                ensure!(row.id==expected.id && row.revision==expected.revision, QueueError::Conflict);
+            }
             if state == "queued" {
                 if paused(c, &s.id)? {
                     return Ok(None);
@@ -716,6 +745,31 @@ impl DeliveryOwner {
             })?))
         })?;
         claim.map(|c| self.complete(c, until, live)).transpose()
+    }
+    pub(crate) fn start_queued_turn(
+        &mut self,
+        item: &input_queue::QueueItem,
+    ) -> Result<crate::db::turn_repo::TurnTimer> {
+        ensure!(item.session_id == self.session.id, QueueError::Conflict);
+        let effect = if item.state == input_queue::QueueState::Handoff {
+            item.handoff_id
+                .clone()
+                .context("Missing acknowledged delivery identity")?
+        } else {
+            self.queue_before(
+                item.mode,
+                None,
+                std::time::Instant::now() + super::WRITE_DEADLINE,
+                false,
+                Some(item),
+            )?
+            .ok_or(QueueError::Conflict)?
+            .id
+        };
+        let (_, turn) = self
+            .begin_selected_generation(Some(&effect))?
+            .ok_or(QueueError::Conflict)?;
+        crate::db::turn_repo::TurnTimer::from_dispatch(self.session.clone(), &turn)
     }
     pub fn next_peer(&mut self) -> Result<Option<Handoff>> {
         self.peer_before(
@@ -815,7 +869,7 @@ impl DeliveryOwner {
             let next = if peers {
                 self.peer_before(remaining, until, true)
             } else {
-                self.queue_before(QueueMode::Steer, None, until, true)
+                self.queue_before(QueueMode::Steer, None, until, true, None)
             };
             let handoff = match next {
                 Ok(Some(value)) => value,

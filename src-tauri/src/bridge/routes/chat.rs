@@ -1,4 +1,5 @@
 use deepseek_code_core::db::session_store::{SegmentPlacement,SegmentUpdate};
+use deepseek_code_core::{services::input_queue::QueueItem,native_engine::provider_manager::ApiFormat};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -32,7 +33,7 @@ pub(super) async fn chat_handler(
 pub(super) async fn start_chat(
     state: AppState,
     req: ChatRequest,
-    queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
+    queued: Option<(QueueItem,ApiFormat)>,
 ) -> axum::response::Response {
     start_authorized_chat(state,req,queued,None).await
 }
@@ -40,7 +41,7 @@ pub(super) async fn start_chat(
 pub(super) async fn start_authorized_chat(
     state: AppState,
     req: ChatRequest,
-    queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
+    queued: Option<(QueueItem,ApiFormat)>,
     grant: Option<deepseek_code_core::db::session_store::H5Session>,
 ) -> axum::response::Response {
     let h5 = grant.is_some();
@@ -75,7 +76,7 @@ pub(super) async fn start_authorized_chat(
 
     // The backend keeps this lease for the whole turn; the engine shares it
     // without retaining a second reference that could outlive this release.
-    let execution_lease = match super::input_queue::execution_lease(&state.db_manager, &req.conversation_id) {
+    let execution_lease = match state.db_manager.chat_execution_lease(&req.conversation_id,&req.model) {
         Ok(lease) => std::sync::Arc::new(lease),
         Err(error) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
     };
@@ -90,7 +91,7 @@ pub(super) async fn start_authorized_chat(
     });
     let lifecycle_state = state.clone();
     let lifecycle_id = conv_id.clone();
-    let messages = req.messages;
+    let mut messages = req.messages;
 
     tracing::info!(module = "Chat", "[1/7] Parsed request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
 
@@ -110,15 +111,6 @@ pub(super) async fn start_authorized_chat(
                 }
             }
         }
-        if let Some(item) = &queued {
-            let claimed = if item.state == deepseek_code_core::services::input_queue::QueueState::Queued {
-                deepseek_code_core::services::input_queue::claim(&state.db_manager, &conv_id, item.id, item.revision)
-            } else { Ok(item.clone()) };
-            let result = claimed.and_then(|item| super::input_queue::handoff(&state.db_manager, &conv_id, &item));
-            if let Err(error) = result {
-                return (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-            }
-        }
         let user_content = if queued.is_some() { None } else { user_content };
         let model_save = model.clone();
         let saved=tokio::task::spawn_blocking(move || db.admit_chat_message(&conv_id_save,&model_save,user_content.as_ref())).await;
@@ -134,10 +126,22 @@ pub(super) async fn start_authorized_chat(
     }
     tracing::info!(module = "Chat", "[2/7] SQLite save COMPLETED");
 
-    let mut turn = match state.db_manager.start_turn_timer(&conv_id) {
+    let timer = match &queued {
+        Some((item,_)) => state.db_manager.start_desktop_input(&conv_id,execution_lease.clone(),item),
+        None => state.db_manager.start_turn_timer(&conv_id),
+    };
+    let mut turn = match timer {
         Ok(turn) => turn,
+        Err(error) if error.downcast_ref::<deepseek_code_core::services::input_queue::QueueError>().is_some() =>
+            return (StatusCode::CONFLICT,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not start turn timing: {error:#}")}))).into_response(),
     };
+    if let Some((_,format)) = queued {
+        messages = match crate::runtime::SessionStore::new(state.db_manager.clone()).model_history(&conv_id,&format) {
+            Ok(history) => history,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+        };
+    }
     let first_assistant_id = match turn.ensure_segment() {
         Ok(id) => id,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not persist assistant segment: {error:#}")}))).into_response(),

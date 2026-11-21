@@ -227,6 +227,13 @@ impl TurnTimer {
         Self::begin(TurnStore::Session(session))
     }
 
+    pub(crate) fn from_dispatch(shard:super::session_store::SessionDb, id:&str)->Result<Self>{
+        let record = shard.read(|r| r.dispatched_turn(id))?;
+        let elapsed=(chrono::Utc::now()-chrono::DateTime::parse_from_rfc3339(&record.started_at)?.to_utc()).to_std().unwrap_or_default();
+        let now=Instant::now();
+        Ok(Self {store:TurnStore::Session(shard), started:now.checked_sub(elapsed).unwrap_or(now),record,message_id:None,finished:false})
+    }
+
     fn begin(store: TurnStore) -> Result<Self> {
         let started = Instant::now();
         let record = TurnRecord {

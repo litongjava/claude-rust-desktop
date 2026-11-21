@@ -10,7 +10,7 @@ use axum::{
 use deepseek_code_core::{
     db::DbManager,
     native_engine::engine_core::ChatRequest,
-    services::input_queue::{self as queue, QueueError, QueueItem, QueueMode, QueueState},
+    services::input_queue::{self as queue, QueueError, QueueMode},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -61,8 +61,7 @@ pub(super) fn execution_lease(
     db: &DbManager,
     id: &str,
 ) -> anyhow::Result<deepseek_code_core::services::session_messages::ExecutionLease> {
-    deepseek_code_core::services::session_messages::ExecutionLease::acquire(db.data_dir(), id)?
-        .ok_or_else(|| anyhow::anyhow!("Session is executing in another process"))
+    db.existing_chat_lease(id)
 }
 
 /// The turn that queued this dispatch can still hold the execution lease for a
@@ -85,28 +84,6 @@ pub(super) async fn wait_for_release(
     }
 }
 
-pub(super) fn handoff(db: &DbManager, id: &str, item: &QueueItem) -> anyhow::Result<QueueItem> {
-    queue::handoff(db, id, item.id, item.revision, |tx, item, message_id| {
-        let paused: bool = tx.query_row("SELECT COALESCE((SELECT paused FROM session_input_queue_control WHERE session_id=?1),0)",[id],|r|r.get(0))?;
-        anyhow::ensure!(!paused, QueueError::Paused);
-        let order: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
-        crate::db::message_repo::save_user_message(
-            tx,
-            message_id,
-            id,
-            &item.content,
-            &chrono::Utc::now().to_rfc3339(),
-            order,
-        )?;
-        tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1",[id])?;
-        Ok(())
-    })
-}
-
 // A plain spawning function breaks the recursive future type between collector and dispatch.
 pub(super) fn kick(state: AppState, id: String) {
     tokio::spawn(async move {
@@ -125,14 +102,10 @@ async fn dispatch(state: AppState, id: &str) -> anyhow::Result<()> {
     if queue::is_paused(&state.db_manager, id)? {
         return Ok(());
     }
-    let items = queue::list(&state.db_manager, id)?;
-    let Some(item) = items
-        .into_iter()
-        .find(|i| matches!(i.state, QueueState::Queued | QueueState::Claimed))
-    else {
+    let Some(item) = state.db_manager.next_desktop_input(id)? else {
         return Ok(());
     };
-    let mut req = state.db_manager.desktop_context(id)?;
+    let req = state.db_manager.desktop_context(id)?;
     let format = {
         let config = state.config_manager.lock().await;
         let config = config
@@ -151,13 +124,9 @@ async fn dispatch(state: AppState, id: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Queued turn provider unavailable"))?;
         crate::runtime::provider_from_config(provider).api_format
     };
-    req.messages =
-        crate::runtime::SessionStore::new(state.db_manager.clone()).model_history(id, &format)?;
-    req.messages
-        .push(json!({"role":"user","content":item.content}));
     // chat owns the same collector/persistence path as an interactive turn. Its body
     // is disposable: collection is detached from any HTTP consumer.
-    let response = super::chat::start_chat(state, req, Some(item)).await;
+    let response = super::chat::start_chat(state, req, Some((item,format))).await;
     anyhow::ensure!(
         response.status().is_success(),
         "Queued turn failed admission: {}",

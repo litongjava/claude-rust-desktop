@@ -939,3 +939,32 @@ fn host_queue_mutations_return_the_committed_payload_and_preserve_claims() -> Re
     assert_eq!(queue::list(&stores,shard.id())?[0].handoff_id.as_deref(),Some(effect.id.as_str()));
     Ok(())
 }
+
+#[test]
+fn desktop_recovers_ack_before_dispatch_and_starts_only_the_receipted_turn() -> Result<()> {
+    use deepseek_code_core::{db::turn_repo::TurnStatus,services::input_queue::{self as queue,QueueMode,QueueState}};
+    use std::sync::Arc;
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let session = stores.create("chat", Default::default())?;
+    let first = queue::enqueue(&session,session.id(),"request",serde_json::json!("first"),QueueMode::NextTurn)?;
+    let stale = stores.next_desktop_input(session.id())?.unwrap();
+    let edited = queue::edit(&session,session.id(),first.id,first.revision,"current")?;
+    let lease=Arc::new(session.acquire_execution()?);
+    assert!(stores.start_desktop_input(session.id(),lease.clone(),&stale).is_err());
+    assert_eq!(stores.next_desktop_input(session.id())?,Some(edited));
+    let effect = session.delivery_under_lease(lease.clone())?.next_queue(QueueMode::NextTurn,None)?.unwrap();
+    drop(lease);
+    let ready = stores.next_desktop_input(session.id())?.unwrap();
+    assert_eq!(ready.state,QueueState::Handoff);
+    assert_eq!(ready.handoff_id.as_deref(),Some(effect.id.as_str()));
+    let lease=Arc::new(session.acquire_execution()?);
+    let mut turn=stores.start_desktop_input(session.id(),lease.clone(),&ready)?;
+    let id=turn.record().turn_id.clone();
+    turn.ensure_segment()?;
+    assert_eq!(turn.finish(TurnStatus::Completed)?.turn_id,id);
+    assert!(stores.start_desktop_input(session.id(),lease,&ready).is_err());
+    assert!(stores.next_desktop_input(session.id())?.is_none());
+    assert_eq!(session.read(|r|Ok(r.messages()?.len()))?,2);
+    Ok(())
+}
