@@ -194,12 +194,11 @@ mod tests {
             initial_worker_id: uuid::Uuid::new_v4().to_string(),
             created_at: "now".into(),
         };
-        context
-            .save_setting(&key(&parent, &child).unwrap(), &record)
+        context.db.park_worker(&context.db.worker_pair(&parent,&child).unwrap(), &record)
             .unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&child, |conn| {
                 conn.execute(
                     "INSERT INTO peripheral_settings(key,value) VALUES(?1,'bypass')",
                     [format!("cli.permission-mode.{child}")],
@@ -225,7 +224,7 @@ mod tests {
         let project = super::super::session_trust::inspect(&context.db, &child).unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                     [&project.id],

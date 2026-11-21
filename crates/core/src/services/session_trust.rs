@@ -191,7 +191,7 @@ mod tests {
         let project = inspect(&store.db, id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                     [&project.id],
@@ -210,7 +210,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 project_repo::set_folders(
                     conn,
                     &original.id,
@@ -256,7 +256,7 @@ mod tests {
         assert!(store.resume(&other).is_err());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 assert_eq!(
                     project_repo::list_project_files(conn, &fixed.project_id)
                         .unwrap()
@@ -287,7 +287,7 @@ mod tests {
         let ambiguous = source.join("..").join(source.file_name().unwrap());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE projects SET workspace_path=?1 WHERE id=?2",
                     params![ambiguous.to_string_lossy(), original.id],
@@ -339,7 +339,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 project_repo::set_folders(
                     conn,
                     &original.id,
@@ -388,7 +388,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| prepared.save(conn, &id, &original.id, source.to_str().unwrap()))
+            .fixture_directory(|conn| prepared.save(conn, &id, &original.id, source.to_str().unwrap()))
             .unwrap()
             .unwrap();
         let fork = store.fork(&id).unwrap();
@@ -404,7 +404,7 @@ mod tests {
         assert!(store.resume(&id).is_err());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 let source_saved: String = conn
                     .query_row(
                         "SELECT source_path FROM conversation_worktrees WHERE conversation_id=?1",

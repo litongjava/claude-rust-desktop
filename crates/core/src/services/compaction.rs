@@ -826,8 +826,7 @@ mod hook_tests {
         let id = store.create(dir.path(), "model", "provider").unwrap();
         store.append(&id, "user", "Finish task").unwrap();
         store.append(&id, "assistant", "Tests pending").unwrap();
-        service
-            .save_setting(&session_hooks::key(&id), &"old-context")
+        service.db.open_session(&id).unwrap().write(|w| w.set_setting(crate::db::session_store::settings::SESSION_START_CONTEXT, &"old-context".to_owned()))
             .unwrap();
         std::fs::write(dir.path().join("hook.cjs"), r#"let text='';process.stdin.on('data',x=>text+=x);process.stdin.on('end',()=>{const fs=require('fs'),v=JSON.parse(text);fs.appendFileSync('events.jsonl',JSON.stringify(v)+'\n');const mode=process.argv[2];if(mode==='fail'){process.stderr.write('expected failure');process.exit(2)}if(mode==='slow'){fs.writeFileSync('started','yes');setTimeout(()=>{},30000);return}if(mode==='delay'){setTimeout(()=>{console.log('post notice')},400);return}console.log(v.hook_event_name==='PreCompact'?'keep exact paths':v.hook_event_name==='SessionStart'?'fresh-context':'post notice');});"#).unwrap();
         (dir, service, store, id)
@@ -964,7 +963,7 @@ mod hook_tests {
             let (dir, service, store, id) = fixture();
             configure(&service, "fail", "ok", "ok");
             if failure == "context-write" {
-                service.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_context BEFORE UPDATE ON peripheral_settings BEGIN SELECT RAISE(ABORT, 'simulated context failure'); END;")).unwrap().unwrap();
+                service.db.fixture_shard(&id, |conn|conn.execute_batch("CREATE TRIGGER fail_context BEFORE UPDATE ON peripheral_settings BEGIN SELECT RAISE(ABORT, 'simulated context failure'); END;")).unwrap().unwrap();
             }
             let result = compact_hooks(
                 &service,
@@ -1176,9 +1175,7 @@ mod part_tests {
         let contents = |branch: &str| -> Vec<(String, bool)> {
             service
                 .db
-                .with_conn(|conn| message_repo::get_messages_by_conversation(conn, branch))
-                .unwrap()
-                .unwrap()
+                .open_session(branch).unwrap().read(|r|r.messages()).unwrap()
                 .into_iter()
                 .map(|m| (m.content, m.is_compact_boundary))
                 .collect()
@@ -1245,7 +1242,7 @@ mod count_tests {
         (dir, store, id)
     }
 
-    fn compact_once(store: &SessionStore, id: &str) {
+    fn compact_once<D: crate::db::session_store::SessionAccess>(store: &SessionStore<D>, id: &str) {
         let prepared = prepare(&store.db, id).unwrap();
         commit(&store.db, prepared, "summary").unwrap();
     }
@@ -1260,13 +1257,7 @@ mod count_tests {
         store.append(&id, "assistant", "Next progress").unwrap();
         compact_once(&store, &id);
         assert_eq!(count(&store.db, &id).unwrap(), CompactionCount::Exact(2));
-        let branch = store
-            .db
-            .with_conn(|conn| {
-                crate::db::conversation_repo::branch_conversation(conn, &id, None, None)
-            })
-            .unwrap()
-            .unwrap();
+        let branch = store.fork(&id).unwrap();
         assert_eq!(
             count(&store.db, &branch).unwrap(),
             CompactionCount::Exact(0)
@@ -1274,9 +1265,21 @@ mod count_tests {
         assert_eq!(count(&store.db, &id).unwrap(), CompactionCount::Exact(2));
     }
 
+    // Explicit old-format fixtures exercise counters that predate session shards.
+    fn legacy_fixture() -> (tempfile::TempDir, SessionStore<DbManager>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbManager::new(dir.path().join("pre-counter.sqlite")).unwrap();
+        db.init().unwrap();
+        let store = SessionStore::new(std::sync::Arc::new(db));
+        let id = store.create(dir.path(),"model","provider").unwrap();
+        store.append(&id,"user","Task").unwrap();
+        store.append(&id,"assistant","Progress").unwrap();
+        (dir,store,id)
+    }
+
     #[test]
     fn a_session_from_before_the_counter_reports_its_own_boundaries_exactly() {
-        let (_dir, store, id) = fixture();
+        let (_dir, store, id) = legacy_fixture();
         let prepared = prepare(&store.db, &id).unwrap();
         commit(&store.db, prepared, "summary").unwrap();
         // Simulate a session written before the counter existed.
@@ -1295,7 +1298,7 @@ mod count_tests {
 
     #[test]
     fn a_legacy_branch_never_claims_its_ancestor_boundaries() {
-        let (_dir, store, id) = fixture();
+        let (_dir, store, id) = legacy_fixture();
         compact_once(&store, &id);
         let branch = store.fork(&id).unwrap();
         // An old branch has no counter key and no legacy marker.
@@ -1358,7 +1361,7 @@ mod fingerprint_tests {
     fn digest(store: &SessionStore, id: &str) -> String {
         store
             .db
-            .with_conn(|conn| fingerprint(conn, id))
+            .fixture_shard(id, |conn| fingerprint(conn, id))
             .unwrap()
             .unwrap()
             .0
@@ -1372,10 +1375,7 @@ mod fingerprint_tests {
         assert_eq!(first.len(), 64, "expected a hex SHA-256 digest");
         // Reading must not depend on any in-process cache.
         drop(store);
-        let reopened = SessionStore::new(std::sync::Arc::new(
-            DbManager::new(paths.data_dir.join(DATABASE_FILE)).expect("reopen database"),
-        ));
-        reopened.db.init().unwrap();
+        let reopened = SessionStore::new(paths.open_database().unwrap());
         assert_eq!(first, digest(&reopened, &id));
     }
 
@@ -1385,7 +1385,7 @@ mod fingerprint_tests {
         let before = digest(&store, &id);
         store
             .db
-            .with_conn(|conn| message_repo::update_message_content(conn, &ids[0], "Edited task"))
+            .fixture_shard(&id, |conn| message_repo::update_message_content(conn, &ids[0], "Edited task"))
             .unwrap()
             .unwrap();
         let after = digest(&store, &id);

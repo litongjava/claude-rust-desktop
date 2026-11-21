@@ -143,12 +143,19 @@ mod tests {
         (temp, store, id)
     }
 
+    fn finish_request(store: &SessionStore, id: &str) -> Result<Option<String>> {
+        let worker = store.db.open_session(id)?.delivery_owner()?;
+        let Some(claim) = worker.claim_compaction()? else { return Ok(None); };
+        worker.finish_compaction(&claim, &super::super::compaction::GeneratedSummary {text:"Summary".into(),native:None})?;
+        Ok(Some(claim.keep))
+    }
+
     #[test]
     fn a_request_below_thirty_percent_is_refused() {
         let (_temp, store, id) = fixture();
         let error = request(&store.db, &id, "Keep the pending tests", 20, 100).unwrap_err();
         assert!(error.to_string().contains("at least 30%"), "{error}");
-        assert!(take(&store.db, &id).unwrap().is_none());
+        assert!(finish_request(&store, &id).unwrap().is_none());
     }
 
     #[test]
@@ -157,10 +164,10 @@ mod tests {
         let message = request(&store.db, &id, "Keep the pending tests", 50, 100).unwrap();
         assert!(message.starts_with("Compaction queued"), "{message}");
         assert_eq!(
-            take(&store.db, &id).unwrap().as_deref(),
+            finish_request(&store, &id).unwrap().as_deref(),
             Some("Keep the pending tests")
         );
-        assert!(take(&store.db, &id).unwrap().is_none());
+        assert!(finish_request(&store, &id).unwrap().is_none());
     }
 
     #[test]
@@ -189,7 +196,7 @@ mod tests {
         request(&store.db, &id, "Earlier keep text", 50, 100).unwrap();
         request(&store.db, &id, "Later keep text", 60, 100).unwrap();
         assert_eq!(
-            take(&store.db, &id).unwrap().as_deref(),
+            finish_request(&store, &id).unwrap().as_deref(),
             Some("Later keep text")
         );
     }

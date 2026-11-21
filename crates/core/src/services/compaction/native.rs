@@ -188,7 +188,7 @@ mod tests {
             if conflict {
                 store.append(&id, "user", "New instruction").unwrap();
             } else {
-                store.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_timestamp BEFORE UPDATE OF updated_at ON conversations BEGIN SELECT RAISE(ABORT, 'failure'); END;")).unwrap().unwrap();
+                store.db.fixture_shard(&id, |conn| conn.execute_batch("CREATE TRIGGER fail_native BEFORE UPDATE ON compaction_state BEGIN SELECT RAISE(ABORT, 'failure'); END;")).unwrap().unwrap();
             }
             let before = store.history(&id).unwrap();
             let summary = GeneratedSummary {
@@ -197,7 +197,7 @@ mod tests {
             };
             assert!(commit_with_context(&store.db, prepared, &summary, None).is_err());
             assert_eq!(store.history(&id).unwrap(), before);
-            let count = store.db.with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'compaction.native.%'", [], |r| r.get::<_, i64>(0))).unwrap().unwrap();
+            let count = store.db.fixture_shard(&id, |conn| conn.query_row("SELECT COUNT(*) FROM native_boundaries", [], |r| r.get::<_, i64>(0))).unwrap().unwrap();
             assert_eq!(count, 0);
         }
     }

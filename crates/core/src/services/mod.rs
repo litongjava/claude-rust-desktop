@@ -280,10 +280,10 @@ mod tests {
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
         let context =
             ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
-        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join(DATABASE_FILE));
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join("global.db"));
         let releaser = test_support::release_after(release, holder, Duration::from_secs(6));
         let started = Instant::now();
-        context.save_setting("probe", &"value").unwrap();
+        context.db.global().set_setting(crate::db::session_store::GlobalSetting::MachinePreference("probe"), &"value").unwrap();
         assert!(
             started.elapsed() >= Duration::from_secs(5),
             "save returned after {:?}",
@@ -291,7 +291,7 @@ mod tests {
         );
         releaser.join().unwrap();
         assert_eq!(
-            context.setting::<String>("probe").unwrap().as_deref(),
+            context.db.global().setting::<String>(crate::db::session_store::GlobalSetting::MachinePreference("probe")).unwrap().as_deref(),
             Some("value")
         );
     }

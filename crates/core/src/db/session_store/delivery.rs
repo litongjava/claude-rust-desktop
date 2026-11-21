@@ -671,7 +671,19 @@ struct Claim {
     revision: i64,
     steer: bool,
 }
+pub(crate) const TURN_POLL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl DeliveryOwner {
+    #[cfg(test)]
+    pub(crate) fn duplicate_inbox_lock(&self) -> std::io::Result<std::fs::File> {
+        self._consumer.duplicate_descriptor()
+    }
+
+    pub(crate) fn poll_peer_context(&mut self, limit:usize) -> Result<Vec<DeliveredInput>> {
+        self.session.validate_peer_endpoint()?;
+        self.poll_turn(true,limit)
+    }
+
     /// Start at most one durable generation per acknowledged user delivery.
     /// Recovery calls this after polling, including when the previous owner
     /// died after G ack but before notifying the engine.
@@ -903,7 +915,7 @@ impl DeliveryOwner {
     /// An ack-only retry injects content only if this same live owner committed it.
     pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
         use crate::db::message_repo;
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let until = std::time::Instant::now() + TURN_POLL_WAIT;
         let mut remaining = 128 * 1024;
         let mut inputs = Vec::new();
         for _ in 0..limit.min(8) {

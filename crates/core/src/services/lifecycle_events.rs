@@ -272,7 +272,7 @@ mod tests {
         }
         context
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&session, |conn| {
                 crate::db::message_repo::insert_message(
                     conn,
                     "boundary",

@@ -172,13 +172,13 @@ mod tests {
         let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
         let session = store.create(temp.path(), "model", "provider").unwrap();
         let message = store.append(&session, "assistant", "reply").unwrap();
-        store.db.with_conn(|conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request1","providerId":"provider","model":"model","inputTokens":100,"outputTokens":50,"cacheReadTokens":20,"usage":{"cost_usd":0.125}}))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request1","providerId":"provider","model":"model","inputTokens":100,"outputTokens":50,"cacheReadTokens":20,"usage":{"cost_usd":0.125}}))).unwrap().unwrap();
         let config = AppConfig::default();
         assert_eq!(
             session_cost(&store.db, &session, &config).unwrap()["total_usd"],
             0.125
         );
-        store.db.with_conn(|conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request2","providerId":"provider","model":"unknown","inputTokens":100,"outputTokens":50}))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request2","providerId":"provider","model":"unknown","inputTokens":100,"outputTokens":50}))).unwrap().unwrap();
         let result = session_cost(&store.db, &session, &config).unwrap();
         assert!(result["total_usd"].is_null());
         assert_eq!(result["known_subtotal_usd"], 0.125);
@@ -194,7 +194,7 @@ mod tests {
         let message = store.append(&session, "assistant", "reply").unwrap();
         // Saturday 2026-10-24 is off-peak: half of 2000*0.30 + 10000*0.006 + 100*1.20 per million.
         let started = chrono::DateTime::parse_from_rfc3339("2026-10-24T12:00:00Z").unwrap().timestamp_millis();
-        store.db.with_conn(|conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request1","providerId":"cli-runtime","model":"deepseek-flash","startedAt":started,"inputTokens":2000,"outputTokens":100,"cacheReadTokens":10000,"cacheWriteTokens":0,"usage":{"input_tokens":2000,"output_tokens":100,"cache_read_input_tokens":10000}}))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn|crate::db::request_repo::save_request(conn,&message,&json!({"id":"request1","providerId":"cli-runtime","model":"deepseek-flash","startedAt":started,"inputTokens":2000,"outputTokens":100,"cacheReadTokens":10000,"cacheWriteTokens":0,"usage":{"input_tokens":2000,"output_tokens":100,"cache_read_input_tokens":10000}}))).unwrap().unwrap();
         let result = session_cost(&store.db, &session, &AppConfig::default()).unwrap();
         let total = result["total_usd"].as_f64().unwrap();
         assert!((total - (2000.0 * 0.30 + 10000.0 * 0.006 + 100.0 * 1.20) / 2_000_000.0).abs() < 1e-12, "{result}");

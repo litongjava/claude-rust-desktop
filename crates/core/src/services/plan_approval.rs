@@ -334,7 +334,7 @@ mod tests {
             // Same transaction/order helper as Desktop final save, without a reset event.
             context
                 .db
-                .with_conn(|conn| -> Result<()> {
+                .fixture_shard(&id, |conn| -> Result<()> {
                     let tx = crate::db::write_transaction(conn)?;
                     let (order, archive) = final_response_order(&tx, &id, None)?;
                     assert_eq!(archive, boundary_first);
@@ -368,7 +368,7 @@ mod tests {
                 .contains("OLD_DESKTOP_SECRET"));
             context
                 .db
-                .with_conn(|conn| {
+                .fixture_shard(&id, |conn| {
                     conn.execute(
                         "UPDATE peripheral_settings SET value='invalid metadata' WHERE key=?1",
                         [format!("plan.context_boundary.{id}")],
@@ -378,7 +378,7 @@ mod tests {
                 .unwrap();
             assert!(context
                 .db
-                .with_conn(|conn| final_response_order(conn, &id, None))
+                .fixture_shard(&id, |conn| final_response_order(conn, &id, None))
                 .unwrap()
                 .is_err());
         }
@@ -397,7 +397,7 @@ mod tests {
         manager.set_mode(crate::permissions::PermissionMode::PlanMode);
         assert!(commit_approved_boundary(&context, &id, "plan", &manager, stale).is_err());
         assert!(latest_boundary(&context.db, &id).unwrap().is_none());
-        context.db.with_conn(|conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
+        context.db.fixture_shard(&id, |conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
         assert!(
             commit_approved_boundary(&context, &id, "plan", &manager, manager.mode_snapshot())
                 .is_err()
@@ -451,17 +451,12 @@ mod tests {
             is_error: true,
             sort_order: 0,
         };
-        archive_segment(
-            &context.db,
-            &id,
-            &boundary,
-            None,
-            "OLD_SECRET",
-            "OLD_THINKING",
-            &[tool],
-            &[],
-        )
-        .unwrap();
+        let segment = sessions.append(&id, "assistant","").unwrap();
+        use crate::db::session_store::{ExecutorHistory,SegmentPlacement,SegmentUpdate};
+        ExecutorHistory::Session(context.db.open_session(&id).unwrap()).save_segment(&segment,SegmentUpdate {
+            placement:SegmentPlacement::Before(&boundary),text:Some("OLD_SECRET"),thinking:Some("OLD_THINKING"),
+            tools:&[tool],..Default::default()
+        }).unwrap();
         sessions.append(&id, "assistant", "new answer").unwrap();
         let history = sessions
             .model_history(

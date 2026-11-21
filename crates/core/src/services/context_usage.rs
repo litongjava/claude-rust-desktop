@@ -308,7 +308,7 @@ mod tests {
             ),
         ] {
             let message = store.append(session, "assistant", "private body").unwrap();
-            store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":id,"source":"native_engine","model":model,"usage":usage,"status":"completed"}]))).unwrap().unwrap();
+            store.db.fixture_shard(session, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":id,"source":"native_engine","model":model,"usage":usage,"status":"completed"}]))).unwrap().unwrap();
         }
         let result = last_request(&store.db, &parent).unwrap().unwrap();
         assert_eq!(result.model, "model");
@@ -330,7 +330,7 @@ mod tests {
                 .unwrap();
             store
                 .db
-                .with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &snapshots))
+                .fixture_shard(&parent, |conn| message_repo::save_request_snapshots(conn, &message, &snapshots))
                 .unwrap()
                 .unwrap();
             let prior = last_request(&store.db, &parent).unwrap().unwrap();
@@ -338,7 +338,7 @@ mod tests {
             assert_eq!(prior.reported_input_tokens, Some(60));
         }
         let message = store.append(&parent, "assistant", "new response").unwrap();
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"new","source":"native_engine","model":"new-model","contextUsage":{"bad":"PRIVATE"}}]))).unwrap().unwrap();
+        store.db.fixture_shard(&parent, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"new","source":"native_engine","model":"new-model","contextUsage":{"bad":"PRIVATE"}}]))).unwrap().unwrap();
         let result = last_request(&store.db, &parent).unwrap().unwrap();
         assert_eq!(result.model, "new-model");
         assert!(result.usage.is_none());
@@ -358,7 +358,7 @@ mod tests {
             .is_none());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&parent, |conn| {
                 conn.execute("DELETE FROM messages WHERE conversation_id=?1", [&parent])
             })
             .unwrap()
@@ -392,7 +392,7 @@ mod tests {
         let estimate = |tokens: u64| json!({"serialized_utf8_bytes":tokens * 3,"estimated_tokens":tokens,"unknown_parts":0});
         let usage = json!({"version":1,"history":estimate(1),"instructions":estimate(500),"tools":estimate(700),"output_schema":estimate(0),
             "configured_context_window":null,"requested_output_budget":0,"sent_output_reserve":null,"estimated_input_tokens":null});
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"r","source":"native_engine","providerId":"fixture","model":"fixture-model","contextUsage":usage}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"r","source":"native_engine","providerId":"fixture","model":"fixture-model","contextUsage":usage}]))).unwrap().unwrap();
         assert_eq!(
             estimated_tokens(&store, &session, "fixture-model", Some("fixture"))
                 .unwrap()
@@ -401,7 +401,7 @@ mod tests {
         );
         store
             .db
-            .with_conn(|conn| -> anyhow::Result<()> {
+            .fixture_shard(&session, |conn| -> anyhow::Result<()> {
                 message_repo::insert_message(
                     conn, "boundary", &session, "user", "summary", None, "now", true, 10,
                 )?;
@@ -433,7 +433,7 @@ mod tests {
         let estimate = |tokens: u64| json!({"serialized_utf8_bytes":tokens * 3,"estimated_tokens":tokens,"unknown_parts":0});
         let usage = json!({"version":1,"history":estimate(1),"instructions":estimate(500),"tools":estimate(700),"output_schema":estimate(0),
             "configured_context_window":null,"requested_output_budget":0,"sent_output_reserve":null,"estimated_input_tokens":null});
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"before","source":"native_engine","providerId":"fixture","model":"fixture-model","startedAt":1000,"status":"completed","inputTokens":90000,"usage":{"input_tokens":90000},"contextUsage":usage}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"before","source":"native_engine","providerId":"fixture","model":"fixture-model","startedAt":1000,"status":"completed","inputTokens":90000,"usage":{"input_tokens":90000},"contextUsage":usage}]))).unwrap().unwrap();
         assert_eq!(
             last_request(&store.db, &session)
                 .unwrap()
@@ -461,7 +461,7 @@ mod tests {
         assert!(estimate.tokens < 90000, "{estimate:?}");
         // A request that recorded the new boundary restores measured usage.
         let message = store.append(&session, "assistant", "after").unwrap();
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"after","source":"native_engine","providerId":"fixture","contextBoundary":boundary.id,"model":"fixture-model","startedAt":boundary.created_at_ms.map(|ms|ms+1),"status":"completed","inputTokens":48000,"usage":{"input_tokens":48000}}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"after","source":"native_engine","providerId":"fixture","contextBoundary":boundary.id,"model":"fixture-model","startedAt":boundary.created_at_ms.map(|ms|ms+1),"status":"completed","inputTokens":48000,"usage":{"input_tokens":48000}}]))).unwrap().unwrap();
         let after = last_request_since(&store.db, &session, &boundary.id)
             .unwrap()
             .unwrap();
@@ -484,7 +484,7 @@ mod tests {
             "configured_context_window":128000,"requested_output_budget":1000,"sent_output_reserve":1000,"estimated_input_tokens":null});
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&session, |conn| {
                 message_repo::save_request_snapshots(
                     conn,
                     &answer,
@@ -521,7 +521,7 @@ mod tests {
             "configured_context_window":128000,"requested_output_budget":1000,"sent_output_reserve":1000,"estimated_input_tokens":null});
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&session, |conn| {
                 message_repo::save_request_snapshots(
                     conn,
                     &answer,

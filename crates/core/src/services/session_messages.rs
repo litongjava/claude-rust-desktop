@@ -595,12 +595,21 @@ impl ExecutionLease {
         // A real owner holds the lock for a whole turn, so the short retry only absorbs momentary holds such as an execution_active probe or a forked descriptor; two overlapping turns still cannot both run.
         crate::fs::try_lock_briefly(&file)
             .context("Session is already executing in another owner")?;
+        #[cfg(test)]
+        lock_observer::inspect(&file);
         Ok(Some(Self {
             file,
             address: None,
             lifecycle: Vec::new(),
             owner: std::process::id(),
         }))
+    }
+}
+
+#[cfg(test)]
+impl ExecutionLease {
+    pub(crate) fn duplicate_descriptor(&self) -> std::io::Result<File> {
+        self.file.try_clone()
     }
 }
 
@@ -639,7 +648,9 @@ impl Target {
     pub fn drain(&self,limit:usize)->Result<Vec<String>>{
         ensure!(self.generation==std::process::id(),"Message consumer ownership changed");
         let owner=self.live.upgrade().context("Message consumer ownership changed")?;
-        let inputs=owner.lock().unwrap_or_else(|e|e.into_inner()).as_mut().context("Message consumer ownership changed")?.poll_turn(true,limit)?;
+        let mut guard = owner.lock().unwrap_or_else(|e| e.into_inner());
+        let delivery = guard.as_mut().context("Message consumer ownership changed")?;
+        let inputs = delivery.poll_peer_context(limit)?;
         Ok(inputs.into_iter().map(|i|i.text).collect())
     }
 }
@@ -754,21 +765,11 @@ mod lock_observer {
 mod tests {
     #[test]
     fn family_excludes_unrelated_saved_sessions_and_notices_include_body_once() {
-        let (_temp, context, store, parent, child) = fixture();
-        let other = store.fork(&parent).unwrap();
-        let grandchild = store.fork(&child).unwrap();
-        context
-            .save_setting(
-                &format!("background-agent.job"),
-                &serde_json::json!({"parent":parent,"session_id":child}),
-            )
-            .unwrap();
-        context
-            .save_setting(
-                &format!("delegation.{grandchild}"),
-                &serde_json::json!({"parent_session_id":child,"session_id":grandchild}),
-            )
-            .unwrap();
+        let (_temp, context, store, parent, other) = fixture();
+        let root = context.paths.data_dir.join("workspaces");
+        let cwd = store.workspace(&parent,&root).unwrap();
+        let child = store.derive_owned_child(&parent,&root,&cwd).unwrap();
+        let grandchild = store.derive_owned_child(&child,&root,&cwd).unwrap();
         for current in [&parent, &child, &grandchild] {
             let peers = session_peers(&context, current).unwrap();
             assert_eq!(peers.len(), 3);
@@ -843,7 +844,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(receiver_active(&context.paths.data_dir, &recipient).unwrap());
-        let duplicate = owner.file.try_clone().unwrap();
+        let duplicate = owner.delivery.lock().unwrap().as_ref().unwrap().duplicate_inbox_lock().unwrap();
         let stale = owner.target.clone();
         drop(owner);
         assert!(
@@ -856,21 +857,7 @@ mod tests {
         // The old generation is no longer the consumer, even though a stale
         // `Target` handle still exists.
         assert!(stale.drain(8).is_err());
-        let current: String = context
-            .db
-            .with_conn(|conn| {
-                Ok::<String, anyhow::Error>(conn.query_row(
-                    "SELECT generation FROM session_inbox_consumers WHERE session_id=?1",
-                    [&recipient],
-                    |row| row.get(0),
-                )?)
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            current, resumed.target.generation,
-            "the old generation's cleanup removed the newer consumer row"
-        );
+        assert!(receiver_active(&context.paths.data_dir, &recipient).unwrap());
         assert!(resumed.target.drain(8).unwrap().is_empty());
         drop(duplicate);
         drop(resumed);
@@ -878,119 +865,40 @@ mod tests {
         assert!(!receiver_active(&context.paths.data_dir, &recipient).unwrap());
     }
 
-    fn generation_row(context: &ServiceContext, session: &str) -> Option<String> {
-        context
-            .db
-            .with_conn(|conn| {
-                Ok::<Option<String>, anyhow::Error>(
-                    conn.query_row(
-                        "SELECT generation FROM session_inbox_consumers WHERE session_id=?1",
-                        [session],
-                        |row| row.get(0),
-                    )
-                    .optional()?,
-                )
-            })
-            .unwrap()
-            .unwrap()
-    }
-
-    /// A forked child carries a copy of the same descriptor but a different PID.
-    /// Its copy must neither remove the live parent's consumer row nor release
-    /// the parent's lock, so the ownership check precedes all cleanup.
     #[test]
     fn a_copied_consumer_does_not_clean_up_the_live_owner() {
-        let (_temp, context, _store, _sender, recipient) = fixture();
-        let mut owner = Consumer::attach(&context.paths.data_dir, &recipient)
-            .unwrap()
-            .unwrap();
-        let generation = owner.target.generation.clone();
-        let parent_target = owner.target.clone();
-        // The parent keeps its own descriptor after the child copies it.
-        let parent_descriptor = owner.file.try_clone().unwrap();
-        // Simulate the child's copy without an unsafe `fork` in this threaded
-        // process: same descriptor and generation, foreign owner identity.
-        owner.owner = std::process::id().wrapping_add(1);
+        let (_temp, ctx, _, _, recipient) = fixture();
+        let owner = Consumer::attach(&ctx.paths.data_dir, &recipient).unwrap().unwrap();
+        // A fork copies the parent’s target and lifetime. Simulate dropping that
+        // foreign copy while the acquiring parent still owns the lease.
+        let copied = Consumer {
+            target: owner.target.clone(), delivery: owner.delivery.clone(),
+            owner: std::process::id().wrapping_add(1),
+        };
+        drop(copied);
+        assert!(owner.target.drain(8).unwrap().is_empty());
+        assert!(Consumer::attach(&ctx.paths.data_dir,&recipient).is_err());
+        let stale = owner.target.clone();
         drop(owner);
-        assert_eq!(
-            generation_row(&context, &recipient).as_deref(),
-            Some(generation.as_str()),
-            "a copied owner removed the live consumer's generation row"
-        );
-        assert!(
-            parent_target.drain(8).is_ok(),
-            "a copied handle ended the live parent's lifetime"
-        );
-        drop(parent_target);
-
-        // The parent's own release still frees the session and its row.
-        release_owned(&parent_descriptor, std::process::id());
-        drop(parent_descriptor);
-        let real = Consumer::attach(&context.paths.data_dir, &recipient)
-            .expect("the parent's release freed the session")
-            .expect("a real session id");
-        let real_generation = real.target.generation.clone();
-        assert_ne!(real_generation, generation);
-        drop(real);
-        assert_eq!(
-            generation_row(&context, &recipient),
-            None,
-            "the real owner's release must remove its own row"
-        );
+        let next = Consumer::attach(&ctx.paths.data_dir, &recipient).unwrap().unwrap();
+        assert!(next.target.drain(8).unwrap().is_empty());
+        assert!(stale.drain(8).is_err());
     }
 
-    /// A failed generation-row cleanup must not leave the released handle usable:
-    /// the in-memory lifetime ends at release, independently of the database.
     #[test]
-    fn a_stale_target_cannot_commit_after_release_when_cleanup_fails() {
-        let (_temp, context, store, sender, recipient) = fixture();
-        send(&context, &sender, &recipient, "stays queued").unwrap();
-        let owner = Consumer::attach(&context.paths.data_dir, &recipient)
-            .unwrap()
-            .unwrap();
+    fn a_stale_target_cannot_commit_after_release_while_the_directory_writer_is_busy() {
+        let (_temp, ctx, store, sender, recipient) = fixture();
+        send(&ctx,&sender,&recipient,"stays queued").unwrap();
+        let owner = Consumer::attach(&ctx.paths.data_dir,&recipient).unwrap().unwrap();
         let stale = owner.target.clone();
-        // A transient database error during Drop leaves the generation row behind.
-        context
-            .db
-            .with_conn(|conn| {
-                conn.execute_batch(
-                    "CREATE TRIGGER reject_consumer_delete BEFORE DELETE ON session_inbox_consumers \
-                     BEGIN SELECT RAISE(ABORT,'fixture cleanup failure'); END;",
-                )
-            })
-            .unwrap()
-            .unwrap();
+        let (release, holder) = hold_writer(&ctx);
         drop(owner);
-        assert!(
-            generation_row(&context, &recipient).is_some(),
-            "the injected failure must leave the generation row behind"
-        );
-        assert!(!receiver_active(&context.paths.data_dir, &recipient).unwrap());
-        assert!(
-            stale.drain(8).is_err(),
-            "a stale target committed after the consumer was released"
-        );
-        // The denied drain leaves the queue and the transcript untouched.
-        assert_eq!(
-            inbox(&context, &recipient, false).unwrap()[0].state,
-            "queued"
-        );
+        assert!(stale.drain(8).is_err());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(!receiver_active(&ctx.paths.data_dir,&recipient).unwrap());
+        assert_eq!(inbox(&ctx,&recipient,false).unwrap()[0].state,"queued");
         assert!(store.history(&recipient).unwrap().is_empty());
-        context
-            .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_consumer_delete"))
-            .unwrap()
-            .unwrap();
-        context
-            .db
-            .with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM session_inbox_consumers WHERE session_id=?1",
-                    [&recipient],
-                )
-            })
-            .unwrap()
-            .unwrap();
     }
 
     /// Release waits for a drain that already started, and once it returns no
@@ -1005,9 +913,8 @@ mod tests {
         // Hold the same lock a running drain holds. The bounded wait below only
         // checks that release did not overtake it; the correctness assertion is
         // the rejected drain after the release completed.
-        let in_flight = stale
-            .lifetime
-            .alive
+        let live = stale.live.upgrade().unwrap();
+        let in_flight = live
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -1041,49 +948,16 @@ mod tests {
     #[test]
     fn a_failed_consumer_attach_releases_the_lock_before_descriptor_close() {
         let (_temp, context, _store, _sender, recipient) = fixture();
-        // A successful attach creates the consumer table the trigger targets.
-        drop(
-            Consumer::attach(&context.paths.data_dir, &recipient)
-                .unwrap()
-                .unwrap(),
-        );
-        context
-            .db
-            .with_conn(|conn| {
-                conn.execute_batch(
-                    "CREATE TRIGGER reject_consumer BEFORE INSERT ON session_inbox_consumers \
-                     BEGIN SELECT RAISE(ABORT,'fixture failure'); END;",
-                )
-            })
-            .unwrap()
-            .unwrap();
+        let shard = context.db.open_session(&recipient).unwrap();
+        let competing_inbox = ExecutionLease::acquire_inbox(&context.paths.data_dir, shard.incarnation()).unwrap();
         let (send, receive) = std::sync::mpsc::channel();
         lock_observer::install(Box::new(move |file| {
             send.send(file.try_clone().unwrap()).unwrap();
         }));
-        let error = match Consumer::attach(&context.paths.data_dir, &recipient) {
-            Ok(_) => panic!("the injected trigger must fail the attach"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:#}").contains("fixture failure"),
-            "{error:#}"
-        );
-        let duplicate = receive.try_recv().expect("the attach never took the lock");
-        assert!(
-            !receiver_active(&context.paths.data_dir, &recipient).unwrap(),
-            "a failed attach left the lock held through a duplicated descriptor"
-        );
-        assert_eq!(
-            generation_row(&context, &recipient),
-            None,
-            "a failed attach must not leave a consumer row"
-        );
-        context
-            .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_consumer"))
-            .unwrap()
-            .unwrap();
+        assert!(Consumer::attach(&context.paths.data_dir,&recipient).is_err());
+        let duplicate = receive.try_recv().expect("attach acquired the execution lock");
+        assert!(!execution_active(&context.paths.data_dir,shard.incarnation()).unwrap());
+        drop(competing_inbox);
         // A real consumer is admitted at once, while the duplicate is alive.
         let owner = Consumer::attach(&context.paths.data_dir, &recipient)
             .expect("the failed attach released the lock")
@@ -1130,10 +1004,10 @@ mod tests {
         lock_observer::install(Box::new(move |file| {
             send.send(file.try_clone().unwrap()).unwrap();
         }));
-        assert!(!receiver_active(dir.path(), &id).unwrap());
+        assert!(!receiver_active_by_key(dir.path(), &id).unwrap());
         let duplicate = receive.try_recv().expect("the probe never took the lock");
         assert!(
-            !receiver_active(dir.path(), &id).unwrap(),
+            !receiver_active_by_key(dir.path(), &id).unwrap(),
             "the probe's lock outlived it through a duplicated descriptor"
         );
         let owner = std::fs::OpenOptions::new()
@@ -1370,16 +1244,16 @@ mod tests {
             .unwrap();
         assert!(receiver_active(&context.paths.data_dir, &recipient).unwrap());
         assert!(Consumer::attach(&context.paths.data_dir, &recipient).is_err());
-        context.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER reject_inbox_context BEFORE INSERT ON messages WHEN NEW.role='user' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
+        context.db.fixture_shard(&recipient, |conn|conn.execute_batch("CREATE TRIGGER reject_inbox_context BEFORE INSERT ON messages WHEN NEW.role='user' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
         assert!(owner.target.drain(8).is_err());
         assert_eq!(
             inbox(&context, &recipient, false).unwrap()[0].state,
-            "queued"
+            "claimed"
         );
         assert!(store.history(&recipient).unwrap().is_empty());
         context
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_inbox_context"))
+            .fixture_shard(&recipient, |conn| conn.execute_batch("DROP TRIGGER reject_inbox_context"))
             .unwrap()
             .unwrap();
         mark_read(&context, &recipient, &message.id).unwrap();
@@ -1407,7 +1281,7 @@ mod tests {
     fn hold_writer(
         context: &ServiceContext,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-        let path = context.paths.data_dir.join(crate::runtime::DATABASE_FILE);
+        let path = context.paths.data_dir.join("global.db");
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
@@ -1467,12 +1341,12 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "a contended poll waited {elapsed:?}"
         );
-        let (state, consumer_generation, committed_at): (String, Option<String>, Option<String>) =
+        let (state, consumer_generation, committed_at): (String, Option<i64>, Option<String>) =
             context
                 .db
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     Ok::<_, anyhow::Error>(conn.query_row(
-                        "SELECT state,consumer_generation,committed_at FROM session_inbox WHERE recipient=?1",
+                        "SELECT state,generation,committed_at FROM session_inbox WHERE recipient=?1",
                         [&recipient],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )?)
@@ -1511,11 +1385,11 @@ mod tests {
         let owner = Consumer::attach(&context.paths.data_dir, &recipient)
             .unwrap()
             .unwrap();
-        context.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER reject_inbox_context BEFORE INSERT ON messages WHEN NEW.role='user' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
+        context.db.fixture_shard(&recipient, |conn|conn.execute_batch("CREATE TRIGGER reject_inbox_context BEFORE INSERT ON messages WHEN NEW.role='user' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
         let error = owner.target.drain(8).unwrap_err();
         let text = format!("{error:#}");
         assert!(
-            text.contains("session message drain failed after"),
+            text.contains("deliver input failed after"),
             "{text}"
         );
         // SQLITE_CONSTRAINT_TRIGGER from the fixture's RAISE(ABORT).
@@ -1525,7 +1399,7 @@ mod tests {
         // never the SQL text or the queued body.
         let diagnostic = crate::performance::request_diagnostic(&error);
         assert!(
-            diagnostic.contains("session message drain failed after"),
+            diagnostic.contains("deliver input failed after"),
             "{diagnostic}"
         );
         assert!(
@@ -1537,22 +1411,20 @@ mod tests {
         assert!(store.history(&recipient).unwrap().is_empty());
         assert_eq!(
             inbox(&context, &recipient, false).unwrap()[0].state,
-            "queued"
+            "claimed"
         );
         context
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_inbox_context"))
+            .fixture_shard(&recipient, |conn| conn.execute_batch("DROP TRIGGER reject_inbox_context"))
             .unwrap()
             .unwrap();
         assert_eq!(owner.target.drain(8).unwrap().len(), 1);
         drop(owner);
     }
 
-    /// A failure at the acknowledgement statement happens after the message row
-    /// and the conversation count were written. The whole poll unit must roll
-    /// back: no history row, no count increment and an untouched queue row.
+    /// Recovery acknowledges the existing receipt without replaying the local effect.
     #[test]
-    fn a_late_acknowledgement_failure_rolls_back_the_whole_poll_unit() {
+    fn a_late_acknowledgement_failure_recovers_one_durable_receipt() {
         let (_temp, context, store, sender, recipient) = fixture();
         send(&context, &sender, &recipient, "rolled back body").unwrap();
         let owner = Consumer::attach(&context.paths.data_dir, &recipient)
@@ -1561,7 +1433,7 @@ mod tests {
         let count = |context: &ServiceContext| -> i64 {
             context
                 .db
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     Ok::<_, anyhow::Error>(conn.query_row(
                         "SELECT message_count FROM conversations WHERE id=?1",
                         [&recipient],
@@ -1576,7 +1448,7 @@ mod tests {
         // insert_message and increment_message_count already ran.
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute_batch(
                     "CREATE TRIGGER reject_inbox_ack BEFORE UPDATE OF state ON session_inbox \
                      WHEN NEW.state='context_committed' \
@@ -1588,7 +1460,7 @@ mod tests {
         let error = owner.target.drain(8).unwrap_err();
         let text = format!("{error:#}");
         assert!(
-            text.contains("session message drain failed after"),
+            text.contains("acknowledge delivery failed after"),
             "{text}"
         );
         assert!(text.contains("sqlite extended code 1811"), "{text}");
@@ -1596,25 +1468,23 @@ mod tests {
             !format!("{error:#}").contains("rolled back body"),
             "the diagnostic exposed queued content: {text}"
         );
-        // Everything the unit wrote before the failed acknowledgement is gone.
-        assert!(store.history(&recipient).unwrap().is_empty());
-        assert_eq!(count(&context), before_count);
-        let (state, generation, committed_at): (String, Option<String>, Option<String>) = context
+        assert_eq!(store.history(&recipient).unwrap().len(),1);
+        let (state, generation, committed_at): (String, Option<i64>, Option<String>) = context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 Ok::<_, anyhow::Error>(conn.query_row(
-                    "SELECT state,consumer_generation,committed_at FROM session_inbox WHERE recipient=?1",
+                    "SELECT state,generation,committed_at FROM session_inbox WHERE recipient=?1",
                     [&recipient],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?)
             })
             .unwrap()
             .unwrap();
-        assert_eq!(state, "queued");
-        assert!(generation.is_none() && committed_at.is_none());
+        assert_eq!(state, "claimed");
+        assert!(generation.is_some() && committed_at.is_none());
         context
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_inbox_ack"))
+            .fixture_directory(|conn| conn.execute_batch("DROP TRIGGER reject_inbox_ack"))
             .unwrap()
             .unwrap();
         let delivered = owner.target.drain(8).unwrap();
@@ -1638,10 +1508,10 @@ mod tests {
         let owner = Consumer::attach(&context.paths.data_dir, &recipient)
             .unwrap()
             .unwrap();
-        let generation = generation_row(&context, &recipient);
+        let current = owner.target.clone();
         let project_id: String = context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 Ok::<_, anyhow::Error>(conn.query_row(
                     "SELECT project_id FROM conversations WHERE id=?1",
                     [&recipient],
@@ -1653,7 +1523,7 @@ mod tests {
         let update = |sql: &str, value: &str, id: &str| {
             context
                 .db
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     Ok::<_, anyhow::Error>(conn.execute(sql, rusqlite::params![value, id])?)
                 })
                 .unwrap()
@@ -1703,7 +1573,7 @@ mod tests {
         );
 
         // None of these refusals changed the consumer or consumed context.
-        assert_eq!(generation_row(&context, &recipient), generation);
+        assert!(current.drain(8).unwrap().is_empty());
         assert!(owner.target.drain(8).unwrap().is_empty());
         drop(owner);
     }
@@ -1746,17 +1616,17 @@ mod tests {
                 .unwrap()
         }
         let (_temp, context, _store, _sender, _recipient) = fixture();
-        let path = context.paths.data_dir.join(crate::runtime::DATABASE_FILE);
+        let path = context.paths.data_dir.join("global.db");
         let conn = Connection::open(&path).unwrap();
         conn.busy_timeout(std::time::Duration::from_millis(7_000))
             .unwrap();
         {
-            let _poll = BusyTimeoutGuard::within(&conn, INBOX_POLL_WRITE_WAIT).unwrap();
+            let _poll = BusyTimeoutGuard::within(&conn, crate::db::session_store::TURN_POLL_WAIT).unwrap();
             assert_eq!(timeout_ms(&conn), 250);
         }
         assert_eq!(timeout_ms(&conn), 7_000);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _poll = BusyTimeoutGuard::within(&conn, INBOX_POLL_WRITE_WAIT).unwrap();
+            let _poll = BusyTimeoutGuard::within(&conn, crate::db::session_store::TURN_POLL_WAIT).unwrap();
             panic!("unwind while the poll timeout is lowered");
         }));
         assert!(unwound.is_err());
@@ -1791,10 +1661,10 @@ mod tests {
     fn pending_listing_survives_large_history_and_chat_sessions_are_skipped() {
         let (_temp, context, _store, sender, recipient) = fixture();
         let old = send(&context, &sender, &recipient, "old").unwrap();
-        context.db.with_conn(|conn| -> Result<()> {
+        context.db.fixture_directory(|conn| -> Result<()> {
             conn.execute("UPDATE session_inbox SET state='context_committed' WHERE id=?1", [&old.id])?;
             for index in 0..1001 {
-                conn.execute("INSERT INTO session_inbox(id,sender,recipient,project_source,content,created_at,state) SELECT ?1,sender,recipient,project_source,content,created_at,state FROM session_inbox WHERE id=?2", params![format!("fixture-{index}"),old.id])?;
+                conn.execute("INSERT INTO session_inbox(id,sender,sender_incarnation,recipient,project_source,payload,size,created_at,state) SELECT ?1,sender,sender_incarnation,recipient,project_source,payload,size,created_at,state FROM session_inbox WHERE id=?2", params![format!("fixture-{index}"),old.id])?;
             }
             Ok(())
         }).unwrap().unwrap();
@@ -1806,7 +1676,7 @@ mod tests {
         );
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE conversations SET workspace_mode='chat' WHERE id=?1",
                     [&recipient],
@@ -1834,7 +1704,7 @@ mod tests {
         let sender_project = super::super::session_trust::inspect(&context.db, &sender).unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                     [sender_project.id],
@@ -1847,7 +1717,7 @@ mod tests {
             .unwrap();
         assert!(owner.target.drain(8).unwrap().is_empty());
         let queued = inbox(&context, &recipient, false).unwrap();
-        assert_eq!(queued[0].state, "queued");
+        assert_eq!(queued[0].state, "blocked");
         assert!(queued[0].blocked_reason.is_some());
         assert!(store.history(&recipient).unwrap().is_empty());
     }
@@ -1875,7 +1745,7 @@ mod tests {
         let project = super::super::session_trust::inspect(&context.db, &recipient).unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 worktree.save(conn, &recipient, &project.id, source.to_str().unwrap())
             })
             .unwrap()

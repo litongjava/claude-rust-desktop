@@ -102,6 +102,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"secret-fixture-key","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         Checkpoint::open(&db, "session", &provider, "system")
@@ -136,10 +138,10 @@ mod tests {
             .get(&request)
             .is_none());
         let value: String = db
-            .with_conn(|c| {
+            .fixture_shard("session", |c| {
                 c.query_row(
-                    "SELECT value FROM peripheral_settings WHERE key=?1",
-                    [key("session")],
+                    "SELECT fingerprint || request_key || summary FROM compaction_checkpoint",
+                    [],
                     |r| r.get(0),
                 )
             })
@@ -153,22 +155,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"secret-fixture-key","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         // A version 1 fingerprint is what the earlier strategy stored.
         let fingerprint = digest(
             &json!({"version":1,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":"system","input":"history"}),
         );
-        let stale =
-            json!({"fingerprint":fingerprint,"completed":{ request.clone(): "Stale summary" }});
-        db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [key("session"), stale.to_string()],
-            )
-        })
-        .unwrap()
-        .unwrap();
+        db.fixture_shard("session", |c| c.execute(
+            "INSERT INTO compaction_checkpoint VALUES(?1,?2,'Stale summary')", [&fingerprint,&request]
+        )).unwrap().unwrap();
         assert!(
             Checkpoint::open(&db, "session", &provider, "system")
                 .unwrap()
@@ -206,6 +203,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"fixture","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         Checkpoint::open(&db, "session", &provider, "system")
@@ -232,9 +231,9 @@ mod tests {
         store.append(&id, "assistant", "Progress").unwrap();
         store
             .db
-            .with_conn(|c| {
+            .fixture_shard(&id, |c| {
                 c.execute(
-                    "INSERT INTO peripheral_settings(key,value) VALUES(?1,'{}')",
+                    "INSERT INTO compaction_checkpoint VALUES(?1,'request','summary')",
                     [key(&id)],
                 )
             })
@@ -244,9 +243,9 @@ mod tests {
         super::super::commit(&store.db, prepared, "Final summary").unwrap();
         let remaining: i64 = store
             .db
-            .with_conn(|c| {
+            .fixture_shard(&id, |c| {
                 c.query_row(
-                    "SELECT COUNT(*) FROM peripheral_settings WHERE key=?1",
+                    "SELECT COUNT(*) FROM compaction_checkpoint WHERE fingerprint=?1",
                     [key(&id)],
                     |r| r.get(0),
                 )

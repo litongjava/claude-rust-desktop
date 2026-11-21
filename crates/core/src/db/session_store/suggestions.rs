@@ -214,7 +214,7 @@ mod tests {
         let store = SessionStore::new(paths.open_database()?);
         let other = paths.open_database()?;
         let session = store.create(root.path(), "old", "provider")?;
-        let mut turn = TurnTimer::start(store.db.clone(), &session)?;
+        let mut turn = store.db.start_turn_timer(&session)?;
         let begin = || {
             SuggestionTurn::begin(
                 store.db.clone(),
@@ -251,7 +251,7 @@ mod tests {
         .complete(&assistant)?
         .unwrap();
         assert!(guard.is_current()?);
-        let _next = TurnTimer::start(other, &session)?;
+        let _next = other.start_turn_timer(&session)?;
         assert_eq!(
             HistoryPosition::current(&store.db, &session)?.unwrap(),
             guard.position
