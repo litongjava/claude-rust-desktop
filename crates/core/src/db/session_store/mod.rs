@@ -410,27 +410,38 @@ impl SessionDb {
         &self,
         label: &str,
         deadline: Duration,
+        body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.write_locked_with_commit(label,deadline,body,|tx|Ok(tx.commit()?))
+    }
+
+    fn write_locked_with_commit<T>(
+        &self,
+        label: &str,
+        deadline: Duration,
         mut body: impl FnMut(&SessionWrite<'_>) -> Result<T>,
+        mut commit:impl FnMut(rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<T> {
         let start=Instant::now();
         let _admission=self.provider_fence(false,deadline)?;
         let binding = self.binding_control()?;
         let (result, projection) = self.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            crate::db::write_tx(c, label, deadline.saturating_sub(start.elapsed()), |tx| {
+            crate::db::write_tx_with_commit(c, label, deadline.saturating_sub(start.elapsed()), |tx| {
                 let before:i64=tx.query_row("SELECT total_changes()",[],|r|r.get(0))?;
-                let writer=SessionWrite(tx,&self.id,false.into(),&binding);
+                let writer=SessionWrite(&tx,&self.id,false.into(),&binding);
                 let result=layout::callback(|| body(&writer))?;
                 let changed:bool=tx.query_row("SELECT total_changes()>?1",[before],|r|r.get(0))?;
                 let mut summary=None;
                 if changed {
-                    history::advance(tx)?;
+                    history::advance(&tx)?;
                     if writer.2.get() || !tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_turns WHERE status='running')",[],|r|r.get::<_,bool>(0))? {
-                        match history::projection(tx) {
+                        match history::projection(&tx) {
                             Ok(projection) => summary = Some(projection),
                             Err(error) => tracing::warn!(%error, session=%self.id, "Directory summary could not be computed"),
                         }
                     }
                 }
+                commit(tx)?;
                 Ok((result,summary))
             })
         })

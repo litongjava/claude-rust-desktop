@@ -1,10 +1,10 @@
 //! Session-local permission mode storage shared by CLI and its worker.
 use crate::{
-    db::DbManager,
+    db::session_store::SessionAccess,
     permissions::{PermissionManager, PermissionMode},
 };
 use anyhow::{Context, Result};
-use rusqlite::OptionalExtension;
+#[cfg(test)] use crate::db::DbManager;
 pub fn parse(value: &str) -> Result<PermissionMode> {
     PermissionMode::parse(value)
 }
@@ -18,69 +18,15 @@ pub fn name(mode: PermissionMode) -> &'static str {
         PermissionMode::Auto => "auto",
     }
 }
-pub fn load(db: &DbManager, session: &str) -> Result<Option<PermissionMode>> {
-    let value: Option<String> = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [format!("cli.permission-mode.{session}")],
-            |row| row.get(0),
-        )
-        .optional()
-    })??;
-    value.map(|value| parse(&value)).transpose()
+pub fn load(db:&impl SessionAccess,session:&str)->Result<Option<PermissionMode>>{
+    db.select_session(session)?.saved_mode()
 }
-pub fn set(
-    db: &DbManager,
-    session: &str,
-    manager: &PermissionManager,
-    mode: PermissionMode,
-) -> Result<()> {
-    db.with_conn(|conn| -> Result<()> {
-        crate::db::write_tx_with_commit(
-            conn,
-            "session permission mode",
-            crate::db::STARTUP_WRITE_DEADLINE,
-            |tx| {
-                if mode == PermissionMode::PlanMode {
-                    let previous: Option<String> = tx.query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("cli.permission-mode.{session}")], |row| row.get(0),
-                    ).optional()?;
-                    // Preserve the origin across worker handoff and repeated plan entry.
-                    if previous.as_deref() != Some("plan") {
-                        let bypass = manager.bypass_available()
-                            && (manager.get_mode() == PermissionMode::BypassPermissions
-                                || previous.as_deref() == Some("bypass"));
-                        tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("plan.return-bypass.{session}"), bypass.to_string()])?;
-                    }
-                }
-                tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("cli.permission-mode.{session}"), name(mode).into()])?;
-                manager.commit_mode_update(mode, || Ok(tx.commit()?))
-            },
-        )
-        .context("Saving session permission mode")
-    })?
+pub fn set(db:&impl SessionAccess,session:&str,manager:&PermissionManager,mode:PermissionMode)->Result<()> {
+    db.select_session(session)?.commit_mode(manager,mode).context("Saving session permission mode")
 }
-
-pub fn plan_returns_to_bypass(
-    db: &DbManager,
-    session: &str,
-    manager: &PermissionManager,
-) -> Result<bool> {
-    if !manager.bypass_available() || manager.get_mode() != PermissionMode::PlanMode {
-        return Ok(false);
-    }
-    let value: Option<String> = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [format!("plan.return-bypass.{session}")],
-            |row| row.get(0),
-        )
-        .optional()
-    })??;
-    Ok(value.as_deref() == Some("true"))
+pub fn plan_returns_to_bypass(db:&impl SessionAccess,session:&str,manager:&PermissionManager)->Result<bool>{
+    Ok(manager.bypass_available() && manager.get_mode()==PermissionMode::PlanMode && db.select_session(session)?.saved_plan_origin()?)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,3 +58,55 @@ impl SessionRepository<'_> {
         }
     }
 }
+
+impl SessionRepository<'_> {
+    pub(crate) fn saved_mode(&self) -> Result<Option<crate::permissions::PermissionMode>> {
+        self.read(|c, id| {
+            super::state::local(c, &format!("cli.permission-mode.{id}"))?
+                .map(|s| crate::services::session_permission_mode::parse(&s))
+                .transpose()
+        })
+    }
+    pub(crate) fn saved_plan_origin(&self) -> Result<bool> {
+        self.read(|c, id| {
+            Ok(
+                super::state::local(c, &format!("plan.return-bypass.{id}"))?.as_deref()
+                    == Some("true"),
+            )
+        })
+    }
+    /// The in-memory policy changes under the manager lock only if SQLite commits.
+    pub(crate) fn commit_mode(
+        &self,
+        manager: &crate::permissions::PermissionManager,
+        mode: crate::permissions::PermissionMode,
+    ) -> Result<()> {
+        let label = "session permission mode";
+        let deadline = crate::db::STARTUP_WRITE_DEADLINE;
+        let commit =
+            |tx: rusqlite::Transaction<'_>| manager.commit_mode_update(mode, || Ok(tx.commit()?));
+        match &self.0 {
+            Backend::Admitted(s) => {
+                let _guard = s.stores.key_lock(&s.key, false, false)?;
+                s.write_locked_with_commit(
+                    label,
+                    deadline,
+                    |w| w.set_agent_mode_from(mode, manager.get_mode(), manager.bypass_available()),
+                    commit,
+                )
+            }
+            Backend::Shared(db, id) => db.with_conn(|c| {
+                crate::db::write_tx_with_commit(c, label, deadline, |tx| {
+                    super::state::save_agent_mode(
+                        &tx,
+                        id,
+                        mode,
+                        manager.get_mode(),
+                        manager.bypass_available(),
+                    )?;
+                    commit(tx)
+                })
+            })?,
+        }
+    }
+}
