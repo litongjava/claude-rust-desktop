@@ -159,12 +159,13 @@ async fn terminal(root: &Path) -> Value {
     .unwrap()
 }
 fn rows(root: &Path) -> Vec<Value> {
-    let conn = {
-        let data=root.join("data");
-        let sessions=deepseek_code_core::db::session_store::Stores::open(&data).unwrap().conversations().unwrap();
-        assert_eq!(sessions.len(),1);
-        fixture_sql::shard_connection(&data,&sessions[0].id).unwrap()
-    };
+    let sessions=deepseek_code_core::db::session_store::Stores::open(&root.join("data")).unwrap().conversations().unwrap();
+    assert_eq!(sessions.len(),1);
+    session_rows(root,&sessions[0].id)
+}
+
+fn session_rows(root:&Path,session:&str)->Vec<Value> {
+    let conn=fixture_sql::shard_connection(&root.join("data"),session).unwrap();
     let mut stmt=conn.prepare("SELECT t.id,t.name,t.input,t.output,t.is_error,o.parent_tool_call_id FROM tool_calls t LEFT JOIN tool_call_origins o ON o.tool_call_id=t.id ORDER BY t.id").unwrap();
     let rows=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"input":r.get::<_,Option<String>>(2)?,"output":r.get::<_,Option<String>>(3)?,"is_error":r.get::<_,bool>(4)?,"parent":r.get::<_,Option<String>>(5)?}))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
     for row in &rows {
@@ -599,7 +600,7 @@ async fn sdk_toolscript_super_gates_precede_the_approval_host() {
         assert!(client.finish().await.0.success());
         terminal(root.path()).await;
         assert!(!root.path().join("approved.txt").exists());
-        let db = rows(root.path());
+        let db = session_rows(root.path(),&session);
         let row = db.iter().find(|r| r["name"] == "Write").unwrap();
         assert_eq!(row["is_error"], true);
         assert!(

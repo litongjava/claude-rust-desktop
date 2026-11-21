@@ -1867,6 +1867,7 @@ async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
         .unwrap();
         deepseek_code_core::services::agents::install(&context,serde_json::from_value(json!({"id":"sdk-fixture-agent","description":"Actual configured agent","system_prompt":"Use local fixtures","tools":["Read"]})).unwrap()).unwrap();
         let session = uuid::Uuid::new_v4().to_string();
+        context.db.create_code_session(root.path(),"fixture-model","sdk-fixture",&session).unwrap();
         context
             .db.seed_preference(&session, deepseek_code_core::db::session_store::settings::DISPLAY,
                 &json!({"output_style":"learning"}),
@@ -1899,7 +1900,7 @@ async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
             root.path(),
             &server,
             &[
-                "--session-id",
+                "--resume",
                 &session,
                 "--system-prompt",
                 "CLI_BASE_REPLACED",

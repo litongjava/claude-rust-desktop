@@ -267,11 +267,8 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
     winner
         .store
         .db
-        .shard_sql(&winner.id, |c| {
-            c.execute_batch(
-                "CREATE TRIGGER reject_effort BEFORE UPDATE ON peripheral_settings
-        WHEN NEW.key='cli.session' BEGIN SELECT RAISE(ABORT,'effort write rejected'); END;",
-            )
+        .directory_sql(|c| {
+            c.execute_batch("CREATE TRIGGER reject_effort BEFORE INSERT ON cli_binding_efforts BEGIN SELECT RAISE(ABORT,'effort write rejected'); END;")
         })
         .unwrap()
         .unwrap();
@@ -289,7 +286,7 @@ async fn rejected_picker_preserves_winner_settings_and_saves_effort_atomically()
     winner
         .store
         .db
-        .shard_sql(&winner.id, |c| c.execute_batch("DROP TRIGGER reject_effort"))
+        .directory_sql(|c| c.execute_batch("DROP TRIGGER reject_effort"))
         .unwrap()
         .unwrap();
     picker

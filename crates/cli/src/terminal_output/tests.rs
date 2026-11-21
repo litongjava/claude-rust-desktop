@@ -152,6 +152,8 @@ async fn fail_stream(screen_reader: bool, failure: DisplayFailure) {
         false,
         screen_reader,
     );
+    let session_id=uuid::Uuid::new_v4().to_string();
+    command.args(["--session-id",&session_id]);
     let args: Vec<_> = command
         .get_argv()
         .iter()
@@ -187,7 +189,7 @@ async fn fail_stream(screen_reader: bool, failure: DisplayFailure) {
             if volume.is_some() {
                 prefix.extend([
                     "-P".into(),
-                    data.join("deepseek_code.db-wal").into_os_string(),
+                    data.join("sessions").join(&session_id).join("session.db-wal").into_os_string(),
                 ]);
             } else {
                 prefix.extend(["-e".into(), "inject=write:error=EIO".into()]);
@@ -201,7 +203,7 @@ async fn fail_stream(screen_reader: bool, failure: DisplayFailure) {
         .await;
     if matches!(failure, DisplayFailure::FullWithTimerFailure) {
         // The transcript can commit here. Only the later turn-timer update fails.
-        rusqlite::Connection::open(data.join("deepseek_code.db"))
+        crate::fixture_sql::shard_connection(&data,&session_id)
             .unwrap()
             .execute_batch(
                 "CREATE TRIGGER reject_turn_finish BEFORE UPDATE OF status ON execution_turns
@@ -264,7 +266,7 @@ async fn fail_stream(screen_reader: bool, failure: DisplayFailure) {
         let log = fs::read_to_string(trace).unwrap();
         for (syscall, path) in [
             ("write(1<", "/response.txt>"),
-            ("pwrite64(", "/deepseek_code.db-wal>"),
+            ("pwrite64(", "/session.db-wal>"),
         ] {
             assert!(
                 log.lines().any(|line| line.contains(syscall)

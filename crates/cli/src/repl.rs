@@ -498,7 +498,8 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
                     index as i64,
                 )?;
             }
-            Ok(())
+            conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
+                Ok(())
         })
         .unwrap()
         .unwrap();

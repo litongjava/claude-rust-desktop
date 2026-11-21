@@ -805,11 +805,7 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
     ] {
         let mut fixture = Fixture::start("bypass", false).await;
         let lease = if case == "lease" {
-            session_messages::ExecutionLease::acquire(
-                &fixture.context.paths.data_dir,
-                &fixture.child,
-            )
-            .unwrap()
+            Some(fixture.context.db.open_session(&fixture.child).unwrap().acquire_execution().unwrap())
         } else {
             None
         };
@@ -890,7 +886,7 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
         if case != "failure" {
             assert_eq!(
                 session_messages::pending_count(&fixture.context, &fixture.child).unwrap(),
-                1
+                1, "{case}"
             );
         }
         drop(lease);

@@ -4942,7 +4942,8 @@ mod completion_tests {
                 // Old records may repeat the provider raw id across messages.
                 message_repo::insert_tool_call(conn, &format!("{message}:same-raw"), message, "Read", Some("{}"), Some("ok"), false, 0)?;
             }
-            Ok(())
+            conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
+                Ok(())
         }).unwrap().unwrap();
         let mut display = TurnDisplay::new(false, "ask", &paths.data_dir.join("keybindings.json"), vec![]).unwrap();
         display.restore_numbers(&session).unwrap();

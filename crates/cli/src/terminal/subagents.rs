@@ -331,6 +331,7 @@ mod tests {
         let store = SessionStore::new(context.db.clone());
         let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
         let child = store.fork(&parent).unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.fork(&parent).unwrap();
         context.db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"session_id":child,"parent_session_id":parent,"agent_type":"general","status":"completed","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context

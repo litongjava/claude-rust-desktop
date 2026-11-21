@@ -1641,6 +1641,7 @@ mod agent_row_tests {
                 for (id,tokens) in requests {
                     conn.execute("INSERT INTO model_requests(id,message_id,conversation_id,output_tokens) VALUES (?1,'m',?2,?3)", (id,session,tokens))?;
                 }
+                conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
                 Ok(())
             }).unwrap().unwrap();
         }
