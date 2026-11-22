@@ -106,6 +106,22 @@ impl FileMemory {
             include_str!("../../prompt/file_memory.md"), index_excerpt(&xml(index)))
     }
 
+    pub(crate) fn prepare_delivery(
+        &self,
+        messages: &[Value],
+        read_only: bool,
+        budget: usize,
+    ) -> Result<Option<Entry>> {
+        let Some(shard) = &self.session else {
+            return Ok(None);
+        };
+        let id = messages.last().and_then(|m| m["id"].as_str());
+        let (_, entries) = prepare(shard, Some(self), messages, true, read_only, budget)?;
+        Ok(entries
+            .into_iter()
+            .find(|e| e.key.strip_prefix("message:") == id))
+    }
+
     pub(crate) fn current_prompt_index(&self, read_only: bool) -> Result<Option<String>> {
         let memory = match &self.session {
             Some(shard) => {

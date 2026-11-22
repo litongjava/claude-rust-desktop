@@ -42,7 +42,10 @@ impl DeliveredInput {
     }
 
     pub fn model_message(&self) -> Value {
-        json!({"role":"user", "content":self.content, "origin":self.origin})
+        let origin = if self.origin.starts_with("queue-input-") { "user" } else { &self.origin };
+        let mut message = json!({"role":"user", "content":self.content, "origin":origin});
+        if let Some(id) = &self.message_id { message["id"] = json!(id); }
+        message
     }
 }
 

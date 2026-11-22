@@ -101,15 +101,23 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
     for anthropic in [false, true] {
         let server = Server::start(anthropic, Mode::SlowTool).await;
         let root = tempfile::tempdir().unwrap();
+        use deepseek_code_core::services::{memory_files::FileMemory, EnvironmentCredentials, ServiceContext};
+        let context = ServiceContext::open(
+            deepseek_code_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap(),
+            std::sync::Arc::new(EnvironmentCredentials),
+        ).unwrap();
+        let memory = FileMemory::workspace(&context, root.path()).unwrap();
+        memory.put("saffron.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
         let mut client = Client::start(root.path(), &server, &["--allowed-tools", STEER_TOOL]);
         client.send(user("Run the slow probe")).await;
         // The tool is now executing; the host corrects the turn while it runs.
         client.frame("tool_start").await;
+        std::fs::write(memory.directory.join("MEMORY.md"), "steer-index-marker").unwrap();
         client
-            .send(user("Skip the rest and answer STEERED now"))
+            .send(user("saffron: Skip the rest and answer STEERED now"))
             .await;
         let delivered = client.frame("queued_input").await;
-        assert_eq!(delivered["text"], "Skip the rest and answer STEERED now");
+        assert_eq!(delivered["text"], "saffron: Skip the rest and answer STEERED now");
         assert!(
             delivered["origin"]
                 .as_str()
@@ -130,6 +138,8 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         );
         let tool = tool_result_index(second).expect("tool result in the second request");
         let steer = message_index(second, "answer STEERED now").expect("steering text");
+        let content = second["messages"][steer]["content"].to_string();
+        assert!(content.contains("steer-recall-marker") && content.contains("steer-index-marker"));
         assert!(
             steer >= tool,
             "the steering text must follow the tool result: {second}"
@@ -169,6 +179,16 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         assert_eq!(queue.len(), 1, "{queue:?}");
         assert_eq!(queue[0].mode, QueueMode::Steer);
         assert_eq!(queue[0].state, QueueState::Handoff, "{queue:?}");
+
+        let mut resumed = Client::start(root.path(), &server, &["--resume", session_id]);
+        resumed.send(user("one last question")).await;
+        assert_eq!(resumed.result().await["is_error"], false);
+        assert!(resumed.finish().await.0.success());
+        let replay = streamed_requests(&server).pop().unwrap();
+        let at = message_index(&replay, "answer STEERED now").unwrap();
+        for marker in ["steer-recall-marker", "steer-index-marker"] {
+            assert_eq!(replay["messages"][at].to_string().matches(marker).count(), 1);
+        }
     }
 }
 
