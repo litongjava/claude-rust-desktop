@@ -29,6 +29,7 @@ fn note(body: &str) -> String {
 
 struct Fixture {
     root: tempfile::TempDir,
+    context: ServiceContext,
     memory: PathBuf,
     id: String,
 }
@@ -44,6 +45,7 @@ impl Fixture {
         memory.put("saffron.md", &note(ORIGINAL), None).unwrap();
         Self {
             root,
+            context,
             memory: memory.directory,
             id: uuid::Uuid::new_v4().to_string(),
         }
@@ -211,4 +213,132 @@ async fn overflow_retry_reuses_admitted_receipt() {
 #[tokio::test]
 async fn overflow_summary_failure_keeps_admitted_receipt() {
     overflow(true).await;
+}
+
+async fn compressed_chat(large: bool, edited: bool) {
+    let fixture = Fixture::new();
+    let current = format!(
+        "INDEX_CURRENT_37{}",
+        if large {
+            "x".repeat(18_500)
+        } else {
+            String::new()
+        }
+    );
+    if large {
+        assert_eq!(current.len(), 18_516);
+    }
+    let index = fixture.memory.join("MEMORY.md");
+    fs::write(&index, if edited { "INDEX_OLD_37" } else { &current }).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let capture = requests.clone();
+    let server = fixture
+        .serve(12_800, move |body| {
+            assert_eq!(body["stream"], true);
+            capture.lock().unwrap().push(body["messages"].to_string());
+            if large {
+                answer(&"The project build finished. ".repeat(100))
+            } else {
+                answer(&"older conversation material. ".repeat(890))
+            }
+        })
+        .await;
+    let prior = if large { 4 } else { 1 };
+    for n in 0..prior {
+        let output = fixture
+            .turn(n == 0, &format!("Summarize build {}.", n + 1))
+            .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::write(index, &current).unwrap();
+    let prompt = if large {
+        "What does saffron mean?".to_owned()
+    } else {
+        format!("{QUESTION}{}", " saffron".repeat(800))
+    };
+    let output = fixture.turn(false, &prompt).await;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), prior + 1);
+    let last = calls.last().unwrap();
+    assert!(last.contains("[CRITICAL: Context Compressed]"));
+    assert_eq!(last.matches(&current).count(), 1);
+    assert!(!last.contains("INDEX_OLD_37"));
+    assert_eq!(last.matches(ORIGINAL).count(), 1);
+    assert_eq!(last.matches(&prompt).count(), 1);
+}
+
+#[tokio::test]
+async fn compressed_chat_sends_one_edited_index() {
+    compressed_chat(false, true).await;
+}
+
+#[tokio::test]
+async fn compressed_chat_fits_large_edited_index() {
+    compressed_chat(true, true).await;
+}
+
+#[tokio::test]
+async fn compressed_chat_fits_large_unchanged_index() {
+    compressed_chat(true, false).await;
+}
+
+#[tokio::test]
+async fn receipt_after_text_boundary_supersedes_all_earlier_indexes() {
+    use deepseek_code_core::services::compaction;
+
+    let fixture = Fixture::new();
+    let index = fixture.memory.join("MEMORY.md");
+    fs::write(&index, "FROZEN_INDEX_C").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let server = fixture
+        .serve(128_000, move |body| {
+            captured.lock().unwrap().push(body["messages"].clone());
+            answer("done")
+        })
+        .await;
+
+    let first = fixture.turn(true, "hello").await;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let prefix = compaction::prepare(&fixture.context.db, &fixture.id).unwrap();
+    compaction::commit(&fixture.context.db, prefix, "hello and its answer").unwrap();
+    for (marker, question) in [
+        ("INDEX_CHANGE_D", "first saffron question"),
+        ("INDEX_CHANGE_E", "second saffron question"),
+    ] {
+        fs::write(&index, marker).unwrap();
+        let output = fixture.turn(false, question).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    server.abort();
+    let _ = server.await;
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let last = calls[2].to_string();
+    assert!(!last.contains("FROZEN_INDEX_C") && !last.contains("INDEX_CHANGE_D"));
+    assert_eq!(last.matches("INDEX_CHANGE_E").count(), 1);
+    assert_eq!(last.matches(ORIGINAL).count(), 2);
+    let latest = calls[2].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(latest.contains("second saffron question") && latest.contains("INDEX_CHANGE_E"));
 }

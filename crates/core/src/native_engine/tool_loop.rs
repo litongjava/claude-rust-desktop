@@ -3242,20 +3242,25 @@ impl ToolLoopExecutor {
                     .position(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
             })
             .flatten();
-        crate::services::turn_context::resolve(&self.turn_context, &self.messages)
-            .into_iter()
-            .enumerate()
-            .map(|(index, after)| {
-                (
-                    if Some(index) == target {
-                        self.context_reminders.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    after,
-                )
-            })
-            .collect()
+        let mut additions: Vec<_> =
+            crate::services::turn_context::resolve(&self.turn_context, &self.messages)
+                .into_iter()
+                .enumerate()
+                .map(|(index, after)| {
+                    (
+                        if Some(index) == target {
+                            self.context_reminders.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        after,
+                    )
+                })
+                .collect();
+        if self.applied_compaction {
+            project_memory_context::replay_index(&mut additions, 0);
+        }
+        additions
     }
 
     pub fn with_allowed_tools(mut self, tools: Option<Vec<String>>) -> Self {
@@ -5324,7 +5329,7 @@ impl ToolLoopExecutor {
             self.replay_window(
                 &mut request_messages,
                 durable_len,
-                Self::build_anthropic_messages,
+                Self::render_anthropic_messages,
             )
             .await?;
 
@@ -6032,7 +6037,7 @@ impl ToolLoopExecutor {
             self.replay_window(
                 &mut request_messages,
                 durable_len,
-                Self::build_openai_messages,
+                Self::render_openai_messages,
             )
             .await?;
 
@@ -6792,7 +6797,13 @@ impl ToolLoopExecutor {
     }
 
     fn build_anthropic_messages(&self) -> Result<Vec<AnthropicMessage>> {
-        let additions = self.message_additions();
+        self.render_anthropic_messages(&self.message_additions())
+    }
+
+    fn render_anthropic_messages(
+        &self,
+        additions: &[(Vec<String>, Vec<String>)],
+    ) -> Result<Vec<AnthropicMessage>> {
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.prepare_history_tool_outputs(&mut messages);
         Ok(messages
@@ -6893,7 +6904,13 @@ impl ToolLoopExecutor {
     }
 
     fn build_openai_messages(&self) -> Result<Vec<OpenAIMessage>> {
-        let additions = self.message_additions();
+        self.render_openai_messages(&self.message_additions())
+    }
+
+    fn render_openai_messages(
+        &self,
+        additions: &[(Vec<String>, Vec<String>)],
+    ) -> Result<Vec<OpenAIMessage>> {
         // Responses accepts content arrays for user messages, so the stable
         // instruction blocks stay separate for caching. Chat Completions keeps
         // one string because several compatible servers reject arrays there.
@@ -7015,16 +7032,27 @@ impl ToolLoopExecutor {
             .collect();
         // Responses replays the compact window verbatim and ignores the display
         // text of its boundary row. Put the index immediately after that window.
-        if built.first().is_some_and(|m| m.provider_content.as_ref().is_some_and(|v| v["compaction"] == true)) {
-            if let Some(index) = self.context_reminders.iter().find(|s| s.starts_with("<system-reminder>\n<project_memory>\n")) {
-                built.insert(1, OpenAIMessage {
-                    role: "user".into(),
-                    content: OpenAIContent::Text(index.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    provider_content: None,
-                });
+        if built.first().is_some_and(|m| {
+            m.provider_content
+                .as_ref()
+                .is_some_and(|v| v["compaction"] == true)
+        }) {
+            if let Some(index) = additions[0]
+                .0
+                .iter()
+                .find(|s| s.starts_with("<system-reminder>\n<project_memory>\n"))
+            {
+                built.insert(
+                    1,
+                    OpenAIMessage {
+                        role: "user".into(),
+                        content: OpenAIContent::Text(index.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        provider_content: None,
+                    },
+                );
             }
         }
         Ok(built)

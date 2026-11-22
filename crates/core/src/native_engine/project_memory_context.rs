@@ -59,31 +59,62 @@ impl ToolLoopExecutor {
             }
         });
     }
+}
 
-    pub(super) fn compacted_index(&self) -> Option<String> {
-        // In-flight compression has no durable boundary. Carry forward the most
-        // recently announced index from this request's immutable receipts.
-        self.turn_context
-            .iter()
-            .rev()
-            .flat_map(|entry| &entry.blocks)
-            .find(|block| is_index(block))
-            .map(|block| block.replacen("MEMORY.md changed. The current index follows.\n", "", 1))
-            .or_else(|| {
-                self.context_reminders
-                    .iter()
-                    .find(|block| is_index(block))
-                    .cloned()
-            })
-    }
-
-    pub(super) fn add_compacted_memory(&self, messages: &mut Vec<Value>) {
-        if let Some(index) = self.compacted_index() {
-            let at = messages
-                .iter()
-                .take_while(|m| m["role"] == "system")
-                .count();
-            messages.insert(at, json!({"role":"user","content":index}));
+/// Walk generated reminders in reverse transcript order. Keep the newest index
+/// on its own message when that message survives. If it is in the prefix being
+/// summarized, return it for the new window instead. User content is untouched.
+pub(super) fn replay_index(
+    additions: &mut [(Vec<String>, Vec<String>)],
+    retain_from: usize,
+) -> (bool, Option<String>) {
+    let mut changed = false;
+    let mut seen = false;
+    let mut prefix = None;
+    for (row, (before, after)) in additions.iter_mut().enumerate().rev() {
+        for blocks in [after, before] {
+            for i in (0..blocks.len()).rev() {
+                if !is_index(&blocks[i]) {
+                    continue;
+                }
+                if seen {
+                    changed = true;
+                    blocks.remove(i);
+                } else if row < retain_from {
+                    changed = true;
+                    prefix = Some(blocks.remove(i).replacen(
+                        "MEMORY.md changed. The current index follows.\n",
+                        "",
+                        1,
+                    ));
+                }
+                seen = true;
+            }
         }
+    }
+    (changed, prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_replay_keeps_only_the_newest_announcement_with_protected_steers() {
+        let index = "<system-reminder>\n<project_memory>\nC".to_owned();
+        let change = |content| {
+            format!("<system-reminder>\nMEMORY.md changed. The current index follows.\n<project_memory>\n{content}")
+        };
+        let mut rows = vec![
+            (vec![index], vec![]),
+            (vec![], vec![change("C"), "first recall".into()]),
+            (vec![], vec![change("D")]),
+            (vec![], vec![change("C"), "steer recall".into()]),
+        ];
+        let (changed, prefix) = replay_index(&mut rows, 1);
+        assert!(changed && prefix.is_none());
+        assert!(rows[0].0.is_empty() && rows[2].1.is_empty());
+        assert_eq!(rows[1].1, ["first recall"]);
+        assert_eq!(rows[3].1, [change("C"), "steer recall".to_owned()]);
     }
 }

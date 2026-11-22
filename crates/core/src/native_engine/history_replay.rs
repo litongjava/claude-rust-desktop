@@ -151,7 +151,7 @@ impl ToolLoopExecutor {
         &mut self,
         window: &mut Vec<M>,
         durable_len: usize,
-        render: fn(&Self) -> Result<Vec<M>>,
+        render: fn(&Self, &[(Vec<String>, Vec<String>)]) -> Result<Vec<M>>,
     ) -> Result<()> {
         let model = &self.provider.model;
         let limit = model
@@ -181,7 +181,7 @@ impl ToolLoopExecutor {
         if let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() {
             let additions = window.split_off(durable_len);
             native_cut = self.reload_with_cut(&shard, native)?;
-            *window = render(self)?;
+            *window = render(self, &self.message_additions())?;
             persisted_len = window.len();
             window.extend(additions);
             rows = values(window)?;
@@ -205,12 +205,9 @@ impl ToolLoopExecutor {
             };
             let cut = native_cut.context("Missing native compaction snapshot")?;
             if cut.prefix_len > 0 {
-                let extra_index = usize::from(
-                    self.messages
-                        .first()
-                        .is_some_and(|m| m["provider_content"]["compaction"] == true)
-                        && self.session_reminders.project_memory.is_some(),
-                );
+                // The Responses renderer can insert one standalone index after
+                // an opaque boundary when no later receipt supersedes it.
+                let extra_index = persisted_len.saturating_sub(self.messages.len());
                 let end = cut.prefix_len + extra_index;
                 anyhow::ensure!(end <= persisted_len, "Invalid native compaction cut");
                 let mut suffix = rows.split_off(end);
@@ -222,7 +219,7 @@ impl ToolLoopExecutor {
                 self.compact_native_window(&shard, &cut, rows).await?;
                 let additions = window.split_off(persisted_len);
                 self.reload_history(&shard)?;
-                *window = render(self)?;
+                *window = render(self, &self.message_additions())?;
                 window.extend(additions);
             }
             let mut result = values(window)?;
@@ -241,7 +238,17 @@ impl ToolLoopExecutor {
         // Compress only the history preceding the current typed exchange. Its
         // multimodal blocks, receipts and any following steers travel together.
         let protected = self.protected_input;
-        let mut suffix = rows.split_off(protected.unwrap_or(rows.len()).min(rows.len()));
+        let cut = protected.unwrap_or(rows.len()).min(rows.len());
+        let mut additions = self.message_additions();
+        let (changed, index) = project_memory_context::replay_index(&mut additions, cut);
+        let prefix_index = index.map(|text| json!({"role":"user","content":text}));
+        if changed {
+            let rendered = values(&render(self, &additions)?)?;
+            // Keep any in-flight tool or hook messages appended since render.
+            anyhow::ensure!(rendered.len() <= rows.len(), "Invalid replay window");
+            rows.splice(..rendered.len(), rendered);
+        }
+        let mut suffix = rows.split_off(cut);
         if protected.is_some() && TokenCounter::estimate(&suffix) > capacity {
             crate::services::compaction::clear_tool_results(&mut suffix);
             anyhow::ensure!(
@@ -250,40 +257,55 @@ impl ToolLoopExecutor {
             );
         }
         let mut compressed = if rows.is_empty() {
-            Vec::new()
+            rows
+        } else if tiered && level == CompressionLevel::None {
+            let result = crate::memory::TieredCompressor::new().compress(&rows);
+            if rows == result && estimated <= capacity {
+                return Ok(());
+            }
+            result
         } else {
-            let original = rows.clone();
-            self.remove_compaction_indexes(&mut rows);
-            let (mut result, changed) = if tiered && level == CompressionLevel::None {
-                let result = crate::memory::TieredCompressor::new().compress(&rows);
-                let changed = rows != result;
-                (result, changed)
-            } else {
-                let (result, metadata) = compressor
-                    .compress(rows, None, level, Some(&self.provider))
-                    .await;
-                (result, metadata.was_compressed)
-            };
-            if changed {
-                self.add_compacted_memory(&mut result);
+            let (result, metadata) = compressor
+                .compress(rows.clone(), None, level, Some(&self.provider))
+                .await;
+            if metadata.was_compressed {
                 result
+            } else if estimated <= capacity {
+                // An unchanged window keeps the normal request's cached prefix.
+                return Ok(());
             } else {
-                original
+                rows
             }
         };
-        if protected.is_some()
-            && TokenCounter::estimate(&compressed) + TokenCounter::estimate(&suffix) > capacity
-        {
-            // Keep the summary and system context when the compressor's last
-            // historical exchange would crowd out current-turn input.
-            compressed.retain(|row| row["role"] == "system" || row["_is_summary"] == true);
-            self.add_compacted_memory(&mut compressed);
-        }
+        let index_at = prefix_index.map(|index| {
+            let at = compressed
+                .iter()
+                .take_while(|row| row["role"] == "system")
+                .count();
+            compressed.insert(at, index);
+            at
+        });
+        let suffix_start = compressed.len();
         compressed.extend(suffix);
-        anyhow::ensure!(
-            protected.is_none() || TokenCounter::estimate(&compressed) <= capacity,
-            "Context overflow: the admitted inputs and required context exceed the model window"
-        );
+        if protected.is_some() && TokenCounter::estimate(&compressed) > capacity {
+            // Discard older exchanges before sacrificing current-turn tool results.
+            compressed = compressed
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    (i >= suffix_start
+                        || Some(i) == index_at
+                        || row["role"] == "system"
+                        || row["_is_summary"] == true)
+                        .then_some(row)
+                })
+                .collect();
+            if TokenCounter::estimate(&compressed) > capacity {
+                crate::services::compaction::clear_tool_results(&mut compressed);
+                anyhow::ensure!(TokenCounter::estimate(&compressed) <= capacity,
+                    "Context overflow: the admitted inputs and required context exceed the model window");
+            }
+        }
         *window = compressed
             .into_iter()
             .map(serde_json::from_value)
