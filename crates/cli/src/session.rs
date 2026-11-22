@@ -1994,7 +1994,7 @@ impl Session {
                         crate::compaction::notice(&format!("Could not save request attempt log: {log_error}"));
                     }
                     // Recovery errors must reach the same finalization as requests.
-                    match crate::session_commands::reactive_compact(self, prompt, &mut turn).await {
+                    match crate::session_commands::reactive_compact(self, prompt, &mut turn, completion.queued.is_some()).await {
                         Ok(false) => {
                             recovery_requests.clear();
                             Err(error)
@@ -2009,7 +2009,7 @@ impl Session {
                         }
                         Ok(true) => {
                             let previous = completion.sdk_result.take();
-                            *completion = TurnCompletion::default();
+                            *completion = TurnCompletion { queued: completion.queued.take(), ..Default::default() };
                             // Retrying after compaction stays inside this turn and
                             // keeps its ownership; a failure here would mean the
                             // lease was lost, so it must not be ignored.

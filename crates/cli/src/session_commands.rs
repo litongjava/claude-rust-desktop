@@ -755,7 +755,12 @@ pub fn is_context_overflow(error: &anyhow::Error) -> bool {
 /// context window, drop the failed attempt, compact the earlier conversation
 /// the way autocompact does, and let the caller send the prompt again. False
 /// (with nothing changed) when there is no earlier conversation to compact.
-pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepseek_code_core::db::turn_repo::TurnTimer) -> Result<bool> {
+pub async fn reactive_compact(
+    session: &Session,
+    prompt: &str,
+    turn: &mut deepseek_code_core::db::turn_repo::TurnTimer,
+    queued: bool,
+) -> Result<bool> {
     use deepseek_code_core::db::message_repo;
     let rows = session.selected_session()?.repository().messages()?;
     let start = rows.iter().rposition(|row| row.is_compact_boundary).unwrap_or(0);
@@ -764,7 +769,16 @@ pub async fn reactive_compact(session: &Session, prompt: &str, turn: &mut deepse
         return Ok(false);
     }
     crate::compaction::notice("Context limit reached; compacting the conversation and retrying…");
-    session.selected_session()?.write(|w| w.rewind_failed_attempt(&rows[index].id,&turn.record().turn_id))?;
+    let failed_start = if queued {
+        rows.get(index + 1)
+    } else {
+        rows.get(index)
+    };
+    if let Some(row) = failed_start {
+        session
+            .selected_session()?
+            .write(|w| w.rewind_failed_attempt(&row.id, &turn.record().turn_id))?;
+    }
     turn.clear_segment();
     compact_automatic(session, "", None).await?;
     Ok(true)

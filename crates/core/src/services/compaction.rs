@@ -223,6 +223,7 @@ impl CompactionTracker {
 }
 
 pub struct PreparedCompaction {
+    pub(crate) before: Option<String>,
     pub(crate) pending_request: Option<String>,
     pub(crate) incarnation: Option<String>,
     pub(crate) conversation_id: String,
@@ -315,7 +316,7 @@ pub(crate) fn fingerprint(
     conn: &rusqlite::Connection,
     id: &str,
 ) -> Result<(String, String, usize)> {
-    transcript(conn, id, false)
+    transcript(conn, id, false, None)
 }
 
 // Include tools and attachment metadata in conflict detection, not just message count.
@@ -328,6 +329,7 @@ pub(crate) fn transcript(
     conn: &rusqlite::Connection,
     id: &str,
     replay_memory: bool,
+    before: Option<&str>,
 ) -> Result<(String, String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
@@ -357,15 +359,23 @@ pub(crate) fn transcript(
             text.push_str(&format!("{byte:02x}"));
             text
         });
+    let end = match before {
+        Some(id) => rows
+            .iter()
+            .position(|row| row.id == id)
+            .context("Queued input missing")?,
+        None => rows.len(),
+    };
+    ensure!(end >= start, "Queued input is behind the active boundary");
     if replay_memory {
-        for row in &mut all[start..] {
+        for row in &mut all[start..end] {
             attach_summary_memory(conn, row)?;
         }
     }
     Ok((
         fingerprint,
-        serde_json::to_string(&all[start..])?,
-        rows.len() - start,
+        serde_json::to_string(&all[start..end])?,
+        end - start,
     ))
 }
 

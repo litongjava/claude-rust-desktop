@@ -26,10 +26,23 @@ impl CheckpointKey {
     }
 }
 
+/// A next-turn delivery already owns its transcript row when its turn starts.
+pub(super) fn queued_turn_input(c: &Connection) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT m.id FROM delivery_generations d JOIN execution_turns t ON t.id=d.turn_id
+         JOIN messages m ON m.id=d.delivery_id WHERE t.status='running'
+         ORDER BY m.sort_order,m.rowid LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()?)
+}
+
 pub struct CompactionClaim {
     pub(crate) id: String,
     incarnation: String,
     fingerprint: String,
+    before: Option<String>,
     pub keep: String,
     pub transcript: String,
 }
@@ -143,7 +156,8 @@ impl DeliveryOwner {
             if !has_target {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
-            let (fingerprint, transcript, count) = compaction::transcript(&tx, &s.id, true)?;
+            let before = queued_turn_input(&tx)?;
+            let (fingerprint, transcript, count) = compaction::transcript(&tx, &s.id, true, before.as_deref())?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -151,6 +165,7 @@ impl DeliveryOwner {
                 id,
                 incarnation: s.incarnation.clone(),
                 fingerprint,
+                before,
                 keep,
                 transcript,
             }))
@@ -200,7 +215,7 @@ impl DeliveryOwner {
                 compaction::fingerprint(w.0, w.1)?.0 == claim.fingerprint,
                 "Session changed during compaction"
             );
-            w.commit_summary(summary, &memory)
+            w.commit_summary(summary, &memory, claim.before.as_deref())
         })
     }
 }
@@ -241,14 +256,23 @@ impl SessionRepository<'_> {
                     .context("Session not found")?;
                 ensure!(!row.archived, "Session is archived");
             }
+            let before = if incarnation.is_some() {
+                queued_turn_input(c)?
+            } else {
+                None
+            };
             let (fingerprint, transcript, count) =
-                compaction::transcript(c, id, incarnation.is_some())?;
-            ensure!(count >= 2, "Not enough messages to compact");
+                compaction::transcript(c, id, incarnation.is_some(), before.as_deref())?;
+            ensure!(
+                count >= 2 || (before.is_some() && count == 1),
+                "Not enough messages to compact"
+            );
             let pending_request = if incarnation.is_some() {
                 c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?
             } else {None};
             Ok(compaction::PreparedCompaction {
                 pending_request,
+                before,
                 incarnation,
                 conversation_id: id.into(),
                 fingerprint,
@@ -287,7 +311,8 @@ impl SessionRepository<'_> {
                     if let Some(request)=&prepared.pending_request {
                         ensure!(w.0.execute("DELETE FROM compaction_request WHERE id=?1",[request])?==1,"Compaction request changed");
                     }
-                    let message_id = w.commit_summary(generated, &memory)?;
+                    let message_id =
+                        w.commit_summary(generated, &memory, prepared.before.as_deref())?;
                     if let Some(context) = context {
                         state::set_local(
                             w.0,
@@ -314,15 +339,30 @@ impl SessionWrite<'_> {
         &self,
         summary: &compaction::GeneratedSummary,
         memory: &crate::services::memory_files::prompt::Admission,
+        before: Option<&str>,
     ) -> Result<String> {
         let content = format!(
             "[Conversation summary — earlier transcript retained in session history]\n{}",
             summary.text.trim()
         );
+        let order = if let Some(id) = before {
+            let order =
+                self.0
+                    .query_row("SELECT sort_order FROM messages WHERE id=?1", [id], |r| {
+                        r.get::<_, i64>(0)
+                    })?;
+            self.0.execute(
+                "UPDATE messages SET sort_order=sort_order+1 WHERE (sort_order,rowid)>=(SELECT sort_order,rowid FROM messages WHERE id=?1)",
+                [id],
+            )?;
+            order
+        } else {
+            self.next_order()?
+        };
         let message = boundary::create(
             self.0,
             self.1,
-            self.next_order()?,
+            order,
             &content,
             boundary::Kind::Compaction,
             boundary::Storage::Shard(memory),

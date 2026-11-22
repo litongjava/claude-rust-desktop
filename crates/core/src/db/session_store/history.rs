@@ -866,6 +866,13 @@ impl SessionRead<'_> {
         format: &crate::native_engine::provider_manager::ApiFormat,
     ) -> Result<Vec<Value>> {
         let (mut messages, _) = self.model_history(format)?;
+        if let Some(id) = super::compaction::queued_turn_input(self.0)? {
+            let end = messages
+                .iter()
+                .position(|row| row["id"] == id)
+                .context("Queued input missing from native history")?;
+            messages.truncate(end);
+        }
         for message in &mut messages {
             if message["origin"] != "typed" {
                 continue;
