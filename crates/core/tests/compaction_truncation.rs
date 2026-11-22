@@ -1,6 +1,8 @@
 //! Bounded recovery when a summary hits its output limit, against local fixtures.
 #[path = "support/session_sql.rs"]
 mod session_sql;
+#[path = "support/summary_response.rs"]
+mod summary_response;
 use session_sql::FixtureSql;
 use axum::{extract::DefaultBodyLimit, routing::post, Json, Router};
 use deepseek_code_core::{
@@ -288,9 +290,15 @@ async fn start(config: Config) -> Fixture {
         let captured_hang = captured_hang.clone();
         let captured_merge = captured_merge.clone();
         async move {
-            assert!(body
-                .get("tools")
-                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)));
+            let streaming = body["stream"] == true;
+            if body.get("tools").is_some() {
+                assert!(
+                    streaming
+                        && body["messages"]
+                            .to_string()
+                            .contains("Write one continuation summary")
+                );
+            }
             let usage = ContextUsage::from_body(
                 if anthropic {
                     "anthropic-messages"
@@ -446,11 +454,11 @@ async fn start(config: Config) -> Fixture {
                     _ => format!("{label} #{number}"),
                 }
             };
-            Json(if anthropic {
+            summary_response::reply(if anthropic {
                 json!({"id":"r","type":"message","role":"assistant","model":"gpt-6-astra","content":[{"type":"text","text":text}],"stop_reason":match finish { 1 => "max_tokens", 2 => "refusal", _ => "end_turn" },"usage":{"input_tokens":1,"output_tokens":1}})
             } else {
                 json!({"id":"r","object":"chat.completion","created":0,"model":"gpt-6-astra","choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":match finish { 1 => "length", 2 => "content_filter", _ => "stop" }}]})
-            })
+            }, streaming)
         }
     };
     let app = Router::new()
@@ -847,8 +855,12 @@ async fn truncation_at_the_model_cap_splits_by_tokens_and_merges_in_order() {
             .expect("a merge request follows the split halves");
         assert!(merge > children[1], "{format}: {log:?}");
         let merged = prompt_of(&sent[merge]);
-        let first = merged.find("summary-first").expect("first half summary");
-        let second = merged.find("summary-second").expect("second half summary");
+        let first = merged
+            .find(&format!("#{}", children[0] + 1))
+            .expect("first half summary");
+        let second = merged
+            .find(&format!("#{}", children[1] + 1))
+            .expect("second half summary");
         assert!(first < second, "{format}: the merge keeps the half order");
         // Seeded Unicode and the oversized tool result cross the wire intact,
         // never as a replacement character.

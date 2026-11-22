@@ -121,7 +121,7 @@ mod tool_loading_tests;
 mod tool_loading_restore_tests;
 
 #[path = "multimodal.rs"]
-mod multimodal;
+pub(super) mod multimodal;
 #[path = "provider_transcript.rs"]
 mod provider_transcript;
 #[cfg(test)]
@@ -3908,45 +3908,7 @@ impl ToolLoopExecutor {
             self.require_pending_peer_message = false;
         }
 
-        if self
-            .permission_manager
-            .as_ref()
-            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
-        {
-            if let (Some(root), Some(session)) = (
-                self.search_config_path
-                    .as_deref()
-                    .and_then(std::path::Path::parent),
-                self.conv_id.as_deref(),
-            ) {
-                let path = crate::services::plans::path(root, session)?;
-                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWhile planning mode is active, the only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit. Shell commands follow the Plan shell policy; CodeGraph initialization and index refresh are allowed for the current project or external reference directories, including generated index files. Direct project editing tools remain blocked until plan approval.\n", path.display()));
-            }
-        }
-
-        if !self.durable_user_input {
-            if let (Some(root), Some(session)) = (
-                self.search_config_path.as_deref().and_then(|p| p.parent()),
-                self.conv_id.as_deref(),
-            ) {
-                self.durable_user_input =
-                    crate::services::background_sessions::worker_directory(root, session)?
-                        .is_some();
-            }
-        }
-        // MCP discovery is a live external exchange, so execution ownership and
-        // authority checks must succeed before any SDK/stdio server is contacted.
-        if let Some(history) = self.session_search_storage() {
-            history.restore(&mut self.messages)?;
-        }
-        Box::pin(self.refresh_mcp_tools()).await?;
-        // A tool loaded earlier in this session stays available; the current
-        // settings still decide whether it may come back. The durable rows are
-        // read first so their load order wins over a display-only message
-        // window that may start in the middle of the session.
-        self.restore_persisted_loaded_tools()?;
-        self.restore_loaded_tools();
-        self.exposed_tools = None;
+        self.restore_request_context().await?;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
             directories.extend(manager.session_directories(conv));
@@ -4078,18 +4040,50 @@ impl ToolLoopExecutor {
         result
     }
 
-    async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
-        let conv_id = self.conv_id.clone().unwrap_or_default();
-        tracing::info!(
-            module = "ToolLoop",
-            "[E1] execute ENTRY: conv_id={}, messages_count={}, provider={}",
-            conv_id,
-            self.messages.len(),
-            self.provider.provider.id
-        );
+    pub(super) async fn restore_request_context(&mut self) -> Result<()> {
+        if self
+            .permission_manager
+            .as_ref()
+            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
+        {
+            if let (Some(root), Some(session)) = (
+                self.search_config_path
+                    .as_deref()
+                    .and_then(std::path::Path::parent),
+                self.conv_id.as_deref(),
+            ) {
+                let path = crate::services::plans::path(root, session)?;
+                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWhile planning mode is active, the only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit. Shell commands follow the Plan shell policy; CodeGraph initialization and index refresh are allowed for the current project or external reference directories, including generated index files. Direct project editing tools remain blocked until plan approval.\n", path.display()));
+            }
+        }
 
-        self.prepare_model_input()?;
+        if !self.durable_user_input {
+            if let (Some(root), Some(session)) = (
+                self.search_config_path.as_deref().and_then(|p| p.parent()),
+                self.conv_id.as_deref(),
+            ) {
+                self.durable_user_input =
+                    crate::services::background_sessions::worker_directory(root, session)?
+                        .is_some();
+            }
+        }
+        // MCP discovery is a live external exchange, so execution ownership and
+        // authority checks must succeed before any SDK/stdio server is contacted.
+        if let Some(history) = self.session_search_storage() {
+            history.restore(&mut self.messages)?;
+        }
+        Box::pin(self.refresh_mcp_tools()).await?;
+        // A tool loaded earlier in this session stays available; the current
+        // settings still decide whether it may come back. The durable rows are
+        // read first so their load order wins over a display-only message
+        // window that may start in the middle of the session.
+        self.restore_persisted_loaded_tools()?;
+        self.restore_loaded_tools();
+        self.exposed_tools = None;
+        self.prepare_model_input()
+    }
 
+    fn compress_history(&mut self) {
         // Token 计数与自动压缩 - First pass
         tracing::info!(module = "ToolLoop", "[E2] Checking token threshold...");
         let token_threshold = crate::config::OrchestrationConfig::token_threshold();
@@ -4112,44 +4106,6 @@ impl ToolLoopExecutor {
             );
         }
         tracing::info!(module = "ToolLoop", "[E2] Token check COMPLETED");
-
-        // 提取最后一条用户消息用于记忆检索
-        tracing::info!(module = "ToolLoop", "[E3] Extracting last user message...");
-        let last_user_msg = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .and_then(|m| m.get("content"))
-            .map(|content| {
-                if let Some(text) = content.as_str() {
-                    return text.to_string();
-                }
-                content
-                    .as_array()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|block| block.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
-        tracing::info!(
-            module = "ToolLoop",
-            "[E3] Last user msg len={}",
-            last_user_msg.len()
-        );
-
-        if let Some(ref prefetch) = self.prefetch_engine {
-            let msg = last_user_msg.clone();
-            let prefetch_clone = prefetch.clone();
-            tokio::spawn(async move {
-                prefetch_clone.prefetch_for_message(&msg).await;
-            });
-        }
 
         // 模型特定的检查和二次压缩
         tracing::info!(module = "ToolLoop", "[E4.5] Model-specific token check...");
@@ -4194,6 +4150,159 @@ impl ToolLoopExecutor {
             );
         }
         tracing::info!(module = "ToolLoop", "[E4.5] Model check COMPLETED");
+
+    }
+
+    fn apply_reasoning_prompt(&mut self) {
+        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+            if let Some(ref sp) = self.system_prompt {
+                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
+            } else {
+                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
+            }
+        }
+    }
+
+    pub(super) async fn replay_request(&mut self) -> Result<super::followup::WireRequest> {
+        self.compress_history();
+        match self.provider.provider.api_format {
+            ApiFormat::Anthropic => {
+                let messages = self.build_anthropic_messages()?;
+                self.apply_reasoning_prompt();
+                let (messages, prepared) = self.prepare_model_round(messages).await?;
+                let body = self.anthropic_client.request_body(
+                    &self.provider,
+                    messages,
+                    prepared.system_prompt.as_deref(),
+                    prepared.tools,
+                    self.max_tokens,
+                    matches!(self.reasoning_mode, ReasoningMode::Deep),
+                )?;
+                Ok(super::followup::WireRequest {
+                    api: "anthropic-messages".into(),
+                    body,
+                    builtin_vision: None,
+                })
+            }
+            ApiFormat::OpenAI => {
+                let messages = self.build_openai_messages()?;
+                self.apply_reasoning_prompt();
+                let (messages, prepared) = self.prepare_model_round(messages).await?;
+                self.openai_client.request_body(
+                    &self.provider,
+                    messages,
+                    prepared.system_prompt.as_deref(),
+                    prepared.tools,
+                    self.max_tokens,
+                    self.conv_id.as_deref(),
+                )
+            }
+        }
+    }
+
+    async fn prepare_model_round<M: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        messages: Vec<M>,
+    ) -> Result<(Vec<M>, PreparedRequest)> {
+        let messages = if crate::services::compaction::native::supports(&self.provider) {
+            messages
+        } else {
+            self.compress_round(messages).await?
+        };
+        Ok((messages, self.prepare_request()?))
+    }
+
+    async fn compress_round<M: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        messages: Vec<M>,
+    ) -> Result<Vec<M>> {
+        let limit = self.request_context_limit();
+        let values: Vec<_> = messages
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?;
+        let estimated = TokenCounter::estimate(&values);
+        if estimated > limit * 70 / 100 {
+            let compressor = ContextCompressor::new(None).with_overrides(&self.projected_results);
+            let window = ContextWindow {
+                model_id: self.provider.model.id.clone(),
+                total_tokens: estimated as u64,
+                reserved_for_completion: u64::from(self.max_tokens) * 2,
+                context_window: limit as u64,
+            };
+            let level = compressor.determine_compression_level(&window);
+            if level != CompressionLevel::None {
+                let (compressed, metadata) = compressor
+                    .compress(values, None, level, Some(&self.provider))
+                    .await;
+                if metadata.was_compressed {
+                    return Ok(compressed
+                        .into_iter()
+                        .map(serde_json::from_value)
+                        .collect::<serde_json::Result<_>>()?);
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    fn request_context_limit(&self) -> usize {
+        self.provider
+            .model
+            .context_window
+            .map(|n| (n as f64 * 0.90) as usize)
+            .unwrap_or_else(|| TokenCounter::get_safe_limit(&self.provider.model.id, 0.90))
+    }
+
+    async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
+        let conv_id = self.conv_id.clone().unwrap_or_default();
+        tracing::info!(
+            module = "ToolLoop",
+            "[E1] execute ENTRY: conv_id={}, messages_count={}, provider={}",
+            conv_id,
+            self.messages.len(),
+            self.provider.provider.id
+        );
+
+        self.compress_history();
+
+        // 提取最后一条用户消息用于记忆检索
+        tracing::info!(module = "ToolLoop", "[E3] Extracting last user message...");
+        let last_user_msg = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .and_then(|m| m.get("content"))
+            .map(|content| {
+                if let Some(text) = content.as_str() {
+                    return text.to_string();
+                }
+                content
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        tracing::info!(
+            module = "ToolLoop",
+            "[E3] Last user msg len={}",
+            last_user_msg.len()
+        );
+
+        if let Some(ref prefetch) = self.prefetch_engine {
+            let msg = last_user_msg.clone();
+            let prefetch_clone = prefetch.clone();
+            tokio::spawn(async move {
+                prefetch_clone.prefetch_for_message(&msg).await;
+            });
+        }
 
         tracing::info!(
             module = "ToolLoop",
@@ -5364,12 +5473,8 @@ impl ToolLoopExecutor {
 
     async fn continue_anthropic(&mut self, cursor: Continuation<AnthropicMessage>) -> Result<(String, Option<String>)> {
         let mut conversation_messages = cursor.messages;
-        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
-            if let Some(ref sp) = self.system_prompt {
-                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
-            } else {
-                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
-            }
+        if cursor.iteration == 0 {
+            self.apply_reasoning_prompt();
         }
 
         let mut full_text = cursor.text;
@@ -5435,70 +5540,16 @@ impl ToolLoopExecutor {
             );
             tracing::info!(module = "AnthropicLoop", "API key length={}", api_key_len);
 
-            // Context compression check before each API call
-            {
-                let model_context_limit = self
-                    .provider
-                    .model
-                    .context_window
-                    .map(|n| (n as f64 * 0.90) as usize)
-                    .unwrap_or_else(|| TokenCounter::get_safe_limit(&model_id, 0.90));
-                let conv_values: Vec<Value> = conversation_messages
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<std::result::Result<_, _>>()?;
-                let estimated = TokenCounter::estimate(&conv_values);
-                if estimated > (model_context_limit * 70 / 100) {
-                    tracing::info!(
-                        module = "AnthropicLoop",
-                        "Context compression needed: {} tokens (limit: {})",
-                        estimated,
-                        model_context_limit
-                    );
-                    let compressor =
-                        ContextCompressor::new(None).with_overrides(&self.projected_results);
-                    let context_window = ContextWindow {
-                        model_id: model_id.clone(),
-                        total_tokens: estimated as u64,
-                        reserved_for_completion: (self.max_tokens as u64) * 2,
-                        context_window: model_context_limit as u64,
-                    };
-                    let level = compressor.determine_compression_level(&context_window);
-                    if level != CompressionLevel::None {
-                        let conv_values: Vec<Value> = conversation_messages
-                            .iter()
-                            .map(serde_json::to_value)
-                            .collect::<std::result::Result<_, _>>()?;
-                        let (compressed, metadata) = compressor
-                            .compress(
-                                conv_values,
-                                // The client adds the base prompt separately; keep existing system messages intact.
-                                None,
-                                level,
-                                Some(&self.provider),
-                            )
-                            .await;
-                        if metadata.was_compressed {
-                            conversation_messages = compressed
-                                .into_iter()
-                                .map(serde_json::from_value)
-                                .collect::<std::result::Result<Vec<AnthropicMessage>, _>>()?;
-                            tracing::info!(
-                                module = "AnthropicLoop",
-                                "Context compressed: {} -> {} messages, saved {} tokens",
-                                metadata.original_count,
-                                metadata.compressed_count,
-                                metadata.token_reduction
-                            );
-                        }
-                    }
-                }
-            }
-
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
-            let PreparedRequest { tools, system_prompt } = self.prepare_request()?;
+            let prepared;
+            (conversation_messages, prepared) =
+                self.prepare_model_round(conversation_messages).await?;
+            let PreparedRequest {
+                tools,
+                system_prompt,
+            } = prepared;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             self.streaming_tool_args.clear();
             let mut request_trace = RequestTrace::new(json!({
@@ -5528,6 +5579,7 @@ impl ToolLoopExecutor {
             let http_attempts: crate::performance::AttemptCounter;
             let mut context_capture = request_trace.capture_context(self.event_tx.clone());
             context_capture.suggestion = self.suggestion.clone();
+
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5889,7 +5941,7 @@ impl ToolLoopExecutor {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
             }
-            if let Some(capture) = &self.suggestion {
+            if let Some(capture) = &context_capture.suggestion {
                 capture.finish(
                     &snapshot,
                     &self.provider,
@@ -6115,12 +6167,8 @@ impl ToolLoopExecutor {
 
     async fn continue_openai(&mut self, cursor: Continuation<OpenAIMessage>) -> Result<(String, Option<String>)> {
         let mut conversation_messages = cursor.messages;
-        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
-            if let Some(ref sp) = self.system_prompt {
-                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
-            } else {
-                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
-            }
+        if cursor.iteration == 0 {
+            self.apply_reasoning_prompt();
         }
 
         let mut full_text = cursor.text;
@@ -6208,32 +6256,21 @@ impl ToolLoopExecutor {
             );
             tracing::info!(module = "OpenAILoop", "API key length={}", api_key_len);
 
-            // Context compression check before each API call
-            {
-                let model_context_limit = self
-                    .provider
-                    .model
-                    .context_window
-                    .map(|n| (n as f64 * 0.90) as usize)
-                    .unwrap_or_else(|| TokenCounter::get_safe_limit(&model_id, 0.90));
-                let conv_values: Vec<Value> = conversation_messages
+            if crate::services::compaction::native::supports(&self.provider) {
+                let conv_values = conversation_messages
                     .iter()
                     .map(serde_json::to_value)
-                    .collect::<std::result::Result<_, _>>()?;
-                let estimated = TokenCounter::estimate(&conv_values);
-                if estimated > (model_context_limit * 70 / 100) {
-                    tracing::info!(
-                        module = "OpenAILoop",
-                        "Context compression needed: {} tokens (limit: {})",
-                        estimated,
-                        model_context_limit
-                    );
-                    if crate::services::compaction::native::supports(&self.provider) {
+                    .collect::<serde_json::Result<Vec<_>>>()?;
+                if TokenCounter::estimate(&conv_values) > self.request_context_limit() * 70 / 100 {
                         let mut options = self
                             .openai_client
                             .request_options
                             .clone()
                             .compaction("native");
+                        if let Some(ExecutorHistory::Session(session)) = &self.executor_history {
+                            options.compaction_metrics =
+                                Some(super::compaction_metrics::MetricsStore(session.clone()));
+                        }
                         let mut record = super::request_recording::CompactionRecord::start(
                             &mut options,
                             "auto",
@@ -6272,55 +6309,19 @@ impl ToolLoopExecutor {
                             reasoning_content: None,
                             provider_content: compacted.native,
                         }];
-                    } else {
-                        let compressor =
-                            ContextCompressor::new(None).with_overrides(&self.projected_results);
-                        let context_window = ContextWindow {
-                            model_id: model_id.clone(),
-                            total_tokens: estimated as u64,
-                            reserved_for_completion: (self.max_tokens as u64) * 2,
-                            context_window: model_context_limit as u64,
-                        };
-                        let level = compressor.determine_compression_level(&context_window);
-                        if level != CompressionLevel::None {
-                            let conv_values: Vec<Value> = conversation_messages
-                                .iter()
-                                .map(serde_json::to_value)
-                                .collect::<std::result::Result<_, _>>()?;
-                            let (compressed, metadata) = compressor
-                                .compress(
-                                    conv_values,
-                                    // The client adds the base prompt separately; keep existing system messages intact.
-                                    None,
-                                    level,
-                                    Some(&self.provider),
-                                )
-                                .await;
-                            if metadata.was_compressed {
-                                conversation_messages = compressed
-                                    .into_iter()
-                                    .map(serde_json::from_value)
-                                    .collect::<std::result::Result<Vec<OpenAIMessage>, _>>()?;
-                                tracing::info!(
-                                    module = "OpenAILoop",
-                                    "Context compressed: {} -> {} messages, saved {} tokens",
-                                    metadata.original_count,
-                                    metadata.compressed_count,
-                                    metadata.token_reduction
-                                );
-                            }
-                        }
-                    }
                 }
             }
 
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
+            let prepared;
+            (conversation_messages, prepared) =
+                self.prepare_model_round(conversation_messages).await?;
             let PreparedRequest {
                 tools,
                 system_prompt,
-            } = self.prepare_request()?;
+            } = prepared;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             // One attempt of this model step. A stalled attempt that is replaced
             // must leave nothing behind, so the parser state belongs to the
@@ -6390,6 +6391,7 @@ impl ToolLoopExecutor {
                 let http_attempts: crate::performance::AttemptCounter;
                 let mut context_capture = request_trace.capture_context(self.event_tx.clone());
                 context_capture.suggestion = self.suggestion.clone();
+
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6792,7 +6794,7 @@ impl ToolLoopExecutor {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
                 }
-                if let Some(capture) = &self.suggestion {
+                if let Some(capture) = &context_capture.suggestion {
                     capture.finish(
                         &snapshot,
                         &self.provider,
@@ -7104,10 +7106,15 @@ impl ToolLoopExecutor {
         Ok((full_text, stop_reason))
     }
 
-    fn build_anthropic_messages(&self) -> Result<Vec<AnthropicMessage>> {
-        let additions = self.message_additions();
+    pub(super) fn prepare_main_history(&self) -> Result<Vec<Value>> {
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.render_history(&mut messages)?;
+        Ok(messages)
+    }
+
+    fn build_anthropic_messages(&self) -> Result<Vec<AnthropicMessage>> {
+        let messages = self.prepare_main_history()?;
+        let additions = self.message_additions();
         Ok(messages
             .iter()
             .enumerate()
@@ -7206,13 +7213,12 @@ impl ToolLoopExecutor {
     }
 
     fn build_openai_messages(&self) -> Result<Vec<OpenAIMessage>> {
-        let additions = self.message_additions();
         // Responses accepts content arrays for user messages, so the stable
         // instruction blocks stay separate for caching. Chat Completions keeps
         // one string because several compatible servers reject arrays there.
         let separate_parts = super::provider_runtime::responses_api(&self.provider);
-        let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.render_history(&mut messages)?;
+        let messages = self.prepare_main_history()?;
+        let additions = self.message_additions();
         Ok(messages
             .iter()
             .enumerate()

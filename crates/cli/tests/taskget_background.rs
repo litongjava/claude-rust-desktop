@@ -552,7 +552,7 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         let compact = serde_json::to_string(compact).unwrap();
         assert!(compact.contains("warning: duplicated tail"), "{compact}");
         assert!(!compact.contains("output_capture"));
-        assert!(!compact.contains("Omitted output:"));
+        assert!(compact.contains(&serde_json::to_string(&summary).unwrap()[1..serde_json::to_string(&summary).unwrap().len() - 1]), "{compact}");
         return;
     }
 

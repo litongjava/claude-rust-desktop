@@ -25,7 +25,11 @@ struct Fixture {
     fail: bool,
 }
 
-async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Response {
+async fn respond(
+    State(state): State<Fixture>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     state.requests.lock().unwrap().push(body.clone());
     if body["stream"] == true && body["messages"].to_string().contains("TIMED_TURN_FIXTURE") {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -40,6 +44,16 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
             })),
         )
             .into_response();
+    }
+    if body["stream"] == true
+        && headers
+            .get("x-dcl-request-kind")
+            .is_some_and(|kind| kind == "compaction")
+    {
+        return chat_stream(
+            json!({"content":"SUMMARY_SENTINEL: preserve task and run tests"}),
+            "stop",
+        );
     }
     if body["stream"] != true {
         return Json(json!({"id":"summary", "object":"chat.completion", "created":0,
@@ -67,16 +81,7 @@ async fn respond(State(state): State<Fixture>, Json(body): Json<Value>) -> Respo
         };
         (json!({"content":content}), "stop")
     };
-    let chunks = [
-        json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
-        json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":12,"completion_tokens":8}}),
-    ];
-    let body = chunks
-        .iter()
-        .map(|v| format!("data: {v}\n\n"))
-        .collect::<String>()
-        + "data: [DONE]\n\n";
-    ([("content-type", "text/event-stream")], body).into_response()
+    chat_stream(delta, finish)
 }
 
 async fn server(tool: Option<&str>, fail: bool) -> (String, Fixture, tokio::task::JoinHandle<()>) {
@@ -866,6 +871,7 @@ const CONTEXT_SEARCH_REPLY: &str = "Recovered archive ID x19-qrx-441 from the sa
 
 async fn context_search_provider(
     State(requests): State<Arc<Mutex<Vec<Value>>>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let step = {
@@ -873,11 +879,15 @@ async fn context_search_provider(
         requests.push(body.clone());
         requests.len()
     };
-    if step == 3 && body["stream"] != true {
+    if step == 3 {
+        assert_eq!(headers["x-dcl-request-kind"], "compaction");
+        let summary = json!({"role":"assistant","content":"COMPACT_FIXTURE: A file was read."});
+        if body["stream"] == true {
+            return chat_stream(summary, "stop");
+        }
         return Json(json!({
-            "id":"summary","object":"chat.completion","created":0,"model":"fixture-model",
-            "choices":[{"index":0,"message":{"role":"assistant","content":"COMPACT_FIXTURE: A file was read."},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}
+            "id":"fixture-summary","object":"chat.completion","created":0,"model":"fixture-model",
+            "choices":[{"index":0,"message":summary,"finish_reason":"stop"}]
         })).into_response();
     }
     let call = |id: &str, name: &str, args: Value| json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
@@ -927,10 +937,10 @@ async fn context_search_provider(
                 .into_response()
         }
     };
-    context_search_stream(delta, finish)
+    chat_stream(delta, finish)
 }
 
-fn context_search_stream(delta: Value, finish: &str) -> Response {
+fn chat_stream(delta: Value, finish: &str) -> Response {
     let start = json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
     let end = json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":12,"completion_tokens":8}});
     (
@@ -1193,11 +1203,11 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
                         "ContextSearch",
                         json!({"query":"legacy-marker","range":"after","role":"assistant"}),
                     ),
-                    _ => return context_search_stream(json!({"content":"finished"}), "stop"),
+                    _ => return chat_stream(json!({"content":"finished"}), "stop"),
                 };
                 let delta = json!({"tool_calls":[{"index":0,"id":format!("legacy-{}",seen.len()),
                 "type":"function","function":{"name":name,"arguments":args.to_string()}}]});
-                context_search_stream(delta, "tool_calls")
+                chat_stream(delta, "tool_calls")
             }
         }),
     );

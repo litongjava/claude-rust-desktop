@@ -211,9 +211,19 @@ pub(crate) fn replay_history(
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
-    let mut history = Vec::new();
     let messages =
         crate::db::model_results::read_messages(conn, id, |row, collapsed| (row, collapsed))?;
+    replay_rows(conn, id, &messages, format, native)
+}
+
+pub(crate) fn replay_rows(
+    conn: &rusqlite::Connection,
+    id: &str,
+    messages: &[(message_repo::MessageRow, bool)],
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let mut history = Vec::new();
     let start = messages
         .iter()
         .rposition(|(m, _)| m.is_compact_boundary)
@@ -222,7 +232,7 @@ pub(crate) fn replay_history(
         .get(start)
         .filter(|(m, _)| m.is_compact_boundary)
         .map(|(m, _)| m.id.clone());
-    for (message, collapsed) in messages.into_iter().skip(start) {
+    for (message, collapsed) in messages.iter().skip(start) {
         if let Some(mut native) = native(&message.id)? {
             crate::native_engine::tool_loop::prepare_native_window(
                 &mut native,
@@ -278,7 +288,7 @@ pub(crate) fn replay_history(
         }
         use rusqlite::OptionalExtension;
         let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
-        let mut collapsed = collapsed;
+        let mut collapsed = *collapsed;
         let content = if let Some(json) = structured {
             let mut content: Value = serde_json::from_str(&json)?;
             if collapsed
@@ -286,7 +296,7 @@ pub(crate) fn replay_history(
                     .as_array()
                     .is_some_and(|b| b.len() == 1 && b[0]["type"] == "text")
             {
-                content[0]["text"] = Value::String(message.content);
+                content[0]["text"] = Value::String(message.content.clone());
             } else if message.role == "user" {
                 collapsed |= crate::native_engine::tool_loop::project_notification(
                     &mut content,
@@ -296,7 +306,7 @@ pub(crate) fn replay_history(
             }
             content
         } else if !message.content.is_empty() {
-            Value::String(message.content)
+            Value::String(message.content.clone())
         } else {
             continue;
         };

@@ -446,7 +446,7 @@ mod tests {
                 WHERE model_output IS NULL AND model_preview IS NULL AND model_recovery IS NULL AND model_search IS NULL",
                 [], |r| r.get(0)).unwrap();
             assert_eq!(nulls, 4);
-            json!(rows)
+            rows.iter().map(|row| json!({"role":"tool","tool_call_id":row.id,"content":row.output})).collect::<Vec<_>>()
         }).unwrap();
         for legacy in [false, true] {
             if legacy {
@@ -480,7 +480,11 @@ mod tests {
                     .transcript;
             for transcript in [&full, &part] {
                 let entries: Vec<Value> = serde_json::from_str(transcript).unwrap();
-                assert_eq!(entries.last().unwrap()["tools"], expected);
+                let results: Vec<_> = entries
+                    .into_iter()
+                    .filter(|m| m["role"] == "tool")
+                    .collect();
+                assert_eq!(results, expected);
             }
             let results = f.search(json!({"query":"ordinary-marker","role":"tool"}));
             let matches = results["matches"].as_array().unwrap();
@@ -674,9 +678,11 @@ mod tests {
         let transcript = compact();
         assert_eq!(transcript, compact());
         let entries: Vec<Value> = serde_json::from_str(&transcript).unwrap();
-        let view = entries.last().unwrap()["tools"][0]["output"]
-            .as_str()
+        let result = entries
+            .iter()
+            .find(|m| m["tool_call_id"] == "old-page")
             .unwrap();
+        let view = result["content"].as_str().unwrap();
         assert!(!view.contains(&payload));
         let reference = view
             .split_once("; full text: ")
@@ -691,7 +697,11 @@ mod tests {
         let part =
             compaction::prepare_part(&f.db, &f.session, &message, compaction::Part::From).unwrap();
         let entries: Vec<Value> = serde_json::from_str(&part.transcript).unwrap();
-        assert_eq!(entries[0]["tools"][0]["output"], view);
+        let result = entries
+            .iter()
+            .find(|m| m["tool_call_id"] == "old-page")
+            .unwrap();
+        assert_eq!(result["content"], view);
         let result = f.search(json!({"query":"page-marker","tool_name":"TaskGet"}));
         assert!(result["matches"][0]["excerpt"]
             .as_str()
@@ -712,9 +722,7 @@ mod tests {
         .notification();
         f.append("user", &notice);
         let entries: Vec<Value> = serde_json::from_str(&compact()).unwrap();
-        let projected = entries.last().unwrap()["message"]["content"]
-            .as_str()
-            .unwrap();
+        let projected = entries.last().unwrap()["content"].as_str().unwrap();
         assert!(!projected.contains(&payload));
         let reference = projected
             .split_once("; full text: ")

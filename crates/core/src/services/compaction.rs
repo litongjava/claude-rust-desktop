@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 pub(crate) mod checkpoint;
+pub mod microcompact;
 pub(crate) mod native;
 
 pub struct GeneratedSummary {
@@ -268,47 +269,44 @@ impl From<CommittedCompaction> for CompactionResult {
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-pub(crate) fn fingerprint(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> Result<(String, String, usize)> {
-    history_snapshot(conn, id, None)
-}
-
-pub(crate) fn model_entry(
-    conn: &rusqlite::Connection,
-    row: &message_repo::MessageRow,
-) -> Result<Value> {
-    let mut message = row.clone();
-    message.content = crate::db::model_results::message_text(conn, row)?;
-    let tools = crate::db::model_results::calls(conn, &row.id, &row.conversation_id)?;
-    Ok(json!({"message":message,"tools":tools}))
-}
-
-pub(crate) fn history_snapshot(
-    conn: &rusqlite::Connection,
-    id: &str,
-    projection: Option<&std::path::Path>,
-) -> Result<(String, String, usize)> {
+pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows
         .iter()
         .rposition(|m| m.is_compact_boundary)
         .unwrap_or(0);
-    let mut all = Vec::new();
+    let count = rows.len() - start;
     let mut hasher = Sha256::new();
-    for (index, row) in rows.iter().enumerate() {
+    if let Some(boundary) = rows.get(start).filter(|m| m.is_compact_boundary) {
+        use rusqlite::OptionalExtension;
+        let sharded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='native_boundaries')",
+            [],
+            |r| r.get(0),
+        )?;
+        let window = if sharded {
+            conn.query_row(
+                "SELECT value FROM native_boundaries WHERE message_id=?1",
+                [&boundary.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            native::load(conn, &boundary.id)?.map(|v| v.to_string())
+        };
+        if let Some(window) = window {
+            // Fence replacement of the opaque payload during generation.
+            hasher.update(window.as_bytes());
+        }
+    }
+
+    for row in &rows {
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         message_repo::hash_history_entry(conn, row, &attachments, &mut hasher)?;
-        if index >= start && projection.is_some() {
-            let mut entry = model_entry(conn, row)?;
-            entry["attachment_metadata"] = Value::Array(attachments);
-            all.push(entry);
-        }
     }
     let digest = hasher.finalize();
     let fingerprint = digest
@@ -317,11 +315,18 @@ pub(crate) fn history_snapshot(
             text.push_str(&format!("{byte:02x}"));
             text
         });
-    Ok((
-        fingerprint,
-        serde_json::to_string(&all)?,
-        rows.len() - start,
-    ))
+    Ok((fingerprint, count))
+}
+
+/// Model-visible rows for the optional request record and durable queue claim.
+pub(crate) fn recorded_history(conn: &rusqlite::Connection, id: &str) -> Result<String> {
+    let (rows, _) = crate::runtime::replay_history(
+        conn,
+        id,
+        &crate::native_engine::provider_manager::ApiFormat::OpenAI,
+        |_| Ok(None),
+    )?;
+    Ok(serde_json::to_string(&rows)?)
 }
 
 pub fn prepare(db: &impl crate::db::session_store::SessionAccess, id: &str) -> Result<PreparedCompaction> {
@@ -501,10 +506,6 @@ pub async fn compact(
 ) -> Result<CompactionResult> {
     let started = std::time::Instant::now();
     let prepared = prepare(db, id)?;
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        instructions, prepared.transcript
-    );
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -518,7 +519,6 @@ pub async fn compact(
             provider_id,
             model,
             PROMPT,
-            &input,
             instructions,
             options,
         )
@@ -542,6 +542,8 @@ pub enum Part {
 }
 
 pub struct PreparedPart {
+    pub(crate) messages: Vec<Value>,
+    pub(crate) boundary: Option<String>,
     pub(crate) incarnation: String,
     pub(crate) fingerprint: String,
     pub(crate) transcript: String,
@@ -571,8 +573,12 @@ pub async fn summarize_part(
     provider_id: &str,
     model: &str,
 ) -> Result<(String, usize)> {
-    let prepared = prepare_part(db, id, message_id, part)?;
-    let input = format!("Conversation JSON:\n{}", prepared.transcript);
+    let provider = engine.resolved_provider(provider_id, model).await?;
+    let prepared = db.open_session(id)?.prepare_summary_part_for(
+        message_id,
+        part,
+        &provider.provider.api_format,
+    )?;
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -581,7 +587,16 @@ pub async fn summarize_part(
         &prepared.transcript,
     );
     let summary = engine
-        .generate_summary_recorded(Some(id), provider_id, model, PROMPT, &input, options)
+        .generate_replay_summary(
+            db.open_session(id)?,
+            provider,
+            model,
+            PROMPT,
+            "",
+            prepared.messages.clone(),
+            prepared.boundary.clone(),
+            options,
+        )
         .await?;
     let result = commit_part(db, id, message_id, part, prepared, &summary)?;
     if let Some(record) = &mut record {
@@ -648,14 +663,13 @@ pub async fn compact_with_hooks_tracked(
         instructions,
         trigger,
         tracker,
-        |input, focus, options| async move {
+        |focus, options| async move {
             engine
                 .generate_compaction_recorded(
                     id,
                     provider_id,
                     model,
                     PROMPT,
-                    &input,
                     &focus,
                     options,
                 )
@@ -676,7 +690,7 @@ async fn compact_hooks<F, Fut>(
     summarize: F,
 ) -> Result<CompactionResult>
 where
-    F: FnOnce(String, String, crate::native_engine::request_options::RequestOptions) -> Fut,
+    F: FnOnce(String, crate::native_engine::request_options::RequestOptions) -> Fut,
     Fut: std::future::Future<Output = Result<GeneratedSummary>>,
 {
     use super::tool_hooks::{HookEvent, HookRunner};
@@ -714,10 +728,6 @@ where
             focus.push_str(&text);
         }
     }
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        focus, prepared.transcript
-    );
     let mut options = crate::native_engine::request_options::RequestOptions::from_db(
         &context.db,
         Some(id),
@@ -728,7 +738,7 @@ where
         trigger,
         &prepared.transcript,
     );
-    let summary = summarize(input, focus, options).await?;
+    let summary = summarize(focus, options).await?;
     let (fresh_context, start_warnings) =
         match super::session_hooks::collect(context, workspace, id, "compact", model).await {
             Ok(result) => result,
@@ -870,7 +880,7 @@ mod hook_tests {
             "",
             "manual",
             None,
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         )
         .await
         .unwrap();
@@ -894,7 +904,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         );
         tokio::pin!(future);
         let outcome = tokio::select! {
@@ -944,8 +954,7 @@ mod hook_tests {
                 "focus",
                 trigger,
                 None,
-                |input, focus, _| async move {
-                    assert!(input.contains("focus\n\nkeep exact paths"));
+                |focus, _| async move {
                     assert_eq!(focus, "focus\n\nkeep exact paths");
                     Ok("summary".into())
                 },
@@ -978,9 +987,13 @@ mod hook_tests {
         }
     }
     #[tokio::test]
-    async fn base64_model_boundary_hooked_summary_uses_stored_output() {
+    async fn base64_model_boundary_hooked_summary_records_replayed_output() {
         let (dir, service, store, id) = fixture();
         configure(&service, "ok", "ok", "ok");
+        service
+            .db
+            .set_request_recording_policy(&id, true, false)
+            .unwrap();
         let msg = store.append(&id, "assistant", "").unwrap();
         let payload = "QUJD".repeat(256);
         let raw = json!({"stdout":format!("header\n{payload}\n"),"exit_code":0}).to_string();
@@ -999,8 +1012,18 @@ mod hook_tests {
             "focus",
             "manual",
             None,
-            |input, focus, _| async move {
+            |focus, options| async move {
                 assert!(focus.contains("keep exact paths"));
+                let (path, _) = options.compaction_record.unwrap();
+                let record: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                let input = record["before_messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["tool_call_id"] == "bash")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
                 assert!(input.contains("base64 data omitted"));
                 assert!(!input.contains(&payload));
                 Ok("summary".into())
@@ -1026,7 +1049,7 @@ mod hook_tests {
                 "",
                 "auto",
                 None,
-                |_, _, _| async {
+                |_, _| async {
                     if failure == "generation" {
                         anyhow::bail!("generation failed");
                     }
@@ -1074,7 +1097,7 @@ mod hook_tests {
                 "",
                 "manual",
                 None,
-                |_, _, _| async {
+                |_, _| async {
                     if stage == "summary" {
                         std::fs::write(dir.path().join("started"), "yes").unwrap();
                         std::future::pending::<()>().await;
@@ -1125,7 +1148,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         )
         .await
         .unwrap();
@@ -1151,7 +1174,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { anyhow::bail!("generation failed") },
+            |_, _| async { anyhow::bail!("generation failed") },
         )
         .await;
         assert!(result.is_err());

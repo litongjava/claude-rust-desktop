@@ -10,7 +10,7 @@ pub(super) fn openai_content(content: &Value) -> Result<OpenAIContent> {
     Ok(serde_json::from_value(messages[0]["content"].clone())?)
 }
 
-pub(super) fn anthropic_content(content: &Value) -> Result<AnthropicContent> {
+pub(in crate::native_engine) fn anthropic_content(content: &Value) -> Result<AnthropicContent> {
     let mut messages = normalize_messages(&[json!({"content": content})])?;
     if let Some(blocks) = messages[0]["content"].as_array_mut() {
         for block in blocks {
@@ -29,7 +29,7 @@ pub(super) fn anthropic_content(content: &Value) -> Result<AnthropicContent> {
     Ok(serde_json::from_value(messages[0]["content"].clone())?)
 }
 
-pub(super) fn normalize_messages(messages: &[Value]) -> Result<Vec<Value>> {
+pub(in crate::native_engine) fn normalize_messages(messages: &[Value]) -> Result<Vec<Value>> {
     messages
         .iter()
         .map(|message| {

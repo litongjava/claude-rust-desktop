@@ -130,7 +130,7 @@ async fn first_send_raw_cli_images_reach_actual_model_requests() {
 #[tokio::test]
 async fn protocol_normalization_and_retained_compression_preserve_images() {
     for anthropic in [false, true] {
-        let (engine, _events) = executor("http://127.0.0.1:1", "openai", mixed_content());
+        let (mut engine, _events) = executor("http://127.0.0.1:1", "openai", mixed_content());
         let messages: Vec<Value> = if anthropic {
             engine
                 .build_anthropic_messages()
@@ -168,7 +168,7 @@ async fn protocol_normalization_and_retained_compression_preserve_images() {
             };
             assert_content(&content, anthropic);
         }
-        let (engine, _events) = executor(
+        let (mut engine, _events) = executor(
             "http://127.0.0.1:1",
             "openai",
             json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"broken"}}]),

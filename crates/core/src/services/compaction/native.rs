@@ -25,9 +25,20 @@ pub(crate) fn load(conn: &rusqlite::Connection, message: &str) -> Result<Option<
 }
 
 pub(crate) fn supports(provider: &ResolvedProvider) -> bool {
+    provider
+        .model
+        .id
+        .rsplit('/')
+        .next()
+        .is_some_and(|id| id.starts_with("gpt-") || id.starts_with("chatgpt-"))
+        && compact_transport(provider)
+}
+
+fn compact_transport(provider: &ResolvedProvider) -> bool {
     matches!(provider.provider.api_format, ApiFormat::OpenAI)
         && provider.provider.builtin_id.is_some()
-        && provider.model.api.as_deref() == Some("openai-responses")
+        && provider_runtime::resolved_transport(provider)
+            .is_ok_and(|(protocol, _)| protocol == "openai-responses")
 }
 
 pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) -> Result<()> {
@@ -36,7 +47,7 @@ pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) 
             .get("provider_content")
             .filter(|value| value["compaction"] == true)
         {
-            ensure!(supports(provider)
+            ensure!(compact_transport(provider)
                 && native["provider"] == provider.provider.id
                 && native["base_url"] == provider.provider.base_url.trim_end_matches('/')
                 && native["model"] == provider.model.id,
@@ -97,25 +108,19 @@ pub(crate) async fn generate_messages_with_options(
     root: Option<&std::path::Path>,
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
-    let body = provider_runtime::compaction_request(provider, messages, instructions)?;
-    let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
-        .context("Native compaction requires a configured gateway URL")?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "Invalid native compaction gateway URL"
-    );
-    let route = url.path().trim_end_matches('/');
-    let route = route.strip_suffix("/responses").unwrap_or(route);
-    url.set_path(&format!("{route}/responses/compact"));
+    let body = provider_runtime::compaction_request(provider, messages, instructions, session)?;
+    let (url, headers) = provider_runtime::compact_endpoint(provider)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let mut options = options;
+    let mut metrics = crate::native_engine::compaction_metrics::CompactionMetrics::start(
+        &mut options,
+        provider,
+        "openai-responses-compact",
+    )?;
     let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
         provider,
         "compaction",
@@ -126,14 +131,12 @@ pub(crate) async fn generate_messages_with_options(
             .and_then(|context| context.parent_session_id.as_deref()),
         options.model_request_id.as_deref(),
     );
-    let mut request = client
+    let request = client
         .post(url)
+        .headers(headers)
         .headers(options.headers(provider)?)
         .headers(identity.headers())
         .json(&body);
-    if !provider.provider.api_key.is_empty() {
-        request = request.bearer_auth(&provider.provider.api_key);
-    }
     let mut response = crate::native_engine::request_recording::send(
         request,
         &options,
@@ -154,6 +157,9 @@ pub(crate) async fn generate_messages_with_options(
         bytes.extend_from_slice(&chunk);
     }
     let result: Value = serde_json::from_slice(&bytes).context("Invalid native compaction JSON")?;
+    if let Some(metrics) = &mut metrics {
+        metrics.observe_usage(&result["usage"]);
+    }
     ensure!(
         result["object"] == "response.compaction",
         "Gateway did not return a native response.compaction result"
@@ -175,6 +181,9 @@ pub(crate) async fn generate_messages_with_options(
         root,
         session.unwrap_or_default(),
     );
+    if let Some(metrics) = metrics {
+        metrics.finish(&result["usage"], "compact", "completed")?;
+    }
     Ok(GeneratedSummary {
         text: "Native Responses compaction completed. The encrypted context is saved and will be restored for this provider/model. Earlier messages remain in session history.".into(),
         native:Some(native),

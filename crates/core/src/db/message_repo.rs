@@ -390,10 +390,38 @@ pub(crate) fn hash_history_entry(
     mut hasher: impl std::io::Write,
 ) -> Result<()> {
     let calls = get_tool_calls_for_message(conn, &row.id)?;
-    serde_json::to_writer(
-        &mut hasher,
-        &serde_json::json!({"message":row,"tools":calls,"attachment_metadata":attachments}),
-    )?;
+    let mut entry =
+        serde_json::json!({"message": row, "tools": calls, "attachment_metadata": attachments});
+    use rusqlite::OptionalExtension;
+    if let Some(content) = conn
+        .query_row(
+            "SELECT content_json FROM message_user_content WHERE message_id=?1",
+            [&row.id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        entry["user_content"] = serde_json::from_str(&content)?;
+    }
+    for call in &calls {
+        if let Some(display) = call.output.as_deref() {
+            let content: Option<String> = conn.query_row(
+                "SELECT content_json FROM mcp_tool_outputs WHERE conversation_id=?1 AND tool_use_id=?2 AND display_text=?3",
+                params![row.conversation_id, call.id, display],
+                |r| r.get(0),
+            ).optional()?;
+            if let Some(content) = content {
+                entry["mcp_content"][&call.id] = serde_json::from_str(&content)?;
+            }
+        }
+        let notes = tool_call_note(conn, &call.id)?;
+        let delivered = crate::services::input_queue::load_delivered(conn, &call.id)?;
+        if notes.is_some() || !delivered.is_empty() {
+            entry["tool_context"][&call.id] =
+                serde_json::json!({"approval_note":notes,"delivered":delivered});
+        }
+    }
+    serde_json::to_writer(&mut hasher, &entry)?;
     hasher.write_all(b"\n")?;
     Ok(())
 }

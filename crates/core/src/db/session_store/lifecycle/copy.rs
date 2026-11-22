@@ -126,23 +126,49 @@ impl SessionDb {
         message: &str,
         part: crate::services::compaction::Part,
     ) -> Result<crate::services::compaction::PreparedPart> {
+        self.prepare_summary_part_for(
+            message,
+            part,
+            &crate::native_engine::provider_manager::ApiFormat::OpenAI,
+        )
+    }
+
+    pub(crate) fn prepare_summary_part_for(
+        &self,
+        message: &str,
+        part: crate::services::compaction::Part,
+        format: &crate::native_engine::provider_manager::ApiFormat,
+    ) -> Result<crate::services::compaction::PreparedPart> {
         use crate::services::compaction::{Part, PreparedPart};
         self.read(|r| {
-            let rows=r.messages()?;
-            let index=rows.iter().position(|m|m.id==message).context("Message not found in this conversation")?;
-            let range=match part {
-                Part::UpTo=>rows[..index].iter().rposition(|m|m.is_compact_boundary).unwrap_or(0)..index,
-                Part::From=>index..rows.len(),
+            let rows = crate::db::model_results::read_messages(r.0, self.id(), |row, collapsed| (row, collapsed))?;
+            let index = rows.iter().position(|(m, _)| m.id == message)
+                .context("Message not found in this conversation")?;
+            let range = match part {
+                Part::UpTo => rows[..index].iter().rposition(|(m, _)| m.is_compact_boundary).unwrap_or(0)..index,
+                Part::From => index..rows.len(),
             };
-            ensure!(!range.is_empty(),"Nothing to summarize there");
-            let mut transcript=Vec::new();
-            for row in &rows[range.clone()] {
-                ensure!(!r.0.query_row("SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",[&row.id],|r|r.get::<_,bool>(0))?, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
-                transcript.push(crate::services::compaction::model_entry(r.0,row)?);
+            let selected = &rows[range];
+            ensure!(!selected.is_empty(), "Nothing to summarize there");
+            for (row, _) in selected {
+                let native: bool = r.0.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",
+                    [&row.id], |r| r.get(0),
+                )?;
+                ensure!(!native, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
             }
-            Ok(PreparedPart {incarnation:self.incarnation().into(),fingerprint:crate::services::compaction::fingerprint(r.0,self.id())?.0,transcript:serde_json::to_string(&transcript)?,count:range.len()})
+            let (messages, boundary) = crate::runtime::replay_rows(r.0, self.id(), selected, format, |_| Ok(None))?;
+            Ok(PreparedPart {
+                boundary,
+                incarnation: self.incarnation().into(),
+                fingerprint: crate::services::compaction::fingerprint(r.0, self.id())?.0,
+                transcript: serde_json::to_string(&messages)?,
+                messages,
+                count: selected.len(),
+            })
         })
     }
+
     pub fn branch(&self, destination: &str, boundary: Branch<'_>) -> Result<SessionDb> {
         self.branch_at(destination, boundary, None, None, None)
     }
@@ -270,7 +296,14 @@ impl Copier<'_> {
         if let Some(id) = self.mapped(kind, old)? {
             return Ok(id);
         }
-        let id = if kind == "message" {
+        let compaction = kind == "request" && self.src.prepare_cached(
+            "SELECT 1 FROM request_metadata WHERE request_id=?1 AND json_extract(value,'$.kind')='compaction'"
+        )?.exists([old])?;
+        let id = if compaction {
+            // Compaction has no assistant trajectory. Its ID names the HTTP
+            // request in every descendant and in the recording gateway.
+            old.to_owned()
+        } else if kind == "message" {
             self.messages.issue()
         } else {
             Uuid::new_v4().to_string()
@@ -372,6 +405,19 @@ impl Copier<'_> {
                 let mut blocks: Json = serde_json::from_str(&row.get::<_, String>(i)?)?;
                 self.remap_blocks(&row.get::<_, String>(idx("message_id")?)?, &mut blocks)?;
                 values[i] = Value::Text(blocks.to_string());
+            }
+            if table == "request_metadata" {
+                let i = idx("value")?;
+                let mut metadata: Json = serde_json::from_str(row.get_ref(i)?.as_str()?)?;
+                if metadata["kind"] == "compaction" && metadata.get("originSession").is_none() {
+                    let request: String = row.get(idx("request_id")?)?;
+                    metadata["originSession"] = Json::String(self.src.query_row(
+                        "SELECT conversation_id FROM model_requests WHERE id=?1",
+                        [request],
+                        |r| r.get(0),
+                    )?);
+                    values[i] = Value::Text(metadata.to_string());
+                }
             }
             if table == "session_permission_authority" {
                 values[idx("id")?] = Value::Null

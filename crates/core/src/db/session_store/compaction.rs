@@ -1,6 +1,7 @@
 use super::*;
 use crate::services::{compaction, compaction_requests};
 use rusqlite::params;
+use serde_json::Value;
 
 /// Only digests of provider configuration and fragment inputs reach SQLite.
 pub struct CheckpointKey {
@@ -51,6 +52,29 @@ impl CompactionClaim {
 }
 
 impl SessionWrite<'_> {
+    pub(crate) fn start_compaction_metrics(
+        &self,
+        snapshot: &Value,
+        metadata: &Value,
+    ) -> Result<Option<String>> {
+        let message: Option<String> = self.0.query_row(
+            "SELECT id FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+            [self.1], |row| row.get(0),
+        ).optional()?;
+        if let Some(message) = &message {
+            self.finish_compaction_metrics(message, snapshot)?;
+            self.set_request_metadata(
+                snapshot["id"].as_str().context("Missing request ID")?,
+                metadata,
+            )?;
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn finish_compaction_metrics(&self, message: &str, snapshot: &Value) -> Result<()> {
+        crate::db::request_repo::save_request(self.0, message, snapshot)
+    }
+
     pub fn request_compaction(&self, keep: &str, used_tokens: u64, window: u64) -> Result<()> {
         compaction_requests::validate(self.0, self.1, keep, used_tokens, window)?;
         self.0.execute(
@@ -143,7 +167,7 @@ impl DeliveryOwner {
             if !has_target {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
-            let (fingerprint, transcript, count) = compaction::history_snapshot(&tx, &s.id, Some(s.stores.data_dir()))?;
+            let (fingerprint, count) = compaction::fingerprint(&tx, &s.id)?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -152,7 +176,7 @@ impl DeliveryOwner {
                 incarnation: s.incarnation.clone(),
                 fingerprint,
                 keep,
-                transcript,
+                transcript: compaction::recorded_history(&tx, &s.id)?,
             }))
         })?;
         match candidate {
@@ -239,11 +263,7 @@ impl SessionRepository<'_> {
                     .context("Session not found")?;
                 ensure!(!row.archived, "Session is archived");
             }
-            let root = match &self.0 {
-                owned::Backend::Admitted(shard) => shard.stores.data_dir(),
-                owned::Backend::Shared(db, _) => db.data_dir(),
-            };
-            let (fingerprint, transcript, count) = compaction::history_snapshot(c, id, Some(root))?;
+            let (fingerprint, count) = compaction::fingerprint(c, id)?;
             ensure!(count >= 2, "Not enough messages to compact");
             let pending_request = if incarnation.is_some() {
                 c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?
@@ -253,7 +273,7 @@ impl SessionRepository<'_> {
                 incarnation,
                 conversation_id: id.into(),
                 fingerprint,
-                transcript,
+                transcript: compaction::recorded_history(c, id)?,
                 count,
             })
         })

@@ -1,5 +1,7 @@
 #[path = "support/session_sql.rs"]
 mod session_sql;
+#[path = "support/summary_response.rs"]
+mod summary_response;
 use session_sql::FixtureSql;
 use axum::{routing::post, Json, Router};
 use deepseek_code_core::{
@@ -82,7 +84,10 @@ async fn fixture(
     let app = Router::new().route(if anthropic { "/v1/messages" } else { "/v1/chat/completions" }, post(move |Json(body): Json<Value>| {
         let captured = captured.clone();
         async move {
-            assert!(body.get("tools").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)));
+            let streaming = body["stream"] == true;
+            if body.get("tools").is_some() {
+                assert!(streaming && body["messages"].to_string().contains("Write one continuation summary"));
+            }
             let usage = deepseek_code_core::native_engine::request_context::ContextUsage::from_body(if anthropic { "anthropic-messages" } else { "openai-completions" }, &body, Some(window), 4096);
             assert!(usage.text_subtotal() + body["max_tokens"].as_u64().unwrap() <= u64::from(window) * 9 / 10, "wire input {} plus output exceeds safe window {}", usage.text_subtotal(), u64::from(window) * 9 / 10);
             let merge_too_short = mode == 3 && body["messages"].to_string().contains("Merge these summaries") && body["max_tokens"].as_u64().unwrap() < 8192;
@@ -91,11 +96,11 @@ async fn fixture(
             let fail = mode == 1 && number == 2;
             let truncated = mode == 3 && merge_too_short;
             let text = "Original request retained; NEEDS_TESTING: finish the remaining tests.";
-            Json(if anthropic {
+            summary_response::reply(if anthropic {
                 json!({"id":"r","type":"message","role":"assistant","model":"gpt-6-astra","content":[{"type":"text","text":text}],"stop_reason":if truncated { "max_tokens" } else if fail { "refusal" } else { "end_turn" },"usage":{"input_tokens":1,"output_tokens":1}})
             } else {
                 json!({"id":"r","object":"chat.completion","created":0,"model":"gpt-6-astra","choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":if truncated { "length" } else if fail { "content_filter" } else { "stop" }}]})
-            })
+            }, streaming)
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

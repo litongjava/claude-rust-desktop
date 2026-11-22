@@ -703,7 +703,7 @@ impl SessionWrite<'_> {
         )
     }
     pub fn rewind_from(&self, message: &str) -> Result<()> {
-        self.remove_tail(message,None)
+        self.remove_tail(message, None)
     }
 
     /// The retry will allocate a fresh segment under the original live turn.

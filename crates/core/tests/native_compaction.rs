@@ -81,7 +81,10 @@ async fn fixture(mode: u8) -> Fixture {
         let released = response_released.clone();
         async move {
             assert_eq!(headers["authorization"], "Bearer gateway-key");
-            assert!(body.get("tools").is_none() && body.get("stream").is_none());
+            for excluded in ["tools", "tool_choice", "reasoning", "stream"] {
+                assert!(body.get(excluded).is_none());
+            }
+            assert_eq!(body["prompt_cache_options"], json!({"mode":"implicit"}));
             seen.lock().unwrap().push(body);
             arrived.notify_one();
             if mode == 2 { std::future::pending::<()>().await; }
@@ -92,7 +95,7 @@ async fn fixture(mode: u8) -> Fixture {
                 {"type":"function_call_output","call_id":"old","output":format!("old page!{}!","QUJD".repeat(256))},
                 {"role":"user","content":[{"type":"input_text","text":format!("<task-notification>\n<kind>monitor</kind>\n<event>!{}!</event>\n</task-notification>","QUJD".repeat(256))}]},
                 {"type":"compaction","encrypted_content":"opaque exact content"}
-            ])} else {window()},"usage":{"input_tokens":150,"output_tokens":77}})))
+            ])} else {window()},"usage":{"input_tokens":150,"input_tokens_details":{"cached_tokens":112},"output_tokens":77}})))
         }
     }));
     let captured = seen.clone();
@@ -196,6 +199,8 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
     let requests = seen.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0]["input"].to_string().contains(&original));
+    assert_eq!(requests[0]["prompt_cache_key"].as_str().unwrap().len(), 32);
+    assert_eq!(requests[0]["prompt_cache_key"], requests[1]["prompt_cache_key"]);
     assert_eq!(
         &requests[1]["input"].as_array().unwrap()[..3],
         window().as_array().unwrap()
@@ -222,6 +227,18 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
     let meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     assert_eq!(meta["purpose"], "compaction");
     assert_eq!(meta["compaction_stage"], "native");
+    let measured: (i64, i64) = store
+        .db
+        .shard_sql(&id, |c| {
+            c.query_row(
+                "SELECT input_tokens, cache_read_tokens FROM model_requests WHERE id=?1",
+                [meta["model_request_id"].as_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(measured, (150, 112));
     let body_path = meta_path
         .to_string_lossy()
         .replace(".meta.json", ".request.json");
@@ -340,6 +357,7 @@ async fn native_window_survives_reload_fork_and_actual_next_request_without_rewr
         .await
         .unwrap();
         let actual = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(first["prompt_cache_key"] == actual["prompt_cache_key"], session == &id);
         assert_eq!(
             &actual["input"].as_array().unwrap()[..3],
             window().as_array().unwrap()

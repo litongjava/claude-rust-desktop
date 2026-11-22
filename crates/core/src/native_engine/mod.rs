@@ -38,3 +38,6 @@ pub(crate) mod mcp_output;
 pub mod request_recording;
 
 pub mod suggestion;
+
+pub(crate) mod compaction_metrics;
+mod followup;

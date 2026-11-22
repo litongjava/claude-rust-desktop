@@ -40,7 +40,7 @@ fn parts(content: &OpenAIContent, api: &str, assistant: bool) -> Result<Vec<Valu
     })).collect()
 }
 
-pub(super) fn request(
+pub(in crate::native_engine) fn request(
     api: &str,
     provider: &ResolvedProvider,
     metadata: &Value,
@@ -61,19 +61,14 @@ pub(super) fn request(
         .into_iter()
         .filter(|m| m.role != "system")
         .collect::<Vec<_>>();
+    let mut input = conversation_input(api, messages)?;
     let effort = provider.model.effort.as_deref();
     if api == "bedrock-converse-stream" {
-        return bedrock(provider, messages, &system, tools, max_tokens);
+        return bedrock(provider, input, &system, tools, max_tokens);
     }
     if api == "openai-completions" {
-        let mut input = Vec::new();
         if !system.is_empty() {
-            input.push(json!({"role":"system","content":system}));
-        }
-        for message in messages {
-            let mut item = serde_json::to_value(message)?;
-            item.as_object_mut().unwrap().remove("provider_content");
-            input.push(item);
+            input.insert(0, json!({"role":"system","content":system}));
         }
         let mut body = json!({"model":provider.model.id,"messages":input,"stream":true,"stream_options":{"include_usage":true}});
         if crate::performance::accepts_mid_system(&provider.provider.base_url) { crate::performance::move_system_tail_chat(&mut body); }
@@ -110,6 +105,114 @@ pub(super) fn request(
         }
         super::super::tool_call_ids::normalize_chat(&mut body);
         return Ok(body);
+    }
+    let mut body = match api {
+        "openai-responses" => {
+            let mut body = json!({"model":provider.model.id,"input":input,"instructions":system,"stream":true,"store":false,"max_output_tokens":max_tokens,"include":["reasoning.encrypted_content"]});
+            if !tools.is_empty() {
+                body["tools"] = tools.iter().map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.input_schema,"strict":false})).collect();
+            }
+            if let Some(effort) = effort {
+                body["reasoning"] =
+                    json!({"effort":if effort == "off" {"none"} else {effort},"summary":"auto"});
+            }
+            body
+        }
+        "google-generative-ai" => {
+            let mut body =
+                json!({"contents":input,"generationConfig":{"maxOutputTokens":max_tokens}});
+            if !system.is_empty() {
+                body["systemInstruction"] = json!({"parts":[{"text":system}]});
+            }
+            if !tools.is_empty() {
+                body["tools"] = json!([{"functionDeclarations":tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parametersJsonSchema":t.input_schema})).collect::<Vec<_>>()}]);
+            }
+            if let Some(effort) = effort {
+                body["generationConfig"]["thinkingConfig"] = if provider
+                    .model
+                    .id
+                    .contains("gemini-3")
+                {
+                    json!({"thinkingLevel":if effort == "off" {"minimal"} else {effort},"includeThoughts":true})
+                } else {
+                    json!({"thinkingBudget":match effort {"off"=>0,"low"=>1024,"medium"=>8192,_=>16384},"includeThoughts":true})
+                };
+            }
+            body
+        }
+        _ => {
+            let mut body = json!({"model":provider.model.id,"messages":input,"stream":true,"max_tokens":max_tokens});
+            if !system.is_empty() {
+                body["system"] = json!(system);
+                if crate::performance::accepts_mid_system(&provider.provider.base_url) {
+                    crate::performance::move_system_tail(&mut body);
+                }
+            }
+            if !tools.is_empty() {
+                body["tools"] = tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.input_schema})).collect();
+            }
+            if let Some(effort) = effort {
+                super::super::anthropic_client::apply_effort(
+                    &mut body,
+                    effort,
+                    &provider.model.id,
+                    max_tokens,
+                )?;
+            }
+            body
+        }
+    };
+    if api == "anthropic-messages" {
+        super::super::tool_call_ids::normalize_anthropic(&mut body);
+    }
+    if api == "anthropic-messages" && metadata["compat"]["supportsCacheControlOnTools"] != false {
+        crate::performance::apply_conversation_cache(&mut body);
+    }
+    Ok(body)
+}
+
+fn bedrock(
+    provider: &ResolvedProvider,
+    input: Vec<Value>,
+    system: &str,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+) -> Result<Value> {
+    let mut body = json!({"messages":input,"inferenceConfig":{"maxTokens":max_tokens}});
+    if !system.is_empty() {
+        body["system"] = json!([{"text":system}]);
+    }
+    if !tools.is_empty() {
+        body["toolConfig"] = json!({"tools":tools.iter().map(|t|json!({"toolSpec":{"name":t.name,"description":t.description,"inputSchema":{"json":t.input_schema}}})).collect::<Vec<_>>()});
+    }
+    if let Some(effort) = provider.model.effort.as_deref().filter(|v| *v != "off") {
+        if provider.model.id.contains("anthropic") || provider.model.id.contains("claude") {
+            if max_tokens < 2048 {
+                bail!("Bedrock Claude thinking requires at least 2048 output tokens");
+            }
+            body["additionalModelRequestFields"] = json!({"thinking":{"type":"enabled","budget_tokens":match effort {"low"=>1024,"medium"=>4096,_=>16384}.min(max_tokens-1)}});
+        } else {
+            bail!("Explicit reasoning effort is not implemented for this Bedrock model; omit --effort to use the model default");
+        }
+    }
+    Ok(body)
+}
+
+pub(in crate::native_engine) fn conversation_input(
+    api: &str,
+    messages: Vec<OpenAIMessage>,
+) -> Result<Vec<Value>> {
+    if api == "bedrock-converse-stream" {
+        return bedrock_input(messages);
+    }
+    if api == "openai-completions" {
+        let mut input = Vec::new();
+        for message in messages {
+            let mut item = serde_json::to_value(message)?;
+            item.as_object_mut().unwrap().remove("provider_content");
+            input.push(item);
+        }
+        return Ok(input);
     }
     let mut input = Vec::new();
     let mut compact_prefix = 0;
@@ -187,71 +290,10 @@ pub(super) fn request(
         super::super::tool_call_ids::normalize_responses(&mut tail);
         input.extend(tail);
     }
-    let mut body = match api {
-        "openai-responses" => {
-            let mut body = json!({"model":provider.model.id,"input":input,"instructions":system,"stream":true,"store":false,"max_output_tokens":max_tokens,"include":["reasoning.encrypted_content"]});
-            if !tools.is_empty() {
-                body["tools"] = tools.iter().map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.input_schema,"strict":false})).collect();
-            }
-            if let Some(effort) = effort {
-                body["reasoning"] =
-                    json!({"effort":if effort == "off" {"none"} else {effort},"summary":"auto"});
-            }
-            body
-        }
-        "google-generative-ai" => {
-            let mut body =
-                json!({"contents":input,"generationConfig":{"maxOutputTokens":max_tokens}});
-            if !system.is_empty() {
-                body["systemInstruction"] = json!({"parts":[{"text":system}]});
-            }
-            if !tools.is_empty() {
-                body["tools"] = json!([{"functionDeclarations":tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parametersJsonSchema":t.input_schema})).collect::<Vec<_>>()}]);
-            }
-            if let Some(effort) = effort {
-                body["generationConfig"]["thinkingConfig"] = if provider
-                    .model
-                    .id
-                    .contains("gemini-3")
-                {
-                    json!({"thinkingLevel":if effort == "off" {"minimal"} else {effort},"includeThoughts":true})
-                } else {
-                    json!({"thinkingBudget":match effort {"off"=>0,"low"=>1024,"medium"=>8192,_=>16384},"includeThoughts":true})
-                };
-            }
-            body
-        }
-        _ => {
-            let mut body = json!({"model":provider.model.id,"messages":input,"stream":true,"max_tokens":max_tokens});
-            if !system.is_empty() {
-                body["system"] = json!(system);
-                if crate::performance::accepts_mid_system(&provider.provider.base_url) { crate::performance::move_system_tail(&mut body); }
-            }
-            if !tools.is_empty() {
-                body["tools"] = tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.input_schema})).collect();
-            }
-            if let Some(effort) = effort {
-                super::super::anthropic_client::apply_effort(&mut body, effort, &provider.model.id, max_tokens)?;
-            }
-            body
-        }
-    };
-    if api == "anthropic-messages" {
-        super::super::tool_call_ids::normalize_anthropic(&mut body);
-    }
-    if api == "anthropic-messages" && metadata["compat"]["supportsCacheControlOnTools"] != false {
-        crate::performance::apply_conversation_cache(&mut body);
-    }
-    Ok(body)
+    Ok(input)
 }
 
-fn bedrock(
-    provider: &ResolvedProvider,
-    messages: Vec<OpenAIMessage>,
-    system: &str,
-    tools: Vec<ToolDefinition>,
-    max_tokens: u32,
-) -> Result<Value> {
+fn bedrock_input(messages: Vec<OpenAIMessage>) -> Result<Vec<Value>> {
     let mut input = Vec::new();
     for message in messages {
         let mut blocks = Vec::new();
@@ -304,22 +346,5 @@ fn bedrock(
             input.push(json!({"role":role,"content":blocks}));
         }
     }
-    let mut body = json!({"messages":input,"inferenceConfig":{"maxTokens":max_tokens}});
-    if !system.is_empty() {
-        body["system"] = json!([{"text":system}]);
-    }
-    if !tools.is_empty() {
-        body["toolConfig"] = json!({"tools":tools.iter().map(|t|json!({"toolSpec":{"name":t.name,"description":t.description,"inputSchema":{"json":t.input_schema}}})).collect::<Vec<_>>()});
-    }
-    if let Some(effort) = provider.model.effort.as_deref().filter(|v| *v != "off") {
-        if provider.model.id.contains("anthropic") || provider.model.id.contains("claude") {
-            if max_tokens < 2048 {
-                bail!("Bedrock Claude thinking requires at least 2048 output tokens");
-            }
-            body["additionalModelRequestFields"] = json!({"thinking":{"type":"enabled","budget_tokens":match effort {"low"=>1024,"medium"=>4096,_=>16384}.min(max_tokens-1)}});
-        } else {
-            bail!("Explicit reasoning effort is not implemented for this Bedrock model; omit --effort to use the model default");
-        }
-    }
-    Ok(body)
+    Ok(input)
 }
