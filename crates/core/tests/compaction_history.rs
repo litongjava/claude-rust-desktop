@@ -42,6 +42,7 @@ impl Fixture {
         let seen_routes = routes.clone();
         let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| {
             let compact = headers["x-dcl-request-kind"] == "compaction";
+            let cache_write = body.to_string().contains("cache write fixture");
             let stream = body["stream"] == true;
             let responses = body.get("input").is_some();
             let bedrock = body.get("inferenceConfig").is_some();
@@ -51,7 +52,7 @@ impl Fixture {
             seen_routes.lock().unwrap().push((uri.path().to_owned(),headers));
             seen.lock().unwrap().push(body);
             async move {
-                let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":80}});
+                let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":if cache_write {75} else {80}, "cache_write_tokens":if cache_write {5} else {0}}});
                 if uri.path().ends_with("/responses/compact") {
                     return Json(json!({"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":100,"output_tokens":3}})).into_response();
                 }
@@ -479,5 +480,22 @@ async fn bedrock_compaction_persists_inclusive_input_and_disjoint_cache_counts()
         f.store.db.usage(|| false).unwrap().days[0].tokens,
         [20, 3, 75, 5]
     );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn compaction_records_chat_cache_writes_in_their_own_bucket() {
+    let f = Fixture::new(128_000).await;
+    f.append("user", "cache write fixture");
+    f.append("assistant", "Acknowledged.");
+    f.compact().await.unwrap();
+    let child = f.store.fork(&f.id).unwrap();
+    let usage = f.store.db.usage(|| false).unwrap();
+    assert!(usage.failures.is_empty());
+    assert_eq!(usage.days.len(), 1);
+    assert_eq!(usage.days[0].tokens, [20, 3, 75, 5]);
+    let (details, input, _) = f.store.db.open_session(&child).unwrap().repository().usage_totals(&[]).unwrap();
+    assert_eq!(input, 100);
+    assert_eq!(details["cache_write_tokens"], 5);
     f.finish().await;
 }

@@ -25,6 +25,12 @@ pub struct RequestTrace {
     openai_recovery_content: bool,
 }
 
+pub(super) fn cache_write_tokens(usage: &Value) -> Option<u64> {
+    usage["cache_creation_input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens_details"]["cache_write_tokens"].as_u64())
+}
+
 impl RequestTrace {
     pub fn new(mut snapshot: Value) -> Self {
         super::request_identity::annotate(&mut snapshot);
@@ -423,9 +429,7 @@ impl RequestTrace {
             .or_else(|| self.usage["prompt_tokens_details"]["cached_tokens"].as_u64())
             .or_else(|| self.usage["prompt_cache_hit_tokens"].as_u64())
             .or_else(|| self.usage["cached_tokens"].as_u64());
-        let cache_write = self.usage["cache_creation_input_tokens"]
-            .as_u64()
-            .or_else(|| self.usage["prompt_tokens_details"]["cache_write_tokens"].as_u64());
+        let cache_write = cache_write_tokens(&self.usage);
         // Anthropic input_tokens excludes cached input; OpenAI prompt_tokens includes it.
         let total = self.usage["total_tokens"].as_u64().or_else(|| {
             input.zip(output).map(|(input, output)| {

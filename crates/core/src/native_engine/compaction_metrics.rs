@@ -82,7 +82,7 @@ impl CompactionMetrics {
                 .map(|(input, output)| input.saturating_add(output))
         });
         snapshot["outputTokens"] = json!(output);
-        snapshot["cacheWriteTokens"] = json!(usage["cache_creation_input_tokens"].as_u64());
+        snapshot["cacheWriteTokens"] = json!(super::request_trace::cache_write_tokens(usage));
         snapshot["totalTokens"] = json!(total);
         snapshot["usage"] = usage.clone();
         // Session usage and pricing use prompt_tokens to identify an inclusive
