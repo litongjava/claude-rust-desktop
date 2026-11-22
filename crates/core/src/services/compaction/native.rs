@@ -25,9 +25,18 @@ pub(crate) fn load(conn: &rusqlite::Connection, message: &str) -> Result<Option<
 }
 
 pub(crate) fn supports(provider: &ResolvedProvider) -> bool {
+    provider
+        .model
+        .id
+        .rsplit('/')
+        .next()
+        .is_some_and(|id| id.starts_with("gpt-") || id.starts_with("chatgpt-"))
+        && compact_transport(provider)
+}
+
+fn compact_transport(provider: &ResolvedProvider) -> bool {
     matches!(provider.provider.api_format, ApiFormat::OpenAI)
         && provider.provider.builtin_id.is_some()
-        && provider.model.id.rsplit('/').next().is_some_and(|id| id.starts_with("gpt-") || id.starts_with("chatgpt-"))
         && provider.model.api.as_deref() == Some("openai-responses")
 }
 
@@ -37,7 +46,7 @@ pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) 
             .get("provider_content")
             .filter(|value| value["compaction"] == true)
         {
-            ensure!(supports(provider)
+            ensure!(compact_transport(provider)
                 && native["provider"] == provider.provider.id
                 && native["base_url"] == provider.provider.base_url.trim_end_matches('/')
                 && native["model"] == provider.model.id,

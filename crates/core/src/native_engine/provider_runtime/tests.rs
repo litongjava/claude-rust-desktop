@@ -1858,3 +1858,31 @@ async fn responses_requests_send_a_stable_hashed_prompt_cache_key() {
     drop(bodies);
     server.abort();
 }
+
+#[test]
+fn compaction_cache_options_follow_the_gpt_model_version() {
+    for (model, supported) in [
+        ("gpt-5.5", false),
+        ("gpt-5.6", true),
+        ("openai/gpt-6-astra", true),
+        ("other-model", false),
+    ] {
+        assert_eq!(
+            super::supports_prompt_cache_options(model),
+            supported,
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn matching_opaque_history_remains_readable_after_a_non_gpt_model_switches_to_summary_compaction() {
+    use crate::services::compaction::native;
+    let fixture = provider("openai", "openai-responses", "http://localhost");
+    let history = [json!({"role":"user","provider_content":{"compaction":true,"provider":"test","base_url":"http://localhost","model":"fixture-model"}})];
+    assert!(!native::supports(&fixture));
+    native::validate_history(&history, &fixture).unwrap();
+    let mut different = fixture;
+    different.model.id = "different".into();
+    assert!(native::validate_history(&history, &different).is_err());
+}

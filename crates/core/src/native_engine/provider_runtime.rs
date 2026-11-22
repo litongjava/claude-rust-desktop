@@ -58,7 +58,12 @@ pub(crate) fn compaction_request(
 
 // The compact API accepts prompt_cache_options starting with GPT-5.6.
 fn supports_prompt_cache_options(model: &str) -> bool {
-    let Some(version) = model.strip_prefix("gpt-").and_then(|s| s.split('-').next()) else {
+    let Some(version) = model
+        .rsplit('/')
+        .next()
+        .and_then(|id| id.strip_prefix("gpt-"))
+        .and_then(|s| s.split('-').next())
+    else {
         return false;
     };
     let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
