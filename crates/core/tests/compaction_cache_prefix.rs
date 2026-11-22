@@ -121,6 +121,8 @@ async fn scenario(api: &str, truncate: bool) {
     if let Some(text) = &long_suffix {
         store.append(&id, "user", text).unwrap();
     }
+    let shard = store.db.open_session(&id).unwrap();
+    let input_before = shard.repository().usage_totals(&[]).unwrap().1;
     let before = store.history(&id).unwrap();
     compaction::compact(
         &engine(),
@@ -174,6 +176,11 @@ async fn scenario(api: &str, truncate: bool) {
         "SELECT input_tokens,cache_read_tokens,(SELECT count(*) FROM tool_calls) FROM model_requests WHERE id=?1",
         [calls[1].0["x-request-id"].to_str().unwrap()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))).unwrap().unwrap();
     assert_eq!(measured, (100, 80, 0));
+    let input_after = shard.repository().usage_totals(&[]).unwrap().1;
+    assert_eq!(
+        input_after - input_before,
+        if truncate { 100 + 3 * 41 } else { 100 }
+    );
     for (headers, body) in &calls[2..] {
         assert!(!body.to_string().contains("DISCARD_PARTIAL"));
         assert_eq!(body["max_tokens"], 4096);

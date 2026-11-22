@@ -73,10 +73,23 @@ impl CompactionMetrics {
         });
         snapshot["inputTokens"] = json!(input);
         snapshot["cacheReadTokens"] = json!(cached);
-        snapshot["outputTokens"] = json!(usage["completion_tokens"]
+        let output = usage["completion_tokens"]
             .as_u64()
-            .or_else(|| usage["output_tokens"].as_u64()));
+            .or_else(|| usage["output_tokens"].as_u64());
+        let total = usage["total_tokens"].as_u64().or_else(|| {
+            input
+                .zip(output)
+                .map(|(input, output)| input.saturating_add(output))
+        });
+        snapshot["outputTokens"] = json!(output);
+        snapshot["cacheWriteTokens"] = json!(usage["cache_creation_input_tokens"].as_u64());
+        snapshot["totalTokens"] = json!(total);
         snapshot["usage"] = usage.clone();
+        // Session usage and pricing use prompt_tokens to identify an inclusive
+        // input count. Keep the provider-specific fields for inspection as well.
+        if usage.get("input_tokens").is_some() && usage.get("prompt_tokens").is_none() {
+            snapshot["usage"]["prompt_tokens"] = json!(input);
+        }
     }
 
     pub(crate) fn finish(mut self, usage: &Value, reason: &str, status: &str) -> Result<()> {
