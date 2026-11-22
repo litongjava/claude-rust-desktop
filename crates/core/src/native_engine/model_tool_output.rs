@@ -956,6 +956,24 @@ mod tests {
     }
 
     #[test]
+    fn base64_review_task_provenance_keeps_ordinary_and_agent_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(256);
+        let session = uuid::Uuid::new_v4().to_string();
+        let call = |name, args| {
+            crate::tools::tasks::execute_for_session(name, args, dir.path(), &session).unwrap()
+        };
+        let id = call("TaskCreate", json!({"subject":"ordinary record"}))["id"].clone();
+        call("TaskUpdate", json!({"id":id,"output":blob}));
+        let record = call("TaskGet", json!({"id":id}));
+        assert_eq!(record["output"], blob);
+        for value in [record, json!({"stdout":blob,"backend":"agent"})] {
+            let raw = value.to_string();
+            assert_eq!(command_preview("TaskGet",&raw,Some(dir.path()),None,true),raw);
+        }
+    }
+
+    #[test]
     fn base64_shell_thresholds_and_fallback_preserve_original_output() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["Bash", "TaskGet"] {
@@ -968,7 +986,7 @@ mod tests {
                         format!("{}I", &data[..len - 1])
                     };
                     let text = format!("{prefix}{payload}");
-                    let raw = json!({"stdout": text}).to_string();
+                    let raw = if name == "TaskGet" { json!({"metadata":{"managed_shell":true},"stdout": text}) } else { json!({"stdout": text}) }.to_string();
                     let full = render(name, &raw, None);
                     let view = command_preview(name, &raw, Some(dir.path()), None, false);
                     if len < limit {
@@ -1003,7 +1021,7 @@ mod tests {
             let value = if name == "Bash" {
                 json!({"stdout":text})
             } else {
-                json!({"stdout":text,"output":text,"result":text,"status":"completed"})
+                json!({"metadata":{"managed_shell":true},"stdout":text,"output":text,"result":text,"status":"completed"})
             };
             let raw = serde_json::to_string_pretty(&value).unwrap();
             let full = render(name, &raw, None);
@@ -1071,7 +1089,8 @@ mod tests {
         let dots = ".".repeat(16000);
         let stdout = format!("{dots}\nerror: {blob}\n{dots}");
         for name in ["Bash", "TaskGet"] {
-            let raw = serde_json::to_string_pretty(&json!({"stdout":stdout}))
+            let value = if name == "TaskGet" { json!({"metadata":{"managed_shell":true},"stdout":stdout}) } else { json!({"stdout":stdout}) };
+            let raw = serde_json::to_string_pretty(&value)
                 .unwrap()
                 .replace("stdout", "std\\u006fut")
                 .replace("QUJD", "QU\\u004aD");

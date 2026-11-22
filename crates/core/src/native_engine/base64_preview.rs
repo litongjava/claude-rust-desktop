@@ -50,6 +50,10 @@ fn task_blocks(original: &str) -> Option<Blocks> {
     let mut objects =
         serde_json::Deserializer::from_str(json).into_iter::<HashMap<String, &RawValue>>();
     let fields = objects.next()?.ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(fields.get("metadata")?.get()).ok()?;
+    if metadata["managed_shell"] != true && metadata["monitor"] != true {
+        return None;
+    }
     let mut runs = Vec::new();
     let mut counts = HashMap::new();
     // A snapshot can repeat stdout and stderr in output and result. Count
@@ -86,18 +90,17 @@ impl Collapsed {
             count,
             bytes,
             mut json_end,
-        } = task
-            .then(|| task_blocks(original))
-            .flatten()
-            .unwrap_or_else(|| {
-                let runs = runs(original);
-                Blocks {
-                    count: runs.len(),
-                    bytes: runs.iter().map(|b| b.range.len()).sum(),
-                    runs,
-                    json_end: None,
-                }
-            });
+        } = if task {
+            task_blocks(original)?
+        } else {
+            let runs = runs(original);
+            Blocks {
+                count: runs.len(),
+                bytes: runs.iter().map(|b| b.range.len()).sum(),
+                runs,
+                json_end: None,
+            }
+        };
         if blocks.is_empty() {
             return None;
         }
