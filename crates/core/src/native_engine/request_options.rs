@@ -4,6 +4,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
+    pub(crate) compaction_metrics: Option<super::compaction_metrics::MetricsStore>,
     pub(crate) suggestion_guard: Option<(
         std::sync::Arc<crate::session_files::suggestion::SuggestionGuard>,
         std::time::Instant,

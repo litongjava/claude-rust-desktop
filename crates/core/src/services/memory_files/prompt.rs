@@ -399,6 +399,32 @@ pub(crate) fn summary_blocks(c: &rusqlite::Connection, id: &str) -> Result<Vec<S
         .collect())
 }
 
+pub(crate) fn attach_summary_recall(
+    conn: &rusqlite::Connection,
+    messages: &mut [Value],
+) -> Result<()> {
+    for message in messages {
+        if message["origin"] != "typed" {
+            continue;
+        }
+        if let Some(id) = message["id"].as_str() {
+            let blocks = summary_blocks(conn, id)?;
+            if !blocks.is_empty() {
+                let content = &mut message["content"];
+                if !content.is_array() {
+                    *content = serde_json::json!([{"type":"text","text":content}]);
+                }
+                content.as_array_mut().unwrap().extend(
+                    blocks
+                        .into_iter()
+                        .map(|text| serde_json::json!({"type":"text","text":text})),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn replay(
     shard: &SessionDb,
     boundary: Option<&str>,

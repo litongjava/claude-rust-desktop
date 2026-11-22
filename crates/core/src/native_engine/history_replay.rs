@@ -126,6 +126,9 @@ impl ToolLoopExecutor {
             .request_options
             .clone()
             .compaction("native");
+        options.compaction_metrics = Some(super::super::compaction_metrics::MetricsStore(
+            shard.clone(),
+        ));
         let mut record =
             CompactionRecord::start(&mut options, "auto", &serde_json::to_string(&input)?);
         self.remove_compaction_indexes(&mut input);
@@ -147,10 +150,12 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
+    // A live window can refresh its durable prefix. A summary already owns
+    // a snapshot, possibly cut before a queued input or at a partial boundary.
     pub(super) async fn replay_window<M: serde::Serialize + serde::de::DeserializeOwned>(
         &mut self,
         window: &mut Vec<M>,
-        durable_len: usize,
+        durable_len: Option<usize>,
         render: fn(&Self, &[(Vec<String>, Vec<String>)]) -> Result<Vec<M>>,
     ) -> Result<()> {
         let model = &self.provider.model;
@@ -177,8 +182,10 @@ impl ToolLoopExecutor {
             return Ok(());
         }
         let mut native_cut = None;
-        let mut persisted_len = durable_len;
-        if let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() {
+        let mut persisted_len = window.len();
+        if let (Some(durable_len), Some(ExecutorHistory::Session(shard))) =
+            (durable_len, self.executor_history.clone())
+        {
             let additions = window.split_off(durable_len);
             native_cut = self.reload_with_cut(&shard, native)?;
             *window = render(self, &self.message_additions())?;
@@ -200,6 +207,9 @@ impl ToolLoopExecutor {
         }
 
         if native {
+            if durable_len.is_none() {
+                return Ok(());
+            }
             let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() else {
                 anyhow::bail!("Native Responses compression requires durable session history");
             };
@@ -251,6 +261,10 @@ impl ToolLoopExecutor {
         let mut suffix = rows.split_off(cut);
         if protected.is_some() && TokenCounter::estimate(&suffix) > capacity {
             crate::services::compaction::clear_tool_results(&mut suffix);
+            if durable_len.is_none() && TokenCounter::estimate(&suffix) > capacity {
+                // The summary planner can split an input too large for a normal turn.
+                return Ok(());
+            }
             anyhow::ensure!(
                 TokenCounter::estimate(&suffix) <= capacity,
                 "Context overflow: the current turn's admitted inputs exceed the model window"
@@ -302,6 +316,9 @@ impl ToolLoopExecutor {
                 .collect();
             if TokenCounter::estimate(&compressed) > capacity {
                 crate::services::compaction::clear_tool_results(&mut compressed);
+                if durable_len.is_none() && TokenCounter::estimate(&compressed) > capacity {
+                    return Ok(());
+                }
                 anyhow::ensure!(TokenCounter::estimate(&compressed) <= capacity,
                     "Context overflow: the admitted inputs and required context exceed the model window");
             }

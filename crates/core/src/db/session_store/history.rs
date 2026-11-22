@@ -850,41 +850,10 @@ impl SessionRead<'_> {
             |r| r.get(0),
         )?)
     }
-    pub(crate) fn native_summary_history(
-        &self,
-        format: &crate::native_engine::provider_manager::ApiFormat,
-        before: Option<&str>,
-    ) -> Result<Vec<Value>> {
-        let (mut messages, _) = self.model_history(format)?;
-        let queued = self.queued_turn_input()?;
-        if let Some(id) = before.or(queued.as_deref()) {
-            let end = messages
-                .iter()
-                .position(|row| row["id"] == id)
-                .context("Admitted input missing from native history")?;
-            messages.truncate(end);
-        }
-        for message in &mut messages {
-            if message["origin"] != "typed" {
-                continue;
-            }
-            if let Some(id) = message["id"].as_str() {
-                let blocks = crate::services::memory_files::prompt::summary_blocks(self.0, id)?;
-                if !blocks.is_empty() {
-                    let content = &mut message["content"];
-                    if !content.is_array() {
-                        *content = serde_json::json!([{"type":"text","text":content}]);
-                    }
-                    content.as_array_mut().unwrap().extend(
-                        blocks
-                            .into_iter()
-                            .map(|text| serde_json::json!({"type":"text","text":text})),
-                    );
-                }
-            }
-        }
-        Ok(messages)
+    pub(crate) fn attach_summary_recall(&self, messages: &mut [Value]) -> Result<()> {
+        crate::services::memory_files::prompt::attach_summary_recall(self.0, messages)
     }
+
     pub(crate) fn boundary_id(&self) -> Result<Option<String>> {
         Ok(self.0.query_row("SELECT id FROM messages WHERE is_compact_boundary=1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
             [], |r| r.get(0)).optional()?)
@@ -934,7 +903,7 @@ impl SessionRead<'_> {
         self.model_history_before(format, None)
     }
 
-    pub(super) fn model_history_before(
+    pub(crate) fn model_history_before(
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
         before: Option<&str>,

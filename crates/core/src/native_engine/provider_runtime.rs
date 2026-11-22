@@ -13,7 +13,7 @@ use std::{pin::Pin, sync::LazyLock};
 mod bedrock;
 mod cloud_auth;
 mod events;
-mod messages;
+pub(super) mod messages;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +35,7 @@ pub(crate) fn compaction_request(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
     instructions: &str,
+    session: Option<&str>,
 ) -> Result<Value> {
     let body = messages::request(
         "openai-responses",
@@ -45,9 +46,29 @@ pub(crate) fn compaction_request(
         vec![],
         0,
     )?;
-    Ok(
-        serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]}),
-    )
+    let mut compact = serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]});
+    if let Some(key) = super::request_identity::prompt_cache_key(session) {
+        compact["prompt_cache_key"] = Value::String(key);
+        if supports_prompt_cache_options(&provider.model.id) {
+            compact["prompt_cache_options"] = serde_json::json!({"mode":"implicit"});
+        }
+    }
+    Ok(compact)
+}
+
+// The compact API accepts prompt_cache_options starting with GPT-5.6.
+fn supports_prompt_cache_options(model: &str) -> bool {
+    let Some(version) = model
+        .rsplit('/')
+        .next()
+        .and_then(|id| id.strip_prefix("gpt-"))
+        .and_then(|s| s.split('-').next())
+    else {
+        return false;
+    };
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    major.parse::<u32>().ok().zip(minor.parse::<u32>().ok())
+        .is_some_and(|version| version >= (5, 6))
 }
 
 pub(super) fn metadata(provider: &ResolvedProvider) -> Result<(&'static Value, &'static Value)> {
@@ -89,7 +110,9 @@ fn resolved_base<'a>(configured: &'a str, entry: &'a Value, model: &'a Value) ->
 
 /// The catalog protocol and the API the shared transport dials for it. The
 /// Chat alias (`mistral-conversations`) is the same normalized protocol.
-fn resolved_transport(provider: &ResolvedProvider) -> Result<(&'static str, &'static str)> {
+pub(crate) fn resolved_transport(
+    provider: &ResolvedProvider,
+) -> Result<(&'static str, &'static str)> {
     let (_, model) = metadata(provider)?;
     let protocol = provider
         .model
@@ -109,6 +132,16 @@ fn resolved_transport(provider: &ResolvedProvider) -> Result<(&'static str, &'st
         "google-generative-ai" => Ok(("google-generative-ai", "google-generative-ai")),
         _ => bail!("Built-in protocol '{protocol}' is not implemented by the native Rust transport; no fallback protocol or Node process was used"),
     }
+}
+
+/// The endpoint base for the selected catalog model, including per-model overrides.
+pub(crate) fn catalog_base(provider: &ResolvedProvider) -> Result<&str> {
+    let (entry, model) = metadata(provider)?;
+    Ok(resolved_base(
+        provider.provider.base_url.trim_end_matches('/'),
+        entry,
+        model,
+    ))
 }
 
 /// Whether this provider's model stream uses the shared Chat Completions
@@ -243,6 +276,7 @@ pub async fn stream_with_options_counted(
 /// transport. A single-post budget uses a client with no redirects and no
 /// internal retries, so one authorized replacement really is one POST.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn stream_with_options_counted_budget(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
@@ -318,19 +352,51 @@ async fn stream_with_options_client_budget(
     budget: crate::performance::AttemptBudget,
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
     let provider = &provider.current()?;
-    let (entry, model) = metadata(provider)?;
-    let (protocol, api) = resolved_transport(provider)?;
     let initiator = if messages.last().is_some_and(|m| m.role != "user") {
         "agent"
     } else {
         "user"
     };
+    let wire = request_body(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        options.session_id.as_deref(),
+    )?;
+    stream_body(
+        provider,
+        wire.body,
+        initiator,
+        wire.builtin_vision.unwrap_or(false),
+        max_tokens,
+        context_capture,
+        options,
+        client,
+        budget,
+    )
+    .await
+}
+
+pub(super) fn request_body(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    session: Option<&str>,
+) -> Result<super::followup::WireRequest> {
+    let (entry, model) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
     let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
     let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
     // Responses endpoints route requests to a prompt cache by this key, so the
     // same conversation keeps reusing one cached prefix.
     if api == "openai-responses" {
-        if let Some(key) = super::request_identity::prompt_cache_key() {
+        if let Some(key) = super::request_identity::prompt_cache_key(session) {
             body["prompt_cache_key"] = serde_json::json!(key);
         }
     }
@@ -425,37 +491,22 @@ async fn stream_with_options_client_budget(
             "Fast mode requires the Anthropic messages API"
         );
     }
-    stream_body(
-        provider,
+    Ok(super::followup::WireRequest {
+        api: api.to_owned(),
         body,
-        initiator,
-        vision,
-        max_tokens,
-        context_capture,
-        options,
-        client,
-        budget,
-    )
-    .await
+        builtin_vision: Some(vision),
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn stream_body(
+fn resolve_endpoint(
     provider: &ResolvedProvider,
-    body: Value,
-    initiator: &'static str,
-    vision: bool,
-    max_tokens: u32,
-    context_capture: Option<&super::request_context::ContextCapture>,
-    options: &super::request_options::RequestOptions,
-    client: reqwest::Client,
-    budget: crate::performance::AttemptBudget,
-) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    protocol: &str,
+    api: &str,
+    key: &str,
+) -> Result<(String, String)> {
     let account_state = provider.binding_snapshot();
     let env = |name: &str| super::session_binding::account_var(account_state.as_deref(), name);
     let (entry, model) = metadata(provider)?;
-    let (protocol, api) = resolved_transport(provider)?;
-    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
     let configured = provider.provider.base_url.trim_end_matches('/');
     let region = if protocol == "bedrock-converse-stream" {
         provider
@@ -484,7 +535,7 @@ pub(super) async fn stream_body(
     } else {
         String::new()
     };
-    let base = resolved_base(configured, entry, model);
+    let base = catalog_base(provider)?;
     let base = if protocol == "bedrock-converse-stream"
         && (configured.is_empty() || configured.contains(".amazonaws.com"))
     {
@@ -600,6 +651,108 @@ pub(super) async fn stream_body(
             )
         }
     };
+    Ok((url, region))
+}
+
+fn catalog_headers(
+    entry: &Value,
+    protocol: &str,
+    api: &str,
+    key: &str,
+    initiator: &str,
+    vision: bool,
+) -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    let sensitive = |value: &str| -> Result<HeaderValue> {
+        let mut header = HeaderValue::from_str(value)?;
+        header.set_sensitive(true);
+        Ok(header)
+    };
+    let mut headers = HeaderMap::new();
+    if entry["id"] == "github-copilot" {
+        headers.insert("x-initiator", HeaderValue::from_str(initiator)?);
+        headers.insert(
+            "openai-intent",
+            HeaderValue::from_static("conversation-edits"),
+        );
+        if vision {
+            headers.insert("copilot-vision-request", HeaderValue::from_static("true"));
+        }
+    }
+    if protocol == "openai-codex-responses" {
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_str(&codex_account(key)?)?,
+        );
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static("responses=experimental"),
+        );
+    }
+    if entry["id"] == "cloudflare-ai-gateway" {
+        headers.insert(
+            "cf-aig-authorization",
+            sensitive(&format!("Bearer {key}"))?,
+        );
+    } else if protocol == "azure-openai-responses" {
+        headers.insert("api-key", sensitive(key)?);
+    } else if !key.is_empty() && matches!(api, "openai-completions" | "openai-responses") {
+        headers.insert(
+            AUTHORIZATION,
+            sensitive(&format!("Bearer {key}"))?,
+        );
+    }
+    Ok(headers)
+}
+
+pub(crate) fn compact_endpoint(
+    provider: &ResolvedProvider,
+) -> Result<(reqwest::Url, reqwest::header::HeaderMap)> {
+    let (entry, _) = metadata(provider)?;
+    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
+    // Explicit native callers can select Responses for a model whose ordinary
+    // protocol is Chat. A Responses alias retains its own URL and credentials.
+    let protocol = match resolved_transport(provider) {
+        Ok((configured, "openai-responses")) => configured,
+        _ => "openai-responses",
+    };
+    let (url, _) = resolve_endpoint(provider, protocol, "openai-responses", &key)?;
+    let mut url = reqwest::Url::parse(&url).context("Native compaction requires a gateway URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && (url.query().is_none() || protocol == "azure-openai-responses"),
+        "Invalid native compaction gateway URL"
+    );
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Invalid native compaction path"))?
+        .push("compact");
+    Ok((
+        url,
+        catalog_headers(entry, protocol, "openai-responses", &key, "user", false)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_body(
+    provider: &ResolvedProvider,
+    body: Value,
+    initiator: &'static str,
+    vision: bool,
+    max_tokens: u32,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let account_state = provider.binding_snapshot();
+    let (entry, _) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
+    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
+    let (url, region) = resolve_endpoint(provider, protocol, api, &key)?;
+    let transport_headers = catalog_headers(entry, protocol, api, &key, initiator, vision)?;
     let google_token =
         if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
             // A credential exchange is a buffered request, so it keeps the
@@ -613,11 +766,6 @@ pub(super) async fn stream_body(
             None
         };
     let encoded_body = serde_json::to_string(&body)?;
-    let account = if protocol == "openai-codex-responses" {
-        Some(codex_account(&key)?)
-    } else {
-        None
-    };
     let harness_headers = options.headers(provider)?;
     let identity = super::request_identity::RequestIdentity::from_options(
         context_capture,
@@ -632,8 +780,7 @@ pub(super) async fn stream_body(
         let encoded_body = encoded_body.clone();
         let body = body.clone();
         let key = key.clone();
-        let account = account.clone();
-        let protocol = protocol.to_owned();
+        let transport_headers = transport_headers.clone();
         let provider = provider.clone();
         let options = options.clone();
         let capture = context_capture.cloned();
@@ -647,7 +794,7 @@ pub(super) async fn stream_body(
             let encoded_body = encoded_body.clone();
             let body = body.clone();
             let key = key.clone();
-            let account = account.clone();
+            let transport_headers = transport_headers.clone();
             let identity_headers = identity.headers();
             let provider = provider.clone();
             let options = options.clone();
@@ -655,31 +802,15 @@ pub(super) async fn stream_body(
             let google_token = google_token.clone();
         let account_state = account_state.clone();
             let api = api_owned.clone();
-            let protocol = protocol.clone();
             let region = region.clone();
             Box::pin(async move {
                 let mut request = client
                     .post(&url)
+                    .headers(transport_headers)
                     .headers(identity_headers)
                     .headers(harness_headers)
                     .header("content-type", "application/json")
                     .body(encoded_body.clone());
-                if entry["id"] == "github-copilot" {
-                    request = request
-                        .header("X-Initiator", initiator)
-                        .header("Openai-Intent", "conversation-edits");
-                    if vision {
-                        request = request.header("Copilot-Vision-Request", "true");
-                    }
-                }
-                if protocol == "azure-openai-responses" {
-                    request = request.header("api-key", &key);
-                }
-                if let Some(account) = &account {
-                    request = request
-                        .header("chatgpt-account-id", account)
-                        .header("OpenAI-Beta", "responses=experimental");
-                }
                 match api.as_str() {
                     "anthropic-messages" => {
                         request = request.header("anthropic-version", "2023-06-01");
@@ -706,17 +837,7 @@ pub(super) async fn stream_body(
                             request = request.bearer_auth(&key);
                         }
                     }
-                    _ => {
-                        if !key.is_empty()
-                            && protocol != "azure-openai-responses"
-                            && entry["id"] != "cloudflare-ai-gateway"
-                        {
-                            request = request.bearer_auth(&key);
-                        }
-                    }
-                }
-                if entry["id"] == "cloudflare-ai-gateway" {
-                    request = request.header("cf-aig-authorization", format!("Bearer {key}"));
+                    _ => {}
                 }
                 if let Some(capture) = &capture {
                     capture

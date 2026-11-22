@@ -76,6 +76,8 @@ pub struct OpenAIChoice {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAIUsage {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
@@ -484,22 +486,63 @@ impl OpenAIClient {
         crate::performance::AttemptCounter,
     )> {
         let provider = &provider.current()?;
+        let initiator = if messages.last().is_some_and(|m| m.role != "user") {
+            "agent"
+        } else {
+            "user"
+        };
+        let wire = self.request_body(
+            provider,
+            messages,
+            system_prompt,
+            tools,
+            max_tokens,
+            self.request_options.session_id.as_deref(),
+        )?;
+        if let Some(vision) = wire.builtin_vision {
+            let client = if budget.is_single_post() {
+                super::model_http::single_post_client()?
+            } else {
+                super::model_http::streaming_client(super::model_http::Redirect::None)?
+            };
+            super::provider_runtime::stream_body(
+                provider,
+                wire.body,
+                initiator,
+                vision,
+                max_tokens,
+                context_capture,
+                &self.request_options,
+                client,
+                budget,
+            )
+            .await
+        } else {
+            self.stream_body(provider, wire.body, max_tokens, context_capture, budget)
+                .await
+        }
+    }
+
+    pub(super) fn request_body(
+        &self,
+        provider: &ResolvedProvider,
+        messages: Vec<OpenAIMessage>,
+        system_prompt: Option<&str>,
+        tools: Vec<ToolDefinition>,
+        max_tokens: u32,
+        session: Option<&str>,
+    ) -> Result<super::followup::WireRequest> {
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            // The built-in transport returns the HTTP attempts it really made;
-            // the Chat Completions path shares one budget with its body.
-            return super::provider_runtime::stream_with_options_counted_budget(
+            return super::provider_runtime::request_body(
                 provider,
                 messages,
                 system_prompt,
                 tools,
                 max_tokens,
                 self.response_schema.as_ref(),
-                context_capture,
-                &self.request_options,
-                budget,
-            )
-            .await;
+                session,
+            );
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);
         let mut body_messages = Vec::new();
@@ -549,7 +592,7 @@ impl OpenAIClient {
             }
         }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
-        self.stream_body(provider, body, max_tokens, context_capture, budget).await
+        Ok(super::followup::WireRequest { api: "openai-completions".into(), body, builtin_vision: None })
     }
 
     pub(super) async fn stream_body(

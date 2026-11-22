@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 pub(crate) mod checkpoint;
+pub mod microcompact;
 pub(crate) mod native;
 
 pub struct GeneratedSummary {
@@ -272,93 +273,95 @@ impl From<CommittedCompaction> for CompactionResult {
     }
 }
 
-pub(crate) fn summary_row(
-    c: &rusqlite::Connection,
-    row: &message_repo::MessageRow,
-) -> Result<Value> {
-    let mut tools = Vec::new();
-    for call in message_repo::get_tool_calls_for_message(c, &row.id)? {
-        let inputs = crate::services::input_queue::load_delivered(c, &call.id)?;
-        let mut tool = serde_json::to_value(call)?;
-        if !inputs.is_empty() {
-            tool["delivered_inputs"] =
-                Value::Array(inputs.iter().map(|i| i.model_message()).collect());
-        }
-        tools.push(tool);
-    }
-    Ok(json!({"message": row, "tools": tools}))
-}
-
-pub(crate) fn attach_summary_memory(c: &rusqlite::Connection, row: &mut Value) -> Result<()> {
-    fn attach(c: &rusqlite::Connection, id: &str, item: &mut Value) -> Result<()> {
-        let blocks = crate::services::memory_files::prompt::summary_blocks(c, id)?;
-        if !blocks.is_empty() {
-            item["memory_attachments"] = json!(blocks);
-        }
-        Ok(())
-    }
-    if row["message"]["role"] == "user" {
-        if let Some(id) = row["message"]["id"].as_str().map(str::to_owned) {
-            if crate::db::session_store::message_origin(c, &id)?.as_deref() == Some("typed") {
-                attach(c, &id, row)?;
-            }
-        }
-    }
-    for tool in row["tools"].as_array_mut().into_iter().flatten() {
-        for input in tool
-            .get_mut("delivered_inputs")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            if input["origin"] == "typed" {
-                if let Some(id) = input["id"].as_str().map(str::to_owned) {
-                    attach(c, &id, input)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn fingerprint(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> Result<(String, String, usize)> {
-    transcript(conn, id, false, None)
-}
-
 // Include tools and attachment metadata in conflict detection, not just message count.
 //
 // Returns a digest instead of a second full copy of the history: `prepare`
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-pub(crate) fn transcript(
+pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, usize)> {
+    fingerprint_before(conn, id, None)
+}
+
+pub(crate) fn fingerprint_before(
     conn: &rusqlite::Connection,
     id: &str,
-    replay_memory: bool,
     before: Option<&str>,
-) -> Result<(String, String, usize)> {
+) -> Result<(String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows
         .iter()
         .rposition(|m| m.is_compact_boundary)
         .unwrap_or(0);
-    let mut all = Vec::new();
+    let end = match before {
+        Some(id) => rows
+            .iter()
+            .position(|row| row.id == id)
+            .context("Queued input missing")?,
+        None => rows.len(),
+    };
+    let count = end
+        .checked_sub(start)
+        .context("Queued input is behind the active boundary")?;
+    let mut hasher = Sha256::new();
+    if let Some(boundary) = rows.get(start).filter(|m| m.is_compact_boundary) {
+        use rusqlite::OptionalExtension;
+        let sharded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='native_boundaries')",
+            [],
+            |r| r.get(0),
+        )?;
+        let window = if sharded {
+            conn.query_row(
+                "SELECT value FROM native_boundaries WHERE message_id=?1",
+                [&boundary.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            native::load(conn, &boundary.id)?.map(|v| v.to_string())
+        };
+        if let Some(window) = window {
+            // Fence replacement of the opaque payload during generation.
+            hasher.update(window.as_bytes());
+        }
+    }
+
     for row in &rows {
-        let mut item = summary_row(conn, row)?;
+        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        item["attachment_metadata"] = json!(attachments);
-        all.push(item);
-    }
-    let mut hasher = Sha256::new();
-    for entry in &all {
-        serde_json::to_writer(&mut hasher, entry)?;
+        let mut entry = json!({"message": row, "tools": calls, "attachment_metadata": attachments});
+        use rusqlite::OptionalExtension;
+        if let Some(content) = conn
+            .query_row(
+                "SELECT content_json FROM message_user_content WHERE message_id=?1",
+                [&row.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            entry["user_content"] = serde_json::from_str(&content)?;
+        }
+        for call in &calls {
+            if let Some(display) = call.output.as_deref() {
+                if let Some(output) =
+                    crate::native_engine::mcp_output::McpOutput::load(conn, id, &call.id, display)?
+                {
+                    entry["mcp_content"][&call.id] = output.content;
+                }
+            }
+            let notes = message_repo::tool_call_note(conn, &call.id)?;
+            let delivered = crate::services::input_queue::load_delivered(conn, &call.id)?;
+            if notes.is_some() || !delivered.is_empty() {
+                entry["tool_context"][&call.id] =
+                    json!({"approval_note":notes,"delivered":delivered});
+            }
+        }
+        serde_json::to_writer(&mut hasher, &entry)?;
         hasher.write_all(b"\n")?;
     }
     let digest = hasher.finalize();
@@ -368,24 +371,28 @@ pub(crate) fn transcript(
             text.push_str(&format!("{byte:02x}"));
             text
         });
-    let end = match before {
-        Some(id) => rows
-            .iter()
-            .position(|row| row.id == id)
-            .context("Queued input missing")?,
-        None => rows.len(),
-    };
-    ensure!(end >= start, "Queued input is behind the active boundary");
-    if replay_memory {
-        for row in &mut all[start..end] {
-            attach_summary_memory(conn, row)?;
-        }
+    Ok((fingerprint, count))
+}
+
+/// Model-visible rows for the optional request record and durable queue claim.
+pub(crate) fn recorded_history(
+    conn: &rusqlite::Connection,
+    id: &str,
+    sharded: bool,
+    before: Option<&str>,
+) -> Result<String> {
+    let (mut rows, _) = crate::runtime::replay_history_with_ids(
+        conn,
+        id,
+        &crate::native_engine::provider_manager::ApiFormat::OpenAI,
+        |_| Ok(None),
+        sharded,
+        before,
+    )?;
+    if sharded {
+        crate::services::memory_files::prompt::attach_summary_recall(conn, &mut rows)?;
     }
-    Ok((
-        fingerprint,
-        serde_json::to_string(&all[start..end])?,
-        end - start,
-    ))
+    Ok(serde_json::to_string(&rows)?)
 }
 
 pub fn prepare(
@@ -565,10 +572,6 @@ pub async fn compact(
 ) -> Result<CompactionResult> {
     let started = std::time::Instant::now();
     let prepared = prepare(db, id)?;
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        instructions, prepared.transcript
-    );
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -582,7 +585,6 @@ pub async fn compact(
             provider_id,
             model,
             PROMPT,
-            &input,
             instructions,
             prepared.before.as_deref(),
             options,
@@ -607,6 +609,8 @@ pub enum Part {
 }
 
 pub struct PreparedPart {
+    pub(crate) messages: Vec<Value>,
+    pub(crate) boundary: Option<String>,
     pub(crate) incarnation: String,
     pub(crate) fingerprint: String,
     pub(crate) transcript: String,
@@ -636,8 +640,12 @@ pub async fn summarize_part(
     provider_id: &str,
     model: &str,
 ) -> Result<(String, usize)> {
-    let prepared = prepare_part(db, id, message_id, part)?;
-    let input = format!("Conversation JSON:\n{}", prepared.transcript);
+    let provider = engine.resolved_provider(provider_id, model).await?;
+    let prepared = db.open_session(id)?.prepare_summary_part_for(
+        message_id,
+        part,
+        &provider.provider.api_format,
+    )?;
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -646,7 +654,16 @@ pub async fn summarize_part(
         &prepared.transcript,
     );
     let summary = engine
-        .generate_summary_recorded(Some(id), provider_id, model, PROMPT, &input, options)
+        .generate_replay_summary(
+            db.open_session(id)?,
+            provider,
+            model,
+            PROMPT,
+            "",
+            prepared.messages.clone(),
+            prepared.boundary.clone(),
+            options,
+        )
         .await?;
     let result = commit_part(db, id, message_id, part, prepared, &summary)?;
     if let Some(record) = &mut record {
@@ -713,16 +730,15 @@ pub async fn compact_with_hooks_tracked(
         instructions,
         trigger,
         tracker,
-        |input, focus, options| async move {
+        |focus, before, options| async move {
             engine
                 .generate_compaction_recorded(
                     id,
                     provider_id,
                     model,
                     PROMPT,
-                    &input,
                     &focus,
-                    tracker.and_then(|t| t.before_input.as_deref()),
+                    before.as_deref(),
                     options,
                 )
                 .await
@@ -742,7 +758,7 @@ async fn compact_hooks<F, Fut>(
     summarize: F,
 ) -> Result<CompactionResult>
 where
-    F: FnOnce(String, String, crate::native_engine::request_options::RequestOptions) -> Fut,
+    F: FnOnce(String, Option<String>, crate::native_engine::request_options::RequestOptions) -> Fut,
     Fut: std::future::Future<Output = Result<GeneratedSummary>>,
 {
     use super::tool_hooks::{HookEvent, HookRunner};
@@ -785,10 +801,6 @@ where
             focus.push_str(&text);
         }
     }
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        focus, prepared.transcript
-    );
     let mut options = crate::native_engine::request_options::RequestOptions::from_db(
         &context.db,
         Some(id),
@@ -799,7 +811,7 @@ where
         trigger,
         &prepared.transcript,
     );
-    let summary = summarize(input, focus, options).await?;
+    let summary = summarize(focus, prepared.before.clone(), options).await?;
     let (fresh_context, start_warnings) =
         match super::session_hooks::collect(context, workspace, id, "compact", model).await {
             Ok(result) => result,
@@ -902,58 +914,9 @@ pub(crate) fn apply_persisted_boundary(
     Ok(None)
 }
 
-const MICROCOMPACT_KEEP_RECENT: usize = 10;
-const MICROCOMPACT_MIN_CHARS: usize = 1000;
-const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared to save context]";
-
-/// Microcompact moves its line forward only once the request passes half the
-/// window, so between moves every request shares the same prefix and cache.
-fn microcompact_through(
-    current: usize,
-    len: usize,
-    estimated_tokens: usize,
-    window: Option<u32>,
-) -> usize {
-    match window.filter(|window| *window > 0) {
-        Some(window) if estimated_tokens > window as usize / 2 => {
-            current.max(len.saturating_sub(MICROCOMPACT_KEEP_RECENT))
-        }
-        _ => current,
-    }
-}
-
-/// Replaces large tool results in `messages` with a short placeholder, in
-/// either provider's history format.
-pub(crate) fn clear_tool_results(messages: &mut [Value]) {
-    let large = |content: &Value| match content {
-        Value::String(text) => text.len() > MICROCOMPACT_MIN_CHARS,
-        Value::Array(blocks) => {
-            blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .map(str::len)
-                .sum::<usize>()
-                > MICROCOMPACT_MIN_CHARS
-                || blocks.iter().any(|block| block["type"] == "image")
-        }
-        _ => false,
-    };
-    for message in messages {
-        if message["role"] == "tool" && large(&message["content"]) {
-            message["content"] = json!(CLEARED_TOOL_RESULT);
-        }
-        if let Some(blocks) = message["content"].as_array_mut() {
-            for block in blocks
-                .iter_mut()
-                .filter(|block| block["type"] == "tool_result")
-            {
-                if large(&block["content"]) {
-                    block["content"] = json!(CLEARED_TOOL_RESULT);
-                }
-            }
-        }
-    }
-}
+pub(crate) use microcompact::clear_tool_results;
+#[cfg(test)]
+use microcompact::{through as microcompact_through, CLEARED_TOOL_RESULT, MICROCOMPACT_MIN_CHARS};
 
 /// As the reference CLI's microcompact: once the conversation passes half the
 /// context window, large tool results older than the last few messages are
@@ -974,17 +937,11 @@ pub fn microcompact(
             through: 0,
             boundary,
         });
-    let len = history.len();
-    clear_tool_results(&mut history[..state.through.min(len)]);
-    let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
-    let through = microcompact_through(state.through, len, estimated, window);
-    if through != state.through {
-        state.through = through;
+    let changed = microcompact::replay(history, &mut state, window)?;
+    if changed {
         repository.set_preference(MICROCOMPACT, Some(&state))?;
-        clear_tool_results(&mut history[..through.min(len)]);
-        return Ok(true);
     }
-    Ok(false)
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1128,8 +1085,7 @@ mod hook_tests {
                 "focus",
                 trigger,
                 None,
-                |input, focus, _| async move {
-                    assert!(input.contains("focus\n\nkeep exact paths"));
+                |focus, _, _| async move {
                     assert_eq!(focus, "focus\n\nkeep exact paths");
                     Ok("summary".into())
                 },

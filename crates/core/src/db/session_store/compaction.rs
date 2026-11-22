@@ -1,6 +1,7 @@
 use super::*;
 use crate::services::{compaction, compaction_requests};
 use rusqlite::params;
+use serde_json::Value;
 
 /// Only digests of provider configuration and fragment inputs reach SQLite.
 pub struct CheckpointKey {
@@ -70,6 +71,29 @@ impl CompactionClaim {
 }
 
 impl SessionWrite<'_> {
+    pub(crate) fn start_compaction_metrics(
+        &self,
+        snapshot: &Value,
+        metadata: &Value,
+    ) -> Result<Option<String>> {
+        let message: Option<String> = self.0.query_row(
+            "SELECT id FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+            [self.1], |row| row.get(0),
+        ).optional()?;
+        if let Some(message) = &message {
+            self.finish_compaction_metrics(message, snapshot)?;
+            self.set_request_metadata(
+                snapshot["id"].as_str().context("Missing request ID")?,
+                metadata,
+            )?;
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn finish_compaction_metrics(&self, message: &str, snapshot: &Value) -> Result<()> {
+        crate::db::request_repo::save_request(self.0, message, snapshot)
+    }
+
     pub fn request_compaction(&self, keep: &str, used_tokens: u64, window: u64) -> Result<()> {
         compaction_requests::validate(self.0, self.1, keep, used_tokens, window)?;
         self.0.execute(
@@ -239,7 +263,7 @@ impl DeliveryOwner {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
             let before = queued_turn_input(&tx)?;
-            let (fingerprint, transcript, count) = compaction::transcript(&tx, &s.id, true, before.as_deref())?;
+            let (fingerprint, count) = compaction::fingerprint_before(&tx, &s.id, before.as_deref())?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -247,9 +271,9 @@ impl DeliveryOwner {
                 id,
                 incarnation: s.incarnation.clone(),
                 fingerprint,
+                transcript: compaction::recorded_history(&tx, &s.id, true, before.as_deref())?,
                 before,
                 keep,
-                transcript,
             }))
         })?;
         match candidate {
@@ -349,8 +373,7 @@ impl SessionRepository<'_> {
             } else {
                 None
             };
-            let (fingerprint, transcript, count) =
-                compaction::transcript(c, id, incarnation.is_some(), before.as_deref())?;
+            let (fingerprint, count) = compaction::fingerprint_before(c, id, before.as_deref())?;
             ensure!(
                 count >= 2 || (before.is_some() && count == 1),
                 "Not enough messages to compact"
@@ -360,12 +383,17 @@ impl SessionRepository<'_> {
             } else {None};
             Ok(compaction::PreparedCompaction {
                 pending_request,
-                before,
-                incarnation,
                 conversation_id: id.into(),
                 fingerprint,
-                transcript,
+                transcript: compaction::recorded_history(
+                    c,
+                    id,
+                    incarnation.is_some(),
+                    before.as_deref(),
+                )?,
                 count,
+                incarnation,
+                before,
             })
         })
     }

@@ -124,7 +124,7 @@ mod tool_loading_restore_tests;
 #[path = "project_memory_context.rs"]
 mod project_memory_context;
 #[path = "multimodal.rs"]
-mod multimodal;
+pub(super) mod multimodal;
 #[path = "provider_transcript.rs"]
 mod provider_transcript;
 #[cfg(test)]
@@ -3982,45 +3982,7 @@ impl ToolLoopExecutor {
             self.require_pending_peer_message = false;
         }
 
-        if self
-            .permission_manager
-            .as_ref()
-            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
-        {
-            if let (Some(root), Some(session)) = (
-                self.search_config_path
-                    .as_deref()
-                    .and_then(std::path::Path::parent),
-                self.conv_id.as_deref(),
-            ) {
-                let path = crate::services::plans::path(root, session)?;
-                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWhile planning mode is active, the only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit. Shell commands follow the Plan shell policy; CodeGraph initialization and index refresh are allowed for the current project or external reference directories, including generated index files. Direct project editing tools remain blocked until plan approval.\n", path.display()));
-            }
-        }
-
-        if !self.durable_user_input {
-            if let (Some(root), Some(session)) = (
-                self.search_config_path.as_deref().and_then(|p| p.parent()),
-                self.conv_id.as_deref(),
-            ) {
-                self.durable_user_input =
-                    crate::services::background_sessions::worker_directory(root, session)?
-                        .is_some();
-            }
-        }
-        // MCP discovery is a live external exchange, so execution ownership and
-        // authority checks must succeed before any SDK/stdio server is contacted.
-        if let Some(history) = self.session_search_storage() {
-            history.restore(&mut self.messages)?;
-        }
-        Box::pin(self.refresh_mcp_tools()).await?;
-        // A tool loaded earlier in this session stays available; the current
-        // settings still decide whether it may come back. The durable rows are
-        // read first so their load order wins over a display-only message
-        // window that may start in the middle of the session.
-        self.restore_persisted_loaded_tools()?;
-        self.restore_loaded_tools();
-        self.exposed_tools = None;
+        self.restore_request_context().await?;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
             directories.extend(manager.session_directories(conv));
@@ -4142,6 +4104,99 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
+    pub(super) async fn restore_request_context(&mut self) -> Result<()> {
+        if self
+            .permission_manager
+            .as_ref()
+            .is_some_and(|pm| pm.get_mode() == crate::permissions::PermissionMode::PlanMode)
+        {
+            if let (Some(root), Some(session)) = (
+                self.search_config_path
+                    .as_deref()
+                    .and_then(std::path::Path::parent),
+                self.conv_id.as_deref(),
+            ) {
+                let path = crate::services::plans::path(root, session)?;
+                self.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nWhile planning mode is active, the only writable plan file for this session is: {}. Use its exact absolute path with Write/Edit. Shell commands follow the Plan shell policy; CodeGraph initialization and index refresh are allowed for the current project or external reference directories, including generated index files. Direct project editing tools remain blocked until plan approval.\n", path.display()));
+            }
+        }
+
+        if !self.durable_user_input {
+            if let (Some(root), Some(session)) = (
+                self.search_config_path.as_deref().and_then(|p| p.parent()),
+                self.conv_id.as_deref(),
+            ) {
+                self.durable_user_input =
+                    crate::services::background_sessions::worker_directory(root, session)?
+                        .is_some();
+            }
+        }
+        // MCP discovery is a live external exchange, so execution ownership and
+        // authority checks must succeed before any SDK/stdio server is contacted.
+        if let Some(history) = self.session_search_storage() {
+            history.restore(&mut self.messages)?;
+        }
+        Box::pin(self.refresh_mcp_tools()).await?;
+        // A tool loaded earlier in this session stays available; the current
+        // settings still decide whether it may come back. The durable rows are
+        // read first so their load order wins over a display-only message
+        // window that may start in the middle of the session.
+        self.restore_persisted_loaded_tools()?;
+        self.restore_loaded_tools();
+        self.exposed_tools = None;
+        Ok(())
+    }
+
+    fn apply_reasoning_prompt(&mut self) {
+        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+            if let Some(ref sp) = self.system_prompt {
+                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
+            } else {
+                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
+            }
+        }
+    }
+
+    pub(super) async fn replay_request(&mut self) -> Result<super::followup::WireRequest> {
+        match self.provider.provider.api_format {
+            ApiFormat::Anthropic => {
+                let mut messages = self.build_anthropic_messages()?;
+                self.apply_reasoning_prompt();
+                self.replay_window(&mut messages, None, Self::render_anthropic_messages)
+                    .await?;
+                let prepared = self.prepare_request()?;
+                let body = self.anthropic_client.request_body(
+                    &self.provider,
+                    messages,
+                    prepared.system_prompt.as_deref(),
+                    prepared.tools,
+                    self.max_tokens,
+                    matches!(self.reasoning_mode, ReasoningMode::Deep),
+                )?;
+                Ok(super::followup::WireRequest {
+                    api: "anthropic-messages".into(),
+                    body,
+                    builtin_vision: None,
+                })
+            }
+            ApiFormat::OpenAI => {
+                let mut messages = self.build_openai_messages()?;
+                self.apply_reasoning_prompt();
+                self.replay_window(&mut messages, None, Self::render_openai_messages)
+                    .await?;
+                let prepared = self.prepare_request()?;
+                self.openai_client.request_body(
+                    &self.provider,
+                    messages,
+                    prepared.system_prompt.as_deref(),
+                    prepared.tools,
+                    self.max_tokens,
+                    self.conv_id.as_deref(),
+                )
+            }
+        }
+    }
+
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
         let conv_id = self.conv_id.clone().unwrap_or_default();
         tracing::info!(
@@ -4151,6 +4206,7 @@ impl ToolLoopExecutor {
             self.messages.len(),
             self.provider.provider.id
         );
+
 
         // 提取最后一条用户消息用于记忆检索
         tracing::info!(module = "ToolLoop", "[E3] Extracting last user message...");
@@ -5252,12 +5308,8 @@ impl ToolLoopExecutor {
 
     async fn continue_anthropic(&mut self, cursor: Continuation<AnthropicMessage>) -> Result<(String, Option<String>)> {
         let mut conversation_messages = cursor.messages;
-        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
-            if let Some(ref sp) = self.system_prompt {
-                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
-            } else {
-                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
-            }
+        if cursor.iteration == 0 {
+            self.apply_reasoning_prompt();
         }
 
         let mut full_text = cursor.text;
@@ -5328,7 +5380,7 @@ impl ToolLoopExecutor {
             let mut request_messages = conversation_messages.clone();
             self.replay_window(
                 &mut request_messages,
-                durable_len,
+                Some(durable_len),
                 Self::render_anthropic_messages,
             )
             .await?;
@@ -5369,6 +5421,7 @@ impl ToolLoopExecutor {
             let http_attempts: crate::performance::AttemptCounter;
             let mut context_capture = request_trace.capture_context(self.event_tx.clone());
             context_capture.suggestion = self.suggestion.clone();
+
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5730,7 +5783,7 @@ impl ToolLoopExecutor {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
             }
-            if let Some(capture) = &self.suggestion {
+            if let Some(capture) = &context_capture.suggestion {
                 capture.finish(
                     &snapshot,
                     &self.provider,
@@ -5938,12 +5991,8 @@ impl ToolLoopExecutor {
 
     async fn continue_openai(&mut self, cursor: Continuation<OpenAIMessage>) -> Result<(String, Option<String>)> {
         let mut conversation_messages = cursor.messages;
-        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
-            if let Some(ref sp) = self.system_prompt {
-                self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
-            } else {
-                self.system_prompt = Some("You are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.".to_string());
-            }
+        if cursor.iteration == 0 {
+            self.apply_reasoning_prompt();
         }
 
         let mut full_text = cursor.text;
@@ -6036,7 +6085,7 @@ impl ToolLoopExecutor {
             let mut request_messages = conversation_messages.clone();
             self.replay_window(
                 &mut request_messages,
-                durable_len,
+                Some(durable_len),
                 Self::render_openai_messages,
             )
             .await?;
@@ -6044,10 +6093,11 @@ impl ToolLoopExecutor {
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
             // catalog read, so a hot change cannot make them disagree.
+            let prepared = self.prepare_request()?;
             let PreparedRequest {
                 tools,
                 system_prompt,
-            } = self.prepare_request()?;
+            } = prepared;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             // One attempt of this model step. A stalled attempt that is replaced
             // must leave nothing behind, so the parser state belongs to the
@@ -6117,6 +6167,7 @@ impl ToolLoopExecutor {
                 let http_attempts: crate::performance::AttemptCounter;
                 let mut context_capture = request_trace.capture_context(self.event_tx.clone());
                 context_capture.suggestion = self.suggestion.clone();
+
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6519,7 +6570,7 @@ impl ToolLoopExecutor {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
                 }
-                if let Some(capture) = &self.suggestion {
+                if let Some(capture) = &context_capture.suggestion {
                     capture.finish(
                         &snapshot,
                         &self.provider,
@@ -6796,6 +6847,12 @@ impl ToolLoopExecutor {
         Ok((full_text, stop_reason))
     }
 
+    pub(super) fn prepare_main_history(&self) -> Result<Vec<Value>> {
+        let mut messages = multimodal::normalize_messages(&self.messages)?;
+        self.prepare_history_tool_outputs(&mut messages);
+        Ok(messages)
+    }
+
     fn build_anthropic_messages(&self) -> Result<Vec<AnthropicMessage>> {
         self.render_anthropic_messages(&self.message_additions())
     }
@@ -6804,8 +6861,7 @@ impl ToolLoopExecutor {
         &self,
         additions: &[(Vec<String>, Vec<String>)],
     ) -> Result<Vec<AnthropicMessage>> {
-        let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.prepare_history_tool_outputs(&mut messages);
+        let messages = self.prepare_main_history()?;
         Ok(messages
             .iter()
             .enumerate()
@@ -6915,8 +6971,7 @@ impl ToolLoopExecutor {
         // instruction blocks stay separate for caching. Chat Completions keeps
         // one string because several compatible servers reject arrays there.
         let separate_parts = super::provider_runtime::responses_api(&self.provider);
-        let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.prepare_history_tool_outputs(&mut messages);
+        let messages = self.prepare_main_history()?;
         let mut built: Vec<_> = messages
             .iter()
             .enumerate()

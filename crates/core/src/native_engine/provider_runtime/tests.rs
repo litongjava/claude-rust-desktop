@@ -1858,3 +1858,47 @@ async fn responses_requests_send_a_stable_hashed_prompt_cache_key() {
     drop(bodies);
     server.abort();
 }
+
+#[test]
+fn compaction_cache_options_follow_the_gpt_model_version() {
+    for (model, supported) in [
+        ("gpt-5.5", false),
+        ("gpt-5.6", true),
+        ("openai/gpt-6-astra", true),
+        ("other-model", false),
+    ] {
+        assert_eq!(
+            super::supports_prompt_cache_options(model),
+            supported,
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn matching_opaque_history_remains_readable_after_a_non_gpt_model_switches_to_summary_compaction() {
+    use crate::services::compaction::native;
+    let fixture = provider("openai", "openai-responses", "http://localhost");
+    let history = [json!({"role":"user","provider_content":{"compaction":true,"provider":"test","base_url":"http://localhost","model":"fixture-model"}})];
+    assert!(!native::supports(&fixture));
+    native::validate_history(&history, &fixture).unwrap();
+    let mut different = fixture;
+    different.model.id = "different".into();
+    assert!(native::validate_history(&history, &different).is_err());
+}
+
+#[test]
+fn native_compaction_resolves_the_main_catalog_endpoint_and_excludes_aliases() {
+    let mut p = provider("opencode-go", "openai-responses", "");
+    p.model.id = "gpt-6-luna".into();
+    p.model.api = None;
+    assert!(crate::services::compaction::native::supports(&p));
+    assert_eq!(
+        catalog_base(&p).unwrap(),
+        "https://opencode.ai/inference/go/openai/v1"
+    );
+    for alias in ["openai-codex-responses", "azure-openai-responses"] {
+        p.model.api = Some(alias.into());
+        assert!(!crate::services::compaction::native::supports(&p));
+    }
+}

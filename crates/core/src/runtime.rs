@@ -222,18 +222,39 @@ pub(crate) fn replay_history_with_ids(
     include_provenance: bool,
     before: Option<&str>,
 ) -> Result<(Vec<Value>, Option<String>)> {
-    let mut history = Vec::new();
     let messages = message_repo::get_messages_by_conversation(conn, id)?;
+    let end = match before {
+        Some(input) => messages
+            .iter()
+            .position(|row| row.id == input)
+            .context("Admitted input missing")?,
+        None => messages.len(),
+    };
+    replay_rows(
+        conn,
+        id,
+        &messages[..end],
+        format,
+        native,
+        include_provenance,
+    )
+}
+
+pub(crate) fn replay_rows(
+    conn: &rusqlite::Connection,
+    id: &str,
+    messages: &[message_repo::MessageRow],
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+    include_provenance: bool,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let mut history = Vec::new();
     let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
     let boundary = messages
         .get(start)
         .filter(|m| m.is_compact_boundary)
         .map(|m| m.id.clone());
-    for message in messages
-        .into_iter()
-        .skip(start)
-        .take_while(|m| Some(m.id.as_str()) != before)
-    {
+    for message in messages.iter().skip(start) {
         if let Some(native) = native(&message.id)? {
             let mut row =
                 json!({"role":message.role,"content":message.content,"provider_content":native});

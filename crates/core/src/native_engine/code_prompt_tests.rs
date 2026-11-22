@@ -500,7 +500,11 @@ async fn memory_admission_request_matrix() {
                 assert!(!prepared.transcript.contains("SESSION-INDEX"));
                 if protocol == "responses" {
                     let compact_input = shard
-                        .read(|r| r.native_summary_history(&ApiFormat::OpenAI, None))
+                        .read(|r| {
+                            let (mut rows, _) = r.model_history(&ApiFormat::OpenAI)?;
+                            r.attach_summary_recall(&mut rows)?;
+                            Ok(rows)
+                        })
                         .unwrap();
                     assert_eq!(
                         serde_json::to_string(&compact_input)
