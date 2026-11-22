@@ -7,6 +7,7 @@ use crate::services::turn_context::{self, Entry};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 
 #[derive(Serialize, Deserialize)]
 struct IndexState {
@@ -47,7 +48,7 @@ fn index_excerpt(index: &str) -> String {
 }
 
 /// Internal deliveries may use the user role in both wire protocols.
-fn typed_query(message: &Value) -> Option<String> {
+fn typed_query(message: &Value) -> Option<Cow<'_, str>> {
     if message["role"] != "user"
         || message.get("origin").is_some_and(|source| source != "user")
         || message["_is_summary"] == true
@@ -57,7 +58,7 @@ fn typed_query(message: &Value) -> Option<String> {
     }
     let content = &message["content"];
     let query = if let Some(text) = content.as_str() {
-        text.to_owned()
+        Cow::Borrowed(text)
     } else {
         let blocks = content.as_array()?;
         if !blocks.iter().all(|b| {
@@ -68,11 +69,13 @@ fn typed_query(message: &Value) -> Option<String> {
         }) {
             return None;
         }
-        blocks
-            .iter()
-            .filter_map(|b| b["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        Cow::Owned(
+            blocks
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     };
     // Older transcripts and host requests can lack an origin tag.
     let text = query.trim_start();
@@ -116,10 +119,15 @@ pub(crate) fn prepare(
     let (state, mut entries, recorded) = shard.read(|r| {
         let mut entries = Vec::new();
         let mut recorded = false;
-        for slot @ (key, occurrence) in slots.iter().flatten() {
+        for (message, slot) in messages.iter().zip(&slots) {
+            let Some(slot @ (key, occurrence)) = slot else {
+                continue;
+            };
             if let Some(blocks) = r.setting(receipt(boundary.as_deref(), key, *occurrence))? {
                 recorded |= target == Some(slot);
-                if !blocks.is_empty() {
+                // A host can resubmit the same content and occurrence with a
+                // different origin. A receipt belongs only to human input.
+                if !blocks.is_empty() && typed_query(message).is_some() {
                     entries.push(Entry {
                         key: key.clone(),
                         occurrence: *occurrence,

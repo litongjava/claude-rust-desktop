@@ -849,6 +849,8 @@ mod tests {
         assert!(index.unwrap().contains("note-6.md"));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blocks[0].matches("body-marker-").count(), 5);
+        let peer = json!({"role":"user","origin":"peer","content":"preferences"});
+        assert!(prepare(&[peer], true).1.is_empty());
         let mut history = vec![typed, json!({"role":"assistant","content":"done"})];
         std::fs::write(memory.directory.join("MEMORY.md"), "new index").unwrap();
         for (allow, next) in [
