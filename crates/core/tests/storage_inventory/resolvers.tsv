@@ -109,6 +109,7 @@
 1	crates/core/src/native_engine/child_session.rs	prepare_child_session	worker_pair(&spawn.parent_session_id,&session_id)
 1	crates/core/src/native_engine/child_session.rs	prepare_child_session	worker_pair(&spawn.parent_session_id,child)
 1	crates/core/src/native_engine/child_session.rs	save_owner	worker_pair(&owner.parent_session_id,session)
+1	crates/core/src/native_engine/code_prompt_tests.rs	executor	open_session(ID)
 1	crates/core/src/native_engine/code_prompt_tests.rs	memory_admission_request_matrix	open_session(ID)
 1	crates/core/src/native_engine/delegation.rs	prepare_delegated_child	select_session(&child)
 1	crates/core/src/native_engine/delegation_resume_tests.rs	foreground_agent_executes_from_parent_on_default_worker_stack	open_session(child)
