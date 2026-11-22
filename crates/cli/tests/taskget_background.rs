@@ -3,8 +3,8 @@
 //! inspected so the advertised catalog and the tool result are both verified.
 #[path = "../../core/tests/support/session_sql.rs"]
 mod fixture_sql;
-use fixture_sql::FixtureSql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+use fixture_sql::FixtureSql;
 use serde_json::{json, Value};
 use std::{
     process::Stdio,
@@ -18,6 +18,7 @@ mod tool_loading;
 #[derive(Clone, Default)]
 struct Fixture {
     long_output: bool,
+    base64: bool,
     foreground: bool,
     raw_size: Option<usize>,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -110,8 +111,10 @@ async fn respond(
             "call-bash",
             "Bash",
             &json!({
-                "command": if fixture.foreground {
-                    "node -e \"console.log('i6-start');console.log('x'.repeat(7500));console.log('error: hidden in the model preview');console.log('x'.repeat(7500));console.log('warning: duplicated tail')\""
+                "command": if fixture.base64 {
+                    r#"node -e "process.stdout.write(Buffer.from('ABC').toString('base64').repeat(25600))""#
+                } else if fixture.foreground {
+                    "node -e \"console.log('i6-start');console.log('.'.repeat(7500));console.log('error: hidden in the model preview');console.log('.'.repeat(7500));console.log('warning: duplicated tail')\""
                 } else if fixture.long_output {
                     REVIEW_PAGE_COMMAND
                 } else {
@@ -213,15 +216,38 @@ enum OptOut {
     Environment,
 }
 
+#[tokio::test]
+async fn cli_base64_foreground_and_background_results_recover_100_kib() {
+    for foreground in [true, false] {
+        run_shell(
+            Fixture {
+                foreground,
+                base64: true,
+                ..Fixture::default()
+            },
+            OptOut::None,
+        )
+        .await;
+    }
+}
+
 async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bool) {
+    run_shell(
+        Fixture {
+            foreground,
+            long_output,
+            ..Fixture::default()
+        },
+        opt_out,
+    )
+    .await;
+}
+
+async fn run_shell(fixture: Fixture, opt_out: OptOut) {
+    let (foreground, long_output) = (fixture.foreground, fixture.long_output);
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let fixture = Fixture {
-        long_output,
-        foreground,
-        ..Fixture::default()
-    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
@@ -323,6 +349,54 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
             4
         }
     );
+    if fixture.base64 {
+        server.abort();
+        let view = last_tool_content(requests.last().unwrap()).unwrap();
+        assert!(
+            !view.contains("QUJD"),
+            "foreground={foreground}, preview starts with {:?}",
+            view.chars().take(512).collect::<String>()
+        );
+        assert!(
+            view.contains("base64: 1 block collapsed (100 KB)"),
+            "{view}"
+        );
+        assert!(!view.contains("Omitted output:"), "{view}");
+        let task: Value;
+        let body = if foreground {
+            view
+        } else {
+            task = serde_json::from_str(view).unwrap();
+            assert_eq!(task["status"], "completed");
+            task["stdout"].as_str().unwrap()
+        };
+        let (path, location) = body
+            .split_once("76800 bytes decoded, looks like text; full output: ")
+            .unwrap()
+            .1
+            .split_once(", line ")
+            .unwrap();
+        let line = location
+            .split(']')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        let blob = "QUJD".repeat(25600);
+        assert!(saved.lines().nth(line - 1).unwrap().contains(&blob));
+        if foreground {
+            assert_eq!(saved, blob);
+        } else {
+            assert_eq!(
+                serde_json::from_str::<Value>(&saved).unwrap()["stdout"],
+                blob
+            );
+        }
+        drop(requests);
+        let _ = server.await;
+        return;
+    }
     if foreground {
         let summary = requests[1]["messages"]
             .as_array()

@@ -12,6 +12,13 @@ const DIGEST_BUDGET: usize = 2048;
 #[path = "command_output_summary.rs"]
 mod command_output_summary;
 
+#[path = "base64_preview.rs"]
+pub(crate) mod base64_preview;
+
+pub(crate) fn monitor_line(text: &str, root: &Path) -> Option<String> {
+    base64_preview::Collapsed::prepare("Monitor", text, root).map(|preview| preview.text)
+}
+
 impl super::ToolLoopExecutor {
     /// Called by both provider builders, after typed MCP/image restoration.
     pub(super) fn prepare_history_tool_outputs(&self, messages: &mut [Value]) {
@@ -369,21 +376,29 @@ fn command_preview_with_room(
         Some(CommandMetadata::Page { bytes, widths, .. }) => Some((bytes, widths)),
         _ => None,
     };
-    let cleaned = render(name, raw, None);
     let mut spans = [None, None];
-    let draft = if bash && root.is_some() {
-        render_with_spans(name, raw, Some(LONG_COMMAND_OUTPUT_BYTES), &mut spans)
+    let cleaned = render_with_spans(name, raw, None, &mut spans);
+    let collapsed = root
+        .filter(|_| matches!(name, "Bash" | "TaskGet" | "TaskOutput"))
+        .and_then(|root| base64_preview::Collapsed::prepare(name, &cleaned, root));
+    let limit = MODEL_TOOL_OUTPUT_BYTES - reserved;
+    let (mut base, retained) = if let Some(preview) = &collapsed {
+        let (text, kept) = preview.retain(if bash {
+            limit.min(LONG_COMMAND_OUTPUT_BYTES)
+        } else {
+            limit
+        });
+        (text, Some(kept))
+    } else if let Some(root) = root {
+        let draft = if bash {
+            render_with_spans(name, raw, Some(LONG_COMMAND_OUTPUT_BYTES), &mut spans)
+        } else {
+            cleaned.clone()
+        };
+        retain_tool_output_with_ranges(root, &cleaned, &draft, limit)
     } else {
-        if bash {
-            render_with_spans(name, raw, None, &mut spans);
-        }
-        cleaned.clone()
+        (cleaned.clone(), Some(PreviewRanges::whole(cleaned.len())))
     };
-    let retain = |limit| match root {
-        Some(root) => retain_tool_output_with_ranges(root, &cleaned, &draft, limit),
-        None => (draft.clone(), Some(PreviewRanges::whole(draft.len()))),
-    };
-    let (mut base, retained) = retain(MODEL_TOOL_OUTPUT_BYTES - reserved);
     if !enabled {
         return base;
     }
@@ -544,7 +559,12 @@ fn command_preview_with_room(
         return base;
     }
 
-    let json_result = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
+    let json_result = !bash
+        && (base == raw
+            || collapsed
+                .as_ref()
+                .is_some_and(|c| c.json_end.is_some() && base == c.text))
+        && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
     let outer = retained.unwrap_or_else(|| {
         if bash {
             // Without a spill, the retained result is the full cleaned output.
@@ -552,10 +572,16 @@ fn command_preview_with_room(
         }
         PreviewRanges::whole(cleaned.len())
     });
+    let outer = match &collapsed {
+        Some(preview) => preview.source_ranges(&outer),
+        None => vec![outer.head, outer.tail],
+    };
     let serialized_elided = if bash || json_result {
         0
     } else {
-        cleaned.len().saturating_sub(outer.kept())
+        cleaned
+            .len()
+            .saturating_sub(outer.iter().map(Range::len).sum())
     };
     // RawValue borrows the original JSON spelling, including escaped keys and
     // strings. Serialized byte cuts must be projected before counting lines.
@@ -630,30 +656,39 @@ fn command_preview_with_room(
         !(json_result && value["duration_ms"].as_u64() == Some(*ms))
             && !base.contains(&format!(r#""duration_ms":{ms}"#))
     });
-    let summary = command_output_summary::summarize(&streams, duration_ms, &base);
+    let summary =
+        command_output_summary::summarize(&streams, duration_ms, &base, collapsed.is_some());
     if summary.is_empty() {
         return base;
     }
     let available = MODEL_TOOL_OUTPUT_BYTES
         .saturating_sub(base.len())
         .min(DIGEST_BUDGET);
-    let encode = |text: &str| {
-        if json_result {
-            format!(
-                ",\"model_output_summary\":{}",
-                serde_json::to_string(text).expect("string serialization")
-            )
-        } else {
-            format!("\n\n{text}")
-        }
+    let compact_json_end = collapsed
+        .as_ref()
+        .and_then(|c| c.json_end)
+        .filter(|_| json_result);
+    let appendix = if compact_json_end.is_some() {
+        // Extend the final model_output_summary string after its base64 count.
+        let quoted = serde_json::to_string(&summary).expect("string serialization");
+        format!("\\n{}", &quoted[1..quoted.len() - 1])
+    } else if json_result {
+        format!(
+            ",\"model_output_summary\":{}",
+            serde_json::to_string(&summary).expect("string serialization")
+        )
+    } else {
+        format!("\n\n{summary}")
     };
-    let appendix = encode(&summary);
     if appendix.len() > available && root.is_some() && reserved == 0 {
         return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
     }
     if appendix.len() <= available {
         if json_result {
-            base.insert_str(json_end - 1, &appendix);
+            base.insert_str(
+                compact_json_end.map_or(json_end - 1, |end| end - 2),
+                &appendix,
+            );
         } else {
             base.push_str(&appendix);
         }
@@ -725,26 +760,30 @@ fn project_alias(
     }
 }
 
+fn json_char_width(ch: char, spelling: &[u8]) -> usize {
+    match spelling {
+        [b'\\', b'u', ..] if ch.len_utf8() == 4 => 12,
+        [b'\\', b'u', ..] => 6,
+        [b'\\', ..] => 2,
+        _ => ch.len_utf8(),
+    }
+}
+
 /// Map complete visible JSON string scalars back to the decoded stream.
 fn visible_json_string(
     text: &str,
     encoded: &str,
     start: usize,
-    outer: &PreviewRanges,
+    outer: &[Range<usize>],
 ) -> Vec<Range<usize>> {
     let mut spans: Vec<Range<usize>> = Vec::new();
     let mut pos = 1; // opening quote
     for (offset, ch) in text.char_indices() {
-        let width = match encoded.as_bytes().get(pos..) {
-            Some([b'\\', b'u', ..]) if ch.len_utf8() == 4 => 12, // surrogate pair
-            Some([b'\\', b'u', ..]) => 6,
-            Some([b'\\', ..]) => 2,
-            _ => ch.len_utf8(),
-        };
+        let width = json_char_width(ch, &encoded.as_bytes()[pos..]);
         let end = pos + width;
-        if [&outer.head, &outer.tail]
-            .iter()
-            .any(|r| r.start <= start + pos && start + end <= r.end)
+        if outer
+            .get(outer.partition_point(|r| r.end <= start + pos))
+            .is_some_and(|r| r.start <= start + pos && start + end <= r.end)
         {
             if let Some(last) = spans.last_mut().filter(|r| r.end == offset) {
                 last.end += ch.len_utf8();
@@ -760,12 +799,12 @@ fn visible_json_string(
 fn visible_ranges(
     sources: &[Range<usize>],
     span: &BodySpan,
-    outer: &PreviewRanges,
+    outer: &[Range<usize>],
 ) -> Vec<Range<usize>> {
     let mut visible = Vec::new();
     for (inner, offset) in span.ranges.parts() {
         let start = span.start + offset;
-        for (kept, _) in outer.parts() {
+        for kept in outer {
             for source in sources {
                 let from = inner
                     .start
@@ -917,12 +956,153 @@ mod tests {
     }
 
     #[test]
+    fn base64_shell_thresholds_and_fallback_preserve_original_output() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Bash", "TaskGet"] {
+            for (prefix, limit) in [("", 1024), ("data:text/plain;base64,", 256)] {
+                for len in [limit - 1, limit] {
+                    let data = "QUJD".repeat(limit / 4);
+                    let payload = if len == limit {
+                        data.clone()
+                    } else {
+                        format!("{}I", &data[..len - 1])
+                    };
+                    let text = format!("{prefix}{payload}");
+                    let raw = json!({"stdout": text}).to_string();
+                    let full = render(name, &raw, None);
+                    let view = command_preview(name, &raw, Some(dir.path()), None, false);
+                    if len < limit {
+                        assert_eq!(view, full);
+                    } else {
+                        assert!(view.contains("base64: 1 block collapsed"), "{view}");
+                        assert!(!view.contains(&data[..64]));
+                        let bad_root = dir.path().join("blocked");
+                        std::fs::write(&bad_root, "").unwrap();
+                        assert_eq!(
+                            command_preview(name, &raw, Some(&bad_root), None, true),
+                            full
+                        );
+                    }
+                }
+            }
+        }
+        let input = crate::tools::get_tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "Bash")
+            .unwrap()
+            .input_schema;
+        assert!(input["properties"].get("raw").is_none());
+    }
+
+    #[test]
+    fn base64_shell_and_task_get_save_100_kib_before_previewing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = "QUJD".repeat(25 * 1024);
+        let text = format!("before\n{data}\nafter");
+        for name in ["Bash", "TaskGet"] {
+            let value = if name == "Bash" {
+                json!({"stdout":text})
+            } else {
+                json!({"stdout":text,"output":text,"result":text,"status":"completed"})
+            };
+            let raw = serde_json::to_string_pretty(&value).unwrap();
+            let full = render(name, &raw, None);
+            let view = command_preview(name, &raw, Some(dir.path()), None, true);
+            assert!(!view.contains(&data[..16]));
+            assert!(!view.contains("Omitted output:"));
+            assert!(view.contains("base64: 1 block collapsed (100 KB)"));
+            let body = if name == "TaskGet" {
+                serde_json::from_str::<Value>(&view).unwrap()["stdout"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            } else {
+                view.clone()
+            };
+            let (path, line) = body
+                .split_once("76800 bytes decoded, looks like text; full output: ")
+                .unwrap()
+                .1
+                .split_once(", line ")
+                .unwrap();
+            let line = line.split(']').next().unwrap().parse::<usize>().unwrap();
+            let saved = std::fs::read_to_string(path).unwrap();
+            assert_eq!(saved, full);
+            assert!(saved.lines().nth(line - 1).unwrap().contains(&data));
+            assert_eq!(
+                command_preview(name, &raw, Some(dir.path()), None, false),
+                view
+            );
+        }
+    }
+
+    #[test]
+    fn base64_and_i6_count_disjoint_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(512);
+        let dots = ".".repeat(20000);
+        let stdout = format!("{blob}\n{dots}\n{blob}");
+        let (raw, capture) = crate::tools::bash_process::fixture_capture(
+            [stdout.as_bytes(), b""],
+            100_000,
+            100_000,
+            0,
+        );
+        let view = command_preview("Bash", &raw, Some(dir.path()), capture.as_ref(), true);
+        let (body, summary) = view.split_once("\n\nOmitted output:").unwrap();
+        assert_eq!(body.matches("[base64 data omitted:").count(), 2);
+        assert!(body.contains("base64: 2 blocks collapsed (4 KB)"));
+        let kept_dots = body
+            .lines()
+            .filter(|l| l.starts_with("...."))
+            .map(str::len)
+            .sum::<usize>();
+        assert!(kept_dots > 0 && kept_dots < dots.len());
+        assert_eq!(
+            summary.trim(),
+            format!("stdout: {} bytes, 0 whole lines", dots.len() - kept_dots)
+        );
+    }
+
+    #[test]
+    fn base64_marker_survives_a_middle_cut_and_json_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(512);
+        let dots = ".".repeat(16000);
+        let stdout = format!("{dots}\nerror: {blob}\n{dots}");
+        for name in ["Bash", "TaskGet"] {
+            let raw = serde_json::to_string_pretty(&json!({"stdout":stdout}))
+                .unwrap()
+                .replace("stdout", "std\\u006fut")
+                .replace("QUJD", "QU\\u004aD");
+            let view = command_preview(name, &raw, Some(dir.path()), None, true);
+            assert_eq!(view.matches("[base64 data omitted:").count(), 1);
+            assert!(!view.contains("QUJD"));
+            assert!(view.contains("base64: 1 block collapsed (2 KB)"));
+            let (body, summary) = view.split_once("\n\nOmitted output:").unwrap();
+            let shown = body
+                .split(|c| c != '.')
+                .filter(|run| run.len() > 3)
+                .map(str::len)
+                .sum::<usize>();
+            // Both surrounding newlines fall inside the middle cut.
+            assert_eq!(
+                summary.trim(),
+                format!(
+                    "stdout: {} bytes, 0 whole lines",
+                    dots.len() * 2 + "error: ".len() + 2 - shown
+                )
+            );
+        }
+    }
+
+    #[test]
     fn model_tool_output_command_lines_follow_unlabeled_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let stdout = format!(
             "error: head\n{}\nfatal: middle\n{}\nFAILED tail\n",
-            "h".repeat(8000),
-            "t".repeat(8000)
+            ".".repeat(8000),
+            "!".repeat(8000)
         );
         let raw = json!({"stdout":stdout,"stderr":"","shell":"bash","shell_path":"/bin/bash","success":true,"exit_code":0,"pipeline_sigpipe":false}).to_string();
         let result = command_preview("Bash", &raw, Some(dir.path()), None, true);
@@ -938,7 +1118,7 @@ mod tests {
     fn model_tool_output_preserves_long_console_task_outcomes_and_managed_shell_status() {
         let dir = tempfile::tempdir().unwrap();
         let outcome = r#"{"exit_code":91,"final_drain_complete":true}"#;
-        let mut task = json!({"task_id":"fixture","stdout":"x".repeat(12000),"stderr":"","output":outcome,"result":outcome,"metadata":{"managed_shell":true,"interaction":"pty"}});
+        let mut task = json!({"task_id":"fixture","stdout":".".repeat(12000),"stderr":"","output":outcome,"result":outcome,"metadata":{"managed_shell":true,"interaction":"pty"}});
         for name in ["TaskGet", "TaskOutput"] {
             let raw = task.to_string();
             assert_eq!(
@@ -1007,7 +1187,7 @@ mod tests {
     #[test]
     fn model_tool_output_elapsed_requires_ten_seconds_and_hidden_information() {
         let dir = tempfile::tempdir().unwrap();
-        let stdout = vec![b'x'; 12_000];
+        let stdout = vec![b'.'; 12_000];
         let (raw, capture) =
             crate::tools::bash_process::fixture_capture([&stdout, b""], 100_000, 100_000, 0);
         let mut meta = capture.unwrap();
@@ -1020,7 +1200,7 @@ mod tests {
             if ms == 9999 {
                 assert_eq!(view.as_bytes(), stdout);
             } else {
-                assert_eq!(view, format!("{}\n\nElapsed: 10000 ms", "x".repeat(12_000)));
+                assert_eq!(view, format!("{}\n\nElapsed: 10000 ms", ".".repeat(12_000)));
             }
         }
     }
@@ -1165,7 +1345,7 @@ mod tests {
         let engine = executor(temp.path());
         for name in ["PowerShell", "TaskGet"] {
             let raw = json!({
-                "stdout":format!("{}\nlast line", "x".repeat(12_300)),
+                "stdout":format!("{}\nlast line", ".".repeat(12_300)),
                 "stderr":"warning: retrying\nerror: stopped",
                 "exit_code":3,
                 "duration_ms":129,
@@ -1211,7 +1391,7 @@ mod tests {
     fn model_tool_output_complete_near_capacity_json_stays_intact() {
         let temp = tempfile::tempdir().unwrap();
         let engine = executor(temp.path());
-        let raw = json!({"stdout":"x".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
+        let raw = json!({"stdout":".".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
             .to_string();
         assert!(raw.len() < MODEL_TOOL_OUTPUT_BYTES);
         assert_eq!(engine.retained_tool_output("TaskGet", &raw), raw);
@@ -1471,7 +1651,9 @@ mod tests {
         );
         let stored = store
             .db
-            .fixture_shard(&id, |conn| crate::db::message_repo::get_tool_calls_for_message(conn, &assistant))
+            .fixture_shard(&id, |conn| {
+                crate::db::message_repo::get_tool_calls_for_message(conn, &assistant)
+            })
             .unwrap()
             .unwrap();
         assert_eq!(stored[0].output.as_deref(), Some(raw.as_str()));
@@ -1508,7 +1690,7 @@ mod tests {
                     "shell",
                     "Bash",
                     json!({"command":concat!(
-                        "node -e \"process.stdout.write('START'+ 'x'.repeat(200000)+'TEST SUMMARY\\n",
+                        "node -e \"process.stdout.write('START'+ '.'.repeat(200000)+'TEST SUMMARY\\n",
                         "    Running tests/fail.rs (target/debug/deps/fail-abc)\\n\\nrunning 1 test\\n",
                         "test failing_case ... FAILED\\n",
                         "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n",

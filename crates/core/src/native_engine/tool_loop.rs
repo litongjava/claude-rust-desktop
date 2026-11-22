@@ -569,6 +569,7 @@ impl Drop for PermissionWaiterGuard {
 
 #[path = "model_tool_output.rs"]
 mod model_output;
+pub(crate) use model_output::{base64_preview, monitor_line};
 
 pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
