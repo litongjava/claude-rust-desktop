@@ -120,15 +120,7 @@ impl Matcher<'_> {
 }
 
 pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<String> {
-    let workspace = db
-        .with_conn(|conn| crate::db::conversation_repo::conversation_metadata(conn, session))??
-        .and_then(|row| row.workspace_path)
-        .unwrap_or_default();
-    let enabled = crate::config::command_output::enabled(
-        Some(db.data_dir()),
-        std::path::Path::new(&workspace),
-    );
-    search(session, db.data_dir(), enabled, value, |selection| {
+    search(session, db.data_dir(), session, value, |selection| {
         db.with_conn(|conn| context_search_repo::read(conn, session, selection))?
     })
 }
@@ -136,7 +128,7 @@ pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<Str
 pub(crate) fn search(
     cursor_scope: &str,
     root: &std::path::Path,
-    enabled: bool,
+    session: &str,
     value: Value,
     read: impl FnOnce(Selection<'_>) -> Result<context_search_repo::Transcript>,
 ) -> Result<String> {
@@ -224,21 +216,33 @@ pub(crate) fn search(
         position: previous.as_ref().map(|cursor| &cursor.position),
     })?;
 
+    let mut projected = Vec::new();
     transcript.sources.retain_mut(|source| {
         if let Some(name) = &source.location.tool_name {
-            let Some(text) = searchable_tool_text(
-                name,
-                &source.text,
-                root,
-                enabled,
-                source.location.tool_call_id.as_deref().unwrap_or_default(),
-            ) else {
+            let Some(text) = searchable_tool_text(name, &source.text) else {
                 transcript.skipped_structured_sources += 1;
                 return false;
             };
             if let Cow::Owned(text) = text {
                 source.text = text;
             }
+        }
+        let name = source.location.tool_name.as_deref().or_else(|| {
+            (source.location.role == "user"
+                && crate::native_engine::tool_loop::monitor_notification(&source.text))
+            .then_some("Monitor")
+        });
+        let view = name.and_then(|name| {
+            crate::native_engine::tool_loop::project_for_model(name, &source.text, root, session)
+        });
+        projected.push(view.is_some());
+        if let Some(text) = view {
+            // A replacement in the overlap starts a new searchable excerpt.
+            // Cursor offsets are in the original SQLite bytes.
+            if !text.starts_with(&source.text[..source.overlap]) {
+                source.overlap = 0;
+            }
+            source.text = text;
         }
         true
     });
@@ -282,8 +286,14 @@ pub(crate) fn search(
             output.next_cursor = Some(cursor_for(source.position)?);
             break;
         }
-        let (excerpt, excerpt_truncated) =
-            excerpt(&source.text, start, end, source.preceded, source.truncated);
+        let (excerpt, excerpt_truncated) = excerpt(
+            &source.text,
+            start,
+            end,
+            source.preceded,
+            source.truncated,
+            projected[idx],
+        );
         positions.push(source.position);
         output.matches.push(Hit {
             location: source.location,
@@ -308,13 +318,7 @@ pub(crate) fn search(
     }
 }
 
-fn searchable_tool_text<'a>(
-    name: &str,
-    text: &'a str,
-    root: &std::path::Path,
-    enabled: bool,
-    id: &str,
-) -> Option<Cow<'a, str>> {
+fn searchable_tool_text<'a>(name: &str, text: &'a str) -> Option<Cow<'a, str>> {
     let Some(name) = context_search_repo::projection_name(name) else {
         return Some(Cow::Borrowed(text));
     };
@@ -334,8 +338,7 @@ fn searchable_tool_text<'a>(
         }
     }
     Some(Cow::Owned(
-        crate::native_engine::tool_loop::history_projection(name, text, root, id, enabled)
-            .unwrap_or_else(|| crate::native_engine::tool_loop::model_tool_output(name, text)),
+        crate::native_engine::tool_loop::model_tool_output(name, text),
     ))
 }
 
@@ -384,6 +387,7 @@ fn excerpt(
     end: usize,
     preceded: bool,
     source_truncated: bool,
+    projected: bool,
 ) -> (String, bool) {
     let before = EXCERPT_BYTES.saturating_sub(end - start).min(96);
     let left = text.ceil_char_boundary(start.saturating_sub(before));
@@ -392,6 +396,29 @@ fn excerpt(
             .min(left + EXCERPT_BYTES)
             .min(text.len()),
     );
+    // A search excerpt may clip context, but a recovery reference must remain usable.
+    let (mut left, mut right) = (left, right);
+    if projected {
+        for (at, _) in text.match_indices("[base64 data omitted: about ") {
+            if at >= right {
+                break;
+            }
+            let Some((_, rest)) = text[at..].split_once(", line ") else {
+                continue;
+            };
+            let Some((number, tail)) = rest.split_once(']') else {
+                continue;
+            };
+            if !number.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let end = text.len() - tail.len();
+            if end > left {
+                left = left.min(at);
+                right = right.max(end);
+            }
+        }
+    }
     let prefix = if left > 0 || preceded { "…" } else { "" };
     let suffix = if right < text.len() || source_truncated {
         "…"

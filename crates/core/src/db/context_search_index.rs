@@ -5,16 +5,8 @@ use anyhow::{ensure, Result};
 use rusqlite::{params, Connection, DatabaseName};
 
 pub(super) const BLOCK: usize = 64 * 1024;
-pub(super) const PROJECTED_TOOLS: [&str; 8] = [
-    "Bash",
-    "TaskGet",
-    "TaskOutput",
-    "Read",
-    "Write",
-    "Edit",
-    "MultiEdit",
-    "ApplyPatch",
-];
+pub(super) const PROJECTED_TOOLS: [&str; 6] =
+    ["Bash", "Read", "Write", "Edit", "MultiEdit", "ApplyPatch"];
 
 /// DbManager holds BEGIN IMMEDIATE through schema creation, backfill and trigger installation.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {

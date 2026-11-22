@@ -1418,7 +1418,15 @@ pub(super) fn control(
                 json!({"task_id":id,"status":status,"cancellation_requested":true,"message":"Monitor stop requested; you will get a final 'stopped' notification."}),
             ));
         }
-        let stdout = super::monitor::task_stdout(&directory)?;
+        let (stdout, size) = crate::performance::command_output::SnapshotSize::read_log(
+            &directory.join("stdout.log"),
+            64 * 1024,
+            true,
+        )?;
+        super::bash_process::publish_snapshot(
+            [size, Default::default()],
+            [stdout.len(), 0],
+        );
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
             .map(|file| {
@@ -1447,7 +1455,7 @@ pub(super) fn control(
     // next one. Ownership was already enforced by `read_for_session` above.
     let page = crate::tools::output_page::PageRequest::parse(input)?;
     if matches!(&page, crate::tools::output_page::PageRequest::Page { .. }) {
-        let mut value = page_task_get(task, &id, status, root, &directory, &page)?;
+        let mut value = page_task_get(task, &id, status, &directory, &page)?;
         if let Some(facts) = &owner_loss {
             value["owner_loss"] = facts.clone();
         }
@@ -1462,18 +1470,10 @@ pub(super) fn control(
     };
     let (stdout, out_size) = read("stdout.log")?;
     let (stderr, err_size) = read("stderr.log")?;
-    let cuts =
-        ["stdout", "stderr"].map(|name| directory.join(format!("{name}.capture-cut")).exists());
-    if cuts.contains(&true) {
-        super::bash_process::publish_metadata(
-            super::bash_process::CommandMetadata::ShellSnapshot {
-                streams: [out_size, err_size],
-                cuts,
-            },
-        );
-    } else {
-        super::bash_process::publish_snapshot([out_size, err_size], [stdout.len(), stderr.len()]);
-    }
+    super::bash_process::publish_snapshot(
+        [out_size, err_size],
+        [stdout.len(), stderr.len()],
+    );
     let mut snapshot = task;
     snapshot["task_id"] = json!(id);
     snapshot["status"] = status.clone();
@@ -1729,60 +1729,6 @@ pub(crate) mod reconcile_probe {
     }
 }
 
-#[cfg(test)]
-#[test]
-fn base64_review_pages_share_a_physical_run() {
-    use super::output_page::{Cursor, PageRequest};
-    let dir = tempfile::tempdir().unwrap();
-    let blob = "QUJD".repeat(256);
-    std::fs::write(dir.path().join("stdout.log"), &blob).unwrap();
-    let mut cursor = None;
-    let mut paths = Vec::new();
-    for page in 0..2 {
-        let (value, meta) = super::bash_process::capture_sync(|| {
-            page_task_get(
-                json!({"metadata":{"managed_shell":true}}),
-                "t",
-                json!("completed"),
-                dir.path(),
-                dir.path(),
-                &PageRequest::Page {
-                    cursor: cursor.take(),
-                    max_bytes: 512,
-                },
-            )
-            .unwrap()
-        });
-        assert_eq!(value["stdout"].as_str().unwrap().len(), 512);
-        cursor = Some(Cursor::decode(value["next_cursor"].as_str().unwrap()).unwrap());
-        let view = crate::native_engine::tool_loop::model_output::command_preview(
-            "TaskGet",
-            &value.to_string(),
-            Some(dir.path()),
-            meta.as_ref(),
-            true,
-        );
-        assert!(!view.contains("QUJD"));
-        assert!(view.contains("768 bytes decoded"));
-        assert_eq!(view.contains("1 block collapsed (1 KB)"), page == 0);
-        let result: Value = serde_json::from_str(&view).unwrap();
-        paths.push(
-            result["stdout"]
-                .as_str()
-                .unwrap()
-                .split_once("full output: ")
-                .unwrap()
-                .1
-                .split_once(", line ")
-                .unwrap()
-                .0
-                .to_owned(),
-        );
-    }
-    assert_eq!(paths[0], paths[1]);
-    assert!(std::fs::read_to_string(&paths[0]).unwrap().contains(&blob));
-}
-
 fn terminal(status: &Value) -> bool {
     matches!(status.as_str(), Some("completed" | "failed" | "cancelled"))
 }
@@ -1803,7 +1749,6 @@ fn page_task_get(
     task: Value,
     id: &str,
     status: Value,
-    root: &Path,
     directory: &Path,
     request: &crate::tools::output_page::PageRequest,
 ) -> Result<Value> {
@@ -1853,24 +1798,7 @@ fn page_task_get(
     let mut value = task;
     value["task_id"] = json!(id);
     value["status"] = status.clone();
-    let mut sources = [None, None];
-    for (i, (stream, offset, page, path)) in [
-        (stdout_stream.as_mut(), out, &stdout, &stdout_path),
-        (stderr_stream.as_mut(), err, &stderr, &stderr_path),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if let Some(stream) = stream {
-            sources[i] = stream.base64_source(
-                root,
-                offset,
-                page,
-                path.with_extension("capture-cut").exists(),
-            )?;
-        }
-    }
-    super::bash_process::publish_shell_page(&stdout, &stderr, sources);
+    super::bash_process::publish_page(&stdout, &stderr);
     if done && value["metadata"]["interaction"] != "pty" {
         if let Some(signal) = stored_shell_signal(&value) {
             value["termination_reason"] = json!(format!("terminated by signal {signal}"));

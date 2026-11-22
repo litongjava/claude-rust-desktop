@@ -127,7 +127,6 @@ impl SessionDb {
         part: crate::services::compaction::Part,
     ) -> Result<crate::services::compaction::PreparedPart> {
         use crate::services::compaction::{Part, PreparedPart};
-        let enabled = self.command_summary_enabled();
         self.read(|r| {
             let rows=r.messages()?;
             let index=rows.iter().position(|m|m.id==message).context("Message not found in this conversation")?;
@@ -139,9 +138,9 @@ impl SessionDb {
             let mut transcript=Vec::new();
             for row in &rows[range.clone()] {
                 ensure!(!r.0.query_row("SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",[&row.id],|r|r.get::<_,bool>(0))?, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
-                let mut calls = r.tools(&row.id)?;
-                crate::services::compaction::project_calls(&mut calls, self.stores.data_dir(),enabled);
-                transcript.push(serde_json::json!({"message":row,"tools":calls}));
+                let mut entry = serde_json::json!({"message":row,"tools":r.tools(&row.id)?});
+                crate::services::compaction::project_entry(&mut entry, self.stores.data_dir(), self.id());
+                transcript.push(entry);
             }
             Ok(PreparedPart {incarnation:self.incarnation().into(),fingerprint:crate::services::compaction::fingerprint(r.0,self.id())?.0,transcript:serde_json::to_string(&transcript)?,count:range.len()})
         })

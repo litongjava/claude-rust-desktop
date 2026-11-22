@@ -263,44 +263,6 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
-    /// Classify the page against the same opened capture used for its cursor.
-    pub(super) fn base64_source(
-        &mut self,
-        root: &Path,
-        offset: u64,
-        page: &StreamPage,
-        cut: bool,
-    ) -> Result<Option<super::bash_process::PageSource>> {
-        if page.text.is_empty() || self.size < super::base64_collapse::DATA_URI_THRESHOLD as u64 {
-            return Ok(None);
-        }
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        (&mut self.file)
-            .take(self.size.min(MAX_PAGE_BYTES))
-            .read_to_end(&mut bytes)?;
-        let Some(prefix) = bytes.get(..offset as usize) else {
-            return Ok(None);
-        };
-        let start = String::from_utf8_lossy(prefix).len();
-        let text = String::from_utf8_lossy(&bytes);
-        let cut = cut || self.size > bytes.len() as u64;
-        if !super::base64_collapse::captured_runs(&text, cut)
-            .iter()
-            .any(|r| r.range.start < start + page.text.len() && r.range.end > start)
-        {
-            return Ok(None);
-        }
-        let path = crate::performance::save_tool_output_bytes(root, &bytes)?;
-        Ok(Some(super::bash_process::PageSource {
-            path,
-            window: offset as usize..page.next as usize,
-            cut,
-            origin: 0,
-            first_line: 1,
-        }))
-    }
-
     pub(crate) fn generation(&self) -> String {
         format!("{}:{}", self.device, self.inode)
     }

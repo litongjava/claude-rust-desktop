@@ -275,18 +275,24 @@ pub(crate) fn fingerprint(
     history_snapshot(conn, id, None)
 }
 
-pub(crate) fn project_calls(
-    calls: &mut [message_repo::ToolCallRow],
-    root: &std::path::Path,
-    enabled: bool,
-) {
-    for call in calls {
-        if let Some(projected) = call.output.as_deref().and_then(|raw| {
-            crate::native_engine::tool_loop::history_projection(
-                &call.name, raw, root, &call.id, enabled,
-            )
-        }) {
-            call.output = Some(projected);
+/// Serialize the same row shape as storage while changing only model-facing output.
+pub(crate) fn project_entry(entry: &mut Value, root: &std::path::Path, session: &str) {
+    use crate::native_engine::tool_loop::{monitor_notification, project_for_model};
+    let message = &mut entry["message"];
+    if message["role"] == "user" {
+        if let Some(view) = message["content"]
+            .as_str()
+            .filter(|s| monitor_notification(s))
+            .and_then(|s| project_for_model("Monitor", s, root, session))
+        {
+            message["content"] = Value::String(view);
+        }
+    }
+    for call in entry["tools"].as_array_mut().into_iter().flatten() {
+        if let (Some(name), Some(raw)) = (call["name"].as_str(), call["output"].as_str()) {
+            if let Some(view) = project_for_model(name, raw, root, session) {
+                call["output"] = Value::String(view);
+            }
         }
     }
 }
@@ -294,7 +300,7 @@ pub(crate) fn project_calls(
 pub(crate) fn history_snapshot(
     conn: &rusqlite::Connection,
     id: &str,
-    projection: Option<(&std::path::Path, bool)>,
+    projection: Option<&std::path::Path>,
 ) -> Result<(String, String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
@@ -305,7 +311,7 @@ pub(crate) fn history_snapshot(
     let mut all = Vec::new();
     let mut hasher = Sha256::new();
     for (index, row) in rows.iter().enumerate() {
-        let mut calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
+        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
@@ -314,9 +320,8 @@ pub(crate) fn history_snapshot(
         serde_json::to_writer(&mut hasher, &entry)?;
         hasher.write_all(b"\n")?;
         if index >= start {
-            if let Some((root, enabled)) = projection {
-                project_calls(&mut calls, root, enabled);
-                entry["tools"] = serde_json::to_value(calls)?;
+            if let Some(root) = projection {
+                project_entry(&mut entry, root, id);
             }
             all.push(entry);
         }

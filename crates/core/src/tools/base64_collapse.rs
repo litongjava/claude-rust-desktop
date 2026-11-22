@@ -31,13 +31,6 @@ static ALPHABET: [bool; 256] = {
     table
 };
 
-/// The retained tail of a capture can start in the middle of a quartet.
-pub(crate) fn leading_fragment(text: &str) -> usize {
-    text.bytes()
-        .take_while(|&b| ALPHABET[b as usize] || b == b'=')
-        .count()
-}
-
 fn engine(url_safe: bool) -> GeneralPurpose {
     GeneralPurpose::new(
         if url_safe {
@@ -66,20 +59,13 @@ pub(crate) fn collapse(text: &str) -> (String, usize) {
     (out, runs.len())
 }
 
-#[derive(Clone)]
 pub(crate) struct Run {
-    pub incomplete: bool,
     pub range: std::ops::Range<usize>,
     pub decoded_len: usize,
     pub kind: &'static str,
 }
 
 pub(crate) fn runs(text: &str) -> Vec<Run> {
-    captured_runs(text, false)
-}
-
-/// At a known capture cut, the last quartet can be incomplete or noncanonical.
-pub(crate) fn captured_runs(text: &str, cut: bool) -> Vec<Run> {
     let bytes = text.as_bytes();
     let mut runs = Vec::new();
     let mut index = 0;
@@ -114,18 +100,10 @@ pub(crate) fn captured_runs(text: &str, cut: bool) -> Vec<Run> {
         if data.len() + padding < threshold {
             continue;
         }
-        let incomplete = cut && index == bytes.len();
-        let validated = match (incomplete, padding) {
-            (true, 0) => collapsed_run(&data[..data.len() / 4 * 4], 0),
-            // The second '=' of canonical padding can be the first missing byte.
-            (true, 1) if data.len() % 4 == 2 => collapsed_run(data, 2),
-            _ => collapsed_run(data, padding),
-        };
-        let Some((decoded_len, kind)) = validated else {
+        let Some((decoded_len, kind)) = collapsed_run(data, padding) else {
             continue;
         };
         runs.push(Run {
-            incomplete,
             range: start..index,
             decoded_len,
             kind,

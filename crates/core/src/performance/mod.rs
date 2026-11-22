@@ -835,20 +835,6 @@ pub fn retain_tool_output(root: &std::path::Path, output: &str, preview: &str) -
 }
 
 /// Share a stable, complete spill between model previews and history replay.
-pub(crate) fn save_tool_output(
-    root: &std::path::Path,
-    output: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    save_tool_output_bytes(root, output.as_bytes())
-}
-
-pub(crate) fn save_tool_output_bytes(
-    root: &std::path::Path,
-    output: &[u8],
-) -> std::io::Result<std::path::PathBuf> {
-    save_output_in(&root.join("tool-outputs"), output)
-}
-
 pub(crate) fn save_output_in(
     directory: &std::path::Path,
     output: &[u8],
@@ -883,7 +869,7 @@ pub(crate) fn retain_tool_output_with_ranges(
     if output == preview && output.len() <= limit {
         return (output.to_string(), Some(PreviewRanges::whole(output.len())));
     }
-    match save_tool_output(root, output) {
+    match save_output_in(&root.join("tool-outputs"), output.as_bytes()) {
         Ok(path) => {
             let note = format!(
                 "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",

@@ -213,16 +213,11 @@ fn stream_occurrence_id(message: &str, provider_id: &str) -> String {
 }
 
 impl SessionDb {
-    pub(super) fn command_summary_enabled(&self) -> bool {
-        let workspace = self.workspace().unwrap_or_default();
-        crate::config::command_output::enabled(Some(self.stores.data_dir()), &workspace)
-    }
-
     pub fn context_search(&self, input: Value) -> Result<String> {
         crate::tools::context_search::search(
             &self.incarnation,
             self.stores.data_dir(),
-            self.command_summary_enabled(),
+            self.id(),
             input,
             |selection| {
                 self.read(|r| {

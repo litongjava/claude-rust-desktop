@@ -568,10 +568,10 @@ impl Drop for PermissionWaiterGuard {
 }
 
 #[path = "model_tool_output.rs"]
-pub(crate) mod model_output;
+mod model_output;
 #[path = "model_projection.rs"]
 mod model_projection;
-pub(crate) use model_output::{base64_preview, history_projection, monitor_line};
+pub(crate) use model_projection::{monitor_notification, project_for_model};
 
 pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
@@ -2795,11 +2795,36 @@ impl ToolLoopExecutor {
         id: Option<&str>,
     ) -> String {
         let root = self.search_config_path.as_deref().and_then(|p| p.parent());
+        let preview = self.ordinary_tool_preview(tool_name, output, id, root);
+        root.and_then(|root| {
+            project_for_model(
+                tool_name,
+                &preview,
+                root,
+                self.conv_id.as_deref().unwrap_or_default(),
+            )
+        })
+        .unwrap_or(preview)
+    }
+
+    fn ordinary_tool_preview(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+        root: Option<&std::path::Path>,
+    ) -> String {
         if model_output::is_shell_result(tool_name) {
             let enabled = self.summary_enabled(root);
-            let metadata = root
-                .zip(id)
-                .and_then(|(root, id)| model_output::read_metadata(root, id));
+            let metadata = if enabled {
+                root.zip(id)
+                    .and_then(|(root, id)| {
+                        std::fs::read(model_output::metadata_path(root, id)).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            } else {
+                None
+            };
             return model_output::command_preview(
                 tool_name,
                 output,
@@ -3005,12 +3030,12 @@ impl ToolLoopExecutor {
             .search_config_path
             .as_deref()
             .and_then(std::path::Path::parent);
-        if let Some(root) = root.filter(|_| model_output::is_shell_result(tool_name)) {
+        if let Some(root) = root.filter(|root| {
+            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
+        }) {
             let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
-            if let Some(metadata) =
-                metadata.filter(|m| m.needed_for_base64() || self.summary_enabled(Some(root)))
-            {
-                if let Err(error) = model_output::save_metadata(root, id, metadata) {
+            if let Some(metadata) = metadata {
+                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
                     tracing::debug!(%error, "Could not retain shell capture metadata");
                 }
             }
@@ -5355,11 +5380,12 @@ impl ToolLoopExecutor {
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
                 .await;
+            let queued = self.queued_model_content(queued);
             for content in self
                 .drain_approval_notes()
                 .into_iter()
                 .map(Value::String)
-                .chain(queued.into_iter().map(|input| input.content))
+                .chain(queued)
                 .chain(self.drain_peer_messages()?.into_iter().map(Value::String))
             {
                 let content = multimodal::anthropic_content(&content)?;
@@ -6120,11 +6146,12 @@ impl ToolLoopExecutor {
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
                 .await;
+            let queued = self.queued_model_content(queued);
             for content in self
                 .drain_approval_notes()
                 .into_iter()
                 .map(Value::String)
-                .chain(queued.into_iter().map(|input| input.content))
+                .chain(queued)
                 .chain(self.drain_peer_messages()?.into_iter().map(Value::String))
             {
                 let content = multimodal::openai_content(&content)?;

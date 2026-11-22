@@ -55,11 +55,10 @@ impl Captured {
         if let Some(excerpts) = &mut self.excerpts {
             excerpts.push(bytes);
         }
-        let prefix = bytes.len().min(self.limit.saturating_sub(self.head.len()));
         let head = bytes
             .len()
             .min((self.limit / 2).saturating_sub(self.head.len()));
-        self.head.extend_from_slice(&bytes[..prefix]);
+        self.head.extend_from_slice(&bytes[..head]);
         let tail_cap = self.limit - self.limit / 2;
         let rest = &bytes[head.max(bytes.len().saturating_sub(tail_cap))..];
         let remove = (self.tail.len() + rest.len()).saturating_sub(tail_cap);
@@ -77,7 +76,7 @@ impl Captured {
     }
 
     fn bytes_and_omission(&self) -> (Vec<u8>, usize, Option<std::ops::Range<usize>>) {
-        let mut bytes = self.head[..self.head.len().min(self.limit / 2)].to_vec();
+        let mut bytes = self.head.clone();
         let tail: Vec<_> = self.tail.iter().copied().collect();
         let mut tail_start = 0;
         let mut retained = self.extent.bytes;
@@ -106,18 +105,7 @@ impl Captured {
 
     fn present_with_limit(&self, limit: usize) -> (String, bool, StreamCapture) {
         let (bytes, capture_elided_bytes, marker) = self.bytes_and_omission();
-        self.present_bytes(limit, &bytes, capture_elided_bytes, marker, false)
-    }
-
-    fn present_bytes(
-        &self,
-        limit: usize,
-        bytes: &[u8],
-        capture_elided_bytes: usize,
-        marker: Option<std::ops::Range<usize>>,
-        capture_prefix: bool,
-    ) -> (String, bool, StreamCapture) {
-        let text = String::from_utf8_lossy(bytes);
+        let text = String::from_utf8_lossy(&bytes);
         let sources = match marker {
             Some(marker) => {
                 let tail = ByteLines::measure(&text.as_bytes()[marker.end..]);
@@ -160,9 +148,6 @@ impl Captured {
             excerpts: self.excerpts.as_ref().map(LineCapture::finish),
             first_lines,
             widths: shown.widths,
-            capture_prefix,
-            source: None,
-            preview_digest: None,
             capture_elided_bytes,
             tool_elided_text_bytes: source_ranges.iter().map(|r| r.len()).sum::<usize>()
                 - shown.text_bytes,
@@ -172,46 +157,11 @@ impl Captured {
     }
 }
 
-/// If a tool-level cut would lose source, classify the original streams first.
-fn present_streams(streams: [&Captured; 2], limit: usize) -> [(String, bool, StreamCapture); 2] {
-    let needs_cut = streams
-        .iter()
-        .any(|s| s.overflowed() || s.head.len() > limit || std::str::from_utf8(&s.head).is_err());
-    let preserve = needs_cut
-        && streams.iter().any(|s| {
-            !super::base64_collapse::captured_runs(
-                &String::from_utf8_lossy(&s.head),
-                s.overflowed(),
-            )
-            .is_empty()
-        });
-    streams.map(|s| {
-        let (preview, truncated, mut stats) = s.present_with_limit(limit);
-        if preserve {
-            // Keep the historical tool/UI result. Only the model uses the source
-            // metrics and bytes captured before that result was clipped.
-            stats = s
-                .present_bytes(
-                    usize::MAX,
-                    &s.head,
-                    s.extent.bytes - s.head.len(),
-                    None,
-                    s.overflowed(),
-                )
-                .2;
-            stats.source = Some(s.head.clone());
-            stats.preview_digest = Some(StreamCapture::digest(&preview));
-        }
-        (preview, truncated, stats)
-    })
-}
-
 async fn capture(
     mut pipe: impl AsyncRead + Unpin,
     output: &mut Captured,
     log: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
-    let mut cut_flag = log.as_ref().map(|p| p.with_extension("capture-cut"));
     let mut log = log.map(std::fs::File::create).transpose()?;
     let mut buffer = [0u8; 8192];
     loop {
@@ -220,11 +170,6 @@ async fn capture(
             break;
         }
         let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.extent.bytes));
-        if keep < count {
-            if let Some(path) = cut_flag.take() {
-                std::fs::write(path, b"")?;
-            }
-        }
         output.push(&buffer[..count]);
         if let Some(log) = log.as_mut() {
             std::io::Write::write_all(log, &buffer[..keep])?;
@@ -277,7 +222,6 @@ pub(crate) fn review_capture(large: bool) -> (String, ShellCapture) {
     (
         text,
         ShellCapture {
-            source_file: None,
             duration_ms: 50,
             stdout,
             stderr: Captured::default().present_with_limit(limit).2,
@@ -292,15 +236,13 @@ pub(crate) fn fixture_capture(
     tool_limit: usize,
     exit: i64,
 ) -> (String, Option<CommandMetadata>) {
-    let streams = streams.map(|bytes| {
+    let [(out, out_cut, stdout), (err, err_cut, stderr)] = streams.map(|bytes| {
         let mut captured = Captured::with_limit(capture_limit);
         for chunk in bytes.chunks(317) {
             captured.push(chunk);
         }
-        captured
+        captured.present_with_limit(tool_limit)
     });
-    let [(out, out_cut, stdout), (err, err_cut, stderr)] =
-        present_streams(streams.each_ref(), tool_limit);
     let capture = shell_metadata(37, stdout, stderr, [out.len(), err.len()]);
     let result = json!({"stdout":out, "stderr":err, "exit_code":exit, "stdout_truncated":out_cut,"stderr_truncated":err_cut});
     (result.to_string(), capture.map(CommandMetadata::Shell))
@@ -317,12 +259,6 @@ pub(super) async fn run(command: &mut Command, timeout: Duration, shell: &str) -
 pub(crate) struct StreamCapture {
     pub(crate) bytes: usize,
     pub(crate) lines: usize,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) capture_prefix: bool,
-    #[serde(skip)]
-    pub(crate) source: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) preview_digest: Option<[u8; 32]>,
     pub(crate) capture_elided_bytes: usize,
     pub(crate) tool_elided_text_bytes: usize,
     pub(crate) ranges: Vec<std::ops::Range<usize>>,
@@ -334,65 +270,11 @@ pub(crate) struct StreamCapture {
     pub(crate) widths: ReplacementWidths,
 }
 
-impl StreamCapture {
-    pub(crate) fn digest(text: &str) -> [u8; 32] {
-        use sha2::Digest;
-        sha2::Sha256::digest(text.as_bytes()).into()
-    }
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ShellCapture {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) source_file: Option<std::path::PathBuf>,
     pub(crate) duration_ms: u64,
     pub(crate) stdout: StreamCapture,
     pub(crate) stderr: StreamCapture,
-}
-
-impl ShellCapture {
-    /// A single file contains stdout and stderr in order. The separator is
-    /// outside both stream ranges. A stdout-only capture stays byte-identical.
-    pub(crate) fn recovery(
-        &self,
-        root: &Path,
-    ) -> std::io::Result<Option<(std::path::PathBuf, Vec<u8>)>> {
-        if let Some(path) = &self.source_file {
-            return Ok(Some((path.clone(), std::fs::read(path)?)));
-        }
-        let Some(mut bytes) = self.stdout.source.clone() else {
-            return Ok(None);
-        };
-        let stderr = self.stderr.source.as_deref().unwrap_or_default();
-        if !bytes.is_empty() && !stderr.is_empty() {
-            bytes.push(b'\n');
-        }
-        bytes.extend_from_slice(stderr);
-        let path = crate::performance::save_tool_output_bytes(root, &bytes)?;
-        Ok(Some((path, bytes)))
-    }
-
-    pub(crate) fn source_ranges(&self) -> [std::ops::Range<usize>; 2] {
-        let out = self.stdout.bytes - self.stdout.capture_elided_bytes;
-        let err = self.stderr.bytes - self.stderr.capture_elided_bytes;
-        let start = out + usize::from(out > 0 && err > 0);
-        [0..out, start..start + err]
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PageSource {
-    pub path: std::path::PathBuf,
-    pub window: std::ops::Range<usize>,
-    pub cut: bool,
-    #[serde(default)]
-    pub origin: usize,
-    #[serde(default = "first_line")]
-    pub first_line: usize,
-}
-
-fn first_line() -> usize {
-    1
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -400,33 +282,13 @@ pub(crate) enum CommandMetadata {
     Shell(ShellCapture),
     Snapshot([crate::performance::command_output::SnapshotSize; 2]),
     ShellSnapshot {
-        #[serde(default)]
-        cuts: [bool; 2],
         streams: [crate::performance::command_output::SnapshotSize; 2],
-    },
-    MonitorTail {
-        stream: crate::performance::command_output::SnapshotSize,
-        source: Option<PageSource>,
     },
     PageExit(i64), // Existing private sidecars.
     Page {
-        #[serde(default)]
-        sources: [Option<PageSource>; 2],
         bytes: [usize; 2],
         widths: [ReplacementWidths; 2],
     },
-}
-
-impl CommandMetadata {
-    pub(crate) fn needed_for_base64(&self) -> bool {
-        match self {
-            Self::Shell(shell) => shell.stdout.source.is_some(),
-            Self::MonitorTail { .. } => true,
-            Self::Page { sources, .. } => sources.iter().any(Option::is_some),
-            Self::ShellSnapshot { cuts, .. } => cuts.contains(&true),
-            _ => false,
-        }
-    }
 }
 
 tokio::task_local! {
@@ -474,25 +336,14 @@ pub(crate) fn publish_page(
     stdout: &super::output_page::StreamPage,
     stderr: &super::output_page::StreamPage,
 ) {
-    publish_shell_page(stdout, stderr, [None, None]);
-}
-
-pub(super) fn publish_shell_page(
-    stdout: &super::output_page::StreamPage,
-    stderr: &super::output_page::StreamPage,
-    sources: [Option<PageSource>; 2],
-) {
     let streams = [stdout, stderr];
     // Decoded length is an upper bound. Save exact source widths for any
     // candidate, including a page whose replacements crossed the threshold.
     replace_metadata(
-        (sources.iter().any(Option::is_some) || qualifies(streams.map(|s| s.text.len()))).then(
-            || CommandMetadata::Page {
-                sources,
-                bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
-                widths: streams.map(|s| s.widths.clone()),
-            },
-        ),
+        qualifies(streams.map(|s| s.text.len())).then(|| CommandMetadata::Page {
+            bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
+            widths: streams.map(|s| s.widths.clone()),
+        }),
     );
 }
 
@@ -520,8 +371,8 @@ pub(super) async fn run_logged_with_capture(
     let started = Instant::now();
     let run = run_captured(command, timeout, logs, stdin, OUTPUT_LIMIT, true).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
-    let [(stdout, stdout_truncated, stdout_stats), (stderr, stderr_truncated, stderr_stats)] =
-        present_streams([&run.stdout, &run.stderr], super::max_output_bytes());
+    let (stdout, stdout_truncated, stdout_stats) = run.stdout.present();
+    let (stderr, stderr_truncated, stderr_stats) = run.stderr.present();
     let mut result = if run.timed_out {
         let timeout = timeout.unwrap_or_default();
         json!({"error":format!("Command timed out after {} ms; descendants were terminated. For long installations or builds, set timeout explicitly (milliseconds, at most 600000), or use run_in_background.",timeout.as_millis()),"is_error":true,"timed_out":true})
@@ -555,13 +406,11 @@ fn shell_metadata(
     stderr: StreamCapture,
     text_bytes: [usize; 2],
 ) -> Option<ShellCapture> {
-    (stdout.source.is_some() || qualifies([stdout.bytes, stderr.bytes]) || qualifies(text_bytes))
-        .then_some(ShellCapture {
-            source_file: None,
-            duration_ms,
-            stdout,
-            stderr,
-        })
+    (qualifies([stdout.bytes, stderr.bytes]) || qualifies(text_bytes)).then_some(ShellCapture {
+        duration_ms,
+        stdout,
+        stderr,
+    })
 }
 
 /// Runs a command with a bounded **raw** capture: the whole document within

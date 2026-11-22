@@ -22,7 +22,6 @@ pub(super) fn summarize(
     streams: &[(&str, Stream<'_>); 2],
     duration_ms: Option<u64>,
     preview: &str,
-    base64_collapsed: bool,
 ) -> String {
     let mut summary = String::new();
     let mut notable: Vec<(&str, &str, Line)> = Vec::new();
@@ -69,24 +68,9 @@ pub(super) fn summarize(
         // Captured markers can survive a tool-level cut. Also scan retained
         // source lines, skipping visible ones before spending the marker cap.
         let mut missing = Lines::default();
-        let blocks = if base64_collapsed {
-            crate::tools::base64_collapse::runs(stream.text)
-        } else {
-            Vec::new()
-        };
         let visible_text = |text: &str| {
             let quoted = serde_json::to_string(text).expect("string");
-            // A short diagnostic quote may overlap a much longer block.
-            // Use decoded stream offsets even if the JSON escaped its bytes.
-            let overlaps_block = !blocks.is_empty()
-                && stream.text.match_indices(text).any(|(at, _)| {
-                    let next = blocks.partition_point(|b| b.range.end <= at);
-                    blocks
-                        .get(next)
-                        .is_some_and(|b| b.range.start < at + text.len())
-                });
-            overlaps_block
-                || preview.contains(text)
+            preview.contains(text)
                 || preview.contains(&quoted[1..quoted.len() - 1])
                 || streams
                     .iter()
