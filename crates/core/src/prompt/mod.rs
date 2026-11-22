@@ -923,6 +923,9 @@ mod tests {
         assert_eq!(prompt.matches("# Execution and verification").count(), 1);
         assert!(prompt.contains("In a non-interactive run (no user to reply)"));
         assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
+        assert!(prompt.contains("isn't in the project or its dependency cache"));
+        assert!(prompt.contains("`~/code/<owner>/<repo>` (fetch if already cloned) and read it there."));
+        assert!(prompt.contains("Never clone into the project directory."));
         for removed in [
             "historical name of the shell tool",
             "Bash timeout is in milliseconds",
