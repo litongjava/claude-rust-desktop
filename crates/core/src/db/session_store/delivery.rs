@@ -677,6 +677,16 @@ struct Claim {
 }
 pub(crate) const TURN_POLL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Bound each writer acquisition for live queue delivery. Resolving memory,
+/// hashing files and flushing a committed WAL can each outlast a poll interval.
+fn write_wait(until: std::time::Instant, live_input: bool) -> std::time::Duration {
+    if live_input {
+        TURN_POLL_WAIT
+    } else {
+        until.saturating_duration_since(std::time::Instant::now())
+    }
+}
+
 impl DeliveryOwner {
     #[cfg(test)]
     pub(crate) fn duplicate_inbox_lock(&self) -> std::io::Result<std::fs::File> {
@@ -729,7 +739,7 @@ impl DeliveryOwner {
         self.queue_before(
             mode,
             tool,
-            &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
+            std::time::Instant::now() + super::WRITE_DEADLINE,
             false,
             None,
         )
@@ -739,7 +749,7 @@ impl DeliveryOwner {
         &mut self,
         mode: QueueMode,
         tool: Option<&str>,
-        until: &mut std::time::Instant,
+        until: std::time::Instant,
         live: bool,
         expected: Option<&input_queue::QueueItem>,
     ) -> Result<Option<Handoff>> {
@@ -778,7 +788,7 @@ impl DeliveryOwner {
                 })?;
             }
         }
-        let claim = s.stores.global().write_with_deadline("claim queue", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
+        let claim = s.stores.global().write_with_deadline("claim queue", &s.id, true, write_wait(until, live), |c| {
             let Some((id, state)) = pending(c)? else {
                 return Ok(None);
             };
@@ -830,7 +840,7 @@ impl DeliveryOwner {
             self.queue_before(
                 item.mode,
                 None,
-                &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
+                std::time::Instant::now() + super::WRITE_DEADLINE,
                 false,
                 Some(item),
             )?
@@ -845,7 +855,7 @@ impl DeliveryOwner {
     pub fn next_peer(&mut self) -> Result<Option<Handoff>> {
         self.peer_before(
             usize::MAX,
-            &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
+            std::time::Instant::now() + super::WRITE_DEADLINE,
             false,
         )
     }
@@ -853,7 +863,7 @@ impl DeliveryOwner {
     fn peer_before(
         &mut self,
         max_bytes: usize,
-        until: &mut std::time::Instant,
+        until: std::time::Instant,
         live: bool,
     ) -> Result<Option<Handoff>> {
         layout::allow_entry()?;
@@ -928,22 +938,22 @@ impl DeliveryOwner {
         }
         Ok(None)
     }
-    /// Discovery shares a contention budget across the batch. Each committed
-    /// live receipt has a separate bounded acknowledgement after its WAL flush.
+    /// A batch contains at most eight items. Peers share a discovery deadline,
+    /// while live queue entries each get a bounded wait at the next writer.
     /// An ack-only retry injects content only if this same live owner committed it.
     pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
         use crate::db::message_repo;
-        let mut until = std::time::Instant::now() + TURN_POLL_WAIT;
+        let until = std::time::Instant::now() + TURN_POLL_WAIT;
         let mut remaining = 128 * 1024;
         let mut inputs = Vec::new();
         for _ in 0..limit.min(8) {
-            if std::time::Instant::now() >= until {
+            if peers && std::time::Instant::now() >= until {
                 break;
             }
             let next = if peers {
-                self.peer_before(remaining, &mut until, true)
+                self.peer_before(remaining, until, true)
             } else {
-                self.queue_before(QueueMode::Steer, None, &mut until, true, None)
+                self.queue_before(QueueMode::Steer, None, until, true, None)
             };
             let handoff = match next {
                 Ok(Some(value)) => value,
@@ -1002,13 +1012,9 @@ impl DeliveryOwner {
                 Ok(existing.is_some())
             })
     }
-    fn complete(
-        &mut self,
-        claim: Claim,
-        until: &mut std::time::Instant,
-        live: bool,
-    ) -> Result<Handoff> {
+    fn complete(&mut self, claim: Claim, until: std::time::Instant, live: bool) -> Result<Handoff> {
         let s = &self.session;
+        let live_input = live && claim.sender.is_none();
         s.stores.step(Phase::DeliveryClaimed)?;
         let fresh = if self.has_receipt(&claim)? {
             false
@@ -1023,16 +1029,10 @@ impl DeliveryOwner {
                 None
             };
             let typed = claim.prompt_origin == "typed";
-            let resolving = std::time::Instant::now();
             let memory = typed
                 .then(|| crate::services::memory_files::prompt::Admission::session(s))
                 .transpose()?;
-            if live && typed {
-                *until += resolving.elapsed();
-            }
-            let mut admitted_at = None;
-            let delivered = s.write_locked_with_deadline("deliver input", until.saturating_duration_since(std::time::Instant::now()), |tx| {
-                admitted_at = (live && typed).then(std::time::Instant::now);
+            let delivered = s.write_locked_with_deadline("deliver input", write_wait(until, live_input), |tx| {
                 ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {
                     let exists: bool = tx.0.query_row(
@@ -1097,16 +1097,10 @@ impl DeliveryOwner {
                 }
                 Ok(true)
             })?;
-            // Receipt selection and publication after acquiring the shard writer
-            // are admitted work. Preserve the remaining contention budget for
-            // the acknowledgement and the next queued input in this batch.
-            if let Some(started) = admitted_at {
-                *until += started.elapsed();
-            }
             if !delivered {
                 s.stores
                     .global()
-                    .write_with_deadline("cancel rewound tool delivery", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
+                    .write_with_deadline("cancel rewound tool delivery", &s.id, true, write_wait(until, live_input), |c| {
                         ensure!(
                             c.execute("UPDATE session_input_queue SET state='cancelled', revision=revision+1 WHERE session_id=?1 AND delivery_id=?2 AND revision=?3 AND state='claimed'", params![s.id, claim.id, claim.revision])? == 1,
                             "Stale tool claim"
@@ -1127,10 +1121,7 @@ impl DeliveryOwner {
         // durable in G, flush the committed receipt (also on ack-only replay).
         // A pinned reader can postpone the checkpoint; the G claim stays live.
         s.connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, |c| {
-            let _wait = crate::db::BusyTimeoutGuard::within(
-                c,
-                until.saturating_duration_since(std::time::Instant::now()),
-            )?;
+            let _wait = crate::db::BusyTimeoutGuard::within(c, write_wait(until, live_input))?;
             let busy: i64 = c.query_row("PRAGMA wal_checkpoint(FULL)", [], |r| r.get(0))?;
             if busy != 0 {
                 return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
@@ -1142,17 +1133,9 @@ impl DeliveryOwner {
             Ok(())
         })?;
         s.stores.step(Phase::DeliveryCommitted)?;
-        // A successful FULL checkpoint can outlast the discovery deadline even
-        // on an uncontended database. Give the directory acknowledgement of a
-        // live receipt its own bounded writer acquisition after the flush.
-        let ack_wait = if live && self.live_handoffs.contains_key(&claim.id) {
-            TURN_POLL_WAIT
-        } else {
-            until.saturating_duration_since(std::time::Instant::now())
-        };
         s.stores
             .global()
-            .write_with_deadline("acknowledge delivery", &s.id, true, ack_wait, |c| {
+            .write_with_deadline("acknowledge delivery", &s.id, true, write_wait(until, live_input), |c| {
                 let changed = if claim.sender.is_some() {
                     c.execute("UPDATE session_inbox SET state='context_committed',blocked_reason=NULL,committed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1 AND recipient=?2 AND state='claimed' AND generation=?3", params![claim.id, s.id, claim.revision])?
                 } else {
