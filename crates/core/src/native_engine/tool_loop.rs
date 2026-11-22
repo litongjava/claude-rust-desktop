@@ -7061,7 +7061,7 @@ impl ToolLoopExecutor {
         let separate_parts = super::provider_runtime::responses_api(&self.provider);
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.prepare_history_tool_outputs(&mut messages);
-        Ok(messages
+        let mut built: Vec<_> = messages
             .iter()
             .enumerate()
             .filter_map(|(index, msg)| {
@@ -7173,7 +7173,22 @@ impl ToolLoopExecutor {
                     provider_content: msg.get("provider_content").cloned(),
                 })
             })
-            .collect())
+            .collect();
+        // Responses replays the compact window verbatim and ignores the display
+        // text of its boundary row. Put the index immediately after that window.
+        if built.first().is_some_and(|m| m.provider_content.as_ref().is_some_and(|v| v["compaction"] == true)) {
+            if let Some(index) = self.context_reminders.iter().find(|s| s.starts_with("<system-reminder>\n<project_memory>\n")) {
+                built.insert(1, OpenAIMessage {
+                    role: "user".into(),
+                    content: OpenAIContent::Text(index.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    provider_content: None,
+                });
+            }
+        }
+        Ok(built)
     }
 
     fn get_workspace_cwd(&self) -> &str {

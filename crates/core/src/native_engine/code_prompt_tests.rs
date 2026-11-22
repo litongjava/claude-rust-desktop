@@ -197,6 +197,19 @@ fn chat_text_events(text: &str) -> Vec<Value> {
 
 /// Run one turn against a local endpoint and return the request body.
 async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Value {
+    capture_history_request(
+        format,
+        reminders,
+        vec![json!({"role":"user","content":"hello"})],
+    )
+    .await
+}
+
+async fn capture_history_request(
+    format: &str,
+    reminders: Vec<String>,
+    messages: Vec<Value>,
+) -> Value {
     use axum::{http::header, routing::post, Json, Router};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -244,8 +257,11 @@ async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Va
     let temp = tempfile::tempdir().unwrap();
     let mut executor = ToolLoopExecutor::new(
         provider,
-        vec![json!({"role":"user","content":"hello"})],
-        Some(crate::prompt::compose_system_prompt(None, PromptProfile::Code)),
+        messages,
+        Some(crate::prompt::compose_system_prompt(
+            None,
+            PromptProfile::Code,
+        )),
         128,
         tx,
         temp.path().to_string_lossy().into(),
@@ -263,6 +279,24 @@ async fn capture_instruction_request(format: &str, reminders: Vec<String>) -> Va
     let captured = captured.lock().await;
     assert_eq!(captured.len(), 1, "{format}");
     captured[0].clone()
+}
+
+#[tokio::test]
+async fn memory_native_boundary_keeps_the_index_and_opaque_items() {
+    let items = json!([{"role":"user","content":"original question"},{"type":"compaction","encrypted_content":"opaque-item"}]);
+    let body = capture_history_request("responses", vec![
+        "<system-reminder>\n<project_memory>\nCURRENT-INDEX\n</project_memory>\n</system-reminder>".into(),
+    ], vec![
+        json!({"role":"user","content":"Native compaction completed","provider_content":{"api":"openai-responses","compaction":true,"items":items}}),
+        json!({"role":"user","content":"continue"}),
+    ]).await;
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(&input[..2], items.as_array().unwrap());
+    assert_eq!(
+        body["input"].to_string().matches("CURRENT-INDEX").count(),
+        1
+    );
+    assert!(!body["instructions"].to_string().contains("CURRENT-INDEX"));
 }
 
 #[tokio::test]
@@ -687,8 +721,7 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
                     block.remove("cache_control");
                 }
             }
-            (blocks.len() == 1 && blocks[0]["type"] == "text")
-                .then(|| blocks[0]["text"].clone())
+            (blocks.len() == 1 && blocks[0]["type"] == "text").then(|| blocks[0]["text"].clone())
         });
         if let Some(text) = single_text {
             message["content"] = text;
@@ -704,8 +737,8 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
 #[test]
 fn first_message_tool_and_skills_lists_stay_frozen_across_requests_and_resume() {
     use crate::prompt::{
-        date_reminder, first_message_reminders, loadable_tools_for_session,
-        skills_for_session, SessionReminders,
+        date_reminder, first_message_reminders, loadable_tools_for_session, skills_for_session,
+        SessionReminders,
     };
     let root = tempfile::tempdir().unwrap();
     let builtin = vec![("ListDir".to_owned(), "List a directory.".to_owned())];
@@ -730,8 +763,7 @@ fn first_message_tool_and_skills_lists_stay_frozen_across_requests_and_resume() 
     // A later request sees a different catalog and skill set, but the frozen
     // files win and the first message is byte-for-byte unchanged.
     let later_tools = loadable_tools_for_session(root.path(), "s", &[], &[]);
-    let later_skills =
-        skills_for_session(root.path(), "s", &["- other: Changed".to_owned()]);
+    let later_skills = skills_for_session(root.path(), "s", &["- other: Changed".to_owned()]);
     assert_eq!(later_tools, tools);
     assert_eq!(later_skills, skill_list);
     assert_eq!(compose(later_tools, later_skills), first);
@@ -799,8 +831,7 @@ fn a_skill_enabled_mid_session_produces_one_change_reminder_on_the_latest_messag
         json!({"role":"assistant","content":"ok"}),
         json!({"role":"user","content":"second"}),
     ];
-    let entry =
-        crate::services::turn_context::for_last(&history, vec![change.clone()]).unwrap();
+    let entry = crate::services::turn_context::for_last(&history, vec![change.clone()]).unwrap();
     let (tx, _rx) = mpsc::channel(8);
     let executor = ToolLoopExecutor::new(
         provider("http://127.0.0.1:1", "openai"),
