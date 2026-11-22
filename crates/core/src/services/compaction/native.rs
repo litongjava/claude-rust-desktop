@@ -37,7 +37,7 @@ pub(crate) fn supports(provider: &ResolvedProvider) -> bool {
 fn compact_transport(provider: &ResolvedProvider) -> bool {
     matches!(provider.provider.api_format, ApiFormat::OpenAI)
         && provider.provider.builtin_id.is_some()
-        && provider.model.api.as_deref() == Some("openai-responses")
+        && provider_runtime::compact_base(provider).is_some()
 }
 
 pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) -> Result<()> {
@@ -104,7 +104,7 @@ pub(crate) async fn generate_messages_with_options(
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions, session)?;
-    let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
+    let mut url = reqwest::Url::parse(provider_runtime::compact_base(provider).context("Native compaction requires the plain Responses endpoint")?)
         .context("Native compaction requires a configured gateway URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https")

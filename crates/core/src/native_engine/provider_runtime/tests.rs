@@ -1886,3 +1886,19 @@ fn matching_opaque_history_remains_readable_after_a_non_gpt_model_switches_to_su
     different.model.id = "different".into();
     assert!(native::validate_history(&history, &different).is_err());
 }
+
+#[test]
+fn native_compaction_resolves_the_main_catalog_endpoint_and_excludes_aliases() {
+    let mut p = provider("opencode-go", "openai-responses", "");
+    p.model.id = "gpt-6-luna".into();
+    p.model.api = None;
+    assert!(crate::services::compaction::native::supports(&p));
+    assert_eq!(
+        compact_base(&p),
+        Some("https://opencode.ai/inference/go/openai/v1")
+    );
+    for alias in ["openai-codex-responses", "azure-openai-responses"] {
+        p.model.api = Some(alias.into());
+        assert!(compact_base(&p).is_none());
+    }
+}

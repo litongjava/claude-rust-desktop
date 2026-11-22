@@ -134,6 +134,19 @@ pub(super) fn resolved_transport(
     }
 }
 
+/// The plain Responses endpoint used by the main turn, including catalog defaults.
+pub(crate) fn compact_base(provider: &ResolvedProvider) -> Option<&str> {
+    if resolved_transport(provider).ok()?.0 != "openai-responses" {
+        return None;
+    }
+    let (entry, model) = metadata(provider).ok()?;
+    Some(resolved_base(
+        provider.provider.base_url.trim_end_matches('/'),
+        entry,
+        model,
+    ))
+}
+
 /// Whether this provider's model stream uses the shared Chat Completions
 /// transport that post-content timeout recovery can stage. The answer reuses
 /// the sender's route/protocol resolution, so the two cannot disagree.
