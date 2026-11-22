@@ -948,16 +948,8 @@ impl ToolLoopExecutor {
             Some(&self.workspace_cwd),
         )?;
         self.prompt_profile = profile;
-        (self.messages, self.context_boundary_id) =
-            shard.read(|r| r.model_history(&self.provider.provider.api_format))?;
-        self.applied_compaction = self.context_boundary_id.is_some();
-        let (project_memory, receipts) = crate::services::memory_files::prompt::replay(
-            shard,
-            self.context_boundary_id.as_deref(),
-            &self.messages,
-        )?;
-        self.turn_context = crate::services::turn_context::load(root, id)?;
-        self.turn_context.extend(receipts);
+        self.reload_history(&shard.clone())?;
+        let project_memory = self.session_reminders.project_memory.clone();
         let instructions = crate::project_instructions::load_all(Some(root), &workspace)?;
         let (user_instructions, project_instructions) =
             crate::project_instructions::reminder_parts(&instructions);

@@ -77,27 +77,3 @@ pub(crate) fn seal(
     }
     Ok(())
 }
-
-impl SessionDb {
-    pub(crate) fn plan_boundary_context(
-        &self,
-        id: &str,
-    ) -> Result<(serde_json::Value, Option<String>)> {
-        self.read(|r| {
-            let message = crate::db::message_repo::get_message(r.0, id)?
-                .context("Approved plan boundary disappeared")?;
-            let origin = super::message_origin(r.0, id)?;
-            ensure!(
-                message.conversation_id == self.id()
-                    && message.is_compact_boundary
-                    && origin.as_deref() == Some("approved_plan"),
-                "Invalid approved plan boundary"
-            );
-            let prefix = crate::services::memory_files::prompt::frozen_index(r.0, Some(id))?;
-            let message = serde_json::json!({
-                "id": id, "role": message.role, "content": message.content, "origin": origin
-            });
-            Ok((message, prefix))
-        })
-    }
-}

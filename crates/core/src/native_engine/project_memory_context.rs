@@ -60,11 +60,10 @@ impl ToolLoopExecutor {
         });
     }
 
-    pub(super) fn refresh_compacted_memory(&mut self) -> Option<String> {
+    pub(super) fn compacted_index(&self) -> Option<String> {
         // In-flight compression has no durable boundary. Carry forward the most
         // recently announced index from this request's immutable receipts.
-        let current = self
-            .turn_context
+        self.turn_context
             .iter()
             .rev()
             .flat_map(|entry| &entry.blocks)
@@ -75,20 +74,11 @@ impl ToolLoopExecutor {
                     .iter()
                     .find(|block| is_index(block))
                     .cloned()
-            });
-        if let Some(at) = self.context_reminders.iter().position(|s| is_index(s)) {
-            self.context_reminders.splice(at..=at, current.clone());
-        } else {
-            self.context_reminders.extend(current.clone());
-        }
-        for entry in &mut self.turn_context {
-            entry.blocks.retain(|s| !is_index(s));
-        }
-        current
+            })
     }
 
-    pub(super) fn add_compacted_memory(&mut self, messages: &mut Vec<Value>) {
-        if let Some(index) = self.refresh_compacted_memory() {
+    pub(super) fn add_compacted_memory(&self, messages: &mut Vec<Value>) {
+        if let Some(index) = self.compacted_index() {
             let at = messages
                 .iter()
                 .take_while(|m| m["role"] == "system")

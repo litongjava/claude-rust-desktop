@@ -57,6 +57,9 @@ impl FileMemory {
 
 #[derive(Serialize, Deserialize)]
 struct Receipt {
+    /// Older receipts predate tracking delivery to a provider.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     announced: Option<bool>,
     index_hash: Option<String>,
@@ -80,10 +83,6 @@ fn index_key(boundary: Option<&str>) -> Setting<IndexState> {
     boundary.map_or(INDEX, |id| {
         Setting::memory_receipt(format!("prompt.index.boundary.{id}"))
     })
-}
-
-pub(crate) fn frozen_index(tx: &rusqlite::Connection, id: Option<&str>) -> Result<Option<String>> {
-    Ok(index_key(id).read(tx)?.and_then(|state| state.first))
 }
 
 pub(crate) fn freeze_empty_boundary(tx: &rusqlite::Connection, id: &str) -> Result<()> {
@@ -268,6 +267,7 @@ impl Admission {
         receipt(id).write(
             tx,
             &Receipt {
+                pending: true,
                 announced: Some(changed && current.first.is_some()),
                 index_hash: if changed { current.first_hash } else { None },
                 blocks,
@@ -308,23 +308,29 @@ pub(crate) fn replay(
     boundary: Option<&str>,
     messages: &[Value],
 ) -> Result<(Option<String>, Vec<Entry>)> {
-    shard.read(|r| {
-        let prefix = r.setting(index_key(boundary))?.and_then(|s| s.first);
-        let mut entries = Vec::new();
-        for message in messages
-            .iter()
-            .filter(|m| m["role"] == "user" && m["origin"] == "typed")
-        {
-            if let Some(id) = message["id"].as_str() {
-                if let Some(saved) = r.setting(receipt(id))? {
-                    if !saved.blocks.is_empty() {
-                        entries.push(attachment(id, saved.blocks));
-                    }
+    shard.read(|r| replay_at(r, boundary, messages))
+}
+
+pub(crate) fn replay_at(
+    r: &crate::db::session_store::SessionRead<'_>,
+    boundary: Option<&str>,
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Entry>)> {
+    let prefix = r.setting(index_key(boundary))?.and_then(|s| s.first);
+    let mut entries = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|m| m["role"] == "user" && m["origin"] == "typed")
+    {
+        if let Some(id) = message["id"].as_str() {
+            if let Some(saved) = r.setting(receipt(id))? {
+                if !saved.blocks.is_empty() {
+                    entries.push(attachment(id, saved.blocks));
                 }
             }
         }
-        Ok((prefix, entries))
-    })
+    }
+    Ok((prefix, entries))
 }
 
 #[cfg(test)]

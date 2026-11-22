@@ -357,6 +357,22 @@ pub(crate) fn visible_memory_index(
 }
 
 impl super::SessionDb {
+    pub(crate) fn acknowledge_model_inputs(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.write(|w| {
+            let mut update = w.0.prepare_cached(
+                "UPDATE peripheral_settings SET value=json_remove(value,'$.pending')
+                WHERE key='memory.prompt.message.'||?1 AND json_extract(value,'$.pending')=1",
+            )?;
+            for id in ids {
+                update.execute([id])?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn admit_user(&self, id: &str, content: &Value, origin: &str) -> Result<()> {
         let _guard = self.hold_incarnation()?;
         let memory = (origin == "typed")
@@ -871,6 +887,48 @@ impl SessionRead<'_> {
         }
         Ok(messages)
     }
+    pub(crate) fn boundary_id(&self) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT id FROM messages WHERE is_compact_boundary=1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+            [], |r| r.get(0)).optional()?)
+    }
+
+    /// Identify the active exchange even when a new process opens it after
+    /// multiple steers. Next-turn deliveries have their own generation.
+    pub(crate) fn protected_inputs(
+        &self,
+        messages: &[Value],
+    ) -> Result<(Option<usize>, Vec<String>)> {
+        let mut steer = self.0.prepare_cached(
+            "SELECT 1 FROM delivery_receipts d WHERE d.delivery_id=?1 AND NOT EXISTS(
+            SELECT 1 FROM delivery_generations g WHERE g.delivery_id=d.delivery_id)",
+        )?;
+        let mut pending = self.0.prepare_cached(
+            "SELECT 1 FROM peripheral_settings WHERE key='memory.prompt.message.'||?1
+            AND json_extract(value,'$.pending')=1",
+        )?;
+        let mut unsent = Vec::new();
+        let mut first = None;
+        let mut active = true;
+        for (i, row) in messages.iter().enumerate().rev() {
+            let Some(id) = row["id"].as_str().filter(|_| row["role"] == "user") else {
+                continue;
+            };
+            if row["origin"] == "typed" {
+                let unseen = pending.exists([id])?;
+                if unseen {
+                    unsent.push(id.to_owned());
+                }
+                if active || unseen {
+                    first = Some(i);
+                }
+            }
+            if active && !steer.exists([id])? {
+                active = false;
+            }
+        }
+        Ok((first, unsent))
+    }
+
     pub fn model_history(
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,

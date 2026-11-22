@@ -700,7 +700,10 @@ impl ContextCompressor {
                 let content = user_msg.get("content")
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
-                summary.push_str(&format!("**Latest request**: {}\n", content));
+                summary.push_str(&format!(
+                    "**Latest request**: {}\n",
+                    utf8_prefix(content, 500)
+                ));
             }
         }
 

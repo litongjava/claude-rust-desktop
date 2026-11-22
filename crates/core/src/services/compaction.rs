@@ -873,6 +873,114 @@ pub(crate) fn apply_persisted_boundary(
     Ok(None)
 }
 
+const MICROCOMPACT_KEEP_RECENT: usize = 10;
+const MICROCOMPACT_MIN_CHARS: usize = 1000;
+const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared to save context]";
+
+/// Microcompact moves its line forward only once the request passes half the
+/// window, so between moves every request shares the same prefix and cache.
+fn microcompact_through(
+    current: usize,
+    len: usize,
+    estimated_tokens: usize,
+    window: Option<u32>,
+) -> usize {
+    match window.filter(|window| *window > 0) {
+        Some(window) if estimated_tokens > window as usize / 2 => {
+            current.max(len.saturating_sub(MICROCOMPACT_KEEP_RECENT))
+        }
+        _ => current,
+    }
+}
+
+/// Replaces large tool results in `messages` with a short placeholder, in
+/// either provider's history format.
+pub(crate) fn clear_tool_results(messages: &mut [Value]) {
+    let large = |content: &Value| match content {
+        Value::String(text) => text.len() > MICROCOMPACT_MIN_CHARS,
+        Value::Array(blocks) => {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .map(str::len)
+                .sum::<usize>()
+                > MICROCOMPACT_MIN_CHARS
+                || blocks.iter().any(|block| block["type"] == "image")
+        }
+        _ => false,
+    };
+    for message in messages {
+        if message["role"] == "tool" && large(&message["content"]) {
+            message["content"] = json!(CLEARED_TOOL_RESULT);
+        }
+        if let Some(blocks) = message["content"].as_array_mut() {
+            for block in blocks
+                .iter_mut()
+                .filter(|block| block["type"] == "tool_result")
+            {
+                if large(&block["content"]) {
+                    block["content"] = json!(CLEARED_TOOL_RESULT);
+                }
+            }
+        }
+    }
+}
+
+/// As the reference CLI's microcompact: once the conversation passes half the
+/// context window, large tool results older than the last few messages are
+/// replaced with a placeholder. The saved transcript is unchanged.
+pub fn microcompact(
+    shard: &crate::db::session_store::SessionDb,
+    boundary: Option<&str>,
+    history: &mut [Value],
+    window: Option<u32>,
+) -> Result<bool> {
+    use crate::db::session_store::settings::{Microcompact, MICROCOMPACT};
+    let boundary = boundary.unwrap_or_default().to_owned();
+    let repository = shard.repository();
+    let mut state = repository
+        .preference(MICROCOMPACT)?
+        .filter(|state| state.boundary == boundary)
+        .unwrap_or(Microcompact {
+            through: 0,
+            boundary,
+        });
+    let len = history.len();
+    clear_tool_results(&mut history[..state.through.min(len)]);
+    let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
+    let through = microcompact_through(state.through, len, estimated, window);
+    if through != state.through {
+        state.through = through;
+        repository.set_preference(MICROCOMPACT, Some(&state))?;
+        clear_tool_results(&mut history[..through.min(len)]);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod microcompact_tests {
+    use super::*;
+    #[test]
+    fn memory_replay_preserves_typed_blocks_when_clearing_old_tool_results() {
+        assert_eq!(microcompact_through(0, 30, 400, Some(1000)), 0);
+        assert_eq!(microcompact_through(0, 30, 600, Some(1000)), 20);
+        assert_eq!(microcompact_through(25, 30, 600, Some(1000)), 25);
+        assert_eq!(microcompact_through(4, 30, 600, None), 4);
+        let big = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let mut history = vec![
+            json!({"role":"tool","content":big}),
+            json!({"role":"tool","content":"small"}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":[{"type":"text","text":big}]},{"type":"text","text":big}]}),
+        ];
+        clear_tool_results(&mut history);
+        assert_eq!(history[0]["content"], CLEARED_TOOL_RESULT);
+        assert_eq!(history[1]["content"], "small");
+        assert_eq!(history[2]["content"][0]["content"], CLEARED_TOOL_RESULT);
+        assert_eq!(history[2]["content"][1]["text"], big);
+    }
+}
+
 #[cfg(test)]
 mod hook_tests {
     use super::*;

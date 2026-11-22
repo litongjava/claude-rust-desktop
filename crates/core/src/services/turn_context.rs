@@ -80,6 +80,28 @@ pub fn load(root: &Path, session: &str) -> Result<Vec<Entry>> {
         .collect()
 }
 
+/// Reconstruct the context attached to the selected durable window.
+pub(crate) fn replay(
+    shard: &crate::db::session_store::SessionDb,
+    boundary: Option<&str>,
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Entry>)> {
+    shard.read(|r| replay_at(shard, r, boundary, messages))
+}
+
+pub(crate) fn replay_at(
+    shard: &crate::db::session_store::SessionDb,
+    r: &crate::db::session_store::SessionRead<'_>,
+    boundary: Option<&str>,
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Entry>)> {
+    let mut saved = load(shard.scoped_stores().data_dir(), shard.id())?;
+    let (index, receipts) =
+        crate::services::memory_files::prompt::replay_at(r, boundary, messages)?;
+    saved.extend(receipts);
+    Ok((index, saved))
+}
+
 /// An entry placing `blocks` after the last user message of `messages`.
 pub fn for_last(messages: &[Value], blocks: Vec<String>) -> Option<Entry> {
     let (key, occurrence) = locate(messages).into_iter().rev().flatten().next()?;

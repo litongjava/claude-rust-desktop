@@ -1292,7 +1292,7 @@ impl QueryEngine {
                 )
             })
             .flatten();
-        let mut turn_context = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<()> {
             for (block, skill) in turn_blocks {
                 if let Some(entry) =
                     crate::services::turn_context::for_last(&turn_messages, vec![block])
@@ -1311,7 +1311,7 @@ impl QueryEngine {
                     crate::services::turn_context::save(&turn_root, &turn_session, &entry)?;
                 }
             }
-            crate::services::turn_context::load(&turn_root, &turn_session)
+            Ok(())
         })
         .await??;
         // The first user message opens with the stable session context; skills
@@ -1320,20 +1320,19 @@ impl QueryEngine {
             crate::project_instructions::reminder_parts(&instructions);
         let memory_session = selected.clone();
         let memory_context = plugin_context.clone();
-        let (file_memory, project_memory, memory_turns) = {
+        let (file_memory, project_memory, turn_context) = {
             use crate::services::memory_files::{self, FileMemory};
             let memory = memory_files::config(&memory_context)?
                 .enabled
                 .then(|| FileMemory::session(&memory_context, memory_session.id()))
                 .transpose()?;
-            let (index, turns) = memory_files::prompt::replay(
+            let (index, turns) = crate::services::turn_context::replay(
                 &memory_session,
                 applied_compaction.as_deref(),
                 &request.messages,
             )?;
             (memory, index, turns)
         };
-        turn_context.extend(memory_turns);
         let context_reminders = crate::prompt::SessionReminders {
             user_instructions,
             environment: Some(environment),

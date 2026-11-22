@@ -2167,10 +2167,18 @@ impl Session {
             .set_session_rules(&self.id, crate::permission_commands::load(self)?);
         // Read the history and its compaction boundary in one store view, so the
         // request reports the context it actually sends.
-        let (mut history, context_boundary) = self
-            .store
-            .model_history_with_boundary(&self.id, &self.selected_provider().await?.provider.api_format)?;
-        crate::session_commands::microcompact(self, &mut history, self.context_window().await)?;
+        let (mut history, context_boundary) = self.store.model_history_with_boundary(
+            &self.id,
+            &self.selected_provider().await?.provider.api_format,
+        )?;
+        if deepseek_code_core::services::compaction::microcompact(
+            &self.selected_session()?,
+            context_boundary.as_deref(),
+            &mut history,
+            self.context_window().await,
+        )? {
+            crate::compaction::notice("Cleared older tool results to save context.");
+        }
         if !hook_wake && completion.queued.is_none() {
             let message = json!({"role":"user","origin":origin.tag(),"content":content.cloned().unwrap_or(json!(prompt))});
             history.push(message);

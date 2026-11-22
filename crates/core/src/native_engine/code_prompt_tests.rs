@@ -1126,3 +1126,170 @@ fn a_skill_enabled_mid_session_produces_one_change_reminder_on_the_latest_messag
     assert!(additions[1].0.is_empty() && additions[1].1.is_empty());
     assert_eq!(additions[2].1, vec![change]);
 }
+
+/// Drive the live provider loop through a clear and two queued inputs. Reopen
+/// the same shard in a new process before admitting any further prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_live_replay_bytes_after_clear_compression_and_steering() -> Result<()> {
+    use crate::db::session_store::{SessionDb, Stores};
+    use crate::services::{
+        input_queue::{QueueMode, QueueOrigin},
+        memory_files::FileMemory,
+        turn_context,
+    };
+    const CHILD: &str = "DCL_REPLAY_SAME_HISTORY";
+    const ID: &str = "9af5ebef-e220-4f60-8485-8fa0495a5aa6";
+    fn executor(
+        base: &str,
+        shard: &SessionDb,
+    ) -> Result<(ToolLoopExecutor, mpsc::Receiver<EngineEvent>)> {
+        let mut provider = provider(base, "openai");
+        provider.model.context_window = Some(6500);
+        provider.model.supports_vision = true;
+        let (messages, boundary) = shard.read(|r| r.model_history(&ApiFormat::OpenAI))?;
+        let (index, entries) = turn_context::replay(shard, boundary.as_deref(), &messages)?;
+        let skills = turn_context::invoked_skills_reminder(&entries, &messages);
+        let (tx, rx) = mpsc::channel(256);
+        let engine = ToolLoopExecutor::new(
+            provider,
+            messages,
+            None,
+            512,
+            tx,
+            shard.scoped_stores().data_dir().display().to_string(),
+            ReasoningMode::Standard,
+        )
+        .with_conv_id(ID.into())
+        .with_executor_history(ExecutorHistory::Session(shard.clone()))?
+        .with_session_reminders(crate::prompt::SessionReminders {
+            project_memory: index,
+            skills,
+            ..Default::default()
+        })
+        .with_turn_context(entries)
+        .with_applied_compaction(boundary.is_some())
+        .with_context_boundary(boundary);
+        Ok((engine, rx))
+    }
+    if let Some(data) = std::env::var_os(CHILD) {
+        let shard = Stores::open(std::path::Path::new(&data))?.open_session(ID)?;
+        let (mut engine, _events) = executor(&std::env::var("DCL_REPLAY_ENDPOINT")?, &shard)?;
+        engine.execute().await?;
+        return Ok(());
+    }
+
+    let root = tempfile::tempdir()?;
+    let data = root.path().join("data");
+    let context = crate::services::session_messages::context(&data)?;
+    let project = root.path().join("project");
+    std::fs::create_dir(&project)?;
+    let memory = FileMemory::workspace(&context, &project)?;
+    memory.put(
+        "fixture.md",
+        "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nSTEER_EXCERPT\n",
+        None,
+    )?;
+    let index = memory.directory.join("MEMORY.md");
+    std::fs::write(&index, "INDEX_A")?;
+    let shard = context
+        .db
+        .create_code_session(&project, "code-test", "code-test", ID)?;
+    std::fs::write(&index, "OLD_RECEIPT_B")?;
+    shard.admit_prompt("before clear", None, "typed")?;
+    let history = shard.read(|r| r.model_history(&ApiFormat::OpenAI))?.0;
+    let entry = turn_context::for_last(&history, vec!["before clear".into()]).unwrap();
+    turn_context::save(
+        &data,
+        ID,
+        &turn_context::Entry {
+            skill: Some(turn_context::InvokedSkill {
+                name: "example".into(),
+                path: "example.md".into(),
+                content: "SAVED_SKILL".into(),
+            }),
+            ..entry
+        },
+    )?;
+    let mut turn = context.db.start_turn_timer(ID)?;
+    let previous = turn.ensure_segment()?;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let capture = requests.clone();
+    let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |body: axum::body::Bytes| {
+        let capture = capture.clone();
+        async move {
+            let mut rows = capture.lock().unwrap();
+            rows.push(body.to_vec());
+            let events = if rows.len() == 1 {
+                vec![json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"lookup","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"missing.txt\"}"}}]},"finish_reason":"tool_calls"}]})]
+            } else { chat_text_events("done") };
+            let stream = events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+            ([("content-type", "text/event-stream")], stream)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let (mut live, _events) = executor(&endpoint, &shard)?;
+    std::fs::write(&index, "PLAN_INDEX_C")?;
+    let plan = shard.approve_plan(&format!(
+        "APPROVED_PLAN {}",
+        "implement the sample steps. ".repeat(1250)
+    ))?;
+    live.pending_plan_reset = Some((plan, shard.clone()));
+    live.parent_message_id = Some(previous);
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aNtQAAAAASUVORK5CYII=";
+    shard.enqueue("first", &json!([{"type":"text","text":"saffron FIRST_STEER"},{"type":"image_url","image_url":{"url":image}}]), QueueMode::Steer, QueueOrigin::User)?;
+    shard.enqueue(
+        "second",
+        &json!("SECOND_STEER"),
+        QueueMode::Steer,
+        QueueOrigin::User,
+    )?;
+    live.execute().await?;
+    drop(live);
+    let child = tokio::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            concat!(
+                module_path!(),
+                "::memory_live_replay_bytes_after_clear_compression_and_steering"
+            )
+            .split_once("::")
+            .unwrap()
+            .1,
+        ])
+        .env(CHILD, &data)
+        .env("DCL_REPLAY_ENDPOINT", endpoint)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{} {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let rows = requests.lock().unwrap();
+    assert_eq!(rows.len(), 3);
+    let first = std::str::from_utf8(&rows[0])?;
+    assert!(
+        first.contains("SAVED_SKILL")
+            && first.contains("PLAN_INDEX_C")
+            && !first.contains("OLD_RECEIPT_B")
+    );
+    let wire = std::str::from_utf8(&rows[1])?;
+    for term in [
+        "Compressed",
+        "FIRST_STEER",
+        "STEER_EXCERPT",
+        "SECOND_STEER",
+        image,
+        "PLAN_INDEX_C",
+    ] {
+        assert!(wire.contains(term), "missing {term}");
+    }
+    assert!(rows[1] == rows[2], "live and resumed HTTP bodies differ");
+    Ok(())
+}
