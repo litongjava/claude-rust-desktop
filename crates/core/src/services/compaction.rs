@@ -268,7 +268,34 @@ impl From<CommittedCompaction> for CompactionResult {
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, String, usize)> {
+pub(crate) fn fingerprint(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<(String, String, usize)> {
+    history_snapshot(conn, id, None)
+}
+
+pub(crate) fn project_calls(
+    calls: &mut [message_repo::ToolCallRow],
+    root: &std::path::Path,
+    enabled: bool,
+) {
+    for call in calls {
+        if let Some(projected) = call.output.as_deref().and_then(|raw| {
+            crate::native_engine::tool_loop::history_projection(
+                &call.name, raw, root, &call.id, enabled,
+            )
+        }) {
+            call.output = Some(projected);
+        }
+    }
+}
+
+pub(crate) fn history_snapshot(
+    conn: &rusqlite::Connection,
+    id: &str,
+    projection: Option<(&std::path::Path, bool)>,
+) -> Result<(String, String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows
@@ -276,18 +303,23 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         .rposition(|m| m.is_compact_boundary)
         .unwrap_or(0);
     let mut all = Vec::new();
-    for row in &rows {
-        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
+    let mut hasher = Sha256::new();
+    for (index, row) in rows.iter().enumerate() {
+        let mut calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        all.push(json!({"message": row, "tools": calls, "attachment_metadata": attachments}));
-    }
-    let mut hasher = Sha256::new();
-    for entry in &all {
-        serde_json::to_writer(&mut hasher, entry)?;
+        let mut entry = json!({"message": row, "tools": calls, "attachment_metadata": attachments});
+        serde_json::to_writer(&mut hasher, &entry)?;
         hasher.write_all(b"\n")?;
+        if index >= start {
+            if let Some((root, enabled)) = projection {
+                project_calls(&mut calls, root, enabled);
+                entry["tools"] = serde_json::to_value(calls)?;
+            }
+            all.push(entry);
+        }
     }
     let digest = hasher.finalize();
     let fingerprint = digest
@@ -298,7 +330,7 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         });
     Ok((
         fingerprint,
-        serde_json::to_string(&all[start..])?,
+        serde_json::to_string(&all)?,
         rows.len() - start,
     ))
 }

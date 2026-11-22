@@ -129,6 +129,7 @@ impl DeliveryOwner {
         layout::allow_entry()?;
         let s = &self.session;
         s.require_active_compaction()?;
+        let enabled = s.command_summary_enabled();
         let candidate = s.connection_under_lock(OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
             let tx = c.transaction()?;
             let request = tx
@@ -143,7 +144,7 @@ impl DeliveryOwner {
             if !has_target {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
-            let (fingerprint, transcript, count) = compaction::fingerprint(&tx, &s.id)?;
+            let (fingerprint, transcript, count) = compaction::history_snapshot(&tx, &s.id, Some((s.stores.data_dir(),enabled)))?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -230,16 +231,31 @@ impl SessionRepository<'_> {
             owned::Backend::Admitted(shard) => Some(shard.incarnation().to_owned()),
             owned::Backend::Shared(_, _) => None,
         };
-        if let owned::Backend::Admitted(shard) = &self.0 {
+        let shard_policy = if let owned::Backend::Admitted(shard) = &self.0 {
             shard.require_active_compaction()?;
-        }
+            Some(shard.command_summary_enabled())
+        } else {
+            None
+        };
         self.read(|c, id| {
-            if incarnation.is_none() {
-                let row = crate::db::conversation_repo::conversation_metadata(c, id)?
-                    .context("Session not found")?;
-                ensure!(!row.archived, "Session is archived");
-            }
-            let (fingerprint, transcript, count) = compaction::fingerprint(c, id)?;
+            let settings = match &self.0 {
+                owned::Backend::Admitted(shard) => (shard.stores.data_dir(), shard_policy.unwrap()),
+                owned::Backend::Shared(db, _) => {
+                    let row = crate::db::conversation_repo::conversation_metadata(c, id)?
+                        .context("Session not found")?;
+                    ensure!(!row.archived, "Session is archived");
+                    let root = db.data_dir();
+                    (
+                        root,
+                        crate::config::command_output::enabled(
+                            Some(root),
+                            std::path::Path::new(row.workspace_path.as_deref().unwrap_or("")),
+                        ),
+                    )
+                }
+            };
+            let (fingerprint, transcript, count) =
+                compaction::history_snapshot(c, id, Some(settings))?;
             ensure!(count >= 2, "Not enough messages to compact");
             let pending_request = if incarnation.is_some() {
                 c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?

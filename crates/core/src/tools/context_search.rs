@@ -120,11 +120,23 @@ impl Matcher<'_> {
 }
 
 pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<String> {
-    search(session, value, |selection| db.with_conn(|conn| context_search_repo::read(conn, session, selection))?)
+    let workspace = db
+        .with_conn(|conn| crate::db::conversation_repo::conversation_metadata(conn, session))??
+        .and_then(|row| row.workspace_path)
+        .unwrap_or_default();
+    let enabled = crate::config::command_output::enabled(
+        Some(db.data_dir()),
+        std::path::Path::new(&workspace),
+    );
+    search(session, db.data_dir(), enabled, value, |selection| {
+        db.with_conn(|conn| context_search_repo::read(conn, session, selection))?
+    })
 }
 
 pub(crate) fn search(
     cursor_scope: &str,
+    root: &std::path::Path,
+    enabled: bool,
     value: Value,
     read: impl FnOnce(Selection<'_>) -> Result<context_search_repo::Transcript>,
 ) -> Result<String> {
@@ -214,7 +226,13 @@ pub(crate) fn search(
 
     transcript.sources.retain_mut(|source| {
         if let Some(name) = &source.location.tool_name {
-            let Some(text) = searchable_tool_text(name, &source.text) else {
+            let Some(text) = searchable_tool_text(
+                name,
+                &source.text,
+                root,
+                enabled,
+                source.location.tool_call_id.as_deref().unwrap_or_default(),
+            ) else {
                 transcript.skipped_structured_sources += 1;
                 return false;
             };
@@ -290,7 +308,13 @@ pub(crate) fn search(
     }
 }
 
-fn searchable_tool_text<'a>(name: &str, text: &'a str) -> Option<Cow<'a, str>> {
+fn searchable_tool_text<'a>(
+    name: &str,
+    text: &'a str,
+    root: &std::path::Path,
+    enabled: bool,
+    id: &str,
+) -> Option<Cow<'a, str>> {
     let Some(name) = context_search_repo::projection_name(name) else {
         return Some(Cow::Borrowed(text));
     };
@@ -310,7 +334,8 @@ fn searchable_tool_text<'a>(name: &str, text: &'a str) -> Option<Cow<'a, str>> {
         }
     }
     Some(Cow::Owned(
-        crate::native_engine::tool_loop::model_tool_output(name, text),
+        crate::native_engine::tool_loop::history_projection(name, text, root, id, enabled)
+            .unwrap_or_else(|| crate::native_engine::tool_loop::model_tool_output(name, text)),
     ))
 }
 
@@ -444,6 +469,56 @@ mod tests {
         fn search(&self, input: Value) -> Value {
             serde_json::from_str(&self.db.open_session(&self.session).unwrap().context_search(input).unwrap()).unwrap()
         }
+    }
+
+    #[test]
+    fn base64_review_history_projects_results_and_hashes_original_rows() {
+        let f = Fixture::new();
+        f.append("user", "run both commands");
+        let msg = f.append("assistant", "");
+        let payload = "QUJD".repeat(64);
+        for name in ["Bash", "TaskGet"] {
+            let raw = json!({"metadata":{"managed_shell":true},"stdout":format!("data:text/plain;base64,{payload}")}).to_string();
+            f.tool(&msg, name, name, &raw);
+        }
+        let prepared = compaction::prepare(&f.db, &f.session).unwrap();
+        assert!(!prepared.transcript.contains(&payload));
+        assert!(prepared.transcript.contains("hidden-hook-input"));
+        assert_eq!(
+            prepared
+                .transcript
+                .matches("base64: 1 block collapsed")
+                .count(),
+            2
+        );
+        for name in ["Bash", "TaskGet"] {
+            let results = f.search(json!({"query":"data:text/plain;base64,", "tool_name":name}));
+            assert!(results["matches"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("base64 data omitted"));
+            assert!(!results.to_string().contains("QUJD"));
+            let exact = f.search(json!({"query":payload,"tool_name":name}));
+            assert_eq!(exact["matches"], json!([]));
+        }
+        f.db.fixture_shard(&f.session, |c| {
+            let raw: String = c
+                .query_row("SELECT output FROM tool_calls WHERE id='Bash'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(raw.contains(&payload));
+            c.execute(
+                "UPDATE tool_calls SET output=? WHERE id='Bash'",
+                [raw.replace("QUJD", "QUJE")],
+            )
+            .unwrap();
+        })
+        .unwrap();
+        assert_ne!(
+            prepared.fingerprint,
+            compaction::prepare(&f.db, &f.session).unwrap().fingerprint
+        );
     }
 
     #[test]

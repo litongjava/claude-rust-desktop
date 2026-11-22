@@ -348,7 +348,27 @@ pub(super) fn save_metadata(
     Ok(())
 }
 
-pub(super) fn command_preview(
+pub(crate) fn read_metadata(root: &Path, id: &str) -> Option<CommandMetadata> {
+    serde_json::from_slice(&std::fs::read(metadata_path(root, id)).ok()?).ok()
+}
+
+/// Keep ordinary stored history in its existing format. For an encoded result,
+/// use the same renderer and occurrence-specific source metadata as a live turn.
+pub(crate) fn history_projection(
+    name: &str,
+    raw: &str,
+    root: &Path,
+    id: &str,
+    enabled: bool,
+) -> Option<String> {
+    if !matches!(name, "Bash" | "TaskGet" | "TaskOutput") {
+        return None;
+    }
+    let metadata = read_metadata(root, id);
+    command_preview_inner(name, raw, Some(root), metadata.as_ref(), enabled, 0, true)
+}
+
+pub(crate) fn command_preview(
     name: &str,
     raw: &str,
     root: Option<&Path>,
@@ -366,6 +386,19 @@ fn command_preview_with_room(
     enabled: bool,
     reserved: usize,
 ) -> String {
+    command_preview_inner(name, raw, root, metadata, enabled, reserved, false)
+        .expect("unconditional preview")
+}
+
+fn command_preview_inner(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    metadata: Option<&CommandMetadata>,
+    enabled: bool,
+    reserved: usize,
+    only_collapsed: bool,
+) -> Option<String> {
     use command_output_summary::Stream;
     let bash = name == "Bash";
     let capture = match metadata {
@@ -381,6 +414,9 @@ fn command_preview_with_room(
     let collapsed = root
         .filter(|_| matches!(name, "Bash" | "TaskGet" | "TaskOutput"))
         .and_then(|root| base64_preview::Collapsed::prepare(name, &cleaned, root));
+    if only_collapsed && collapsed.is_none() {
+        return None;
+    }
     let limit = MODEL_TOOL_OUTPUT_BYTES - reserved;
     let (mut base, retained) = if let Some(preview) = &collapsed {
         let (text, kept) = preview.retain(if bash {
@@ -400,19 +436,19 @@ fn command_preview_with_room(
         (cleaned.clone(), Some(PreviewRanges::whole(cleaned.len())))
     };
     if !enabled {
-        return base;
+        return Some(base);
     }
     let task = matches!(name, "TaskGet" | "TaskOutput");
     let json = raw.strip_prefix("Error: ").unwrap_or(raw);
     let mut input = serde_json::Deserializer::from_str(json).into_iter::<Value>();
     let Some(Ok(value @ Value::Object(_))) = input.next() else {
-        return base;
+        return Some(base);
     };
     if task && value["metadata"]["interaction"] == "pty" {
-        return base;
+        return Some(base);
     }
     if !bash && value.get("model_output_summary").is_some() {
-        return base;
+        return Some(base);
     }
     let json_end = raw.len() - json.len() + input.byte_offset();
     // TaskGet renders managed-shell result strings as stdout, which can itself
@@ -556,7 +592,7 @@ fn command_preview_with_room(
         })
     });
     if !crate::performance::command_output::qualifies(bytes) {
-        return base;
+        return Some(base);
     }
 
     let json_result = !bash
@@ -659,7 +695,7 @@ fn command_preview_with_room(
     let summary =
         command_output_summary::summarize(&streams, duration_ms, &base, collapsed.is_some());
     if summary.is_empty() {
-        return base;
+        return Some(base);
     }
     let available = MODEL_TOOL_OUTPUT_BYTES
         .saturating_sub(base.len())
@@ -681,7 +717,15 @@ fn command_preview_with_room(
         format!("\n\n{summary}")
     };
     if appendix.len() > available && root.is_some() && reserved == 0 {
-        return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
+        return command_preview_inner(
+            name,
+            raw,
+            root,
+            metadata,
+            enabled,
+            DIGEST_BUDGET,
+            only_collapsed,
+        );
     }
     if appendix.len() <= available {
         if json_result {
@@ -693,7 +737,7 @@ fn command_preview_with_room(
             base.push_str(&appendix);
         }
     }
-    base
+    Some(base)
 }
 
 /// A stored managed result can include status text, labels and the shell's
