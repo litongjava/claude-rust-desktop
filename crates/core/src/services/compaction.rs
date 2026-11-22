@@ -283,14 +283,14 @@ pub(crate) fn project_entry(entry: &mut Value, root: &std::path::Path, session: 
         if let Some(view) = message["content"]
             .as_str()
             .filter(|s| monitor_notification(s))
-            .and_then(|s| project_for_model("Monitor", s, root, session))
+            .and_then(|s| project_for_model("Monitor", s, Some(root), session))
         {
             message["content"] = Value::String(view);
         }
     }
     for call in entry["tools"].as_array_mut().into_iter().flatten() {
         if let (Some(name), Some(raw)) = (call["name"].as_str(), call["output"].as_str()) {
-            if let Some(view) = project_for_model(name, raw, root, session) {
+            if let Some(view) = project_for_model(name, raw, Some(root), session) {
                 call["output"] = Value::String(view);
             }
         }

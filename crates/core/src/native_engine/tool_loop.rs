@@ -2796,14 +2796,12 @@ impl ToolLoopExecutor {
     ) -> String {
         let root = self.search_config_path.as_deref().and_then(|p| p.parent());
         let preview = self.ordinary_tool_preview(tool_name, output, id, root);
-        root.and_then(|root| {
-            project_for_model(
-                tool_name,
-                &preview,
-                root,
-                self.conv_id.as_deref().unwrap_or_default(),
-            )
-        })
+        project_for_model(
+            tool_name,
+            &preview,
+            root,
+            self.conv_id.as_deref().unwrap_or_default(),
+        )
         .unwrap_or(preview)
     }
 

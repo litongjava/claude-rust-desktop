@@ -12,7 +12,7 @@ pub(crate) fn monitor_notification(text: &str) -> bool {
 pub(crate) fn project_for_model(
     name: &str,
     text: &str,
-    root: &Path,
+    root: Option<&Path>,
     session: &str,
 ) -> Option<String> {
     if !matches!(
@@ -25,10 +25,16 @@ pub(crate) fn project_for_model(
     if runs.is_empty() {
         return None;
     }
-    let directory = root
-        .join("tool-outputs")
-        .join(format!("{:x}", Sha256::digest(session)));
-    let path = match save_output_in(&directory, text.as_bytes()) {
+    let saved = root
+        .map(Path::to_path_buf)
+        .map_or_else(crate::runtime::resolve_default_data_dir, Ok)
+        .and_then(|root| {
+            let directory = std::path::absolute(root)?
+                .join("tool-outputs")
+                .join(format!("{:x}", Sha256::digest(session)));
+            Ok(save_output_in(&directory, text.as_bytes())?)
+        });
+    let path = match saved {
         Ok(path) => path,
         Err(error) => {
             tracing::warn!(%error, "Could not save model output");
@@ -37,6 +43,10 @@ pub(crate) fn project_for_model(
             ));
         }
     };
+    let saved_preview = text.lines().any(|line| {
+        line.starts_with("Saved tool result (")
+            && line.contains(" bytes, may already be truncated by the tool): ")
+    });
     let mut view = String::new();
     let mut previous = 0;
     let mut line = 1;
@@ -54,7 +64,7 @@ pub(crate) fn project_for_model(
             line
         )
         .unwrap();
-        if adjacent_cut(&text[..run.range.start], &text[run.range.end..]) {
+        if saved_preview && adjacent_cut(&text[..run.range.start], &text[run.range.end..]) {
             view.push_str(" (partial at output cut)");
         }
         bytes += run.range.len();
@@ -97,22 +107,28 @@ mod tests {
         for name in ["Bash", "TaskGet", "TaskOutput", "Monitor"] {
             for (prefix, size) in [("", 1024), ("data:text/plain;base64,", 256)] {
                 let full = format!("{prefix}{}", "Q".repeat(size));
-                assert!(
-                    project_for_model(name, &full[..full.len() - 1], temp.path(), "session")
-                        .is_none()
-                );
-                let projected = project_for_model(name, &full, temp.path(), "session").unwrap();
+                assert!(project_for_model(
+                    name,
+                    &full[..full.len() - 1],
+                    Some(temp.path()),
+                    "session"
+                )
+                .is_none());
+                let projected =
+                    project_for_model(name, &full, Some(temp.path()), "session").unwrap();
                 assert!(projected.contains("base64: 1 block collapsed"));
                 let blocked = temp.path().join("file");
                 std::fs::write(&blocked, "ordinary file").unwrap();
-                let failure = project_for_model(name, &full, &blocked, "session").unwrap();
+                let failure = project_for_model(name, &full, Some(&blocked), "session").unwrap();
                 assert!(failure.contains("unable to save"));
                 assert!(!failure.contains("full text:"));
                 assert!(!failure.contains(&full));
             }
         }
         for name in ["Read", "Edit"] {
-            assert!(project_for_model(name, &"Q".repeat(1024), temp.path(), "session").is_none());
+            assert!(
+                project_for_model(name, &"Q".repeat(1024), Some(temp.path()), "session").is_none()
+            );
         }
         let bash = crate::tools::get_tool_definitions()
             .into_iter()

@@ -233,7 +233,12 @@ pub(crate) fn search(
             .then_some("Monitor")
         });
         let view = name.and_then(|name| {
-            crate::native_engine::tool_loop::project_for_model(name, &source.text, root, session)
+            crate::native_engine::tool_loop::project_for_model(
+                name,
+                &source.text,
+                Some(root),
+                session,
+            )
         });
         projected.push(view.is_some());
         if let Some(text) = view {

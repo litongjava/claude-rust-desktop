@@ -27,9 +27,7 @@ impl super::ToolLoopExecutor {
     }
 
     pub(super) fn project_notification(&self, content: &mut Value) {
-        let Some(root) = self.search_config_path.as_deref().and_then(Path::parent) else {
-            return;
-        };
+        let root = self.search_config_path.as_deref().and_then(Path::parent);
         let Some(text) = content.as_str().filter(|s| super::monitor_notification(s)) else {
             return;
         };
