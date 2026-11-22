@@ -97,7 +97,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 type Fault = dyn Fn(Phase) -> Result<()> + Send + Sync;
 struct Root {

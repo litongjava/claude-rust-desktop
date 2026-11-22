@@ -622,6 +622,7 @@ impl SessionDb {
             _lease: lease,
             _consumer: consumer,
             live_handoffs: Default::default(),
+            deferred_steer: false,
         })
     }
 
@@ -684,6 +685,7 @@ pub struct DeliveryOwner {
     _lease: std::sync::Arc<ExecutionLease>,
     _consumer: ExecutionLease,
     live_handoffs: std::collections::HashMap<String,String>,
+    deferred_steer: bool,
 }
 #[derive(Debug, PartialEq)]
 pub struct Handoff {
@@ -963,12 +965,19 @@ impl DeliveryOwner {
         }
         Ok(None)
     }
+    pub(crate) fn has_deferred_steer(&self) -> bool {
+        self.deferred_steer
+    }
+
     /// A batch contains at most eight items. Peers share a discovery deadline,
     /// while live queue entries each get a bounded wait at the next writer.
     /// An ack-only retry injects content only if this same live owner committed it.
     pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
         use crate::db::message_repo;
         let until = std::time::Instant::now() + TURN_POLL_WAIT;
+        if !peers {
+            self.deferred_steer = false;
+        }
         let mut remaining = 128 * 1024;
         let mut inputs = Vec::new();
         for _ in 0..limit.min(8) {
@@ -984,12 +993,17 @@ impl DeliveryOwner {
                 Ok(Some(value)) => value,
                 Ok(None) => break,
                 Err(error) if crate::db::is_contention(&error) => {
+                    if !peers {
+                        self.deferred_steer = true;
+                    }
                     tracing::debug!(session=%self.session.id, %error, "Deferred turn delivery");
                     break;
                 }
                 Err(error) => return Err(error),
             };
-            let Some(origin) = self.live_handoffs.remove(&handoff.id) else { continue; };
+            let Some(origin) = self.live_handoffs.get(&handoff.id).cloned() else {
+                continue;
+            };
             let input = self.session.connection_under_lock(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 |c| {
@@ -1012,6 +1026,7 @@ impl DeliveryOwner {
                     }))
                 },
             )?;
+            self.live_handoffs.remove(&handoff.id);
             if let Some(input) = input {
                 remaining = remaining.saturating_sub(input.text.len());
                 inputs.push(input);
@@ -1136,6 +1151,21 @@ impl DeliveryOwner {
             }
             true
         };
+        if !fresh && !live && claim.steer && claim.target.is_none() && claim.sender.is_none() {
+            s.write_locked_with_deadline(
+                "recover interrupted steer",
+                write_wait(until, false),
+                |tx| {
+                    tx.0.execute(
+                        "INSERT OR IGNORE INTO delivery_generations(delivery_id)
+                    SELECT ?1 WHERE EXISTS(SELECT 1 FROM messages WHERE id=?1)
+                    AND NOT EXISTS(SELECT 1 FROM execution_turns WHERE status='running')",
+                        [&claim.id],
+                    )?;
+                    Ok(())
+                },
+            )?;
+        }
         // Routine writes use NORMAL. Before making the cross-file handoff
         // durable in G, flush the committed receipt (also on ack-only replay).
         // A pinned reader can postpone the checkpoint; the G claim stays live.
@@ -1225,6 +1255,51 @@ mod turn_delivery_tests {
         assert!(owner.poll_turn(false, 8)?.is_empty());
         assert_eq!(session.read(|r| r.messages())?.len(), 1);
         assert!(owner.begin_generation()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stranded_steer_schedules_one_generation_after_owner_failure() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fail_once = AtomicBool::new(true);
+        let stores = Stores::open(root.path())?.with_fault_hook(move |phase| {
+            if phase == Phase::DeliveryCommitted && fail_once.swap(false, Ordering::SeqCst) {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )
+                .into());
+            }
+            Ok(())
+        });
+        let session = stores.create("interrupted-consumer", Default::default())?;
+        let mut owner = session.delivery_owner()?;
+        let turn = session.write(|w| w.start_turn())?;
+        session.enqueue(
+            "req",
+            &serde_json::json!("update"),
+            QueueMode::Steer,
+            input_queue::QueueOrigin::User,
+        )?;
+        let deadline = std::time::Instant::now() + super::super::WRITE_DEADLINE;
+        while owner.live_handoffs.is_empty() {
+            assert!(owner.poll_turn(false, 8)?.is_empty());
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "receipt never committed"
+            );
+        }
+        drop(owner);
+        session.write(|w| w.finish_turn(&turn, crate::db::turn_repo::TurnStatus::Failed, 0))?;
+        let mut recovery = session.delivery_owner()?;
+        let handoff = recovery.next_queue(QueueMode::Steer, None)?.unwrap();
+        let (delivery, next) = recovery
+            .begin_generation()?
+            .expect("stranded steer needs a generation");
+        assert_eq!(delivery, handoff.id);
+        session.write(|w| w.finish_turn(&next, crate::db::turn_repo::TurnStatus::Completed, 1))?;
+        assert!(recovery.begin_generation()?.is_none());
+        assert_eq!(session.read(|r| r.messages())?.len(), 1);
         Ok(())
     }
 }

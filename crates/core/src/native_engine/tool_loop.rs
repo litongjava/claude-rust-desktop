@@ -3778,28 +3778,53 @@ impl ToolLoopExecutor {
     async fn deliver_queued_inputs(
         &mut self,
         after_tool_results: bool,
-    ) -> Vec<crate::services::input_queue::DeliveredInput> {
+    ) -> Result<Vec<crate::services::input_queue::DeliveredInput>> {
         if !after_tool_results {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(owner) = self.turn_delivery.upgrade() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let inputs = owner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .poll_turn(false, 8)
-            .unwrap_or_else(|error| {
-                tracing::warn!("Steer handoff retained for recovery: {error:#}");
-                Vec::new()
-            });
+            .poll_turn(false, 8)?;
         for input in &inputs {
             let _ = self
                 .event_tx
                 .send(EngineEvent::QueuedInput(input.clone()))
                 .await;
         }
-        inputs
+        Ok(inputs)
+    }
+
+    /// A tool poll may have committed a steer just before its WAL flush or
+    /// directory acknowledgement timed out. The same owner finishes that handoff.
+    async fn finish_deferred_steers(&mut self, can_continue: bool) -> Result<Vec<Value>> {
+        let Some(owner) = self.turn_delivery.upgrade() else {
+            return Ok(Vec::new());
+        };
+        let deadline = tokio::time::Instant::now() + crate::db::session_store::WRITE_DEADLINE;
+        while owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_deferred_steer()
+        {
+            anyhow::ensure!(
+                can_continue,
+                "Cannot deliver an admitted steer within the iteration limit"
+            );
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out delivering an admitted steer"
+            );
+            let inputs = self.deliver_queued_inputs(true).await?;
+            if !inputs.is_empty() {
+                return self.render_delivered_inputs(&inputs);
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(Vec::new())
     }
 
     fn render_delivered_inputs(
@@ -5375,7 +5400,7 @@ impl ToolLoopExecutor {
             self.resume_pending_owned_children().await;
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
-                .await;
+                .await?;
             let queued = self.render_delivered_inputs(&queued)?;
             for content in self
                 .drain_approval_notes()
@@ -6008,14 +6033,13 @@ impl ToolLoopExecutor {
                     self.publish_context_reset(boundary_id).await?;
                 }
             } else {
-                let incoming = if self
+                let can_continue = self
                     .max_tool_iterations
-                    .is_none_or(|limit| iteration + 1 < limit)
-                {
-                    self.drain_peer_messages()?
-                } else {
-                    Vec::new()
-                };
+                    .is_none_or(|limit| iteration + 1 < limit);
+                let mut incoming = self.finish_deferred_steers(can_continue).await?;
+                if can_continue {
+                    incoming.extend(self.drain_peer_messages()?.into_iter().map(Value::String));
+                }
                 if !incoming.is_empty() {
                     conversation_messages.push(AnthropicMessage {
                         role: "assistant".into(),
@@ -6024,7 +6048,7 @@ impl ToolLoopExecutor {
                     for content in incoming {
                         conversation_messages.push(AnthropicMessage {
                             role: "user".into(),
-                            content: AnthropicContent::Text(content),
+                            content: multimodal::anthropic_content(&content)?,
                         });
                     }
                     continue;
@@ -6052,6 +6076,7 @@ impl ToolLoopExecutor {
                 .max_tool_iterations
                 .is_some_and(|limit| iteration + 1 >= limit)
             {
+                self.finish_deferred_steers(false).await?;
                 stop_reason = Some("max_iterations".to_string());
                 let _ = self
                     .event_tx
@@ -6135,7 +6160,7 @@ impl ToolLoopExecutor {
             self.resume_pending_owned_children().await;
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
-                .await;
+                .await?;
             let queued = self.render_delivered_inputs(&queued)?;
             for content in self
                 .drain_approval_notes()
@@ -6962,14 +6987,13 @@ impl ToolLoopExecutor {
                     self.publish_context_reset(boundary_id).await?;
                 }
             } else {
-                let incoming = if self
+                let can_continue = self
                     .max_tool_iterations
-                    .is_none_or(|limit| iteration + 1 < limit)
-                {
-                    self.drain_peer_messages()?
-                } else {
-                    Vec::new()
-                };
+                    .is_none_or(|limit| iteration + 1 < limit);
+                let mut incoming = self.finish_deferred_steers(can_continue).await?;
+                if can_continue {
+                    incoming.extend(self.drain_peer_messages()?.into_iter().map(Value::String));
+                }
                 if !incoming.is_empty() {
                     conversation_messages.push(OpenAIMessage {
                         role: "assistant".into(),
@@ -6982,7 +7006,7 @@ impl ToolLoopExecutor {
                     for content in incoming {
                         conversation_messages.push(OpenAIMessage {
                             role: "user".into(),
-                            content: OpenAIContent::Text(content),
+                            content: multimodal::openai_content(&content)?,
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,
@@ -7022,6 +7046,7 @@ impl ToolLoopExecutor {
                 .max_tool_iterations
                 .is_some_and(|limit| iteration + 1 >= limit)
             {
+                self.finish_deferred_steers(false).await?;
                 stop_reason = Some("max_iterations".to_string());
                 let _ = self
                     .event_tx

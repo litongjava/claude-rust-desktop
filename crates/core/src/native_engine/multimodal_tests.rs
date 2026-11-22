@@ -222,15 +222,19 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
     engine.turn_delivery = Arc::downgrade(&owner);
     engine.goal_db = Some(store.db.clone());
     engine.conv_id = Some(id.clone());
-    assert!(engine.deliver_queued_inputs(false).await.is_empty());
+    assert!(engine
+        .deliver_queued_inputs(false)
+        .await
+        .unwrap()
+        .is_empty());
     input_queue::set_paused(&store.db, &id, true).unwrap();
-    assert!(engine.deliver_queued_inputs(true).await.is_empty());
+    assert!(engine.deliver_queued_inputs(true).await.unwrap().is_empty());
     input_queue::set_paused(&store.db, &id, false).unwrap();
-    let delivered = engine.deliver_queued_inputs(true).await;
+    let delivered = engine.deliver_queued_inputs(true).await.unwrap();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].content, json!("now"));
     assert_eq!(delivered[0].origin, format!("queue-input-{}", steer.id));
-    assert!(engine.deliver_queued_inputs(true).await.is_empty());
+    assert!(engine.deliver_queued_inputs(true).await.unwrap().is_empty());
     let rows = input_queue::list(&store.db, &id).unwrap();
     assert_eq!(
         rows.iter().find(|row| row.id == next.id).unwrap().state,
@@ -302,10 +306,14 @@ async fn queued_images_replay_after_file_removal_without_becoming_approval_notes
     engine.goal_db = Some(store.db.clone());
     engine.conv_id = Some(id.clone());
     engine.search_config_path = Some(temp.path().join("config.json"));
-    assert!(engine.deliver_queued_inputs(false).await.is_empty());
-    let inputs = engine.deliver_queued_inputs(true).await;
+    assert!(engine
+        .deliver_queued_inputs(false)
+        .await
+        .unwrap()
+        .is_empty());
+    let inputs = engine.deliver_queued_inputs(true).await.unwrap();
     assert_eq!(inputs.len(), 2);
-    assert!(engine.deliver_queued_inputs(true).await.is_empty());
+    assert!(engine.deliver_queued_inputs(true).await.unwrap().is_empty());
     match events.recv().await.unwrap() {
         EngineEvent::QueuedInput(input) => assert_eq!(input, inputs[0]),
         event => panic!("Unexpected event: {event:?}"),
