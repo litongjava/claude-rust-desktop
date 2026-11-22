@@ -1,8 +1,7 @@
 //! A single-use copy of the last wire request of one main turn. Nothing from
 //! the follow-up passes through the tool loop, turn accounting or transcript.
 use super::{
-    anthropic_client::AnthropicClient, openai_client::OpenAIClient,
-    provider_manager::ResolvedProvider, provider_runtime, request_identity::TurnIdentity,
+    followup::WireRequest, provider_manager::ResolvedProvider, request_identity::TurnIdentity,
     request_options::RequestOptions, request_trace::RequestTrace,
 };
 use crate::session_files::suggestion::SuggestionGuard;
@@ -24,8 +23,7 @@ pub struct SuggestionCapture(Arc<Mutex<CaptureState>>);
 
 #[derive(Default)]
 struct CaptureState {
-    body: Option<(String, Value)>,
-    builtin_vision: Option<bool>,
+    body: Option<WireRequest>,
     automatic_cache: bool,
     completed: Option<CompletedRequest>,
 }
@@ -46,9 +44,12 @@ impl SuggestionCapture {
         model: &str,
     ) {
         *self.0.lock().unwrap() = CaptureState {
-            body: Some((protocol.to_owned(), body.clone())),
+            body: Some(WireRequest {
+                api: protocol.to_owned(),
+                body: body.clone(),
+                builtin_vision,
+            }),
             automatic_cache: automatic_cache(url, model),
-            builtin_vision,
             completed: None,
         };
     }
@@ -75,7 +76,7 @@ impl SuggestionCapture {
     pub async fn generate(self, guard: Arc<SuggestionGuard>) -> Result<Option<String>> {
         let capture = std::mem::take(&mut *self.0.lock().unwrap());
         let (
-            Some((api, mut body)),
+            Some(mut request),
             Some(CompletedRequest {
                 provider,
                 mut options,
@@ -89,35 +90,11 @@ impl SuggestionCapture {
             return Ok(None);
         }
         options.suggestion_guard = Some((guard.clone(), finished + TTL));
-        append_instruction(&api, &mut body)?;
+        request.append_instruction(INSTRUCTION)?;
         let identity = TurnIdentity::new(options.session_id.clone(), None);
         let operation = async {
-            let budget = crate::performance::AttemptBudget::single_attempt();
-            let direct_anthropic = capture.builtin_vision.is_none() && api == "anthropic-messages";
-            let (mut stream, _) = if let Some(vision) = capture.builtin_vision {
-                provider_runtime::stream_body(
-                    &provider,
-                    body,
-                    "user",
-                    vision,
-                    0,
-                    None,
-                    &options,
-                    super::model_http::single_post_client()?,
-                    budget,
-                )
-                .await?
-            } else if direct_anthropic {
-                AnthropicClient::new()
-                    .with_request_options(options)
-                    .stream_body(&provider, body, 0, None)
-                    .await?
-            } else {
-                OpenAIClient::new()
-                    .with_request_options(options)
-                    .stream_body(&provider, body, 0, None, budget)
-                    .await?
-            };
+            let direct_anthropic = request.direct_anthropic();
+            let mut stream = request.stream(&provider, options).await?;
             let mut response = String::new();
             while let Some(chunk) = stream.next().await {
                 response.push_str(&chunk?);
@@ -173,32 +150,6 @@ impl SuggestionCapture {
             result = identity.scope(tokio::time::timeout(Duration::from_secs(15), operation)) => result?,
         }
     }
-}
-
-fn append_instruction(api: &str, body: &mut Value) -> Result<()> {
-    let (key, message) = match api {
-        "openai-completions" | "anthropic-messages" => {
-            ("messages", json!({"role":"user","content":INSTRUCTION}))
-        }
-        "openai-responses" => (
-            "input",
-            json!({"role":"user","content":[{"type":"input_text","text":INSTRUCTION}]}),
-        ),
-        "google-generative-ai" => (
-            "contents",
-            json!({"role":"user","parts":[{"text":INSTRUCTION}]}),
-        ),
-        "bedrock-converse-stream" => (
-            "messages",
-            json!({"role":"user","content":[{"text":INSTRUCTION}]}),
-        ),
-        _ => anyhow::bail!("Unknown suggestion protocol {api}"),
-    };
-    body[key]
-        .as_array_mut()
-        .context("Missing wire message list")?
-        .push(message);
-    Ok(())
 }
 
 // Groq documents automatic prompt caching only for these model families.
@@ -482,9 +433,17 @@ mod tests {
             ("google-generative-ai", "contents"),
             ("bedrock-converse-stream", "messages"),
         ] {
-            let original = json!({key:[{"role":"user","content":"first"}],"tools":[{"name":"z"},{"name":"a"}]});
-            let mut body = original.clone();
-            append_instruction(api, &mut body).unwrap();
+            let mut original = json!({key:[{"role":"user","content":"first"}],"tools":[{"name":"z"},{"name":"a"}]});
+            if api.starts_with("openai") {
+                original["tool_choice"] = json!("required");
+            }
+            let mut request = WireRequest {
+                api: api.into(),
+                body: original.clone(),
+                builtin_vision: None,
+            };
+            request.append_instruction(INSTRUCTION).unwrap();
+            let mut body = request.body;
             let added = body[key].as_array_mut().unwrap().pop().unwrap();
             assert_eq!(added["role"], "user");
             assert!(added.to_string().contains(INSTRUCTION));
