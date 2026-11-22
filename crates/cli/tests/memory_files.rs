@@ -289,7 +289,10 @@ async fn scenario(protocol: &'static str, plan: bool) {
     }));
     std::fs::write(
         memory.directory.join("MEMORY.md"),
-        "manual-index-edit-on-resume\n",
+        format!(
+            "manual-index-edit-on-resume\n{}hidden-tail",
+            "x".repeat(8 * 1024 * 1024)
+        ),
     )
     .unwrap();
     let id = context.db.latest_code(&workspace).unwrap().unwrap().id;
@@ -341,6 +344,8 @@ async fn scenario(protocol: &'static str, plan: bool) {
         text.contains("MEMORY.md changed") && text.contains("manual-index-edit-on-resume"),
         "{text}"
     );
+    assert!(text.contains("[MEMORY.md truncated]"));
+    assert!(!text.contains("hidden-tail"));
     assert!(text.contains("Relevant project memory files:"));
     drop(requests);
     assert_eq!(legacy.stats().await.unwrap().total_memories, 1);
