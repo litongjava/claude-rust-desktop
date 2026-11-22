@@ -737,10 +737,18 @@ impl SessionRead<'_> {
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
+        self.prompt_history(format, false)
+    }
+
+    pub(crate) fn prompt_history(
+        &self,
+        format: &crate::native_engine::provider_manager::ApiFormat,
+        identify: bool,
+    ) -> Result<(Vec<Value>, Option<String>)> {
         let id: String = self
             .0
             .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
-        crate::runtime::replay_history(self.0, &id, format, |message| {
+        crate::runtime::replay_history_with_ids(self.0, &id, format, |message| {
             let raw: Option<String> = self
                 .0
                 .query_row(
@@ -751,7 +759,7 @@ impl SessionRead<'_> {
                 .optional()?;
             raw.map(|v| serde_json::from_str(&v).map_err(Into::into))
                 .transpose()
-        })
+        }, identify)
     }
 }
 impl SessionWrite<'_> {

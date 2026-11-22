@@ -116,10 +116,16 @@ fn is_recall_block(block: &str) -> bool {
 pub fn resolve(entries: &[Entry], messages: &[Value]) -> Vec<Vec<String>> {
     locate(messages)
         .into_iter()
-        .map(|slot| match slot {
+        .zip(messages)
+        .map(|(slot, message)| match slot {
             Some((key, occurrence)) => entries
                 .iter()
-                .filter(|entry| entry.key == key && entry.occurrence == occurrence)
+                .filter(|entry| {
+                    if let Some(id) = entry.key.strip_prefix("message:") {
+                        return message["id"].as_str() == Some(id);
+                    }
+                    entry.key == key && entry.occurrence == occurrence
+                })
                 .flat_map(|entry| entry.blocks.iter().cloned())
                 .filter(|block| !is_recall_block(block))
                 .collect(),

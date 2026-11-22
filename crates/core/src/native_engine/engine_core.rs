@@ -1240,6 +1240,7 @@ impl QueryEngine {
         let recall_budget = (window / 10)
             .min((window * 85 / 100).saturating_sub(used))
             .min(4096);
+        let memory_format = hook_provider.provider.api_format.clone();
         let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(
             &plugin_context,
             &workspace,
@@ -1354,13 +1355,19 @@ impl QueryEngine {
             memory_messages[0]["id"] = serde_json::json!(boundary_id);
             memory_messages[0]["origin"] = serde_json::json!("compaction");
         }
-        let (file_memory, project_memory, memory_turns) =
+        let turn_id = request.assistant_message_id.clone();
+        let (file_memory, project_memory, memory_turns, identified_messages) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 use crate::services::memory_files::{self, FileMemory};
                 let memory = memory_files::config(&memory_context)?
                     .enabled
                     .then(|| FileMemory::session(&memory_context, memory_session.id()))
                     .transpose()?;
+                memory_files::prompt::identify(&memory_session, &memory_format, &mut memory_messages)?;
+                if let Some(last) = memory_messages.last_mut().filter(|m| m["role"] == "user" && m["id"].is_null()) {
+                    // An embedding can submit a turn before writing its user row.
+                    last["id"] = serde_json::json!(turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+                }
                 let (index, turns) = memory_files::prompt::prepare(
                     &memory_session,
                     memory.as_ref(),
@@ -1369,9 +1376,10 @@ impl QueryEngine {
                     read_only,
                     recall_budget,
                 )?;
-                Ok((memory, index, turns))
+                Ok((memory, index, turns, memory_messages))
             })
             .await??;
+        request.messages = identified_messages;
         turn_context.extend(memory_turns);
         let context_reminders = crate::prompt::first_message_reminders(
             crate::prompt::SessionReminders {

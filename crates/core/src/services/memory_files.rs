@@ -833,9 +833,37 @@ mod tests {
     }
 
     #[test]
+    fn memory_receipts_follow_message_ids_after_compaction_and_rewind() {
+        let (_root, memory) = fixture();
+        let shard = memory.session.as_ref().unwrap();
+        let prepare = |boundary, id| {
+            prompt::prepare(shard, Some(&memory), &[
+            json!({"role":"user","content":"same summary","origin":"compaction","id":boundary}),
+            json!({"role":"user","content":"preferences","id":id}),
+        ], true, false, 4096).unwrap()
+        };
+        memory.put("note.md", &note("old fact"), None).unwrap();
+        prepare("b1", "u1");
+        std::fs::write(memory.directory.join("note.md"), note("new fact")).unwrap();
+        std::fs::write(memory.directory.join("MEMORY.md"), "edited index").unwrap();
+        let (prefix, entries) = prepare("b2", "u2");
+        assert!(entries[0].blocks.iter().any(|b| b.contains("new fact")));
+        assert!(prefix.unwrap().contains("edited index"));
+        std::fs::write(memory.directory.join("MEMORY.md"), "after rewind").unwrap();
+        let (_, removed) = prepare("b2", "removed");
+        assert!(removed[0].blocks.iter().any(|b| b.contains("after rewind")));
+        let (_, replacement) = prepare("b2", "replacement");
+        assert!(replacement[0]
+            .blocks
+            .iter()
+            .any(|b| b.contains("after rewind")));
+        assert_eq!(replacement, prepare("b2", "replacement").1);
+    }
+
+    #[test]
     fn file_memory_zero_hit_receipts_survive_restart_without_user_text() {
         let (_root, memory) = fixture();
-        let first = json!({"role":"user","content":"preferences"});
+        let first = json!({"role":"user","content":"preferences","id":"first"});
         let shard = memory.session.as_ref().unwrap();
         let (_, turns) =
             prompt::prepare(shard, Some(&memory), &[first.clone()], true, false, 4096).unwrap();
@@ -857,10 +885,10 @@ mod tests {
         let (_, turns) = prepare(&[
             first.clone(),
             json!({"role":"assistant","content":"ok"}),
-            first,
+            json!({"role":"user","content":"preferences","id":"second"}),
         ]);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].occurrence, 1);
+        assert_eq!(turns[0].key, "message:second");
         assert!(turns[0].blocks.iter().any(|b| b.contains("new body")));
         assert!(!memory.context.paths.data_dir.join("turn-context").exists());
     }
@@ -882,12 +910,12 @@ mod tests {
         let prepare = |messages: &[Value], allow| {
             prompt::prepare(shard, Some(&memory), messages, allow, false, 4096).unwrap()
         };
-        let typed = json!({"role":"user","content":"preferences"});
+        let typed = json!({"role":"user","content":"preferences","id":"first"});
         let (index, entries) = prepare(&[typed.clone()], true);
         assert!(index.unwrap().contains("note-6.md"));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blocks[0].matches("body-marker-").count(), 5);
-        let peer = json!({"role":"user","origin":"peer","content":"preferences"});
+        let peer = json!({"role":"user","origin":"peer","content":"preferences","id":"first"});
         assert!(prepare(&[peer], true).1.is_empty());
         let mut history = vec![typed, json!({"role":"assistant","content":"done"})];
         std::fs::write(memory.directory.join("MEMORY.md"), "new index").unwrap();
@@ -903,7 +931,7 @@ mod tests {
             ),
             (
                 true,
-                json!({"role":"user","origin":"peer","content":"preferences"}),
+                json!({"role":"user","origin":"peer","content":"preferences","id":"first"}),
             ),
             (
                 false,
@@ -915,7 +943,7 @@ mod tests {
             assert!(!index.unwrap().contains("new index"));
             assert_eq!(turns, entries);
         }
-        history.push(json!({"role":"user","content":"next preferences"}));
+        history.push(json!({"role":"user","content":"next preferences","id":"next"}));
         let (_, turns) = prepare(&history, true);
         assert!(turns.last().unwrap().blocks[0].contains("new index"));
         assert_eq!(prepare(&history, true).1, turns);

@@ -211,6 +211,16 @@ pub(crate) fn replay_history(
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
+    replay_history_with_ids(conn, id, format, native, false)
+}
+
+pub(crate) fn replay_history_with_ids(
+    conn: &rusqlite::Connection,
+    id: &str,
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+    identify: bool,
+) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
     let messages = message_repo::get_messages_by_conversation(conn, id)?;
     let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
@@ -260,8 +270,14 @@ pub(crate) fn replay_history(
         }
         use rusqlite::OptionalExtension;
         let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
+        let row_at = history.len();
         if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
         else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
+        if identify && message.role == "user" {
+            if let Some(row) = history.get_mut(row_at) {
+                row["id"] = json!(message.id);
+            }
+        }
     }
     crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
     Ok((history, boundary))

@@ -3,7 +3,7 @@
 //! replay the original turn even when another process has edited the files.
 use super::{xml, FileMemory};
 use crate::db::session_store::{settings::Setting, SessionDb};
-use crate::services::turn_context::{self, Entry};
+use crate::services::turn_context::Entry;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +12,8 @@ use std::borrow::Cow;
 #[derive(Serialize, Deserialize)]
 struct IndexState {
     first: Option<String>,
-    last_hash: Option<String>,
+    #[serde(default)]
+    first_hash: Option<String>,
 }
 
 const INDEX: Setting<IndexState> = Setting::new("memory.prompt.index");
@@ -121,11 +122,60 @@ impl FileMemory {
     }
 }
 
-fn receipt(boundary: Option<&str>, key: &str, occurrence: usize) -> Setting<Vec<String>> {
-    Setting::memory_receipt(format!(
-        "prompt.turn.{}.{key}.{occurrence}",
-        boundary.unwrap_or("start")
-    ))
+#[derive(Serialize, Deserialize)]
+struct Receipt {
+    index_hash: Option<String>,
+    blocks: Vec<String>,
+}
+
+fn receipt(id: &str) -> Setting<Receipt> {
+    Setting::memory_receipt(format!("prompt.message.{id}"))
+}
+
+fn attachment(id: &str, blocks: Vec<String>) -> Entry {
+    Entry {
+        key: format!("message:{id}"),
+        occurrence: 0,
+        blocks,
+        skill: None,
+    }
+}
+
+/// Hosts can send a display transcript with no database IDs. Pair its user
+/// frames with the admitted transcript in reverse delivery order. Protocol
+/// events without a user row (e.g. tool results) never acquire a receipt.
+pub(crate) fn identify(
+    shard: &SessionDb,
+    format: &crate::native_engine::provider_manager::ApiFormat,
+    messages: &mut [Value],
+) -> Result<()> {
+    shard.read(|r| {
+        let (history, _) = r.prompt_history(format, true)?;
+        let mut saved = history
+            .iter()
+            .rev()
+            .filter(|m| m["role"] == "user")
+            .peekable();
+        for message in messages.iter_mut().rev().filter(|m| m["role"] == "user") {
+            if message["origin"] == "compaction" {
+                continue;
+            }
+            while let Some(row) = saved.peek() {
+                if row["content"] == message["content"] {
+                    if let Some(id) = row["id"].as_str() {
+                        message["id"] = id.into();
+                    }
+                    saved.next();
+                    break;
+                }
+                if row["id"].is_string() {
+                    break;
+                }
+                saved.next();
+            }
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn prepare(
@@ -136,11 +186,9 @@ pub(crate) fn prepare(
     read_only: bool,
     recall_budget: usize,
 ) -> Result<(Option<String>, Vec<Entry>)> {
-    let slots = turn_context::locate(messages);
-    if !slots.iter().any(Option::is_some) {
+    if !messages.iter().any(|m| m["role"] == "user") {
         return Ok(Default::default());
     }
-    // Compaction restarts occurrence counts in the remaining transcript.
     let boundary = messages
         .first()
         .filter(|m| m["origin"] == "compaction")
@@ -149,35 +197,35 @@ pub(crate) fn prepare(
         Some(id) => Setting::memory_receipt(format!("prompt.index.boundary.{id}")),
         None => INDEX,
     };
-    let target = slots.last().and_then(Option::as_ref);
-    let (state, mut entries, recorded) = shard.read(|r| {
+    let target = messages
+        .last()
+        .and_then(|m| Some((m["id"].as_str()?, typed_query(m)?)));
+    // Only receipts still visible in this transcript can advance its watermark.
+    // Rewind and compact boundaries can remove the turn that announced an edit.
+    let (state, mut entries, visible_hash, recorded) = shard.read(|r| {
         let mut entries = Vec::new();
+        let mut visible_hash = None;
         let mut recorded = false;
-        for (message, slot) in messages.iter().zip(&slots) {
-            let Some(slot @ (key, occurrence)) = slot else {
+        for message in messages {
+            let Some(id) = message["id"].as_str() else {
                 continue;
             };
-            if let Some(blocks) = r.setting(receipt(boundary, key, *occurrence))? {
-                recorded |= target == Some(slot);
-                // A host can resubmit the same content and occurrence with a
-                // different origin. A receipt belongs only to human input.
-                if !blocks.is_empty() && typed_query(message).is_some() {
-                    entries.push(Entry {
-                        key: key.clone(),
-                        occurrence: *occurrence,
-                        blocks,
-                        skill: None,
-                    });
+            if typed_query(message).is_none() {
+                continue;
+            }
+            if let Some(saved) = r.setting(receipt(id))? {
+                recorded |= target.as_ref().is_some_and(|(target, _)| *target == id);
+                visible_hash = saved.index_hash;
+                if !saved.blocks.is_empty() {
+                    entries.push(attachment(id, saved.blocks));
                 }
             }
         }
-        Ok((r.setting(index_state())?, entries, recorded))
+        Ok((r.setting(index_state())?, entries, visible_hash, recorded))
     })?;
-    let query = allow_new
-        .then(|| messages.last().and_then(typed_query))
-        .flatten();
+    let target = target.filter(|_| allow_new && !recorded);
     if let Some(state) = &state {
-        if recorded || query.is_none() || memory.is_none() {
+        if target.is_none() || memory.is_none() {
             return Ok((state.first.clone(), entries));
         }
     }
@@ -193,26 +241,31 @@ pub(crate) fn prepare(
             snapshot.as_ref().map_or("", |s| s.index_hash.as_str())
         )
     });
-    let recall = match (memory, &snapshot, &query) {
-        (Some(m), Some(snapshot), Some(query)) => m.recall(snapshot, query, recall_budget)?,
+    let recall = match (memory, &snapshot, &target) {
+        (Some(m), Some(snapshot), Some((_, query))) => m.recall(snapshot, query, recall_budget)?,
         _ => None,
     };
-
-    let (first, attachment) = shard.write(|w| {
-        let saved = w.setting(index_state())?;
-        let mut update = saved.is_none();
-        let mut state = saved.unwrap_or_else(|| IndexState {
-            first: current.clone(),
-            last_hash: hash.clone(),
-        });
-        let mut attachment = None;
-        if let Some((key, occurrence)) = target.filter(|_| query.is_some()) {
-            let setting = || receipt(boundary, key, *occurrence);
-            let blocks = match w.setting(setting())? {
-                Some(existing) => existing,
+    let first = shard.write(|w| {
+        let state = match w.setting(index_state())? {
+            Some(state) => state,
+            None => {
+                let state = IndexState {
+                    first: current.clone(),
+                    first_hash: hash.clone(),
+                };
+                w.set_setting(index_state(), &state)?;
+                state
+            }
+        };
+        if let Some((id, _)) = target {
+            let saved = match w.setting(receipt(id))? {
+                Some(saved) => saved,
                 None => {
                     let mut blocks = Vec::new();
-                    if state.last_hash != hash {
+                    let previous = visible_hash.as_ref().or(state.first_hash.as_ref());
+                    let changed = previous
+                        .map_or_else(|| state.first != current, |h| Some(h) != hash.as_ref());
+                    if changed {
                         if let Some(index) = &current {
                             blocks.push(index.replacen(
                                 "<project_memory>",
@@ -220,33 +273,24 @@ pub(crate) fn prepare(
                                 1,
                             ));
                         }
-                        state.last_hash = hash.clone();
-                        update = true;
                     }
                     blocks.extend(
-                        recall
-                            .iter()
-                            .map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
+                        recall.map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
                     );
-                    w.set_setting(setting(), &blocks)?;
-                    blocks
+                    let saved = Receipt {
+                        index_hash: hash,
+                        blocks,
+                    };
+                    w.set_setting(receipt(id), &saved)?;
+                    saved
                 }
             };
-            if !blocks.is_empty() {
-                attachment = Some(Entry {
-                    key: key.clone(),
-                    occurrence: *occurrence,
-                    blocks,
-                    skill: None,
-                });
+            if !saved.blocks.is_empty() {
+                entries.push(attachment(id, saved.blocks));
             }
         }
-        if update {
-            w.set_setting(index_state(), &state)?;
-        }
-        Ok((state.first, attachment))
+        Ok(state.first)
     })?;
-    entries.extend(attachment);
     Ok((first, entries))
 }
 
