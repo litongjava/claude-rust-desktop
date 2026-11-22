@@ -2677,7 +2677,7 @@ async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
         assert_eq!(schema["required"], json!(["names"]));
         assert_eq!(schema["properties"]["names"]["items"]["type"], "string");
         let first = request_tool_names(&requests[0], anthropic);
-        // Exactly the 12 built-in defaults, each once. MCP tools keep their own
+        // Exactly the built-in defaults, each once. MCP tools keep their own
         // loading rules and are not part of the switches.
         let mut core = vec![
             "Bash",
@@ -2692,17 +2692,15 @@ async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
             "EnterPlanMode",
             "ExitPlanMode",
             "TaskStop",
+            "TodoRead",
+            "TodoWrite",
         ];
-        let mut seen: Vec<String> = first
+        let seen: Vec<String> = first
             .iter()
             .filter(|name| !name.starts_with("mcp__") && !matches!(name.as_str(), "ListMcpResources" | "ReadMcpResource"))
             .cloned()
             .collect();
-        for name in &seen {
-            assert!(core.contains(&name.as_str()), "unexpected built-in {name}: {first:?}");
-        }
         core.sort_unstable();
-        seen.sort_unstable();
         assert_eq!(seen, core, "{first:?}");
         let mut unique = first.clone();
         unique.sort_unstable();
@@ -2717,7 +2715,9 @@ async fn sdk_cli_requests_default_core_tools_and_loads_an_on_demand_one() {
             assert!(!first.contains(&name.to_owned()), "retired {name}: {first:?}");
         }
         let second = request_tool_names(&requests[1], anthropic);
-        assert!(second.contains(&"ListDir".to_owned()), "{second:?}");
+        let mut expected = first;
+        expected.push("ListDir".into());
+        assert_eq!(second, expected);
         // The loaded tool really ran on the fixture directory.
         assert!(requests[2].to_string().contains("fixture.txt"));
         drop(requests);

@@ -68,6 +68,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "EnterPlanMode",
     "ExitPlanMode",
     "TaskStop",
+    "TodoRead",
+    "TodoWrite",
 ];
 
 /// Whether the name belongs to the default core set. The list only decides the
@@ -355,6 +357,8 @@ mod tests {
                 "EnterPlanMode",
                 "ExitPlanMode",
                 "TaskStop",
+                "TodoRead",
+                "TodoWrite",
             ]
         );
         for name in CORE_TOOLS {
