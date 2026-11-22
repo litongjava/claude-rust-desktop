@@ -105,19 +105,7 @@ pub(crate) async fn generate_messages_with_options(
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions, session)?;
-    let base = provider_runtime::catalog_base(provider)?;
-    let mut url = reqwest::Url::parse(base).context("Native compaction requires a gateway URL")?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "Invalid native compaction gateway URL"
-    );
-    let root = url.path().trim_end_matches('/');
-    let root = root.strip_suffix("/responses").unwrap_or(root);
-    url.set_path(&format!("{root}/responses/compact"));
+    let (url, headers) = provider_runtime::compact_endpoint(provider)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(15))
@@ -139,14 +127,12 @@ pub(crate) async fn generate_messages_with_options(
             .and_then(|context| context.parent_session_id.as_deref()),
         options.model_request_id.as_deref(),
     );
-    let mut request = client
+    let request = client
         .post(url)
+        .headers(headers)
         .headers(options.headers(provider)?)
         .headers(identity.headers())
         .json(&body);
-    if !provider.provider.api_key.is_empty() {
-        request = request.bearer_auth(&provider.provider.api_key);
-    }
     let mut response = crate::native_engine::request_recording::send(
         request,
         &options,

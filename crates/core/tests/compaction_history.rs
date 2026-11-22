@@ -22,6 +22,7 @@ struct Fixture {
     id: String,
     provider: Provider,
     requests: Arc<Mutex<Vec<Value>>>,
+    routes: Arc<Mutex<Vec<(String, HeaderMap)>>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -37,7 +38,9 @@ impl Fixture {
         let id = store.create(root.path(), "model", "fixture").unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
-        let app = Router::new().fallback(post(move |headers: HeaderMap, Json(body): Json<Value>| {
+        let routes = Arc::new(Mutex::new(Vec::new()));
+        let seen_routes = routes.clone();
+        let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| {
             let compact = headers["x-dcl-request-kind"] == "compaction";
             let stream = body["stream"] == true;
             let responses = body.get("input").is_some();
@@ -45,9 +48,13 @@ impl Fixture {
             let anthropic = headers.contains_key("anthropic-version");
             let structured = body["response_format"]["type"] == "json_schema" || body["messages"].to_string().contains("fixture always answers JSON");
             let text = if structured { r#"{"ok":true}"# } else if compact { "Pending work is recorded." } else { "last answer" };
+            seen_routes.lock().unwrap().push((uri.path().to_owned(),headers));
             seen.lock().unwrap().push(body);
             async move {
                 let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":80}});
+                if uri.path().ends_with("/responses/compact") {
+                    return Json(json!({"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":100,"output_tokens":3}})).into_response();
+                }
                 if bedrock {
                     let frames: Vec<u8> = [("messageStart",json!({"role":"assistant"})),
                         ("contentBlockDelta",json!({"contentBlockIndex":0,"delta":{"text":text}})),
@@ -86,6 +93,7 @@ impl Fixture {
             id,
             provider,
             requests,
+            routes,
             server,
         }
     }
@@ -350,4 +358,53 @@ async fn reasoning_enabled_claude_reuses_the_prefix_on_both_transports() {
         }
         f.finish().await;
     }
+}
+
+#[tokio::test]
+async fn native_compaction_uses_the_main_cloudflare_route_and_authentication() {
+    let mut f = Fixture::new(128_000).await;
+    let vars = [
+        ("CLOUDFLARE_ACCOUNT_ID", "account"),
+        ("CLOUDFLARE_GATEWAY_ID", "gateway"),
+    ];
+    let previous = vars.map(|(name, _)| std::env::var_os(name));
+    for (name, value) in vars {
+        std::env::set_var(name, value);
+    }
+    f.provider.builtin_id = Some("cloudflare-ai-gateway".into());
+    f.provider
+        .base_url
+        .push_str("/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai");
+    f.provider.models[0].id = "gpt-5".into();
+    f.provider.models[0].api = Some("openai-responses".into());
+    f.append("user", "First request");
+    f.append("assistant", "Earlier response");
+    f.append("user", "Continue");
+    f.main_turn(None).await;
+    let result = f.compact().await;
+    for ((name, _), old) in vars.into_iter().zip(previous) {
+        if let Some(value) = old {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+    result.unwrap();
+    {
+        let routes = f.routes.lock().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].0, "/v1/account/gateway/openai/responses");
+        assert_eq!(routes[1].0, format!("{}/compact", routes[0].0));
+        for (_, headers) in routes.iter() {
+            assert_eq!(headers["cf-aig-authorization"], "Bearer fixture");
+            assert!(!headers.contains_key("authorization"));
+        }
+        let requests = f.requests.lock().unwrap();
+        assert!(requests[0]["prompt_cache_key"].is_string());
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            requests[1]["prompt_cache_key"]
+        );
+    }
+    f.finish().await;
 }

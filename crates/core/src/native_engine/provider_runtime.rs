@@ -472,23 +472,15 @@ async fn stream_with_options_client_budget(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn stream_body(
+fn resolve_endpoint(
     provider: &ResolvedProvider,
-    body: Value,
-    initiator: &'static str,
-    vision: bool,
-    max_tokens: u32,
-    context_capture: Option<&super::request_context::ContextCapture>,
-    options: &super::request_options::RequestOptions,
-    client: reqwest::Client,
-    budget: crate::performance::AttemptBudget,
-) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    protocol: &str,
+    api: &str,
+    key: &str,
+) -> Result<(String, String)> {
     let account_state = provider.binding_snapshot();
     let env = |name: &str| super::session_binding::account_var(account_state.as_deref(), name);
     let (entry, model) = metadata(provider)?;
-    let (protocol, api) = resolved_transport(provider)?;
-    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
     let configured = provider.provider.base_url.trim_end_matches('/');
     let region = if protocol == "bedrock-converse-stream" {
         provider
@@ -517,7 +509,7 @@ pub(super) async fn stream_body(
     } else {
         String::new()
     };
-    let base = resolved_base(configured, entry, model);
+    let base = catalog_base(provider)?;
     let base = if protocol == "bedrock-converse-stream"
         && (configured.is_empty() || configured.contains(".amazonaws.com"))
     {
@@ -633,6 +625,108 @@ pub(super) async fn stream_body(
             )
         }
     };
+    Ok((url, region))
+}
+
+fn catalog_headers(
+    entry: &Value,
+    protocol: &str,
+    api: &str,
+    key: &str,
+    initiator: &str,
+    vision: bool,
+) -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    let sensitive = |value: &str| -> Result<HeaderValue> {
+        let mut header = HeaderValue::from_str(value)?;
+        header.set_sensitive(true);
+        Ok(header)
+    };
+    let mut headers = HeaderMap::new();
+    if entry["id"] == "github-copilot" {
+        headers.insert("x-initiator", HeaderValue::from_str(initiator)?);
+        headers.insert(
+            "openai-intent",
+            HeaderValue::from_static("conversation-edits"),
+        );
+        if vision {
+            headers.insert("copilot-vision-request", HeaderValue::from_static("true"));
+        }
+    }
+    if protocol == "openai-codex-responses" {
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_str(&codex_account(key)?)?,
+        );
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static("responses=experimental"),
+        );
+    }
+    if entry["id"] == "cloudflare-ai-gateway" {
+        headers.insert(
+            "cf-aig-authorization",
+            sensitive(&format!("Bearer {key}"))?,
+        );
+    } else if protocol == "azure-openai-responses" {
+        headers.insert("api-key", sensitive(key)?);
+    } else if !key.is_empty() && matches!(api, "openai-completions" | "openai-responses") {
+        headers.insert(
+            AUTHORIZATION,
+            sensitive(&format!("Bearer {key}"))?,
+        );
+    }
+    Ok(headers)
+}
+
+pub(crate) fn compact_endpoint(
+    provider: &ResolvedProvider,
+) -> Result<(reqwest::Url, reqwest::header::HeaderMap)> {
+    let (entry, _) = metadata(provider)?;
+    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
+    // Explicit native callers can select Responses for a model whose ordinary
+    // protocol is Chat. A Responses alias retains its own URL and credentials.
+    let protocol = match resolved_transport(provider) {
+        Ok((configured, "openai-responses")) => configured,
+        _ => "openai-responses",
+    };
+    let (url, _) = resolve_endpoint(provider, protocol, "openai-responses", &key)?;
+    let mut url = reqwest::Url::parse(&url).context("Native compaction requires a gateway URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && (url.query().is_none() || protocol == "azure-openai-responses"),
+        "Invalid native compaction gateway URL"
+    );
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Invalid native compaction path"))?
+        .push("compact");
+    Ok((
+        url,
+        catalog_headers(entry, protocol, "openai-responses", &key, "user", false)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_body(
+    provider: &ResolvedProvider,
+    body: Value,
+    initiator: &'static str,
+    vision: bool,
+    max_tokens: u32,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let account_state = provider.binding_snapshot();
+    let (entry, _) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
+    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
+    let (url, region) = resolve_endpoint(provider, protocol, api, &key)?;
+    let transport_headers = catalog_headers(entry, protocol, api, &key, initiator, vision)?;
     let google_token =
         if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
             // A credential exchange is a buffered request, so it keeps the
@@ -646,11 +740,6 @@ pub(super) async fn stream_body(
             None
         };
     let encoded_body = serde_json::to_string(&body)?;
-    let account = if protocol == "openai-codex-responses" {
-        Some(codex_account(&key)?)
-    } else {
-        None
-    };
     let harness_headers = options.headers(provider)?;
     let identity = super::request_identity::RequestIdentity::from_options(
         context_capture,
@@ -665,8 +754,7 @@ pub(super) async fn stream_body(
         let encoded_body = encoded_body.clone();
         let body = body.clone();
         let key = key.clone();
-        let account = account.clone();
-        let protocol = protocol.to_owned();
+        let transport_headers = transport_headers.clone();
         let provider = provider.clone();
         let options = options.clone();
         let capture = context_capture.cloned();
@@ -680,7 +768,7 @@ pub(super) async fn stream_body(
             let encoded_body = encoded_body.clone();
             let body = body.clone();
             let key = key.clone();
-            let account = account.clone();
+            let transport_headers = transport_headers.clone();
             let identity_headers = identity.headers();
             let provider = provider.clone();
             let options = options.clone();
@@ -688,31 +776,15 @@ pub(super) async fn stream_body(
             let google_token = google_token.clone();
         let account_state = account_state.clone();
             let api = api_owned.clone();
-            let protocol = protocol.clone();
             let region = region.clone();
             Box::pin(async move {
                 let mut request = client
                     .post(&url)
+                    .headers(transport_headers)
                     .headers(identity_headers)
                     .headers(harness_headers)
                     .header("content-type", "application/json")
                     .body(encoded_body.clone());
-                if entry["id"] == "github-copilot" {
-                    request = request
-                        .header("X-Initiator", initiator)
-                        .header("Openai-Intent", "conversation-edits");
-                    if vision {
-                        request = request.header("Copilot-Vision-Request", "true");
-                    }
-                }
-                if protocol == "azure-openai-responses" {
-                    request = request.header("api-key", &key);
-                }
-                if let Some(account) = &account {
-                    request = request
-                        .header("chatgpt-account-id", account)
-                        .header("OpenAI-Beta", "responses=experimental");
-                }
                 match api.as_str() {
                     "anthropic-messages" => {
                         request = request.header("anthropic-version", "2023-06-01");
@@ -739,17 +811,7 @@ pub(super) async fn stream_body(
                             request = request.bearer_auth(&key);
                         }
                     }
-                    _ => {
-                        if !key.is_empty()
-                            && protocol != "azure-openai-responses"
-                            && entry["id"] != "cloudflare-ai-gateway"
-                        {
-                            request = request.bearer_auth(&key);
-                        }
-                    }
-                }
-                if entry["id"] == "cloudflare-ai-gateway" {
-                    request = request.header("cf-aig-authorization", format!("Bearer {key}"));
+                    _ => {}
                 }
                 if let Some(capture) = &capture {
                     capture
