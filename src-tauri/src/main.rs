@@ -279,15 +279,9 @@ fn main() {
                             tracing::error!("Inbound chat model unavailable");
                             continue;
                         };
-                        let event = msg.raw_data.get("event").unwrap_or(&msg.raw_data);
-                        let origin = match event.pointer("/sender/sender_type").and_then(|s| s.as_str()) {
-                            Some("user") => "typed",
-                            Some("app") => "im_app",
-                            _ => "im_event",
-                        };
                         let admitted = db_for_im.open_session(&cid).and_then(|shard| {
                             let lease = std::sync::Arc::new(shard.acquire_execution()?);
-                            shard.admit_prompt(&msg.content, None, origin)?;
+                            msg.admit(&shard)?;
                             let (messages, boundary) = shard.read(|r| r.model_history(&provider.provider.api_format))?;
                             Ok((lease, messages, boundary))
                         });

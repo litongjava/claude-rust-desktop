@@ -1389,4 +1389,70 @@ mod tests {
             .unwrap()
             .contains("outside"));
     }
+    #[test]
+    fn memory_im_attachment_metadata_never_selects_a_file() -> Result<()> {
+        let (_root, memory) = fixture();
+        let shard = memory.session.as_ref().unwrap();
+        memory.put(
+            "note.md",
+            "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nIM_RECALLED\n",
+            None,
+        )?;
+        let router = crate::im_integration::message_router::MessageRouter::new();
+        for (sender, kind, payload, expected) in [
+            ("user", "file", json!({"file_name":"saffron"}), false),
+            ("user", "image", json!({"image_key":"saffron"}), false),
+            ("app", "text", json!({"text":"saffron"}), false),
+            ("user", "text", json!({"text":"saffron"}), true),
+        ] {
+            let msg = router.parse_inbound("feishu",json!({"event":{"sender":{"sender_type":sender},"message":{"message_type":kind,"content":payload.to_string()}}}))?;
+            let id = msg.admit(shard)?;
+            let entries = replay(shard).1;
+            let matched = entries.iter().any(|e| {
+                e.key == format!("message:{id}")
+                    && e.blocks.iter().any(|b| b.contains("IM_RECALLED"))
+            });
+            assert_eq!(matched, expected, "{sender} {kind}");
+        }
+        for (platform, raw, expected) in [
+            (
+                "telegram",
+                json!({"message":{"from":{"is_bot":false},"document":{"file_name":"saffron"}}}),
+                false,
+            ),
+            (
+                "telegram",
+                json!({"message":{"from":{"is_bot":false},"document":{"file_name":"saffron"},"caption":"ordinary caption"}}),
+                false,
+            ),
+            (
+                "telegram",
+                json!({"message":{"from":{"is_bot":false},"photo":[],"caption":"saffron"}}),
+                true,
+            ),
+            (
+                "dingtalk",
+                json!({"senderStaffId":"person","msgtype":"file","text":{"content":"saffron"}}),
+                false,
+            ),
+            (
+                "wechat",
+                json!({"FromUserName":"person","MsgType":"file","Content":"saffron"}),
+                false,
+            ),
+        ] {
+            let id = router.parse_inbound(platform, raw)?.admit(shard)?;
+            assert_eq!(
+                replay(shard)
+                    .1
+                    .iter()
+                    .any(|e| e.key == format!("message:{id}")
+                        && e.blocks.iter().any(|b| b.contains("IM_RECALLED"))),
+                expected,
+                "{platform}"
+            );
+        }
+        Ok(())
+    }
+
 }
