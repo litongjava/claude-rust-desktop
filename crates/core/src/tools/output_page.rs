@@ -292,7 +292,13 @@ impl Stream {
             return Ok(None);
         }
         let path = crate::performance::save_tool_output_bytes(root, &bytes)?;
-        Ok(Some(super::bash_process::PageSource { path, start, cut }))
+        Ok(Some(super::bash_process::PageSource {
+            path,
+            window: offset as usize..page.next as usize,
+            cut,
+            origin: 0,
+            first_line: 1,
+        }))
     }
 
     pub(crate) fn generation(&self) -> String {

@@ -71,9 +71,9 @@ struct Blocks {
     json_end: Option<usize>,
 }
 
-type PageSources = [Option<crate::tools::bash_process::PageSource>; 2];
+type PageSources<'a> = [Option<&'a crate::tools::bash_process::PageSource>; 2];
 
-fn task_blocks(original: &str, pages: Option<&PageSources>, cuts: [bool; 2]) -> Option<Blocks> {
+fn task_blocks(original: &str, pages: Option<PageSources>, cuts: [bool; 2]) -> Option<Blocks> {
     let json = original.strip_prefix("Error: ").unwrap_or(original);
     let mut objects =
         serde_json::Deserializer::from_str(json).into_iter::<HashMap<String, &RawValue>>();
@@ -113,25 +113,33 @@ fn task_blocks(original: &str, pages: Option<&PageSources>, cuts: [bool; 2]) -> 
         };
         let mut blocks = Vec::new();
         let mut origins = Vec::new();
-        if page {
-            let Some(source) = pages.and_then(|p| p[index].as_ref()) else {
+        if page || pages.is_some() {
+            let Some(source) = pages.and_then(|p| p[index]) else {
                 continue;
             };
-            let bytes = std::fs::read(&source.path).ok()?;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&source.path).ok()?;
+            file.seek(SeekFrom::Start(source.origin as u64)).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
             let full = String::from_utf8_lossy(&bytes);
-            let end = source.start + text.len();
-            if full.get(source.start..end) != Some(text.as_str()) {
+            let start = source.window.start;
+            let end = source.window.end;
+            let window = bytes.get(start..end)?;
+            if String::from_utf8_lossy(window) != text {
                 continue;
             }
-            let mut line = 1;
+            let mut page_pos = 0;
+            let mut decoded_pos = 0;
+            let mut line = source.first_line;
             let mut pos = 0;
             let found = crate::tools::base64_collapse::captured_runs(&full, source.cut);
             let ranges = raw_ranges(&bytes, &found);
             for (mut run, physical) in found.into_iter().zip(ranges) {
-                if run.range.start >= end {
+                if physical.start >= end {
                     break;
                 }
-                if run.range.end <= source.start {
+                if physical.end <= start {
                     continue;
                 }
                 line += full[pos..run.range.start]
@@ -142,14 +150,18 @@ fn task_blocks(original: &str, pages: Option<&PageSources>, cuts: [bool; 2]) -> 
                 origins.push(Location {
                     path: Some(source.path.clone()),
                     line,
-                    range: physical,
+                    range: source.origin + physical.start..source.origin + physical.end,
                 });
-                if run.range.start >= source.start {
+                if !page || physical.start >= start {
                     result.count += 1;
                     result.bytes += run.range.len();
                 }
-                run.range = run.range.start.saturating_sub(source.start)
-                    ..run.range.end.min(end) - source.start;
+                let left = physical.start.saturating_sub(start);
+                let right = physical.end.min(end) - start;
+                decoded_pos += String::from_utf8_lossy(&window[page_pos..left]).len();
+                run.range = decoded_pos..decoded_pos + right - left;
+                page_pos = right;
+                decoded_pos = run.range.end;
                 blocks.push(run);
             }
         } else {
@@ -162,7 +174,7 @@ fn task_blocks(original: &str, pages: Option<&PageSources>, cuts: [bool; 2]) -> 
         }
         let mut encoded = blocks.clone();
         encode_ranges(original, raw, &text, &mut encoded);
-        if !page {
+        if !page && pages.is_none() {
             origins = encoded
                 .iter()
                 .map(|b| Location {
@@ -296,7 +308,7 @@ impl Collapsed {
         stream_runs: Option<Vec<Run>>,
         source_file: Option<&Path>,
         stream_locations: HashMap<usize, Location>,
-        pages: Option<&PageSources>,
+        pages: Option<PageSources>,
         cuts: [bool; 2],
     ) -> Option<Self> {
         let task = matches!(name, "TaskGet" | "TaskOutput");
@@ -323,7 +335,7 @@ impl Collapsed {
         }
         let path = if let Some(path) = source_file {
             path.to_owned()
-        } else if let Some(source) = pages.and_then(|p| p.iter().flatten().next()) {
+        } else if let Some(source) = pages.and_then(|p| p.into_iter().flatten().next()) {
             source.path.clone()
         } else {
             crate::performance::save_tool_output(root, original).ok()?

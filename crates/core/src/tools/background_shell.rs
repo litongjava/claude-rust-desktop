@@ -1418,15 +1418,7 @@ pub(super) fn control(
                 json!({"task_id":id,"status":status,"cancellation_requested":true,"message":"Monitor stop requested; you will get a final 'stopped' notification."}),
             ));
         }
-        let (stdout, size) = crate::performance::command_output::SnapshotSize::read_log(
-            &directory.join("stdout.log"),
-            64 * 1024,
-            true,
-        )?;
-        super::bash_process::publish_snapshot(
-            [size, Default::default()],
-            [stdout.len(), 0],
-        );
+        let stdout = super::monitor::task_stdout(&directory)?;
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
             .map(|file| {

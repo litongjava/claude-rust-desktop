@@ -383,8 +383,16 @@ impl ShellCapture {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PageSource {
     pub path: std::path::PathBuf,
-    pub start: usize,
+    pub window: std::ops::Range<usize>,
     pub cut: bool,
+    #[serde(default)]
+    pub origin: usize,
+    #[serde(default = "first_line")]
+    pub first_line: usize,
+}
+
+fn first_line() -> usize {
+    1
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -395,6 +403,10 @@ pub(crate) enum CommandMetadata {
         #[serde(default)]
         cuts: [bool; 2],
         streams: [crate::performance::command_output::SnapshotSize; 2],
+    },
+    MonitorTail {
+        stream: crate::performance::command_output::SnapshotSize,
+        source: Option<PageSource>,
     },
     PageExit(i64), // Existing private sidecars.
     Page {
@@ -409,6 +421,7 @@ impl CommandMetadata {
     pub(crate) fn needed_for_base64(&self) -> bool {
         match self {
             Self::Shell(shell) => shell.stdout.source.is_some(),
+            Self::MonitorTail { .. } => true,
             Self::Page { sources, .. } => sources.iter().any(Option::is_some),
             Self::ShellSnapshot { cuts, .. } => cuts.contains(&true),
             _ => false,

@@ -516,7 +516,12 @@ fn command_preview_inner(
                     .map(|(path, _)| path.as_path()),
                 locations,
                 match metadata {
-                    Some(CommandMetadata::Page { sources, .. }) => Some(sources),
+                    Some(CommandMetadata::Page { sources, .. }) => {
+                        Some(sources.each_ref().map(Option::as_ref))
+                    }
+                    Some(CommandMetadata::MonitorTail { source, .. }) => {
+                        Some([source.as_ref(), None])
+                    }
                     _ => None,
                 },
                 match metadata {
@@ -597,6 +602,7 @@ fn command_preview_inner(
     let mut streams = streams.map(|(key, text)| {
         let index = usize::from(key == "stderr");
         let snapshot = match metadata {
+            Some(CommandMetadata::MonitorTail { stream, .. }) if index == 0 => Some(stream),
             Some(
                 CommandMetadata::Snapshot(streams) | CommandMetadata::ShellSnapshot { streams, .. },
             ) => Some(&streams[index]),
