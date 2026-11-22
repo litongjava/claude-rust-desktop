@@ -569,6 +569,8 @@ impl Drop for PermissionWaiterGuard {
 
 #[path = "model_tool_output.rs"]
 pub(crate) mod model_output;
+#[path = "model_projection.rs"]
+mod model_projection;
 pub(crate) use model_output::{base64_preview, history_projection, monitor_line};
 
 pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {

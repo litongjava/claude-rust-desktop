@@ -846,9 +846,15 @@ pub(crate) fn save_tool_output_bytes(
     root: &std::path::Path,
     output: &[u8],
 ) -> std::io::Result<std::path::PathBuf> {
+    save_output_in(&root.join("tool-outputs"), output)
+}
+
+pub(crate) fn save_output_in(
+    directory: &std::path::Path,
+    output: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
-    let directory = root.join("tool-outputs");
-    std::fs::create_dir_all(&directory)?;
+    std::fs::create_dir_all(directory)?;
     // Stable paths keep replayed requests identical and avoid duplicate spills.
     let digest = ring::digest::digest(&ring::digest::SHA256, output);
     let key: String = digest
@@ -860,7 +866,7 @@ pub(crate) fn save_tool_output_bytes(
     if std::fs::read(&path).is_ok_and(|bytes| bytes == output) {
         return Ok(path);
     }
-    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(output)?;
     file.as_file().sync_all()?;
     file.persist(&path)?;
