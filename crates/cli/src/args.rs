@@ -1244,6 +1244,11 @@ mod tests {
 
 #[derive(Debug, Subcommand)]
 pub enum FileMemoryCommands {
+    /// Preview catalog pointer repairs; pass the returned token to apply that exact preview.
+    Repair {
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     List {
         query: Option<String>,
     },

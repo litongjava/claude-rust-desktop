@@ -96,6 +96,9 @@ pub async fn run(cli: &crate::args::Cli, paths: &RuntimePaths, action: &MemoryCo
                 )?
             };
             let result = match action {
+                FileMemoryCommands::Repair { confirm } => {
+                    memory.repair_catalog(confirm.as_deref())?
+                }
                 FileMemoryCommands::List { query } => {
                     memory.listing(query.as_deref().unwrap_or_default())?
                 }

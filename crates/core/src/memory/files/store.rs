@@ -74,10 +74,20 @@ pub struct Snapshot {
     pub diagnostics: Vec<Diagnostic>,
     pub index: String,
     pub index_hash: String,
-    pub index_repaired: bool,
 }
 
 impl Snapshot {
+    /// A confirmation binds the authored preimage and the complete proposed text.
+    pub fn repair_preview(&self, scope: &str) -> Result<(String, String)> {
+        let proposed = index::repair(&self.entries, &self.index);
+        if proposed.len() > MAX_INDEX_BYTES {
+            return Err(invalid("repaired index exceeds storage limit"));
+        }
+        let token =
+            hash(format!("{scope}:{}:{}", self.index_hash, hash(proposed.as_bytes())).as_bytes());
+        Ok((proposed, token))
+    }
+
     pub fn index_context(&self, path: &str) -> IndexContext {
         IndexContext::from_index(&self.index, path, IndexLimits::default(), str::len)
     }
@@ -164,6 +174,37 @@ impl FileMemoryStore {
     /// Never create files, repair an index or recover a journal in a read-only turn.
     pub fn open_read_only(data_dir: &Path, scope: &MemoryScope) -> Result<Self> {
         Self::open_mode(data_dir, scope, StoreOptions::default(), true)
+    }
+
+    /// Before the first store write there may already be hand-authored files,
+    /// but no state directory or lock. Never bootstrap these just to list them.
+    pub fn project_snapshot(data_dir: &Path, scope: &MemoryScope) -> Result<Snapshot> {
+        let state = data_dir.join("memory/state").join(scope.key());
+        let missing = |e: &MemoryFileError| matches!(e, MemoryFileError::Io(e) if e.kind() == std::io::ErrorKind::NotFound);
+        match super::scoped_directory(data_dir, &state, true) {
+            Err(e) if missing(&e) => (),
+            other => {
+                other?;
+                return Self::open_read_only(data_dir, scope)?.snapshot();
+            }
+        }
+        let directory = data_dir
+            .join("memory/projects")
+            .join(scope.key())
+            .join("memory");
+        let directory = match super::scoped_directory(data_dir, &directory, true) {
+            Err(e) if missing(&e) => None,
+            other => Some(other?),
+        };
+        let snapshot = Self::read_snapshot(directory.as_deref(), 0)?;
+        // If a concurrent writer initialized the store, repeat under its lock.
+        match super::scoped_directory(data_dir, &state, true) {
+            Err(e) if missing(&e) => Ok(snapshot),
+            other => {
+                other?;
+                Self::open_read_only(data_dir, scope)?.snapshot()
+            }
+        }
     }
 
     pub(crate) fn open_resident(root: &Path, directory: &Path, read_only: bool) -> Result<Self> {
@@ -268,8 +309,12 @@ impl FileMemoryStore {
     }
 
     fn lock(&self) -> Result<ProjectLock> {
+        self.lock_mode(self.read_only)
+    }
+
+    fn lock_mode(&self, read_only: bool) -> Result<ProjectLock> {
         self.cancelled()?;
-        let file = self.state.lock_file(self.read_only)?;
+        let file = self.state.lock_file(read_only)?;
         let start = Instant::now();
         loop {
             self.cancelled()?;
@@ -307,8 +352,8 @@ impl FileMemoryStore {
 
     pub fn read(&self, filename: &str) -> Result<Option<Entry>> {
         memory_filename(filename)?;
-        let _lock = self.lock()?;
-        self.recover()?;
+        let _lock = self.lock_mode(true)?;
+        self.ensure_clean()?;
         self.directory
             .read(filename, MAX_FILE_BYTES)?
             .map(|bytes| Entry::new(filename.into(), bytes))
@@ -319,8 +364,8 @@ impl FileMemoryStore {
     /// read_bytes to inspect it first. No malformed file is silently deleted.
     pub fn read_bytes(&self, filename: &str) -> Result<Option<Vec<u8>>> {
         memory_filename(filename)?;
-        let _lock = self.lock()?;
-        self.recover()?;
+        let _lock = self.lock_mode(true)?;
+        self.ensure_clean()?;
         self.directory.read(filename, MAX_FILE_BYTES)
     }
 
@@ -337,14 +382,11 @@ impl FileMemoryStore {
         let previous = before.as_deref().map(MemoryDocument::parse).transpose()?;
         let after = document.prepare(previous.as_ref())?;
         let entry = Entry::new(filename.into(), after.clone())?;
-        self.mutate(
-            Some(Change {
-                name: filename.into(),
-                before,
-                after: Some(after),
-            }),
-            None,
-        )?;
+        self.commit_topic(Change {
+            name: filename.into(),
+            before,
+            after: Some(after),
+        })?;
         Ok(entry)
     }
 
@@ -360,62 +402,72 @@ impl FileMemoryStore {
         if before.is_none() {
             return Err(invalid("memory not found"));
         }
-        self.mutate(
-            Some(Change {
-                name: filename.into(),
-                before,
-                after: None,
-            }),
-            None,
-        )?;
+        self.commit_topic(Change {
+            name: filename.into(),
+            before,
+            after: None,
+        })?;
         Ok(())
     }
 
-    /// A managed read reconciles external changes. Invalid files are diagnosed
-    /// and retained on disk, but never become index/context entries.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let _lock = self.lock()?;
-        self.recover()?;
-        if self.read_only {
-            return self.scanned_snapshot();
-        }
-        self.mutate(None, None)
+        let _lock = self.lock_mode(true)?;
+        self.ensure_clean()?;
+        Self::read_snapshot(Some(&self.directory), self.generation()?)
     }
 
-    fn scanned_snapshot(&self) -> Result<Snapshot> {
-        let (entries, diagnostics) = self.scan(None)?;
-        let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
-        let index = index::build(&entries, previous.as_deref().unwrap_or_default());
-        let index_hash = hash(index.as_bytes());
+    fn read_snapshot(directory: Option<&SafeDir>, generation: u64) -> Result<Snapshot> {
+        let (entries, diagnostics, bytes) = match directory {
+            Some(dir) => {
+                let (entries, diagnostics) = Self::scan(dir, None)?;
+                (
+                    entries,
+                    diagnostics,
+                    dir.read("MEMORY.md", MAX_INDEX_BYTES)?.unwrap_or_default(),
+                )
+            }
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        let index = String::from_utf8(bytes).map_err(|_| invalid("index is not UTF-8"))?;
         Ok(Snapshot {
-            generation: self.generation()?,
-            index_hash,
+            generation,
+            index_hash: hash(index.as_bytes()),
             index,
             entries,
             diagnostics,
-            index_repaired: false,
         })
     }
 
-    /// Accept index ordering through ordinary file adapters without allowing
-    /// invented pointers or removal of an existing fact merely by hiding its row.
-    pub fn update_index(&self, bytes: &[u8], expected: ExpectedVersion) -> Result<Snapshot> {
+    pub fn confirm_repair(&self, scope: &str, confirmation: &str) -> Result<()> {
         if self.read_only {
             return Err(invalid("memory is read-only"));
         }
-        if bytes.len() > MAX_INDEX_BYTES || std::str::from_utf8(bytes).is_err() {
-            return Err(invalid("invalid index encoding/size"));
-        }
         let _lock = self.lock()?;
         self.recover()?;
-        let old = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
-        expected.check("MEMORY.md", old.as_deref())?;
-        self.mutate(None, Some(bytes))
+        let snapshot = Self::read_snapshot(Some(&self.directory), self.generation()?)?;
+        let (proposed, token) = snapshot.repair_preview(scope)?;
+        if token != confirmation {
+            return Err(MemoryFileError::Conflict("catalog repair preview".into()));
+        }
+        if proposed != snapshot.index {
+            let before = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
+            if before.as_deref().unwrap_or_default() != snapshot.index.as_bytes() {
+                return Err(MemoryFileError::Conflict("MEMORY.md".into()));
+            }
+            self.commit(
+                vec![Change {
+                    name: "MEMORY.md".into(),
+                    before,
+                    after: Some(proposed.into_bytes()),
+                }],
+                Self::catalog(&snapshot.entries)?,
+            )?;
+        }
+        Ok(())
     }
 
-    fn scan(&self, change: Option<&Change>) -> Result<(Vec<Entry>, Vec<Diagnostic>)> {
-        let mut files: BTreeMap<String, Option<Vec<u8>>> = self
-            .directory
+    fn scan(directory: &SafeDir, change: Option<&Change>) -> Result<(Vec<Entry>, Vec<Diagnostic>)> {
+        let mut files: BTreeMap<String, Option<Vec<u8>>> = directory
             .list()?
             .into_iter()
             .filter(|name| name.ends_with(".md") && name != "MEMORY.md")
@@ -438,8 +490,7 @@ impl FileMemoryStore {
                 memory_filename(&name)?;
                 let bytes = match supplied {
                     Some(bytes) => bytes,
-                    None => self
-                        .directory
+                    None => directory
                         .read(&name, MAX_FILE_BYTES)?
                         .ok_or_else(|| MemoryFileError::Conflict(name.clone()))?,
                 };
@@ -498,29 +549,13 @@ impl FileMemoryStore {
         Ok((entries, diagnostics))
     }
 
-    fn mutate(&self, change: Option<Change>, ordering: Option<&[u8]>) -> Result<Snapshot> {
-        let (entries, diagnostics) = self.scan(change.as_ref())?;
-        let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
-        let index = index::build(
-            &entries,
-            ordering.unwrap_or(previous.as_deref().unwrap_or_default()),
-        );
-        if index.len() > MAX_INDEX_BYTES {
-            return Err(invalid("index exceeds storage limit"));
-        }
-        let index_repaired = previous.as_deref() != Some(index.as_bytes());
-        let mut changes = Vec::new();
-        if let Some(change) = change {
-            changes.push(change);
-        }
-        if index_repaired {
-            changes.push(Change {
-                name: "MEMORY.md".into(),
-                before: previous,
-                after: Some(index.as_bytes().to_vec()),
-            });
-        }
-        let catalog = hash(
+    fn commit_topic(&self, change: Change) -> Result<()> {
+        let (entries, _) = Self::scan(&self.directory, Some(&change))?;
+        self.commit(vec![change], Self::catalog(&entries)?)
+    }
+
+    fn catalog(entries: &[Entry]) -> Result<Vec<u8>> {
+        Ok(hash(
             &serde_json::to_vec(
                 &entries
                     .iter()
@@ -529,26 +564,13 @@ impl FileMemoryStore {
             )
             .map_err(|_| invalid("catalog serialization"))?,
         )
-        .into_bytes();
-        if !changes.is_empty()
-            || self.state.read("catalog", 64)?.as_deref() != Some(catalog.as_slice())
-        {
-            self.commit(changes, catalog)?;
-        }
-        Ok(Snapshot {
-            generation: self.generation()?,
-            entries,
-            diagnostics,
-            index_hash: hash(index.as_bytes()),
-            index,
-            index_repaired,
-        })
+        .into_bytes())
     }
 
     fn commit(&self, changes: Vec<Change>, catalog: Vec<u8>) -> Result<()> {
         let previous_generation = self.generation()?;
         let journal = Journal {
-            version: 1,
+            version: 2,
             id: uuid::Uuid::new_v4().to_string(),
             previous_generation,
             generation: previous_generation
@@ -586,6 +608,19 @@ impl FileMemoryStore {
         self.finish(&envelope.payload)
     }
 
+    fn ensure_clean(&self) -> Result<()> {
+        if self
+            .state
+            .read("journal.json", MAX_JOURNAL_BYTES)?
+            .is_some()
+        {
+            return Err(invalid(
+                "memory recovery requires a writable maintenance operation",
+            ));
+        }
+        Ok(())
+    }
+
     fn recover(&self) -> Result<()> {
         let Some(bytes) = self.state.read("journal.json", MAX_JOURNAL_BYTES)? else {
             return Ok(());
@@ -606,7 +641,7 @@ impl FileMemoryStore {
     }
 
     fn preflight(&self, journal: &Journal) -> Result<()> {
-        if journal.version != 1
+        if !matches!(journal.version, 1 | 2)
             || uuid::Uuid::parse_str(&journal.id).is_err()
             || journal.changes.len() > 2
             || journal.previous_generation.checked_add(1) != Some(journal.generation)
@@ -655,6 +690,13 @@ impl FileMemoryStore {
                 }
             }
             let current = self.directory.read(&change.name, limit)?;
+            // A pre-upgrade journal could contain an implicit catalog rewrite.
+            // Never roll it forward over an authored preimage on upgrade.
+            if journal.version == 1 && change.name == "MEMORY.md" && current != change.after {
+                return Err(MemoryFileError::RecoveryConflict(
+                    "unapplied legacy index rewrite".into(),
+                ));
+            }
             if current != change.before && current != change.after {
                 return Err(MemoryFileError::RecoveryConflict(change.name.clone()));
             }

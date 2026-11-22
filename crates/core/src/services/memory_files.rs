@@ -277,7 +277,7 @@ impl FileMemory {
         config(&self.context).is_ok_and(|config| config.enabled)
     }
 
-    pub fn store(&self, read_only: bool) -> Result<FileMemoryStore> {
+    fn validate_scope(&self) -> Result<()> {
         ensure!(self.active(), "Local file memory is disabled");
         if let Some(id) = &self.session {
             let current = Self::from_session(&self.context, id.clone(), None)?;
@@ -286,6 +286,11 @@ impl FileMemory {
                 "Memory scope changed during the turn; restart the turn"
             );
         }
+        Ok(())
+    }
+
+    pub fn store(&self, read_only: bool) -> Result<FileMemoryStore> {
+        self.validate_scope()?;
         Ok(if read_only {
             FileMemoryStore::open_read_only(&self.context.paths.data_dir, &self.scope)?
         } else {
@@ -293,8 +298,36 @@ impl FileMemory {
         })
     }
 
+    fn snapshot(&self) -> Result<crate::memory::files::Snapshot> {
+        self.validate_scope()?;
+        Ok(FileMemoryStore::project_snapshot(
+            &self.context.paths.data_dir,
+            &self.scope,
+        )?)
+    }
+
+    pub fn repair_catalog(&self, confirmation: Option<&str>) -> Result<Value> {
+        let snapshot = self.snapshot()?;
+        let (proposed, token) = snapshot.repair_preview(self.scope.key())?;
+        let changed = proposed != snapshot.index;
+        if let Some(confirmation) = confirmation {
+            ensure!(
+                token == confirmation,
+                "Catalog repair preview changed; preview again"
+            );
+            if changed {
+                self.store(false)?
+                    .confirm_repair(self.scope.key(), confirmation)?;
+            }
+            return Ok(json!({"applied":changed,"scope":self.scope.key()}));
+        }
+        Ok(
+            json!({"scope":self.scope.key(),"changed":changed,"before":snapshot.index,"after":proposed,"confirmation":token}),
+        )
+    }
+
     pub fn listing(&self, query: &str) -> Result<Value> {
-        let snapshot = self.store(false)?.snapshot()?;
+        let snapshot = self.snapshot()?;
         let items = snapshot.entries.iter().filter(|entry| query.is_empty() || relevance(&entry.document, query) > 0.0).map(|entry| json!({
             "id":entry.filename,"name":entry.document.name,"description":entry.document.description,"type":entry.document.kind,
             "content":String::from_utf8_lossy(&entry.bytes),"version":entry.hash

@@ -1,5 +1,5 @@
 use super::store::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct IndexLimits {
@@ -93,43 +93,55 @@ fn escape(text: &str) -> String {
     output
 }
 
-pub(super) fn build(entries: &[Entry], previous: &[u8]) -> String {
-    let mut remaining: BTreeMap<_, _> = entries
-        .iter()
-        .map(|entry| (entry.filename.as_str(), entry))
-        .collect();
-    let mut ordered = Vec::new();
-    let mut seen = HashSet::new();
-    if let Ok(previous) = std::str::from_utf8(previous) {
-        for row in previous.lines() {
-            if let Some((_, tail)) = row.rsplit_once("](") {
-                if let Some((filename, _)) = tail.split_once(')') {
-                    if seen.insert(filename) {
-                        if let Some(entry) = remaining.remove(filename) {
-                            ordered.push(entry);
-                        }
-                    }
+fn pointer(entry: &Entry) -> String {
+    format!(
+        "- [{}]({}) — {}",
+        escape(&entry.document.name),
+        entry.filename,
+        escape(&entry.document.description)
+    )
+}
+
+/// Only canonical catalog rows are managed by explicit repair. All other text,
+/// including arbitrary Markdown links and original line endings, stays authored.
+pub(super) fn repair(entries: &[Entry], previous: &str) -> String {
+    let mut remaining: BTreeMap<_, _> = entries.iter().map(|e| (e.filename.as_str(), e)).collect();
+    let mut result = String::new();
+    for line in previous.split_inclusive('\n') {
+        let row = line.trim_end_matches(['\r', '\n']);
+        let file = row
+            .strip_prefix("- [")
+            .and_then(|label| {
+                let (end, _) = label.match_indices("](").find(|(i, _)| {
+                    label[..*i]
+                        .bytes()
+                        .rev()
+                        .take_while(|&b| b == b'\\')
+                        .count()
+                        % 2
+                        == 0
+                })?;
+                label[end + 2..].split_once(") — ").map(|(file, _)| file)
+            })
+            .filter(|file| super::memory_filename(file).is_ok());
+        match file {
+            Some(file) => {
+                if let Some(entry) = remaining.remove(file) {
+                    result.push_str(&pointer(entry));
+                    result.push_str(&line[row.len()..]);
                 }
             }
+            None => result.push_str(line),
         }
     }
-    let mut rest: Vec<_> = remaining.into_values().collect();
-    rest.sort_by_key(|entry| {
-        (
-            super::format::name_key(&entry.document.name),
-            entry.filename.clone(),
-        )
-    });
-    ordered.extend(rest);
-    ordered
-        .into_iter()
-        .map(|entry| {
-            format!(
-                "- [{}]({}) — {}\n",
-                escape(&entry.document.name),
-                entry.filename,
-                escape(&entry.document.description)
-            )
-        })
-        .collect()
+    let mut missing: Vec<_> = remaining.into_values().collect();
+    missing.sort_by_key(|e| (super::format::name_key(&e.document.name), &e.filename));
+    for entry in missing {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&pointer(entry));
+        result.push('\n');
+    }
+    result
 }

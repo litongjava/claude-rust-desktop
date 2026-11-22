@@ -113,6 +113,16 @@ fn process_worker() {
             };
             fs::write(root.join(format!("result-{id}")), status).unwrap();
         }
+        "crash-repair" => {
+            let memory = store(&root);
+            let (_, token) = memory
+                .snapshot()
+                .unwrap()
+                .repair_preview("fixture")
+                .unwrap();
+            memory.confirm_repair("fixture", &token).unwrap();
+            panic!("configured repair crash checkpoint was not reached");
+        }
         "crash" | "crash-delete" => {
             let memory = store(&root);
             let before = memory.read("one.md").unwrap().unwrap();
@@ -385,7 +395,8 @@ fn store_crud_persists_ids_extensions_generation_and_index() {
         .unwrap();
     assert!(first.document.id().is_some());
     let initial = memory.snapshot().unwrap();
-    assert!(initial.index.contains("[中文标题](one.md)"));
+    assert!(initial.index.is_empty());
+    assert!(!memory.index_path().exists());
     assert_eq!(initial.entries.len(), 1);
     assert!(initial
         .diagnostics
@@ -497,9 +508,12 @@ fn external_bad_files_are_retained_diagnosed_and_not_indexed() {
     let snapshot = memory.snapshot().unwrap();
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.diagnostics.len(), 3);
-    assert!(snapshot.index.contains("valid.md"));
+    let (proposal, token) = snapshot.repair_preview("fixture").unwrap();
+    memory.confirm_repair("fixture", &token).unwrap();
+    assert_eq!(memory.snapshot().unwrap().index, proposal);
+    assert!(proposal.contains("valid.md"));
     for (name, bytes) in &invalids {
-        assert!(!snapshot.index.contains(name));
+        assert!(!proposal.contains(name));
         assert_eq!(fs::read(memory.directory().join(name)).unwrap(), *bytes);
     }
 }
@@ -509,43 +523,70 @@ fn index_repairs_missing_stale_and_deleted_pointers_preserving_valid_order() {
     let root = tempfile::tempdir().unwrap();
     let memory = store(root.path());
     memory
-        .put("one.md", &note("One", "fact"), ExpectedVersion::Absent)
+        .put(
+            "one.md",
+            &note("One ](aside", "fact"),
+            ExpectedVersion::Absent,
+        )
         .unwrap();
     memory
         .put("two.md", &note("Two", "fact"), ExpectedVersion::Absent)
         .unwrap();
     fs::write(
         memory.index_path(),
-        "arbitrary old index text\n- [stale](two.md) — old\n- [invented](ghost.md) — missing\n",
+        "arbitrary old index text\r\n- [stale](two.md) — old\r\n- [invented](ghost.md) — missing\n",
     )
     .unwrap();
     let snapshot = memory.snapshot().unwrap();
-    assert!(snapshot.index_repaired);
-    assert!(snapshot.index.starts_with("- [Two](two.md)"));
-    assert!(snapshot.index.contains("one.md"));
-    assert!(!snapshot.index.contains("ghost.md"));
-    assert!(!snapshot.index.contains("arbitrary"));
+    let (proposal, token) = snapshot.repair_preview("fixture").unwrap();
+    assert_eq!(
+        fs::read_to_string(memory.index_path()).unwrap(),
+        snapshot.index
+    );
+    assert!(proposal.starts_with("arbitrary old index text\r\n- [Two](two.md)"));
+    assert!(proposal.contains("one.md"));
+    assert!(!proposal.contains("ghost.md"));
+    memory.confirm_repair("fixture", &token).unwrap();
+    assert_eq!(memory.snapshot().unwrap().index, proposal);
     fs::remove_file(memory.directory().join("two.md")).unwrap();
+    let stale = memory.snapshot().unwrap();
+    assert_eq!(stale.index, proposal);
+    let (_, token) = stale.repair_preview("fixture").unwrap();
+    memory.confirm_repair("fixture", &token).unwrap();
     assert!(!memory.snapshot().unwrap().index.contains("two.md"));
-    assert!(!memory.snapshot().unwrap().index_repaired);
+    let clean = memory.snapshot().unwrap();
+    let (_, token) = clean.repair_preview("fixture").unwrap();
+    memory.confirm_repair("fixture", &token).unwrap();
+    assert_eq!(memory.snapshot().unwrap().generation, clean.generation);
 }
 
 #[test]
-fn index_update_uses_cas_and_cannot_hide_existing_memories() {
+fn index_repair_refuses_changed_preimage_or_proposal() {
     let root = tempfile::tempdir().unwrap();
     let memory = store(root.path());
     memory
         .put("one.md", &note("One", "fact"), ExpectedVersion::Absent)
         .unwrap();
     let before = memory.snapshot().unwrap();
-    let after = memory
-        .update_index(b"", ExpectedVersion::Hash(before.index_hash))
-        .unwrap();
-    assert!(after.index.contains("one.md"));
+    let (_, token) = before.repair_preview("fixture").unwrap();
+    fs::write(memory.index_path(), b"authored\r\n").unwrap();
     assert!(matches!(
-        memory.update_index(b"", ExpectedVersion::Hash("stale".into())),
+        memory.confirm_repair("fixture", &token),
         Err(MemoryFileError::Conflict(_))
     ));
+    let (_, token) = memory
+        .snapshot()
+        .unwrap()
+        .repair_preview("fixture")
+        .unwrap();
+    memory
+        .put("two.md", &note("Two", "fact"), ExpectedVersion::Absent)
+        .unwrap();
+    assert!(matches!(
+        memory.confirm_repair("fixture", &token),
+        Err(MemoryFileError::Conflict(_))
+    ));
+    assert_eq!(fs::read(memory.index_path()).unwrap(), b"authored\r\n");
 }
 
 #[test]
@@ -869,23 +910,45 @@ fn process_crashes_at_each_commit_boundary_recover_consistent_index_and_generati
                 ExpectedVersion::Absent,
             )
             .unwrap();
+        fs::write(memory.index_path(), "marker unchanged\n").unwrap();
         drop(memory);
-        let mut worker = child(root.path(), "crash")
-            .env("DCL_MEMORY_TEST_CRASH", phase)
-            .spawn_owned()
-            .unwrap();
+        let mut worker = child(
+            root.path(),
+            if phase == "index" {
+                "crash-repair"
+            } else {
+                "crash"
+            },
+        )
+        .env("DCL_MEMORY_TEST_CRASH", phase)
+        .spawn_owned()
+        .unwrap();
         assert_eq!(bounded_wait(&mut worker).code(), Some(87), "{phase}");
+        if phase == "journal" {
+            let journal = state(root.path()).join("journal.json");
+            let before = fs::read(&journal).unwrap();
+            let scope = MemoryScope::private("fixture-owner").unwrap();
+            assert!(FileMemoryStore::project_snapshot(root.path(), &scope).is_err());
+            assert_eq!(fs::read(&journal).unwrap(), before);
+            assert_eq!(
+                fs::read(state(root.path()).join("generation")).unwrap(),
+                b"1"
+            );
+        }
         let recovered = store(root.path()).snapshot().unwrap();
-        let expected = if phase == "staged" {
+        let expected = if matches!(phase, "staged" | "index") {
             "Original"
         } else {
             "Changed"
         };
         assert_eq!(recovered.entries[0].document.name, expected, "{phase}");
-        assert!(
-            recovered.index.contains(&format!("[{expected}](one.md)")),
-            "{phase}"
-        );
+        if phase == "index" {
+            assert!(recovered
+                .index
+                .starts_with("marker unchanged\n- [Original](one.md)"));
+        } else {
+            assert_eq!(recovered.index, "marker unchanged\n", "{phase}");
+        }
         assert_eq!(
             recovered.generation,
             if phase == "staged" { 1 } else { 2 },
@@ -928,7 +991,7 @@ fn recovery_preserves_external_conflict_and_journal_instead_of_overwriting() {
 }
 
 #[test]
-fn external_body_only_changes_invalidate_generation_without_rewriting_index() {
+fn snapshot_observes_external_edits_without_advancing_generation() {
     let root = tempfile::tempdir().unwrap();
     let memory = store(root.path());
     let entry = memory
@@ -940,9 +1003,9 @@ fn external_body_only_changes_invalidate_generation_without_rewriting_index() {
         .replace("old body", "new body");
     fs::write(memory.directory().join("one.md"), edited).unwrap();
     let after = memory.snapshot().unwrap();
-    assert!(!after.index_repaired);
+    assert_ne!(before.entries[0].hash, after.entries[0].hash);
     assert_eq!(before.index, after.index);
-    assert_eq!(after.generation, before.generation + 1);
+    assert_eq!(after.generation, before.generation);
     assert_eq!(memory.snapshot().unwrap().generation, after.generation);
 }
 
