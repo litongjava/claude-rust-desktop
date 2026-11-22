@@ -99,7 +99,7 @@ fn durable_tool_index(history: &[Value]) -> Option<usize> {
 #[tokio::test]
 async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
     for anthropic in [false, true] {
-        let server = Server::start(anthropic, Mode::SlowTool).await;
+        let server = Server::start(anthropic, Mode::ShellApproval).await;
         let root = tempfile::tempdir().unwrap();
         use deepseek_code_core::services::{memory_files::FileMemory, EnvironmentCredentials, ServiceContext};
         let context = ServiceContext::open(
@@ -109,17 +109,43 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         let memory = FileMemory::workspace(&context, root.path()).unwrap();
         memory.put("saffron.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
         let coord = root.path().join("coord");
-        let mut client = Client::start_in_project_capturing(root.path(), &server,
-            &["--allowed-tools", STEER_TOOL, "--coordination-dir", coord.to_str().unwrap()]);
+        let transport = Some((
+            server.url.as_str(),
+            if anthropic { "anthropic" } else { "openai" },
+        ));
+        let mut client = Client::launch_with(
+            root.path(),
+            transport,
+            &[
+                "--permission-mode",
+                "ask",
+                "--coordination-dir",
+                coord.to_str().unwrap(),
+            ],
+            Some(root.path()),
+            false,
+        );
         client.send(user("Run the slow probe")).await;
-        // The tool is now executing; the host corrects the turn while it runs.
-        client.frame("tool_start").await;
+        // Keep the tool pending while the SDK admits the correction on stdin.
+        let permission = client
+            .frame_with_timeout("control_request", Duration::from_secs(60))
+            .await;
+        assert_eq!(permission["request"]["tool_name"], STEER_TOOL);
         std::fs::write(memory.directory.join("MEMORY.md"), "steer-index-marker").unwrap();
         client
             .send(user("saffron: Skip the rest and answer STEERED now"))
             .await;
-        let delivered = client.frame("queued_input").await;
-        assert_eq!(delivered["text"], "saffron: Skip the rest and answer STEERED now");
+        client.send(json!({
+            "type":"control_response",
+            "response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":"allow"}}
+        })).await;
+        let delivered = client
+            .frame_with_timeout("queued_input", Duration::from_secs(60))
+            .await;
+        assert_eq!(
+            delivered["text"],
+            "saffron: Skip the rest and answer STEERED now"
+        );
         assert!(
             delivered["origin"]
                 .as_str()
@@ -182,7 +208,18 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         assert_eq!(queue[0].mode, QueueMode::Steer);
         assert_eq!(queue[0].state, QueueState::Handoff, "{queue:?}");
 
-        let mut resumed = Client::start(root.path(), &server, &["--resume", session_id]);
+        let mut resumed = Client::launch_with(
+            root.path(),
+            transport,
+            &[
+                "--resume",
+                session_id,
+                "--coordination-dir",
+                coord.to_str().unwrap(),
+            ],
+            Some(root.path()),
+            false,
+        );
         resumed.send(user("one last question")).await;
         assert_eq!(resumed.result().await["is_error"], false);
         assert!(resumed.finish().await.0.success());

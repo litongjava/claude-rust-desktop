@@ -636,7 +636,12 @@ struct Client {
 }
 impl Client {
     async fn frame(&mut self, kind: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        self.frame_with_timeout(kind, Duration::from_secs(10)).await
+    }
+
+    async fn frame_with_timeout(&mut self, kind: &str, timeout: Duration) -> Value {
+        let mut seen = Vec::new();
+        tokio::time::timeout(timeout, async {
             loop {
                 let line = self
                     .output
@@ -649,13 +654,14 @@ impl Client {
                     frame["type"] != "result" || kind == "result",
                     "Unexpected terminal result while waiting for {kind}: {frame}"
                 );
+                seen.push(frame["type"].clone());
                 if frame["type"] == kind {
                     return frame;
                 }
             }
         })
         .await
-        .unwrap()
+        .unwrap_or_else(|_| panic!("Timed out waiting for {kind}, received {seen:?}"))
     }
     fn start(root: &Path, server: &Server, extra: &[&str]) -> Self {
         if matches!(server.fixture.mode, Mode::RuntimeAgent) {

@@ -1260,6 +1260,9 @@ Windows 测试编译回归（Codex 04）：core 的 `--lib <filter>` 仍会编�
 
 隔离数据目录运行 `cargo test --locked -p deepseek-code-cli --test memory_files`：两个协议的本地模型 mock 必须在实际首个及恢复请求看到 MEMORY.md 索引和中文相关正文；普通 Read/Edit/Write/ApplyPatch 完成版本化维护，其他目录写入不继承免确认；Plan Read 成功而 Edit 拒绝；无归属 SQLite 哨兵不出现在请求，旧条目数量不变。core 跑 `services::memory_files::tests`、`file_memory`、`memory_scope_grant` 和原 `memory::files::tests`。运行 `cargo test --locked -p deepseek-code-core --lib -- memory prompt`。检查首条用户消息的项目说明后紧跟 MEMORY.md，超过 200 行或 25 KiB 时有截断提示。检索只绑定发起本轮的用户输入，最多五个文件。工具结果、任务通知、同伴消息、压缩和 hook 唤醒均不得触发检索。在两个协议下保存首条消息，手工修改磁盘索引后恢复同一会话，核对首条内容逐字一致，新索引提醒出现在本轮，系统消息内没有索引或摘录。
 
+运行 `cargo test --locked -p deepseek-code-core --lib memory_admission_request_matrix`，检查用户消息入库时绑定检索结果、生成消息跳过检索、原生及文本压缩后索引只出现一次，并逐字节比较三种协议在独立进程恢复前后的请求。运行 `cargo test --locked -p deepseek-code-cli --test sdk user_frame_during_a_tool_run_reaches_the_next_model_request`，检查运行中收到的 SDK 用户帧在工具续轮携带已存的附件。
+
+
 手工终端：`dcl --data-dir <临时数据> --path <临时项目> memory files list`；用 `put <name.md> <source.md> [--version HASH]` 创建/更新、delete 必须提供版本，过时版本失败。`/memory entries` 新建、编辑器保存、取消和删除确认；另一进程改相同文件后旧面板提交应报 Conflict。`/memory legacy` 与 flat memory 命令仅管理旧归档，不能误报为当前项目文件。Home 使用 `--session`，移动会话工作区后旧能力不能继续写；Plan 不创建记忆目录或修复磁盘索引。Windows 和真实终端的未执行项须独立列为未验证。
 ### 子代理结束时停止其后台 shell 任务
 

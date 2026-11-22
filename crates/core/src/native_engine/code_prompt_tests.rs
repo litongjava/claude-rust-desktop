@@ -210,7 +210,17 @@ async fn capture_history_request(
     reminders: Vec<String>,
     messages: Vec<Value>,
 ) -> Value {
-    use axum::{http::header, routing::post, Json, Router};
+    serde_json::from_slice(&capture_history_bytes(format, reminders, messages, Vec::new()).await)
+        .unwrap()
+}
+
+async fn capture_history_bytes(
+    format: &str,
+    reminders: Vec<String>,
+    messages: Vec<Value>,
+    entries: Vec<crate::services::turn_context::Entry>,
+) -> Vec<u8> {
+    use axum::{http::header, routing::post, body::Bytes, Router};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (provider, route, events) = match format {
@@ -230,15 +240,15 @@ async fn capture_history_request(
             chat_text_events("done"),
         ),
     };
-    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let requests = captured.clone();
     let responses = format == "responses";
     let app = Router::new().route(
         route,
-        post(move |Json(body): Json<Value>| {
+        post(move |body: Bytes| {
             let requests = requests.clone();
             async move {
-                requests.lock().await.push(body);
+                requests.lock().await.push(body.to_vec());
                 let mut stream = events
                     .into_iter()
                     .map(|event| format!("data: {event}\n\n"))
@@ -268,6 +278,7 @@ async fn capture_history_request(
         ReasoningMode::Standard,
     )
     .with_prompt_profile(PromptProfile::Code)
+    .with_turn_context(entries)
     .with_context_reminders(reminders)
     .with_conv_id(format!("instructions-{format}"));
     let (text, _) = tokio::time::timeout(Duration::from_secs(15), executor.execute())
@@ -275,10 +286,268 @@ async fn capture_history_request(
         .unwrap()
         .unwrap();
     server.abort();
+    let _ = server.await;
     assert_eq!(text, "done", "{format}");
     let captured = captured.lock().await;
     assert_eq!(captured.len(), 1, "{format}");
     captured[0].clone()
+}
+
+async fn memory_request_bytes(
+    shard: &crate::db::session_store::SessionDb,
+    protocol: &str,
+) -> Vec<u8> {
+    let format = if protocol == "anthropic" {
+        ApiFormat::Anthropic
+    } else {
+        ApiFormat::OpenAI
+    };
+    let (messages, boundary) = shard.read(|r| r.model_history(&format)).unwrap();
+    let (index, turns) =
+        crate::services::memory_files::prompt::replay(shard, boundary.as_deref(), &messages)
+            .unwrap();
+    capture_history_bytes(protocol, index.into_iter().collect(), messages, turns).await
+}
+
+/// Capture raw HTTP bodies. A separate invocation of the test executable reopens
+/// the same shard and compares the bytes while the edited files remain on disk.
+#[tokio::test]
+async fn memory_admission_request_matrix() {
+    use crate::db::session_store::Stores;
+    use crate::services::{compaction, input_queue::QueueMode, memory_files::FileMemory};
+    const CHILD: &str = "DCL_MEMORY_MATRIX_RESUME";
+    const ID: &str = "324adc65-222a-4929-a63f-5f557a32f271";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = std::path::PathBuf::from(root);
+        let shard = Stores::open(&root.join("data"))
+            .unwrap()
+            .open_session(ID)
+            .unwrap();
+        let protocol = std::env::var("DCL_MEMORY_MATRIX_PROTOCOL").unwrap();
+        let bytes = memory_request_bytes(&shard, &protocol).await;
+        assert_eq!(
+            bytes,
+            std::fs::read(root.join("request")).unwrap(),
+            "resumed HTTP body"
+        );
+        return;
+    }
+
+    for protocol in ["openai", "anthropic", "responses"] {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let context = crate::services::session_messages::context(&data).unwrap();
+        let memory = FileMemory::workspace(&context, &project).unwrap();
+        memory.put("matrix.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nSTORED-EXCERPT\n", None).unwrap();
+        let index = memory.directory.join("MEMORY.md");
+        std::fs::write(&index, "SESSION-INDEX").unwrap();
+        let shard = context
+            .db
+            .create_code_session(&project, "model", "provider", ID)
+            .unwrap();
+        let mut typed = Vec::new();
+        let mut generated = Vec::new();
+        for path in [
+            "turn start",
+            "tool continuation",
+            "steering",
+            "SDK frame",
+            "queued input",
+            "goal continuation",
+            "error resume",
+        ] {
+            let text = format!("{path} saffron");
+            match path {
+                "tool continuation" => {
+                    shard
+                        .write(|w| {
+                            let assistant = w.append("assistant", "")?;
+                            w.tool(
+                                &crate::db::message_repo::ToolCallRow {
+                                    id: "lookup".into(),
+                                    message_id: assistant,
+                                    name: "Read".into(),
+                                    input: Some("{}".into()),
+                                    output: Some("tool result".into()),
+                                    is_error: false,
+                                    sort_order: 0,
+                                },
+                                None,
+                            )
+                        })
+                        .unwrap();
+                }
+                "steering" | "queued input" => {
+                    let mode = if path == "steering" {
+                        QueueMode::Steer
+                    } else {
+                        QueueMode::NextTurn
+                    };
+                    let stale =
+                        (path == "steering").then(|| compaction::prepare(&shard, ID).unwrap());
+                    shard.enqueue(path, &json!(text), mode).unwrap();
+                    shard
+                        .delivery_owner()
+                        .unwrap()
+                        .next_queue(mode, (path == "steering").then_some("lookup"))
+                        .unwrap()
+                        .unwrap();
+                    if let Some(prepared) = stale {
+                        assert!(compaction::commit(&shard, prepared, "missing steer").is_err());
+                    }
+                    typed.push(text);
+                }
+                "goal continuation" | "error resume" => {
+                    shard
+                        .admit_prompt(
+                            &text,
+                            None,
+                            if path == "error resume" {
+                                "error_resume"
+                            } else {
+                                "goal_continuation"
+                            },
+                        )
+                        .unwrap();
+                    generated.push(text);
+                }
+                _ => {
+                    let content =
+                        (path == "SDK frame").then(|| json!([{"type":"text", "text":text}]));
+                    shard
+                        .admit_prompt(&text, content.as_ref(), "typed")
+                        .unwrap();
+                    typed.push(text);
+                }
+            }
+            let bytes = memory_request_bytes(&shard, protocol).await;
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let messages = body[if protocol == "responses" {
+                "input"
+            } else {
+                "messages"
+            }]
+            .as_array()
+            .unwrap();
+            if path == "tool continuation" {
+                let count = match protocol {
+                    "openai" => messages.iter().filter(|m| m["role"] == "tool").count(),
+                    "responses" => messages
+                        .iter()
+                        .filter(|m| m["type"] == "function_call_output")
+                        .count(),
+                    _ => messages
+                        .iter()
+                        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                        .filter(|block| block["type"] == "tool_result")
+                        .count(),
+                };
+                assert_eq!(count, 1, "{protocol} tool result");
+            }
+            for (texts, expect) in [(&typed, true), (&generated, false)] {
+                for text in texts {
+                    let message = messages
+                        .iter()
+                        .find(|m| m["content"].to_string().contains(text))
+                        .unwrap();
+                    // Anthropic may join adjacent user frames. Each typed text
+                    // must be followed by its own receipt before the next text.
+                    let content = message["content"].to_string();
+                    let suffix = content.split_once(text).unwrap().1;
+                    let end = typed
+                        .iter()
+                        .chain(&generated)
+                        .filter_map(|t| suffix.find(t))
+                        .min()
+                        .unwrap_or(suffix.len());
+                    assert_eq!(
+                        suffix[..end].contains("STORED-EXCERPT"),
+                        expect,
+                        "{protocol} {path}: {text}"
+                    );
+                }
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&bytes)
+                    .matches("STORED-EXCERPT")
+                    .count(),
+                typed.len(),
+                "{protocol} {path}"
+            );
+            assert_eq!(
+                bytes,
+                memory_request_bytes(&shard, protocol).await,
+                "{protocol} {path} retry"
+            );
+        }
+        for compact in [false, true] {
+            if compact {
+                std::fs::write(&index, "BOUNDARY-INDEX").unwrap();
+                let prepared = compaction::prepare(&shard, ID).unwrap();
+                assert_eq!(
+                    prepared.transcript.matches("STORED-EXCERPT").count(),
+                    typed.len()
+                );
+                assert!(!prepared.transcript.contains("SESSION-INDEX"));
+                if protocol == "responses" {
+                    let compact_input = shard
+                        .read(|r| r.native_summary_history(&ApiFormat::OpenAI))
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&compact_input)
+                            .unwrap()
+                            .matches("STORED-EXCERPT")
+                            .count(),
+                        typed.len()
+                    );
+                }
+                let native = (protocol == "responses").then(|| json!({"api":"openai-responses","compaction":true,"items":[{"type":"compaction","encrypted_content":"opaque-item"}]}));
+                shard
+                    .repository()
+                    .commit_compaction(
+                        &prepared,
+                        &compaction::GeneratedSummary {
+                            text: "summary".into(),
+                            native,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                shard
+                    .admit_prompt("after compaction saffron", None, "typed")
+                    .unwrap();
+            }
+            let bytes = memory_request_bytes(&shard, protocol).await;
+            if compact {
+                let request = String::from_utf8_lossy(&bytes);
+                assert_eq!(request.matches("BOUNDARY-INDEX").count(), 1);
+                assert_eq!(request.matches("STORED-EXCERPT").count(), 1);
+                assert!(!request.contains("SESSION-INDEX"));
+            }
+            std::fs::write(&index, "unadmitted disk edit").unwrap();
+            std::fs::write(root.path().join("request"), &bytes).unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(module_path!(), "::memory_admission_request_matrix")
+                        .split_once("::")
+                        .unwrap()
+                        .1,
+                ])
+                .env(CHILD, root.path())
+                .env("DCL_MEMORY_MATRIX_PROTOCOL", protocol)
+                .output()
+                .unwrap();
+            let output = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && output.contains("1 passed"),
+                "{output} {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+    }
 }
 
 #[tokio::test]
