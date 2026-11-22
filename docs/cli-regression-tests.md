@@ -913,6 +913,16 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 - 回放跨捕获缺口或 stdout/stderr 的真实 libtest 输出、相互矛盾的 pytest/Jest footer。摘要只引用来源可核对的原文，不计算任何测试计数或推断结果。固定种子生成双流、伪 footer、随机内容、无效 UTF-8 和随机截断边界；逐一校验行号、引文、原始字节数、行数和 16,000 字节消息预算。
 - 本地 OpenAI 和 Anthropic mock 覆盖普通调用、后台 TaskGet、恢复/分叉、手动压缩与关闭设置。核对原始事件、SQLite 记录、分页文本和游标；摘要仅出现在模型副本。
 
+### I41. Bash、TaskGet 与 Monitor 的长 base64
+
+```bash
+cargo test --locked -p deepseek-code-core --lib -- model_tool_output base64
+cargo test --locked -p deepseek-code-cli --test taskget_background cli_base64_foreground_and_background_results_recover_100_kib
+```
+
+- 本地模型分别运行前台 Bash、后台 Bash 加 TaskGet，输出 100 KiB 连续 base64。核对真实请求中没有载荷，按占位符给出的路径、行号读回原文。TaskGet 快照的 stdout、output、result 副本只计一次。Monitor 用真实脚本打印同样大小的第二行，按通知给出的 stdout.log 行号核对完整内容。
+- 普通载荷在 1023/1024 字节、data URI 在 255/256 字节检查边界。保留短结果的原始格式；保存失败时保留原文。Bash schema 无 raw 参数。混合普通长文本和 base64 时，按实际可见字节核对 I6 的省略数，单独核对 base64 块数和编码字节数。
+
 ## Shell 配置回归
 
 - 使用独立数据目录验证 `config set shell.*`、`config show`、`!` 和模型工具；环境变量优先于文件，显式工具 Shell 优先于默认值，无效配置不能静默回退。
