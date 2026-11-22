@@ -1,6 +1,6 @@
 //! Exercise compaction through a resumed CLI and the provider's HTTP interface.
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -54,7 +54,7 @@ impl Fixture {
     async fn serve(
         &self,
         window: u32,
-        respond: impl Fn(Value) -> Response + Send + Sync + 'static,
+        respond: impl Fn(Value, bool) -> Response + Send + Sync + 'static,
     ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -65,7 +65,12 @@ impl Fixture {
         )
         .unwrap();
         let respond = Arc::new(respond);
-        let endpoint = move |Json(body): Json<Value>| std::future::ready(respond(body));
+        let endpoint = move |headers: HeaderMap, Json(body): Json<Value>| {
+            let compact = headers
+                .get("x-dcl-request-kind")
+                .is_some_and(|kind| kind == "compaction");
+            std::future::ready(respond(body, compact))
+        };
         let app = Router::new().route("/v1/chat/completions", post(endpoint));
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
     }
@@ -142,18 +147,18 @@ async fn overflow(fail_summary: bool) {
     let file = fixture.memory.join("saffron.md");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let capture = requests.clone();
-    let server = fixture.serve(128_000, move |body| {
+    let server = fixture.serve(128_000, move |body, compact| {
         let mut calls = capture.lock().unwrap();
         calls.push((body["messages"].to_string(), admitted(&export(&data, &id))));
         if calls.len() == 2 {
             if !fail_summary { fs::write(&file, note(EDITED)).unwrap(); }
             return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"context_length_exceeded","message":"prompt is too long"}}))).into_response();
         }
-        if body["stream"] != true {
+        if compact {
             if fail_summary {
                 return (StatusCode::FORBIDDEN, Json(json!({"error":{"message":"summary refused"}}))).into_response();
             }
-            return Json(json!({"id":"summary","object":"chat.completion","created":0,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"compacted"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})).into_response();
+            return answer("compacted");
         }
         answer("done")
     }).await;
@@ -233,7 +238,7 @@ async fn compressed_chat(large: bool, edited: bool) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let capture = requests.clone();
     let server = fixture
-        .serve(12_800, move |body| {
+        .serve(12_800, move |body, _| {
             assert_eq!(body["stream"], true);
             capture.lock().unwrap().push(body["messages"].to_string());
             if large {
@@ -303,7 +308,7 @@ async fn receipt_after_text_boundary_supersedes_all_earlier_indexes() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     let server = fixture
-        .serve(128_000, move |body| {
+        .serve(128_000, move |body, _| {
             captured.lock().unwrap().push(body["messages"].clone());
             answer("done")
         })
