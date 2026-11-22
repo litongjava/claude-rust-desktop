@@ -12,65 +12,146 @@ const DIGEST_BUDGET: usize = 2048;
 #[path = "command_output_summary.rs"]
 mod command_output_summary;
 
+/// Only actual overrides bypass a later light cut, including when a
+/// provider reuses a call ID. Keep fingerprints instead of copying image blocks.
+#[derive(Default, Clone)]
+pub(crate) struct AppliedOverrides(
+    std::collections::HashMap<String, std::collections::HashSet<[u8; 32]>>,
+);
+
+impl AppliedOverrides {
+    fn fingerprint(content: &Value) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        match content.as_str() {
+            Some(text) => Sha256::digest(text.as_bytes()).into(),
+            None => Sha256::digest(content.to_string().as_bytes()).into(),
+        }
+    }
+    pub(super) fn record(&mut self, id: &str, content: &Value) {
+        self.0
+            .entry(id.to_owned())
+            .or_default()
+            .insert(Self::fingerprint(content));
+    }
+    pub(crate) fn contains(&self, id: &str, content: &Value) -> bool {
+        self.0
+            .get(id)
+            .is_some_and(|views| views.contains(&Self::fingerprint(content)))
+    }
+}
+
 impl super::ToolLoopExecutor {
-    /// Called by both provider builders, after typed MCP/image restoration.
-    pub(super) fn prepare_history_tool_outputs(&self, messages: &mut [Value]) {
-        let mut names = std::collections::HashMap::<String, String>::new();
-        for message in messages {
-            if let Some(calls) = message["tool_calls"].as_array() {
-                for call in calls {
-                    if let (Some(id), Some(name)) =
-                        (call["id"].as_str(), call["function"]["name"].as_str())
-                    {
-                        names.insert(id.into(), name.into());
-                    }
+    pub(super) fn queued_model_content(
+        &mut self,
+        inputs: Vec<crate::services::input_queue::DeliveredInput>,
+    ) -> Vec<Value> {
+        inputs
+            .into_iter()
+            .map(|input| {
+                let original = super::monitor_notification(&input.text).then(|| input.text.clone());
+                let content = input.model_content(
+                    self.search_config_path.as_deref().and_then(Path::parent),
+                    self.conv_id.as_deref().unwrap_or_default(),
+                );
+                if original
+                    .as_deref()
+                    .is_some_and(|raw| content.as_str().is_some_and(|text| text != raw))
+                {
+                    self.projected_results.record("", &content);
                 }
+                content
+            })
+            .collect()
+    }
+
+    /// Replace only complete results that actually collapsed. Ordinary history
+    /// retains its original size until the provider builder renders it.
+    pub(super) fn project_history(&mut self, messages: &mut [Value]) -> anyhow::Result<()> {
+        use crate::db::model_results::StoredContent;
+        let root = self.search_config_path.as_deref().and_then(Path::parent);
+        let session = self.conv_id.as_deref().unwrap_or_default();
+        let history = self.session_search_storage();
+        let cwd = std::path::PathBuf::from(self.get_workspace_cwd());
+        let overrides = &mut self.projected_results;
+        for message in messages.iter_mut() {
+            if let Some(window) = message.get_mut("provider_content") {
+                prepare_native_window(window, root, session);
             }
-            if message["role"] == "tool" {
-                if let (Some(name), Some(text)) = (
-                    message["tool_call_id"]
-                        .as_str()
-                        .and_then(|id| names.get(id)),
-                    message["content"].as_str(),
-                ) {
-                    message["content"] = Value::String(self.preview_tool_output_for_id(
-                        name,
-                        text,
-                        message["tool_call_id"].as_str(),
-                    ));
-                }
-            } else if let Some(blocks) = message["content"].as_array_mut() {
-                for block in blocks {
-                    if block["type"] == "tool_use" {
-                        if let (Some(id), Some(name)) =
-                            (block["id"].as_str(), block["name"].as_str())
-                        {
-                            names.insert(id.into(), name.into());
-                        }
-                    } else if block["type"] == "tool_result" {
-                        if let Some(name) =
-                            block["tool_use_id"].as_str().and_then(|id| names.get(id))
-                        {
-                            if let Some(text) = block["content"].as_str() {
-                                block["content"] = Value::String(self.preview_tool_output_for_id(
-                                    name,
-                                    text,
-                                    block["tool_use_id"].as_str(),
-                                ));
-                            } else {
-                                self.retain_content(name, &mut block["content"]);
-                            }
-                        }
+            if message["role"] == "user" {
+                let stored = message
+                    .as_object_mut()
+                    .and_then(|m| m.remove("_collapsed_monitor"))
+                    == Some(Value::Bool(true));
+                if let Some(content) = message.get_mut("content") {
+                    if stored || project_notification(content, root, session) {
+                        overrides.record("", content);
                     }
                 }
             }
         }
+        let mut prepare = |conn: Option<&rusqlite::Connection>| {
+            visit_history_outputs(messages, |name, id, content, openai, _| {
+                let stored = match conn {
+                    Some(conn) => {
+                        crate::db::model_results::provider_content(conn, session, id, name, openai)?
+                    }
+                    None => StoredContent::Missing,
+                };
+                let view = match stored {
+                    StoredContent::Ordinary => return Ok(false),
+                    StoredContent::Override(view) => view,
+                    StoredContent::Missing => {
+                        if let Some(raw) = content.as_str() {
+                            let Some(view) = crate::db::model_results::result_override(
+                                name,
+                                raw,
+                                root,
+                                session,
+                                Some(id),
+                                &cwd,
+                            ) else {
+                                return Ok(false);
+                            };
+                            Value::String(view.text)
+                        } else {
+                            if !project_result_content(name, content, root, session) {
+                                return Ok(false);
+                            }
+                            content.clone()
+                        }
+                    }
+                };
+                overrides.record(id, &view);
+                *content = view;
+                Ok(true)
+            })
+        };
+        if let Some(history) = history {
+            history.read(|conn, _| prepare(Some(conn)))
+        } else {
+            prepare(None)
+        }
+    }
+
+    pub(super) fn render_history(&self, messages: &mut [Value]) -> anyhow::Result<()> {
+        visit_history_outputs(messages, |name, id, content, openai, collapsed| {
+            if !collapsed {
+                if let Some(text) = content.as_str() {
+                    *content = Value::String(self.ordinary_preview(name, text, Some(id)));
+                } else if !openai {
+                    self.retain_content(name, content);
+                }
+            }
+            Ok(false)
+        })
     }
 
     pub(super) fn retain_content(&self, name: &str, content: &mut Value) {
         if let Some(text) = content.as_str() {
-            *content = Value::String(self.preview_tool_output(name, text));
-        } else if let Some(blocks) = content.as_array() {
+            *content = Value::String(self.ordinary_preview(name, text, None));
+            return;
+        }
+        if let Some(blocks) = content.as_array() {
             // Text-only MCP blocks share one budget. Images and opaque blocks stay intact.
             if blocks.iter().all(|block| {
                 block["type"] == "text"
@@ -82,10 +163,199 @@ impl super::ToolLoopExecutor {
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                *content = Value::String(self.preview_tool_output(name, &text));
+                *content = Value::String(self.ordinary_preview(name, &text, None));
             }
         }
     }
+}
+
+pub(crate) fn project_result_content(
+    name: &str,
+    content: &mut Value,
+    root: Option<&Path>,
+    session: &str,
+) -> bool {
+    if !super::eligible(name) {
+        return false;
+    }
+    let projected = match content {
+        Value::Array(_) => super::project_for_model(name, &content.to_string(), root, session)
+            .map(|view| serde_json::from_str(&view.text).unwrap_or(Value::String(view.text))),
+        Value::String(raw) => {
+            super::project_for_model(name, raw, root, session).map(|view| Value::String(view.text))
+        }
+        _ => None,
+    };
+    if let Some(projected) = projected {
+        *content = projected;
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn ordinary_preview(
+    tool_name: &str,
+    output: &str,
+    id: Option<&str>,
+    root: Option<&Path>,
+    cwd: &Path,
+) -> String {
+    if is_shell_result(tool_name) {
+        let enabled = crate::config::command_output::enabled(root, cwd);
+        let metadata = if enabled {
+            root.zip(id)
+                .and_then(|(root, id)| std::fs::read(metadata_path(root, id)).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        } else {
+            None
+        };
+        return command_preview(tool_name, output, root, metadata.as_ref(), enabled);
+    }
+    let cleaned = super::model_tool_output(tool_name, output);
+    // Read already selects the requested line range.
+    if let Some(root) = root.filter(|_| tool_name != "Read") {
+        let preview = super::compact_tool_output(tool_name, &cleaned);
+        crate::performance::retain_tool_output(root, &cleaned, &preview)
+    } else {
+        cleaned
+    }
+}
+
+fn project_text_blocks(
+    content: &mut Value,
+    mut project: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    let mut changed = false;
+    if let Some(blocks) = content.as_array_mut() {
+        for block in blocks
+            .iter_mut()
+            .filter(|block| matches!(block["type"].as_str(), Some("text" | "input_text")))
+        {
+            if let Some(view) = block["text"].as_str().and_then(&mut project) {
+                block["text"] = Value::String(view);
+                changed = true;
+            }
+        }
+    } else if let Some(view) = content.as_str().and_then(project) {
+        *content = Value::String(view);
+        changed = true;
+    }
+    changed
+}
+
+pub(crate) fn project_notification(
+    content: &mut Value,
+    root: Option<&Path>,
+    session: &str,
+) -> bool {
+    project_text_blocks(content, |text| {
+        if super::monitor_notification(text) {
+            super::project_for_model("Monitor", text, root, session).map(|v| v.text)
+        } else {
+            None
+        }
+    })
+}
+
+/// Keep the exact gateway reply for display and its model-facing window together.
+pub(crate) fn seal_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
+    if window["compaction"] != true || window["model_projected"] == true {
+        return;
+    }
+    let original = window["items"].clone();
+    prepare_native_window(window, root, session);
+    if window["items"] != original {
+        window["model_items"] = window["items"].take();
+        window["items"] = original;
+    }
+}
+
+// A saved Responses compact window can contain plaintext messages alongside
+// encrypted reasoning. Only identified results and Monitor text are projected.
+pub(crate) fn prepare_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
+    if let Some(items) = window.as_object_mut().and_then(|o| o.remove("model_items")) {
+        window["items"] = items;
+        return;
+    }
+    if window["compaction"] != true || window["model_projected"] == true {
+        return;
+    }
+    let Some(items) = window.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut names = std::collections::HashMap::<String, String>::new();
+    let mut changed = false;
+    for item in items {
+        if item["role"] == "user" {
+            if let Some(content) = item.get_mut("content") {
+                changed |= project_notification(content, root, session);
+            }
+        } else if item["type"] == "function_call" {
+            if let (Some(id), Some(name)) = (item["call_id"].as_str(), item["name"].as_str()) {
+                names.insert(id.into(), name.into());
+            }
+        } else if item["type"] == "function_call_output" {
+            if let Some(name) = item["call_id"].as_str().and_then(|id| names.get(id)) {
+                if let Some(output) = item.get_mut("output") {
+                    changed |= project_result_content(name, output, root, session);
+                }
+            }
+        }
+    }
+    if changed {
+        window["model_projected"] = Value::Bool(true);
+    }
+}
+
+fn visit_history_outputs(
+    messages: &mut [Value],
+    mut result: impl FnMut(&str, &str, &mut Value, bool, bool) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    let mut names = std::collections::HashMap::<String, String>::new();
+    for message in messages {
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for call in calls {
+                if let (Some(id), Some(name)) =
+                    (call["id"].as_str(), call["function"]["name"].as_str())
+                {
+                    names.insert(id.into(), name.into());
+                }
+            }
+        }
+        if message["role"] == "tool" {
+            if let Some((id, name)) = message["tool_call_id"]
+                .as_str()
+                .and_then(|id| names.get_key_value(id))
+            {
+                let collapsed = message.as_object_mut().unwrap().remove("_collapsed")
+                    == Some(Value::Bool(true));
+                if result(name, id, &mut message["content"], true, collapsed)? {
+                    message["_collapsed"] = Value::Bool(true);
+                }
+            }
+        } else if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for block in blocks {
+                if block["type"] == "tool_use" {
+                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
+                        names.insert(id.into(), name.into());
+                    }
+                } else if block["type"] == "tool_result" {
+                    if let Some((id, name)) = block["tool_use_id"]
+                        .as_str()
+                        .and_then(|id| names.get_key_value(id))
+                    {
+                        let collapsed = block.as_object_mut().unwrap().remove("_collapsed")
+                            == Some(Value::Bool(true));
+                        if result(name, id, &mut block["content"], false, collapsed)? {
+                            block["_collapsed"] = Value::Bool(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> String {
@@ -348,7 +618,53 @@ pub(super) fn command_preview(
     metadata: Option<&CommandMetadata>,
     enabled: bool,
 ) -> String {
-    command_preview_with_room(name, raw, root, metadata, enabled, 0)
+    command_preview_with_room(name, raw, root, metadata, enabled, 0, &mut None)
+}
+
+pub(crate) fn projected_command_notes(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    id: Option<&str>,
+    cwd: &Path,
+) -> String {
+    let Some(root) = root else {
+        return String::new();
+    };
+    if !is_shell_result(name) || raw.len() < LONG_COMMAND_OUTPUT_BYTES {
+        return String::new();
+    }
+    let metadata = id
+        .and_then(|id| std::fs::read(metadata_path(root, id)).ok())
+        .and_then(|v| serde_json::from_slice(&v).ok());
+    let mut digest = None;
+    command_preview_with_room(
+        name,
+        raw,
+        Some(root),
+        metadata.as_ref(),
+        crate::config::command_output::enabled(Some(root), cwd),
+        0,
+        &mut digest,
+    );
+    let mut notes = String::new();
+    let cleaned = render(name, raw, None);
+    if cleaned.len() > MODEL_TOOL_OUTPUT_BYTES {
+        if let Ok(path) =
+            crate::performance::save_output_in(&root.join("tool-outputs"), cleaned.as_bytes())
+        {
+            notes = format!(
+                "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",
+                cleaned.len(),
+                super::model_projection::recovery_path(&path)
+            );
+        }
+    }
+    if let Some(digest) = digest {
+        notes.push_str("\n\n");
+        notes.push_str(&digest);
+    }
+    notes
 }
 
 fn command_preview_with_room(
@@ -358,6 +674,7 @@ fn command_preview_with_room(
     metadata: Option<&CommandMetadata>,
     enabled: bool,
     reserved: usize,
+    digest: &mut Option<String>,
 ) -> String {
     use command_output_summary::Stream;
     let bash = name == "Bash";
@@ -649,9 +966,24 @@ fn command_preview_with_room(
     };
     let appendix = encode(&summary);
     if appendix.len() > available && root.is_some() && reserved == 0 {
-        return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
+        return command_preview_with_room(
+            name,
+            raw,
+            root,
+            metadata,
+            enabled,
+            DIGEST_BUDGET,
+            digest,
+        );
     }
     if appendix.len() <= available {
+        *digest = Some(
+            summary
+                .lines()
+                .filter(|line| !line.contains(" | "))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         if json_result {
             base.insert_str(json_end - 1, &appendix);
         } else {
@@ -806,6 +1138,10 @@ fn shell_stem(value: &str) -> String {
 fn shell_matches(requested: &str, shell_path: &str) -> bool {
     shell_stem(requested) == shell_stem(shell_path)
 }
+
+#[cfg(test)]
+#[path = "model_projection_tests.rs"]
+mod projection_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1165,7 +1501,7 @@ mod tests {
         let engine = executor(temp.path());
         for name in ["PowerShell", "TaskGet"] {
             let raw = json!({
-                "stdout":format!("{}\nlast line", "x".repeat(12_300)),
+                "stdout":format!("{}\nlast line", ".".repeat(12_300)),
                 "stderr":"warning: retrying\nerror: stopped",
                 "exit_code":3,
                 "duration_ms":129,
@@ -1211,7 +1547,7 @@ mod tests {
     fn model_tool_output_complete_near_capacity_json_stays_intact() {
         let temp = tempfile::tempdir().unwrap();
         let engine = executor(temp.path());
-        let raw = json!({"stdout":"x".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
+        let raw = json!({"stdout":".".repeat(15_900), "next_cursor":"fixture", "exit_code":0})
             .to_string();
         assert!(raw.len() < MODEL_TOOL_OUTPUT_BYTES);
         assert_eq!(engine.retained_tool_output("TaskGet", &raw), raw);
@@ -1344,7 +1680,7 @@ mod tests {
         assert_eq!(render("ToolLoad", "plain text", None), "plain text");
     }
 
-    fn executor(root: &std::path::Path) -> ToolLoopExecutor {
+    pub(super) fn executor(root: &std::path::Path) -> ToolLoopExecutor {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let provider = ResolvedProvider {
             provider: serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),
@@ -1396,7 +1732,12 @@ mod tests {
             stdout: stream(&stdout),
             stderr: stream("FINAL ERROR"),
         };
-        save_metadata(temp.path(), occurrence, &CommandMetadata::Shell(capture)).unwrap();
+        save_metadata(
+            &paths.data_dir,
+            occurrence,
+            &CommandMetadata::Shell(capture),
+        )
+        .unwrap();
         store
             .db
             .fixture_shard(&id, |conn| {
@@ -1413,7 +1754,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let mut engine = executor(temp.path());
+        let mut engine = executor(&paths.data_dir);
         let fresh = engine.retained_tool_output_for_id("Bash", &raw, Some(occurrence));
         assert!(fresh.len() <= 16_000);
         for expected in [
@@ -1450,16 +1791,15 @@ mod tests {
                     &built[1]["content"][0]["content"]
                 };
                 assert_eq!(actual, &json!(fresh));
-                assert_eq!(engine.messages[1]["content"].as_str().unwrap_or(&raw), raw);
             }
         }
         assert_eq!(
-            std::fs::read_dir(temp.path().join("tool-outputs"))
+            std::fs::read_dir(paths.data_dir.join("tool-outputs"))
                 .unwrap()
                 .count(),
             1
         );
-        let spill = std::fs::read_dir(temp.path().join("tool-outputs"))
+        let spill = std::fs::read_dir(paths.data_dir.join("tool-outputs"))
             .unwrap()
             .next()
             .unwrap()

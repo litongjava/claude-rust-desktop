@@ -146,6 +146,9 @@ impl ToolLoopExecutor {
                 .collect::<serde_json::Result<_>>()?,
             self.system_prompt.as_deref().unwrap_or(""),
             self.conv_id.as_deref(),
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
         )
         .await?;
         let boundary = shard.commit_compaction_window(cut, &compacted)?;
@@ -153,6 +156,55 @@ impl ToolLoopExecutor {
             record.finish(&compacted, &boundary);
         }
         Ok(())
+    }
+
+    /// Native compaction for a request window that is not backed by the
+    /// durable shard. It changes only this request.
+    async fn compact_in_flight<M: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        mut input: Vec<Value>,
+    ) -> Result<Vec<M>> {
+        use crate::native_engine::request_recording::CompactionRecord;
+        let mut options = self
+            .openai_client
+            .request_options
+            .clone()
+            .compaction("native");
+        let mut record =
+            CompactionRecord::start(&mut options, "auto", &serde_json::to_string(&input)?);
+        self.remove_compaction_indexes(&mut input);
+        let compacted = crate::services::compaction::native::generate_messages_with_options(
+            &self.provider,
+            options,
+            input
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<serde_json::Result<_>>()?,
+            self.system_prompt.as_deref().unwrap_or(""),
+            self.conv_id.as_deref(),
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
+        )
+        .await?;
+        if let Some(record) = &mut record {
+            record.finish(&compacted, "in-flight-native-window");
+        }
+        let mut native = compacted.native;
+        if let Some(window) = native.as_mut() {
+            prepare_native_window(
+                window,
+                self.search_config_path
+                    .as_deref()
+                    .and_then(std::path::Path::parent),
+                self.conv_id.as_deref().unwrap_or_default(),
+            );
+        }
+        Ok(vec![serde_json::from_value(json!({
+            "role":"user",
+            "content":compacted.text,
+            "provider_content":native,
+        }))?])
     }
 
     // A live window can refresh its durable prefix. A summary already owns
@@ -188,17 +240,32 @@ impl ToolLoopExecutor {
         }
         let mut physical_cut = None;
         let mut persisted_len = window.len();
+        let mut durable_window = None;
         if let (Some(durable_len), Some(ExecutorHistory::Session(shard))) =
             (durable_len, self.executor_history.clone())
         {
+            let original = values(window)?;
             let additions = window.split_off(durable_len);
             physical_cut = self.reload_with_cut(&shard, true)?;
             *window = render(self, &self.message_additions())?;
             persisted_len = window.len();
+            let durable = values(window)?;
+            // An explicit request can carry a window that the durable shard does
+            // not contain (for example a replayed conversation). Compact that
+            // in-flight window instead of rewriting the stored history.
+            let matches = original.len() >= durable.len() && original[..durable.len()] == durable[..];
+            durable_window = (!matches).then_some(original);
             window.extend(additions);
-            rows = values(window)?;
+            rows = if native {
+                match &durable_window {
+                    Some(provided) => provided.clone(),
+                    None => values(window)?,
+                }
+            } else {
+                values(window)?
+            };
         }
-        let compressor = ContextCompressor::new(None);
+        let compressor = ContextCompressor::new(None).with_overrides(&self.projected_results);
         let estimated = TokenCounter::estimate(&rows);
         let level = compressor.determine_compression_level(&ContextWindow {
             model_id: self.provider.model.id.clone(),
@@ -212,6 +279,10 @@ impl ToolLoopExecutor {
         }
 
         if native {
+            if let Some(provided) = durable_window {
+                *window = self.compact_in_flight(provided).await?;
+                return Ok(());
+            }
             if durable_len.is_none() {
                 return Ok(());
             }

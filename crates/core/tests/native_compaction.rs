@@ -90,7 +90,12 @@ async fn fixture(mode: u8) -> Fixture {
             if mode == 2 { std::future::pending::<()>().await; }
             if mode == 6 { released.notified().await; }
             if mode == 1 || mode == 6 { return (StatusCode::BAD_GATEWAY, Json(json!({"error":"incomplete"}))); }
-            (StatusCode::OK, Json(json!({"object":"response.compaction","output":window(),"usage":{"input_tokens":150,"input_tokens_details":{"cached_tokens":112},"output_tokens":77}})))
+            (StatusCode::OK, Json(json!({"object":"response.compaction","output":if mode==7 {json!([
+                {"type":"function_call","call_id":"old","name":"TaskGet","arguments":"{}"},
+                {"type":"function_call_output","call_id":"old","output":format!("old page!{}!","QUJD".repeat(256))},
+                {"role":"user","content":[{"type":"input_text","text":format!("<task-notification>\n<kind>monitor</kind>\n<event>!{}!</event>\n</task-notification>","QUJD".repeat(256))}]},
+                {"type":"compaction","encrypted_content":"opaque exact content"}
+            ])} else {window()},"usage":{"input_tokens":150,"input_tokens_details":{"cached_tokens":112},"output_tokens":77}})))
         }
     }));
     let captured = seen.clone();
@@ -144,7 +149,7 @@ async fn fixture(mode: u8) -> Fixture {
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let provider: Provider = serde_json::from_value(json!({"id":"gateway","name":"gateway","builtin_id":"openai","api_format":"openai","base_url":format!("http://{}/tools/codex/v1",listener.local_addr().unwrap()),"api_key":"gateway-key","enabled":true,"models":[{"id":"gpt-6-astra","name":"model","api":"openai-responses","enabled":true,"supports_web_search":false,"max_tokens":8192,"context_window":if mode == 3 {16000} else {256000}}]})).unwrap();
+    let provider: Provider = serde_json::from_value(json!({"id":"gateway","name":"gateway","builtin_id":"openai","api_format":"openai","base_url":format!("http://{}/tools/codex/v1",listener.local_addr().unwrap()),"api_key":"gateway-key","enabled":true,"models":[{"id":"gpt-6-astra","name":"model","api":"openai-responses","enabled":true,"supports_web_search":false,"max_tokens":8192,"context_window":if matches!(mode,3|7) {16000} else {256000}}]})).unwrap();
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -655,3 +660,87 @@ async fn context_search_hint_requires_persisted_compaction_without_host_provenan
         .contains("Host continuation summary"));
     server.abort();
 }
+
+#[tokio::test]
+async fn base64_model_boundary_native_compaction_projects_stored_protocol_results() {
+    let Fixture {
+        dir: _dir,
+        store,
+        id,
+        engine,
+        seen,
+        server,
+        ..
+    } = fixture(0).await;
+    let assistant = store.append(&id, "assistant", "").unwrap();
+    let payload = "QUJD".repeat(256);
+    let page = format!("historical page\n!{payload}!");
+    let ordinary = r#"{"stdout":"ordinary"}"#;
+    store
+        .db
+        .shard_sql(&id, |conn| {
+            for (index, (name, text)) in [("TaskGet", page.as_str()), ("Bash", ordinary)]
+                .into_iter()
+                .enumerate()
+            {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    conn,
+                    &format!("call{index}"),
+                    &assistant,
+                    name,
+                    Some("{}"),
+                    Some(text),
+                    false,
+                    index as i64,
+                )?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+    let notice = format!("<task-notification>\n<kind>monitor</kind>\n<event>!{payload}!</event>\n</task-notification>");
+    store.append(&id, "user", &notice).unwrap();
+    compaction::compact(&engine, &store.db, &id, "gateway", "gpt-6-astra", "")
+        .await
+        .unwrap();
+    let request = seen.lock().unwrap()[0].clone();
+    let items = request["input"].as_array().unwrap();
+    let page_view = items
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .find_map(|i| {
+            i["output"]
+                .as_str()
+                .filter(|text| text.starts_with("historical page"))
+        })
+        .unwrap();
+    let notice_view = items
+        .iter()
+        .filter(|i| i["role"] == "user")
+        .find_map(|i| {
+            i["content"][0]["text"]
+                .as_str()
+                .filter(|text| text.starts_with("<task-notification>"))
+        })
+        .unwrap();
+    for (view, raw, number) in [
+        (page_view, page.as_str(), 2),
+        (notice_view, notice.as_str(), 3),
+    ] {
+        assert!(!view.contains(&payload));
+        let (file, line) = view
+            .split_once("; full text: ")
+            .unwrap()
+            .1
+            .split_once(", line ")
+            .unwrap();
+        assert_eq!(line.split_once(']').unwrap().0, number.to_string());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+    }
+    assert!(items.iter().any(|i| i["output"] == ordinary));
+    server.abort();
+    let _ = server.await;
+}
+
+#[path = "native_compaction/model_output.rs"]
+mod model_output;

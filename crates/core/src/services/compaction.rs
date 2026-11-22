@@ -329,40 +329,11 @@ pub(crate) fn fingerprint_before(
     }
 
     for row in &rows {
-        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut entry = json!({"message": row, "tools": calls, "attachment_metadata": attachments});
-        use rusqlite::OptionalExtension;
-        if let Some(content) = conn
-            .query_row(
-                "SELECT content_json FROM message_user_content WHERE message_id=?1",
-                [&row.id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            entry["user_content"] = serde_json::from_str(&content)?;
-        }
-        for call in &calls {
-            if let Some(display) = call.output.as_deref() {
-                if let Some(output) =
-                    crate::native_engine::mcp_output::McpOutput::load(conn, id, &call.id, display)?
-                {
-                    entry["mcp_content"][&call.id] = output.content;
-                }
-            }
-            let notes = message_repo::tool_call_note(conn, &call.id)?;
-            let delivered = crate::services::input_queue::load_delivered(conn, &call.id)?;
-            if notes.is_some() || !delivered.is_empty() {
-                entry["tool_context"][&call.id] =
-                    json!({"approval_note":notes,"delivered":delivered});
-            }
-        }
-        serde_json::to_writer(&mut hasher, &entry)?;
-        hasher.write_all(b"\n")?;
+        message_repo::hash_history_entry(conn, row, &attachments, &mut hasher)?;
     }
     let digest = hasher.finalize();
     let fingerprint = digest
@@ -1115,6 +1086,53 @@ mod hook_tests {
             assert_eq!(events[2]["compact_summary"], "summary");
         }
     }
+    #[tokio::test]
+    async fn base64_model_boundary_hooked_summary_records_replayed_output() {
+        let (dir, service, store, id) = fixture();
+        configure(&service, "ok", "ok", "ok");
+        service
+            .db
+            .set_request_recording_policy(&id, true, false)
+            .unwrap();
+        let msg = store.append(&id, "assistant", "").unwrap();
+        let payload = "QUJD".repeat(256);
+        let raw = json!({"stdout":format!("header\n{payload}\n"),"exit_code":0}).to_string();
+        service
+            .db
+            .fixture_shard(&id, |c| {
+                message_repo::insert_tool_call(c, "bash", &msg, "Bash", None, Some(&raw), false, 0)
+            })
+            .unwrap()
+            .unwrap();
+        compact_hooks(
+            &service,
+            dir.path(),
+            &id,
+            "model",
+            "focus",
+            "manual",
+            None,
+            |focus, _before, options| async move {
+                assert!(focus.contains("keep exact paths"));
+                let (path, _) = options.compaction_record.unwrap();
+                let record: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                let input = record["before_messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["tool_call_id"] == "bash")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                assert!(input.contains("base64 data omitted"));
+                assert!(!input.contains(&payload));
+                Ok("summary".into())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn generation_failure_conflict_and_context_write_failure_preserve_old_context() {
         for failure in ["generation", "conflict", "context-write"] {

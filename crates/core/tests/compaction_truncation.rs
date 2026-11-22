@@ -808,7 +808,7 @@ async fn truncation_at_the_model_cap_splits_by_tokens_and_merges_in_order() {
         attach_tool_result(
             &fixture,
             "Bash",
-            &format!("TOOLRESULT {}", "x".repeat(40_000)),
+            &format!("TOOLRESULT {}", ".".repeat(40_000)),
         );
         let before = fixture.store.history(&fixture.id).unwrap();
         compaction::compact(
@@ -870,7 +870,7 @@ async fn truncation_at_the_model_cap_splits_by_tokens_and_merges_in_order() {
         );
         assert!(
             sent.iter()
-                .any(|body| body.to_string().contains("TOOLRESULT xxxx")),
+                .any(|body| body.to_string().contains("TOOLRESULT ....")),
             "{format}: the oversized tool result must reach the fragments"
         );
         assert!(

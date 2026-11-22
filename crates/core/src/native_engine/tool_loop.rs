@@ -290,6 +290,7 @@ pub struct ToolLoopExecutor {
     /// unavailable, as in SDK, Desktop and child sessions.
     context_usage: Option<(u64, u64)>,
     auto_history: Vec<Value>,
+    projected_results: model_output::AppliedOverrides,
     messages: Vec<Value>,
     /// The compact boundary the current `messages` were built from, supplied
     /// with them by the host. Never re-queried while a request is sent: the
@@ -337,7 +338,7 @@ pub struct ToolLoopExecutor {
     /// The first typed input in the active turn, including later steers.
     protected_input: Option<usize>,
     pending_inputs: Vec<String>,
-    replay_tools: Vec<crate::db::message_repo::ToolCallRow>,
+    replay_tools: Vec<crate::db::message_repo::ReplayToolRow>,
     tool_order: i64,
     standalone_frontend: bool,
     /// Hook context and skill content recorded for earlier user messages.
@@ -578,6 +579,15 @@ impl Drop for PermissionWaiterGuard {
 
 #[path = "model_tool_output.rs"]
 mod model_output;
+pub(crate) use model_output::{
+    prepare_native_window, project_notification, project_result_content, seal_native_window,
+};
+pub(crate) use model_output::{projected_command_notes, AppliedOverrides};
+#[path = "model_projection.rs"]
+mod model_projection;
+pub(crate) use model_projection::{
+    eligible, has_qualifying_result, monitor_notification, project_for_model, Projected, Recovery,
+};
 
 pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
@@ -651,10 +661,10 @@ fn compact_tool_output(tool_name: &str, output: &str) -> String {
                     .last()
                     .map(|(idx, ch)| idx + ch.len_utf8())
                     .unwrap_or(0);
-                format!(
-                    "{}... (truncated, {} bytes total)",
-                    &output[..safe_end],
-                    output.len()
+                crate::performance::placeholder_preview::prefix(
+                    output,
+                    safe_end,
+                    &format!("... (truncated, {} bytes total)", output.len()),
                 )
             } else {
                 output.to_string()
@@ -1619,6 +1629,7 @@ impl ToolLoopExecutor {
             context_usage: None,
             suggestion: None,
             auto_history: messages.clone(),
+            projected_results: Default::default(),
             model_selector: provider.model.id.clone(),
             provider,
             messages,
@@ -2782,57 +2793,68 @@ impl ToolLoopExecutor {
         self.retained_tool_output_for_id(tool_name, output, None)
     }
 
-    fn retained_tool_output_for_id(
-        &self,
-        tool_name: &str,
-        output: &str,
-        id: Option<&str>,
-    ) -> String {
-        self.record_tool_usage(tool_name);
-        self.preview_tool_output_for_id(tool_name, output, id)
-    }
-
-    fn preview_tool_output(&self, tool_name: &str, output: &str) -> String {
-        self.preview_tool_output_for_id(tool_name, output, None)
+    #[cfg(test)]
+    fn retained_tool_output_for_id(&self, name: &str, raw: &str, id: Option<&str>) -> String {
+        self.unsaved_override(name, raw, id)
+            .unwrap_or_else(|| self.ordinary_preview(name, raw, id))
     }
 
     fn summary_enabled(&self, root: Option<&std::path::Path>) -> bool {
         crate::config::command_output::enabled(root, std::path::Path::new(self.get_workspace_cwd()))
     }
 
-    fn preview_tool_output_for_id(
-        &self,
-        tool_name: &str,
+    fn unsaved_override(&self, name: &str, raw: &str, id: Option<&str>) -> Option<String> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        crate::db::model_results::result_override(
+            name,
+            raw,
+            root,
+            self.conv_id.as_deref().unwrap_or_default(),
+            id,
+            std::path::Path::new(self.get_workspace_cwd()),
+        )
+        .map(|v| v.text)
+    }
+
+    fn ordinary_preview(&self, name: &str, raw: &str, id: Option<&str>) -> String {
+        model_output::ordinary_preview(
+            name,
+            raw,
+            id,
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
+            std::path::Path::new(self.get_workspace_cwd()),
+        )
+    }
+
+    fn completed_model_text(
+        &mut self,
+        call: &PendingToolCall,
+        input: &Value,
         output: &str,
-        id: Option<&str>,
-    ) -> String {
-        let root = self.search_config_path.as_deref().and_then(|p| p.parent());
-        if model_output::is_shell_result(tool_name) {
-            let enabled = self.summary_enabled(root);
-            let metadata = if enabled {
-                root.zip(id)
-                    .and_then(|(root, id)| {
-                        std::fs::read(model_output::metadata_path(root, id)).ok()
-                    })
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            } else {
-                None
-            };
-            return model_output::command_preview(
-                tool_name,
-                output,
-                root,
-                metadata.as_ref(),
-                enabled,
-            );
-        }
-        let cleaned = model_tool_output(tool_name, output);
-        // Read already selects the requested line range.
-        if let Some(root) = root.filter(|_| tool_name != "Read") {
-            let preview = compact_tool_output(tool_name, &cleaned);
-            crate::performance::retain_tool_output(root, &cleaned, &preview)
+        failed: bool,
+    ) -> Result<String> {
+        self.record_tool_usage(&call.name);
+        let cwd = std::path::Path::new(self.get_workspace_cwd());
+        let view = if let (Some(history), Some(message)) = (
+            self.session_search_storage(),
+            self.parent_message_id.as_deref(),
+        ) {
+            history
+                .complete_model_result(message, &call.id, &call.name, input, output, failed, cwd)?
         } else {
-            cleaned
+            self.unsaved_override(&call.name, output, Some(&call.id))
+        };
+        if let Some(text) = view {
+            self.projected_results
+                .record(&call.provider_id, &Value::String(text.clone()));
+            Ok(text)
+        } else {
+            Ok(self.ordinary_preview(&call.name, output, Some(&call.id)))
         }
     }
 
@@ -2847,6 +2869,21 @@ impl ToolLoopExecutor {
         let Some(mut content) = content else {
             return Ok(None);
         };
+        let mut model = content.content.clone();
+        if project_result_content(
+            name,
+            &mut model,
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
+            self.conv_id.as_deref().unwrap_or_default(),
+        ) {
+            self.record_tool_usage(name);
+            content.model_content = Some(model.clone());
+        } else if !content.has_images() {
+            self.record_tool_usage(name);
+            self.retain_content(name, &mut model);
+        }
         if let Some(history) = self.session_search_storage() {
             let started = std::time::Instant::now();
             if self.parent_message_id.is_none() {
@@ -2859,12 +2896,7 @@ impl ToolLoopExecutor {
                     "save MCP tool output", history.id(), started, error,
                 ))?;
         }
-        // Images and structured blocks must remain real provider content. Only
-        // plain text can use the existing spill/preview representation.
-        if !content.has_images() {
-            self.record_tool_usage(name);
-            self.retain_content(name, &mut content.content);
-        }
+        content.content = model;
         Ok(Some(content))
     }
 
@@ -4102,6 +4134,16 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
+    fn prepare_model_input(&mut self) -> Result<()> {
+        let mut messages = std::mem::take(&mut self.messages);
+        let result = self.project_history(&mut messages);
+        if result.is_ok() {
+            self.auto_history = messages.clone();
+        }
+        self.messages = messages;
+        result
+    }
+
     pub(super) async fn restore_request_context(&mut self) -> Result<()> {
         if self
             .permission_manager
@@ -4142,7 +4184,34 @@ impl ToolLoopExecutor {
         self.restore_persisted_loaded_tools()?;
         self.restore_loaded_tools();
         self.exposed_tools = None;
-        Ok(())
+        self.prepare_model_input()
+    }
+
+    /// Tiered compression for a live window that has no durable transcript.
+    /// Durable windows are compressed from the same session view in replay.
+    fn compress_history(&mut self) {
+        let threshold = crate::config::OrchestrationConfig::token_threshold();
+        if !crate::services::compaction::native::supports(&self.provider)
+            && TokenCounter::exceeds_threshold(&self.messages, threshold)
+        {
+            self.messages = crate::memory::TieredCompressor::new().compress(&self.messages);
+        }
+        let safety_margin = 0.85;
+        let safe_limit = self
+            .provider
+            .model
+            .context_window
+            .map(|n| (n as f64 * safety_margin) as usize)
+            .unwrap_or_else(|| TokenCounter::get_safe_limit(&self.provider.model.id, safety_margin));
+        if !crate::services::compaction::native::supports(&self.provider)
+            && TokenCounter::estimate(&self.messages) > safe_limit
+        {
+            self.messages = crate::memory::TieredCompressor::new().compress_progressive(
+                &self.messages,
+                safe_limit,
+                TokenCounter::estimate,
+            );
+        }
     }
 
     fn apply_reasoning_prompt(&mut self) {
@@ -4156,6 +4225,9 @@ impl ToolLoopExecutor {
     }
 
     pub(super) async fn replay_request(&mut self) -> Result<super::followup::WireRequest> {
+        if self.executor_history.is_none() {
+            self.compress_history();
+        }
         match self.provider.provider.api_format {
             ApiFormat::Anthropic => {
                 let mut messages = self.build_anthropic_messages()?;
@@ -4205,6 +4277,9 @@ impl ToolLoopExecutor {
             self.provider.provider.id
         );
 
+        if self.executor_history.is_none() {
+            self.compress_history();
+        }
 
         // 提取最后一条用户消息用于记忆检索
         tracing::info!(module = "ToolLoop", "[E3] Extracting last user message...");
@@ -5890,6 +5965,15 @@ impl ToolLoopExecutor {
                                 manager.record_tool_success(self.conv_id.as_deref().unwrap_or(""));
                             }
                         }
+                        let content = match mcp {
+                            Some(value) => value.content,
+                            None => json!(self.completed_model_text(
+                                tc,
+                                &actual_input,
+                                &output_str,
+                                is_error
+                            )?),
+                        };
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -5900,13 +5984,6 @@ impl ToolLoopExecutor {
                                 is_error,
                             })
                             .await;
-                        let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output_for_id(
-                                &tc.name,
-                                &output_str,
-                                Some(&tc.id)
-                            ))
-                        });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
                             content,
@@ -6738,6 +6815,19 @@ impl ToolLoopExecutor {
                                 manager.record_tool_success(self.conv_id.as_deref().unwrap_or(""));
                             }
                         }
+                        if let Some(content) = &mcp {
+                            if content.model_content.is_some() {
+                                self.projected_results
+                                    .record(&tc.provider_id, &json!(content.openai_text()));
+                            }
+                            tool_images.extend(content.openai_images(&tc.id));
+                        }
+                        let compacted = match mcp {
+                            Some(value) => value.openai_text(),
+                            None => {
+                                self.completed_model_text(tc, &actual_input, &output_str, is_error)?
+                            }
+                        };
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -6748,12 +6838,6 @@ impl ToolLoopExecutor {
                                 is_error,
                             })
                             .await;
-                        if let Some(content) = &mcp {
-                            tool_images.extend(content.openai_images(&tc.id));
-                        }
-                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
-                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
-                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),
@@ -6861,7 +6945,7 @@ impl ToolLoopExecutor {
 
     pub(super) fn prepare_main_history(&self) -> Result<Vec<Value>> {
         let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.prepare_history_tool_outputs(&mut messages);
+        self.render_history(&mut messages)?;
         Ok(messages)
     }
 

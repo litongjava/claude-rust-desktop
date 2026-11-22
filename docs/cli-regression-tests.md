@@ -936,6 +936,21 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 - 回放跨捕获缺口或 stdout/stderr 的真实 libtest 输出、相互矛盾的 pytest/Jest footer。摘要只引用来源可核对的原文，不计算任何测试计数或推断结果。固定种子生成双流、伪 footer、随机内容、无效 UTF-8 和随机截断边界；逐一校验行号、引文、原始字节数、行数和 16,000 字节消息预算。
 - 本地 OpenAI 和 Anthropic mock 覆盖普通调用、后台 TaskGet、恢复/分叉、手动压缩与关闭设置。核对原始事件、SQLite 记录、分页文本和游标；摘要仅出现在模型副本。
 
+### I41. Bash、TaskGet 与 Monitor 的长 base64
+
+持久化每个工具结果时，先对完整结果应用 Read/WebFetch 共用的判定规则，再生成模型文本。普通编码串阈值为 1024 字节，data URI 为 256 字节。单个请求页或快照就是该次调用的完整结果。
+
+```bash
+cargo test --locked -p deepseek-code-core --lib -- base64_model_boundary base64_i6_cut base64_review_history base64_shell_thresholds
+cargo test --locked -p deepseek-code-core --test native_compaction
+cargo test --locked -p deepseek-code-cli --test taskget_background cli_base64_model_boundary_resumes_100_kib_shell_results
+```
+
+- 前台 Bash、超时转后台、TaskGet 快照与分页（含超过 1 MiB 的 PTY 日志）、新旧 Monitor 事件均检查普通内容、编码块、行号、原文 SHA-256 和请求重放。前台与后台的 100 KiB CLI 夹具通过本地模型检查新进程恢复。
+- 核对 I6 省略统计和保存路径。base64 恢复文件逐字节等于产生本次结果的完整文本，行号指向该文件中的物理行。会话目录无法写入时检查模型收到明确的读取错误，终端和存储仍保留原始结果。
+- 对旧的 TaskGet 页执行压缩和 ContextSearch，验证摘要冲突检测使用原始行，检索摘要保留可打开的路径。检查超过 8 MiB 的普通任务仍可分页检索，跨读取边界的非规范编码保持原样。检索路径取自存储字段，覆盖目录名包含 `, line ` 和 Unix 非 UTF-8 字节的情况。
+- native_compaction 使用本地网关检查带类型的文本数组、压缩后的第一个请求、两种上下文压力及部分摘要。单元测试检查带钩子的摘要、旧行只读回退和原始结果与模型文本的原子更新，并扫描模型、摘要和检索代码是否直接读取展示字段。
+
 ## Shell 配置回归
 
 - 使用独立数据目录验证 `config set shell.*`、`config show`、`!` 和模型工具；环境变量优先于文件，显式工具 Shell 优先于默认值，无效配置不能静默回退。

@@ -54,7 +54,9 @@ impl Stores {
         else {
             return Ok(None);
         };
-        let messages = self.open_listed(&entry)?.read(|r| r.messages())?;
+        let messages = self
+            .open_listed(&entry)?
+            .read(|r| crate::db::model_results::messages(r.0, id))?;
         Ok(Some((entry.conversation.model, messages)))
     }
 
@@ -100,7 +102,7 @@ impl DbManager {
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             let row = catalog::conversation_metadata(&tx, id)?;
-            let messages = history::get_messages_by_conversation(&tx, id)?;
+            let messages = crate::db::model_results::messages(&tx, id)?;
             Ok(if row.is_none() && messages.is_empty() {
                 None
             } else {

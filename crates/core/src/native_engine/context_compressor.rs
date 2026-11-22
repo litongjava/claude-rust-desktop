@@ -104,6 +104,7 @@ pub struct ConversationTurn {
 /// Context Compressor
 pub struct ContextCompressor {
     config: CompressionConfig,
+    overrides: super::tool_loop::AppliedOverrides,
 }
 
 // Keep byte budgets without cutting through a UTF-8 code point.
@@ -119,7 +120,13 @@ impl ContextCompressor {
     pub fn new(config: Option<CompressionConfig>) -> Self {
         Self {
             config: config.unwrap_or_default(),
+            overrides: Default::default(),
         }
+    }
+
+    pub(crate) fn with_overrides(mut self, overrides: &super::tool_loop::AppliedOverrides) -> Self {
+        self.overrides = overrides.clone();
+        self
     }
 
     /// Determine if and what level of compression is needed
@@ -214,7 +221,7 @@ impl ContextCompressor {
 
         for msg in &messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            
+
             // Skip empty assistant messages
             if role == "assistant" {
                 let empty = match msg.get("content") {
@@ -230,18 +237,22 @@ impl ContextCompressor {
             // Truncate long tool outputs
             if role == "tool" || role == "function" {
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if content.len() > self.config.max_tool_output_bytes {
-                    let safe_end = content.char_indices()
+                if content.len() > self.config.max_tool_output_bytes
+                    && !msg["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|id| self.overrides.contains(id, &msg["content"]))
+                {
+                    let safe_end = content
+                        .char_indices()
                         .take(self.config.max_tool_output_bytes)
                         .last()
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
-                    let truncated = &content[..safe_end];
+                    let notice = format!("... [truncated, {} bytes total]", content.len());
+                    let truncated = crate::performance::placeholder_preview::prefix(content, safe_end, &notice);
                     let mut compressed_msg = msg.clone();
                     if let Some(obj) = compressed_msg.as_object_mut() {
-                        obj.insert("content".to_string(), serde_json::json!(
-                            format!("{}... [truncated, {} bytes total]", truncated, content.len())
-                        ));
+                        obj.insert("content".to_string(), truncated.into());
                         obj.insert("_compressed".to_string(), serde_json::json!(true));
                     }
                     compressed.push(compressed_msg);
@@ -251,18 +262,20 @@ impl ContextCompressor {
             } else {
                 // Truncate very long messages
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if content.len() > self.config.max_message_content_chars && role == "user" {
-                    let safe_end = content.char_indices()
+                if content.len() > self.config.max_message_content_chars
+                    && role == "user"
+                    && !self.overrides.contains("", &msg["content"])
+                {
+                    let safe_end = content
+                        .char_indices()
                         .take(self.config.max_message_content_chars)
                         .last()
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
-                    let truncated = &content[..safe_end];
+                    let truncated = crate::performance::placeholder_preview::prefix(content, safe_end, "... [truncated]");
                     let mut compressed_msg = msg.clone();
                     if let Some(obj) = compressed_msg.as_object_mut() {
-                        obj.insert("content".to_string(), serde_json::json!(
-                            format!("{}... [truncated]", truncated)
-                        ));
+                        obj.insert("content".to_string(), truncated.into());
                         obj.insert("_compressed".to_string(), serde_json::json!(true));
                     }
                     compressed.push(compressed_msg);

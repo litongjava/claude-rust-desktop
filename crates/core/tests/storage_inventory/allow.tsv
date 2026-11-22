@@ -84,7 +84,7 @@ crates/core/src/super_agent/store.rs	with_conn	2	4583dad3617dde37503cba1a4d6a4e9
 crates/core/src/tools/agent_messages.rs	Connection::open	2	fbc2ec62ba77a36d521daba87010187165113634e2c9bc2b58104bf363d6a7f3	Independent named-agent mailbox database
 crates/core/src/tools/background_shell.rs	Connection::open	2	fe5c3a9773afa4eba60b834cb1537e6e835128797825309fdfcb67ca2cf22d86	Colocated background_shell repository fixture
 crates/core/src/tools/context_search.rs	Connection::open	1	a8c4f14fa397a031189e3aaab4a269d400b3e0e194970914ce5f352b026f7f2d	Optional in-memory FTS candidate selection and repository fixture adapter
-crates/core/src/tools/context_search.rs	with_conn	1	6c4e10f65dbc1efec4c519d51e90e4a78d4783000836d7339e9beb7108086b3d	Optional in-memory FTS candidate selection and repository fixture adapter
+crates/core/src/tools/context_search.rs	with_conn	1	d16fd11ed25d97f8f1071c9cdbf76d557822462c5f61ce22eafa3117d0fcc90c	Optional in-memory FTS candidate selection and repository fixture adapter
 crates/core/src/tools/coordination.rs	Connection::open	1	4b6545bb10cd46282f5a60377bd075729f223f32c8c66260c37c1cdcb1dd8893	Independent coordination registry fixture
 crates/core/src/tools/monitor.rs	Connection::open	3	7c174759a5f46fb83495ef522bc9bb64af25553327380ce72856dfd24a63b049	Standalone task database for monitor state
 crates/core/src/tools/monitor_completion.rs	Connection::open	1	0be7acd37e776769f8229416b233309ab333a5af6f2f7b9c6e54452054765c6c	Close monitor records in the standalone task database

@@ -141,16 +141,16 @@ impl SessionDb {
     ) -> Result<crate::services::compaction::PreparedPart> {
         use crate::services::compaction::{Part, PreparedPart};
         self.read(|r| {
-            let rows = r.messages()?;
-            let index = rows.iter().position(|m| m.id == message)
+            let rows = crate::db::model_results::read_messages(r.0, self.id(), |row, collapsed| (row, collapsed))?;
+            let index = rows.iter().position(|(m, _)| m.id == message)
                 .context("Message not found in this conversation")?;
             let range = match part {
-                Part::UpTo => rows[..index].iter().rposition(|m| m.is_compact_boundary).unwrap_or(0)..index,
+                Part::UpTo => rows[..index].iter().rposition(|(m, _)| m.is_compact_boundary).unwrap_or(0)..index,
                 Part::From => index..rows.len(),
             };
             let selected = &rows[range];
             ensure!(!selected.is_empty(), "Nothing to summarize there");
-            for row in selected {
+            for (row, _) in selected {
                 let native: bool = r.0.query_row(
                     "SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",
                     [&row.id], |r| r.get(0),
@@ -475,27 +475,30 @@ impl Copier<'_> {
             }
             _ => None,
         };
-        let mut q = self.src.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages ORDER BY sort_order,rowid")?;
+        let mut q = self.src.prepare("SELECT id,role,content,thinking,created_at,is_compact_boundary,sort_order,model_content,model_recovery FROM messages ORDER BY sort_order,rowid")?;
+        let mut insert=self.dst.prepare_cached("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order,model_content,model_recovery) VALUES(?,?,?,?,?,?,?,?,?,?)")?;
         let mut count = 0;
-        for row in q.query_map([], message_repo::row_to_message)? {
-            let m = row?;
-            let id = self.assign("message", &m.id)?;
-            message_repo::insert_message(
-                self.dst,
-                &id,
+        let mut rows = q.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: String = row.get(0)?;
+            let id = self.assign("message", &old_id)?;
+            insert.execute(params![
+                id,
                 self.id,
-                &m.role,
-                &m.content,
-                m.thinking.as_deref(),
-                &m.created_at,
-                m.is_compact_boundary,
-                m.sort_order,
-            )?;
-            if m.role == "user" {
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+                row.get::<_, Value>(4)?,
+                row.get::<_, Value>(5)?,
+                row.get::<_, Value>(6)?,
+                row.get::<_, Value>(7)?,
+                row.get::<_, Value>(8)?
+            ])?;
+            if row.get::<_, String>(1)? == "user" {
                 crate::services::memory_files::prompt::copy_message(
                     self.src,
                     self.dst,
-                    &m.id,
+                    &old_id,
                     &id,
                     &self.session_dir,
                 )?;

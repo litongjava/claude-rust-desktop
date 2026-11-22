@@ -6,6 +6,7 @@ pub mod h5_repo;
 pub mod im_config_repo;
 pub mod im_permission_repo;
 pub mod message_repo;
+pub(crate) mod model_results;
 pub mod migration;
 pub mod permission_repo;
 pub mod project_repo;

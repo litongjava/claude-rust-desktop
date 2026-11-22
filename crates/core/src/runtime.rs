@@ -222,11 +222,12 @@ pub(crate) fn replay_history_with_ids(
     include_provenance: bool,
     before: Option<&str>,
 ) -> Result<(Vec<Value>, Option<String>)> {
-    let messages = message_repo::get_messages_by_conversation(conn, id)?;
+    let messages =
+        crate::db::model_results::read_messages(conn, id, |row, collapsed| (row, collapsed))?;
     let end = match before {
         Some(input) => messages
             .iter()
-            .position(|row| row.id == input)
+            .position(|(row, _)| row.id == input)
             .context("Admitted input missing")?,
         None => messages.len(),
     };
@@ -243,19 +244,27 @@ pub(crate) fn replay_history_with_ids(
 pub(crate) fn replay_rows(
     conn: &rusqlite::Connection,
     id: &str,
-    messages: &[message_repo::MessageRow],
+    messages: &[(message_repo::MessageRow, bool)],
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
     include_provenance: bool,
 ) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
-    let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
+    let start = messages
+        .iter()
+        .rposition(|(m, _)| m.is_compact_boundary)
+        .unwrap_or(0);
     let boundary = messages
         .get(start)
-        .filter(|m| m.is_compact_boundary)
-        .map(|m| m.id.clone());
-    for message in messages.iter().skip(start) {
-        if let Some(native) = native(&message.id)? {
+        .filter(|(m, _)| m.is_compact_boundary)
+        .map(|(m, _)| m.id.clone());
+    for (message, collapsed) in messages.iter().skip(start) {
+        if let Some(mut native) = native(&message.id)? {
+            crate::native_engine::tool_loop::prepare_native_window(
+                &mut native,
+                crate::db::model_results::data_root(conn)?.as_deref(),
+                id,
+            );
             let mut row =
                 json!({"role":message.role,"content":message.content,"provider_content":native});
             if include_provenance {
@@ -265,7 +274,7 @@ pub(crate) fn replay_rows(
             history.push(row);
             continue;
         }
-        let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
+        let mut calls = crate::db::model_results::replay_calls(conn, &message.id, id)?;
         // Nested ToolScript calls are history, not provider protocol:
         // the provider never emitted their ids, so replaying them would
         // fabricate an assistant tool_use with no matching requested
@@ -279,7 +288,11 @@ pub(crate) fn replay_rows(
                     let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
                     history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
                     for tool in &calls {
-                        history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)}));
+                        history.push(json!({
+                            "role":"tool",
+                            "tool_call_id":tool.id,
+                            "content":tool.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)
+                        }));
                     }
                     for tool in &calls {
                         if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? {
@@ -292,7 +305,7 @@ pub(crate) fn replay_rows(
                 ApiFormat::Anthropic => {
                     let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
                     history.push(json!({"role":"assistant","content":blocks}));
-                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
+                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.text.is_none()})).collect();
                     // Approval notes follow the results as the user's own text.
                     for tool in &calls {
                         if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
@@ -302,28 +315,50 @@ pub(crate) fn replay_rows(
             }
             for tool in &calls {
                 for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
-                    history.push(input.model_message());
+                    let mut message = input.model_message();
+                    message["content"] = input.model_content(
+                        crate::db::model_results::data_root(conn)?.as_deref(),
+                        id,
+                    );
+                    history.push(message);
                 }
             }
         }
         use rusqlite::OptionalExtension;
         let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
-        let row_at = history.len();
-        if let Some(content) = structured {
-            history.push(
-                json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}),
-            );
+        let mut collapsed = *collapsed;
+        let content = if let Some(json) = structured {
+            let mut content: Value = serde_json::from_str(&json)?;
+            if collapsed
+                && content
+                    .as_array()
+                    .is_some_and(|b| b.len() == 1 && b[0]["type"] == "text")
+            {
+                content[0]["text"] = Value::String(message.content.clone());
+            } else if message.role == "user" {
+                collapsed |= crate::native_engine::tool_loop::project_notification(
+                    &mut content,
+                    crate::db::model_results::data_root(conn)?.as_deref(),
+                    id,
+                );
+            }
+            content
         } else if !message.content.is_empty() {
-            history.push(json!({"role":message.role,"content":message.content}));
+            Value::String(message.content.clone())
+        } else {
+            continue;
+        };
+        let mut item = json!({"role":message.role,"content":content});
+        if collapsed {
+            item["_collapsed_monitor"] = Value::Bool(true);
         }
         if include_provenance && message.role == "user" {
-            if let Some(row) = history.get_mut(row_at) {
-                row["id"] = json!(message.id);
-                if let Some(origin) = crate::db::session_store::message_origin(conn, &message.id)? {
-                    row["origin"] = json!(origin);
-                }
+            item["id"] = json!(message.id);
+            if let Some(origin) = crate::db::session_store::message_origin(conn, &message.id)? {
+                item["origin"] = json!(origin);
             }
         }
+        history.push(item);
     }
     crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
     Ok((history, boundary))
@@ -561,9 +596,11 @@ impl SessionStore<DbManager> {
         id: &str,
         format: &ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.db.with_conn(|conn| replay_history(conn, id, format, |message| {
-            crate::services::compaction::native::load(conn, message)
-        }))?
+        self.db.with_conn(|conn| {
+            replay_history(conn, id, format, |message| {
+                crate::services::compaction::native::load(conn, message)
+            })
+        })?
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {

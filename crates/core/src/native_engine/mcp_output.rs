@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 pub(crate) struct McpOutput {
     pub content: Value,
     pub metadata: Value,
+    #[serde(skip)]
+    pub model_content: Option<Value>,
     #[serde(default)]
     display_body: Option<String>,
 }
@@ -37,6 +39,7 @@ impl McpOutput {
             content,
             metadata,
             display_body,
+            model_content: None,
         })
     }
 
@@ -77,15 +80,7 @@ impl McpOutput {
     /// Chat Completions tool messages are text-only. Images are emitted in a
     /// following user message after *all* pending tool-result messages.
     pub fn openai_text(&self) -> String {
-        if let Some(blocks) = self.content.as_array() {
-            blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            text(&self.content)
-        }
+        openai_text(&self.content)
     }
 
     pub fn openai_images(&self, id: &str) -> Vec<Value> {
@@ -124,20 +119,126 @@ impl McpOutput {
         display: &str,
         failed: bool,
     ) -> Result<()> {
-        conn.execute("INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) VALUES (?1,?2,?3,?4,?5,?6)", params![session,id,self.content.to_string(),self.metadata.to_string(),display,failed])?;
+        let json = self.content.to_string();
+        let view = if let Some(model) = &self.model_content {
+            Some(model.to_string())
+        } else {
+            let name=conn.query_row("SELECT t.name FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE t.id=?1 AND m.conversation_id=?2",[id,session],|r|r.get::<_,String>(0)).optional()?;
+            name.map(|name| sidecar_override(conn, session, &name, &json))
+                .transpose()?
+                .flatten()
+                .map(|v| v.to_string())
+        };
+        conn.execute("INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error,model_content_json) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![session,id,json,self.metadata.to_string(),display,failed,view])?;
         Ok(())
     }
 
     pub fn load(conn: &Connection, session: &str, id: &str, display: &str) -> Result<Option<Self>> {
-        let row: Option<(String, String)> = conn.query_row("SELECT content_json,metadata_json FROM mcp_tool_outputs WHERE conversation_id=?1 AND tool_use_id=?2 AND display_text=?3", params![session,id,display], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-        row.map(|(content, metadata)| {
+        // The caller can be holding the durable provider preview or the display
+        // text. Bind either spelling to this occurrence's original sidecar.
+        let row=conn.query_row("SELECT coalesce(s.model_content_json,s.content_json),s.metadata_json,s.model_content_json IS NOT NULL,t.name
+            FROM mcp_tool_outputs s LEFT JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text
+              AND EXISTS (SELECT 1 FROM messages m WHERE m.id=t.message_id AND m.conversation_id=s.conversation_id)
+            WHERE s.conversation_id=?1 AND s.tool_use_id=?2 AND (s.display_text=?3 OR t.model_output=?3)",
+            params![session,id,display],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
+        row.map(|(content, metadata, stored, name)| {
+            let mut content = serde_json::from_str(&content)?;
+            if !stored {
+                if let Some(name) = name {
+                    super::tool_loop::project_result_content(
+                        &name,
+                        &mut content,
+                        crate::db::model_results::data_root(conn)?.as_deref(),
+                        session,
+                    );
+                }
+            }
             Ok(Self {
-                content: serde_json::from_str(&content)?,
+                content,
                 metadata: serde_json::from_str(&metadata)?,
+                model_content: None,
                 display_body: Some(display.to_owned()),
             })
         })
         .transpose()
+    }
+}
+
+pub(crate) fn sidecar_override(
+    conn: &Connection,
+    session: &str,
+    name: &str,
+    raw: &str,
+) -> Result<Option<Value>> {
+    if !super::tool_loop::eligible(name) {
+        return Ok(None);
+    }
+    let mut content = serde_json::from_str(raw)?;
+    let collapsed = super::tool_loop::project_result_content(
+        name,
+        &mut content,
+        crate::db::model_results::data_root(conn)?.as_deref(),
+        session,
+    );
+    Ok(collapsed.then_some(content))
+}
+
+/// Previous builds also stored ordinary previews. Retain the exact bytes of
+/// projected sidecars (including recovery paths inherited through a fork).
+pub(crate) fn discard_ordinary_sidecars(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE mcp_tool_outputs SET model_content_json=NULL WHERE model_content_json=content_json",
+        [],
+    )?;
+    let mut query = conn.prepare("SELECT s.rowid, s.content_json, t.name FROM mcp_tool_outputs s
+        LEFT JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text
+              AND EXISTS (SELECT 1 FROM messages m WHERE m.id=t.message_id AND m.conversation_id=s.conversation_id)
+        WHERE s.model_content_json IS NOT NULL ORDER BY s.rowid")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: Option<String> = row.get(2)?;
+        let content: Value = serde_json::from_str(row.get_ref(1)?.as_str()?)?;
+        let raw = content
+            .as_str()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(content.to_string()));
+        if !name
+            .as_deref()
+            .is_some_and(|n| super::tool_loop::has_qualifying_result(n, &raw))
+        {
+            conn.execute(
+                "UPDATE mcp_tool_outputs SET model_content_json=NULL WHERE rowid=?1",
+                [row.get::<_, i64>(0)?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Stream metadata and typed content can arrive in either order. Bind the
+/// typed model copy as soon as the durable occurrence has a name.
+pub(crate) fn bind_pending(conn: &Connection, id: &str, name: &str) -> Result<()> {
+    let row=conn.query_row("SELECT s.conversation_id,s.content_json FROM mcp_tool_outputs s
+        JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text JOIN messages m ON m.id=t.message_id AND m.conversation_id=s.conversation_id
+        WHERE t.id=?1 AND s.model_content_json IS NULL",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
+    if let Some((session, raw)) = row {
+        let Some(view) = sidecar_override(conn, &session, name, &raw)? else {
+            return Ok(());
+        };
+        conn.execute("UPDATE mcp_tool_outputs SET model_content_json=?1 WHERE conversation_id=?2 AND tool_use_id=?3 AND content_json=?4 AND model_content_json IS NULL", params![view.to_string(),session,id,raw])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn openai_text(content: &Value) -> String {
+    if let Some(blocks) = content.as_array() {
+        blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text(content)
     }
 }
 

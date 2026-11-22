@@ -772,6 +772,7 @@ pub fn head_tail_preview(text: &str, limit: usize) -> String {
 
 pub(crate) mod command_lines;
 pub(crate) mod command_output;
+pub(crate) mod placeholder_preview;
 pub(crate) use command_output::LONG_COMMAND_OUTPUT_BYTES;
 
 /// The source ranges preserved by a head/tail preview, with their positions
@@ -808,30 +809,38 @@ pub(crate) fn preview_with_ranges(text: &str, limit: usize) -> (String, PreviewR
     if text.len() <= limit {
         return (text.to_owned(), PreviewRanges::whole(text.len()));
     }
-    let marker = format!(
-        "\n... (output truncated; {} bytes before preview) ...\n",
-        text.len()
-    );
-    if limit < marker.len() {
-        return ("...".chars().take(limit).collect(), PreviewRanges::whole(0));
-    }
-    let budget = limit - marker.len();
-    let head = text.floor_char_boundary(budget / 2);
-    let tail = text.ceil_char_boundary(text.len() - (budget - budget / 2));
-    (
-        format!("{}{}{}", &text[..head], marker, &text[tail..]),
-        PreviewRanges {
-            head: 0..head,
-            tail: tail..text.len(),
-            tail_offset: head + marker.len(),
-        },
-    )
+    placeholder_preview::head_tail(text, limit)
 }
 
 pub(crate) const MODEL_TOOL_OUTPUT_BYTES: usize = 16_000;
 
 pub fn retain_tool_output(root: &std::path::Path, output: &str, preview: &str) -> String {
     retain_tool_output_with_ranges(root, output, preview, MODEL_TOOL_OUTPUT_BYTES).0
+}
+
+/// Share a stable, complete spill between model previews and history replay.
+pub(crate) fn save_output_in(
+    directory: &std::path::Path,
+    output: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(directory)?;
+    // Stable paths keep replayed requests identical and avoid duplicate spills.
+    let digest = ring::digest::digest(&ring::digest::SHA256, output);
+    let key: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = directory.join(format!("{key}.txt"));
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == output) {
+        return Ok(path);
+    }
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(output)?;
+    file.as_file().sync_all()?;
+    file.persist(&path)?;
+    Ok(path)
 }
 
 /// No preview ranges are returned if persisting fails and the full original is used.
@@ -844,31 +853,7 @@ pub(crate) fn retain_tool_output_with_ranges(
     if output == preview && output.len() <= limit {
         return (output.to_string(), Some(PreviewRanges::whole(output.len())));
     }
-    let persist = || -> std::io::Result<std::path::PathBuf> {
-        use std::io::Write;
-        let directory = root.join("tool-outputs");
-        std::fs::create_dir_all(&directory)?;
-        // Stable paths keep replayed requests identical and avoid duplicate spills.
-        let digest = ring::digest::digest(&ring::digest::SHA256, output.as_bytes());
-        let key: String = digest
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let path = directory.join(format!("{key}.txt"));
-        if std::fs::read(&path).is_ok_and(|bytes| bytes == output.as_bytes()) {
-            return Ok(path);
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        file.write_all(output.as_bytes())?;
-        file.sync_all()?;
-        Ok(path)
-    };
-    match persist() {
+    match save_output_in(&root.join("tool-outputs"), output.as_bytes()) {
         Ok(path) => {
             let note = format!(
                 "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",

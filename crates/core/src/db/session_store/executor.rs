@@ -59,7 +59,7 @@ impl ExecutorHistory {
         }
     }
 
-    pub(super) fn read<T>(&self, f: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
+    pub(crate) fn read<T>(&self, f: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
         match self {
             Self::Session(session) => session.read(|r| f(r.0, session.id())),
             Self::Shared(db, id) => db.with_conn(|c| f(c, id))?,
@@ -91,7 +91,7 @@ impl ExecutorHistory {
     pub(crate) fn loaded_tool_results(&self) -> Result<Vec<String>> {
         self.read(|c, id| {
             let mut query = c.prepare_cached(
-                "SELECT t.output FROM tool_calls t JOIN messages m ON m.id=t.message_id
+                "SELECT coalesce(t.model_output,t.output) FROM tool_calls t JOIN messages m ON m.id=t.message_id
                  WHERE m.conversation_id=?1 AND m.role='assistant'
                    AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
                    AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
@@ -101,6 +101,63 @@ impl ExecutorHistory {
             let rows = query.query_map([id], |r| r.get(0))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
+    }
+
+    /// Finish the occurrence before publishing its display event. A later host
+    /// flush can update ordering or input while reusing these exact bytes.
+    pub(crate) fn complete_model_result(
+        &self,
+        message: &str,
+        occurrence: &str,
+        name: &str,
+        input: &Value,
+        output: &str,
+        failed: bool,
+        cwd: &std::path::Path,
+    ) -> Result<Option<String>> {
+        use rusqlite::params;
+        let id = format!("{message}:{occurrence}");
+        let save = |conn: &Connection| -> Result<Option<String>> {
+            conn.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
+                VALUES(?1,?2,'assistant','',?3,(SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))
+                ON CONFLICT(id) DO NOTHING",params![message,self.id(),chrono::Utc::now().to_rfc3339()])?;
+            anyhow::ensure!(
+                conn.query_row(
+                    "SELECT role='assistant' AND conversation_id=?2 FROM messages WHERE id=?1",
+                    params![message, self.id()],
+                    |r| r.get::<_, bool>(0)
+                )?,
+                "Result does not belong to this assistant message"
+            );
+            let order=conn.query_row("SELECT coalesce((SELECT sort_order FROM tool_calls WHERE id=?1),(SELECT coalesce(max(sort_order),-1)+1 FROM tool_calls WHERE message_id=?2))",params![id,message],|r|r.get(0))?;
+            crate::db::message_repo::store_tool_call(
+                conn,
+                &id,
+                message,
+                name,
+                Some(&input.to_string()),
+                Some(output),
+                failed,
+                order,
+                cwd,
+            )?;
+            Ok(conn.query_row(
+                "SELECT model_output FROM tool_calls WHERE id=?",
+                [&id],
+                |r| r.get(0),
+            )?)
+        };
+        match self {
+            Self::Session(session) => session.write_named("complete tool result", |w| save(w.0)),
+            Self::Shared(db, _) => db.with_conn(|conn| {
+                crate::db::write_tx(
+                    conn,
+                    "complete tool result",
+                    crate::db::STARTUP_WRITE_DEADLINE,
+                    |tx| save(tx),
+                )
+            })?,
+        }
     }
 
     pub(crate) fn save_mcp(

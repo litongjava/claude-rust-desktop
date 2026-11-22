@@ -588,6 +588,7 @@ impl QueryEngine {
                 session,
                 &provider,
                 instructions,
+                Some(self.db_manager.data_dir()),
                 options,
             )
             .await;

@@ -764,3 +764,71 @@ fn edited_target_no_longer_matches_reviewed_submission() {
     // Reviewing the pinned bytes still works; only delivery is blocked.
     prepare_non_git_review(&fixture.data, &fixture.task_id, 0, &submitted).unwrap();
 }
+
+#[test]
+fn base64_review_session_messages_use_collapsed_or_original_output() {
+    let f = Fixture::new();
+    let store = crate::runtime::SessionStore::new(f.context.db.clone());
+    let message = store.append(&f.coder, "assistant", "").unwrap();
+    let payload = "QUJD".repeat(256);
+    for (idx, stdout) in [format!("log!{payload}!"), "ordinary!".into()]
+        .iter()
+        .enumerate()
+    {
+        let raw = json!({"stdout":stdout, "stderr":"", "exit_code":0}).to_string();
+        let id = format!("call-{idx}");
+        f.context
+            .db
+            .fixture_shard(&f.coder, |conn| {
+                crate::db::message_repo::insert_tool_call(
+                    conn,
+                    &id,
+                    &message,
+                    "Bash",
+                    Some("{}"),
+                    Some(&raw),
+                    false,
+                    idx as i64,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let response = execute(
+            &f.runtime(&f.reviewer),
+            "SessionMessages",
+            json!({"session_id":f.coder}),
+        )
+        .unwrap();
+        let output = response["messages"][0]["tool_calls"][idx]["output"]
+            .as_str()
+            .unwrap();
+        if idx == 0 {
+            assert!(
+                output.contains("base64 data omitted") && !response.to_string().contains(&payload)
+            );
+            // The reader must consume the durable override even if recomputing the result would differ.
+            f.context
+                .db
+                .fixture_shard(&f.coder, |c| {
+                    c.execute(
+                        "UPDATE tool_calls SET model_output='stored review text' WHERE id=?1",
+                        [&id],
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let stored = execute(
+                &f.runtime(&f.reviewer),
+                "SessionMessages",
+                json!({"session_id":f.coder}),
+            )
+            .unwrap();
+            assert_eq!(
+                stored["messages"][0]["tool_calls"][idx]["output"],
+                "stored review text"
+            );
+        } else {
+            assert_eq!(output, raw);
+        }
+    }
+}

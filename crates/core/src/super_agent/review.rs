@@ -222,7 +222,7 @@ fn session_messages(
                     "id": call.id,
                     "name": call.name,
                     "input": call.input.as_deref().map(redact_text),
-                    "output": call.output.as_deref().map(redact_text),
+                    "output": call.text.as_deref().map(redact_text),
                     "is_error": call.is_error
                 })).collect::<Vec<_>>()
             })

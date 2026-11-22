@@ -22,6 +22,48 @@ pub struct DeliveredInput {
 }
 
 impl DeliveredInput {
+    pub fn resolve(data_dir: Option<&std::path::Path>, session: &str, text: String) -> Self {
+        let notification = text.starts_with(crate::tools::background_shell::NOTIFICATION_START);
+        // Internal notifications cannot name images from the user's clipboard registry.
+        let content = if notification {
+            None
+        } else {
+            data_dir.and_then(|root| content_with_images(root, session, &text))
+        }
+        .map(Value::Array)
+        .unwrap_or_else(|| json!(text));
+        let content = if crate::native_engine::tool_loop::monitor_notification(&text) {
+            crate::native_engine::tool_loop::project_for_model("Monitor", &text, data_dir, session)
+                .map_or(content, |v| json!(v.text))
+        } else {
+            content
+        };
+        Self {
+            message_id: None,
+            text,
+            content,
+            origin: if notification {
+                "task_notification"
+            } else {
+                "user"
+            }
+            .into(),
+            prompt_origin: None,
+        }
+    }
+
+    pub(crate) fn model_content(&self, root: Option<&std::path::Path>, session: &str) -> Value {
+        if self.content.as_str() == Some(&self.text)
+            && crate::native_engine::tool_loop::monitor_notification(&self.text)
+        {
+            if let Some(view) = crate::native_engine::tool_loop::project_for_model(
+                "Monitor", &self.text, root, session,
+            ) {
+                return json!(view.text);
+            }
+        }
+        self.content.clone()
+    }
     pub fn model_message(&self) -> Value {
         let origin = self
             .prompt_origin

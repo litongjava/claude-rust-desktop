@@ -3,8 +3,8 @@
 //! inspected so the advertised catalog and the tool result are both verified.
 #[path = "../../core/tests/support/session_sql.rs"]
 mod fixture_sql;
-use fixture_sql::FixtureSql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+use fixture_sql::FixtureSql;
 use serde_json::{json, Value};
 use std::{
     process::Stdio,
@@ -18,6 +18,7 @@ mod tool_loading;
 #[derive(Clone, Default)]
 struct Fixture {
     long_output: bool,
+    base64: bool,
     foreground: bool,
     raw_size: Option<usize>,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -81,7 +82,7 @@ async fn respond(
         requests.push(body.clone());
         requests.len() - 1
     };
-    if fixture.foreground && body["stream"] != true {
+    if (fixture.foreground || fixture.base64) && body["stream"] != true {
         return Json(json!({"id":"fixture-compact","object":"chat.completion","created":0,"model":"fixture-model",
             "choices":[{"index":0,"message":{"role":"assistant","content":"Preserved the shell output."},"finish_reason":"stop"}]})).into_response();
     }
@@ -110,8 +111,10 @@ async fn respond(
             "call-bash",
             "Bash",
             &json!({
-                "command": if fixture.foreground {
-                    "node -e \"console.log('i6-start');console.log('x'.repeat(7500));console.log('error: hidden in the model preview');console.log('x'.repeat(7500));console.log('warning: duplicated tail')\""
+                "command": if fixture.base64 {
+                    r#"node -e "const s=Buffer.from('ABC').toString('base64');process.stdout.write([s.repeat(256),s.repeat(25600),s.repeat(256)].join('!'))""#
+                } else if fixture.foreground {
+                    "node -e \"console.log('i6-start');console.log('.'.repeat(7500));console.log('error: hidden in the model preview');console.log('.'.repeat(7500));console.log('warning: duplicated tail')\""
                 } else if fixture.long_output {
                     REVIEW_PAGE_COMMAND
                 } else {
@@ -165,6 +168,7 @@ async fn respond(
                 }),
             )
         }
+        3 if fixture.base64 => text_frames("background output observed"),
         3 => {
             let result = last_tool_result(&body)
                 .unwrap_or_else(|| panic!("TaskGet result missing in request {body}"));
@@ -213,28 +217,106 @@ enum OptOut {
     Environment,
 }
 
+#[tokio::test]
+async fn cli_base64_model_boundary_resumes_100_kib_shell_results() {
+    for foreground in [true, false] {
+        run_shell(
+            Fixture {
+                foreground,
+                base64: true,
+                ..Fixture::default()
+            },
+            OptOut::None,
+        )
+        .await;
+    }
+}
+
 async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bool) {
+    run_shell(
+        Fixture {
+            foreground,
+            long_output,
+            ..Fixture::default()
+        },
+        opt_out,
+    )
+    .await;
+}
+
+// The shell fixture emits standard-alphabet data. A main/I6 cut can leave a
+// noncanonical fragment that still contains many copies of the original quartet.
+fn check_shell_payload(view: &str, phase: &str) {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    use base64::Engine as _;
+    for candidate in view.split(|c: char| !(c.is_ascii_alphanumeric() || "+/-_=".contains(c))) {
+        if candidate.len() >= 1024 && candidate.contains("QUJD") {
+            assert!(
+                STANDARD.decode(candidate).is_err() && STANDARD_NO_PAD.decode(candidate).is_err(),
+                "{phase}: canonical {}-byte candidate {:.12}…",
+                candidate.len(),
+                candidate
+            );
+        }
+    }
+}
+
+async fn resume_fixture(
+    data: &std::path::Path,
+    workspace: &std::path::Path,
+    id: &str,
+    prompt: &str,
+) {
+    let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
+    resume
+        .current_dir(workspace)
+        .args(["--print", "--output-format", "stream-json", "--data-dir"])
+        .arg(data)
+        .arg("--path")
+        .arg(workspace)
+        .args([
+            "--provider",
+            "fixture",
+            "--model",
+            "fixture-model",
+            "--resume",
+            id,
+            prompt,
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+async fn run_shell(fixture: Fixture, opt_out: OptOut) {
+    let (foreground, long_output) = (fixture.foreground, fixture.long_output);
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let fixture = Fixture {
-        long_output,
-        foreground,
-        ..Fixture::default()
-    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
         .route("/v1/chat/completions", post(respond))
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // Keep the raw historical snapshot below the automatic compaction threshold
+    // so the fixture can inspect replay and then request compaction explicitly.
+    let context_window = if fixture.base64 { 1_000_000 } else { 128_000 };
     std::fs::write(
         data.join("providers.json"),
         json!([{
             "id":"fixture","name":"Fixture","base_url":base,"api_key":"fixture-only",
             "api_format":"openai","enabled":true,
             "models":[{"id":"fixture-model","name":"Fixture","enabled":true,
-                "context_window":128000,"max_tokens":4096,
+                "context_window":context_window,"max_tokens":4096,
                 "supports_web_search":false,"supports_vision":false}]
         }])
         .to_string(),
@@ -323,6 +405,95 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
             4
         }
     );
+    if fixture.base64 {
+        let live = last_tool_content(requests.last().unwrap())
+            .unwrap()
+            .to_owned();
+        drop(requests);
+        assert!(live.contains("base64 data omitted"), "{live}");
+        check_shell_payload(&live, "live request");
+        let (path, line) = live
+            .split_once("; full text: ")
+            .unwrap()
+            .1
+            .split_once(", line ")
+            .unwrap();
+        let line = line.split_once(']').unwrap().0.parse::<usize>().unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved
+            .lines()
+            .nth(line - 1)
+            .unwrap()
+            .contains(&"QUJD".repeat(256)));
+        let note = live
+            .lines()
+            .find(|line| line.starts_with("Saved tool result ("))
+            .unwrap();
+        assert!(live.contains(note));
+        let i6_path = note.split_once("): ").unwrap().1;
+        assert!(std::fs::read_to_string(i6_path)
+            .unwrap()
+            .contains(&"QUJD".repeat(256)));
+
+        let public_events = String::from_utf8_lossy(&output.stdout);
+        assert!(public_events.contains(&"QUJD".repeat(256)));
+        assert!(!public_events.contains("[base64 data omitted"));
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap();
+        let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let raw = store
+            .db
+            .shard_sql(&id, |conn| {
+                conn.query_row(
+                    "SELECT output FROM tool_calls WHERE name=?1",
+                    [if foreground { "Bash" } else { "TaskGet" }],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(raw.contains(&"QUJD".repeat(256)));
+        assert!(!raw.contains("[base64 data omitted"));
+        assert_eq!(saved, raw);
+        drop(store);
+
+        resume_fixture(&data, root.path(), &id, "Replay the fixture").await;
+        let replay = fixture.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            last_tool_content(&replay),
+            Some(live.as_str()),
+            "fresh process replay"
+        );
+        let start = fixture.requests.lock().unwrap().len();
+        resume_fixture(&data, root.path(), &id, "/compact Keep the fixture command").await;
+        let session_outputs = std::path::Path::new(path).parent().unwrap();
+        let compaction_file = std::fs::read_dir(session_outputs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|file| std::fs::read(file).unwrap() == raw.as_bytes())
+            .expect("the historical row was saved exactly before compaction");
+        // The model receives the transcript as JSON text inside a user message.
+        let quoted_path = serde_json::to_string(&compaction_file).unwrap();
+        let transcript_path = &quoted_path[1..quoted_path.len() - 1];
+        let requests = fixture.requests.lock().unwrap();
+        let mut found_reference = false;
+        for request in &requests[start..] {
+            for message in request["messages"].as_array().unwrap() {
+                if let Some(text) = message["content"].as_str() {
+                    check_shell_payload(text, "compaction message");
+                    found_reference |=
+                        text.contains("[base64 data omitted") && text.contains(transcript_path);
+                }
+            }
+        }
+        assert!(
+            found_reference,
+            "the compaction request must name the stored row"
+        );
+        drop(requests);
+        server.abort();
+        let _ = server.await;
+        return;
+    }
     if foreground {
         let summary = requests[1]["messages"]
             .as_array()
@@ -363,33 +534,7 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
         let summary = summary.to_owned();
         drop(requests);
         for prompt in ["Replay the fixture", "/compact Keep the fixture command"] {
-            let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
-            resume
-                .current_dir(root.path())
-                .args(["--print", "--output-format", "stream-json", "--data-dir"])
-                .arg(&data)
-                .arg("--path")
-                .arg(root.path())
-                .args([
-                    "--provider",
-                    "fixture",
-                    "--model",
-                    "fixture-model",
-                    "--resume",
-                    &id,
-                    prompt,
-                ])
-                .stdin(Stdio::null())
-                .kill_on_drop(true);
-            let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+            resume_fixture(&data, root.path(), &id, prompt).await;
         }
         server.abort();
         let requests = fixture.requests.lock().unwrap();

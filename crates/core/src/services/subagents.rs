@@ -321,7 +321,7 @@ mod tests {
         let conn = fixture();
         let content = json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}}]);
         conn.execute(
-            "INSERT INTO mcp_tool_outputs VALUES('child','message:tool',?1,'{}','image',0)",
+            "INSERT INTO mcp_tool_outputs(conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) VALUES('child','message:tool',?1,'{}','image',0)",
             [content.to_string()],
         )
         .unwrap();

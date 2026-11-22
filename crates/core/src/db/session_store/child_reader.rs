@@ -285,18 +285,24 @@ impl super::ExecutorHistory {
     ) -> Result<
         Vec<(
             crate::db::message_repo::MessageRow,
-            Vec<crate::db::message_repo::ToolCallRow>,
+            Vec<crate::db::model_results::ModelCall>,
         )>,
     > {
         use crate::db::message_repo;
-        self.read(|c,id|{
-            let snapshot=if c.is_autocommit(){Some(c.unchecked_transaction()?)}else{None};
-            let c=snapshot.as_deref().unwrap_or(c);
-            let mut q=c.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages
-                WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order,rowid LIMIT ?3")?;
-            let mut rows=q.query(rusqlite::params![id,cursor,limit])?;
-            let mut found=Vec::new();
-            while let Some(r)=rows.next()?{let message=message_repo::row_to_message(r)?;let calls=message_repo::get_tool_calls_for_message(c,&message.id)?;found.push((message,calls));}
+        self.read(|conn, session| {
+            let snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
+            let conn = snapshot.as_deref().unwrap_or(conn);
+            let mut query = conn.prepare(
+                "SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages
+                 WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order,rowid LIMIT ?3")?;
+            let mut rows = query.query(rusqlite::params![session, cursor, limit])?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next()? {
+                let mut message = message_repo::row_to_message(row)?;
+                message.content = crate::db::model_results::message_text(conn, &message)?;
+                let calls = crate::db::model_results::calls(conn, &message.id, session)?;
+                found.push((message, calls));
+            }
             Ok(found)
         })
     }
