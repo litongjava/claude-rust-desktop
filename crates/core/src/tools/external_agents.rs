@@ -115,6 +115,11 @@ fn model(input: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+// Claude and Codex accept the literal task after their option terminator.
+fn external_prompt(task: &str) -> [String; 2] {
+    ["--".into(), task.into()]
+}
+
 fn arguments(
     agent: &Agent,
     input: &Value,
@@ -141,7 +146,13 @@ fn arguments(
             if let Some(model) = model(input) {
                 args.extend(["--model".into(), model]);
             }
-            args.extend(["--".into(), prompt.into()]);
+            if agent.command == "dcl" {
+                args.extend(
+                    crate::services::background_sessions::PromptOrigin::Generated.arguments(prompt),
+                );
+            } else {
+                args.extend(external_prompt(prompt));
+            }
         }
         _ => {
             // Codex options belong to `exec` before its `resume` subcommand;
@@ -163,7 +174,7 @@ fn arguments(
                 args.push("resume".into());
                 args.push(session.clone());
             }
-            args.extend(["--".into(), prompt.into()]);
+            args.extend(external_prompt(prompt));
         }
     }
     Ok(args)
@@ -506,6 +517,22 @@ mod tests {
 
     fn codex() -> &'static Agent {
         &AGENTS[2]
+    }
+
+    #[test]
+    fn external_dcl_marks_its_directive_generated() {
+        let agent = AGENTS.iter().find(|agent| agent.command == "dcl").unwrap();
+        let args = arguments(
+            agent,
+            &serde_json::json!({}),
+            "--directive",
+            ".",
+            Path::new("out"),
+        )
+        .unwrap();
+        assert!(args.ends_with(
+            &crate::services::background_sessions::PromptOrigin::Generated.arguments("--directive")
+        ));
     }
 
     #[test]

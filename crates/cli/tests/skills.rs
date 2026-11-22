@@ -245,6 +245,16 @@ async fn slash_skills_expand_once_fork_without_parent_history_and_reject_private
             assert_eq!(result["is_error"], false);
             if extra.contains("context: fork") {
                 assert_ne!(result["child_session_id"], parent);
+                let rows = store
+                    .model_history(
+                        result["child_session_id"].as_str().unwrap(),
+                        &deepseek_code_core::native_engine::provider_manager::ApiFormat::OpenAI,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    rows.iter().find(|r| r["role"] == "user").unwrap()["origin"],
+                    "generated"
+                );
                 assert!(result["task_id"].is_string());
                 assert_eq!(store.history(&parent).unwrap().len(), 1);
             }

@@ -208,6 +208,16 @@ async fn real_child_runs_in_the_prepared_workspace_and_resumes_there() {
     .await
     .unwrap();
     wait_for_job(&data, &first.job_id).await;
+    let rows = sessions
+        .model_history(
+            &first.session_id,
+            &deepseek_code_core::native_engine::provider_manager::ApiFormat::OpenAI,
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r["content"] == "first run").unwrap()["origin"],
+        "delegation"
+    );
     let canonical = child_workspace.canonicalize().unwrap();
     assert_eq!(
         std::fs::read_to_string(&first_out).unwrap().trim(),

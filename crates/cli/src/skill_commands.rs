@@ -314,7 +314,7 @@ pub async fn prepare_invocation(
     let instructions = directory.join(format!("{child_id}.md"));
     file.persist(&instructions)?;
     let provider = session.launch_provider().await?;
-    let mut arguments = crate::background_commands::arguments(cli, &session.paths, session, &child_id, "Execute the selected skill in the appended instructions. Report the result concisely. Shell context was already expanded; do not rerun it.", &provider)?;
+    let mut arguments = crate::background_commands::arguments(cli, &session.paths, session, &child_id, "Execute the selected skill in the appended instructions. Report the result concisely. Shell context was already expanded; do not rerun it.", crate::session::TurnOrigin::Generated, &provider)?;
     let position = arguments
         .iter()
         .position(|argument| argument == "--")

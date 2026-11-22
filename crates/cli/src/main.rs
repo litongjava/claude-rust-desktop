@@ -1541,7 +1541,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 Err(error) => { command_eprintln!("Error: {error:#}"); continue; },
                 Ok(false) => {},
             }
-            match background_commands::handle(cli, command, argument, &paths, &mut session, &mut input).await {
+            match background_commands::handle(cli, command, argument, input_origin(scheduled, argument.trim()), &paths, &mut session, &mut input).await {
                 Ok(background_commands::Outcome::Handled) => continue,
                 Ok(background_commands::Outcome::Exit) => break,
                 Err(error) => { report_error(error)?; continue; },

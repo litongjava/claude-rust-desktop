@@ -43,6 +43,9 @@ pub struct Cli {
     pub maintenance: bool,
     /// Initial prompt; piped stdin is appended in non-interactive mode.
     pub prompt: Option<String>,
+    /// Origin of the positional prompt forwarded to this process.
+    #[arg(long, default_value = "typed")]
+    pub prompt_origin: deepseek_code_core::services::background_sessions::PromptOrigin,
     #[command(subcommand)]
     pub command: Option<Commands>,
     /// Project directory (defaults to the current directory).

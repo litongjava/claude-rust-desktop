@@ -200,6 +200,16 @@ async fn exercise(cancel: bool) {
                 .unwrap()
                 .unwrap();
             assert_eq!(value, denied);
+            if !cancel {
+                let rows = store
+                    .model_history(
+                        session,
+                        &deepseek_code_core::native_engine::provider_manager::ApiFormat::OpenAI,
+                    )
+                    .unwrap();
+                let directive = rows.iter().find(|row| row["role"] == "user").unwrap();
+                assert_eq!(directive["origin"], "generated");
+            }
         }
     }
     assert!(!repo.join("module-0").exists());

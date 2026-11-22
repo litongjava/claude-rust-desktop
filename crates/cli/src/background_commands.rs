@@ -19,6 +19,7 @@ pub async fn handle(
     cli: &Cli,
     command: &str,
     argument: &str,
+    origin: crate::session::TurnOrigin<'_>,
     paths: &RuntimePaths,
     session: &mut Session,
     input: &mut Option<crate::terminal::input::TerminalInput>,
@@ -92,7 +93,7 @@ pub async fn handle(
                 .workspace(&child_id, &paths.data_dir.join("workspaces"))?;
             let executable = std::env::current_exe()?;
             let provider = session.launch_provider().await?;
-            let arguments = arguments(cli, paths, session, &child_id, prompt, &provider)?;
+            let arguments = arguments(cli, paths, session, &child_id, prompt, origin, &provider)?;
             let environment = worker_environment(session.auto_route, &provider)?;
             let job = background_sessions::spawn(
                 &paths.data_dir,
@@ -909,6 +910,7 @@ pub(crate) fn arguments(
     session: &Session,
     child_id: &str,
     prompt: &str,
+    origin: crate::session::TurnOrigin<'_>,
     provider: &deepseek_code_core::native_engine::provider_manager::ResolvedProvider,
 ) -> Result<Vec<String>> {
     let mut args = vec!["--provider".into(), provider.provider.id.clone(), "--model".into(), session.binding_state().model.clone()];
@@ -916,14 +918,21 @@ pub(crate) fn arguments(
     if !provider.provider.api_key.is_empty() {
         args.extend(["--api-key-env".into(), "DEEPSEEK_CODE_CHILD_API_KEY".into()]);
     }
-    args.extend(turn_arguments(cli, paths, session, child_id, prompt, provider)?);
+    args.extend(turn_arguments(
+        cli, paths, session, child_id, prompt, origin, provider,
+    )?);
     Ok(args)
 }
 
 /// Turn options shared by a frozen child launch and a submission to a live worker.
 /// The persistent protocol carries its provider binding separately, once.
 pub(crate) fn turn_arguments(
-    cli: &Cli, paths: &RuntimePaths, session: &Session, child_id: &str, prompt: &str,
+    cli: &Cli,
+    paths: &RuntimePaths,
+    session: &Session,
+    child_id: &str,
+    prompt: &str,
+    origin: crate::session::TurnOrigin<'_>,
     provider: &deepseek_code_core::native_engine::provider_manager::ResolvedProvider,
 ) -> Result<Vec<String>> {
     let mut args = vec![
@@ -973,7 +982,7 @@ pub(crate) fn turn_arguments(
         }
     }
     // A positional prompt after -- cannot be parsed as a CLI flag/subcommand.
-    args.extend(["--".into(), prompt.into()]);
+    args.extend(origin.worker_arguments(prompt)?);
     Ok(args)
 }
 
@@ -1332,6 +1341,7 @@ mod worker_config_tests {
             &cli,
             "/continue",
             "unexpected",
+            crate::session::TurnOrigin::Continuation,
             &paths,
             &mut session,
             &mut None
@@ -1348,9 +1358,17 @@ mod worker_config_tests {
         assert!(!wake_for_notifications(&cli, &mut session, &mut None)
             .await
             .unwrap());
-        handle(&cli, "/continue", "", &paths, &mut session, &mut None)
-            .await
-            .unwrap();
+        handle(
+            &cli,
+            "/continue",
+            "",
+            crate::session::TurnOrigin::Continuation,
+            &paths,
+            &mut session,
+            &mut None,
+        )
+        .await
+        .unwrap();
         assert!(!session.waiting_for_continue());
         assert!(!store.db.pending_input(&id, is_notification).unwrap());
         assert!(!wake_for_notifications(&cli, &mut session, &mut None)
@@ -1365,9 +1383,17 @@ mod worker_config_tests {
         }
         session.resume_saved(&paths, &id).await.unwrap();
         assert!(session.waiting_for_continue());
-        handle(&cli, "/continue", "", &paths, &mut session, &mut None)
-            .await
-            .unwrap();
+        handle(
+            &cli,
+            "/continue",
+            "",
+            crate::session::TurnOrigin::Continuation,
+            &paths,
+            &mut session,
+            &mut None,
+        )
+        .await
+        .unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
         assert!(requests.lock().unwrap()[1]["messages"]
             .to_string()
@@ -1588,10 +1614,42 @@ mod worker_config_tests {
         resolved.model.effort = Some("high".into());
         resolved.model.max_tokens = Some(321);
         let prompt = "--disallowed-tools this is literal user input";
-        let args = arguments(&cli, &paths, &session, &session.id, prompt, &resolved).unwrap();
+        let args = arguments(
+            &cli,
+            &paths,
+            &session,
+            &session.id,
+            prompt,
+            crate::session::TurnOrigin::User(prompt),
+            &resolved,
+        )
+        .unwrap();
         let worker = Cli::parse_from(std::iter::once("dcl".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("off"));
         assert_eq!(worker.prompt.as_deref(), Some(prompt));
+        assert_eq!(
+            worker.prompt_origin,
+            background_sessions::PromptOrigin::Typed
+        );
+        let scheduled = arguments(
+            &cli,
+            &paths,
+            &session,
+            &session.id,
+            prompt,
+            crate::session::TurnOrigin::Scheduled,
+            &resolved,
+        )
+        .unwrap();
+        let scheduled = Cli::parse_from(std::iter::once("dcl".into()).chain(scheduled));
+        assert_eq!(
+            scheduled.prompt_origin,
+            background_sessions::PromptOrigin::Generated
+        );
+        assert!(matches!(
+            crate::session::TurnOrigin::command_line(&scheduled, prompt),
+            crate::session::TurnOrigin::Scheduled
+        ));
         assert_eq!(worker.allowed_tools, cli.allowed_tools);
         assert_eq!(worker.disallowed_tools, cli.disallowed_tools);
         assert_eq!(worker.max_tokens, None);
@@ -1603,7 +1661,16 @@ mod worker_config_tests {
         cli.max_tokens = Some(456);
         cli.allowed_tools.clear();
         cli.disallowed_tools.clear();
-        let args = arguments(&cli, &paths, &session, &session.id, "hello", &resolved).unwrap();
+        let args = arguments(
+            &cli,
+            &paths,
+            &session,
+            &session.id,
+            "hello",
+            crate::session::TurnOrigin::User("hello"),
+            &resolved,
+        )
+        .unwrap();
         let worker = Cli::parse_from(std::iter::once("dcl".into()).chain(args));
         assert_eq!(worker.effort.as_deref(), Some("high"));
         assert_eq!(worker.max_tokens, Some(456));

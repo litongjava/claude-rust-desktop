@@ -59,6 +59,35 @@ impl EnvScrub for tokio::process::Command {
     }
 }
 
+/// Provenance of the positional prompt at a standalone CLI process boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptOrigin {
+    Typed,
+    Generated,
+}
+
+impl std::str::FromStr for PromptOrigin {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "typed" => Ok(Self::Typed),
+            "generated" => Ok(Self::Generated),
+            _ => Err("expected typed or generated"),
+        }
+    }
+}
+
+impl PromptOrigin {
+    pub fn arguments(self, prompt: &str) -> [String; 3] {
+        let flag = match self {
+            Self::Typed => "--prompt-origin=typed",
+            Self::Generated => "--prompt-origin=generated",
+        };
+        [flag.into(), "--".into(), prompt.into()]
+    }
+}
+
 /// Remove the host-private variables from a command about to start an ordinary
 /// child process. The supervisor that starts a managed worker passes its own
 /// control directory explicitly, so it is unaffected.

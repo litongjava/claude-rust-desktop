@@ -455,7 +455,7 @@ pub(crate) async fn prepare_child_session(
     } else {
         spawn.prompt.clone()
     };
-    arguments.extend(["--".into(), directive]);
+    arguments.extend(background_sessions::PromptOrigin::Generated.arguments(&directive));
     // Explicit caller values win over inherited launch values.
     for (key, value) in &spawn.extra_env {
         environment.retain(|(existing, _)| existing != key);
@@ -972,7 +972,9 @@ mod tests {
         assert!(arguments
             .iter()
             .any(|arg| arg == "--generated-continuation=delegation"));
-        assert!(arguments.iter().any(|arg| arg == "inspect"));
+        assert!(
+            arguments.ends_with(&background_sessions::PromptOrigin::Generated.arguments("inspect"))
+        );
     }
 
     #[tokio::test]

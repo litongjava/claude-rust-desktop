@@ -147,6 +147,7 @@ pub(crate) fn recall_queued(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnOrigin<'a> {
     User(&'a str),
+    Generated,
     Delegation,
     McpPrompt,
     Scheduled,
@@ -166,27 +167,42 @@ impl<'a> TurnOrigin<'a> {
             Some(crate::args::Continuation::Delegation) => Self::Delegation,
             Some(crate::args::Continuation::McpPrompt) => Self::McpPrompt,
             Some(crate::args::Continuation::Scheduled) => Self::Scheduled,
+            None if cli.prompt_origin
+                == deepseek_code_core::services::background_sessions::PromptOrigin::Generated =>
+            {
+                Self::Generated
+            }
             None => Self::User(cli.original_user_input.as_deref().unwrap_or(text)),
         }
     }
 
     pub(crate) fn worker_arguments(self, prompt: &str) -> Result<Vec<String>> {
         use crate::args::Continuation;
-        let generated = match self {
-            Self::User(raw) if raw != prompt => {
-                return Ok(vec![format!("--original-user-input={raw}")])
+        use deepseek_code_core::services::background_sessions::PromptOrigin;
+        let mut options = Vec::new();
+        let provenance = match self {
+            Self::User(raw) => {
+                if raw != prompt {
+                    options.push(format!("--original-user-input={raw}"));
+                }
+                PromptOrigin::Typed
             }
-            Self::User(_) => return Ok(Vec::new()),
-            Self::GoalContinuation => Continuation::Goal,
-            Self::Continuation => Continuation::Resume,
-            Self::Delegation => Continuation::Delegation,
-            Self::McpPrompt => Continuation::McpPrompt,
-            Self::Scheduled => Continuation::Scheduled,
-            Self::Queue(..) | Self::InitialHook | Self::HookWake | Self::ErrorResume => {
-                bail!("This turn is already owned by the executing session")
+            Self::Generated => PromptOrigin::Generated,
+            generated => {
+                let continuation = match generated {
+                    Self::GoalContinuation => Continuation::Goal,
+                    Self::Continuation => Continuation::Resume,
+                    Self::Delegation => Continuation::Delegation,
+                    Self::McpPrompt => Continuation::McpPrompt,
+                    Self::Scheduled => Continuation::Scheduled,
+                    _ => bail!("This turn is already owned by the executing session"),
+                };
+                options.push(continuation.worker_argument().into());
+                PromptOrigin::Generated
             }
         };
-        Ok(vec![generated.worker_argument().into()])
+        options.extend(provenance.arguments(prompt));
+        Ok(options)
     }
 
     fn admit(
@@ -207,6 +223,7 @@ impl<'a> TurnOrigin<'a> {
     fn tag(self) -> &'a str {
         match self {
             Self::User(_) => "typed",
+            Self::Generated => "generated",
             Self::Delegation => "delegation",
             Self::McpPrompt => "mcp_prompt",
             Self::Scheduled => "scheduled",

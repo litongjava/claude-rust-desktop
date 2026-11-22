@@ -162,6 +162,7 @@ pub async fn run(
         session,
         &child_id,
         &prompt,
+        crate::session::TurnOrigin::Generated,
         &provider,
     )?;
     let environment = crate::background_commands::worker_environment(session.auto_route, &provider)?;

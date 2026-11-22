@@ -104,6 +104,7 @@ async fn rejected_relaunch_keeps_only_the_winning_token_cap() {
         &session,
         &session.id,
         "probe",
+        crate::session::TurnOrigin::User("probe"),
         &active,
     )
     .unwrap();

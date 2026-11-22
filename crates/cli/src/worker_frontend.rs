@@ -172,15 +172,15 @@ async fn single_turn(
     let owner = session.binding.selected_session(&session.id)?;
     let _admission = owner.hold_incarnation()?;
     let job = if std::env::var("DEEPSEEK_CODE_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
-        let mut arguments = crate::background_commands::arguments(
+        let arguments = crate::background_commands::arguments(
             cli,
             &session.paths,
             session,
             &session.id,
             prompt,
+            origin,
             &provider,
         )?;
-        arguments.splice(0..0, origin.worker_arguments(prompt)?);
         let mut environment =
             crate::background_commands::worker_environment(session.auto_route, &provider)?;
         environment.push((
@@ -204,15 +204,15 @@ async fn single_turn(
         let mut worker =
             session_worker::ensure_worker(root, &executable, &session.id, &session.workspace)
                 .await?;
-        let mut arguments = crate::background_commands::turn_arguments(
+        let arguments = crate::background_commands::turn_arguments(
             cli,
             &session.paths,
             session,
             &session.id,
             prompt,
+            origin,
             &provider,
         )?;
-        arguments.splice(0..0, origin.worker_arguments(prompt)?);
         let mut environment = vec![(
             "DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),
             session.auto_route.to_string(),
@@ -1400,6 +1400,7 @@ mod failure_tests {
                         &cli,
                         "/tasks",
                         &show,
+                        crate::session::TurnOrigin::User(&show),
                         &paths,
                         &mut session,
                         &mut None
