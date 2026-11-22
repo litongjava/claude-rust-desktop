@@ -287,6 +287,13 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_
 - Windows CI 预期运行同一测试过滤及 `windows_reparse_points_are_rejected_and_pinned_directories_cannot_be_swapped`、`windows_directory_reparse_point_is_not_a_managed_project_root`、`windows_junction_is_rejected_before_any_external_file_is_created`、`windows_canonical_path_case_aliases_have_one_scope`；符号链接用例要求 Developer Mode/创建符号链接权限，不能无声跳过。Linux 结果不构成 Windows 测试通过。
 - P1 未切换旧 SQLite 后端，不把上述存储层测试当成模型权限、自动召回、CLI picker 或 Desktop/WebView2 验收；后续接入仍要执行本节原有 1–4 与 Desktop A。
 
+#### M3 常驻索引（替代逐消息正文召回）
+
+- 用独立临时 data-dir 和本地模型端点；给 global、team、project、subagent、session 的索引和正文各写不同标记。捕获主会话与子代理的实际请求：首条用户消息里先项目指令再按上述顺序放 scope/路径；主会话无 subagent，子代理无父 session，team 未配置或索引空缺时无对应块。搜索所有消息，确认正文标记从未自动出现。
+- 同时改两个索引，下次请求应只有一条新提醒，只含改动的 scope；原首条前缀逐字节不变。再发一轮，不新增提醒。用普通文件工具写索引再重复；用 CRLF、多字节字符、200/201 行和 25 KiB 临界值检查截断和路径提示。
+- 对 summary/native、自动/手动、partial、plan clear context 和 overflow recovery，各在边界前改索引并发送一次，边界后独立改另一个。比较请求与从会话库恢复的重放：当前索引各一次，不重复边界前提醒；仅边界后的改动有新提醒。退出并用同一 data-dir 恢复，比较相同历史前缀的序列化字节。另核对 fork 复制、删除清理及 home/private 项目隔离。
+- 运行 core 的 `resident_indexes` 单测、`--test compaction_history --test native_compaction` 及 CLI 的 `--test memory_files --test memory_compaction`；分别记录实际覆盖的边界、协议、请求层和进程层。仅重放测试不能替代真实 provider 请求或 Desktop 验收。
+
 ### H. 提示词与工具配置
 
 在数据目录写 `customization.json` 后，用 `dcl -p` 验证：

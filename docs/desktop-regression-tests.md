@@ -198,6 +198,6 @@ A 节旧流程适用于显式 Legacy archive 入口；默认 Project memories �
 2. 新增带 frontmatter 的文件；编辑正文保留 metadata，feedback/project 缺 Why 或 How to apply 应报错。删除取消不变，确认后索引同步删除。
 3. 两个窗口读同版本，窗口一保存后窗口二保存报 409；第二窗口草稿保留，刷新后重读。切换 scope 时旧请求返回不能显示前一项目内容。
 4. 缺 scope 的旧 `/api/memory/ingest`、缺版本更新/删除明确失败；Legacy archive 下的导出/导入继续保留旧数据，默认项目召回不使用它们。
-5. 新会话/恢复/compact 后，用本次 Desktop 模型请求与 Trajectory 核对索引、scope/generation/hash 和用户消息后的正文；删除当前记忆不应改写历史请求。
+5. 在临时 data-dir 中为各 scope 的 `MEMORY.md` 和正文写不同标记。对照 Desktop 实际模型请求：首条用户消息在项目指令之后依次是 global、可选 team、project、仅子代理的 subagent、当前 session；各有路径，无自动附加的正文，也无父 session 泄漏。编辑两份索引后，下次请求仅新增一条合并提醒，冻结首条不变；重复发送不新增提醒。手动 compact 后索引各一次，无边界前提醒；关闭重开会话比较相同历史前缀，再改一个索引确认仅它产生新提醒。构建检查不等于此 WebView 场景通过。
 6. Plan Read 成功，Write/Edit/ApplyPatch 删除拒绝；Router/Coder 门禁、显式 deny/ask 与 hooks 不被目录免确认绕过。禁用记忆后不注入，配置远程 HTTP 后只有远程工具可加载；本地工具目录不得残留 memory_search/ingest。
 7. 自动化组件覆盖文件编辑、CAS 参数、冲突草稿、删除取消和显式旧归档入口；这不代表原生 Desktop/WebView2、Windows reparse 和服务器/手机操作已验证。
