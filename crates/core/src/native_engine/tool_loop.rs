@@ -275,7 +275,7 @@ pub struct ToolLoopExecutor {
     /// Selected model including a virtual context suffix omitted from the wire ID.
     pub(super) model_selector: String,
     pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
-    compaction_source: Option<super::compaction_prefix::Source>,
+    compaction_source: Option<super::compaction_prefix::SourceHasher>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
@@ -2994,11 +2994,11 @@ impl ToolLoopExecutor {
         use super::compaction_prefix::{route, Capture};
         let origin = match (&self.executor_history, &self.compaction_source) {
             (Some(ExecutorHistory::Session(session)), Some(source))
-                if iteration == 0 =>
+                if iteration == source.iteration =>
             {
                 Some(Capture {
                     session: session.clone(),
-                    source: source.clone(),
+                    source: source.snapshot(),
                     prompt_schema: self.response_schema.clone().filter(|_| {
                         !crate::structured_output::provider_enforces_schema(
                             &self.provider.provider.base_url,
@@ -3015,6 +3015,27 @@ impl ToolLoopExecutor {
             .clone()
             .or_else(|| origin.as_ref().map(|_| Default::default()));
         (context, origin)
+    }
+
+    fn capture_tool_round<M: serde::Serialize>(
+        &mut self,
+        iteration: usize,
+        rows: &[M],
+        calls: &[PendingToolCall],
+    ) {
+        let Some(source) = &mut self.compaction_source else {
+            return;
+        };
+        let Some(message) = &self.parent_message_id else {
+            return;
+        };
+        let ids = calls
+            .iter()
+            .map(|c| (c.provider_id.as_str(), format!("{message}:{}", c.id)))
+            .collect();
+        if source.iteration != iteration || source.tool_round(rows, &ids).is_err() {
+            self.compaction_source = None;
+        }
     }
 
     pub fn with_context_reminders(mut self, reminders: Vec<String>) -> Self {
@@ -5401,6 +5422,9 @@ impl ToolLoopExecutor {
                 .chain(queued.into_iter().map(|input| input.content))
                 .chain(self.drain_peer_messages()?.into_iter().map(Value::String))
             {
+                if let Some(source) = &mut self.compaction_source {
+                    source.push(&json!({"role":"user","content":content}));
+                }
                 let content = multimodal::anthropic_content(&content)?;
                 conversation_messages.push(AnthropicMessage {
                     role: "user".into(),
@@ -6008,6 +6032,7 @@ impl ToolLoopExecutor {
                 }
                 self.ensure_permission_continuation()?;
 
+                let round_start = conversation_messages.len();
                 conversation_messages.push(AnthropicMessage {
                     role: "assistant".to_string(),
                     content: AnthropicContent::Blocks(assistant_blocks),
@@ -6018,6 +6043,11 @@ impl ToolLoopExecutor {
                     role: "user".to_string(),
                     content: AnthropicContent::Blocks(tool_results),
                 });
+                self.capture_tool_round(
+                    iteration,
+                    &conversation_messages[round_start..],
+                    &pending_tool_calls,
+                );
                 after_tool_results = true;
                 if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
                     after_tool_results = false;
@@ -6029,6 +6059,7 @@ impl ToolLoopExecutor {
                         content: AnthropicContent::Text(content),
                     }];
                     full_text.clear();
+                    self.compaction_source = None;
                     self.messages.clear();
                     self.stop_hook_active = false;
                     self.publish_context_reset(boundary_id).await?;
@@ -6169,6 +6200,9 @@ impl ToolLoopExecutor {
                 .chain(queued.into_iter().map(|input| input.content))
                 .chain(self.drain_peer_messages()?.into_iter().map(Value::String))
             {
+                if let Some(source) = &mut self.compaction_source {
+                    source.push(&json!({"role":"user","content":content}));
+                }
                 let content = multimodal::openai_content(&content)?;
                 conversation_messages.push(OpenAIMessage {
                     role: "user".into(),
@@ -6958,6 +6992,7 @@ impl ToolLoopExecutor {
                 }
                 self.ensure_permission_continuation()?;
 
+                let round_start = conversation_messages.len();
                 conversation_messages.push(OpenAIMessage {
                     role: "assistant".to_string(),
                     content: assistant_content.unwrap_or(OpenAIContent::Text(String::new())),
@@ -6980,6 +7015,11 @@ impl ToolLoopExecutor {
                         provider_content: None,
                     });
                 }
+                self.capture_tool_round(
+                    iteration,
+                    &conversation_messages[round_start..],
+                    &pending_tool_calls,
+                );
                 after_tool_results = true;
                 if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
                     after_tool_results = false;
@@ -6995,6 +7035,7 @@ impl ToolLoopExecutor {
                         provider_content: None,
                     }];
                     full_text.clear();
+                    self.compaction_source = None;
                     self.messages.clear();
                     self.stop_hook_active = false;
                     self.publish_context_reset(boundary_id).await?;
@@ -7084,11 +7125,10 @@ impl ToolLoopExecutor {
     fn prepare_main_history(&mut self) -> Result<Vec<Value>> {
         let mut messages = multimodal::normalize_messages(&self.messages)?;
         self.prepare_history_tool_outputs(&mut messages);
-        // Only the first iteration has a durable source for every included row.
-        // Later tool iterations can include previews and unpersisted results.
+        // Fingerprint the input after local compression and preview rendering.
         self.compaction_source = (matches!(self.executor_history, Some(ExecutorHistory::Session(_)))
             && !crate::services::compaction::native::supports(&self.provider))
-            .then(|| super::compaction_prefix::Source::new(&messages));
+            .then(|| super::compaction_prefix::SourceHasher::new(&messages));
         Ok(messages)
     }
 

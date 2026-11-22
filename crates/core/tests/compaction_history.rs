@@ -24,8 +24,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new(window: usize) -> Self {
+        Self::with_root(window, tempfile::tempdir().unwrap()).await
+    }
+
+    async fn with_root(window: usize, root: tempfile::TempDir) -> Self {
         deepseek_code_core::config::OrchestrationConfig::init_global().unwrap();
-        let root = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store.create(root.path(), "model", "fixture").unwrap();
@@ -251,4 +254,45 @@ async fn schema_constrained_main_turn_requires_a_text_summary_before_commit() {
         }
         f.finish().await;
     }
+}
+
+#[tokio::test]
+async fn first_iteration_peer_delivery_is_present_once_in_the_reused_prefix() {
+    use deepseek_code_core::services::session_messages;
+    // The inbox poll has a 250 ms deadline including the SQLite checkpoint.
+    // Keep this fixture's database off a busy build disk where available.
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .unwrap();
+    let f = Fixture::with_root(128_000, root).await;
+    f.append("user", "Start the task");
+    f.append("assistant", "Working on it");
+    f.append("user", "Continue");
+    let sender = f.store.fork(&f.id).unwrap();
+    let marker = "UNIQUE_PEER_DELIVERY";
+    session_messages::send(
+        &session_messages::context(&f.paths.data_dir).unwrap(),
+        &sender,
+        &f.id,
+        marker,
+    )
+    .unwrap();
+    f.main_turn(None).await;
+    assert_eq!(
+        json!(f.store.history(&f.id).unwrap())
+            .to_string()
+            .matches(marker)
+            .count(),
+        1
+    );
+    f.compact().await.unwrap();
+    {
+        let calls = f.requests.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for body in calls.iter() {
+            assert_eq!(body.to_string().matches(marker).count(), 1);
+            assert!(body["tools"].is_array());
+        }
+    }
+    f.finish().await;
 }

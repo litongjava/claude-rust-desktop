@@ -881,11 +881,14 @@ async fn context_search_provider(
     };
     if step == 3 {
         assert_eq!(headers["x-dcl-request-kind"], "compaction");
-        assert_eq!(body["stream"], true);
-        return chat_stream(
-            json!({"content":"COMPACT_FIXTURE: A file was read."}),
-            "stop",
-        );
+        let summary = json!({"role":"assistant","content":"COMPACT_FIXTURE: A file was read."});
+        if body["stream"] == true {
+            return chat_stream(summary, "stop");
+        }
+        return Json(json!({
+            "id":"fixture-summary","object":"chat.completion","created":0,"model":"fixture-model",
+            "choices":[{"index":0,"message":summary,"finish_reason":"stop"}]
+        })).into_response();
     }
     let call = |id: &str, name: &str, args: Value| json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
     let messages = body["messages"].as_array().unwrap();
