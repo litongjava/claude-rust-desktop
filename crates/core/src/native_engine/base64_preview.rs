@@ -10,6 +10,7 @@ pub(super) struct Collapsed {
     changes: Vec<(Range<usize>, Range<usize>)>,
     pub json_end: Option<usize>,
     note: String,
+    index: LineIndex,
 }
 
 /// Map decoded string offsets back into the JSON source kept in the spill.
@@ -35,6 +36,55 @@ pub(super) struct Location {
     pub(super) path: Option<std::path::PathBuf>,
     pub(super) line: usize,
     pub(super) range: Range<usize>,
+}
+
+/// The byte ranges are half-open and refer to the immutable saved file.
+pub(crate) struct LineIndex {
+    root: std::path::PathBuf,
+    output: std::path::PathBuf,
+    entries: std::collections::BTreeSet<(Option<std::path::PathBuf>, usize, usize, usize)>,
+}
+
+impl LineIndex {
+    pub(crate) fn new(root: &Path, output: &Path) -> Self {
+        Self {
+            root: root.into(),
+            output: output.into(),
+            entries: Default::default(),
+        }
+    }
+
+    fn record(&mut self, path: &Path, line: usize, range: Range<usize>) {
+        self.entries.insert((
+            (path != self.output).then(|| path.into()),
+            line,
+            range.start,
+            range.end,
+        ));
+    }
+
+    pub(crate) fn monitor_line(&mut self, bytes: &[u8], number: usize, start: usize) {
+        let text = String::from_utf8_lossy(bytes);
+        let blocks = runs(&text);
+        for range in raw_ranges(bytes, &blocks) {
+            self.entries
+                .insert((None, number, start + range.start, start + range.end));
+        }
+    }
+
+    pub(crate) fn pointer(&self) -> std::io::Result<String> {
+        use std::fmt::Write;
+        let mut text = format!("full output: {}\n", self.output.display());
+        for (path, line, start, end) in &self.entries {
+            write!(text, "{line} {start}..{end}").unwrap();
+            if let Some(path) = path {
+                write!(text, " {}", path.display()).unwrap();
+            }
+            text.push('\n');
+        }
+        let path = crate::performance::save_tool_output(&self.root, &text)?;
+        Ok(format!("base64 line index: {}", path.display()))
+    }
 }
 
 pub(super) fn raw_ranges(bytes: &[u8], blocks: &[Run]) -> Vec<Range<usize>> {
@@ -346,6 +396,7 @@ impl Collapsed {
             summary(count, bytes)
         };
         let insert = json_end.map_or(original.len(), |end| end - 1);
+        let mut index = LineIndex::new(root, &path);
         let (mut text, mut changes) = render_runs(
             &original[..insert],
             &blocks,
@@ -353,6 +404,7 @@ impl Collapsed {
             1,
             json_end.is_some(),
             &locations,
+            Some(&mut index),
         );
         let start = text.len();
         if json_end.is_some() {
@@ -367,6 +419,7 @@ impl Collapsed {
         Some(Self {
             text,
             changes,
+            index,
             json_end,
             note,
         })
@@ -376,7 +429,18 @@ impl Collapsed {
     /// from the missing middle in the space reserved below the preview.
     pub fn retain(&self, limit: usize) -> (String, PreviewRanges) {
         let ((_, note_range), marks) = self.changes.split_last().expect("summary insertion");
-        retain_with_references(&self.text, marks, Some((&self.note, note_range)), limit)
+        let (view, kept, missing_index) = retain_with_references(
+            &self.text,
+            marks,
+            Some((&self.note, note_range)),
+            limit,
+            || self.index.pointer().ok(),
+        );
+        if missing_index {
+            // As with a failed I6 spill, preserve the only complete reference list.
+            return (self.text.clone(), PreviewRanges::whole(self.text.len()));
+        }
+        (view, kept)
     }
 
     /// I6 counts only missing ordinary bytes. Each encoded run is already
@@ -410,10 +474,11 @@ fn retain_with_references(
     marks: &[(Range<usize>, Range<usize>)],
     note: Option<(&str, &Range<usize>)>,
     limit: usize,
-) -> (String, PreviewRanges) {
+    index_pointer: impl FnOnce() -> Option<String>,
+) -> (String, PreviewRanges, bool) {
     use crate::performance::preview_with_ranges;
     if text.len() <= limit {
-        return (text.to_owned(), PreviewRanges::whole(text.len()));
+        return (text.to_owned(), PreviewRanges::whole(text.len()), false);
     }
     let note_bytes = note.map_or(0, |(s, _)| s.len() + 1);
     let body_limit = limit - note_bytes;
@@ -451,18 +516,28 @@ fn retain_with_references(
         } else {
             0
         };
-    for (_, r) in marks.iter().filter(|(_, r)| hidden(r, &kept)) {
-        if view.len() + 1 + r.len() > available {
-            break;
+    let missing = marks.iter().filter(|(_, r)| hidden(r, &kept));
+    let missing_bytes = missing.clone().map(|(_, r)| 1 + r.len()).sum::<usize>();
+    let indexed = view.len() + missing_bytes > available;
+    let mut missing_index = false;
+    if indexed {
+        if let Some(pointer) = index_pointer() {
+            view.push('\n');
+            view.push_str(&pointer);
+        } else {
+            missing_index = true;
         }
-        view.push('\n');
-        view.push_str(&text[r.clone()]);
+    } else {
+        for (_, r) in missing {
+            view.push('\n');
+            view.push_str(&text[r.clone()]);
+        }
     }
     if let Some((note, _)) = missing_note {
         view.push('\n');
         view.push_str(note);
     }
-    (view, kept)
+    (view, kept, missing_index)
 }
 
 fn render_runs(
@@ -472,6 +547,7 @@ fn render_runs(
     mut line: usize,
     json: bool,
     locations: &HashMap<usize, Location>,
+    mut index: Option<&mut LineIndex>,
 ) -> (String, Vec<(Range<usize>, Range<usize>)>) {
     let mut text = String::new();
     let mut changes = Vec::new();
@@ -490,6 +566,9 @@ fn render_runs(
         let origin = locations.get(&range.start);
         let path = origin.and_then(|l| l.path.as_deref()).unwrap_or(path);
         let line = origin.map_or(line, |l| l.line);
+        if let Some(index) = index.as_deref_mut() {
+            index.record(path, line, origin.map_or(range, |l| &l.range).clone());
+        }
         let location = if *incomplete {
             "run cut at capture ceiling; captured output"
         } else {
@@ -515,6 +594,7 @@ pub(crate) struct MonitorLine {
     pub text: String,
     pub blocks: usize,
     pub encoded_bytes: usize,
+    pub needs_index: bool,
 }
 
 pub(crate) fn monitor_output_line(
@@ -527,14 +607,11 @@ pub(crate) fn monitor_output_line(
     if blocks.is_empty() {
         return None;
     }
-    let (text, marks) = render_runs(line, &blocks, path, number, false, &HashMap::new());
-    let text = if text.len() > limit {
-        retain_with_references(&text, &marks, None, limit).0
-    } else {
-        text
-    };
+    let (text, marks) = render_runs(line, &blocks, path, number, false, &HashMap::new(), None);
+    let (text, _, needs_index) = retain_with_references(&text, &marks, None, limit, || None);
     Some(MonitorLine {
         text,
+        needs_index,
         blocks: blocks.len(),
         encoded_bytes: blocks.iter().map(|b| b.range.len()).sum(),
     })

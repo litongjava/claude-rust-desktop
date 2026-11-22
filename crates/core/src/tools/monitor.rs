@@ -485,7 +485,7 @@ impl Emitter {
 
 struct PendingLine {
     excerpt: String,
-    encoded: Option<String>,
+    encoded: Option<Vec<u8>>,
     number: usize,
     end: u64,
 }
@@ -522,12 +522,20 @@ fn batch_text(lines: &[PendingLine], log: &Path) -> (String, Option<String>) {
     let mut blocks = 0;
     let mut encoded = 0;
     let mut hidden = Vec::new();
+    let mut needs_index = false;
     for (index, line) in lines.iter().enumerate() {
         let compact = line
             .encoded
             .as_ref()
             .zip(path.as_ref())
-            .and_then(|(full, path)| monitor_output_line(full, path, line.number, MAX_LINE_CHARS));
+            .and_then(|(full, path)| {
+                monitor_output_line(
+                    String::from_utf8_lossy(full).trim_end_matches(['\r', '\n']),
+                    path,
+                    line.number,
+                    MAX_LINE_CHARS,
+                )
+            });
         let shown = compact
             .as_ref()
             .map_or(line.excerpt.as_str(), |output| output.text.as_str());
@@ -542,6 +550,7 @@ fn batch_text(lines: &[PendingLine], log: &Path) -> (String, Option<String>) {
             kept += 1;
         }
         if let Some(output) = compact {
+            needs_index |= output.needs_index;
             blocks += output.blocks;
             encoded += output.encoded_bytes;
             if !fits {
@@ -556,14 +565,49 @@ fn batch_text(lines: &[PendingLine], log: &Path) -> (String, Option<String>) {
         text.push_str(&format!("… {} more lines", lines.len() - kept));
     }
     if let Some(path) = path {
+        let summary = base64_summary(blocks, encoded);
+        let mut refs = String::new();
         for line in hidden {
-            text.push_str(&format!(
+            use std::fmt::Write;
+            write!(
+                refs,
                 "\n[base64 data omitted; full output: {}, line {line}]",
                 path.display()
-            ));
+            )
+            .unwrap();
+            if text.len() + refs.len() + 1 + summary.len() > MAX_EVENT_BYTES {
+                needs_index = true;
+                break;
+            }
+        }
+        if needs_index || text.len() + 1 + summary.len() > MAX_EVENT_BYTES {
+            let mut index = crate::native_engine::tool_loop::base64_preview::LineIndex::new(
+                path.parent().unwrap(),
+                &path,
+            );
+            for line in lines {
+                if let Some(raw) = &line.encoded {
+                    index.monitor_line(raw, line.number, line.end as usize - raw.len());
+                }
+            }
+            if let Ok(pointer) = index.pointer() {
+                let room = MAX_EVENT_BYTES.saturating_sub(pointer.len() + summary.len() + 2);
+                if text.len() > room {
+                    let cut = text[..text.floor_char_boundary(room)]
+                        .rfind('\n')
+                        .unwrap_or(0);
+                    text.truncate(cut);
+                }
+                text.push('\n');
+                text.push_str(&pointer);
+            } else {
+                text.push_str(&refs);
+            }
+        } else {
+            text.push_str(&refs);
         }
         text.push('\n');
-        text.push_str(&base64_summary(blocks, encoded));
+        text.push_str(&summary);
     }
     let terminal = (blocks > 0).then(|| excerpt(&lines[0].excerpt));
     (text, terminal)
@@ -670,7 +714,7 @@ async fn read_lines<R: AsyncRead + Unpin>(
                 }
                 if let Some(sink) = &sink {
                     let encoded = (log.is_some() && !super::base64_collapse::runs(line).is_empty())
-                        .then(|| line.to_owned());
+                        .then(|| buffer.clone());
                     let excerpt: String = line.chars().take(MAX_LINE_CHARS).collect();
                     if encoded.is_some() && !encoded_seen {
                         encoded_seen = std::fs::write(path.with_extension("base64"), b"").is_ok();

@@ -1276,6 +1276,44 @@ mod tests {
     }
 
     #[test]
+    fn base64_review_many_references_preserve_a_complete_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("data:text/plain;base64,{}\n", "QUJD".repeat(64));
+        let raw = json!({"stdout":line.repeat(140)}).to_string();
+        let view = command_preview("Bash", &raw, Some(dir.path()), None, true);
+        assert!(view.contains("140 blocks collapsed"));
+        assert!(view.len() <= MODEL_TOOL_OUTPUT_BYTES);
+        let index = view
+            .split_once("base64 line index: ")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let index = std::fs::read_to_string(index).unwrap();
+        let output = index
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("full output: ")
+            .unwrap();
+        let saved = std::fs::read_to_string(output).unwrap();
+        assert_eq!(saved, line.repeat(140));
+        let lines: Vec<usize> = index
+            .lines()
+            .skip(1)
+            .map(|entry| {
+                let (number, range) = entry.split_once(' ').unwrap();
+                let (start, end) = range.split_once("..").unwrap();
+                let range = start.parse::<usize>().unwrap()..end.parse().unwrap();
+                assert_eq!(&saved[range], "QUJD".repeat(64));
+                number.parse().unwrap()
+            })
+            .collect();
+        assert_eq!(lines, (1..=140).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn base64_shell_thresholds_and_fallback_preserve_original_output() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["Bash", "TaskGet"] {
