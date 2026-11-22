@@ -107,8 +107,16 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
             std::sync::Arc::new(EnvironmentCredentials),
         ).unwrap();
         let memory = FileMemory::workspace(&context, root.path()).unwrap();
-        memory.put("saffron.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
+        memory.put("saffron.md", "---\nname: saffron\ndescription: saffron preferences for a steered answer\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
+        let correction = "saffron: Skip the rest and answer STEERED now";
+        assert!(memory
+            .context_block(correction, true)
+            .unwrap()
+            .1
+            .unwrap()
+            .contains("steer-recall-marker"));
         let coord = root.path().join("coord");
+        let diagnostics = root.path().join("delivery.log");
         let transport = Some((
             server.url.as_str(),
             if anthropic { "anthropic" } else { "openai" },
@@ -117,6 +125,8 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
             root.path(),
             transport,
             &[
+                "--debug-file",
+                diagnostics.to_str().unwrap(),
                 "--permission-mode",
                 "ask",
                 "--coordination-dir",
@@ -132,16 +142,48 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
             .await;
         assert_eq!(permission["request"]["tool_name"], STEER_TOOL);
         std::fs::write(memory.directory.join("MEMORY.md"), "steer-index-marker").unwrap();
-        client
-            .send(user("saffron: Skip the rest and answer STEERED now"))
-            .await;
+        client.send(user(correction)).await;
+        let session_id = context.db.latest_code(root.path()).unwrap().unwrap().id;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let items =
+                    deepseek_code_core::services::input_queue::list(&context.db, &session_id)
+                        .unwrap();
+                if items.iter().any(|item| item.mode == QueueMode::Steer) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("SDK failed to enqueue the user frame while permission was pending");
         client.send(json!({
             "type":"control_response",
             "response":{"subtype":"success","request_id":permission["request_id"],"response":{"behavior":"allow"}}
         })).await;
-        let delivered = client
-            .frame_with_timeout("queued_input", Duration::from_secs(60))
-            .await;
+        let delivered = loop {
+            let frame = client.next_frame().await;
+            if frame["type"] == "queued_input" {
+                break frame;
+            }
+            if frame["type"] == "result" {
+                let items =
+                    deepseek_code_core::services::input_queue::list(&context.db, &session_id)
+                        .unwrap();
+                let log = std::fs::read_to_string(&diagnostics).unwrap_or_default();
+                let delivery: Vec<_> = log
+                    .lines()
+                    .filter(|line| {
+                        line.contains("handoff")
+                            || line.contains("delivery")
+                            || line.contains("contention")
+                    })
+                    .collect();
+                panic!(
+                    "Turn ended before delivery. Queue state {items:?}, diagnostics {delivery:?}"
+                );
+            }
+        };
         assert_eq!(
             delivered["text"],
             "saffron: Skip the rest and answer STEERED now"
@@ -167,7 +209,14 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         let tool = tool_result_index(second).expect("tool result in the second request");
         let steer = message_index(second, "answer STEERED now").expect("steering text");
         let content = second["messages"][steer]["content"].to_string();
-        assert!(content.contains("steer-recall-marker") && content.contains("steer-index-marker"));
+        assert!(
+            content.contains("steer-index-marker"),
+            "missing index change in {content}"
+        );
+        assert!(
+            content.contains("steer-recall-marker"),
+            "missing recalled excerpt in {content}"
+        );
         assert!(
             steer >= tool,
             "the steering text must follow the tool result: {second}"

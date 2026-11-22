@@ -729,7 +729,7 @@ impl DeliveryOwner {
         self.queue_before(
             mode,
             tool,
-            std::time::Instant::now() + super::WRITE_DEADLINE,
+            &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
             false,
             None,
         )
@@ -739,7 +739,7 @@ impl DeliveryOwner {
         &mut self,
         mode: QueueMode,
         tool: Option<&str>,
-        until: std::time::Instant,
+        until: &mut std::time::Instant,
         live: bool,
         expected: Option<&input_queue::QueueItem>,
     ) -> Result<Option<Handoff>> {
@@ -830,7 +830,7 @@ impl DeliveryOwner {
             self.queue_before(
                 item.mode,
                 None,
-                std::time::Instant::now() + super::WRITE_DEADLINE,
+                &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
                 false,
                 Some(item),
             )?
@@ -845,7 +845,7 @@ impl DeliveryOwner {
     pub fn next_peer(&mut self) -> Result<Option<Handoff>> {
         self.peer_before(
             usize::MAX,
-            std::time::Instant::now() + super::WRITE_DEADLINE,
+            &mut (std::time::Instant::now() + super::WRITE_DEADLINE),
             false,
         )
     }
@@ -853,7 +853,7 @@ impl DeliveryOwner {
     fn peer_before(
         &mut self,
         max_bytes: usize,
-        until: std::time::Instant,
+        until: &mut std::time::Instant,
         live: bool,
     ) -> Result<Option<Handoff>> {
         layout::allow_entry()?;
@@ -932,7 +932,7 @@ impl DeliveryOwner {
     /// An ack-only retry injects content only if this same live owner committed it.
     pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
         use crate::db::message_repo;
-        let until = std::time::Instant::now() + TURN_POLL_WAIT;
+        let mut until = std::time::Instant::now() + TURN_POLL_WAIT;
         let mut remaining = 128 * 1024;
         let mut inputs = Vec::new();
         for _ in 0..limit.min(8) {
@@ -940,14 +940,17 @@ impl DeliveryOwner {
                 break;
             }
             let next = if peers {
-                self.peer_before(remaining, until, true)
+                self.peer_before(remaining, &mut until, true)
             } else {
-                self.queue_before(QueueMode::Steer, None, until, true, None)
+                self.queue_before(QueueMode::Steer, None, &mut until, true, None)
             };
             let handoff = match next {
                 Ok(Some(value)) => value,
                 Ok(None) => break,
-                Err(error) if crate::db::is_contention(&error) => break,
+                Err(error) if crate::db::is_contention(&error) => {
+                    tracing::debug!(session=%self.session.id, %error, "Deferred turn delivery");
+                    break;
+                }
                 Err(error) => return Err(error),
             };
             let Some(origin) = self.live_handoffs.remove(&handoff.id) else { continue; };
@@ -998,7 +1001,12 @@ impl DeliveryOwner {
                 Ok(existing.is_some())
             })
     }
-    fn complete(&mut self, claim: Claim, until: std::time::Instant, live: bool) -> Result<Handoff> {
+    fn complete(
+        &mut self,
+        claim: Claim,
+        until: &mut std::time::Instant,
+        live: bool,
+    ) -> Result<Handoff> {
         let s = &self.session;
         s.stores.step(Phase::DeliveryClaimed)?;
         let fresh = if self.has_receipt(&claim)? {
@@ -1014,10 +1022,16 @@ impl DeliveryOwner {
                 None
             };
             let typed = claim.prompt_origin == "typed";
+            let resolving = std::time::Instant::now();
             let memory = typed
                 .then(|| crate::services::memory_files::prompt::Admission::session(s))
                 .transpose()?;
+            if live && typed {
+                *until += resolving.elapsed();
+            }
+            let mut admitted_at = None;
             let delivered = s.write_locked_with_deadline("deliver input", until.saturating_duration_since(std::time::Instant::now()), |tx| {
+                admitted_at = (live && typed).then(std::time::Instant::now);
                 ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {
                     let exists: bool = tx.0.query_row(
@@ -1082,6 +1096,12 @@ impl DeliveryOwner {
                 }
                 Ok(true)
             })?;
+            // Receipt selection and publication after acquiring the shard writer
+            // are admitted work. Preserve the remaining contention budget for
+            // the acknowledgement and the next queued input in this batch.
+            if let Some(started) = admitted_at {
+                *until += started.elapsed();
+            }
             if !delivered {
                 s.stores
                     .global()
@@ -1121,9 +1141,17 @@ impl DeliveryOwner {
             Ok(())
         })?;
         s.stores.step(Phase::DeliveryCommitted)?;
+        // A successful FULL checkpoint can outlast the discovery deadline even
+        // on an uncontended database. Give the directory acknowledgement of a
+        // live receipt its own bounded writer acquisition after the flush.
+        let ack_wait = if live && self.live_handoffs.contains_key(&claim.id) {
+            TURN_POLL_WAIT
+        } else {
+            until.saturating_duration_since(std::time::Instant::now())
+        };
         s.stores
             .global()
-            .write_with_deadline("acknowledge delivery", &s.id, true, until.saturating_duration_since(std::time::Instant::now()), |c| {
+            .write_with_deadline("acknowledge delivery", &s.id, true, ack_wait, |c| {
                 let changed = if claim.sender.is_some() {
                     c.execute("UPDATE session_inbox SET state='context_committed',blocked_reason=NULL,committed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1 AND recipient=?2 AND state='claimed' AND generation=?3", params![claim.id, s.id, claim.revision])?
                 } else {
@@ -1157,6 +1185,11 @@ mod turn_delivery_tests {
                     None,
                 )
                 .into());
+            }
+            if phase == Phase::DeliveryCommitted {
+                // The receipt is durable even when flushing it took the whole
+                // polling interval. A free directory writer must still ack it.
+                std::thread::sleep(TURN_POLL_WAIT + std::time::Duration::from_millis(10));
             }
             Ok(())
         });
