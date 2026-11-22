@@ -84,13 +84,13 @@ pub async fn turn(
     session: &Session,
     prompt: &str,
     input: &mut Option<TerminalInput>,
-    mut generated: bool,
+    mut generated: Option<crate::args::Continuation>,
 ) -> Result<()> {
     let mut next = prompt.to_owned();
     while !crate::signals::terminating() {
         let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input, generated)).await? else { return Ok(()) };
         next = kickoff;
-        generated = true;
+        generated = Some(crate::args::Continuation::Goal);
     }
     Ok(())
 }
@@ -132,7 +132,7 @@ async fn single_turn(
     session: &Session,
     prompt: &str,
     input: &mut Option<TerminalInput>,
-    generated: bool,
+    generated: Option<crate::args::Continuation>,
 ) -> Result<Option<String>> {
     let root = &session.paths.data_dir;
     if let Some(job) = settle_session(session)? {
@@ -170,10 +170,23 @@ async fn single_turn(
     let owner = session.binding.selected_session(&session.id)?;
     let _admission = owner.hold_incarnation()?;
     let job = if std::env::var("DEEPSEEK_CODE_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
-        let mut arguments = crate::background_commands::arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
-        if generated { arguments.insert(0, "--generated-continuation".into()); }
-        let mut environment = crate::background_commands::worker_environment(session.auto_route, &provider)?;
-        environment.push((jobs::WORKER_GENERATION_ENV.into(), format!("{}:{}", session.id, session.binding_state().generation)));
+        let mut arguments = crate::background_commands::arguments(
+            cli,
+            &session.paths,
+            session,
+            &session.id,
+            prompt,
+            &provider,
+        )?;
+        if let Some(origin) = generated {
+            arguments.insert(0, origin.worker_argument().into());
+        }
+        let mut environment =
+            crate::background_commands::worker_environment(session.auto_route, &provider)?;
+        environment.push((
+            jobs::WORKER_GENERATION_ENV.into(),
+            format!("{}:{}", session.id, session.binding_state().generation),
+        ));
         jobs::spawn_foreground(
             root,
             &executable,
@@ -191,12 +204,32 @@ async fn single_turn(
         let mut worker =
             session_worker::ensure_worker(root, &executable, &session.id, &session.workspace)
                 .await?;
-        let mut arguments = crate::background_commands::turn_arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
-        if generated { arguments.insert(0, "--generated-continuation".into()); }
-        let mut environment = vec![("DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),session.auto_route.to_string())];
-        if session_worker::call(&worker, &Request::Ping).await?.generation_supported != Some(true) {
-            session_worker::shutdown_worker(&worker).await.context("Provider switch pending; observe the legacy job with /continue")?;
-            worker = session_worker::ensure_worker(root, &executable, &session.id, &session.workspace).await?;
+        let mut arguments = crate::background_commands::turn_arguments(
+            cli,
+            &session.paths,
+            session,
+            &session.id,
+            prompt,
+            &provider,
+        )?;
+        if let Some(origin) = generated {
+            arguments.insert(0, origin.worker_argument().into());
+        }
+        let mut environment = vec![(
+            "DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),
+            session.auto_route.to_string(),
+        )];
+        if session_worker::call(&worker, &Request::Ping)
+            .await?
+            .generation_supported
+            != Some(true)
+        {
+            session_worker::shutdown_worker(&worker)
+                .await
+                .context("Provider switch pending; observe the legacy job with /continue")?;
+            worker =
+                session_worker::ensure_worker(root, &executable, &session.id, &session.workspace)
+                    .await?;
         }
         let state = session.binding.read().context("Missing session binding")?;
         environment.push((crate::worker_binding::SNAPSHOT_ENV.into(), serde_json::to_string(state.as_ref())?));
@@ -258,7 +291,16 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
     present(session, &job, input, &mut display, false, proposal_frontend.as_ref()).await?;
     let kickoff = if main_execution && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id)? } else { None };
     drop(proposal_frontend);
-    if let Some(kickoff) = kickoff { Box::pin(turn(cli, session, &kickoff, input, true)).await?; }
+    if let Some(kickoff) = kickoff {
+        Box::pin(turn(
+            cli,
+            session,
+            &kickoff,
+            input,
+            Some(crate::args::Continuation::Goal),
+        ))
+        .await?;
+    }
     Ok(())
 }
 

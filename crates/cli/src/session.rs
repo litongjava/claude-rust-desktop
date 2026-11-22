@@ -145,13 +145,22 @@ pub(crate) fn recall_queued(
 
 // Attempt data is published only after optional recovery has settled.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TurnOrigin { User, Generated, InitialHook, HookWake }
+enum TurnOrigin {
+    User,
+    Continuation,
+    GoalContinuation,
+    ErrorResume,
+    InitialHook,
+    HookWake,
+}
 
 impl TurnOrigin {
     fn tag(self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Generated => "generated",
+            Self::User => "typed",
+            Self::Continuation => "continuation",
+            Self::GoalContinuation => "goal_continuation",
+            Self::ErrorResume => "error_resume",
             Self::InitialHook | Self::HookWake => "hook",
         }
     }
@@ -1596,7 +1605,11 @@ impl Session {
     }
 
     pub(crate) async fn turn_with_origin(
-        &self, cli: &Cli, prompt: &str, input: &mut Option<TerminalInput>, generated: bool,
+        &self,
+        cli: &Cli,
+        prompt: &str,
+        input: &mut Option<TerminalInput>,
+        generated: Option<crate::args::Continuation>,
     ) -> Result<()> {
         use std::io::IsTerminal;
         self.apply_settings_permissions(cli)?;
@@ -1616,8 +1629,7 @@ impl Session {
         }
         // Frontends record original human input before skill expansion/worker handoff.
         // A worker receives synthesized context and must never re-label it as user intent.
-        if !generated && frontend
-        {
+        if generated.is_none() && frontend {
             deepseek_code_core::services::permission_authority::record_user(
                 &self.store.db,
                 &self.id,
@@ -1626,8 +1638,13 @@ impl Session {
         }
         // Keep engine/goal futures out of the outer host stack. Debug builds on
         // Windows otherwise exhaust the process stack before a worker can run.
+        let mut origin = match generated {
+            Some(crate::args::Continuation::Goal) => TurnOrigin::GoalContinuation,
+            Some(crate::args::Continuation::Resume) => TurnOrigin::Continuation,
+            None => TurnOrigin::User,
+        };
         if self.sdk_content.is_some() {
-            return Box::pin(self.run_turn(cli, prompt, input)).await;
+            return Box::pin(self.run_turn_origin(cli, prompt, input, origin, true)).await;
         }
         let hook_session = self.id.clone();
         let hook_interactive = input.is_some() && cli.output_format == OutputFormat::Text;
@@ -1662,7 +1679,6 @@ impl Session {
             return crate::worker_frontend::turn(cli, self, prompt, input, generated).await;
         }
         let mut next = prompt.to_owned();
-        let mut origin = if generated { TurnOrigin::Generated } else { TurnOrigin::User };
         loop {
             let goal =
                 deepseek_code_core::services::session_goals::active(&self.store.db, &self.id)?;
@@ -1704,7 +1720,10 @@ impl Session {
             }
             .await;
             match result {
-                Ok(Some(followup)) => { next = followup; origin = TurnOrigin::Generated; }
+                Ok(Some(followup)) => {
+                    next = followup;
+                    origin = TurnOrigin::GoalContinuation;
+                }
                 Ok(None) => break,
                 Err(error) => {
                     let discarded = deepseek_code_core::services::goal_proposals::discard(
@@ -1747,7 +1766,7 @@ impl Session {
                                 match crate::session_commands::wait_goal_retry(self, &goal.id).await
                                 {
                                     Ok(true) => {
-                                        origin = TurnOrigin::Generated;
+                                        origin = TurnOrigin::ErrorResume;
                                         next = format!("Resume unfinished work toward the explicitly authorized goal: {}. Review existing progress first and do not repeat completed operations. Stay within existing permissions.", goal.condition);
                                         continue;
                                     }
@@ -1795,6 +1814,7 @@ impl Session {
         Box::pin(self.run_turn_origin(cli, "", input, TurnOrigin::HookWake, true)).await
     }
 
+    #[cfg(test)]
     async fn run_turn(
         &self,
         cli: &Cli,
@@ -2083,14 +2103,6 @@ impl Session {
         if !hook_wake && completion.queued.is_none() {
             let message = json!({"role":"user","origin":origin.tag(),"content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))});
             history.push(message);
-        } else if completion
-            .queued
-            .as_ref()
-            .is_some_and(|item| item.request_id.starts_with("internal-cli:notice:"))
-        {
-            if let Some(message) = history.last_mut().filter(|m| m["role"] == "user") {
-                message["origin"] = json!("task_notification");
-            }
         }
         let mut system = match &self.sdk_overrides.system_prompt {
             Some(prompt) => prompt.clone(),
@@ -2119,17 +2131,10 @@ impl Session {
         let mut checkpoint = if hook_wake || completion.queued.is_some() {
             None
         } else {
-            let user_message_id = self.selected_session()?.write(|w| {
-                if origin == TurnOrigin::InitialHook {
-                    return w.append_hook_user(prompt);
-                }
-                let id = match &self.sdk_content {
-                    Some(content) => w.append_user_content(prompt, content)?,
-                    None => w.append("user", prompt)?,
-                };
-                w.set_message_metadata(&id, &json!({"promptOrigin": origin.tag()}))?;
-                Ok(id)
-            }).context("Persisting CLI user message")?;
+            let user_message_id = self
+                .selected_session()?
+                .admit_prompt(prompt, self.sdk_content.as_ref(), origin.tag())
+                .context("Persisting CLI user message")?;
             history.last_mut().expect("submitted user message")["id"] = json!(user_message_id);
             match deepseek_code_core::services::checkpoints::capture(
                 &self.paths.data_dir,

@@ -76,9 +76,11 @@ pub async fn run(session: &Session, command: &str) -> Result<()> {
         history.push(styled, None);
     }
     history.save();
-    session
-        .store
-        .append(&session.id, "user", &transcript(command, &stdout, &stderr))?;
+    session.store.append_prompt(
+        &session.id,
+        &transcript(command, &stdout, &stderr),
+        "shell_transcript",
+    )?;
     Ok(())
 }
 

@@ -2,6 +2,21 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Continuation {
+    Goal,
+    Resume,
+}
+
+impl Continuation {
+    pub fn worker_argument(self) -> &'static str {
+        match self {
+            Self::Goal => "--generated-continuation=goal",
+            Self::Resume => "--generated-continuation=resume",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "dcl",
@@ -92,8 +107,8 @@ pub struct Cli {
     #[arg(skip)]
     pub permission_mode_explicit: bool,
     /// The frontend submitted a generated continuation to this worker.
-    #[arg(long, hide = true, requires = "resume")]
-    pub generated_continuation: bool,
+    #[arg(long, hide = true, requires = "resume", value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "goal")]
+    pub generated_continuation: Option<Continuation>,
     /// The generation observed by the terminal requesting a process transfer.
     #[arg(long, hide = true, requires = "resume")]
     pub binding_generation: Option<u64>,
