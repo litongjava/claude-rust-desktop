@@ -23,6 +23,65 @@ impl Drop for Server {
         self.0.abort();
     }
 }
+
+#[test]
+fn listing_an_authored_index_without_topics_preserves_all_39_bytes() {
+    use std::{fs, path::Path, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    let data = root.path().join("data");
+    fs::create_dir(&workspace).unwrap();
+    let files = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_dcl"))
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("-C")
+            .arg(&workspace)
+            .args(["memory", "files"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let empty = files(&["list"]);
+    let dir = Path::new(empty["directory"].as_str().unwrap());
+    assert!(!dir.exists());
+    fs::create_dir_all(dir).unwrap();
+    let index = dir.join("MEMORY.md");
+    let authored = b"Use the reviewed deployment checklist.\n";
+    assert_eq!(authored.len(), 39);
+    fs::write(&index, authored).unwrap();
+    let listed = files(&["list"]);
+    assert_eq!(fs::read(&index).unwrap(), authored);
+    assert_eq!(listed["index"], std::str::from_utf8(authored).unwrap());
+    assert_eq!(listed["generation"], 0);
+    assert!(!data.join("memory/state").exists());
+
+    fs::write(dir.join("topic.md"), note("Topic", "body")).unwrap();
+    let preview = files(&["repair"]);
+    assert_eq!(preview["before"], listed["index"]);
+    assert!(preview["after"]
+        .as_str()
+        .unwrap()
+        .contains("[Topic](topic.md)"));
+    assert_eq!(fs::read(&index).unwrap(), authored);
+    assert!(!data.join("memory/state").exists());
+    let applied = files(&[
+        "repair",
+        "--confirm",
+        preview["confirmation"].as_str().unwrap(),
+    ]);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(
+        fs::read_to_string(index).unwrap(),
+        preview["after"].as_str().unwrap()
+    );
+}
 async fn respond(
     State(mock): State<Arc<Mock>>,
     Json(body): Json<Value>,
@@ -164,6 +223,11 @@ async fn scenario(protocol: &'static str, plan: bool) {
             None,
         )
         .unwrap();
+    std::fs::write(
+        memory.directory.join("MEMORY.md"),
+        "- [中文 preferences](preferences.md)\n",
+    )
+    .unwrap();
     let legacy =
         deepseek_code_core::memory::MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
     legacy

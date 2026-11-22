@@ -1,6 +1,88 @@
 //! Provider-body coverage of every scope and each durable window writer.
 use super::*;
 
+#[tokio::test]
+async fn authored_project_index_survives_listing_topic_crud_and_compaction() -> Result<()> {
+    use crate::services::{compaction::GeneratedSummary, memory_files::FileMemory};
+    use std::fs;
+
+    let root = tempfile::tempdir()?;
+    let ws = root.path().join("project");
+    fs::create_dir(&ws)?;
+    let ctx = crate::services::session_messages::context(&root.path().join("data"))?;
+    let shard =
+        ctx.db
+            .create_code_session(&ws, "model", "provider", &uuid::Uuid::new_v4().to_string())?;
+    let project = FileMemory::session(&ctx, shard.id())?;
+    let tool = |name: &str, input: Value| -> Result<Value> {
+        let filename = project.target(name, &input, ws.to_str().unwrap())?.unwrap();
+        project.tool(name, &input, &filename, false)
+    };
+    let index = project.directory.join("MEMORY.md");
+    let marker = "AUTHORED-PROJECT-CHECKLIST";
+    let authored = format!("# Checklist\r\n{marker}\r\n");
+    tool("Write", json!({"file_path":index,"content":authored}))?;
+    let check_disk = || assert_eq!(fs::read(&index).unwrap(), authored.as_bytes());
+    let check_request = |bytes: Vec<u8>| {
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap().matches(marker).count(),
+            1
+        );
+        let first_user = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        assert!(first_user["content"].to_string().contains(marker));
+        assert!(!request.to_string().contains("MEMORY.md changed."));
+    };
+    check_disk();
+    shard.admit_prompt("before listing", None, "typed")?;
+    check_request(memory_request_bytes(&shard, "openai").await);
+    let generation = project.store(true)?.snapshot()?.generation;
+    let listed = project.listing("")?;
+    assert_eq!(listed["index"], authored);
+    assert_eq!(listed["generation"], generation);
+    check_disk();
+    shard.admit_prompt("after listing", None, "typed")?;
+    check_request(memory_request_bytes(&shard, "openai").await);
+
+    let topic = project.directory.join("sibling.md");
+    tool(
+        "Write",
+        json!({"file_path":topic,"content":"---\nname: Sibling\ndescription: Sibling topic\nmetadata:\n  type: user\n---\nold body\n"}),
+    )?;
+    check_disk();
+    tool(
+        "Edit",
+        json!({"file_path":topic,"old_string":"old body","new_string":"new body"}),
+    )?;
+    check_disk();
+    tool(
+        "ApplyPatch",
+        json!({"patch":format!("*** Begin Patch\n*** Delete File: {}\n*** End Patch", topic.display())}),
+    )?;
+    assert!(!topic.exists());
+    check_disk();
+    shard.admit_prompt("after deletion", None, "typed")?;
+    check_request(memory_request_bytes(&shard, "openai").await);
+
+    let prepared = shard.repository().prepare_compaction(None)?;
+    shard.repository().commit_compaction(
+        &prepared,
+        &GeneratedSummary {
+            text: "summary".into(),
+            native: None,
+        },
+        None,
+    )?;
+    shard.admit_prompt("after compact", None, "typed")?;
+    check_request(memory_request_bytes(&shard, "openai").await);
+    Ok(())
+}
+
 #[test]
 fn memory_fork_copies_and_deletes_only_its_own_directory() -> Result<()> {
     use crate::db::session_store::Branch;
