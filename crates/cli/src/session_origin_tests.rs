@@ -155,11 +155,11 @@ async fn queued_compaction(autocompact: bool) -> Result<()> {
     }
     let admitted = Arc::new(std::sync::OnceLock::<(Arc<Stores>, SessionDb)>::new());
     let summary_session = admitted.clone();
-    let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |Json(body): Json<Value>| {
+    let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
         let capture = capture.clone();
         let summary_session = summary_session.clone();
         async move {
-            if body["stream"] != true {
+            if headers.get("x-dcl-request-kind").is_some_and(|kind| kind == "compaction") {
                 if autocompact {
                     // The 24,000-token window triggers at 19,200. Observe the
                     // admitted input and receipt while its prefix is being summarized.
@@ -167,12 +167,15 @@ async fn queued_compaction(autocompact: bool) -> Result<()> {
                     check_admitted(stores, shard).unwrap();
                     assert!(!body["messages"].to_string().contains("QUEUED_INPUT_7F03"));
                 }
-                return Json(json!({"id":"summary","object":"chat.completion","created":0,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"compacted"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})).into_response();
-            }
-            let mut calls = capture.lock().unwrap();
-            calls.push(body);
-            if !autocompact && calls.len() == 1 {
-                return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"context_length_exceeded","message":"prompt is too long"}}))).into_response();
+                if body["stream"] != true {
+                    return Json(json!({"id":"summary","object":"chat.completion","created":0,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"compacted"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})).into_response();
+                }
+            } else {
+                let mut calls = capture.lock().unwrap();
+                calls.push(body);
+                if !autocompact && calls.len() == 1 {
+                    return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"context_length_exceeded","message":"prompt is too long"}}))).into_response();
+                }
             }
             ([("content-type", "text/event-stream")], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
         }
