@@ -275,26 +275,14 @@ pub(crate) fn fingerprint(
     history_snapshot(conn, id, None)
 }
 
-/// Serialize the same row shape as storage while changing only model-facing output.
-pub(crate) fn project_entry(entry: &mut Value, root: &std::path::Path, session: &str) {
-    use crate::native_engine::tool_loop::{monitor_notification, project_for_model};
-    let message = &mut entry["message"];
-    if message["role"] == "user" {
-        if let Some(view) = message["content"]
-            .as_str()
-            .filter(|s| monitor_notification(s))
-            .and_then(|s| project_for_model("Monitor", s, Some(root), session))
-        {
-            message["content"] = Value::String(view);
-        }
-    }
-    for call in entry["tools"].as_array_mut().into_iter().flatten() {
-        if let (Some(name), Some(raw)) = (call["name"].as_str(), call["output"].as_str()) {
-            if let Some(view) = project_for_model(name, raw, Some(root), session) {
-                call["output"] = Value::String(view);
-            }
-        }
-    }
+pub(crate) fn model_entry(
+    conn: &rusqlite::Connection,
+    row: &message_repo::MessageRow,
+) -> Result<Value> {
+    let mut message = row.clone();
+    message.content = crate::db::model_results::message_text(conn, row)?;
+    let tools = crate::db::model_results::calls(conn, &row.id, &row.conversation_id)?;
+    Ok(json!({"message":message,"tools":tools}))
 }
 
 pub(crate) fn history_snapshot(
@@ -311,18 +299,14 @@ pub(crate) fn history_snapshot(
     let mut all = Vec::new();
     let mut hasher = Sha256::new();
     for (index, row) in rows.iter().enumerate() {
-        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut entry = json!({"message": row, "tools": calls, "attachment_metadata": attachments});
-        serde_json::to_writer(&mut hasher, &entry)?;
-        hasher.write_all(b"\n")?;
-        if index >= start {
-            if let Some(root) = projection {
-                project_entry(&mut entry, root, id);
-            }
+        message_repo::hash_history_entry(conn, row, &attachments, &mut hasher)?;
+        if index >= start && projection.is_some() {
+            let mut entry = model_entry(conn, row)?;
+            entry["attachment_metadata"] = Value::Array(attachments);
             all.push(entry);
         }
     }
@@ -993,6 +977,39 @@ mod hook_tests {
             assert_eq!(events[2]["compact_summary"], "summary");
         }
     }
+    #[tokio::test]
+    async fn base64_model_boundary_hooked_summary_uses_stored_output() {
+        let (dir, service, store, id) = fixture();
+        configure(&service, "ok", "ok", "ok");
+        let msg = store.append(&id, "assistant", "").unwrap();
+        let payload = "QUJD".repeat(256);
+        let raw = json!({"stdout":format!("header\n{payload}\n"),"exit_code":0}).to_string();
+        service
+            .db
+            .fixture_shard(&id, |c| {
+                message_repo::insert_tool_call(c, "bash", &msg, "Bash", None, Some(&raw), false, 0)
+            })
+            .unwrap()
+            .unwrap();
+        compact_hooks(
+            &service,
+            dir.path(),
+            &id,
+            "model",
+            "focus",
+            "manual",
+            None,
+            |input, focus, _| async move {
+                assert!(focus.contains("keep exact paths"));
+                assert!(input.contains("base64 data omitted"));
+                assert!(!input.contains(&payload));
+                Ok("summary".into())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn generation_failure_conflict_and_context_write_failure_preserve_old_context() {
         for failure in ["generation", "conflict", "context-write"] {

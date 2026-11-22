@@ -62,6 +62,7 @@ pub(crate) fn collapse(text: &str) -> (String, usize) {
 pub(crate) struct Run {
     pub range: std::ops::Range<usize>,
     pub decoded_len: usize,
+    pub encoded_len: usize,
     pub kind: &'static str,
 }
 
@@ -105,11 +106,26 @@ pub(crate) fn runs(text: &str) -> Vec<Run> {
         };
         runs.push(Run {
             range: start..index,
+            encoded_len: index - start,
             decoded_len,
             kind,
         });
     }
     runs
+}
+
+/// A downstream budget must not turn part of an invalid token into a qualifying run.
+pub(crate) fn safe_prefix_end(text: &str, cut: usize) -> usize {
+    if text
+        .as_bytes()
+        .get(cut)
+        .is_some_and(|b| ALPHABET[*b as usize] || *b == b'=')
+    {
+        if let Some(run) = runs(&text[..cut]).last().filter(|r| r.range.end == cut) {
+            return run.range.start;
+        }
+    }
+    cut
 }
 
 /// The final note appended by Read and WebFetch when anything was replaced.

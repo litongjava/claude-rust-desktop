@@ -214,17 +214,9 @@ fn stream_occurrence_id(message: &str, provider_id: &str) -> String {
 
 impl SessionDb {
     pub fn context_search(&self, input: Value) -> Result<String> {
-        crate::tools::context_search::search(
-            &self.incarnation,
-            self.stores.data_dir(),
-            self.id(),
-            input,
-            |selection| {
-                self.read(|r| {
-                    crate::db::context_search_repo::read_snapshot(r.0, &self.id, selection)
-                })
-            },
-        )
+        crate::tools::context_search::search(&self.incarnation, input, |selection| {
+            self.read(|r| crate::db::context_search_repo::read_snapshot(r.0, &self.id, selection))
+        })
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -482,7 +474,9 @@ impl SessionWrite<'_> {
                 message_id: message.into(),
                 ..tool.clone()
             };
-            self.tool(&row, None)?;
+            if !messages::pending_after_completion(self.0, &row.id, row.output.as_deref())? {
+                self.tool(&row, None)?;
+            }
             if let Some((parent, sequence)) = origins.get(&tool.id) {
                 messages::save_tool_origin(
                     self.0,
@@ -745,10 +739,17 @@ impl SessionRead<'_> {
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
+        self.replay(format, false)
+    }
+    pub(crate) fn replay(
+        &self,
+        format: &crate::native_engine::provider_manager::ApiFormat,
+        full: bool,
+    ) -> Result<(Vec<Value>, Option<String>)> {
         let id: String = self
             .0
             .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
-        crate::runtime::replay_history(self.0, &id, format, |message| {
+        crate::runtime::replay_history(self.0, &id, format, full, |message| {
             let raw: Option<String> = self
                 .0
                 .query_row(
@@ -764,9 +765,15 @@ impl SessionRead<'_> {
 }
 impl SessionWrite<'_> {
     pub fn native_boundary(&self, message: &str, value: &Value) -> Result<()> {
+        let mut window = value.clone();
+        crate::native_engine::tool_loop::seal_native_window(
+            &mut window,
+            crate::db::model_results::data_root(self.0)?.as_deref(),
+            self.1,
+        );
         self.0.execute("UPDATE compaction_state SET local_count=local_count+1 WHERE singleton=1 AND NOT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)", [message])?;
         self.0
-            .execute("INSERT INTO native_boundaries VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET value=excluded.value", params![message, serde_json::to_string(value)?])?;
+            .execute("INSERT INTO native_boundaries VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET value=excluded.value", params![message, serde_json::to_string(&window)?])?;
         self.0.execute(
             "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
             [message],

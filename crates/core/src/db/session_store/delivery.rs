@@ -958,7 +958,14 @@ impl DeliveryOwner {
                         row.conversation_id == self.session.id && row.role == "user",
                         "Invalid delivered context"
                     );
-                    let content = message_repo::user_content_for_display(c, &row)?;
+                    let content =
+                        if crate::native_engine::tool_loop::monitor_notification(&row.content) {
+                            serde_json::Value::String(crate::db::model_results::message_text(
+                                c, &row,
+                            )?)
+                        } else {
+                            message_repo::user_content_for_display(c, &row)?
+                        };
                     Ok(Some(DeliveredInput {
                         text: row.content,
                         content,
@@ -1045,7 +1052,9 @@ impl DeliveryOwner {
                     inputs.push(DeliveredInput {
                         message_id: None,
                         text: payload.as_str().map(str::to_owned).unwrap_or_else(|| payload.to_string()),
-                        content: payload.clone(),
+                        content: if let Some(raw)=payload.as_str().filter(|v|crate::native_engine::tool_loop::monitor_notification(v)) {
+                            crate::native_engine::tool_loop::project_for_model("Monitor",raw,Some(s.stores.data_dir()),&s.id).map_or_else(||payload.clone(),|v|serde_json::Value::String(v.text))
+                        }else{payload.clone()},
                         origin: if claim.id.starts_with("notice-") {"task_notification"}else{"user"}.into(),
                     });
                     input_queue::save_delivered(tx.0, tool, &inputs)?;

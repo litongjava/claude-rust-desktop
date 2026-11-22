@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL,
     is_compact_boundary INTEGER DEFAULT 0,
     sort_order INTEGER NOT NULL,
+    model_content TEXT,
+    model_recovery TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
@@ -103,6 +105,7 @@ CREATE TABLE IF NOT EXISTS mcp_tool_outputs (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     tool_use_id TEXT NOT NULL,
     content_json TEXT NOT NULL,
+    model_content_json TEXT,
     metadata_json TEXT NOT NULL,
     display_text TEXT NOT NULL,
     is_error INTEGER NOT NULL,
@@ -154,6 +157,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     output TEXT,
     is_error INTEGER DEFAULT 0,
     sort_order INTEGER NOT NULL,
+    model_output TEXT,
+    model_preview TEXT,
+    model_recovery TEXT,
+    model_search TEXT,
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 

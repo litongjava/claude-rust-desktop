@@ -212,9 +212,24 @@ impl ContextCompressor {
             }
         }
 
+        let mut eligible = std::collections::HashSet::new();
         for msg in &messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            
+
+            for call in msg["tool_calls"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(name)) =
+                    (call["id"].as_str(), call["function"]["name"].as_str())
+                {
+                    if super::tool_loop::eligible(name) {
+                        eligible.insert(id);
+                    } else {
+                        eligible.remove(id);
+                    }
+                }
+            }
+            let shell_result = msg["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| eligible.contains(id));
             // Skip empty assistant messages
             if role == "assistant" {
                 let empty = match msg.get("content") {
@@ -230,13 +245,21 @@ impl ContextCompressor {
             // Truncate long tool outputs
             if role == "tool" || role == "function" {
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if content.len() > self.config.max_tool_output_bytes {
-                    let safe_end = content.char_indices()
+                if content.len() > self.config.max_tool_output_bytes
+                    && !(shell_result && content.contains("[base64 data omitted:"))
+                {
+                    let safe_end = content
+                        .char_indices()
                         .take(self.config.max_tool_output_bytes)
                         .last()
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
-                    let truncated = &content[..safe_end];
+                    let cut = if shell_result {
+                        crate::tools::base64_collapse::safe_prefix_end(content, safe_end)
+                    } else {
+                        safe_end
+                    };
+                    let truncated = &content[..cut];
                     let mut compressed_msg = msg.clone();
                     if let Some(obj) = compressed_msg.as_object_mut() {
                         obj.insert("content".to_string(), serde_json::json!(
@@ -251,8 +274,13 @@ impl ContextCompressor {
             } else {
                 // Truncate very long messages
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if content.len() > self.config.max_message_content_chars && role == "user" {
-                    let safe_end = content.char_indices()
+                if content.len() > self.config.max_message_content_chars
+                    && role == "user"
+                    && !(super::tool_loop::monitor_notification(content)
+                        && content.contains("[base64 data omitted:"))
+                {
+                    let safe_end = content
+                        .char_indices()
                         .take(self.config.max_message_content_chars)
                         .last()
                         .map(|(idx, _)| idx)

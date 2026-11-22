@@ -569,10 +569,13 @@ impl Drop for PermissionWaiterGuard {
 
 #[path = "model_tool_output.rs"]
 mod model_output;
-pub(crate) use model_output::project_stored_history;
+pub(crate) use model_output::projected_command_notes;
+pub(crate) use model_output::{
+    ordinary_preview, prepare_native_window, project_result_content, seal_native_window,
+};
 #[path = "model_projection.rs"]
 mod model_projection;
-pub(crate) use model_projection::{monitor_notification, project_for_model};
+pub(crate) use model_projection::{eligible, monitor_notification, project_for_model, Recovery};
 
 pub(crate) fn model_tool_output(tool_name: &str, output: &str) -> String {
     model_output::render(tool_name, output, None)
@@ -2796,14 +2799,15 @@ impl ToolLoopExecutor {
         id: Option<&str>,
     ) -> String {
         let root = self.search_config_path.as_deref().and_then(|p| p.parent());
-        let preview = self.ordinary_tool_preview(tool_name, output, id, root);
-        project_for_model(
+        let view = crate::db::model_results::ModelText::new(
             tool_name,
-            &preview,
+            output,
             root,
             self.conv_id.as_deref().unwrap_or_default(),
-        )
-        .unwrap_or(preview)
+            id,
+            std::path::Path::new(self.get_workspace_cwd()),
+        );
+        view.preview.unwrap_or(view.text)
     }
 
     fn ordinary_tool_preview(
@@ -2813,33 +2817,38 @@ impl ToolLoopExecutor {
         id: Option<&str>,
         root: Option<&std::path::Path>,
     ) -> String {
-        if model_output::is_shell_result(tool_name) {
-            let enabled = self.summary_enabled(root);
-            let metadata = if enabled {
-                root.zip(id)
-                    .and_then(|(root, id)| {
-                        std::fs::read(model_output::metadata_path(root, id)).ok()
-                    })
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            } else {
-                None
-            };
-            return model_output::command_preview(
-                tool_name,
+        model_output::ordinary_preview(
+            tool_name,
+            output,
+            id,
+            root,
+            std::path::Path::new(self.get_workspace_cwd()),
+        )
+    }
+
+    fn completed_model_text(
+        &self,
+        call: &PendingToolCall,
+        input: &Value,
+        output: &str,
+        failed: bool,
+    ) -> Result<String> {
+        if let (Some(history), Some(message)) = (
+            self.session_search_storage(),
+            self.parent_message_id.as_deref(),
+        ) {
+            self.record_tool_usage(&call.name);
+            return history.complete_model_result(
+                message,
+                &call.id,
+                &call.name,
+                input,
                 output,
-                root,
-                metadata.as_ref(),
-                enabled,
+                failed,
+                std::path::Path::new(self.get_workspace_cwd()),
             );
         }
-        let cleaned = model_tool_output(tool_name, output);
-        // Read already selects the requested line range.
-        if let Some(root) = root.filter(|_| tool_name != "Read") {
-            let preview = compact_tool_output(tool_name, &cleaned);
-            crate::performance::retain_tool_output(root, &cleaned, &preview)
-        } else {
-            cleaned
-        }
+        Ok(self.retained_tool_output_for_id(&call.name, output, Some(&call.id)))
     }
 
     fn finish_mcp_output(
@@ -2853,6 +2862,12 @@ impl ToolLoopExecutor {
         let Some(mut content) = content else {
             return Ok(None);
         };
+        let mut model = content.content.clone();
+        if !content.has_images() || eligible(name) {
+            self.record_tool_usage(name);
+            self.retain_content(name, &mut model);
+        }
+        content.model_content = Some(model);
         if let Some(history) = self.session_search_storage() {
             let started = std::time::Instant::now();
             if self.parent_message_id.is_none() {
@@ -2865,12 +2880,10 @@ impl ToolLoopExecutor {
                     "save MCP tool output", history.id(), started, error,
                 ))?;
         }
-        // Images and structured blocks must remain real provider content. Only
-        // plain text can use the existing spill/preview representation.
-        if !content.has_images() {
-            self.record_tool_usage(name);
-            self.retain_content(name, &mut content.content);
-        }
+        content.content = content
+            .model_content
+            .take()
+            .expect("prepared model content");
         Ok(Some(content))
     }
 
@@ -4057,6 +4070,14 @@ impl ToolLoopExecutor {
         Ok(())
     }
 
+    fn prepare_model_input(&mut self) -> Result<()> {
+        let mut messages = std::mem::take(&mut self.messages);
+        self.prepare_history_tool_outputs(&mut messages)?;
+        self.auto_history = messages.clone();
+        self.messages = messages;
+        Ok(())
+    }
+
     async fn execute_scoped(&mut self) -> Result<(String, Option<String>)> {
         let conv_id = self.conv_id.clone().unwrap_or_default();
         tracing::info!(
@@ -4066,6 +4087,8 @@ impl ToolLoopExecutor {
             self.messages.len(),
             self.provider.provider.id
         );
+
+        self.prepare_model_input()?;
 
         // Token 计数与自动压缩 - First pass
         tracing::info!(module = "ToolLoop", "[E2] Checking token threshold...");
@@ -5965,6 +5988,15 @@ impl ToolLoopExecutor {
                                 manager.record_tool_success(self.conv_id.as_deref().unwrap_or(""));
                             }
                         }
+                        let content = match mcp {
+                            Some(value) => value.content,
+                            None => json!(self.completed_model_text(
+                                tc,
+                                &actual_input,
+                                &output_str,
+                                is_error
+                            )?),
+                        };
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -5975,13 +6007,6 @@ impl ToolLoopExecutor {
                                 is_error,
                             })
                             .await;
-                        let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output_for_id(
-                                &tc.name,
-                                &output_str,
-                                Some(&tc.id)
-                            ))
-                        });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
                             content,
@@ -6213,17 +6238,29 @@ impl ToolLoopExecutor {
                             "auto",
                             &serde_json::to_string(&conv_values)?,
                         );
-                        let compacted =
+                        let mut compacted =
                             crate::services::compaction::native::generate_messages_with_options(
                                 &self.provider,
                                 options,
                                 conversation_messages.clone(),
                                 self.system_prompt.as_deref().unwrap_or(""),
                                 self.conv_id.as_deref(),
+                                self.search_config_path
+                                    .as_deref()
+                                    .and_then(std::path::Path::parent),
                             )
                             .await?;
                         if let Some(record) = &mut record {
                             record.finish(&compacted, "in-flight-native-window");
+                        }
+                        if let Some(window) = compacted.native.as_mut() {
+                            prepare_native_window(
+                                window,
+                                self.search_config_path
+                                    .as_deref()
+                                    .and_then(std::path::Path::parent),
+                                self.conv_id.as_deref().unwrap_or_default(),
+                            );
                         }
                         // Only the in-flight context changes here; all original messages and tool rows remain durable.
                         conversation_messages = vec![OpenAIMessage {
@@ -6907,6 +6944,15 @@ impl ToolLoopExecutor {
                                 manager.record_tool_success(self.conv_id.as_deref().unwrap_or(""));
                             }
                         }
+                        if let Some(content) = &mcp {
+                            tool_images.extend(content.openai_images(&tc.id));
+                        }
+                        let compacted = match mcp {
+                            Some(value) => value.openai_text(),
+                            None => {
+                                self.completed_model_text(tc, &actual_input, &output_str, is_error)?
+                            }
+                        };
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -6917,12 +6963,6 @@ impl ToolLoopExecutor {
                                 is_error,
                             })
                             .await;
-                        if let Some(content) = &mcp {
-                            tool_images.extend(content.openai_images(&tc.id));
-                        }
-                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
-                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
-                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),
@@ -7060,8 +7100,7 @@ impl ToolLoopExecutor {
 
     fn build_anthropic_messages(&self) -> Result<Vec<AnthropicMessage>> {
         let additions = self.message_additions();
-        let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.prepare_history_tool_outputs(&mut messages);
+        let messages = multimodal::normalize_messages(&self.messages)?;
         Ok(messages
             .iter()
             .enumerate()
@@ -7165,8 +7204,7 @@ impl ToolLoopExecutor {
         // instruction blocks stay separate for caching. Chat Completions keeps
         // one string because several compatible servers reject arrays there.
         let separate_parts = super::provider_runtime::responses_api(&self.provider);
-        let mut messages = multimodal::normalize_messages(&self.messages)?;
-        self.prepare_history_tool_outputs(&mut messages);
+        let messages = multimodal::normalize_messages(&self.messages)?;
         Ok(messages
             .iter()
             .enumerate()

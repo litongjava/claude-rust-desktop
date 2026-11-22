@@ -180,8 +180,9 @@ pub fn insert_message(
     is_compact_boundary: bool,
     sort_order: i64,
 ) -> Result<()> {
+    let view = super::model_results::notification(conn, conversation_id, role, content)?;
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO messages (id, conversation_id, role, content, thinking, created_at, is_compact_boundary, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        "INSERT INTO messages (id, conversation_id, role, content, thinking, created_at, is_compact_boundary, sort_order, model_content, model_recovery) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     )?;
     stmt.execute(params![
         id,
@@ -192,6 +193,11 @@ pub fn insert_message(
         created_at,
         is_compact_boundary as i64,
         sort_order,
+        view.as_ref().map(|v| &v.text),
+        view.as_ref()
+            .and_then(|v| v.recovery.as_ref())
+            .map(serde_json::to_string)
+            .transpose()?,
     ])?;
     Ok(())
 }
@@ -233,10 +239,11 @@ pub fn save_user_message(
     created_at: &str,
     sort_order: i64,
 ) -> Result<()> {
-    let (display,normalized)=prepare_user_message(content)?;
+    let (display, normalized) = prepare_user_message(content)?;
+    let view = super::model_results::notification(conn, conversation_id, "user", &display)?;
     let changed = conn.execute(
-        "INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'user', ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET content = excluded.content, sort_order = excluded.sort_order WHERE messages.conversation_id = excluded.conversation_id AND messages.role = 'user'",
-        params![id, conversation_id, display, created_at, sort_order],
+        "INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order, model_content, model_recovery) VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET content = excluded.content,model_content=excluded.model_content,model_recovery=excluded.model_recovery, sort_order = excluded.sort_order WHERE messages.conversation_id = excluded.conversation_id AND messages.role = 'user'",
+        params![id, conversation_id, display, created_at, sort_order,view.as_ref().map(|v|&v.text),view.as_ref().and_then(|v|v.recovery.as_ref()).map(serde_json::to_string).transpose()?],
     )?;
     anyhow::ensure!(
         changed == 1,
@@ -375,6 +382,22 @@ pub fn tool_call_note(conn: &Connection, tool_call_id: &str) -> Result<Option<St
         .optional()?)
 }
 
+/// Hash the immutable display transcript for compaction conflict detection.
+pub(crate) fn hash_history_entry(
+    conn: &Connection,
+    row: &MessageRow,
+    attachments: &[serde_json::Value],
+    mut hasher: impl std::io::Write,
+) -> Result<()> {
+    let calls = get_tool_calls_for_message(conn, &row.id)?;
+    serde_json::to_writer(
+        &mut hasher,
+        &serde_json::json!({"message":row,"tools":calls,"attachment_metadata":attachments}),
+    )?;
+    hasher.write_all(b"\n")?;
+    Ok(())
+}
+
 pub fn get_tool_calls_for_message(conn: &Connection, message_id: &str) -> Result<Vec<ToolCallRow>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, message_id, name, input, output, is_error, sort_order FROM tool_calls WHERE message_id = ?1 ORDER BY sort_order ASC, rowid ASC"
@@ -411,15 +434,18 @@ pub fn insert_tool_call(
     // Legacy single-file callers save the transport under the raw provider ID.
     // Bind the typed MCP sidecar to that durable ID in the same save operation.
     if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
-        conn.execute(
-            "INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
-             SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs \
+        let bound = conn.execute(
+            "INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error,model_content_json) \
+             SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error,model_content_json FROM mcp_tool_outputs \
              WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5
-             ON CONFLICT(conversation_id,tool_use_id) DO UPDATE SET content_json=excluded.content_json,metadata_json=excluded.metadata_json,
+             ON CONFLICT(conversation_id,tool_use_id) DO UPDATE SET content_json=excluded.content_json,model_content_json=excluded.model_content_json,metadata_json=excluded.metadata_json,
                 display_text=excluded.display_text,is_error=excluded.is_error
              WHERE mcp_tool_outputs.display_text<>excluded.display_text OR mcp_tool_outputs.is_error<>excluded.is_error",
             params![id,message_id,original,output,is_error],
         )?;
+        if bound != 0 {
+            crate::native_engine::mcp_output::bind_pending(conn, id, name)?;
+        }
     }
     Ok(())
 }
@@ -434,18 +460,59 @@ pub(super) fn upsert_tool_call(
     is_error: bool,
     sort_order: i64,
 ) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO tool_calls (id, message_id, name, input, output, is_error, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id, name=excluded.name, input=excluded.input, output=excluded.output, is_error=excluded.is_error, sort_order=excluded.sort_order"
-    )?;
-    stmt.execute(params![
+    store_tool_call(
+        conn,
         id,
         message_id,
         name,
         input,
         output,
-        is_error as i64,
+        is_error,
         sort_order,
-    ])?;
+        std::path::Path::new("."),
+    )?;
+    crate::native_engine::mcp_output::bind_pending(conn, id, name)
+}
+
+pub(super) fn store_tool_call(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    name: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    is_error: bool,
+    sort_order: i64,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    let session: String = conn.query_row(
+        "SELECT conversation_id FROM messages WHERE id=?",
+        [message_id],
+        |r| r.get(0),
+    )?;
+    // A stream flush may revisit a completed occurrence. Assign its view only
+    // when the actual result changes, including a transition back to pending.
+    if conn.execute("UPDATE tool_calls SET input=?5,is_error=?6,sort_order=?7 WHERE id=?1 AND name=?2 AND message_id=?3 AND output IS ?4 AND (model_output IS NOT NULL OR output IS NULL)",params![id,name,message_id,output,input,is_error,sort_order])? == 1 {
+        return Ok(());
+    }
+    let root = super::model_results::data_root(conn)?;
+    let view = output.map(|raw| {
+        super::model_results::ModelText::new(name, raw, root.as_deref(), &session, Some(id), cwd)
+    });
+    let text = view.as_ref().map(|v| v.text.as_str());
+    let recovery = view.as_ref().and_then(|v| v.recovery.as_ref());
+    let search = text.and_then(|t| {
+        if recovery.is_some() {
+            Some(std::borrow::Cow::Borrowed(t))
+        } else {
+            super::model_results::search_text(name, t)
+        }
+    });
+    conn.execute("INSERT INTO tool_calls (id,message_id,name,input,output,is_error,sort_order,model_output,model_recovery,model_search,model_preview)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id,name=excluded.name,
+        input=excluded.input,output=excluded.output,is_error=excluded.is_error,sort_order=excluded.sort_order,
+        model_output=excluded.model_output,model_recovery=excluded.model_recovery,model_search=excluded.model_search,model_preview=excluded.model_preview",
+        params![id,message_id,name,input,output,is_error,sort_order,text,recovery.map(serde_json::to_string).transpose()?,search.as_deref(),view.as_ref().and_then(|v|v.preview.as_deref())])?;
     Ok(())
 }
 
@@ -548,6 +615,19 @@ pub fn save_nested_tool_row(
     Ok(())
 }
 
+pub(super) fn pending_after_completion(
+    conn: &Connection,
+    id: &str,
+    output: Option<&str>,
+) -> Result<bool> {
+    Ok(output.is_none()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE id=? AND model_output IS NOT NULL)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )?)
+}
+
 pub(super) fn upsert_stream_message(
     conn: &Connection,
     conversation_id: &str,
@@ -569,6 +649,9 @@ fn upsert_stream_tool_result(
     tool: &ToolCallRow,
 ) -> Result<()> {
     upsert_stream_message(conn, conversation_id, message_id, content)?;
+    if pending_after_completion(conn, &tool.id, tool.output.as_deref())? {
+        return Ok(());
+    }
     insert_tool_call(
         conn,
         &tool.id,

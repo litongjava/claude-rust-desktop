@@ -7,7 +7,7 @@ CREATE TABLE manifest (
 CREATE TABLE messages (
     id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES manifest(id),
     role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT,
-    created_at TEXT NOT NULL, is_compact_boundary INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL
+    created_at TEXT NOT NULL, is_compact_boundary INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL, model_content TEXT, model_recovery TEXT
 );
 CREATE TABLE message_user_content (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, content_json TEXT NOT NULL

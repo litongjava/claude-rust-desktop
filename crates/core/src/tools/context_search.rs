@@ -6,7 +6,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 
 use crate::db::{
     context_search_repo::{self, Boundary, Location, Position, Range, Selection, Source},
@@ -72,6 +71,8 @@ struct Hit {
     #[serde(flatten)]
     location: Location,
     excerpt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_path: Option<String>,
     excerpt_truncated: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     match_truncated: bool,
@@ -120,15 +121,13 @@ impl Matcher<'_> {
 }
 
 pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<String> {
-    search(session, db.data_dir(), session, value, |selection| {
+    search(session, value, |selection| {
         db.with_conn(|conn| context_search_repo::read(conn, session, selection))?
     })
 }
 
 pub(crate) fn search(
     cursor_scope: &str,
-    root: &std::path::Path,
-    session: &str,
     value: Value,
     read: impl FnOnce(Selection<'_>) -> Result<context_search_repo::Transcript>,
 ) -> Result<String> {
@@ -208,49 +207,13 @@ pub(crate) fn search(
         (None, Some(id)) => Boundary::Pinned(Some(id)),
         (None, None) => Boundary::Latest,
     };
-    let mut transcript = read(Selection {
+    let transcript = read(Selection {
         range: input.range,
         boundary,
         role,
         tool_name: input.tool_name.as_deref(),
         position: previous.as_ref().map(|cursor| &cursor.position),
     })?;
-
-    let mut projected = Vec::new();
-    transcript.sources.retain_mut(|source| {
-        if let Some(name) = &source.location.tool_name {
-            let Some(text) = searchable_tool_text(name, &source.text) else {
-                transcript.skipped_structured_sources += 1;
-                return false;
-            };
-            if let Cow::Owned(text) = text {
-                source.text = text;
-            }
-        }
-        let name = source.location.tool_name.as_deref().or_else(|| {
-            (source.location.role == "user"
-                && crate::native_engine::tool_loop::monitor_notification(&source.text))
-            .then_some("Monitor")
-        });
-        let view = name.and_then(|name| {
-            crate::native_engine::tool_loop::project_for_model(
-                name,
-                &source.text,
-                Some(root),
-                session,
-            )
-        });
-        projected.push(view.is_some());
-        if let Some(text) = view {
-            // A replacement in the overlap starts a new searchable excerpt.
-            // Cursor offsets are in the original SQLite bytes.
-            if !text.starts_with(&source.text[..source.overlap]) {
-                source.overlap = 0;
-            }
-            source.text = text;
-        }
-        true
-    });
 
     let candidates = match &matcher {
         Matcher::Literal(query) if query.chars().take(3).count() == 3 => {
@@ -297,11 +260,12 @@ pub(crate) fn search(
             end,
             source.preceded,
             source.truncated,
-            projected[idx],
+            source.recovery.as_ref(),
         );
         positions.push(source.position);
         output.matches.push(Hit {
             location: source.location,
+            recovery_path: source.recovery.map(|r| r.path).filter(|p| !p.is_empty()),
             excerpt,
             excerpt_truncated,
             match_truncated: end - start > EXCERPT_BYTES,
@@ -321,30 +285,6 @@ pub(crate) fn search(
         output.next_cursor = positions.pop().map(cursor_for).transpose()?;
         output.has_more = true;
     }
-}
-
-fn searchable_tool_text<'a>(name: &str, text: &'a str) -> Option<Cow<'a, str>> {
-    let Some(name) = context_search_repo::projection_name(name) else {
-        return Some(Cow::Borrowed(text));
-    };
-    let prefix = text.strip_prefix("Error: ").unwrap_or(text);
-    if prefix.trim_start().starts_with('{') {
-        let parsed = serde_json::Deserializer::from_str(prefix)
-            .into_iter::<Value>()
-            .next();
-        match parsed {
-            Some(Ok(value)) if name == "Read" && value.get("image").is_some() => {
-                return value["content"]
-                    .as_str()
-                    .map(|display| Cow::Owned(display.to_owned()));
-            }
-            Some(Ok(_)) => {}
-            _ => return None,
-        }
-    }
-    Some(Cow::Owned(
-        crate::native_engine::tool_loop::model_tool_output(name, text),
-    ))
 }
 
 /// A contentless, private index keeps neither a second copy of text nor a
@@ -392,7 +332,7 @@ fn excerpt(
     end: usize,
     preceded: bool,
     source_truncated: bool,
-    projected: bool,
+    recovery: Option<&crate::native_engine::tool_loop::Recovery>,
 ) -> (String, bool) {
     let before = EXCERPT_BYTES.saturating_sub(end - start).min(96);
     let left = text.ceil_char_boundary(start.saturating_sub(before));
@@ -403,24 +343,11 @@ fn excerpt(
     );
     // A search excerpt may clip context, but a recovery reference must remain usable.
     let (mut left, mut right) = (left, right);
-    if projected {
-        for (at, _) in text.match_indices("[base64 data omitted: about ") {
-            if at >= right {
-                break;
-            }
-            let Some((_, rest)) = text[at..].split_once(", line ") else {
-                continue;
-            };
-            let Some((number, tail)) = rest.split_once(']') else {
-                continue;
-            };
-            if !number.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let end = text.len() - tail.len();
-            if end > left {
-                left = left.min(at);
-                right = right.max(end);
+    if let Some(recovery) = recovery {
+        for span in &recovery.spans {
+            if span.start < right && span.end > left {
+                left = left.min(span.start);
+                right = right.max(span.end);
             }
         }
     }
@@ -501,6 +428,103 @@ mod tests {
         fn search(&self, input: Value) -> Value {
             serde_json::from_str(&self.db.open_session(&self.session).unwrap().context_search(input).unwrap()).unwrap()
         }
+    }
+
+    #[test]
+    fn base64_model_boundary_persists_typed_content_in_either_arrival_order() {
+        let f = Fixture::new();
+        let message = f.append("assistant", "");
+        let payload = "QUJD".repeat(256);
+        let transport = json!({"content":[{"type":"text","text":format!("header\n{payload}\n")},{"type":"image","mimeType":"image/png","data":"AQID"}]});
+        let shard = f.db.open_session(&f.session).unwrap();
+        for (index, sidecar_first) in [true, false].into_iter().enumerate() {
+            let occurrence = format!("typed-{index}");
+            let id = format!("{message}:{occurrence}");
+            let original =
+                crate::native_engine::mcp_output::McpOutput::from_transport(&transport).unwrap();
+            if !sidecar_first {
+                f.tool(&message, &id, "Bash", &original.display());
+            }
+            let display = shard
+                .save_mcp(&message, &occurrence, &transport, false)
+                .unwrap();
+            if sidecar_first {
+                f.tool(&message, &id, "Bash", &display);
+            }
+            f.db.fixture_shard(&f.session,|conn|{
+                let (raw,model):(String,String)=conn.query_row("SELECT content_json,model_content_json FROM mcp_tool_outputs WHERE tool_use_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                let blocks:Value=serde_json::from_str(&model).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(),original.content);
+                assert!(blocks[0]["text"].as_str().unwrap().contains("base64 data omitted"));
+                assert!(!blocks[0]["text"].as_str().unwrap().contains(&payload));
+                assert_eq!(blocks[1],original.content[1]);
+                assert_eq!(crate::db::model_results::provider_content(conn,&f.session,&id,"Bash",false).unwrap(),Some(blocks));
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn base64_model_boundary_atomic_storage_and_legacy_reads() {
+        let f = Fixture::new();
+        f.append("user", "look up the result");
+        let message = f.append("assistant", "");
+        let payload = "QUJD".repeat(256);
+        let raw = json!({"result":json!({"stdout":format!("header\n{payload}\n")}).to_string()})
+            .to_string();
+        f.tool(&message, "stored", "TaskGet", &raw);
+        let read = || {
+            f.store
+                .model_history(
+                    &f.session,
+                    &crate::native_engine::provider_manager::ApiFormat::OpenAI,
+                )
+                .unwrap()
+        };
+        let view = read().into_iter().find(|m| m["role"] == "tool").unwrap()["content"].clone();
+        assert!(view.as_str().unwrap().contains("base64: 1 block collapsed"));
+        assert!(!view.as_str().unwrap().contains(&payload));
+        let stored = || {
+            f.db.fixture_shard(&f.session, |c| {
+                c.query_row(
+                    "SELECT output,model_output FROM tool_calls WHERE id='stored'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+            })
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(stored(), (raw.clone(), Some(view.as_str().unwrap().into())));
+        // Abort a replacement at the same SQL write. Both representations survive.
+        f.db.fixture_shard(&f.session,|c|{
+            c.execute_batch("CREATE TRIGGER reject_replacement BEFORE UPDATE OF output ON tool_calls BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+            assert!(message_repo::insert_tool_call(c,"stored",&message,"TaskGet",None,Some("replacement"),false,0).is_err());
+            c.execute_batch("DROP TRIGGER reject_replacement").unwrap();
+        }).unwrap();
+        assert_eq!(stored().1.as_deref(), view.as_str());
+        // A stored model field must win even if the original would produce different bytes.
+        f.db.fixture_shard(&f.session,|c|c.execute("UPDATE tool_calls SET model_output='stored-model-sentinel',model_search='stored-model-sentinel' WHERE id='stored'",[])).unwrap().unwrap();
+        assert!(read()
+            .iter()
+            .any(|m| m["content"] == "stored-model-sentinel"));
+        assert!(compaction::prepare(&f.db, &f.session)
+            .unwrap()
+            .transcript
+            .contains("stored-model-sentinel"));
+        assert_eq!(
+            f.search(json!({"query":"stored-model-sentinel"}))["matches"][0]["excerpt"],
+            "stored-model-sentinel"
+        );
+        f.db.fixture_shard(&f.session,|c|c.execute("UPDATE tool_calls SET model_output=NULL,model_preview=NULL,model_search=NULL,model_recovery=NULL WHERE id='stored'",[])).unwrap().unwrap();
+        assert_eq!(
+            read().into_iter().find(|m| m["role"] == "tool").unwrap()["content"],
+            view
+        );
+        assert_eq!(
+            f.search(json!({"query":"base64 data omitted"}))["matches"][0]["tool_call_id"],
+            "stored"
+        );
+        assert_eq!(stored(), (raw, None));
     }
 
     #[test]

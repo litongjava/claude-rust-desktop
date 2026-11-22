@@ -19,37 +19,66 @@ impl super::ToolLoopExecutor {
     ) -> Vec<Value> {
         inputs
             .into_iter()
-            .map(|mut input| {
-                project_notification(
-                    &mut input.content,
+            .map(|input| {
+                input.model_content(
                     self.search_config_path.as_deref().and_then(Path::parent),
                     self.conv_id.as_deref().unwrap_or_default(),
-                );
-                input.content
+                )
             })
             .collect()
     }
 
-    /// Called by both provider builders, after typed MCP/image restoration.
-    pub(super) fn prepare_history_tool_outputs(&self, messages: &mut [Value]) {
-        visit_history_outputs(
-            messages,
-            self.search_config_path.as_deref().and_then(Path::parent),
-            self.conv_id.as_deref().unwrap_or_default(),
-            |name, id, content| {
+    /// Resolve occurrence IDs before any compressor can move results to another role.
+    /// A host can also supply an unsaved protocol history, including typed results.
+    pub(super) fn prepare_history_tool_outputs(
+        &self,
+        messages: &mut [Value],
+    ) -> anyhow::Result<()> {
+        let root = self.search_config_path.as_deref().and_then(Path::parent);
+        let session = self.conv_id.as_deref().unwrap_or_default();
+        let mut prepare = |conn: Option<&rusqlite::Connection>| {
+            visit_history_outputs(messages, root, session, |name, id, content, openai| {
+                if let Some(conn) = conn {
+                    if let Some(text) =
+                        crate::db::model_results::provider_content(conn, session, id, name, openai)?
+                    {
+                        *content = text;
+                        return Ok(());
+                    }
+                }
                 if let Some(text) = content.as_str() {
                     *content = Value::String(self.preview_tool_output_for_id(name, text, Some(id)));
+                } else if openai {
+                    project_result_content(name, content, root, session);
                 } else {
                     self.retain_content(name, content);
                 }
-            },
-        );
+                Ok(())
+            })
+        };
+        if let Some(history) = self.session_search_storage() {
+            history.read(|conn, _| prepare(Some(conn)))
+        } else {
+            prepare(None)
+        }
     }
 
     pub(super) fn retain_content(&self, name: &str, content: &mut Value) {
         if let Some(text) = content.as_str() {
             *content = Value::String(self.preview_tool_output(name, text));
-        } else if let Some(blocks) = content.as_array() {
+            return;
+        }
+        if super::eligible(name)
+            && project_result_content(
+                name,
+                content,
+                self.search_config_path.as_deref().and_then(Path::parent),
+                self.conv_id.as_deref().unwrap_or_default(),
+            )
+        {
+            return;
+        }
+        if let Some(blocks) = content.as_array() {
             // Text-only MCP blocks share one budget. Images and opaque blocks stay intact.
             if blocks.iter().all(|block| {
                 block["type"] == "text"
@@ -64,6 +93,59 @@ impl super::ToolLoopExecutor {
                 *content = Value::String(self.preview_tool_output(name, &text));
             }
         }
+    }
+}
+
+pub(crate) fn project_result_content(
+    name: &str,
+    content: &mut Value,
+    root: Option<&Path>,
+    session: &str,
+) -> bool {
+    if !super::eligible(name) {
+        return false;
+    }
+    let projected = match content {
+        Value::Array(_) => super::project_for_model(name, &content.to_string(), root, session)
+            .map(|view| serde_json::from_str(&view.text).unwrap_or(Value::String(view.text))),
+        Value::String(raw) => {
+            super::project_for_model(name, raw, root, session).map(|view| Value::String(view.text))
+        }
+        _ => None,
+    };
+    if let Some(projected) = projected {
+        *content = projected;
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn ordinary_preview(
+    tool_name: &str,
+    output: &str,
+    id: Option<&str>,
+    root: Option<&Path>,
+    cwd: &Path,
+) -> String {
+    if is_shell_result(tool_name) {
+        let enabled = crate::config::command_output::enabled(root, cwd);
+        let metadata = if enabled {
+            root.zip(id)
+                .and_then(|(root, id)| std::fs::read(metadata_path(root, id)).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        } else {
+            None
+        };
+        return command_preview(tool_name, output, root, metadata.as_ref(), enabled);
+    }
+    let cleaned = super::model_tool_output(tool_name, output);
+    // Read already selects the requested line range.
+    if let Some(root) = root.filter(|_| tool_name != "Read") {
+        let preview = super::compact_tool_output(tool_name, &cleaned);
+        crate::performance::retain_tool_output(root, &cleaned, &preview)
+    } else {
+        cleaned
     }
 }
 
@@ -85,26 +167,34 @@ fn project_text_blocks(content: &mut Value, mut project: impl FnMut(&str) -> Opt
 fn project_notification(content: &mut Value, root: Option<&Path>, session: &str) {
     project_text_blocks(content, |text| {
         if super::monitor_notification(text) {
-            super::project_for_model("Monitor", text, root, session)
+            super::project_for_model("Monitor", text, root, session).map(|v| v.text)
         } else {
             None
         }
     });
 }
 
-/// Manual native compaction consumes stored protocol messages directly.
-pub(crate) fn project_stored_history(messages: &mut [Value], root: &Path, session: &str) {
-    visit_history_outputs(messages, Some(root), session, |name, _, content| {
-        project_text_blocks(content, |text| {
-            super::project_for_model(name, text, Some(root), session)
-        });
-    });
+/// Keep the exact gateway reply for display and its model-facing window together.
+pub(crate) fn seal_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
+    if window["compaction"] != true || window["model_projected"] == true {
+        return;
+    }
+    let original = window["items"].clone();
+    prepare_native_window(window, root, session);
+    if window["items"] != original {
+        window["model_items"] = window["items"].take();
+        window["items"] = original;
+    }
 }
 
 // A saved Responses compact window can contain plaintext messages alongside
 // encrypted reasoning. Only identified results and Monitor text are projected.
-fn project_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
-    if window["compaction"] != true {
+pub(crate) fn prepare_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
+    if let Some(items) = window.as_object_mut().and_then(|o| o.remove("model_items")) {
+        window["items"] = items;
+        return;
+    }
+    if window["compaction"] != true || window["model_projected"] == true {
         return;
     }
     let Some(items) = window.get_mut("items").and_then(Value::as_array_mut) else {
@@ -123,25 +213,24 @@ fn project_native_window(window: &mut Value, root: Option<&Path>, session: &str)
         } else if item["type"] == "function_call_output" {
             if let Some(name) = item["call_id"].as_str().and_then(|id| names.get(id)) {
                 if let Some(output) = item.get_mut("output") {
-                    project_text_blocks(output, |text| {
-                        super::project_for_model(name, text, root, session)
-                    });
+                    project_result_content(name, output, root, session);
                 }
             }
         }
     }
+    window["model_projected"] = Value::Bool(true);
 }
 
 fn visit_history_outputs(
     messages: &mut [Value],
     root: Option<&Path>,
     session: &str,
-    mut result: impl FnMut(&str, &str, &mut Value),
-) {
+    mut result: impl FnMut(&str, &str, &mut Value, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut names = std::collections::HashMap::<String, String>::new();
     for message in messages {
         if let Some(window) = message.get_mut("provider_content") {
-            project_native_window(window, root, session);
+            prepare_native_window(window, root, session);
         }
         if message["role"] == "user" {
             if let Some(content) = message.get_mut("content") {
@@ -158,13 +247,11 @@ fn visit_history_outputs(
             }
         }
         if message["role"] == "tool" {
-            if message["content"].is_string() {
-                if let Some((id, name)) = message["tool_call_id"]
-                    .as_str()
-                    .and_then(|id| names.get_key_value(id))
-                {
-                    result(name, id, &mut message["content"]);
-                }
+            if let Some((id, name)) = message["tool_call_id"]
+                .as_str()
+                .and_then(|id| names.get_key_value(id))
+            {
+                result(name, id, &mut message["content"], true)?;
             }
         } else if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
             for block in blocks {
@@ -177,12 +264,13 @@ fn visit_history_outputs(
                         .as_str()
                         .and_then(|id| names.get_key_value(id))
                     {
-                        result(name, id, &mut block["content"]);
+                        result(name, id, &mut block["content"], false)?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> String {
@@ -445,7 +533,53 @@ pub(super) fn command_preview(
     metadata: Option<&CommandMetadata>,
     enabled: bool,
 ) -> String {
-    command_preview_with_room(name, raw, root, metadata, enabled, 0)
+    command_preview_with_room(name, raw, root, metadata, enabled, 0, &mut None)
+}
+
+pub(crate) fn projected_command_notes(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    id: Option<&str>,
+    cwd: &Path,
+) -> String {
+    let Some(root) = root else {
+        return String::new();
+    };
+    if !is_shell_result(name) || raw.len() < LONG_COMMAND_OUTPUT_BYTES {
+        return String::new();
+    }
+    let metadata = id
+        .and_then(|id| std::fs::read(metadata_path(root, id)).ok())
+        .and_then(|v| serde_json::from_slice(&v).ok());
+    let mut digest = None;
+    command_preview_with_room(
+        name,
+        raw,
+        Some(root),
+        metadata.as_ref(),
+        crate::config::command_output::enabled(Some(root), cwd),
+        0,
+        &mut digest,
+    );
+    let mut notes = String::new();
+    let cleaned = render(name, raw, None);
+    if cleaned.len() > MODEL_TOOL_OUTPUT_BYTES {
+        if let Ok(path) =
+            crate::performance::save_output_in(&root.join("tool-outputs"), cleaned.as_bytes())
+        {
+            notes = format!(
+                "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",
+                cleaned.len(),
+                super::model_projection::recovery_path(&path)
+            );
+        }
+    }
+    if let Some(digest) = digest {
+        notes.push_str("\n\n");
+        notes.push_str(&digest);
+    }
+    notes
 }
 
 fn command_preview_with_room(
@@ -455,6 +589,7 @@ fn command_preview_with_room(
     metadata: Option<&CommandMetadata>,
     enabled: bool,
     reserved: usize,
+    digest: &mut Option<String>,
 ) -> String {
     use command_output_summary::Stream;
     let bash = name == "Bash";
@@ -746,9 +881,24 @@ fn command_preview_with_room(
     };
     let appendix = encode(&summary);
     if appendix.len() > available && root.is_some() && reserved == 0 {
-        return command_preview_with_room(name, raw, root, metadata, enabled, DIGEST_BUDGET);
+        return command_preview_with_room(
+            name,
+            raw,
+            root,
+            metadata,
+            enabled,
+            DIGEST_BUDGET,
+            digest,
+        );
     }
     if appendix.len() <= available {
+        *digest = Some(
+            summary
+                .lines()
+                .filter(|line| !line.contains(" | "))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         if json_result {
             base.insert_str(json_end - 1, &appendix);
         } else {
@@ -1497,7 +1647,12 @@ mod tests {
             stdout: stream(&stdout),
             stderr: stream("FINAL ERROR"),
         };
-        save_metadata(temp.path(), occurrence, &CommandMetadata::Shell(capture)).unwrap();
+        save_metadata(
+            &paths.data_dir,
+            occurrence,
+            &CommandMetadata::Shell(capture),
+        )
+        .unwrap();
         store
             .db
             .fixture_shard(&id, |conn| {
@@ -1514,7 +1669,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let mut engine = executor(temp.path());
+        let mut engine = executor(&paths.data_dir);
         let fresh = engine.retained_tool_output_for_id("Bash", &raw, Some(occurrence));
         assert!(fresh.len() <= 16_000);
         for expected in [
@@ -1551,16 +1706,15 @@ mod tests {
                     &built[1]["content"][0]["content"]
                 };
                 assert_eq!(actual, &json!(fresh));
-                assert_eq!(engine.messages[1]["content"].as_str().unwrap_or(&raw), raw);
             }
         }
         assert_eq!(
-            std::fs::read_dir(temp.path().join("tool-outputs"))
+            std::fs::read_dir(paths.data_dir.join("tool-outputs"))
                 .unwrap()
                 .count(),
             1
         );
-        let spill = std::fs::read_dir(temp.path().join("tool-outputs"))
+        let spill = std::fs::read_dir(paths.data_dir.join("tool-outputs"))
             .unwrap()
             .next()
             .unwrap()

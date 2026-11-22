@@ -55,6 +55,7 @@ pub(crate) struct Source {
     pub position: Position,
     pub location: Location,
     pub text: String,
+    pub recovery: Option<crate::native_engine::tool_loop::Recovery>,
     pub overlap: usize,
     pub invalid_utf8: bool,
     pub preceded: bool,
@@ -195,7 +196,7 @@ fn read_page(
         ""
     };
     let mut messages = conn.prepare(&format!(
-        "SELECT sort_order,sequence,id,label,stamp,boundary,size,chunked
+        "SELECT sort_order,sequence,id,label,stamp,boundary,size,chunked,materialized,recovery
          FROM context_search_sources INDEXED BY context_search_order WHERE kind='message' AND owner=?1 {upper_clause} {lower_clause}
          ORDER BY sort_order DESC,sequence DESC LIMIT ?6"
     ))?;
@@ -209,7 +210,7 @@ fn read_page(
     ])?;
     let tools_available = selection.role.is_none_or(|role| role == "tool");
     const TOOL_ROWS: &str = "SELECT sort_order,sequence,id,label,size,chunked,
-                    EXISTS(SELECT 1 FROM tool_call_origins o WHERE o.tool_call_id=s.id)
+                    EXISTS(SELECT 1 FROM tool_call_origins o WHERE o.tool_call_id=s.id),materialized,recovery
              FROM context_search_sources s INDEXED BY context_search_order WHERE kind='tool' AND owner=?1";
     const TOOL_ORDER: &str = "ORDER BY sort_order DESC,sequence DESC LIMIT ?4";
     let mut tools = if tools_available {
@@ -306,13 +307,28 @@ fn read_page(
                     || selection
                         .tool_name
                         .is_some_and(|filter| !name.eq_ignore_ascii_case(filter))
-                    || tool.get::<_, i64>(4)? < 0
                     || tool.get::<_, bool>(6)?
                 {
                     continue;
                 }
+                let size: i64 = tool.get(4)?;
+                if size < 0 {
+                    if size == -2 {
+                        page.transcript.skipped_structured_sources += 1;
+                    }
+                    continue;
+                }
                 let location = location(Some((name, tool.get(2)?)))?;
-                if !page.read_source(conn, tool.get(4)?, tool.get(5)?, position(), location)? {
+                if !page.read_source(
+                    conn,
+                    session,
+                    tool.get(4)?,
+                    tool.get(5)?,
+                    tool.get(7)?,
+                    tool.get(8)?,
+                    position(),
+                    location,
+                )? {
                     return Ok(());
                 }
             }
@@ -330,7 +346,16 @@ fn read_page(
                 message,
                 part: Part::Text { offset },
             };
-            if !page.read_source(conn, row.get(6)?, row.get(7)?, position, location)? {
+            if !page.read_source(
+                conn,
+                session,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                position,
+                location,
+            )? {
                 break;
             }
         }
@@ -390,8 +415,11 @@ impl Page {
     fn read_source(
         &mut self,
         conn: &Connection,
+        session: &str,
         len: usize,
         chunked: bool,
+        materialized: bool,
+        recovery: Option<String>,
         position: Position,
         location: Location,
     ) -> Result<bool> {
@@ -400,11 +428,51 @@ impl Page {
             Part::Text { offset } => ("message", offset),
             Part::Start => unreachable!("source has a selected part"),
         };
-        let structured = location
+        let available = self.available(conn);
+        let id = location
+            .tool_call_id
+            .as_deref()
+            .unwrap_or(&location.message_id);
+        let mut recovery = recovery.map(|v| serde_json::from_str(&v)).transpose()?;
+        let legacy = if materialized {
+            None
+        } else if let Some(name) = location
             .tool_name
             .as_deref()
-            .and_then(projection_name)
-            .is_some();
+            .filter(|name| crate::native_engine::tool_loop::eligible(name))
+        {
+            Some(super::model_results::legacy_search(
+                conn, session, name, id, false,
+            )?)
+        } else if location.role == "user"
+            && len >= crate::tools::background_shell::NOTIFICATION_START.len()
+        {
+            let size = crate::tools::background_shell::NOTIFICATION_START.len();
+            let (prefix, charged) =
+                super::context_search_index::read_bytes(conn, kind, id, chunked, false, 0, size)?;
+            self.payload_read += charged;
+            if prefix == crate::tools::background_shell::NOTIFICATION_START.as_bytes() {
+                Some(super::model_results::legacy_search(
+                    conn, session, "Monitor", id, true,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let legacy = legacy.map(|view| {
+            recovery = view.recovery;
+            view.text
+        });
+        let len = legacy.as_ref().map_or(len, String::len);
+        let structured = !materialized
+            && legacy.is_none()
+            && location
+                .tool_name
+                .as_deref()
+                .and_then(projection_name)
+                .is_some();
         ensure!(
             !structured || offset == 0,
             "Invalid structured result cursor"
@@ -418,18 +486,25 @@ impl Page {
             return Ok(true);
         }
         let start = offset.saturating_sub(OVERLAP_BYTES);
-        let count = (len - start).min(MAX_CHUNK_BYTES).min(self.available(conn));
+        let count = (len - start).min(MAX_CHUNK_BYTES).min(available);
         let truncated = start + count < len;
         if truncated && (structured || count <= offset - start + 4) {
             self.transcript.next = Some(position);
             return Ok(false);
         }
-        let id = location
-            .tool_call_id
-            .as_deref()
-            .unwrap_or(&location.message_id);
-        let (bytes, charged) =
-            super::context_search_index::read_bytes(conn, kind, id, chunked, start, count)?;
+        let (bytes, charged) = if let Some(text) = &legacy {
+            (text.as_bytes()[start..start + count].to_vec(), count)
+        } else {
+            super::context_search_index::read_bytes(
+                conn,
+                kind,
+                id,
+                chunked,
+                materialized,
+                start,
+                count,
+            )?
+        };
         self.payload_read += charged;
         let mut head = 0;
         if start > 0 {
@@ -464,10 +539,32 @@ impl Page {
                 part,
             });
         }
+        let text = if structured {
+            let Some(text) =
+                super::model_results::search_text(location.tool_name.as_deref().unwrap(), &text)
+            else {
+                self.transcript.skipped_structured_sources += 1;
+                return Ok(true);
+            };
+            text.into_owned()
+        } else {
+            text.into_owned()
+        };
+        if let Some(recovery) = &mut recovery {
+            let base = start + head;
+            recovery.spans.retain_mut(|span| {
+                if span.start < base || span.end > base + text.len() {
+                    return false;
+                }
+                *span = span.start - base..span.end - base;
+                true
+            });
+        }
         self.transcript.sources.push(Source {
             position,
             location,
-            text: text.into_owned(),
+            text,
+            recovery,
             overlap,
             invalid_utf8,
             preceded: start + head > 0,

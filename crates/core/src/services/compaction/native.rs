@@ -51,6 +51,7 @@ pub(crate) async fn generate(
     id: &str,
     provider: &ResolvedProvider,
     instructions: &str,
+    root: Option<&std::path::Path>,
     options: crate::native_engine::request_options::RequestOptions,
 ) -> Result<GeneratedSummary> {
     let messages = history
@@ -63,6 +64,7 @@ pub(crate) async fn generate(
         messages,
         instructions,
         Some(id),
+        root,
     )
     .await
 }
@@ -81,6 +83,7 @@ pub(crate) async fn generate_messages(
         messages,
         instructions,
         session,
+        None,
     )
     .await
 }
@@ -91,6 +94,7 @@ pub(crate) async fn generate_messages_with_options(
     messages: Vec<OpenAIMessage>,
     instructions: &str,
     session: Option<&str>,
+    root: Option<&std::path::Path>,
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions)?;
@@ -104,9 +108,9 @@ pub(crate) async fn generate_messages_with_options(
             && url.fragment().is_none(),
         "Invalid native compaction gateway URL"
     );
-    let root = url.path().trim_end_matches('/');
-    let root = root.strip_suffix("/responses").unwrap_or(root);
-    url.set_path(&format!("{root}/responses/compact"));
+    let route = url.path().trim_end_matches('/');
+    let route = route.strip_suffix("/responses").unwrap_or(route);
+    url.set_path(&format!("{route}/responses/compact"));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(15))
@@ -164,10 +168,16 @@ pub(crate) async fn generate_messages_with_options(
                 .is_some_and(|s| !s.is_empty())),
         "Native compaction output has no encrypted compaction item"
     );
+    let mut native = json!({"api":"openai-responses","compaction":true,"items":items,"usage":result["usage"],
+            "provider":provider.provider.id,"base_url":provider.provider.base_url.trim_end_matches('/'),"model":provider.model.id});
+    crate::native_engine::tool_loop::seal_native_window(
+        &mut native,
+        root,
+        session.unwrap_or_default(),
+    );
     Ok(GeneratedSummary {
         text: "Native Responses compaction completed. The encrypted context is saved and will be restored for this provider/model. Earlier messages remain in session history.".into(),
-        native: Some(json!({"api":"openai-responses","compaction":true,"items":items,"usage":result["usage"],
-            "provider":provider.provider.id,"base_url":provider.provider.base_url.trim_end_matches('/'),"model":provider.model.id})),
+        native:Some(native),
     })
 }
 

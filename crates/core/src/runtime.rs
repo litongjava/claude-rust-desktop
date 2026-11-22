@@ -209,21 +209,39 @@ pub(crate) fn replay_history(
     conn: &rusqlite::Connection,
     id: &str,
     format: &ApiFormat,
+    full: bool,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
-    let messages = message_repo::get_messages_by_conversation(conn, id)?;
-    let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
+    let messages = crate::db::model_results::messages(conn, id)?;
+    let start = messages
+        .iter()
+        .rposition(|m| m.is_compact_boundary)
+        .unwrap_or(0);
     let boundary = messages
         .get(start)
         .filter(|m| m.is_compact_boundary)
         .map(|m| m.id.clone());
     for message in messages.into_iter().skip(start) {
-        if let Some(native) = native(&message.id)? {
-            history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
+        if let Some(mut native) = native(&message.id)? {
+            crate::native_engine::tool_loop::prepare_native_window(
+                &mut native,
+                crate::db::model_results::data_root(conn)?.as_deref(),
+                id,
+            );
+            history.push(
+                json!({"role":message.role,"content":message.content,"provider_content":native}),
+            );
             continue;
         }
-        let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
+        let mut calls = crate::db::model_results::calls(conn, &message.id, id)?;
+        if !full {
+            for tool in &mut calls {
+                if let Some(preview) = tool.preview.take() {
+                    tool.text = Some(preview);
+                }
+            }
+        }
         // Nested ToolScript calls are history, not provider protocol:
         // the provider never emitted their ids, so replaying them would
         // fabricate an assistant tool_use with no matching requested
@@ -236,7 +254,13 @@ pub(crate) fn replay_history(
                 ApiFormat::OpenAI => {
                     let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
                     history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
-                    for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
+                    for tool in &calls {
+                        history.push(json!({
+                            "role":"tool",
+                            "tool_call_id":tool.id,
+                            "content":tool.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)
+                        }));
+                    }
                     for tool in &calls {
                         if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
                     }
@@ -244,7 +268,7 @@ pub(crate) fn replay_history(
                 ApiFormat::Anthropic => {
                     let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
                     history.push(json!({"role":"assistant","content":blocks}));
-                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
+                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.text.is_none()})).collect();
                     // Approval notes follow the results as the user's own text.
                     for tool in &calls {
                         if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
@@ -254,7 +278,8 @@ pub(crate) fn replay_history(
             }
             for tool in &calls {
                 for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
-                    history.push(input.model_message());
+                    let origin = input.origin.clone();
+                    history.push(json!({"role":"user","content":input.model_content(crate::db::model_results::data_root(conn)?.as_deref(),id),"origin":origin}));
                 }
             }
         }
@@ -499,9 +524,11 @@ impl SessionStore<DbManager> {
         id: &str,
         format: &ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.db.with_conn(|conn| replay_history(conn, id, format, |message| {
-            crate::services::compaction::native::load(conn, message)
-        }))?
+        self.db.with_conn(|conn| {
+            replay_history(conn, id, format, false, |message| {
+                crate::services::compaction::native::load(conn, message)
+            })
+        })?
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {

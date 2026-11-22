@@ -138,9 +138,7 @@ impl SessionDb {
             let mut transcript=Vec::new();
             for row in &rows[range.clone()] {
                 ensure!(!r.0.query_row("SELECT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)",[&row.id],|r|r.get::<_,bool>(0))?, "Partial text summaries cannot include an opaque Responses boundary; select messages after it or branch before it");
-                let mut entry = serde_json::json!({"message":row,"tools":r.tools(&row.id)?});
-                crate::services::compaction::project_entry(&mut entry, self.stores.data_dir(), self.id());
-                transcript.push(entry);
+                transcript.push(crate::services::compaction::model_entry(r.0,row)?);
             }
             Ok(PreparedPart {incarnation:self.incarnation().into(),fingerprint:crate::services::compaction::fingerprint(r.0,self.id())?.0,transcript:serde_json::to_string(&transcript)?,count:range.len()})
         })
@@ -410,22 +408,24 @@ impl Copier<'_> {
             }
             _ => None,
         };
-        let mut q = self.src.prepare("SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order FROM messages ORDER BY sort_order,rowid")?;
+        let mut q = self.src.prepare("SELECT id,role,content,thinking,created_at,is_compact_boundary,sort_order,model_content,model_recovery FROM messages ORDER BY sort_order,rowid")?;
+        let mut insert=self.dst.prepare_cached("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order,model_content,model_recovery) VALUES(?,?,?,?,?,?,?,?,?,?)")?;
         let mut count = 0;
-        for row in q.query_map([], message_repo::row_to_message)? {
-            let m = row?;
-            let id = self.assign("message", &m.id)?;
-            message_repo::insert_message(
-                self.dst,
-                &id,
+        let mut rows = q.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = self.assign("message", &row.get::<_, String>(0)?)?;
+            insert.execute(params![
+                id,
                 self.id,
-                &m.role,
-                &m.content,
-                m.thinking.as_deref(),
-                &m.created_at,
-                m.is_compact_boundary,
-                m.sort_order,
-            )?;
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+                row.get::<_, Value>(4)?,
+                row.get::<_, Value>(5)?,
+                row.get::<_, Value>(6)?,
+                row.get::<_, Value>(7)?,
+                row.get::<_, Value>(8)?
+            ])?;
             count += 1;
             if limit == Some(count - 1) {
                 break;

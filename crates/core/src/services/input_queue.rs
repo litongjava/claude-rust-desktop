@@ -28,6 +28,12 @@ impl DeliveredInput {
         }
         .map(Value::Array)
         .unwrap_or_else(|| json!(text));
+        let content = if crate::native_engine::tool_loop::monitor_notification(&text) {
+            crate::native_engine::tool_loop::project_for_model("Monitor", &text, data_dir, session)
+                .map_or(content, |v| json!(v.text))
+        } else {
+            content
+        };
         Self {
             message_id: None,
             text,
@@ -41,6 +47,18 @@ impl DeliveredInput {
         }
     }
 
+    pub(crate) fn model_content(self, root: Option<&std::path::Path>, session: &str) -> Value {
+        if self.content.as_str() == Some(&self.text)
+            && crate::native_engine::tool_loop::monitor_notification(&self.text)
+        {
+            if let Some(view) = crate::native_engine::tool_loop::project_for_model(
+                "Monitor", &self.text, root, session,
+            ) {
+                return json!(view.text);
+            }
+        }
+        self.content
+    }
     pub fn model_message(&self) -> Value {
         json!({"role":"user", "content":self.content, "origin":self.origin})
     }
