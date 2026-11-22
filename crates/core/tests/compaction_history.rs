@@ -12,6 +12,9 @@ use deepseek_code_core::{
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+#[path = "../src/native_engine/provider_runtime/bedrock.rs"]
+mod bedrock;
+
 struct Fixture {
     root: tempfile::TempDir,
     paths: RuntimePaths,
@@ -38,12 +41,29 @@ impl Fixture {
             let compact = headers["x-dcl-request-kind"] == "compaction";
             let stream = body["stream"] == true;
             let responses = body.get("input").is_some();
+            let bedrock = body.get("inferenceConfig").is_some();
+            let anthropic = headers.contains_key("anthropic-version");
             let structured = body["response_format"]["type"] == "json_schema" || body["messages"].to_string().contains("fixture always answers JSON");
             let text = if structured { r#"{"ok":true}"# } else if compact { "Pending work is recorded." } else { "last answer" };
             seen.lock().unwrap().push(body);
             async move {
                 let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":80}});
-                if responses {
+                if bedrock {
+                    let frames: Vec<u8> = [("messageStart",json!({"role":"assistant"})),
+                        ("contentBlockDelta",json!({"contentBlockIndex":0,"delta":{"text":text}})),
+                        ("messageStop",json!({"stopReason":"end_turn"})),
+                        ("metadata",json!({"usage":{"inputTokens":100,"outputTokens":3,"totalTokens":103}}))]
+                        .into_iter().flat_map(|(kind, payload)| bedrock::frame(kind, payload)).collect();
+                    ([("content-type","application/vnd.amazon.eventstream")],frames).into_response()
+                } else if anthropic {
+                    let frames = [json!({"type":"message_start","message":{"id":"m","usage":{"input_tokens":100}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+                        json!({"type":"message_stop"})].iter().map(|v|format!("data: {v}\n\n")).collect::<String>();
+                    ([("content-type","text/event-stream")],frames).into_response()
+                } else if responses {
                     let delta = json!({"type":"response.output_text.delta","delta":text});
                     let done = json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":100,"output_tokens":3}}});
                     ([("content-type","text/event-stream")],format!("data: {delta}\n\ndata: {done}\n\n")).into_response()
@@ -90,7 +110,7 @@ impl Fixture {
     async fn main_turn(&self, schema: Option<Value>) {
         let request: ChatRequest = serde_json::from_value(json!({"conversation_id":self.id,
             "messages":self.store.model_history(&self.id,&self.provider.api_format).unwrap(),
-            "response_schema":schema,"system_prompt":"Custom session instructions","model":"model","provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
+            "response_schema":schema,"system_prompt":"Custom session instructions","model":self.provider.models[0].id,"effort":self.provider.models[0].effort,"provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
         let mut stream = self
             .engine()
             .send_message_with_history(request, false)
@@ -121,7 +141,7 @@ impl Fixture {
             &self.store.db,
             &self.id,
             "fixture",
-            "model",
+            &self.provider.models[0].id,
             "Keep pending work",
         )
         .await
@@ -295,4 +315,39 @@ async fn first_iteration_peer_delivery_is_present_once_in_the_reused_prefix() {
         }
     }
     f.finish().await;
+}
+
+#[tokio::test]
+async fn reasoning_enabled_claude_reuses_the_prefix_on_both_transports() {
+    for (builtin, api, model) in [
+        ("anthropic", "anthropic-messages", "claude-sonnet-4-5"),
+        (
+            "amazon-bedrock",
+            "bedrock-converse-stream",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ),
+    ] {
+        let mut f = Fixture::new(128_000).await;
+        f.provider.builtin_id = Some(builtin.into());
+        f.provider.models[0].api = Some(api.into());
+        f.provider.models[0].id = model.into();
+        f.provider.models[0].effort = Some("medium".into());
+        f.append("user", "Original question");
+        f.main_turn(None).await;
+        f.compact().await.unwrap();
+        {
+            let calls = f.requests.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            let mut body = calls[1].clone();
+            let messages = body["messages"].as_array_mut().unwrap();
+            assert!(messages
+                .pop()
+                .unwrap()
+                .to_string()
+                .contains("Keep pending work"));
+            assert!(messages.pop().unwrap().to_string().contains("last answer"));
+            assert_eq!(body, calls[0], "{api}");
+        }
+        f.finish().await;
+    }
 }

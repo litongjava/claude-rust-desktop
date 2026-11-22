@@ -178,15 +178,13 @@ pub(super) fn load(
                 .into_iter()
                 .map(serde_json::from_value::<OpenAIMessage>)
                 .collect::<serde_json::Result<Vec<_>>>()?;
-            let mut body = provider_runtime::messages::request(
-                &wire.api,
-                provider,
-                &Value::Null,
-                messages,
-                None,
-                vec![],
-                1,
-            )?;
+            let input = provider_runtime::messages::conversation_input(&wire.api, messages)?;
+            let mut body = serde_json::json!({key:input});
+            match wire.api.as_str() {
+                "openai-completions" => super::tool_call_ids::normalize_chat(&mut body),
+                "anthropic-messages" => super::tool_call_ids::normalize_anthropic(&mut body),
+                _ => {}
+            }
             body[key].take()
         };
         wire.body[key]
