@@ -2,7 +2,7 @@
 use super::{DirectoryFilter, SessionRead, Stores};
 use anyhow::{ensure, Result};
 use chrono::{Local, NaiveDate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Default)]
 pub struct CorpusUsage {
@@ -39,17 +39,51 @@ impl SessionRead<'_> {
     }
 }
 
+type Days = BTreeMap<(NaiveDate, String, String), DailyUsage>;
+
+fn add_day(days: &mut Days, row: DailyUsage) {
+    let key = (row.day, row.model.clone(), row.session.clone());
+    days.entry(key)
+        .and_modify(|total| {
+            total.started_ms = total.started_ms.min(row.started_ms);
+            total.ended_ms = total.ended_ms.max(row.ended_ms);
+            total.requests += row.requests;
+            total.heat += row.heat;
+            for (sum, n) in total.tokens.iter_mut().zip(row.tokens) {
+                *sum += n;
+            }
+        })
+        .or_insert(row);
+}
+
+#[derive(Default)]
+struct ShardUsage {
+    days: Days,
+    // A fork can copy an in-flight request before its final counters arrive.
+    compactions: Vec<(String, bool, DailyUsage)>,
+}
+
 fn usage_days(
     conn: &rusqlite::Connection,
+    sharded: bool,
     cancelled: &impl Fn() -> bool,
-) -> Result<Vec<DailyUsage>> {
-    let mut days = BTreeMap::new();
+) -> Result<ShardUsage> {
+    let mut scan = ShardUsage::default();
+    let (origin, tables) = if sharded {
+        (
+            "CASE WHEN json_extract(m.value,'$.kind')='compaction' THEN r.id END,
+          CASE WHEN json_extract(m.value,'$.kind')='compaction' THEN json_extract(m.value,'$.originSession') END",
+            "model_requests r LEFT JOIN request_metadata m ON m.request_id=r.id",
+        )
+    } else {
+        ("NULL,NULL", "model_requests")
+    };
     let mut q=conn.prepare(&format!(
             "SELECT started_at_ms,coalesce(ended_at_ms,started_at_ms),coalesce(model,''),
              CASE WHEN {SPLIT_INPUT} THEN coalesce(input_tokens,0)
                   ELSE max(0,coalesce(input_tokens,0)-coalesce(cache_read_tokens,0)-coalesce(cache_write_tokens,0)) END,
-             coalesce(output_tokens,0),coalesce(cache_read_tokens,0),coalesce(cache_write_tokens,0),conversation_id
-             FROM model_requests WHERE started_at_ms IS NOT NULL"))?;
+             coalesce(output_tokens,0),coalesce(cache_read_tokens,0),coalesce(cache_write_tokens,0),conversation_id,{origin}
+             FROM {tables} WHERE started_at_ms IS NOT NULL"))?;
     let mut rows = q.query([])?;
     while let Some(row) = rows.next()? {
         ensure!(!cancelled(), "Stats scan cancelled");
@@ -59,49 +93,60 @@ fn usage_days(
             continue;
         };
         let day = time.with_timezone(&Local).date_naive();
-        let model: String = row.get(2)?;
-        let session: String = row.get(7)?;
-        let v = days
-            .entry((day, model.clone(), session.clone()))
-            .or_insert_with(|| DailyUsage {
-                session,
-                day,
-                model,
-                started_ms,
-                ended_ms,
-                requests: 0,
-                tokens: [0; 4],
-                heat: 0,
-            });
-        v.started_ms = v.started_ms.min(started_ms);
-        v.ended_ms = v.ended_ms.max(ended_ms);
-        v.requests += 1;
-        let mut total = 0;
-        for (i, sum) in v.tokens.iter_mut().enumerate() {
-            let n = i128::from(row.get::<_, i64>(3 + i)?);
-            *sum += n;
-            total += n;
+        let origin: Option<String> = row.get(9)?;
+        let tokens = [row.get::<_, i64>(3)?, row.get(4)?, row.get(5)?, row.get(6)?].map(i128::from);
+        let own = origin.is_none();
+        let charge = DailyUsage {
+            session: origin.unwrap_or(row.get(7)?),
+            day,
+            model: row.get(2)?,
+            started_ms,
+            ended_ms,
+            requests: 1,
+            heat: tokens.iter().sum::<i128>().max(1),
+            tokens,
+        };
+        if let Some(id) = row.get::<_, Option<String>>(8)? {
+            scan.compactions.push((id, own, charge));
+        } else {
+            add_day(&mut scan.days, charge);
         }
-        v.heat += total.max(1);
     }
-    Ok(days.into_values().collect())
+    Ok(scan)
 }
 
 impl Stores {
     pub fn usage(&self, cancelled: impl Fn() -> bool) -> Result<CorpusUsage> {
         let mut result = CorpusUsage::default();
+        let mut days = Days::new();
+        let mut physical = HashMap::<String, (bool, DailyUsage)>::new();
         for row in self.global().list_sessions(DirectoryFilter::default())? {
             ensure!(!cancelled(), "Stats scan cancelled");
             let id = row.conversation.id.as_str();
             let shard = self
                 .open_listed(&row)
-                .and_then(|s| s.read(|r| usage_days(r.0, &cancelled)));
+                .and_then(|s| s.read(|r| usage_days(r.0, true, &cancelled)));
             ensure!(!cancelled(), "Stats scan cancelled");
             match shard {
-                Ok(mut days) => result.days.append(&mut days),
+                Ok(scan) => {
+                    for row in scan.days.into_values() {
+                        add_day(&mut days, row);
+                    }
+                    for (id, own, charge) in scan.compactions {
+                        if physical.get(&id).is_none_or(|(original, previous)| {
+                            (own, charge.ended_ms) > (*original, previous.ended_ms)
+                        }) {
+                            physical.insert(id, (own, charge));
+                        }
+                    }
+                }
                 Err(error) => result.failures.push((id.into(), format!("{error:#}"))),
             }
         }
+        for (_, charge) in physical.into_values() {
+            add_day(&mut days, charge);
+        }
+        result.days = days.into_values().collect();
         Ok(result)
     }
 }
@@ -109,7 +154,11 @@ impl Stores {
 impl crate::db::DbManager {
     pub fn usage(&self, cancelled: impl Fn() -> bool) -> Result<CorpusUsage> {
         Ok(CorpusUsage {
-            days: self.with_conn(|c| usage_days(c, &cancelled))??,
+            days: self
+                .with_conn(|c| usage_days(c, false, &cancelled))??
+                .days
+                .into_values()
+                .collect(),
             failures: Vec::new(),
         })
     }

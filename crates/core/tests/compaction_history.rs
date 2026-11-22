@@ -425,3 +425,33 @@ async fn daily_stats_count_cached_compaction_input_once() {
     }
     f.finish().await;
 }
+
+#[tokio::test]
+async fn fork_and_grandchild_share_one_physical_compaction_charge() {
+    let f = Fixture::new(128_000).await;
+    f.append("user", "Initial request");
+    f.append("assistant", "Earlier reply");
+    f.compact().await.unwrap();
+    let child = f.store.fork(&f.id).unwrap();
+    let grandchild = f.store.fork(&child).unwrap();
+    let request = f.routes.lock().unwrap()[0].1["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for session in [&f.id, &child, &grandchild] {
+        let shard = f.store.db.open_session(session).unwrap();
+        let metadata = shard
+            .read(|r| r.request_metadata(&request))
+            .unwrap()
+            .expect("physical request ID in each fork");
+        assert_eq!(metadata["kind"], "compaction");
+        assert_eq!(shard.repository().usage_totals(&[]).unwrap().1, 100);
+    }
+    let usage = f.store.db.usage(|| false).unwrap();
+    assert!(usage.failures.is_empty());
+    assert_eq!(usage.days.len(), 1);
+    assert_eq!(usage.days[0].session, f.id);
+    assert_eq!(usage.days[0].requests, 1);
+    assert_eq!(usage.days[0].heat, 103);
+    f.finish().await;
+}

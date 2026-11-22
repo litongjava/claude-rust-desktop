@@ -266,7 +266,14 @@ impl Copier<'_> {
         if let Some(id) = self.mapped(kind, old)? {
             return Ok(id);
         }
-        let id = if kind == "message" {
+        let compaction = kind == "request" && self.src.prepare_cached(
+            "SELECT 1 FROM request_metadata WHERE request_id=?1 AND json_extract(value,'$.kind')='compaction'"
+        )?.exists([old])?;
+        let id = if compaction {
+            // Compaction has no assistant trajectory. Its ID names the HTTP
+            // request in every descendant and in the recording gateway.
+            old.to_owned()
+        } else if kind == "message" {
             self.messages.issue()
         } else {
             Uuid::new_v4().to_string()
@@ -368,6 +375,19 @@ impl Copier<'_> {
                 let mut blocks: Json = serde_json::from_str(&row.get::<_, String>(i)?)?;
                 self.remap_blocks(&row.get::<_, String>(idx("message_id")?)?, &mut blocks)?;
                 values[i] = Value::Text(blocks.to_string());
+            }
+            if table == "request_metadata" {
+                let i = idx("value")?;
+                let mut metadata: Json = serde_json::from_str(row.get_ref(i)?.as_str()?)?;
+                if metadata["kind"] == "compaction" && metadata.get("originSession").is_none() {
+                    let request: String = row.get(idx("request_id")?)?;
+                    metadata["originSession"] = Json::String(self.src.query_row(
+                        "SELECT conversation_id FROM model_requests WHERE id=?1",
+                        [request],
+                        |r| r.get(0),
+                    )?);
+                    values[i] = Value::Text(metadata.to_string());
+                }
             }
             if table == "session_permission_authority" {
                 values[idx("id")?] = Value::Null
