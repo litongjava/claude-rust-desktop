@@ -1228,6 +1228,18 @@ impl QueryEngine {
         }
         .ok_or_else(|| anyhow!("No provider found for model: {}", request.model))?;
         crate::services::compaction::native::validate_history(&request.messages, &hook_provider)?;
+        let window = hook_provider
+            .model
+            .context_window
+            .map(|n| n as usize)
+            .unwrap_or_else(|| {
+                super::token_counter::TokenCounter::get_model_context_limit(&hook_provider.model.id)
+            });
+        let used = super::token_counter::TokenCounter::estimate(&request.messages)
+            .saturating_add(request.system_prompt.as_ref().map_or(0, String::len));
+        let recall_budget = (window / 10)
+            .min((window * 85 / 100).saturating_sub(used))
+            .min(4096);
         let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(
             &plugin_context,
             &workspace,
@@ -1307,7 +1319,7 @@ impl QueryEngine {
                 )
             })
             .flatten();
-        let turn_context = tokio::task::spawn_blocking(move || {
+        let mut turn_context = tokio::task::spawn_blocking(move || {
             for (block, skill) in turn_blocks {
                 if let Some(entry) =
                     crate::services::turn_context::for_last(&turn_messages, vec![block])
@@ -1333,11 +1345,39 @@ impl QueryEngine {
         // whose message a compaction removed follow, as in the reference CLI.
         let (user_instructions, project_instructions) =
             crate::project_instructions::reminder_parts(&instructions);
+        let read_only =
+            self.permission_manager.get_mode() == crate::permissions::PermissionMode::PlanMode;
+        let memory_session = selected.clone();
+        let memory_context = plugin_context.clone();
+        let mut memory_messages = request.messages.clone();
+        if applied_compaction {
+            memory_messages[0]["origin"] = serde_json::json!("compaction");
+        }
+        let (file_memory, project_memory, memory_turns) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                use crate::services::memory_files::{self, FileMemory};
+                let memory = memory_files::config(&memory_context)?
+                    .enabled
+                    .then(|| FileMemory::session(&memory_context, memory_session.id()))
+                    .transpose()?;
+                let (index, turns) = memory_files::prompt::prepare(
+                    &memory_session,
+                    memory.as_ref(),
+                    &memory_messages,
+                    !hook_wake,
+                    read_only,
+                    recall_budget,
+                )?;
+                Ok((memory, index, turns))
+            })
+            .await??;
+        turn_context.extend(memory_turns);
         let context_reminders = crate::prompt::first_message_reminders(
             crate::prompt::SessionReminders {
                 user_instructions,
                 environment: Some(environment),
                 project_instructions,
+                project_memory,
                 standalone_frontend,
                 loadable_tools,
                 available_skills: available_skills_listing,
@@ -1611,10 +1651,8 @@ impl QueryEngine {
             workspace_path.clone(),
         )));
 
-        if crate::services::memory_files::config(&plugin_context)?.enabled {
-            executor = executor.with_file_memory(
-                crate::services::memory_files::FileMemory::session(&plugin_context, &conv_id)?,
-            );
+        if let Some(memory) = file_memory {
+            executor = executor.with_file_memory(memory);
         }
         let selector = model.split_once("::").map_or(model.as_str(), |(_, id)| id);
         if super::provider_manager::one_million_context_base(selector)

@@ -2972,19 +2972,6 @@ impl ToolLoopExecutor {
         self
     }
 
-    fn memory_budget(&self) -> usize {
-        let window = self
-            .provider
-            .model
-            .context_window
-            .map(|n| n as usize)
-            .unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id));
-        let used = TokenCounter::estimate(&self.messages)
-            .saturating_add(self.system_prompt.as_ref().map_or(0, String::len));
-        8192.min(window / 10)
-            .min((window * 85 / 100).saturating_sub(used))
-    }
-
     fn memory_read_only(&self) -> bool {
         self.permission_manager
             .as_ref()
@@ -3190,12 +3177,6 @@ impl ToolLoopExecutor {
     pub fn with_turn_context(mut self, entries: Vec<crate::services::turn_context::Entry>) -> Self {
         self.turn_context = entries;
         self
-    }
-
-    /// Record blocks after the last user message, for this request and, when
-    /// the session is known, for every later one.
-    pub(super) fn attach_turn_context(&mut self, blocks: Vec<String>) -> Result<()> {
-        self.attach_turn_entry(blocks, None)
     }
 
     pub(super) fn attach_turn_entry(
@@ -4147,41 +4128,6 @@ impl ToolLoopExecutor {
             });
         }
 
-        // Like the reference CLI, recalled memories follow the user message
-        // they were recalled for and stay there on later turns; a hook wake or
-        // a second run for the same message recalls nothing new.
-        let recall_target = crate::services::turn_context::for_last(&self.messages, Vec::new());
-        let recalled_before = recall_target.as_ref().is_some_and(|target| {
-            self.turn_context.iter().any(|entry| {
-                entry.key == target.key
-                    && entry.occurrence == target.occurrence
-                    && entry
-                        .blocks
-                        .iter()
-                        .any(|block| block.contains(crate::memory::RECALL_LEAD_IN))
-            })
-        });
-        if !self.require_hook_wake && !recalled_before {
-            if let (Some(memory), Some(target)) = (
-                self.file_memory.as_ref().filter(|m| m.active()).cloned(),
-                recall_target.as_ref(),
-            ) {
-                if !memory.recalled(target)? {
-                    let (_, recall) = memory.context_with_budget(
-                        &last_user_msg,
-                        self.memory_read_only(),
-                        self.memory_budget(),
-                    )?;
-                    let hit = recall.is_some();
-                    if let Some(recall) = recall {
-                        self.attach_turn_context(vec![recall])?;
-                    }
-                    // A durable zero-hit receipt must not alter the user's text.
-                    memory.record_recall(target, hit)?;
-                }
-            }
-        }
-        tracing::info!(module = "ToolLoop", "[E4] Memory injection COMPLETED");
         // 模型特定的检查和二次压缩
         tracing::info!(module = "ToolLoop", "[E4.5] Model-specific token check...");
         let model_id = &self.provider.model.id;

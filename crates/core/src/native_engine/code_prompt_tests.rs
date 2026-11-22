@@ -362,6 +362,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         user_instructions: user_block,
         environment: Some(environment),
         project_instructions: project_block,
+        project_memory: Some("<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()),
         standalone_frontend: true,
         loadable_tools: Some(
             "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
@@ -373,11 +374,12 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
         skills: None,
     });
-    assert_eq!(reminders.len(), 8);
+    assert_eq!(reminders.len(), 9);
     let body = capture_instruction_request("responses", reminders).await;
     assert!(body["instructions"]
         .as_str()
-        .is_none_or(|system| !system.contains("# Working environment")));
+        .is_none_or(|system| !system.contains("# Working environment")
+            && !system.contains("MEMORY.md index marker")));
     let first = body["input"]
         .as_array()
         .unwrap()
@@ -385,8 +387,11 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         .find(|message| message["role"] == "user")
         .expect("the request carries the user message");
     let parts = first["content"].as_array().unwrap();
-    assert_eq!(parts.len(), 9, "{parts:?}");
-    assert!(parts.iter().all(|part| part["type"] == "input_text"), "{parts:?}");
+    assert_eq!(parts.len(), 10, "{parts:?}");
+    assert!(
+        parts.iter().all(|part| part["type"] == "input_text"),
+        "{parts:?}"
+    );
     let text = |index: usize| parts[index]["text"].as_str().unwrap();
     assert!(text(0).starts_with("<system-reminder>\n") && text(0).contains("user marker"));
     assert!(!text(0).contains("project marker"));
@@ -394,14 +399,19 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
     assert!(text(1).contains(" - Project: Demo\n - Primary working directory: "));
     assert!(text(1).contains(" - Platform: "));
     assert!(text(2).starts_with("<system-reminder>\n") && text(2).contains("project marker"));
-    assert_eq!(text(3), crate::prompt::standalone_frontend_reminder());
-    assert!(text(4).starts_with("<system-reminder>\nTools you can load with ToolLoad"));
-    assert!(text(5).starts_with("<system-reminder>\nAvailable skills:"));
-    assert_eq!(text(6), crate::prompt::date_reminder("2026-11-19"));
-    assert!(text(7).starts_with("<system-reminder>\n# gitStatus"));
-    assert_eq!(text(8), "hello");
-    for index in 0..8 {
-        assert_eq!(text(index).matches("<system-reminder>").count(), 1, "{index}");
+    assert!(text(3).contains("MEMORY.md index marker"));
+    assert_eq!(text(4), crate::prompt::standalone_frontend_reminder());
+    assert!(text(5).starts_with("<system-reminder>\nTools you can load with ToolLoad"));
+    assert!(text(6).starts_with("<system-reminder>\nAvailable skills:"));
+    assert_eq!(text(7), crate::prompt::date_reminder("2026-11-19"));
+    assert!(text(8).starts_with("<system-reminder>\n# gitStatus"));
+    assert_eq!(text(9), "hello");
+    for index in 0..9 {
+        assert_eq!(
+            text(index).matches("<system-reminder>").count(),
+            1,
+            "{index}"
+        );
         assert!(text(index).ends_with("</system-reminder>"), "{index}");
     }
     println!(

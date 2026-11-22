@@ -2063,7 +2063,19 @@ impl Session {
             .model_history_with_boundary(&self.id, &self.selected_provider().await?.provider.api_format)?;
         crate::session_commands::microcompact(self, &mut history, self.context_window().await)?;
         if !hook_wake && completion.queued.is_none() {
-            history.push(json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))}));
+            let mut message = json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))});
+            if initial_hook {
+                message["origin"] = json!("hook");
+            }
+            history.push(message);
+        } else if completion
+            .queued
+            .as_ref()
+            .is_some_and(|item| item.request_id.starts_with("internal-cli:notice:"))
+        {
+            if let Some(message) = history.last_mut().filter(|m| m["role"] == "user") {
+                message["origin"] = json!("task_notification");
+            }
         }
         let mut system = match &self.sdk_overrides.system_prompt {
             Some(prompt) => prompt.clone(),

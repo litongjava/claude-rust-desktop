@@ -17,7 +17,7 @@ pub struct Setting<T> {
     value: PhantomData<fn() -> T>,
 }
 impl<T> Setting<T> {
-    pub(super) const fn new(name: &'static str) -> Self {
+    pub(crate) const fn new(name: &'static str) -> Self {
         Self {
             name: Cow::Borrowed(name),
             legacy: None,

@@ -334,19 +334,36 @@ impl FileMemoryStore {
         let _lock = self.lock()?;
         self.recover()?;
         if self.read_only {
-            let (entries, diagnostics) = self.scan(None)?;
-            let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
-            let index = index::build(&entries, previous.as_deref().unwrap_or_default());
-            return Ok(Snapshot {
-                generation: self.generation()?,
-                index_hash: hash(index.as_bytes()),
-                index,
-                entries,
-                diagnostics,
-                index_repaired: false,
-            });
+            return self.scanned_snapshot(false);
         }
         self.mutate(None, None)
+    }
+
+    /// Capture the user's on-disk index and candidate files under the same lock.
+    /// Context assembly must not repair away an intervening manual index edit.
+    pub(crate) fn prompt_snapshot(&self) -> Result<Snapshot> {
+        let _lock = self.lock()?;
+        self.recover()?;
+        self.scanned_snapshot(true)
+    }
+
+    fn scanned_snapshot(&self, use_disk_index: bool) -> Result<Snapshot> {
+        let (entries, diagnostics) = self.scan(None)?;
+        let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
+        let index = match previous {
+            Some(bytes) if use_disk_index => {
+                String::from_utf8(bytes).map_err(|_| invalid("invalid index encoding"))?
+            }
+            bytes => index::build(&entries, bytes.as_deref().unwrap_or_default()),
+        };
+        Ok(Snapshot {
+            generation: self.generation()?,
+            index_hash: hash(index.as_bytes()),
+            index,
+            entries,
+            diagnostics,
+            index_repaired: false,
+        })
     }
 
     /// Accept index ordering through ordinary file adapters without allowing
