@@ -108,7 +108,9 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         ).unwrap();
         let memory = FileMemory::workspace(&context, root.path()).unwrap();
         memory.put("saffron.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
-        let mut client = Client::start(root.path(), &server, &["--allowed-tools", STEER_TOOL]);
+        let coord = root.path().join("coord");
+        let mut client = Client::start_in_project_capturing(root.path(), &server,
+            &["--allowed-tools", STEER_TOOL, "--coordination-dir", coord.to_str().unwrap()]);
         client.send(user("Run the slow probe")).await;
         // The tool is now executing; the host corrects the turn while it runs.
         client.frame("tool_start").await;
