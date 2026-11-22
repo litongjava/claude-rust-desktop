@@ -274,19 +274,37 @@ fn main() {
                             }
                         };
 
+                        let model = "claude-sonnet-4-6";
+                        let Some(provider) = engine.resolve_provider(model).await else {
+                            tracing::error!("Inbound chat model unavailable");
+                            continue;
+                        };
+                        let event = msg.raw_data.get("event").unwrap_or(&msg.raw_data);
+                        let origin = match event.pointer("/sender/sender_type").and_then(|s| s.as_str()) {
+                            Some("user") => "typed",
+                            Some("app") => "im_app",
+                            _ => "im_event",
+                        };
+                        let admitted = db_for_im.open_session(&cid).and_then(|shard| {
+                            let lease = std::sync::Arc::new(shard.acquire_execution()?);
+                            shard.admit_prompt(&msg.content, None, origin)?;
+                            let (messages, boundary) = shard.read(|r| r.model_history(&provider.provider.api_format))?;
+                            Ok((lease, messages, boundary))
+                        });
+                        let (lease, messages, context_boundary) = match admitted {
+                            Ok(admitted) => admitted,
+                            Err(error) => { tracing::error!(%error, "Failed to admit inbound chat"); continue; }
+                        };
                         // Build chat request with user's message
                         let chat_req = crate::native_engine::engine_core::ChatRequest {
                             max_turns: None,
                             response_schema: None,
                 provider_id: None, effort: None,
                             conversation_id: cid.clone(),
-                            context_boundary: None,
+                            context_boundary,
                             assistant_message_id: None,
-                            messages: vec![serde_json::json!({
-                                "role": "user",
-                                "content": msg.content.clone()
-                            })],
-                            model: "claude-sonnet-4-6".to_string(),
+                            messages,
+                            model: model.into(),
                             system_prompt: None,
                             standalone_frontend: false,
                             max_tokens: None,
@@ -313,7 +331,7 @@ fn main() {
                         }).await;
 
                         // Call NativeEngine
-                        match engine.send_message(chat_req).await {
+                        match engine.send_message_with_lease(chat_req, true, lease).await {
                             Ok(mut rx) => {
                                 let mut full_text = String::new();
                                 let mut total_input_tokens: u64 = 0;

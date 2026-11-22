@@ -76,9 +76,8 @@ pub(super) async fn start_authorized_chat(
 
     let user_content = req
         .messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .last()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
         .and_then(|m| m.get("content"))
         .cloned();
     if let Some(content) = &user_content {
@@ -118,9 +117,15 @@ pub(super) async fn start_authorized_chat(
     });
     let lifecycle_state = state.clone();
     let lifecycle_id = conv_id.clone();
-    let mut messages = req.messages;
+    let requested_count = req.messages.len();
 
-    tracing::info!(module = "Chat", "[1/7] Parsed request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
+    tracing::info!(
+        module = "Chat",
+        "[1/7] Parsed request: conv_id={}, model={}, messages={}",
+        conv_id,
+        model,
+        requested_count
+    );
 
     // Save user messages to SQLite before starting the engine
     tracing::info!(module = "Chat", "[2/7] Starting SQLite save...");
@@ -145,18 +150,28 @@ pub(super) async fn start_authorized_chat(
         Some((item,_)) => state.db_manager.start_desktop_input(&conv_id,execution_lease.clone(),item),
         None => state.db_manager.start_turn_timer(&conv_id),
     };
-    let mut turn = match timer {
-        Ok(turn) => turn,
-        Err(error) if error.downcast_ref::<deepseek_code_core::services::input_queue::QueueError>().is_some() =>
-            return (StatusCode::CONFLICT,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not start turn timing: {error:#}")}))).into_response(),
-    };
-    if let Some((_,format)) = queued {
-        messages = match crate::runtime::SessionStore::new(state.db_manager.clone()).model_history(&conv_id,&format) {
-            Ok(history) => history,
-            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    let mut turn =
+        match timer {
+            Ok(turn) => turn,
+            Err(error)
+                if error
+                    .downcast_ref::<deepseek_code_core::services::input_queue::QueueError>()
+                    .is_some() =>
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error":error.to_string()})),
+                )
+                    .into_response()
+            }
+            Err(error) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error":format!("Could not start turn timing: {error:#}")}),
+                ),
+            )
+                .into_response(),
         };
-    }
     let first_assistant_id = match turn.ensure_segment() {
         Ok(id) => id,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not persist assistant segment: {error:#}")}))).into_response(),
@@ -188,16 +203,51 @@ pub(super) async fn start_authorized_chat(
             // Sync latest providers
             engine.sync_providers(providers_to_sync).await;
 
+            let model = if model.is_empty() {
+                "claude-sonnet-4-6"
+            } else {
+                &model
+            };
+            let format = match queued.as_ref() {
+                Some((_, format)) => format.clone(),
+                None => {
+                    let provider = match req.provider_id.as_deref() {
+                        Some(id) => engine.resolved_provider(id, model).await.ok(),
+                        None => engine.resolve_provider(model).await,
+                    };
+                    let Some(provider) = provider else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"Chat model unavailable"})),
+                        )
+                            .into_response();
+                    };
+                    provider.provider.api_format
+                }
+            };
+            let (messages, context_boundary) =
+                match crate::runtime::SessionStore::new(state.db_manager.clone())
+                    .model_history_with_boundary(&conv_id, &format)
+                {
+                    Ok(history) => history,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":error.to_string()})),
+                        )
+                            .into_response()
+                    }
+                };
+
             let chat_req = crate::native_engine::engine_core::ChatRequest {
                 max_turns: None,
                 response_schema: None,
                 provider_id: req.provider_id.clone(), effort: req.effort.clone(),
                 conversation_id: conv_id.clone(),
-                // The client supplies the messages; no boundary can be proven.
-                context_boundary: None,
+                context_boundary,
                 assistant_message_id: Some(first_assistant_id.clone()),
-                messages: messages.clone(),
-                model: if model.is_empty() { "claude-sonnet-4-6".to_string() } else { model.clone() },
+                messages,
+                model: model.to_owned(),
                 system_prompt: req.system_prompt.clone(),
                 standalone_frontend: false,
                 max_tokens: req.max_tokens,
