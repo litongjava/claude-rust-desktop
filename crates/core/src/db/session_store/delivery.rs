@@ -928,7 +928,8 @@ impl DeliveryOwner {
         }
         Ok(None)
     }
-    /// Model-boundary polling shares a single contention budget across the batch.
+    /// Discovery shares a contention budget across the batch. Each committed
+    /// live receipt has a separate bounded acknowledgement after its WAL flush.
     /// An ack-only retry injects content only if this same live owner committed it.
     pub(crate) fn poll_turn(&mut self, peers: bool, limit: usize) -> Result<Vec<DeliveredInput>> {
         use crate::db::message_repo;
@@ -1177,7 +1178,8 @@ mod turn_delivery_tests {
     fn busy_ack_defers_a_live_steer_without_losing_or_repeating_its_content() -> Result<()> {
         let root = tempfile::tempdir()?;
         let stores = Stores::open(root.path())?;
-        let hold = AtomicBool::new(true);
+        let pending_fault = std::sync::Arc::new(AtomicBool::new(true));
+        let hold = pending_fault.clone();
         let stores = stores.with_fault_hook(move |phase| {
             if phase == Phase::DeliveryCommitted && hold.swap(false, Ordering::SeqCst) {
                 return Err(rusqlite::Error::SqliteFailure(
@@ -1197,7 +1199,19 @@ mod turn_delivery_tests {
         let mut owner = session.delivery_owner()?;
         session.write(|w| w.start_turn())?;
         session.enqueue("req", &serde_json::json!("update"), QueueMode::Steer)?;
-        assert!(owner.poll_turn(false, 8)?.is_empty());
+        let deadline = std::time::Instant::now() + super::super::WRITE_DEADLINE;
+        while pending_fault.load(Ordering::SeqCst) {
+            assert!(owner.poll_turn(false, 8)?.is_empty());
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "The live receipt did not reach the injected acknowledgement fault"
+            );
+        }
+        assert_eq!(
+            owner.live_handoffs.len(),
+            1,
+            "The owner must retain its committed receipt"
+        );
         let inputs = owner.poll_turn(false, 8)?;
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].content, "update");
