@@ -326,30 +326,34 @@ pub(crate) fn visible_memory_index(
     c: &rusqlite::Connection,
     admitting_id: &str,
 ) -> Result<(Option<String>, Option<String>)> {
-    let boundary: Option<(String, i64)> = c.query_row(
-        "SELECT id,sort_order FROM messages WHERE is_compact_boundary ORDER BY sort_order DESC,rowid DESC LIMIT 1",
-        [], |r| Ok((r.get(0)?, r.get(1)?))
+    let boundary: Option<String> = c.query_row(
+        "SELECT id FROM messages WHERE is_compact_boundary ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+        [], |r| r.get(0)
     ).optional()?;
-    let order = boundary.as_ref().map_or(-1, |b| b.1);
     let hash = c.query_row(
-        "WITH visible(id,pos,tool,part) AS (
-            SELECT m.id,m.sort_order,-1,0 FROM messages m JOIN message_metadata meta ON meta.message_id=m.id
-            WHERE m.role='user' AND m.sort_order>?1 AND json_extract(meta.value,'$.promptOrigin') IN ('typed','user')
+        "WITH history AS (
+            SELECT id, role, sort_order, rowid AS sequence FROM messages
+            WHERE ?1 IS NULL OR (sort_order,rowid)>(SELECT sort_order,rowid FROM messages WHERE id=?1)
+         ), visible(id,pos,sequence,tool,tool_sequence,part) AS (
+            SELECT m.id,m.sort_order,m.sequence,-1,0,0 FROM history m
+            JOIN message_metadata meta ON meta.message_id=m.id
+            WHERE m.role='user' AND json_extract(meta.value,'$.promptOrigin') IN ('typed','user')
             UNION ALL
-            SELECT json_extract(j.value,'$.message_id'),m.sort_order,t.sort_order,j.key
-            FROM messages m JOIN tool_calls t ON t.message_id=m.id
+            SELECT json_extract(j.value,'$.message_id'),m.sort_order,m.sequence,t.sort_order,t.rowid,j.key
+            FROM history m JOIN tool_calls t ON t.message_id=m.id
             JOIN tool_queued_inputs q ON q.tool_call_id=t.id JOIN json_each(q.inputs_json) j
-            WHERE m.sort_order>?1 AND json_extract(j.value,'$.prompt_origin')='typed'
+            WHERE m.role='assistant' AND json_extract(j.value,'$.prompt_origin')='typed'
+              AND NOT EXISTS(SELECT 1 FROM tool_call_origins nested WHERE nested.tool_call_id=t.id)
          )
          SELECT json_extract(p.value,'$.index_hash') FROM visible v
          JOIN peripheral_settings p ON p.key='memory.prompt.message.'||v.id
          WHERE v.id<>?2 AND json_extract(p.value,'$.index_hash') IS NOT NULL
            AND coalesce(json_extract(p.value,'$.announced'),
                json_extract(p.value,'$.blocks[0]') GLOB '<system-reminder>'||char(10)||'MEMORY.md changed.*')
-         ORDER BY v.pos DESC,v.tool DESC,v.part DESC LIMIT 1",
-        params![order, admitting_id], |r| r.get(0)
+         ORDER BY v.pos DESC,v.sequence DESC,v.tool DESC,v.tool_sequence DESC,v.part DESC LIMIT 1",
+        params![boundary, admitting_id], |r| r.get(0)
     ).optional()?;
-    Ok((boundary.map(|b| b.0), hash))
+    Ok((boundary, hash))
 }
 
 impl super::SessionDb {
@@ -952,5 +956,37 @@ impl SessionRead<'_> {
             tail.push(TranscriptExcerpt { role, text:row.get(2)?, tools });
         }
         Ok(tail)
+    }
+}
+
+#[cfg(test)]
+mod memory_index_order_tests {
+    use super::*;
+
+    #[test]
+    fn memory_watermark_follows_visible_rows_with_equal_sort_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stores = crate::db::session_store::Stores::open(temp.path())?;
+        let session = stores.create("memory-index-order", Default::default())?;
+        session.write(|w| {
+            let boundary = w.plan_marker("boundary")?;
+            for (hash, blocks) in [
+                ("first", vec!["<system-reminder>\nMEMORY.md changed. A"]),
+                ("second", vec!["<system-reminder>\nMEMORY.md changed. B"]),
+                ("unannounced", Vec::new()),
+            ] {
+                let id = w.append("user", "same text")?;
+                w.set_prompt_origin(&id, "typed")?;
+                let key =
+                    super::super::settings::Setting::memory_receipt(format!("prompt.message.{id}"));
+                w.set_setting(key, &serde_json::json!({"index_hash":hash,"blocks":blocks}))?;
+            }
+            w.0.execute("UPDATE messages SET sort_order=0", [])?;
+            assert_eq!(
+                visible_memory_index(w.0, "next")?,
+                (Some(boundary), Some("second".into()))
+            );
+            Ok(())
+        })
     }
 }
