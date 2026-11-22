@@ -59,7 +59,7 @@ impl Fixture {
                     let frames: Vec<u8> = [("messageStart",json!({"role":"assistant"})),
                         ("contentBlockDelta",json!({"contentBlockIndex":0,"delta":{"text":text}})),
                         ("messageStop",json!({"stopReason":"end_turn"})),
-                        ("metadata",json!({"usage":{"inputTokens":100,"outputTokens":3,"totalTokens":103}}))]
+                        ("metadata",json!({"usage":{"inputTokens":20,"cacheReadInputTokens":75,"cacheWriteInputTokens":5,"outputTokens":3,"totalTokens":103}}))]
                         .into_iter().flat_map(|(kind, payload)| bedrock::frame(kind, payload)).collect();
                     ([("content-type","application/vnd.amazon.eventstream")],frames).into_response()
                 } else if anthropic {
@@ -453,5 +453,31 @@ async fn fork_and_grandchild_share_one_physical_compaction_charge() {
     assert_eq!(usage.days[0].session, f.id);
     assert_eq!(usage.days[0].requests, 1);
     assert_eq!(usage.days[0].heat, 103);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn bedrock_compaction_persists_inclusive_input_and_disjoint_cache_counts() {
+    let mut f = Fixture::new(128_000).await;
+    f.provider.builtin_id = Some("amazon-bedrock".into());
+    f.provider.models[0].api = Some("bedrock-converse-stream".into());
+    f.append("user", "First request");
+    f.append("assistant", "Earlier reply");
+    f.compact().await.unwrap();
+    let (usage, input, output) = f
+        .store
+        .db
+        .open_session(&f.id)
+        .unwrap()
+        .repository()
+        .usage_totals(&[])
+        .unwrap();
+    assert_eq!((input, output), (100, 3));
+    assert_eq!(usage["cache_read_tokens"], 75);
+    assert_eq!(usage["cache_write_tokens"], 5);
+    assert_eq!(
+        f.store.db.usage(|| false).unwrap().days[0].tokens,
+        [20, 3, 75, 5]
+    );
     f.finish().await;
 }

@@ -432,7 +432,14 @@ impl State {
                 let usage = &payload["usage"];
                 let read = usage["cacheReadInputTokens"].as_u64().unwrap_or_default();
                 let write = usage["cacheWriteInputTokens"].as_u64().unwrap_or_default();
-                self.usage = json!({"prompt_tokens":usage["inputTokens"].as_u64().unwrap_or_default(),"completion_tokens":usage["outputTokens"].as_u64().unwrap_or_default(),"total_tokens":usage["totalTokens"].as_u64().unwrap_or_default(),"prompt_tokens_details":{"cached_tokens":read},"cache_creation_input_tokens":write});
+                let input = usage["inputTokens"]
+                    .as_u64()
+                    .map(|n| n.saturating_add(read).saturating_add(write));
+                let output = usage["outputTokens"].as_u64();
+                let total = usage["totalTokens"]
+                    .as_u64()
+                    .or_else(|| input.zip(output).map(|(i, o)| i.saturating_add(o)));
+                self.usage = json!({"prompt_tokens":input,"completion_tokens":output,"total_tokens":total,"prompt_tokens_details":{"cached_tokens":read},"cache_creation_input_tokens":write});
             }
             kind if kind.ends_with("Exception") => {
                 bail!("Bedrock stream exception {kind}: {}", payload["message"])

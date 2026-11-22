@@ -501,6 +501,7 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 全部使用本地模拟接口和临时数据库，不发真实请求。
 
 - `cargo test --locked -p deepseek-code-core --test compaction_cache_prefix`：主回合完成后重开引擎，通过本地 Chat、Anthropic Messages 和非 GPT Responses 接口比较完整请求体。摘要须保留主回合的系统指令、工具定义、首条消息的提醒和后续回答，末尾只追加一条含 keep 的用户指令。即使回复同时含正文与写文件调用，也只能提交正文；历史只增加摘要边界。按请求 ID 核对 SQLite 的输入和缓存读取 token 数，包括截断后的各次恢复请求。
+- `cargo test --locked -p deepseek-code-core --test compaction_history`：检查本地压缩和首轮收件箱投递后的历史完整性、Responses 不透明窗口的分段回退、结构化输出约束、Claude 推理模式下的前缀复用，以及原生网关的路由和鉴权。核对每日缓存分项、跨分支的物理请求数和 Bedrock 缓存读写。
 - `cargo test --locked -p deepseek-code-core --test native_compaction`：同一 GPT Responses 会话的主请求与原生压缩请求使用相同的 `prompt_cache_key`；分支使用自身会话的键。核对压缩请求可用字段和会话请求指标。真实服务端的命中率需用已启用记录的代理另行测量。
 - `cargo test --locked -p deepseek-code-cli --test compaction_summary_stream`：通过本地 OpenCode Go Chat 接口续接超阈值会话。角色帧和正文帧被合并为一个流元素时，摘要按 SSE 帧顺序解码，正文中的 JSON 字面文本原样写入边界，续接主请求只发送一次。若单个提供方帧内含两个 JSON 值，首个分段请求失败，保留原历史和解析位置，不重发、不写入边界、不发送主请求。
 
