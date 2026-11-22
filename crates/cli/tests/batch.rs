@@ -23,13 +23,22 @@ struct Fixture {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
-    delay: Duration,
+    first_pair: Option<Arc<tokio::sync::Barrier>>,
 }
 async fn respond(State(state): State<Fixture>) -> impl axum::response::IntoResponse {
     let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(active, Ordering::SeqCst);
-    state.calls.fetch_add(1, Ordering::SeqCst);
-    tokio::time::sleep(state.delay).await;
+    let call = state.calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(pair) = &state.first_pair {
+        if call < 2 {
+            // Wait for actual overlap regardless of how long worker startup takes.
+            tokio::time::timeout(Duration::from_secs(12), pair.wait())
+                .await
+                .expect("two batch workers must reach the model concurrently");
+        }
+    } else {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
     state.active.fetch_sub(1, Ordering::SeqCst);
     let body = format!(
         "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
@@ -101,7 +110,7 @@ async fn exercise(cancel: bool) {
         active: Arc::new(AtomicUsize::new(0)),
         peak: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
-        delay: Duration::from_millis(if cancel { 5000 } else { 450 }),
+        first_pair: (!cancel).then(|| Arc::new(tokio::sync::Barrier::new(2))),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
