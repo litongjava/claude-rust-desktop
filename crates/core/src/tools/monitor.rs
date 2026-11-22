@@ -5,6 +5,9 @@
 //! so the CLI can turn them into task notifications without polling the
 //! process itself.
 use super::background_shell::NOTIFICATION_START;
+use crate::native_engine::tool_loop::base64_preview::{
+    monitor_output_line, summary as base64_summary, MonitorLine,
+};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -189,7 +192,7 @@ pub(super) fn start_with_runtime_limit(
             output_events: 0,
             output_times: VecDeque::new(),
         };
-        let mut pending: Vec<String> = Vec::new();
+        let mut pending = Vec::new();
         let mut batch_start: Option<tokio::time::Instant> = None;
         let mut stdout_open = true;
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
@@ -467,23 +470,27 @@ impl Emitter {
 }
 
 /// Joins a batch, bounding it to 50 lines and 16 KiB.
-fn batch_text(lines: &[String]) -> String {
+fn batch_text(lines: &[MonitorLine]) -> String {
     let mut text = String::new();
     let mut bytes = 0usize;
     let mut kept = 0usize;
+    let mut blocks = 0;
+    let mut encoded = 0;
     for line in lines {
         if kept == MAX_EVENT_LINES {
             break;
         }
         // The byte count includes the separator between kept lines.
-        let addition = line.len() + usize::from(kept > 0);
+        let addition = line.text.len() + usize::from(kept > 0);
         if bytes + addition > MAX_EVENT_BYTES {
             break;
         }
         if kept > 0 {
             text.push('\n');
         }
-        text.push_str(line);
+        text.push_str(&line.text);
+        blocks += line.blocks;
+        encoded += line.encoded_bytes;
         bytes += addition;
         kept += 1;
     }
@@ -493,42 +500,65 @@ fn batch_text(lines: &[String]) -> String {
         }
         text.push_str(&format!("… {} more lines", lines.len() - kept));
     }
+    if blocks > 0 {
+        text.push('\n');
+        text.push_str(&base64_summary(blocks, encoded));
+    }
     text
 }
 
 /// Reads one pipe line by line into its log, forwarding stdout lines.
 async fn read_lines<R: AsyncRead + Unpin>(
     reader: R,
-    log: PathBuf,
-    sink: Option<mpsc::UnboundedSender<String>>,
+    path: PathBuf,
+    sink: Option<mpsc::UnboundedSender<MonitorLine>>,
 ) {
     let mut reader = BufReader::new(reader);
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log)
+        .open(&path)
         .ok();
     let mut buffer = Vec::new();
+    let mut line_number = 0;
     loop {
         buffer.clear();
         match reader.read_until(b'\n', &mut buffer).await {
             Ok(0) => break,
             Ok(_) => {
-                while buffer
-                    .last()
-                    .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-                {
-                    buffer.pop();
-                }
-                let line: String = String::from_utf8_lossy(&buffer)
-                    .chars()
-                    .take(MAX_LINE_CHARS)
-                    .collect();
-                if let Some(log) = log.as_mut() {
-                    let _ = writeln!(log, "{line}");
-                }
+                line_number += 1;
+                let full = String::from_utf8_lossy(&buffer);
+                let line = full.trim_end_matches(['\n', '\r']);
+                let compact = sink
+                    .as_ref()
+                    .and_then(|_| monitor_output_line(line, &path, line_number, MAX_LINE_CHARS));
+                let ordinary = || MonitorLine {
+                    text: line.chars().take(MAX_LINE_CHARS).collect(),
+                    ..Default::default()
+                };
+                let output = if let Some(compact) = compact {
+                    // Publish the reference only after the uncut line reaches stdout.log.
+                    if log
+                        .as_mut()
+                        .is_some_and(|file| file.write_all(&buffer).is_ok())
+                    {
+                        compact
+                    } else {
+                        log = None;
+                        ordinary()
+                    }
+                } else {
+                    let output = ordinary();
+                    if log
+                        .as_mut()
+                        .is_some_and(|file| writeln!(file, "{}", output.text).is_err())
+                    {
+                        log = None;
+                    }
+                    output
+                };
                 if let Some(sink) = &sink {
-                    if sink.send(line).is_err() {
+                    if sink.send(output).is_err() {
                         break;
                     }
                 }
@@ -671,6 +701,14 @@ pub fn collect_events(root: &Path, session: &str) -> Result<Vec<Event>> {
         }
     }
     tx.commit()?;
+    // Undelivered events written by older versions still contain raw payloads.
+    for event in &mut events {
+        if event.kind == "output" {
+            if let Some(text) = crate::native_engine::tool_loop::monitor_line(&event.text, root) {
+                event.text = text;
+            }
+        }
+    }
     Ok(events)
 }
 
@@ -1563,6 +1601,44 @@ mod tests {
         assert!(events[2].text.contains("code 0"), "{}", events[2].text);
         assert!(events.iter().all(|event| event.task_id == id));
         assert!(collect_events(root.path(), &session).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base64_monitor_event_names_the_uncut_stdout_line() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = start_monitor(
+            root.path(),
+            &session,
+            r#"printf 'start\n'; awk 'BEGIN {for(i=0;i<25600;i++) printf "QUJD"; print ""}'"#,
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+        let id = task["task_id"].as_str().unwrap();
+        assert_eq!(
+            wait_finished(root.path(), &session, id).await["status"],
+            "completed"
+        );
+        let events = collect_events(root.path(), &session).unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.text.contains("[base64 data omitted:"))
+            .unwrap();
+        assert!(event.text.contains("base64: 1 block collapsed (100 KB)"));
+        assert!(!event.notification().contains("QUJD"));
+        let (path, _) = event
+            .text
+            .split_once("76800 bytes decoded, looks like text; full output: ")
+            .unwrap()
+            .1
+            .split_once(", line 2]")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("start\n{}\n", "QUJD".repeat(25600))
+        );
     }
 
     #[cfg(unix)]
