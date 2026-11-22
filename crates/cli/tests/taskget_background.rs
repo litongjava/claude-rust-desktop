@@ -82,7 +82,7 @@ async fn respond(
         requests.push(body.clone());
         requests.len() - 1
     };
-    if fixture.foreground && body["stream"] != true {
+    if (fixture.foreground || fixture.base64) && body["stream"] != true {
         return Json(json!({"id":"fixture-compact","object":"chat.completion","created":0,"model":"fixture-model",
             "choices":[{"index":0,"message":{"role":"assistant","content":"Preserved the shell output."},"finish_reason":"stop"}]})).into_response();
     }
@@ -244,6 +244,41 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
     .await;
 }
 
+async fn resume_fixture(
+    data: &std::path::Path,
+    workspace: &std::path::Path,
+    id: &str,
+    prompt: &str,
+) {
+    let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
+    resume
+        .current_dir(workspace)
+        .args(["--print", "--output-format", "stream-json", "--data-dir"])
+        .arg(data)
+        .arg("--path")
+        .arg(workspace)
+        .args([
+            "--provider",
+            "fixture",
+            "--model",
+            "fixture-model",
+            "--resume",
+            id,
+            prompt,
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 async fn run_shell(fixture: Fixture, opt_out: OptOut) {
     let (foreground, long_output) = (fixture.foreground, fixture.long_output);
     let root = tempfile::tempdir().unwrap();
@@ -255,13 +290,16 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         .route("/v1/chat/completions", post(respond))
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // Keep the raw historical snapshot below the automatic compaction threshold
+    // so the fixture can inspect replay and then request compaction explicitly.
+    let context_window = if fixture.base64 { 1_000_000 } else { 128_000 };
     std::fs::write(
         data.join("providers.json"),
         json!([{
             "id":"fixture","name":"Fixture","base_url":base,"api_key":"fixture-only",
             "api_format":"openai","enabled":true,
             "models":[{"id":"fixture-model","name":"Fixture","enabled":true,
-                "context_window":128000,"max_tokens":4096,
+                "context_window":context_window,"max_tokens":4096,
                 "supports_web_search":false,"supports_vision":false}]
         }])
         .to_string(),
@@ -412,39 +450,18 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         assert!(!raw.contains("[base64 data omitted"));
         drop(store);
 
-        let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
-        resume
-            .current_dir(root.path())
-            .args(["--print", "--output-format", "stream-json", "--data-dir"])
-            .arg(&data)
-            .arg("--path")
-            .arg(root.path())
-            .args([
-                "--provider",
-                "fixture",
-                "--model",
-                "fixture-model",
-                "--resume",
-                &id,
-                "Replay the fixture",
-            ])
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        resume_fixture(&data, root.path(), &id, "Replay the fixture").await;
         let replay = fixture.requests.lock().unwrap().last().cloned().unwrap();
         assert_eq!(
             last_tool_content(&replay),
             Some(live.as_str()),
             "fresh process replay"
         );
+        let start = fixture.requests.lock().unwrap().len();
+        resume_fixture(&data, root.path(), &id, "/compact Keep the fixture command").await;
+        let compact = serde_json::to_string(&fixture.requests.lock().unwrap()[start..]).unwrap();
+        assert!(compact.contains("[base64 data omitted"));
+        assert!(!compact.contains(&"QUJD".repeat(256)));
         server.abort();
         let _ = server.await;
         return;
@@ -489,33 +506,7 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         let summary = summary.to_owned();
         drop(requests);
         for prompt in ["Replay the fixture", "/compact Keep the fixture command"] {
-            let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
-            resume
-                .current_dir(root.path())
-                .args(["--print", "--output-format", "stream-json", "--data-dir"])
-                .arg(&data)
-                .arg("--path")
-                .arg(root.path())
-                .args([
-                    "--provider",
-                    "fixture",
-                    "--model",
-                    "fixture-model",
-                    "--resume",
-                    &id,
-                    prompt,
-                ])
-                .stdin(Stdio::null())
-                .kill_on_drop(true);
-            let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+            resume_fixture(&data, root.path(), &id, prompt).await;
         }
         server.abort();
         let requests = fixture.requests.lock().unwrap();
