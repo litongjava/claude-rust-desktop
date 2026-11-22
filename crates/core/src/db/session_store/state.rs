@@ -50,6 +50,28 @@ impl GlobalDb {
             Ok(())
         })
     }
+    /// Import a preference once without replacing a concurrent explicit edit.
+    pub(crate) fn initialize_setting<T: Serialize + DeserializeOwned>(
+        &self,
+        key: GlobalSetting<'_>,
+        initial: &T,
+    ) -> Result<T> {
+        layout::allow_entry()?;
+        let [domain, name] = key.parts();
+        let raw = serde_json::to_string(initial)?;
+        self.write("initialize global setting", name, false, |tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO global_settings(domain,name,value) VALUES(?1,?2,?3)",
+                [domain, name, &raw],
+            )?;
+            let chosen: String = tx.query_row(
+                "SELECT value FROM global_settings WHERE domain=?1 AND name=?2",
+                [domain, name],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&chosen)?)
+        })
+    }
     pub fn summary(&self, id: &str) -> Result<Option<Projection>> {
         self.read_directory_row(id, |c| {
             Ok(c.query_row(

@@ -31,18 +31,23 @@ pub fn config(context: &ServiceContext) -> Result<crate::memory::MemoryConfig> {
     if let Some(config) = context.global_setting(key)? {
         return Ok(config);
     }
-    let archive = context.paths.data_dir.join("memory.sqlite3");
+    let imported = archive_config(&context.paths.data_dir)?.unwrap_or_default();
+    context.db.global().initialize_setting(key, &imported)
+}
+
+fn archive_config(data_dir: &Path) -> Result<Option<crate::memory::MemoryConfig>> {
+    let archive = data_dir.join("memory.sqlite3");
     if archive.is_file() {
         use rusqlite::{Connection, OpenFlags, OptionalExtension};
         let conn = Connection::open_with_flags(archive, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         if conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_settings')", [], |row| row.get::<_, bool>(0))? {
             let raw: Option<String> = conn.query_row("SELECT config FROM memory_settings WHERE id=1", [], |r| r.get(0)).optional()?;
             if let Some(raw) = raw {
-                return Ok(serde_json::from_str(&raw)?);
+                return Ok(Some(serde_json::from_str(&raw)?));
             }
         }
     }
-    Ok(Default::default())
+    Ok(None)
 }
 
 pub fn save_config(context: &ServiceContext, config: &crate::memory::MemoryConfig) -> Result<()> {
@@ -720,6 +725,28 @@ mod tests {
     fn note(body: &str) -> String {
         format!("---\nname: 中文 preferences\ndescription: Rust testing 中文测试 preferences\nmetadata:\n  type: user\n---\n{body}\n")
     }
+    #[test]
+    fn file_memory_imports_legacy_configuration_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
+        let context =
+            ServiceContext::open(paths, Arc::new(super::super::EnvironmentCredentials)).unwrap();
+        let archive = context.paths.data_dir.join("memory.sqlite3");
+        let conn = rusqlite::Connection::open(&archive).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE memory_settings(id INTEGER, config TEXT);
+            INSERT INTO memory_settings VALUES(1,'{"enabled":false,"search_top_k":3}')"#,
+        )
+        .unwrap();
+        assert!(!config(&context).unwrap().enabled);
+        drop(conn);
+        std::fs::remove_file(&archive).unwrap();
+        assert_eq!(config(&context).unwrap().search_top_k, 3);
+        save_config(&context, &Default::default()).unwrap();
+        assert!(config(&context).unwrap().enabled);
+        assert!(!archive.exists());
+    }
+
     #[test]
     fn file_memory_context_recall_and_cas_tools() {
         let (_root, memory) = fixture();
