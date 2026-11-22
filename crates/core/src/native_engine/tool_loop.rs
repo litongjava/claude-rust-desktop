@@ -2795,15 +2795,9 @@ impl ToolLoopExecutor {
         let root = self.search_config_path.as_deref().and_then(|p| p.parent());
         if model_output::is_shell_result(tool_name) {
             let enabled = self.summary_enabled(root);
-            let metadata = if enabled {
-                root.zip(id)
-                    .and_then(|(root, id)| {
-                        std::fs::read(model_output::metadata_path(root, id)).ok()
-                    })
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            } else {
-                None
-            };
+            let metadata = root
+                .zip(id)
+                .and_then(|(root, id)| model_output::read_metadata(root, id));
             return model_output::command_preview(
                 tool_name,
                 output,
@@ -3009,12 +3003,12 @@ impl ToolLoopExecutor {
             .search_config_path
             .as_deref()
             .and_then(std::path::Path::parent);
-        if let Some(root) = root.filter(|root| {
-            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
-        }) {
+        if let Some(root) = root.filter(|_| model_output::is_shell_result(tool_name)) {
             let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
-            if let Some(metadata) = metadata {
-                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
+            if let Some(metadata) =
+                metadata.filter(|m| m.needed_for_base64() || self.summary_enabled(Some(root)))
+            {
+                if let Err(error) = model_output::save_metadata(root, id, metadata) {
                     tracing::debug!(%error, "Could not retain shell capture metadata");
                 }
             }

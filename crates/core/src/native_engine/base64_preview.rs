@@ -38,8 +38,42 @@ fn field_runs(original: &str, field: &RawValue, counts: &mut HashMap<String, usi
     blocks
 }
 
+#[derive(Clone)]
+pub(super) struct Location {
+    pub(super) path: Option<std::path::PathBuf>,
+    pub(super) line: usize,
+    pub(super) range: Range<usize>,
+}
+
+pub(super) fn raw_ranges(bytes: &[u8], blocks: &[Run]) -> Vec<Range<usize>> {
+    let mut chunks = bytes.utf8_chunks();
+    let (mut raw, mut decoded) = (0, 0);
+    let mut chunk = chunks.next();
+    let mut offset = |at| {
+        while let Some(part) = chunk.as_ref() {
+            if at <= decoded + part.valid().len() {
+                break;
+            }
+            raw += part.valid().len() + part.invalid().len();
+            decoded += part.valid().len()
+                + if part.invalid().is_empty() {
+                    0
+                } else {
+                    '�'.len_utf8()
+                };
+            chunk = chunks.next();
+        }
+        raw + (at - decoded)
+    };
+    blocks
+        .iter()
+        .map(|b| offset(b.range.start)..offset(b.range.end))
+        .collect()
+}
+
 struct Blocks {
     runs: Vec<Run>,
+    locations: HashMap<usize, Location>,
     count: usize,
     bytes: usize,
     json_end: Option<usize>,
@@ -72,6 +106,7 @@ fn task_blocks(original: &str) -> Option<Blocks> {
     let count = counts.values().sum();
     let bytes = counts.iter().map(|(blob, n)| blob.len() * n).sum();
     Some(Blocks {
+        locations: HashMap::new(),
         runs,
         count,
         bytes,
@@ -84,17 +119,37 @@ impl Collapsed {
         if original.len() < crate::tools::base64_collapse::DATA_URI_THRESHOLD {
             return None;
         }
+        Self::prepare_runs(
+            name,
+            original,
+            root,
+            None,
+            None,
+            HashMap::new(),
+        )
+    }
+
+    pub(super) fn prepare_runs(
+        name: &str,
+        original: &str,
+        root: &Path,
+        stream_runs: Option<Vec<Run>>,
+        source_file: Option<&Path>,
+        stream_locations: HashMap<usize, Location>,
+    ) -> Option<Self> {
         let task = matches!(name, "TaskGet" | "TaskOutput");
         let Blocks {
             runs: blocks,
+            locations,
             count,
             bytes,
             mut json_end,
         } = if task {
             task_blocks(original)?
         } else {
-            let runs = runs(original);
+            let runs = stream_runs.unwrap_or_else(|| runs(original));
             Blocks {
+                locations: stream_locations,
                 count: runs.len(),
                 bytes: runs.iter().map(|b| b.range.len()).sum(),
                 runs,
@@ -104,11 +159,21 @@ impl Collapsed {
         if blocks.is_empty() {
             return None;
         }
-        let path = crate::performance::save_tool_output(root, original).ok()?;
+        let path = if let Some(path) = source_file {
+            path.to_owned()
+        } else {
+            crate::performance::save_tool_output(root, original).ok()?
+        };
         let note = summary(count, bytes);
         let insert = json_end.map_or(original.len(), |end| end - 1);
-        let (mut text, mut changes) =
-            render_runs(&original[..insert], &blocks, &path, 1, json_end.is_some());
+        let (mut text, mut changes) = render_runs(
+            &original[..insert],
+            &blocks,
+            &path,
+            1,
+            json_end.is_some(),
+            &locations,
+        );
         let start = text.len();
         if json_end.is_some() {
             text.push_str(&format!(",\"model_output_summary\":\"{note}\""));
@@ -226,6 +291,7 @@ fn render_runs(
     path: &Path,
     mut line: usize,
     json: bool,
+    locations: &HashMap<usize, Location>,
 ) -> (String, Vec<(Range<usize>, Range<usize>)>) {
     let mut text = String::new();
     let mut changes = Vec::new();
@@ -235,12 +301,21 @@ fn render_runs(
         range,
         decoded_len,
         kind,
+        incomplete,
     } in blocks
     {
         let gap = &original[copied..range.start];
         text.push_str(gap);
         line += gap.bytes().filter(|&b| b == b'\n').count();
-        let marker = format!("[base64 data omitted: about {decoded_len} bytes decoded, looks like {kind}; full output: {}, line {line}]", path.display());
+        let origin = locations.get(&range.start);
+        let path = origin.and_then(|l| l.path.as_deref()).unwrap_or(path);
+        let line = origin.map_or(line, |l| l.line);
+        let location = if *incomplete {
+            "run cut at capture ceiling; captured output"
+        } else {
+            "full output"
+        };
+        let marker = format!("[base64 data omitted: about {decoded_len} bytes decoded, looks like {kind}; {location}: {}, line {line}]", path.display());
         let start = text.len();
         if json {
             let quoted = serde_json::to_string(&marker).expect("JSON string");
@@ -272,7 +347,7 @@ pub(crate) fn monitor_output_line(
     if blocks.is_empty() {
         return None;
     }
-    let (text, marks) = render_runs(line, &blocks, path, number, false);
+    let (text, marks) = render_runs(line, &blocks, path, number, false, &HashMap::new());
     let text = if text.len() > limit {
         retain_with_references(&text, &marks, None, limit).0
     } else {

@@ -100,6 +100,7 @@ pub(super) fn render(name: &str, output: &str, body_budget: Option<usize>) -> St
 }
 
 struct BodySpan {
+    truncated: bool,
     start: usize,
     ranges: PreviewRanges,
 }
@@ -152,6 +153,10 @@ fn render_with_spans(
         return format!("{prefix}{}{suffix}", Value::Object(fields));
     }
     let mut parts = Vec::new();
+    let truncated = [
+        fields.get("stdout_truncated") == Some(&Value::Bool(true)),
+        fields.get("stderr_truncated") == Some(&Value::Bool(true)),
+    ];
     let mut bodies = Vec::new();
     let mut span_parts = Vec::new();
     if name == "Read" {
@@ -276,6 +281,7 @@ fn render_with_spans(
         if prefix.is_empty() && parts.is_empty() && fields.is_empty() {
             if let [(0, label_len, ranges)] = span_parts.as_slice() {
                 spans[0] = Some(BodySpan {
+                    truncated: truncated[0],
                     start: 0,
                     ranges: ranges.clone(),
                 });
@@ -295,6 +301,7 @@ fn render_with_spans(
     let mut offset = prefix.len() + parts.iter().map(|part| part.len() + 1).sum::<usize>();
     for ((index, label_len, ranges), body) in span_parts.into_iter().zip(&bodies) {
         spans[index] = Some(BodySpan {
+            truncated: truncated[index],
             start: offset + label_len,
             ranges,
         });
@@ -336,14 +343,19 @@ pub(super) fn metadata_path(root: &Path, id: &str) -> std::path::PathBuf {
 pub(super) fn save_metadata(
     root: &Path,
     id: &str,
-    capture: &CommandMetadata,
+    mut capture: CommandMetadata,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let path = metadata_path(root, id);
     let dir = root.join("tool-output-metadata");
     std::fs::create_dir_all(&dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    file.write_all(&serde_json::to_vec(capture)?)?;
+    if let CommandMetadata::Shell(shell) = &mut capture {
+        if let Some((path, _)) = shell.recovery(root)? {
+            shell.source_file = Some(path);
+        }
+    }
+    file.write_all(&serde_json::to_vec(&capture)?)?;
     file.persist(path)?;
     Ok(())
 }
@@ -409,11 +421,102 @@ fn command_preview_inner(
         Some(CommandMetadata::Page { bytes, widths, .. }) => Some((bytes, widths)),
         _ => None,
     };
+    let recovery = root
+        .zip(capture)
+        .filter(|_| bash)
+        .and_then(|(root, c)| c.recovery(root).ok().flatten());
+    let streams = recovery.as_ref().zip(capture).and_then(|((_, bytes), c)| {
+        let [out, err] = c.source_ranges();
+        Some([(out.start, bytes.get(out)?), (err.start, bytes.get(err)?)])
+    });
+    let restored = streams.as_ref().zip(capture).and_then(|(streams, c)| {
+        let (prefix, json) = raw
+            .strip_prefix("Error: ")
+            .map_or(("", raw), |json| ("Error: ", json));
+        let mut input = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+        let mut value = input.next()?.ok()?;
+        for ((name, (_, bytes)), stats) in ["stdout", "stderr"]
+            .into_iter()
+            .zip(streams)
+            .zip([&c.stdout, &c.stderr])
+        {
+            let shown = value[name].as_str()?;
+            if stats.preview_digest
+                != Some(crate::tools::bash_process::StreamCapture::digest(shown))
+            {
+                return None;
+            }
+            value[name] = String::from_utf8_lossy(bytes).into_owned().into();
+            value[format!("{name}_truncated")] = stats.capture_prefix.into();
+        }
+        Some(format!("{prefix}{value}{}", &json[input.byte_offset()..]))
+    });
+    let streams = streams.filter(|_| restored.is_some());
+    let raw = restored.as_deref().unwrap_or(raw);
     let mut spans = [None, None];
     let cleaned = render_with_spans(name, raw, None, &mut spans);
     let collapsed = root
         .filter(|_| matches!(name, "Bash" | "TaskGet" | "TaskOutput"))
-        .and_then(|root| base64_preview::Collapsed::prepare(name, &cleaned, root));
+        .and_then(|root| {
+            let mut locations = std::collections::HashMap::new();
+            let blocks = (bash && spans.iter().any(Option::is_some)).then(|| {
+                let mut blocks = Vec::new();
+                for (index, span) in spans.iter().enumerate() {
+                    let Some(span) = span else { continue };
+                    let prefix = capture
+                        .is_some_and(|c| [c.stdout.capture_prefix, c.stderr.capture_prefix][index]);
+                    if span.truncated && !prefix {
+                        continue;
+                    }
+                    let body = &cleaned[span.start..span.start + span.ranges.kept()];
+                    let found = crate::tools::base64_collapse::captured_runs(body, prefix);
+                    let physical = streams
+                        .as_ref()
+                        .map(|streams| base64_preview::raw_ranges(streams[index].1, &found));
+                    let mut line = streams.as_ref().map_or(1, |streams| {
+                        if index == 1 && streams[1].0 > 0 {
+                            2 + streams[0].1.iter().filter(|&&b| b == b'\n').count()
+                        } else {
+                            1
+                        }
+                    });
+                    let mut previous = 0;
+                    for (i, mut block) in found.into_iter().enumerate() {
+                        if let (Some(ranges), Some(streams)) = (&physical, &streams) {
+                            let (offset, bytes) = streams[index];
+                            let range = &ranges[i];
+                            line += bytes[previous..range.start]
+                                .iter()
+                                .filter(|&&b| b == b'\n')
+                                .count();
+                            previous = range.end;
+                            locations.insert(
+                                span.start + block.range.start,
+                                base64_preview::Location {
+                                    path: None,
+                                    line,
+                                    range: offset + range.start..offset + range.end,
+                                },
+                            );
+                        }
+                        block.range = span.start + block.range.start..span.start + block.range.end;
+                        blocks.push(block);
+                    }
+                }
+                blocks
+            });
+            base64_preview::Collapsed::prepare_runs(
+                name,
+                &cleaned,
+                root,
+                blocks,
+                recovery
+                    .as_ref()
+                    .filter(|_| streams.is_some())
+                    .map(|(path, _)| path.as_path()),
+                locations,
+            )
+        });
     if only_collapsed && collapsed.is_none() {
         return None;
     }
@@ -1015,6 +1118,92 @@ mod tests {
             let raw = value.to_string();
             assert_eq!(command_preview("TaskGet",&raw,Some(dir.path()),None,true),raw);
         }
+    }
+
+    #[test]
+    fn base64_review_capture_classifies_before_tool_and_capture_cuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(32768);
+        for (text, ceiling, expected) in [
+            (format!("!!!{blob}Z!"), 1024 * 1024, None),
+            (
+                blob.clone(),
+                1024 * 1024,
+                Some("base64: 1 block collapsed (128 KB)"),
+            ),
+            (blob.clone(), 65536, Some("capture ceiling")),
+            (
+                format!("{}QQ==", "QUJD".repeat(256)),
+                1027,
+                Some("capture ceiling"),
+            ),
+        ] {
+            let (raw, capture) = crate::tools::bash_process::fixture_capture(
+                [text.as_bytes(), b""],
+                ceiling,
+                102400,
+                0,
+            );
+            let view = command_preview("Bash", &raw, Some(dir.path()), capture.as_ref(), true);
+            if let Some(expected) = expected {
+                assert!(view.contains(expected));
+                assert!(!view.contains("QUJDQUJD"));
+                if ceiling > text.len() {
+                    assert!(!view.contains("Omitted output:"));
+                    let path = view
+                        .split_once("full output: ")
+                        .unwrap()
+                        .1
+                        .split_once(", line ")
+                        .unwrap()
+                        .0;
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+                }
+            } else {
+                assert!(!view.contains("[base64 data omitted:"));
+            }
+        }
+    }
+
+    #[test]
+    fn base64_review_capture_preserves_raw_stream_bytes_and_terminal_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(32768);
+        let stdout = [b"\xff!\n".as_slice(), blob.as_bytes()].concat();
+        let (raw, capture) = crate::tools::bash_process::fixture_capture(
+            [&stdout, b"diagnostic"],
+            1024 * 1024,
+            102400,
+            0,
+        );
+        let row: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(row["stdout_truncated"], true);
+        assert!(row["stdout"].as_str().unwrap().contains("output truncated"));
+        let capture = capture.unwrap();
+        let live = command_preview("Bash", &raw, Some(dir.path()), Some(&capture), true);
+        let path = live
+            .split_once("full output: ")
+            .unwrap()
+            .1
+            .split_once(", line 2]")
+            .unwrap()
+            .0;
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            [stdout.as_slice(), b"\ndiagnostic"].concat()
+        );
+        save_metadata(dir.path(), "occurrence", capture).unwrap();
+        let restored = read_metadata(dir.path(), "occurrence").unwrap();
+        assert_eq!(
+            live,
+            command_preview("Bash", &raw, Some(dir.path()), Some(&restored), true)
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tool-outputs"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1625,6 +1814,9 @@ mod tests {
         let occurrence = "inv-fixture-occurrence";
         let row_id = format!("{assistant}:{occurrence}");
         let stream = |text: &str| crate::tools::bash_process::StreamCapture {
+            capture_prefix: false,
+            source: None,
+            preview_digest: None,
             bytes: text.len(),
             lines: text.lines().count(),
             first_lines: vec![0],
@@ -1635,11 +1827,12 @@ mod tests {
             ranges: std::iter::once(0..text.len()).collect(),
         };
         let capture = ShellCapture {
+            source_file: None,
             duration_ms: 314,
             stdout: stream(&stdout),
             stderr: stream("FINAL ERROR"),
         };
-        save_metadata(temp.path(), occurrence, &CommandMetadata::Shell(capture)).unwrap();
+        save_metadata(temp.path(), occurrence, CommandMetadata::Shell(capture)).unwrap();
         store
             .db
             .fixture_shard(&id, |conn| {
