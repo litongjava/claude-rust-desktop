@@ -88,6 +88,67 @@ async fn base64_model_boundary_progressive_pressure() {
     assert!(!json!(sent).to_string().contains(&payload));
 }
 #[tokio::test]
+async fn base64_review_ordinary_light_cut_matches_main() {
+    let messages = vec![
+        json!({"role":"user","content":"check results"}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"marker","type":"function","function":{"name":"Bash","arguments":"{}"}},{"id":"invalid","type":"function","function":{"name":"Bash","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"marker","content":json!({"stdout":".".repeat(4926)}).to_string()}),
+        json!({"role":"tool","tool_call_id":"invalid","content":json!({"stdout":"Q".repeat(4097)}).to_string()}),
+        json!({"role":"user","content":"continue"}),
+    ];
+    let sent = pressure_request(messages, 4841).await;
+    let result = sent.iter().find(|m| m["tool_call_id"] == "invalid").unwrap();
+    assert_eq!(result["content"], format!("{}... [truncated, 4097 bytes total]", "Q".repeat(3999)));
+}
+
+#[tokio::test]
+async fn base64_review_ordinary_progressive_budget_matches_main() {
+    let raw = json!({"stdout":format!("fn plain_symbol ()!\n{}", "normal line.\n".repeat(7000)), "stderr":"","exit_code":0}).to_string();
+    let mut messages = vec![
+        json!({"role":"user","content":"first"}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"old","type":"function","function":{"name":"Bash","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"old","content":raw}),
+    ];
+    for _ in 0..12 {
+        messages.extend([json!({"role":"user","content":"keep going"}), json!({"role":"assistant","content":"step done"})]);
+    }
+    messages.push(json!({"role":"user","content":"continue"}));
+    let sent = pressure_request(messages, 39360).await;
+    assert_eq!(sent.len(), 21);
+    assert!(sent.iter().all(|m| m["role"] != "tool"));
+    assert!(sent.iter().any(|m| m["role"] == "system" && m.to_string().contains("plain_symbol")));
+}
+
+#[tokio::test]
+async fn base64_review_ordinary_legacy_image_matches_main() {
+    let f = fixture(0).await;
+    let message = f.store.append(&f.id, "assistant", "").unwrap();
+    let id = format!("{message}:image");
+    let content = json!({"content":[{"type":"text","text":"plain ordinary line.\n".repeat(1200)},{"type":"image","mimeType":"image/png","data":PNG}]});
+    let display = f.store.db.open_session(&f.id).unwrap().save_mcp(&message, "image", &content, false).unwrap();
+    f.store.db.shard_sql(&f.id, |conn| {
+        deepseek_code_core::db::message_repo::insert_tool_call(conn, &id, &message, "mcp__example__capture", None, Some(&display), false, 0).unwrap();
+        conn.execute_batch("UPDATE tool_calls SET model_output=NULL, model_preview=NULL, model_recovery=NULL, model_search=NULL; UPDATE mcp_tool_outputs SET model_content_json=NULL").unwrap();
+    }).unwrap();
+    f.store.append(&f.id, "user", "continue").unwrap();
+    for format in [ApiFormat::Anthropic, ApiFormat::OpenAI] {
+        let history = f.store.model_history(&f.id, &format).unwrap();
+        assert!(json!(history).to_string().contains(PNG), "{format:?} replay");
+    }
+    let history = f.store.model_history(&f.id, &ApiFormat::OpenAI).unwrap();
+    let req=serde_json::from_value(json!({"conversation_id":f.id,"messages":history,"model":"gpt-6-astra","provider_id":"gateway","workspace_path":f.dir.path()})).unwrap();
+    let mut events = f.engine.send_message(req).await.unwrap();
+    while let Some(event) = events.recv().await {
+        assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");
+    }
+    let wire = f.seen.lock().unwrap().last().unwrap().to_string();
+    assert!(wire.contains(PNG));
+    assert!(!wire.contains("base64 data omitted"));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+#[tokio::test]
 async fn base64_model_boundary_returned_window_and_replay() {
     let f = fixture(7).await;
     let payload = "QUJD".repeat(256);
