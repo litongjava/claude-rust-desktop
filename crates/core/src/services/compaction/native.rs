@@ -104,8 +104,9 @@ pub(crate) async fn generate_messages_with_options(
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions, session)?;
-    let mut url = reqwest::Url::parse(provider_runtime::compact_base(provider).context("Native compaction requires the plain Responses endpoint")?)
-        .context("Native compaction requires a configured gateway URL")?;
+    let base = provider_runtime::compact_base(provider)
+        .context("Native compaction requires the plain Responses endpoint")?;
+    let mut url = reqwest::Url::parse(base).context("Native compaction requires a gateway URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
             && url.username().is_empty()

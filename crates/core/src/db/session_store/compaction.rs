@@ -346,6 +346,7 @@ impl SessionWrite<'_> {
             self.0
                 .execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
         }
+        self.clear_setting(settings::COMPACTION_PREFIX)?;
         self.0.execute("DELETE FROM compaction_checkpoint", [])?;
         Ok(message)
     }

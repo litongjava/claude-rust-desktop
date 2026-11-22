@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 pub(crate) mod checkpoint;
+pub mod microcompact;
 pub(crate) mod native;
 
 pub struct GeneratedSummary {

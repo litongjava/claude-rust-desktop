@@ -564,16 +564,30 @@ impl QueryEngine {
             )
             .await;
         }
+        let selected = shard.scoped_stores();
         let mut checkpoint = crate::services::compaction::checkpoint::Checkpoint::open(
-            &self.db_manager,
+            &selected,
             session,
             &provider,
             system,
         )?;
         checkpoint.options = options;
-        super::generation::summarize(provider, system, input, Some(&mut checkpoint))
-            .await
-            .map(Into::into)
+        let prefix = match super::compaction_prefix::load(&shard, &provider, &history) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                tracing::warn!(%error, "Could not restore the main request for compaction");
+                None
+            }
+        };
+        super::generation::summarize_with_prefix(
+            provider,
+            system,
+            input,
+            Some(&mut checkpoint),
+            prefix.map(|wire| (wire, instructions)),
+        )
+        .await
+        .map(Into::into)
     }
     pub fn new(
         provider_manager: Arc<Mutex<ProviderManager>>,

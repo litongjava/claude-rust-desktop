@@ -13,7 +13,7 @@ use std::{pin::Pin, sync::LazyLock};
 mod bedrock;
 mod cloud_auth;
 mod events;
-mod messages;
+pub(super) mod messages;
 #[cfg(test)]
 mod tests;
 

@@ -59,8 +59,16 @@ impl SuggestionCapture {
         snapshot: &Value,
         provider: &ResolvedProvider,
         options: &RequestOptions,
+        compaction: Option<&super::compaction_prefix::Capture>,
     ) {
         let mut capture = self.0.lock().unwrap();
+        if snapshot["status"] == "completed" {
+            if let (Some(origin), Some(wire)) = (compaction, capture.body.as_ref()) {
+                if let Err(error) = origin.save(wire) {
+                    tracing::warn!(%error, "Could not retain the main request for compaction");
+                }
+            }
+        }
         let cache_read = snapshot["cacheReadTokens"].as_u64().unwrap_or_default() > 0;
         if snapshot["status"] == "completed" && (cache_read || capture.automatic_cache) {
             capture.completed = Some(CompletedRequest {
@@ -306,6 +314,7 @@ mod tests {
                 &json!({"status":"completed","cacheReadTokens":cached}),
                 &provider,
                 &RequestOptions::for_session(Some("session")),
+                None,
             );
             if expired {
                 capture
@@ -409,6 +418,7 @@ mod tests {
                 &json!({"status":"completed","cacheReadTokens":0}),
                 &provider,
                 &RequestOptions::for_session(Some("session")),
+                None,
             );
             assert_eq!(
                 capture.generate(guard).await.unwrap().as_deref(),

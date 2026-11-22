@@ -1,5 +1,8 @@
-//! Bounded, tool-free generation using the same transports as interactive turns.
-use super::{anthropic_client::*, openai_client::*, provider_manager::ResolvedProvider};
+//! Bounded text generation using the same transports as interactive turns.
+use super::{
+    anthropic_client::*, followup::WireRequest, openai_client::*,
+    provider_manager::ResolvedProvider,
+};
 use crate::services::compaction::checkpoint::Checkpoint;
 use anyhow::{ensure, Context, Result};
 use std::fmt;
@@ -12,7 +15,7 @@ const FALLBACK_OUTPUT: u32 = 32_768;
 const FRAGMENT_SUMMARY_TARGET: u32 = 2048;
 /// Desired concise length of the final summary.
 const FINAL_SUMMARY_TARGET: u32 = 4096;
-/// One summary request never carries more estimated input than this, even when
+/// A fragment or merge request never carries more estimated input than this, even when
 /// the model window could hold the whole transcript. Splitting first keeps a
 /// single request affordable and its length target reachable.
 const MAX_INPUT_TOKENS: u64 = 64_000;
@@ -537,6 +540,19 @@ fn log_request(
     );
 }
 
+struct WholeRequest {
+    planner_text: String,
+    wire: WireRequest,
+    estimated_tokens: u64,
+    checkpoint_key: String,
+}
+
+/// The full conversation fit as a cacheable request, but recovery needs the
+/// smaller inputs of the segmented planner.
+#[derive(Debug, thiserror::Error)]
+#[error("Full-history request needs segmented summary recovery")]
+struct NeedsFragments;
+
 /// Bounded recovery for one compaction: a saved result is reused before any
 /// recovery budget is spent, and an unrecoverable request fails loudly.
 struct Summarizer<'a, 'b> {
@@ -555,6 +571,9 @@ struct Summarizer<'a, 'b> {
     /// Completed requests answered from the checkpoint in this compaction.
     reused: usize,
     checkpoint: Option<&'a mut Checkpoint<'b>>,
+    // Only the complete-history request uses this body. Split and merge nodes
+    // must consume their own reduced input.
+    whole_request: Option<WholeRequest>,
 }
 
 impl<'a, 'b> Summarizer<'a, 'b> {
@@ -575,10 +594,17 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         format!("{}{body}", self.targets.prompt(stage))
     }
 
-    /// Every request, including a merge built from recovered child summaries,
-    /// obeys both the window safety line and the single-request input ceiling.
+    fn whole_request(&self, text: &str) -> Option<&WholeRequest> {
+        self.whole_request
+            .as_ref()
+            .filter(|r| r.planner_text == text)
+    }
+
     fn text_fits(&self, text: &str, output: u32) -> bool {
-        input_tokens(self.system, text) <= self.input_budget(output).min(MAX_INPUT_TOKENS)
+        if let Some(request) = self.whole_request(text) {
+            return request.estimated_tokens <= self.input_budget(output);
+        }
+        input_tokens(self.system, text) <= self.planning_limit(output)
     }
 
     /// Count a checkpoint hit and name it in the progress line. The saved
@@ -603,10 +629,17 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         }
     }
 
+    fn request_key(&self, text: &str, output: u32) -> String {
+        if let Some(request) = self.whole_request(text) {
+            return request.checkpoint_key.clone();
+        }
+        Checkpoint::request_key(self.system, text, output)
+    }
+
     fn cached(&self, text: &str, output: u32) -> Option<String> {
         self.checkpoint
             .as_deref()
-            .and_then(|cache| cache.get(&Checkpoint::request_key(self.system, text, output)))
+            .and_then(|cache| cache.get(&self.request_key(text, output)))
     }
 
     fn session(&self) -> Option<String> {
@@ -654,7 +687,7 @@ impl<'a, 'b> Summarizer<'a, 'b> {
     }
 
     async fn attempt(&mut self, text: &str, output: u32, label: &str) -> Result<String> {
-        let key = Checkpoint::request_key(self.system, text, output);
+        let key = self.request_key(text, output);
         if let Some(saved) = self.cached(text, output) {
             self.reuse(label, output);
             return Ok(saved);
@@ -667,23 +700,32 @@ impl<'a, 'b> Summarizer<'a, 'b> {
             )
         });
         self.last_budget = output;
-        let summary = generate_request(
-            self.provider.clone(),
-            self.system,
-            text,
-            output,
-            false,
-            Some(label),
-            self.budget_source,
-            self.checkpoint
-                .as_ref()
-                .map(|c| c.options.clone())
-                .unwrap_or_else(|| {
-                    super::request_options::RequestOptions::for_session(session.as_deref())
-                })
-                .compaction(label),
-        )
-        .await?;
+        let options = self
+            .checkpoint
+            .as_ref()
+            .map(|c| c.options.clone())
+            .unwrap_or_else(|| {
+                super::request_options::RequestOptions::for_session(session.as_deref())
+            })
+            .compaction(label);
+        let summary = match self.whole_request(text) {
+            Some(request) => {
+                generate_followup(&self.provider, request.wire.clone(), output, options).await?
+            }
+            None => {
+                generate_request(
+                    self.provider.clone(),
+                    self.system,
+                    text,
+                    output,
+                    false,
+                    Some(label),
+                    self.budget_source,
+                    options,
+                )
+                .await?
+            }
+        };
         // Only a complete, validated summary reaches the cache.
         if let Some(cache) = self.checkpoint.as_deref_mut() {
             cache.save(key, summary.clone())?;
@@ -744,7 +786,7 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         output: u32,
         summary: &str,
     ) -> Result<()> {
-        let key = Checkpoint::request_key(self.system, &self.text(stage, body), output);
+        let key = self.request_key(&self.text(stage, body), output);
         if let Some(cache) = self.checkpoint.as_deref_mut() {
             if cache.get(&key).is_none() {
                 cache.save(key, summary.to_owned())?;
@@ -769,7 +811,10 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         match self.attempt(&text, output, label).await {
             Ok(summary) => Ok(summary),
             Err(error) => {
-                if error.is::<Truncated>() {
+                let context_limit = self.whole_request(&text).is_some()
+                    && crate::performance::classify(&error)
+                        == crate::performance::ErrorClass::ContextLimit;
+                if error.is::<Truncated>() || context_limit {
                     self.recover(stage, body, output, label, depth, quota).await
                 } else if let Some(invalid) = invalid_result(&error) {
                     self.recover_invalid(stage, body, invalid, output, label, depth, quota)
@@ -870,6 +915,14 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         quota: &mut Quota,
         unusable: Option<InvalidSummary>,
     ) -> Result<String> {
+        if depth == 0 && self.whole_request.is_some() {
+            let text = self.text(stage, body);
+            if self.whole_request(&text).is_some()
+                && input_tokens(self.system, &text) > self.planning_limit(output)
+            {
+                return Err(NeedsFragments.into());
+            }
+        }
         if depth < MAX_SPLIT_DEPTH {
             if let Some((first, second)) = split_in_half(self.system, body) {
                 let fits = |part: &str| self.text_fits(&self.text(stage, part), output);
@@ -1028,10 +1081,20 @@ fn summarize_failure(count: usize, failures: &[(usize, anyhow::Error)]) -> anyho
 /// layers, then write one final summary. No intermediate output becomes active
 /// history; dropping the future cancels the request.
 pub(crate) async fn summarize(
+    provider: ResolvedProvider,
+    system: &str,
+    input: &str,
+    checkpoint: Option<&mut Checkpoint<'_>>,
+) -> Result<String> {
+    summarize_with_prefix(provider, system, input, checkpoint, None).await
+}
+
+pub(super) async fn summarize_with_prefix(
     mut provider: ResolvedProvider,
     system: &str,
     input: &str,
     mut checkpoint: Option<&mut Checkpoint<'_>>,
+    prefix: Option<(WireRequest, &str)>,
 ) -> Result<String> {
     let window = provider.model.context_window.unwrap_or_else(|| {
         super::token_counter::TokenCounter::get_model_context_limit(&provider.model.id) as u32
@@ -1051,6 +1114,29 @@ pub(crate) async fn summarize(
         fragment_output.max(final_output)
     );
     let targets = Targets::new(fragment_output, final_output);
+    let whole_request = if let Some((mut wire, focus)) = prefix {
+        let prompt = targets.prompt(Stage::Final);
+        wire.append_instruction(&format!(
+            "{system}\n\n{prompt}Summary focus requested by the user:\n{focus}"
+        ))?;
+        wire.set_output_budget(final_output);
+        let estimate = super::request_context::ContextUsage::from_body(
+            &wire.api,
+            &wire.body,
+            Some(window),
+            final_output,
+        )
+        .text_subtotal();
+        let key = Checkpoint::request_key(&wire.api, &wire.body.to_string(), final_output);
+        Some(WholeRequest {
+            planner_text: format!("{prompt}{input}"),
+            wire,
+            estimated_tokens: estimate,
+            checkpoint_key: key,
+        })
+    } else {
+        None
+    };
     let mut summarizer = Summarizer {
         provider,
         system,
@@ -1061,12 +1147,13 @@ pub(crate) async fn summarize(
         merge_pool: None,
         reused: 0,
         checkpoint: checkpoint.as_deref_mut(),
+        whole_request,
     };
     let final_limit = summarizer.input_budget(final_output).min(MAX_INPUT_TOKENS);
     // A history that fits one final summary is summarized in one request.
-    if input_tokens(system, &summarizer.text(Stage::Final, input)) <= final_limit {
+    if summarizer.text_fits(&summarizer.text(Stage::Final, input), final_output) {
         let mut quota = Quota::new(MAX_SEGMENT_RECOVERIES);
-        let summary = summarizer
+        let result = summarizer
             .request(
                 Stage::Final,
                 input,
@@ -1075,17 +1162,27 @@ pub(crate) async fn summarize(
                 0,
                 &mut quota,
             )
-            .await
-            .context("Final compaction summary failed; completed fragments retained for retry")?;
-        tracing::info!(
-            module = "Compaction",
-            fragments = 1,
-            reused = summarizer.reused,
-            recoveries = quota.used,
-            "Compaction completed in a single summary"
-        );
-        return Ok(summary);
+            .await;
+        match result {
+            Ok(summary) => {
+                tracing::info!(
+                    module = "Compaction",
+                    fragments = 1,
+                    reused = summarizer.reused,
+                    recoveries = quota.used,
+                    "Compaction completed in a single summary"
+                );
+                return Ok(summary);
+            }
+            Err(error) if error.is::<NeedsFragments>() => {}
+            Err(error) => {
+                return Err(error).context(
+                    "Final compaction summary failed; completed fragments retained for retry",
+                )
+            }
+        }
     }
+    summarizer.whole_request = None;
     let fragment_limit = summarizer.planning_limit(fragment_output);
     let prompt = summarizer.targets.prompt(Stage::Fragment);
     let parts = fragments(system, &prompt, input, fragment_limit)
@@ -1227,6 +1324,80 @@ pub(crate) async fn summarize(
     Ok(summary)
 }
 
+async fn generate_followup(
+    provider: &ResolvedProvider,
+    wire: WireRequest,
+    output: u32,
+    mut options: super::request_options::RequestOptions,
+) -> Result<String> {
+    use futures::StreamExt;
+    let direct_anthropic = wire.direct_anthropic();
+    let mut metrics =
+        super::compaction_metrics::CompactionMetrics::start(&mut options, provider, &wire.api)?;
+    let mut stream = wire.stream(provider, options).await?;
+    let mut trace = super::request_trace::RequestTrace::new(serde_json::json!({}));
+    let mut pending = String::new();
+    while let Some(chunk) = stream.next().await {
+        pending.push_str(&chunk?);
+        let frames = crate::streaming::sse_parser::consume_sse_payloads(&pending);
+        pending = frames.remainder;
+        for frame in frames.payloads {
+            if frame == "[DONE]" {
+                trace.mark_completed();
+            } else {
+                let event = serde_json::from_str(&frame)?;
+                if direct_anthropic {
+                    trace.observe_anthropic(&event);
+                } else {
+                    trace.observe_openai(&event);
+                }
+                if event.get("usage").is_some() || event["message"].get("usage").is_some() {
+                    if let Some(metrics) = &mut metrics {
+                        metrics.observe_usage(trace.usage());
+                    }
+                }
+            }
+        }
+    }
+    ensure!(pending.trim().is_empty(), "Incomplete summary SSE frame");
+    let snapshot = trace.finish("completed", None);
+    let reason = snapshot["finishReason"].as_str().unwrap_or_default();
+    if let Some(metrics) = metrics {
+        metrics.finish(
+            &snapshot["usage"],
+            reason,
+            snapshot["status"].as_str().unwrap_or("incomplete"),
+        )?;
+    }
+    if snapshot["status"] == "incomplete" && matches!(reason, "length" | "max_tokens") {
+        return Err(anyhow::Error::new(Truncated { budget: output }));
+    }
+    ensure!(
+        snapshot["status"] == "completed"
+            && matches!(
+                reason,
+                "stop" | "end_turn" | "stop_sequence" | "tool_calls" | "tool_use"
+            ),
+        "Summary request failed: {}",
+        snapshot["error"].as_str().unwrap_or(reason)
+    );
+    let text = snapshot["responseBlocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    validate_result(
+        text,
+        output,
+        reason.to_owned(),
+        snapshot["outputTokens"]
+            .as_u64()
+            .and_then(|n| n.try_into().ok()),
+    )
+}
+
 async fn generate_request(
     provider: ResolvedProvider,
     system: &str,
@@ -1341,11 +1512,12 @@ async fn generate_request(
             );
             match finish.as_str() {
                 "stop" => {}
+                "tool_calls" if options.compact => {}
                 "length" => return Err(anyhow::Error::new(Truncated { budget: max_tokens })),
                 other => anyhow::bail!("Generation did not finish normally: {other:?}"),
             }
             ensure!(
-                choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty),
+                options.compact || choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty),
                 "Unexpected tool request"
             );
             let text = match choice.message.content {
@@ -1395,6 +1567,7 @@ async fn generate_request(
             );
             match finish.as_str() {
                 "end_turn" | "stop_sequence" => {}
+                "tool_use" if options.compact => {}
                 "max_tokens" => return Err(anyhow::Error::new(Truncated { budget: max_tokens })),
                 other => anyhow::bail!("Generation did not finish normally: {other:?}"),
             }
@@ -1402,7 +1575,9 @@ async fn generate_request(
             for block in response.content {
                 match block {
                     ContentBlock::Text { text: part } => text.push_str(&part),
-                    ContentBlock::ToolUse { .. } => anyhow::bail!("Unexpected tool request"),
+                    ContentBlock::ToolUse { .. } if !options.compact => {
+                        anyhow::bail!("Unexpected tool request")
+                    }
                     _ => {}
                 }
             }
@@ -1544,6 +1719,7 @@ mod tests {
             merge_pool: None,
             reused: 0,
             checkpoint: None,
+            whole_request: None,
         }
     }
 

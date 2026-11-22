@@ -743,8 +743,11 @@ pub async fn context_status(session: &Session) -> Option<String> {
 }
 
 const MICROCOMPACT_KEEP_RECENT: usize = 10;
-const MICROCOMPACT_MIN_CHARS: usize = 1000;
-const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared to save context]";
+use deepseek_code_core::services::compaction::microcompact::clear_tool_results;
+#[cfg(test)]
+use deepseek_code_core::services::compaction::microcompact::{
+    CLEARED_TOOL_RESULT, MICROCOMPACT_MIN_CHARS,
+};
 
 /// Microcompact moves its line forward only once the request passes half the
 /// window, so between moves every request shares the same prefix and cache.
@@ -752,26 +755,6 @@ fn microcompact_through(current: usize, len: usize, estimated_tokens: usize, win
     match window.filter(|window| *window > 0) {
         Some(window) if estimated_tokens > window as usize / 2 => current.max(len.saturating_sub(MICROCOMPACT_KEEP_RECENT)),
         _ => current,
-    }
-}
-
-/// Replaces large tool results in `messages` with a short placeholder, in
-/// either provider's history format.
-fn clear_tool_results(messages: &mut [Value]) {
-    let large = |content: &Value| match content {
-        Value::String(text) => text.len() > MICROCOMPACT_MIN_CHARS,
-        Value::Array(blocks) => blocks.iter().filter_map(|block| block["text"].as_str()).map(str::len).sum::<usize>() > MICROCOMPACT_MIN_CHARS || blocks.iter().any(|block| block["type"] == "image"),
-        _ => false,
-    };
-    for message in messages {
-        if message["role"] == "tool" && large(&message["content"]) {
-            message["content"] = json!(CLEARED_TOOL_RESULT);
-        }
-        if let Some(blocks) = message["content"].as_array_mut() {
-            for block in blocks.iter_mut().filter(|block| block["type"] == "tool_result") {
-                if large(&block["content"]) { block["content"] = json!(CLEARED_TOOL_RESULT); }
-            }
-        }
     }
 }
 

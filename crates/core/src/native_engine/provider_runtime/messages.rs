@@ -40,7 +40,7 @@ fn parts(content: &OpenAIContent, api: &str, assistant: bool) -> Result<Vec<Valu
     })).collect()
 }
 
-pub(super) fn request(
+pub(in crate::native_engine) fn request(
     api: &str,
     provider: &ResolvedProvider,
     metadata: &Value,

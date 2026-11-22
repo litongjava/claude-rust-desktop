@@ -121,7 +121,7 @@ mod tool_loading_tests;
 mod tool_loading_restore_tests;
 
 #[path = "multimodal.rs"]
-mod multimodal;
+pub(super) mod multimodal;
 #[path = "provider_transcript.rs"]
 mod provider_transcript;
 #[cfg(test)]
@@ -275,6 +275,9 @@ pub struct ToolLoopExecutor {
     /// Selected model including a virtual context suffix omitted from the wire ID.
     pub(super) model_selector: String,
     pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
+    compaction_source: Option<super::compaction_prefix::Source>,
+    // The wire uses the provider call ID. Session replay uses the invocation ID.
+    last_completed_tool: Option<(String, String)>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
@@ -1608,6 +1611,8 @@ impl ToolLoopExecutor {
             local_goal_frontend: false,
             context_usage: None,
             suggestion: None,
+            compaction_source: None,
+            last_completed_tool: None,
             auto_history: messages.clone(),
             model_selector: provider.model.id.clone(),
             provider,
@@ -2981,6 +2986,42 @@ impl ToolLoopExecutor {
         self
     }
 
+    fn capture_followup(
+        &self,
+        trace: &mut RequestTrace,
+        iteration: usize,
+        last_provider_id: Option<&str>,
+    ) -> (
+        super::request_context::ContextCapture,
+        Option<super::compaction_prefix::Capture>,
+    ) {
+        use super::compaction_prefix::{route, Capture};
+        let last_tool = self
+            .last_completed_tool
+            .as_ref()
+            .filter(|(provider_id, _)| Some(provider_id.as_str()) == last_provider_id)
+            .map(|(_, invocation)| invocation.clone());
+        let origin = match (&self.executor_history, &self.compaction_source) {
+            (Some(ExecutorHistory::Session(session)), Some(source))
+                if iteration == 0 || last_tool.is_some() =>
+            {
+                Some(Capture {
+                    session: session.clone(),
+                    source: source.clone(),
+                    route: route(&self.provider),
+                    last_tool: last_tool.filter(|_| iteration > 0),
+                })
+            }
+            _ => None,
+        };
+        let mut context = trace.capture_context(self.event_tx.clone());
+        context.suggestion = self
+            .suggestion
+            .clone()
+            .or_else(|| origin.as_ref().map(|_| Default::default()));
+        (context, origin)
+    }
+
     pub fn with_context_reminders(mut self, reminders: Vec<String>) -> Self {
         self.context_reminders = reminders;
         self
@@ -3796,6 +3837,11 @@ impl ToolLoopExecutor {
                 self.execution_lease=history.execution_lease()?.map(std::sync::Arc::new);
             }
         }
+        if matches!(self.executor_history, Some(ExecutorHistory::Session(_)))
+            && !crate::services::compaction::native::supports(&self.provider)
+        {
+            self.compaction_source = Some(super::compaction_prefix::Source::new(&self.messages));
+        }
         let mut async_hook_guard = crate::services::async_hooks::TurnGuard(self.conv_id.clone());
         if self.require_hook_wake {
             let root = self
@@ -3823,6 +3869,7 @@ impl ToolLoopExecutor {
         self.approved_call = None;
         if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
             self.messages = vec![json!({"role":"user","content":content})];
+            self.compaction_source = Some(super::compaction_prefix::Source::new(&self.messages));
             // The reset transcript was built from this boundary, so later
             // requests must report it rather than any newer stored boundary.
             self.context_boundary_id = Some(boundary_id.clone());
@@ -5480,8 +5527,16 @@ impl ToolLoopExecutor {
             // Real HTTP attempts observed by the send layer, so a clean
             // end-of-stream still reports a count instead of "unknown".
             let http_attempts: crate::performance::AttemptCounter;
-            let mut context_capture = request_trace.capture_context(self.event_tx.clone());
-            context_capture.suggestion = self.suggestion.clone();
+            let last_tool = conversation_messages.last().and_then(|m| match &m.content {
+                AnthropicContent::Blocks(blocks) => blocks.iter().rev().find_map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            });
+            let (context_capture, compaction_capture) =
+                self.capture_followup(&mut request_trace, iteration, last_tool);
+
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5843,11 +5898,12 @@ impl ToolLoopExecutor {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
             }
-            if let Some(capture) = &self.suggestion {
+            if let Some(capture) = &context_capture.suggestion {
                 capture.finish(
                     &snapshot,
                     &self.provider,
                     &self.anthropic_client.request_options,
+                    compaction_capture.as_ref(),
                 );
             }
             let response_status = snapshot["status"]
@@ -5979,10 +6035,15 @@ impl ToolLoopExecutor {
                     role: "user".to_string(),
                     content: AnthropicContent::Blocks(tool_results),
                 });
+                self.last_completed_tool = pending_tool_calls
+                    .last()
+                    .map(|call| (call.provider_id.clone(), call.id.clone()));
                 after_tool_results = true;
                 if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
+                    self.compaction_source =
+                        Some(super::compaction_prefix::Source::new(&self.messages));
                     self.context_boundary_id = Some(boundary_id.clone());
                     self.applied_compaction = true;
                     conversation_messages = vec![AnthropicMessage {
@@ -6330,8 +6391,12 @@ impl ToolLoopExecutor {
                 // Real HTTP attempts observed by the send layer, so a clean
                 // end-of-stream still reports a count instead of "unknown".
                 let http_attempts: crate::performance::AttemptCounter;
-                let mut context_capture = request_trace.capture_context(self.event_tx.clone());
-                context_capture.suggestion = self.suggestion.clone();
+                let last_tool = conversation_messages
+                    .last()
+                    .and_then(|m| m.tool_call_id.as_deref());
+                let (context_capture, compaction_capture) =
+                    self.capture_followup(&mut request_trace, iteration, last_tool);
+
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6734,11 +6799,12 @@ impl ToolLoopExecutor {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
                 }
-                if let Some(capture) = &self.suggestion {
+                if let Some(capture) = &context_capture.suggestion {
                     capture.finish(
                         &snapshot,
                         &self.provider,
                         &self.openai_client.request_options,
+                        compaction_capture.as_ref(),
                     );
                 }
                 let response_status = snapshot["status"]
@@ -6938,10 +7004,15 @@ impl ToolLoopExecutor {
                         provider_content: None,
                     });
                 }
+                self.last_completed_tool = pending_tool_calls
+                    .last()
+                    .map(|call| (call.provider_id.clone(), call.id.clone()));
                 after_tool_results = true;
                 if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
                     after_tool_results = false;
                     self.messages = vec![json!({"role":"user","content":content})];
+                    self.compaction_source =
+                        Some(super::compaction_prefix::Source::new(&self.messages));
                     self.context_boundary_id = Some(boundary_id.clone());
                     self.applied_compaction = true;
                     conversation_messages = vec![OpenAIMessage {

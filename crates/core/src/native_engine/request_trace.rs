@@ -120,6 +120,10 @@ impl RequestTrace {
         self.first_content_ms.is_some()
     }
 
+    pub(super) fn usage(&self) -> &Value {
+        &self.usage
+    }
+
     fn merge_usage(&mut self, usage: &Value) {
         fn update(current: &mut Value, reported: &Value) {
             if let Some(fields) = reported.as_object() {
