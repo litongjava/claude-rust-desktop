@@ -462,6 +462,7 @@ fn base64_model_boundary_consumers_use_model_rows() {
         "services/compaction.rs",
         "services/compaction",
         "tools/context_search.rs",
+        "super_agent/review.rs",
         "db/context_search_repo.rs",
         "memory/mod.rs",
     ] {
@@ -492,6 +493,11 @@ fn base64_model_boundary_consumers_use_model_rows() {
     }
     // Mixed-purpose modules also contain legitimate display/export readers.
     for (file, start, end) in [
+        (
+            "db/session_store/child_reader.rs",
+            "pub(crate) fn review_messages(",
+            "impl Stores",
+        ),
         (
             "runtime.rs",
             "pub(crate) fn replay_history(",
