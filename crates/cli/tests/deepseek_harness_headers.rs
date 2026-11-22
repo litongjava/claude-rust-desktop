@@ -27,7 +27,11 @@ async fn respond(
     let compact = body
         .to_string()
         .contains("Write one continuation summary of the conversation above");
-    state.requests.lock().unwrap().push((headers, body));
+    let first = {
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((headers, body));
+        requests.len() == 1
+    };
     if !compact && std::mem::take(&mut *state.recover.lock().unwrap()) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{
             "type":"invalid_request_error", "code":"context_length_exceeded", "message":"prompt is too long"
@@ -38,7 +42,23 @@ async fn respond(
     } else {
         "HEADER_NORMAL_REPLY"
     };
-    let events = if state.api == "anthropic" {
+    let events = if first {
+        let args = json!({"file_path":"fixture.txt"}).to_string();
+        if state.api == "anthropic" {
+            vec![
+                json!({"type":"message_start","message":{"id":"read","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"read-1","name":"Read","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":args}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+                json!({"type":"message_stop"}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"read-1","type":"function","function":{"name":"Read","arguments":args}}]},"finish_reason":"tool_calls"}]}),
+            ]
+        }
+    } else if state.api == "anthropic" {
         vec![
             json!({"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"fixture-model","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
@@ -146,28 +166,33 @@ async fn scenario(api: &'static str) {
         "models":[{"id":"fixture-model","name":"fixture","enabled":true,"context_window":128000,"max_tokens":4096,
             "supports_web_search":false,"supports_vision":false,"api":if api == "anthropic" {"anthropic-messages"} else {"openai-completions"}}]
     }]).to_string()).unwrap();
+    std::fs::write(root.path().join("fixture.txt"), "HEADER_FILE_CONTENTS").unwrap();
     run_cli(&paths, root.path(), &id, "ordinary header check").await;
     {
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].1["messages"]
+            .to_string()
+            .contains("HEADER_FILE_CONTENTS"));
         assert_eq!(requests[0].0["x-deepseek-harness-session-id"], database_id);
         assert!(!requests[0].0.contains_key("x-deepseek-harness-compact"));
     }
     *state.recover.lock().unwrap() = true;
     run_cli(&paths, root.path(), &id, "continue with context recovery").await;
     server.abort();
+    let _ = server.await;
     let requests = state.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        4,
-        "normal, overflow, summary, resumed normal"
+        5,
+        "main call, main answer, overflow, summary, resumed normal"
     );
     for (index, (headers, body)) in requests.iter().enumerate() {
         assert_eq!(headers["x-deepseek-harness-session-id"], database_id);
         let compact = body
             .to_string()
             .contains("Write one continuation summary of the conversation above");
-        assert_eq!(compact, index == 2);
+        assert_eq!(compact, index == 3);
         assert_eq!(
             headers
                 .get("x-deepseek-harness-compact")
@@ -175,7 +200,25 @@ async fn scenario(api: &'static str) {
             compact.then_some("1")
         );
     }
-    assert!(requests[3].1.to_string().contains("HEADER_COMPACT_SUMMARY"));
+    let mut summary_body = requests[3].1.clone();
+    let instruction = summary_body["messages"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(instruction["role"], "user");
+    assert!(instruction.to_string().contains("Return only the summary"));
+    assert!(!summary_body["tools"].as_array().unwrap().is_empty());
+    let answer = summary_body["messages"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(answer["role"], "assistant");
+    assert!(answer.to_string().contains("HEADER_NORMAL_REPLY"));
+    assert_eq!(summary_body, requests[1].1, "last completed main prefix");
+    assert_eq!(requests[3].0["x-dcl-request-kind"], "compaction");
+    assert!(requests[4].1.to_string().contains("HEADER_COMPACT_SUMMARY"));
     assert!(store
         .history(&id)
         .unwrap()
@@ -189,9 +232,9 @@ async fn scenario(api: &'static str) {
         .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
         .collect();
     records.sort_by_key(|r| r["sequence"].as_u64().unwrap());
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[2]["purpose"], "compaction");
-    assert!(records[2]["compaction_stage"].is_string());
+    assert_eq!(records.len(), 5);
+    assert_eq!(records[3]["purpose"], "compaction");
+    assert!(records[3]["compaction_stage"].is_string());
     for record in records.iter().filter(|r| r["purpose"] == "main") {
         let trace = record["model_request_id"]
             .as_str()
@@ -216,7 +259,7 @@ async fn scenario(api: &'static str) {
     assert_eq!(compact["summary"], "HEADER_COMPACT_SUMMARY");
     assert_eq!(
         compact["request_sequences"],
-        json!([records[2]["sequence"]])
+        json!([records[3]["sequence"]])
     );
     assert!(compact["before_estimated_tokens"].as_u64().unwrap() > 0);
     assert!(compact["before_messages"].is_array());
