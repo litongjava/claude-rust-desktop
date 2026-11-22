@@ -515,6 +515,14 @@ fn command_preview_inner(
                     .filter(|_| streams.is_some())
                     .map(|(path, _)| path.as_path()),
                 locations,
+                match metadata {
+                    Some(CommandMetadata::Page { sources, .. }) => Some(sources),
+                    _ => None,
+                },
+                match metadata {
+                    Some(CommandMetadata::ShellSnapshot { cuts, .. }) => *cuts,
+                    _ => [false; 2],
+                },
             )
         });
     if only_collapsed && collapsed.is_none() {
@@ -853,7 +861,7 @@ fn project_alias(
     managed: bool,
     out: &mut Vec<Range<usize>>,
 ) {
-    let mut project = |at: usize, source: Range<usize>| {
+    alias_parts(name, stream, alias, managed, |at, source| {
         for r in kept {
             let start = r.start.max(at);
             let end = r.end.min(at + source.len());
@@ -861,7 +869,19 @@ fn project_alias(
                 out.push(source.start + (start - at)..source.start + (end - at));
             }
         }
-    };
+    });
+}
+
+fn alias_parts(
+    name: &str,
+    stream: &str,
+    alias: &str,
+    managed: bool,
+    mut project: impl FnMut(usize, Range<usize>),
+) {
+    if stream.is_empty() {
+        return;
+    }
     if alias.contains(stream) {
         for (at, _) in alias.match_indices(stream) {
             project(at, 0..stream.len());
@@ -871,20 +891,7 @@ fn project_alias(
     if !managed {
         return;
     }
-    let label = if name == "stdout" {
-        "Output:\n"
-    } else {
-        "Stderr:\n"
-    };
-    let body = match alias.split_once(label) {
-        Some((_, s)) => s,
-        None => alias,
-    };
-    let body = if name == "stdout" {
-        body.split_once("\nStderr:\n").map_or(body, |(s, _)| s)
-    } else {
-        body
-    };
+    let body = alias_body(name, alias);
     let at = body.as_ptr() as usize - alias.as_ptr() as usize;
     // An alias may have been clipped before TaskGet read its log. Its prefix
     // and suffix have known origins only when the source bytes agree.
@@ -904,6 +911,23 @@ fn project_alias(
                 }
             }
         }
+    }
+}
+
+fn alias_body<'a>(name: &str, alias: &'a str) -> &'a str {
+    let label = if name == "stdout" {
+        "Output:\n"
+    } else {
+        "Stderr:\n"
+    };
+    let body = match alias.split_once(label) {
+        Some((_, s)) => s,
+        None => alias,
+    };
+    if name == "stdout" {
+        body.split_once("\nStderr:\n").map_or(body, |(s, _)| s)
+    } else {
+        body
     }
 }
 
@@ -1204,6 +1228,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn base64_review_clipped_aliases_reference_distinct_physical_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "QUJD".repeat(32768);
+        let stdout = format!("{blob}\n{blob}");
+        let alias = preview_with_ranges(&stdout, 102400).0;
+        let raw = serde_json::to_string_pretty(&json!({
+            "stdout":stdout,"output":alias,"result":alias,"metadata":{"managed_shell":true}
+        }))
+        .unwrap();
+        let view = command_preview("TaskGet", &raw, Some(dir.path()), None, true);
+        assert!(!view.contains("QUJD"));
+        assert!(view.contains("base64: 2 blocks collapsed (256 KB)"));
+        let stdout_line = raw
+            .lines()
+            .position(|line| line.contains("\"stdout\""))
+            .unwrap()
+            + 1;
+        assert_eq!(view.matches(&format!(", line {stdout_line}]")).count(), 6);
+    }
+
+    #[test]
+    fn base64_review_shell_snapshot_discloses_a_cut_at_the_capture_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = format!("{}Q", "QUJD".repeat(1024));
+        let alias = preview_with_ranges(&format!("{blob}!!!\n"), 2048).0;
+        let raw =
+            json!({"stdout":blob,"output":alias,"result":alias,"metadata":{"managed_shell":true}})
+                .to_string();
+        let metadata = CommandMetadata::ShellSnapshot {
+            streams: Default::default(),
+            cuts: [true, false],
+        };
+        let view = command_preview("TaskGet", &raw, Some(dir.path()), Some(&metadata), false);
+        assert!(view.contains("run cut at capture ceiling"));
+        assert!(view.contains("base64: 1 block collapsed (4097 bytes)"));
+        assert!(!view.contains("QUJDQUJD"));
     }
 
     #[test]

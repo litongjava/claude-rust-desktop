@@ -31,6 +31,13 @@ static ALPHABET: [bool; 256] = {
     table
 };
 
+/// The retained tail of a capture can start in the middle of a quartet.
+pub(crate) fn leading_fragment(text: &str) -> usize {
+    text.bytes()
+        .take_while(|&b| ALPHABET[b as usize] || b == b'=')
+        .count()
+}
+
 fn engine(url_safe: bool) -> GeneralPurpose {
     GeneralPurpose::new(
         if url_safe {

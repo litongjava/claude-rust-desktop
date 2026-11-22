@@ -13,12 +13,8 @@ pub(super) struct Collapsed {
 }
 
 /// Map decoded string offsets back into the JSON source kept in the spill.
-fn field_runs(original: &str, field: &RawValue, counts: &mut HashMap<String, usize>) -> Vec<Run> {
+fn encode_ranges(original: &str, field: &RawValue, text: &str, blocks: &mut [Run]) {
     let encoded = field.get();
-    let Ok(text) = serde_json::from_str::<String>(encoded) else {
-        return Vec::new();
-    };
-    let mut blocks = runs(&text);
     let mut pos = 1;
     let mut decoded = 0;
     let start = encoded.as_ptr() as usize - original.as_ptr() as usize;
@@ -29,13 +25,9 @@ fn field_runs(original: &str, field: &RawValue, counts: &mut HashMap<String, usi
         decoded = end;
         start + pos
     };
-    for run in &mut blocks {
-        *counts
-            .entry(text[run.range.clone()].to_owned())
-            .or_default() += 1;
-        run.range = advance(run.range.start)..advance(run.range.end);
+    for block in blocks {
+        block.range = advance(block.range.start)..advance(block.range.end);
     }
-    blocks
 }
 
 #[derive(Clone)]
@@ -79,7 +71,9 @@ struct Blocks {
     json_end: Option<usize>,
 }
 
-fn task_blocks(original: &str) -> Option<Blocks> {
+type PageSources = [Option<crate::tools::bash_process::PageSource>; 2];
+
+fn task_blocks(original: &str, pages: Option<&PageSources>, cuts: [bool; 2]) -> Option<Blocks> {
     let json = original.strip_prefix("Error: ").unwrap_or(original);
     let mut objects =
         serde_json::Deserializer::from_str(json).into_iter::<HashMap<String, &RawValue>>();
@@ -88,30 +82,194 @@ fn task_blocks(original: &str) -> Option<Blocks> {
     if metadata["managed_shell"] != true && metadata["monitor"] != true {
         return None;
     }
-    let mut runs = Vec::new();
-    let mut counts = HashMap::new();
-    // A snapshot can repeat stdout and stderr in output and result. Count
-    // physical streams together and take the maximum across those aliases.
-    for keys in [&["stdout", "stderr"][..], &["output"], &["result"]] {
-        let mut group = HashMap::new();
-        for field in keys.iter().filter_map(|&k| fields.get(k)) {
-            runs.extend(field_runs(original, field, &mut group));
-        }
-        for (blob, n) in group {
-            let count = counts.entry(blob).or_insert(0usize);
-            *count = (*count).max(n);
-        }
-    }
-    runs.sort_unstable_by_key(|b| b.range.start);
-    let count = counts.values().sum();
-    let bytes = counts.iter().map(|(blob, n)| blob.len() * n).sum();
-    Some(Blocks {
+    let field = |key: &str| {
+        let raw = *fields.get(key)?;
+        Some((raw, serde_json::from_str::<String>(raw.get()).ok()?))
+    };
+    let mut result = Blocks {
+        runs: Vec::new(),
         locations: HashMap::new(),
-        runs,
-        count,
-        bytes,
+        count: 0,
+        bytes: 0,
         json_end: Some(original.len() - json.len() + objects.byte_offset()),
-    })
+    };
+    let page = fields
+        .get("output_mode")
+        .is_some_and(|v| v.get() == r#""page""#);
+    let newlines: Vec<_> = original.match_indices('\n').map(|(i, _)| i).collect();
+    let mut aliases: HashMap<&str, Vec<(Run, Location)>> = HashMap::new();
+    let keys = if ["stdout", "stderr"].iter().any(|k| {
+        fields
+            .get(*k)
+            .is_some_and(|v| v.get().starts_with('"') && v.get().len() > 2)
+    }) {
+        ["stdout", "stderr"]
+    } else {
+        ["output", "stderr"]
+    };
+    for (index, key) in keys.into_iter().enumerate() {
+        let Some((raw, text)) = field(key) else {
+            continue;
+        };
+        let mut blocks = Vec::new();
+        let mut origins = Vec::new();
+        if page {
+            let Some(source) = pages.and_then(|p| p[index].as_ref()) else {
+                continue;
+            };
+            let bytes = std::fs::read(&source.path).ok()?;
+            let full = String::from_utf8_lossy(&bytes);
+            let end = source.start + text.len();
+            if full.get(source.start..end) != Some(text.as_str()) {
+                continue;
+            }
+            let mut line = 1;
+            let mut pos = 0;
+            let found = crate::tools::base64_collapse::captured_runs(&full, source.cut);
+            let ranges = raw_ranges(&bytes, &found);
+            for (mut run, physical) in found.into_iter().zip(ranges) {
+                if run.range.start >= end {
+                    break;
+                }
+                if run.range.end <= source.start {
+                    continue;
+                }
+                line += full[pos..run.range.start]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count();
+                pos = run.range.end;
+                origins.push(Location {
+                    path: Some(source.path.clone()),
+                    line,
+                    range: physical,
+                });
+                if run.range.start >= source.start {
+                    result.count += 1;
+                    result.bytes += run.range.len();
+                }
+                run.range = run.range.start.saturating_sub(source.start)
+                    ..run.range.end.min(end) - source.start;
+                blocks.push(run);
+            }
+        } else {
+            blocks = crate::tools::base64_collapse::captured_runs(&text, cuts[index]);
+            result.count += blocks.len();
+            result.bytes += blocks.iter().map(|b| b.range.len()).sum::<usize>();
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        let mut encoded = blocks.clone();
+        encode_ranges(original, raw, &text, &mut encoded);
+        if !page {
+            origins = encoded
+                .iter()
+                .map(|b| Location {
+                    path: None,
+                    line: 1 + newlines.partition_point(|&n| n < b.range.start),
+                    range: b.range.clone(),
+                })
+                .collect();
+            for alias in ["output", "result"] {
+                if alias == key {
+                    continue;
+                }
+                let Some((raw_copy, copy)) = field(alias) else {
+                    continue;
+                };
+                super::alias_parts(key, &text, &copy, true, |at, span| {
+                    for (b, origin) in blocks.iter().zip(&origins) {
+                        let start = span.start.max(b.range.start);
+                        let end = span.end.min(b.range.end);
+                        if start < end {
+                            let mut part = b.clone();
+                            part.range = at + (start - span.start)..at + (end - span.start);
+                            aliases
+                                .entry(alias)
+                                .or_default()
+                                .push((part, origin.clone()));
+                        }
+                    }
+                });
+                // The log stopped mid-run. A completion alias may also hold a
+                // suffix from beyond that ceiling. Its boundary is unknown;
+                // point to the retained fragment without counting another run.
+                if let Some(cut) = blocks.last().filter(|b| b.incomplete) {
+                    let body = super::alias_body(key, &copy);
+                    if let Some((_, tail)) = body.split_once(") ...\n") {
+                        let len = crate::tools::base64_collapse::leading_fragment(tail);
+                        if len > 0 && !text.ends_with(tail) {
+                            let start = tail.as_ptr() as usize - copy.as_ptr() as usize;
+                            let mut fragment = cut.clone();
+                            fragment.range = start..start + len;
+                            let mut physical = [fragment.clone()];
+                            encode_ranges(original, raw_copy, &copy, &mut physical);
+                            let range = physical[0].range.clone();
+                            let line = 1 + newlines.partition_point(|&n| n < range.start);
+                            aliases.entry(alias).or_default().push((
+                                fragment,
+                                Location {
+                                    path: None,
+                                    line,
+                                    range,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        result
+            .locations
+            .extend(encoded.iter().zip(origins).map(|(r, l)| (r.range.start, l)));
+        result.runs.extend(encoded);
+    }
+    for (key, mut parts) in aliases {
+        let (raw, text) = field(key)?;
+        parts.sort_by_key(|(b, _)| b.range.start);
+        let mut end = 0;
+        parts.retain(|(b, _)| {
+            if b.range.start < end {
+                false
+            } else {
+                end = b.range.end;
+                true
+            }
+        });
+        if cuts.contains(&true) {
+            let newlines_before = 1 + newlines
+                .partition_point(|&n| n < raw.get().as_ptr() as usize - original.as_ptr() as usize);
+            for mut run in runs(&text) {
+                if parts
+                    .iter()
+                    .any(|(p, _)| p.range.start < run.range.end && p.range.end > run.range.start)
+                {
+                    continue;
+                }
+                run.incomplete = true;
+                let mut encoded = [run.clone()];
+                encode_ranges(original, raw, &text, &mut encoded);
+                parts.push((
+                    run,
+                    Location {
+                        path: None,
+                        line: newlines_before,
+                        range: encoded[0].range.clone(),
+                    },
+                ));
+            }
+            parts.sort_by_key(|(b, _)| b.range.start);
+        }
+        let (mut blocks, origins): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+        encode_ranges(original, raw, &text, &mut blocks);
+        result
+            .locations
+            .extend(blocks.iter().zip(origins).map(|(r, l)| (r.range.start, l)));
+        result.runs.extend(blocks);
+    }
+    result.runs.sort_unstable_by_key(|b| b.range.start);
+    Some(result)
 }
 
 impl Collapsed {
@@ -126,6 +284,8 @@ impl Collapsed {
             None,
             None,
             HashMap::new(),
+            None,
+            [false; 2],
         )
     }
 
@@ -136,6 +296,8 @@ impl Collapsed {
         stream_runs: Option<Vec<Run>>,
         source_file: Option<&Path>,
         stream_locations: HashMap<usize, Location>,
+        pages: Option<&PageSources>,
+        cuts: [bool; 2],
     ) -> Option<Self> {
         let task = matches!(name, "TaskGet" | "TaskOutput");
         let Blocks {
@@ -145,7 +307,7 @@ impl Collapsed {
             bytes,
             mut json_end,
         } = if task {
-            task_blocks(original)?
+            task_blocks(original, pages, cuts)?
         } else {
             let runs = stream_runs.unwrap_or_else(|| runs(original));
             Blocks {
@@ -161,10 +323,16 @@ impl Collapsed {
         }
         let path = if let Some(path) = source_file {
             path.to_owned()
+        } else if let Some(source) = pages.and_then(|p| p.iter().flatten().next()) {
+            source.path.clone()
         } else {
             crate::performance::save_tool_output(root, original).ok()?
         };
-        let note = summary(count, bytes);
+        let note = if count == 0 {
+            "base64: continuation of a previously counted block".to_owned()
+        } else {
+            summary(count, bytes)
+        };
         let insert = json_end.map_or(original.len(), |end| end - 1);
         let (mut text, mut changes) = render_runs(
             &original[..insert],

@@ -211,6 +211,7 @@ async fn capture(
     output: &mut Captured,
     log: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
+    let mut cut_flag = log.as_ref().map(|p| p.with_extension("capture-cut"));
     let mut log = log.map(std::fs::File::create).transpose()?;
     let mut buffer = [0u8; 8192];
     loop {
@@ -219,6 +220,11 @@ async fn capture(
             break;
         }
         let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.extent.bytes));
+        if keep < count {
+            if let Some(path) = cut_flag.take() {
+                std::fs::write(path, b"")?;
+            }
+        }
         output.push(&buffer[..count]);
         if let Some(log) = log.as_mut() {
             std::io::Write::write_all(log, &buffer[..keep])?;
@@ -375,14 +381,25 @@ impl ShellCapture {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PageSource {
+    pub path: std::path::PathBuf,
+    pub start: usize,
+    pub cut: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CommandMetadata {
     Shell(ShellCapture),
     Snapshot([crate::performance::command_output::SnapshotSize; 2]),
     ShellSnapshot {
+        #[serde(default)]
+        cuts: [bool; 2],
         streams: [crate::performance::command_output::SnapshotSize; 2],
     },
     PageExit(i64), // Existing private sidecars.
     Page {
+        #[serde(default)]
+        sources: [Option<PageSource>; 2],
         bytes: [usize; 2],
         widths: [ReplacementWidths; 2],
     },
@@ -390,7 +407,12 @@ pub(crate) enum CommandMetadata {
 
 impl CommandMetadata {
     pub(crate) fn needed_for_base64(&self) -> bool {
-        matches!(self, Self::Shell(shell) if shell.stdout.source.is_some())
+        match self {
+            Self::Shell(shell) => shell.stdout.source.is_some(),
+            Self::Page { sources, .. } => sources.iter().any(Option::is_some),
+            Self::ShellSnapshot { cuts, .. } => cuts.contains(&true),
+            _ => false,
+        }
     }
 }
 
@@ -439,14 +461,25 @@ pub(crate) fn publish_page(
     stdout: &super::output_page::StreamPage,
     stderr: &super::output_page::StreamPage,
 ) {
+    publish_shell_page(stdout, stderr, [None, None]);
+}
+
+pub(super) fn publish_shell_page(
+    stdout: &super::output_page::StreamPage,
+    stderr: &super::output_page::StreamPage,
+    sources: [Option<PageSource>; 2],
+) {
     let streams = [stdout, stderr];
     // Decoded length is an upper bound. Save exact source widths for any
     // candidate, including a page whose replacements crossed the threshold.
     replace_metadata(
-        qualifies(streams.map(|s| s.text.len())).then(|| CommandMetadata::Page {
-            bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
-            widths: streams.map(|s| s.widths.clone()),
-        }),
+        (sources.iter().any(Option::is_some) || qualifies(streams.map(|s| s.text.len()))).then(
+            || CommandMetadata::Page {
+                sources,
+                bytes: streams.map(|s| s.widths.raw_bytes(s.text.len())),
+                widths: streams.map(|s| s.widths.clone()),
+            },
+        ),
     );
 }
 
