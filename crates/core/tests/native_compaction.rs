@@ -81,7 +81,10 @@ async fn fixture(mode: u8) -> Fixture {
         let released = response_released.clone();
         async move {
             assert_eq!(headers["authorization"], "Bearer gateway-key");
-            assert!(body.get("tools").is_none() && body.get("stream").is_none());
+            for excluded in ["tools", "tool_choice", "reasoning", "stream"] {
+                assert!(body.get(excluded).is_none());
+            }
+            assert_eq!(body["prompt_cache_options"], json!({"mode":"implicit"}));
             seen.lock().unwrap().push(body);
             arrived.notify_one();
             if mode == 2 { std::future::pending::<()>().await; }
@@ -191,6 +194,8 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
     let requests = seen.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0]["input"].to_string().contains(&original));
+    assert_eq!(requests[0]["prompt_cache_key"].as_str().unwrap().len(), 32);
+    assert_eq!(requests[0]["prompt_cache_key"], requests[1]["prompt_cache_key"]);
     assert_eq!(
         &requests[1]["input"].as_array().unwrap()[..3],
         window().as_array().unwrap()
@@ -335,6 +340,7 @@ async fn native_window_survives_reload_fork_and_actual_next_request_without_rewr
         .await
         .unwrap();
         let actual = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(first["prompt_cache_key"] == actual["prompt_cache_key"], session == &id);
         assert_eq!(
             &actual["input"].as_array().unwrap()[..3],
             window().as_array().unwrap()

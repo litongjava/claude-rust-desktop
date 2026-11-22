@@ -27,6 +27,7 @@ pub(crate) fn load(conn: &rusqlite::Connection, message: &str) -> Result<Option<
 pub(crate) fn supports(provider: &ResolvedProvider) -> bool {
     matches!(provider.provider.api_format, ApiFormat::OpenAI)
         && provider.provider.builtin_id.is_some()
+        && provider.model.id.rsplit('/').next().is_some_and(|id| id.starts_with("gpt-") || id.starts_with("chatgpt-"))
         && provider.model.api.as_deref() == Some("openai-responses")
 }
 
@@ -93,7 +94,7 @@ pub(crate) async fn generate_messages_with_options(
     session: Option<&str>,
 ) -> Result<GeneratedSummary> {
     let provider = &provider.current()?;
-    let body = provider_runtime::compaction_request(provider, messages, instructions)?;
+    let body = provider_runtime::compaction_request(provider, messages, instructions, session)?;
     let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
         .context("Native compaction requires a configured gateway URL")?;
     ensure!(

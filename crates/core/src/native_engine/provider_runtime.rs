@@ -35,6 +35,7 @@ pub(crate) fn compaction_request(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
     instructions: &str,
+    session: Option<&str>,
 ) -> Result<Value> {
     let body = messages::request(
         "openai-responses",
@@ -45,9 +46,24 @@ pub(crate) fn compaction_request(
         vec![],
         0,
     )?;
-    Ok(
-        serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]}),
-    )
+    let mut compact = serde_json::json!({"model":provider.model.id,"input":body["input"],"instructions":body["instructions"]});
+    if let Some(key) = super::request_identity::prompt_cache_key(session) {
+        compact["prompt_cache_key"] = Value::String(key);
+        if supports_prompt_cache_options(&provider.model.id) {
+            compact["prompt_cache_options"] = serde_json::json!({"mode":"implicit"});
+        }
+    }
+    Ok(compact)
+}
+
+// The compact API accepts prompt_cache_options starting with GPT-5.6.
+fn supports_prompt_cache_options(model: &str) -> bool {
+    let Some(version) = model.strip_prefix("gpt-").and_then(|s| s.split('-').next()) else {
+        return false;
+    };
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    major.parse::<u32>().ok().zip(minor.parse::<u32>().ok())
+        .is_some_and(|version| version >= (5, 6))
 }
 
 pub(super) fn metadata(provider: &ResolvedProvider) -> Result<(&'static Value, &'static Value)> {
@@ -330,7 +346,7 @@ async fn stream_with_options_client_budget(
     // Responses endpoints route requests to a prompt cache by this key, so the
     // same conversation keeps reusing one cached prefix.
     if api == "openai-responses" {
-        if let Some(key) = super::request_identity::prompt_cache_key() {
+        if let Some(key) = super::request_identity::prompt_cache_key(None) {
             body["prompt_cache_key"] = serde_json::json!(key);
         }
     }
