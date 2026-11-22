@@ -244,6 +244,23 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
     .await;
 }
 
+// The shell fixture emits standard-alphabet data. A main/I6 cut can leave a
+// noncanonical fragment that still contains many copies of the original quartet.
+fn check_shell_payload(view: &str, phase: &str) {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    use base64::Engine as _;
+    for candidate in view.split(|c: char| !(c.is_ascii_alphanumeric() || "+/-_=".contains(c))) {
+        if candidate.len() >= 1024 && candidate.contains("QUJD") {
+            assert!(
+                STANDARD.decode(candidate).is_err() && STANDARD_NO_PAD.decode(candidate).is_err(),
+                "{phase}: canonical {}-byte candidate {:.12}…",
+                candidate.len(),
+                candidate
+            );
+        }
+    }
+}
+
 async fn resume_fixture(
     data: &std::path::Path,
     workspace: &std::path::Path,
@@ -389,24 +406,12 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         }
     );
     if fixture.base64 {
-        use base64::Engine as _;
         let live = last_tool_content(requests.last().unwrap())
             .unwrap()
             .to_owned();
         drop(requests);
         assert!(live.contains("base64 data omitted"), "{live}");
-        for fragment in live
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|s| s.len() >= 1024)
-        {
-            assert!(
-                base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(fragment)
-                    .is_err(),
-                "canonical run in request ({})",
-                fragment.len()
-            );
-        }
+        check_shell_payload(&live, "live request");
         let (path, line) = live
             .split_once("; full text: ")
             .unwrap()
@@ -461,7 +466,14 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         resume_fixture(&data, root.path(), &id, "/compact Keep the fixture command").await;
         let compact = serde_json::to_string(&fixture.requests.lock().unwrap()[start..]).unwrap();
         assert!(compact.contains("[base64 data omitted"));
-        assert!(!compact.contains(&"QUJD".repeat(256)));
+        check_shell_payload(&compact, "compaction request");
+        let session_outputs = std::path::Path::new(path).parent().unwrap();
+        let compaction_file = std::fs::read_dir(session_outputs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|file| std::fs::read(file).unwrap() == raw.as_bytes())
+            .expect("the historical row was saved exactly before compaction");
+        assert!(compact.contains(compaction_file.to_str().unwrap()));
         server.abort();
         let _ = server.await;
         return;
