@@ -5,7 +5,9 @@ use super::{
 };
 use crate::services::compaction::checkpoint::Checkpoint;
 use anyhow::{ensure, Context, Result};
-use std::fmt;
+use std::{fmt, sync::Arc};
+
+pub(super) mod replay;
 
 /// Fixed generation budget when neither the selected model nor reliable
 /// provider/model metadata supplies a positive output cap. This is an explicit
@@ -533,8 +535,8 @@ fn log_request(
     );
 }
 
-// Recovery requests must carry encrypted Responses items as protocol objects.
-struct WindowFallback {
+// Protocol objects required by a fragment, including images and opaque Responses items.
+struct RecoveryContext {
     wire: WireRequest,
     tokens: u64,
     checkpoint_system: String,
@@ -542,6 +544,7 @@ struct WindowFallback {
 
 struct WholeRequest {
     planner_text: String,
+    has_media: bool,
     wire: WireRequest,
     estimated_tokens: u64,
     checkpoint_key: String,
@@ -574,7 +577,7 @@ struct Summarizer<'a, 'b> {
     // Only the complete-history request uses this body. Split and merge nodes
     // must consume their own reduced input.
     whole_request: Option<WholeRequest>,
-    fallback: Option<WindowFallback>,
+    fallback: Option<Arc<RecoveryContext>>,
 }
 
 impl<'a, 'b> Summarizer<'a, 'b> {
@@ -724,6 +727,11 @@ impl<'a, 'b> Summarizer<'a, 'b> {
                 let mut wire = fallback.wire.clone();
                 wire.append_instruction(text)?;
                 wire.set_output_budget(output);
+                let estimate = super::request_context::ContextUsage::from_body(
+                    &wire.api, &wire.body, None, output,
+                )
+                .text_subtotal();
+                ensure!(estimate <= self.input_budget(output), "Typed compaction fragment exceeds the context budget; original history retained");
                 generate_followup(&self.provider, wire, output, options).await?
             }
             (None, None) => {
@@ -932,9 +940,9 @@ impl<'a, 'b> Summarizer<'a, 'b> {
     ) -> Result<String> {
         if depth == 0 && self.whole_request.is_some() {
             let text = self.text(stage, body);
-            if self.whole_request(&text).is_some()
-                && input_tokens(self.system, &text) > self.planning_limit(output)
-            {
+            if self.whole_request(&text).is_some_and(|r| {
+                r.has_media || input_tokens(self.system, &text) > self.planning_limit(output)
+            }) {
                 return Err(NeedsFragments.into());
             }
         }
@@ -1104,34 +1112,12 @@ pub(crate) async fn summarize(
     summarize_history(provider, system, input, checkpoint, None, None).await
 }
 
-/// Plan oversized input from the active durable rows before a normal turn's
-/// local compression shortens it. Recovery must be able to split the originals.
-pub(super) fn requires_fragments(
-    provider: &ResolvedProvider,
-    system: &str,
-    input: &str,
-    has_main_turn: bool,
-) -> bool {
-    let window = provider.model.context_window.unwrap_or_else(|| {
-        super::token_counter::TokenCounter::get_model_context_limit(&provider.model.id) as u32
-    });
-    let limit = input_budget_for(u64::from(window), output_budget(provider).0);
-    // A session with a main turn can reuse the provider cache up to its safe
-    // window. A cold import starts at the bounded fragment size.
-    input_tokens(system, input)
-        > if has_main_turn {
-            limit
-        } else {
-            limit.min(MAX_INPUT_TOKENS)
-        }
-}
-
-pub(super) async fn summarize_history(
+async fn summarize_history(
     mut provider: ResolvedProvider,
     system: &str,
     input: &str,
     mut checkpoint: Option<&mut Checkpoint<'_>>,
-    request: Option<(WireRequest, &str)>,
+    request: Option<replay::Replay<'_>>,
     window_fallback: Option<WireRequest>,
 ) -> Result<String> {
     let window = provider.model.context_window.unwrap_or_else(|| {
@@ -1152,7 +1138,23 @@ pub(super) async fn summarize_history(
         fragment_output.max(final_output)
     );
     let targets = Targets::new(fragment_output, final_output);
-    let whole_request = if let Some((mut wire, focus)) = request {
+    let mut media = Vec::new();
+    let whole_request = if let Some(replay) = request {
+        let retains_images = replay.retains_images();
+        let replay::Replay {
+            mut wire,
+            focus,
+            has_main_turn,
+            source_tokens,
+            media: rows,
+        } = replay;
+        media = rows;
+        let limit = input_budget_for(u64::from(window), final_output);
+        let limit = if has_main_turn {
+            limit
+        } else {
+            limit.min(MAX_INPUT_TOKENS)
+        };
         let prompt = targets.prompt(Stage::Final);
         wire.append_instruction(&format!(
             "{system}\n\n{prompt}Summary focus requested by the user:\n{focus}"
@@ -1164,25 +1166,44 @@ pub(super) async fn summarize_history(
             final_output,
         )
         .text_subtotal();
-        let key = Checkpoint::request_key(&wire.api, &wire.body.to_string(), final_output);
-        Some(WholeRequest {
+        (retains_images && source_tokens <= limit && estimate <= limit).then(|| WholeRequest {
+            has_media: !media.is_empty(),
+            checkpoint_key: Checkpoint::request_key(
+                &wire.api,
+                &wire.body.to_string(),
+                final_output,
+            ),
             planner_text: format!("{prompt}{input}"),
             wire,
             estimated_tokens: estimate,
-            checkpoint_key: key,
         })
     } else {
         None
     };
     let fallback = window_fallback.map(|wire| {
         let serialized = wire.body["input"].to_string();
-        let tokens = (serialized.len() as u64).div_ceil(3);
+        let usage = super::request_context::ContextUsage::from_body(
+            &wire.api,
+            &wire.body,
+            None,
+            final_output,
+        );
+        // Reserve space for opaque Responses items without charging any
+        // retained images by their base64 transfer size.
+        let encrypted_bytes: u64 = wire.body["input"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["encrypted_content"].as_str())
+            .map(|data| data.len() as u64)
+            .sum();
+        let tokens = usage.history.estimated_tokens + encrypted_bytes.div_ceil(3);
         let checkpoint_system = Checkpoint::request_key(system, &serialized, final_output);
-        WindowFallback {
+        Arc::new(RecoveryContext {
             wire,
             tokens,
             checkpoint_system,
-        }
+        })
     });
     let mut summarizer = Summarizer {
         fallback,
@@ -1199,7 +1220,9 @@ pub(super) async fn summarize_history(
     };
     let final_limit = summarizer.planning_limit(final_output);
     // A history that fits one final summary is summarized in one request.
-    if summarizer.text_fits(&summarizer.text(Stage::Final, input), final_output) {
+    if (summarizer.whole_request.is_some() || media.is_empty())
+        && summarizer.text_fits(&summarizer.text(Stage::Final, input), final_output)
+    {
         let mut quota = Quota::new(MAX_SEGMENT_RECOVERIES);
         let result = summarizer
             .request(
@@ -1231,16 +1254,23 @@ pub(super) async fn summarize_history(
         }
     }
     summarizer.whole_request = None;
-    let fragment_limit = summarizer.planning_limit(fragment_output);
+    let window_fallback = summarizer.fallback.clone();
+    let sections = replay::recovery_sections(input, media, &summarizer)?;
     let prompt = summarizer.targets.prompt(Stage::Fragment);
-    let parts = fragments(system, &prompt, input, fragment_limit)
-        .map_err(|error| summarizer.planning_failed("fragment planning", fragment_output, error))?;
+    let mut parts = Vec::new();
+    for (section, fallback) in sections {
+        summarizer.fallback = fallback.clone();
+        let limit = summarizer.planning_limit(fragment_output);
+        let fragments = fragments(system, &prompt, section, limit).map_err(|error| {
+            summarizer.planning_failed("fragment planning", fragment_output, error)
+        })?;
+        parts.extend(fragments.into_iter().map(|text| (text, fallback.clone())));
+    }
     let count = parts.len();
     let quotas = segment_quotas(count);
     tracing::info!(
         module = "Compaction",
         fragments = count,
-        fragment_limit,
         final_limit,
         output_budget = fragment_output,
         budget_source = budget_source.as_str(),
@@ -1249,7 +1279,8 @@ pub(super) async fn summarize_history(
     let mut merge_pool = MERGE_RESERVE;
     let mut prepared: Vec<Option<String>> = Vec::with_capacity(count);
     let mut failures: Vec<(usize, anyhow::Error)> = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
+    for (index, (part, fallback)) in parts.into_iter().enumerate() {
+        summarizer.fallback = fallback;
         let mut quota = Quota::new(quotas[index]);
         let label = format!("fragment {}/{}", index + 1, count);
         match summarizer
@@ -1300,6 +1331,7 @@ pub(super) async fn summarize_history(
     if !failures.is_empty() {
         return Err(summarize_failure(count, &failures));
     }
+    summarizer.fallback = window_fallback;
     let mut layer: Vec<String> = prepared.into_iter().flatten().collect();
     let merge_limit = summarizer.planning_limit(fragment_output);
     let mut layer_index = 0usize;

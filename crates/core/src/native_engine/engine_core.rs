@@ -706,38 +706,22 @@ impl QueryEngine {
             anyhow::bail!("Cannot prepare a summary request");
         };
         turn.executor.restore_request_context().await?;
-        let durable = turn.executor.prepare_main_history()?;
-        // Recovery uses the same active messages, before local window reduction.
-        // Keep encrypted items in their typed Responses field on every fragment.
-        let recovery_rows = if window.is_some() {
-            &durable[1..]
-        } else {
-            &durable[..]
-        };
-        let input = format!(
-            "Summary focus requested by the user:\n{instructions}\n\nConversation JSON:\n{}",
-            serde_json::to_string(recovery_rows)?
-        );
-        if super::generation::requires_fragments(&provider, system, &input, has_main_turn) {
-            return super::generation::summarize_history(
-                provider,
-                system,
-                &input,
-                Some(&mut checkpoint),
-                None,
-                window,
-            )
-            .await;
+        let mut durable = turn.executor.prepare_main_history()?;
+        // The saved Responses prefix is already carried in the typed window.
+        if window.is_some() {
+            durable.remove(0);
         }
         let mut wire = turn.executor.replay_request().await?;
         wire.allow_text_summary();
-        super::generation::summarize_history(
+        super::generation::replay::summarize_replay(
             provider,
             system,
-            &input,
-            Some(&mut checkpoint),
-            Some((wire, instructions)),
+            durable,
+            instructions,
+            has_main_turn,
+            wire,
             window,
+            &mut checkpoint,
         )
         .await
     }

@@ -33,13 +33,13 @@ impl Fixture {
     }
 
     async fn with_root(window: usize, root: tempfile::TempDir) -> Self {
-        Self::with_answer(window, root, |_| "Pending work is recorded.").await
+        Self::with_answer(window, root, |_| Some("Pending work is recorded.")).await
     }
 
     async fn with_answer(
         window: usize,
         root: tempfile::TempDir,
-        answer: fn(&Value) -> &'static str,
+        answer: fn(&Value) -> Option<&'static str>,
     ) -> Self {
         deepseek_code_core::config::OrchestrationConfig::init_global().unwrap();
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
@@ -62,10 +62,13 @@ impl Fixture {
             let bedrock = body.get("inferenceConfig").is_some();
             let anthropic = headers.contains_key("anthropic-version");
             let structured = body["response_format"]["type"] == "json_schema" || body["messages"].to_string().contains("fixture always answers JSON");
-            let text = if structured { r#"{"ok":true}"# } else if compact { answer(&body) } else { "last answer" };
+            let text = if structured { Some(r#"{"ok":true}"#) } else if compact { answer(&body) } else { Some("last answer") };
             seen_routes.lock().unwrap().push((uri.path().to_owned(),headers));
             seen.lock().unwrap().push(body);
             async move {
+                let Some(text) = text else {
+                    return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"context_length_exceeded","message":"Maximum context length exceeded"}}))).into_response();
+                };
                 let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":if cache_write {75} else {80}, "cache_write_tokens":if cache_write {5} else {0}}});
                 if uri.path().ends_with("/responses/compact") {
                     return Json(json!({"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":100,"output_tokens":3}})).into_response();
@@ -752,9 +755,9 @@ async fn replay_preserves_the_virtual_context_window() -> anyhow::Result<()> {
     const GATE: &str = "REQUIRES_QA_42";
     let f = Fixture::with_answer(50_000, tempfile::tempdir()?, |body| {
         if body["messages"].to_string().contains(GATE) {
-            GATE
+            Some(GATE)
         } else {
-            "No QA gate was recorded."
+            Some("No QA gate was recorded.")
         }
     })
     .await;
@@ -780,5 +783,130 @@ async fn replay_preserves_the_virtual_context_window() -> anyhow::Result<()> {
         .unwrap()
         .contains(GATE));
     f.finish().await;
+    Ok(())
+}
+
+fn has_typed_image(body: &Value) -> bool {
+    body["messages"].as_array().into_iter().flatten().any(|m| {
+        m["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["type"] == "image_url")
+    })
+}
+
+const VISUAL_FINDING: &str = "Red light is visible.";
+
+fn visual_answer(body: &Value) -> Option<&'static str> {
+    Some(
+        if has_typed_image(body) || body["messages"].to_string().contains(VISUAL_FINDING) {
+            VISUAL_FINDING
+        } else {
+            "No visual evidence was supplied."
+        },
+    )
+}
+
+async fn visual_fixture(
+    filename: &str,
+    answer: fn(&Value) -> Option<&'static str>,
+) -> anyhow::Result<Fixture> {
+    let mut f = Fixture::with_answer(128_000, tempfile::tempdir()?, answer).await;
+    f.provider.models[0].supports_vision = true;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(filename);
+    let image = runtime::image_block_from_file(&path)?;
+    f.store.db.open_session(&f.id)?.write(|w| {
+        w.append_user_content(
+            "Status light",
+            &json!([{"type":"text","text":"Record the status light in this image."},image]),
+        )
+    })?;
+    f.append("assistant", "Acknowledged.");
+    Ok(f)
+}
+
+#[tokio::test]
+async fn replay_preserves_the_visual_finding_for_both_png_encodings() -> anyhow::Result<()> {
+    for filename in ["red-compressed.png", "red-uncompressed.png"] {
+        let f = visual_fixture(filename, visual_answer).await?;
+        f.send_normal(None).await;
+        f.compact().await?;
+        let history = f.store.model_history(&f.id, &f.provider.api_format)?;
+        {
+            let calls = f.requests.lock().unwrap();
+            assert!(has_typed_image(&calls[0]));
+            assert!(
+                calls[1..].iter().any(has_typed_image),
+                "no typed image in summary requests with {filename}"
+            );
+            assert_eq!(calls.len(), 2, "PNG encoding changed the whole-request fit");
+        }
+        assert!(history.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains(VISUAL_FINDING));
+        f.finish().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn visual_recovery_preserves_the_image_or_retains_active_history() -> anyhow::Result<()> {
+    for reject_image in [false, true] {
+        let f = if reject_image {
+            visual_fixture("red-compressed.png", |body| {
+                if has_typed_image(body) {
+                    None
+                } else {
+                    visual_answer(body)
+                }
+            })
+            .await?
+        } else {
+            visual_fixture("red-compressed.png", |body| {
+                if body["tools"].is_array() {
+                    None
+                } else {
+                    visual_answer(body)
+                }
+            })
+            .await?
+        };
+        f.send_normal(None).await;
+        let before = f.store.model_history(&f.id, &f.provider.api_format)?;
+        let result = f.compact().await;
+        let after = f.store.model_history(&f.id, &f.provider.api_format)?;
+        {
+            let calls = f.requests.lock().unwrap();
+            assert!(has_typed_image(&calls[0]));
+            assert!(has_typed_image(&calls[1]));
+            assert!(
+                calls[2..].iter().any(has_typed_image),
+                "the image must reach recovery"
+            );
+            for body in &calls[2..] {
+                if body["messages"].to_string().contains("attached_image") {
+                    assert!(has_typed_image(body));
+                }
+            }
+        }
+        if reject_image {
+            let error = result
+                .err()
+                .expect("an unrepresentable image must fail compaction");
+            assert!(format!("{error:#}").contains("original history retained"));
+            assert!(after == before, "rejected media changed the active history");
+        } else {
+            result?;
+            assert!(after.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains(VISUAL_FINDING));
+        }
+        f.finish().await;
+    }
     Ok(())
 }
