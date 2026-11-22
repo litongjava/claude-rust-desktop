@@ -652,10 +652,10 @@ fn compact_tool_output(tool_name: &str, output: &str) -> String {
                     .last()
                     .map(|(idx, ch)| idx + ch.len_utf8())
                     .unwrap_or(0);
-                format!(
-                    "{}... (truncated, {} bytes total)",
-                    &output[..safe_end],
-                    output.len()
+                crate::performance::placeholder_preview::prefix(
+                    output,
+                    safe_end,
+                    &format!("... (truncated, {} bytes total)", output.len()),
                 )
             } else {
                 output.to_string()

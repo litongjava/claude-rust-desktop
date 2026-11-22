@@ -246,7 +246,7 @@ pub(crate) fn project_for_model(
     let rendered = super::model_tool_output(name, &template);
     let rendered = if root.is_some() && rendered.len() > crate::performance::MODEL_TOOL_OUTPUT_BYTES
     {
-        let (_, ranges) = crate::performance::preview_with_ranges(
+        let (preview, ranges) = crate::performance::preview_with_ranges(
             &rendered,
             crate::performance::MODEL_TOOL_OUTPUT_BYTES,
         );
@@ -281,9 +281,9 @@ pub(crate) fn project_for_model(
             }
         }
         format!(
-            "{}\n... (output truncated; {} bytes before preview) ...\n{}",
+            "{}{}{}",
             &rendered[..head],
-            rendered.len(),
+            &preview[ranges.head.end..ranges.tail_offset],
             &rendered[tail..]
         )
     } else {

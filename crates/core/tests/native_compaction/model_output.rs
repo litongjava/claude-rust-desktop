@@ -195,6 +195,12 @@ fn assigned_reviewer(f: &Fixture) -> ToolRuntime {
 async fn reviewer_wire(f: &Fixture, runtime: &ToolRuntime) -> Value {
     let evidence = review::execute(runtime, "SessionMessages", json!({"session_id":f.id})).unwrap();
     let reply = evidence.to_string();
+    let text = reviewer_page_on_wire(&reply).await;
+    assert_eq!(text, reply);
+    serde_json::from_str(&text).unwrap()
+}
+
+async fn reviewer_page_on_wire(reply: &str) -> String {
     let sent = pressure_request(vec![
         json!({"role":"assistant","content":"","tool_calls":[{"id":"review","type":"function","function":{"name":"SessionMessages","arguments":"{}"}}]}),
         json!({"role":"tool","tool_call_id":"review","content":reply}),
@@ -203,8 +209,7 @@ async fn reviewer_wire(f: &Fixture, runtime: &ToolRuntime) -> Value {
     let text = sent.iter().find(|m| m["tool_call_id"] == "review").unwrap()["content"]
         .as_str()
         .unwrap();
-    assert_eq!(text, reply);
-    serde_json::from_str(text).unwrap()
+    text.to_owned()
 }
 
 #[tokio::test]
@@ -565,4 +570,117 @@ fn base64_model_boundary_search_recovery_paths() {
         };
         assert_eq!(bytes, raw.as_bytes());
     }
+}
+
+fn insert_review_result(f: &Fixture, message: &str, id: &str, position: i64, stdout: &str) {
+    let raw = json!({"stdout":stdout,"stderr":"","exit_code":0}).to_string();
+    f.store
+        .db
+        .shard_sql(&f.id, |conn| {
+            deepseek_code_core::db::message_repo::insert_tool_call(
+                conn,
+                id,
+                message,
+                "Bash",
+                Some("{}"),
+                Some(&raw),
+                false,
+                position,
+            )
+        })
+        .unwrap()
+        .unwrap();
+}
+
+async fn assert_reviewer_preview(page: &str, count: usize, payload: &str) {
+    let wire = reviewer_page_on_wire(page).await;
+    assert!(!wire.contains(payload));
+    assert!(wire.len() <= 16_000);
+    let preview = wire.rsplit_once("\nSaved tool result").unwrap().0;
+    let (head, rest) = preview.split_once("\n... (output truncated; ").unwrap();
+    let (notice, tail) = rest.split_once(") ...\n").unwrap();
+    assert!(page.starts_with(head) && page.ends_with(tail));
+    let tail_start = page.len() - tail.len();
+    let mut omitted = 0;
+    let markers: Vec<_> = page.match_indices("[base64 data omitted:").collect();
+    assert_eq!(markers.len(), count);
+    for (start, _) in markers {
+        let end = start + page[start..].find(']').unwrap() + 1;
+        assert!(
+            !(start < head.len() && head.len() < end),
+            "head splits reference"
+        );
+        assert!(
+            !(start < tail_start && tail_start < end),
+            "tail splits reference"
+        );
+        omitted += usize::from(start >= head.len() && end <= tail_start);
+    }
+    if count == 1 {
+        assert_eq!(
+            omitted, 0,
+            "the single recovery reference fits in the preview"
+        );
+    }
+    let reported = notice
+        .split_once("; placeholders omitted: ")
+        .map_or(0, |(_, count)| count.parse::<usize>().unwrap());
+    assert_eq!(reported, omitted, "{notice}");
+}
+
+#[tokio::test]
+async fn base64_reviewer_preview_three_results() {
+    let f = fixture(0).await;
+    let reviewer = assigned_reviewer(&f);
+    let message = f.store.append(&f.id, "assistant", "").unwrap();
+    let payload = "QUJD".repeat(256);
+    let page = || {
+        review::execute(&reviewer, "SessionMessages", json!({"session_id":f.id}))
+            .unwrap()
+            .to_string()
+    };
+    insert_review_result(&f, &message, "first", 0, "");
+    insert_review_result(&f, &message, "second", 1, &format!("log!{payload}!"));
+    insert_review_result(&f, &message, "third", 2, &".".repeat(12_000));
+    // Allow for the serialized IDs and temporary directory in the default page.
+    let padding = 7770 - page().find("[base64 data omitted:").unwrap();
+    insert_review_result(&f, &message, "first", 0, &".".repeat(padding));
+    let page = page();
+    let (path, rest) = page
+        .split_once("; full text: ")
+        .unwrap()
+        .1
+        .split_once(", line ")
+        .unwrap();
+    let line: usize = rest.split_once(']').unwrap().0.parse().unwrap();
+    assert!(std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .nth(line - 1)
+        .unwrap()
+        .contains(&payload));
+    f.server.abort();
+    let _ = f.server.await;
+    assert_reviewer_preview(&page, 1, &payload).await;
+}
+
+#[tokio::test]
+async fn base64_reviewer_preview_default_page_with_100_references() {
+    let f = fixture(0).await;
+    let reviewer = assigned_reviewer(&f);
+    let payload = "QUJD".repeat(256);
+    for i in 0..4 {
+        let message = f.store.append(&f.id, "assistant", "").unwrap();
+        let stdout = (0..25)
+            .map(|j| format!("asset {i}.{j} = {payload}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        insert_review_result(&f, &message, &format!("result-{i}"), 0, &stdout);
+    }
+    let page = review::execute(&reviewer, "SessionMessages", json!({"session_id":f.id}))
+        .unwrap()
+        .to_string();
+    f.server.abort();
+    let _ = f.server.await;
+    assert_reviewer_preview(&page, 100, &payload).await;
 }

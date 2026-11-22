@@ -248,12 +248,11 @@ impl ContextCompressor {
                         .last()
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
-                    let truncated = &content[..safe_end];
+                    let notice = format!("... [truncated, {} bytes total]", content.len());
+                    let truncated = crate::performance::placeholder_preview::prefix(content, safe_end, &notice);
                     let mut compressed_msg = msg.clone();
                     if let Some(obj) = compressed_msg.as_object_mut() {
-                        obj.insert("content".to_string(), serde_json::json!(
-                            format!("{}... [truncated, {} bytes total]", truncated, content.len())
-                        ));
+                        obj.insert("content".to_string(), truncated.into());
                         obj.insert("_compressed".to_string(), serde_json::json!(true));
                     }
                     compressed.push(compressed_msg);
@@ -273,12 +272,10 @@ impl ContextCompressor {
                         .last()
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
-                    let truncated = &content[..safe_end];
+                    let truncated = crate::performance::placeholder_preview::prefix(content, safe_end, "... [truncated]");
                     let mut compressed_msg = msg.clone();
                     if let Some(obj) = compressed_msg.as_object_mut() {
-                        obj.insert("content".to_string(), serde_json::json!(
-                            format!("{}... [truncated]", truncated)
-                        ));
+                        obj.insert("content".to_string(), truncated.into());
                         obj.insert("_compressed".to_string(), serde_json::json!(true));
                     }
                     compressed.push(compressed_msg);

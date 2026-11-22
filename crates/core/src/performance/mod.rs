@@ -772,6 +772,7 @@ pub fn head_tail_preview(text: &str, limit: usize) -> String {
 
 pub(crate) mod command_lines;
 pub(crate) mod command_output;
+pub(crate) mod placeholder_preview;
 pub(crate) use command_output::LONG_COMMAND_OUTPUT_BYTES;
 
 /// The source ranges preserved by a head/tail preview, with their positions
@@ -808,24 +809,7 @@ pub(crate) fn preview_with_ranges(text: &str, limit: usize) -> (String, PreviewR
     if text.len() <= limit {
         return (text.to_owned(), PreviewRanges::whole(text.len()));
     }
-    let marker = format!(
-        "\n... (output truncated; {} bytes before preview) ...\n",
-        text.len()
-    );
-    if limit < marker.len() {
-        return ("...".chars().take(limit).collect(), PreviewRanges::whole(0));
-    }
-    let budget = limit - marker.len();
-    let head = text.floor_char_boundary(budget / 2);
-    let tail = text.ceil_char_boundary(text.len() - (budget - budget / 2));
-    (
-        format!("{}{}{}", &text[..head], marker, &text[tail..]),
-        PreviewRanges {
-            head: 0..head,
-            tail: tail..text.len(),
-            tail_offset: head + marker.len(),
-        },
-    )
+    placeholder_preview::head_tail(text, limit)
 }
 
 pub(crate) const MODEL_TOOL_OUTPUT_BYTES: usize = 16_000;
